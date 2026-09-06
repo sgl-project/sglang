@@ -179,7 +179,7 @@ class SelfAttention(nn.Module):
         # USPAttention handles SP communication internally; the tail meta keeps
         # SP padding out of the softmax.
         out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta)
-        out = out.view(b, s, -1)
+        out = out.reshape(b, s, -1)
 
         out, _ = self.o(out)
         return out

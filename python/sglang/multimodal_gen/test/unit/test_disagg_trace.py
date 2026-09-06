@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import unittest
 from contextlib import contextmanager
-from types import SimpleNamespace
 
 import torch
 
@@ -67,7 +66,12 @@ def _srt_trace_server_args():
         prev_server_args = srt_server_args_module.get_global_server_args()
     except ValueError:  # nothing published yet
         prev_server_args = None
-    set_global_server_args_for_scheduler(SimpleNamespace(trace_modules="request"))
+    # publish resolves what it is handed, so a stand-in cannot go through it.
+    from sglang.srt.server_args import ServerArgs as SrtServerArgs
+
+    set_global_server_args_for_scheduler(
+        SrtServerArgs(model_path="dummy", trace_modules="request")
+    )
     try:
         yield
     finally:

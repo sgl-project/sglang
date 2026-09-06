@@ -107,10 +107,11 @@ class TestTokenizerConfigUpdates(CustomTestCase):
             def __deepcopy__(self, memo):
                 raise RuntimeError("refuses to be copied")
 
-        manager = _manager(self)
+        # Through the constructor: the field is raw input, and a resolved
+        # record refuses to be written.
+        manager = _manager(self, custom_sigquit_handler=Hostile())
         manager.model_path = "dummy"
         manager.served_model_name = "dummy"
-        manager.server_args.custom_sigquit_handler = Hostile()
 
         self.assertIsNone(manager._dump_config_snapshot())
 
@@ -118,11 +119,10 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         import dataclasses
         import pickle
 
-        manager = _manager(self)
+        # What --custom-sigquit-handler leaves on a real ServerArgs.
+        manager = _manager(self, custom_sigquit_handler=lambda *_: None)
         manager.model_path = "dummy"
         manager.served_model_name = "dummy"
-        # What --custom-sigquit-handler leaves on a real ServerArgs.
-        manager.server_args.custom_sigquit_handler = lambda *_: None
 
         payload = {
             "server_args": manager.server_args,

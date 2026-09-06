@@ -239,12 +239,16 @@ def module_weight_bytes(module) -> int:
     seen: set[int] = set()
     total = 0
     for tensor in list(module.parameters()) + list(module.buffers()):
-        storage = tensor.untyped_storage()
-        pointer = storage.data_ptr()
+        try:
+            storage = tensor.untyped_storage()
+            pointer = storage.data_ptr()
+            storage_bytes = storage.nbytes()
+        except RuntimeError:
+            continue
         if pointer == 0 or pointer in seen:
             continue
         seen.add(pointer)
-        total += storage.nbytes()
+        total += storage_bytes
     return total
 
 
@@ -253,9 +257,9 @@ def describe_host_memory() -> str:
     capped = cgroup_memory_limit_bytes()
     available = host_memory_available_bytes()
     if capped is None:
-        return f"host memory available: {available / GIB_BYTES:.1f} GiB (no cgroup cap)"
+        return f"{available / GIB_BYTES:.1f} GiB available (no cgroup cap)"
     limit, usage = capped
     return (
-        f"host memory available: {available / GIB_BYTES:.1f} GiB "
+        f"{available / GIB_BYTES:.1f} GiB available "
         f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB)"
     )

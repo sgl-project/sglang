@@ -204,6 +204,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.speculative_num_steps = 1
                 worker.speculative_num_draft_tokens = 2
                 worker.device = DEVICE
+                worker.plan_stream = None
                 worker.tree_mask_mode = None
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
                 worker.index_share_for_mtp_iteration = True
@@ -231,12 +232,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     seq_lens=torch.ones((1,), dtype=torch.int32, device=DEVICE),
                 )
 
-                with patch(
-                    "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
-                    return_value=tree_result,
-                ), patch(
-                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                    return_value=(forward_batch, True),
+                with (
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
+                        return_value=tree_result,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                        return_value=(forward_batch, True),
+                    ),
                 ):
                     worker.draft(batch)
 

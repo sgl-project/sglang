@@ -72,16 +72,17 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
+export DEEPEP_HCCL_BUFFSIZE=2000
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export FORCE_DRAFT_MODEL_NON_QUANT=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=2000
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=400
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_NPU_USE_MULTI_STREAM=0
 export SGLANG_SET_CPU_AFFINITY=1
@@ -119,7 +120,7 @@ python3 -m sglang.launch_server \
     --mamba-ssm-dtype bfloat16 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --reasoning-parser qwen3 \
-    --tool-call-parser qwen
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -133,10 +134,11 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 1 \
+    --num-prompts 1 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 1 \
-    --random-range-ratio 1
+    --random-range-ratio 1 \
+    --seed 1
 ```
 
 ### Qwen3-Next-80B-A3B-Instruct W8A8 2P IN3K5 OUT1K5 50ms
@@ -193,6 +195,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_NPU_USE_MULTI_STREAM=0
 export SGLANG_SET_CPU_AFFINITY=1
@@ -234,7 +237,7 @@ python3 -m sglang.launch_server \
     --deepep-mode auto \
     --cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150 \
     --reasoning-parser qwen3 \
-    --tool-call-parser qwen
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -248,10 +251,11 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 300 \
+    --num-prompts 300 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 300 \
-    --random-range-ratio 1
+    --random-range-ratio 1 \
+    --seed 1
 ```
 
 ### Qwen3-Next-80B-A3B-Instruct W8A8 2P IN6K OUT1K5 BS16
@@ -299,12 +303,12 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
+export DEEPEP_HCCL_BUFFSIZE=2000
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export FORCE_DRAFT_MODEL_NON_QUANT=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=2000
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -362,9 +366,10 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --max-attempts 5 \
     --max-concurrency 16 \
+    --num-prompts 16 \
     --random-input-len 6144 \
     --random-output-len 1500 \
-    --num-prompts 16 \
     --random-range-ratio 1
 ```

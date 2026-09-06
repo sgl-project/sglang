@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=8400,
-    suite="nightly-acc-2-npu-a3",
+    suite="full-acc-2-npu-a3",
     nightly=True,
 )
 
@@ -20,7 +20,7 @@ ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "HCCL_BUFFSIZE": "2000",
+    "DEEPEP_HCCL_BUFFSIZE": "2000",
 }
 
 OTHER_ARGS = [
@@ -54,7 +54,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestQwen3(TestNpuAccuracyTestCaseBase):
+class TestQwen3_VL_30B_A3B_Thinking_MMMU(TestNpuAccuracyTestCaseBase):
     model = QWEN3_VL_30B_A3B_THINKING_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS

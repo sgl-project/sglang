@@ -4,7 +4,16 @@ import re
 import threading
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
-from typing import Any, Dict, List, Optional, Set, Tuple
+from time import perf_counter
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -97,6 +106,13 @@ def compute_streamed_layers(
 # of table size to rows actually read makes residency clearly wasteful.
 HOST_RESIDENT_TABLE_MIN_BYTES = 256 * 1024**2
 
+# Parking a component's non-layer weights frees device memory at the cost of two
+# transfers per use and a host copy that competes with the page cache. It is
+# worth that only when what it frees is a meaningful share of the headroom
+# actually available; on a card with room it is pure loss. Below this share of
+# free device memory, the component stays where it is.
+PARK_SIGNIFICANCE = 0.1
+
 
 def _resolve_submodule(root: torch.nn.Module, path: str) -> torch.nn.Module | None:
     current: Any = root
@@ -142,11 +158,16 @@ def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
 def detach_host_resident_tables(
     model: torch.nn.Module,
 ) -> List[Tuple[torch.nn.Module, torch.Tensor]]:
-    """Swap large vocab tables for placeholders so a `.to(device)` skips them."""
+    """Park large vocab tables on the host so a `.to(device)` skips them."""
     detached = []
     for module in _host_resident_tables(model):
         weight = module.weight
-        detached.append((module, weight.data))
+        # Most loaders leave the table on the host, but model-owned loading
+        # paths may already have placed it on the accelerator.  The input hook
+        # below always sends indices to the host, so retaining accelerator data
+        # here would restore a CUDA weight and create a CPU-index/CUDA-weight
+        # mismatch in the embedding gather.
+        detached.append((module, weight.data.to("cpu")))
         weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
     return detached
 
@@ -455,6 +476,7 @@ class LayerwiseOffloadManager:
         self._mapped_regions = MappedRegions()
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
+        self._last_forwarded_layer: int | None = None  # skip-compute can jump
 
         if initialize:
             self._initialize()
@@ -703,7 +725,14 @@ class LayerwiseOffloadManager:
                 contiguous_weights: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
                 for name, weight in weights:
                     local_weight = self._to_local_tensor(weight)
-                    if hosting == "mapped" and self._mapped_regions.holds(local_weight):
+                    if (
+                        hosting == "mapped"
+                        and local_weight.is_contiguous()
+                        and self._mapped_regions.holds(local_weight)
+                    ):
+                        # Only a contiguous view can stay mapped: the reload
+                        # path allocates contiguous and would drop any other
+                        # layout without saying so.
                         # Already a view into the checkpoint. Copying it would
                         # add a second copy of bytes the page cache holds
                         # anyway, and that copy is what does not fit.
@@ -713,13 +742,12 @@ class LayerwiseOffloadManager:
                         # below swaps that same object's storage for a (1,)
                         # placeholder, leaving the placeholder in the store.
                         # Keep an independent tensor over the mapped storage.
-                        self._mapped_cpu_weights[layer_idx][
-                            name
-                        ] = local_weight.detach().view_as(local_weight)
+                        self._mapped_cpu_weights[layer_idx][name] = (
+                            local_weight.detach().view_as(local_weight)
+                        )
                         self._weight_metadata[layer_idx][name] = {
                             "dtype": local_weight.dtype,
                             "shape": tuple(local_weight.shape),
-                            "stride": local_weight.stride(),
                             "preserve_strides": False,
                             "mapped": True,
                         }
@@ -804,9 +832,6 @@ class LayerwiseOffloadManager:
 
         self.register_forward_hooks()
         self._configured = True
-        logger.debug(
-            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}, residency policy: {self.residency_policy}"
-        )
         if self.residency_policy == RESIDENCY_POLICY_STRIDED and self._streamed_order:
             # Printed because the layout is the whole point of the policy, and
             # "did it actually stride?" is otherwise only answerable from a
@@ -861,6 +886,9 @@ class LayerwiseOffloadManager:
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
+        self._last_forwarded_layer = None
+        self._release_unneeded_streamed_layers(keep=set(self._head_of_stream()))
+
         # The resident set first: it has to be there for the whole step, and the
         # caller decides whether to block on it.
         for layer_idx in sorted(self._retained_set):
@@ -911,6 +939,22 @@ class LayerwiseOffloadManager:
             self._streamed_order[(start + offset) % total]
             for offset in range(min(count, total))
         ]
+
+    def _release_unneeded_streamed_layers(self, *, keep: Set[int]) -> None:
+        """Free streamed layers that are on GPU but not in ``keep`` or resident."""
+        retain = set(self._retained_set) | keep
+        for layer_idx in list(self._gpu_layers):
+            if layer_idx not in retain:
+                self.release_layer(layer_idx)
+
+    def _release_skip_gap(self, *, last_ran: int, next_ran: int) -> None:
+        """Free speculative prefetches in ``(last_ran, next_ran)`` after a jump."""
+        if next_ran <= last_ran + 1:
+            return
+        retain = set(self._retained_set)
+        for layer_idx in range(last_ran + 1, next_ran):
+            if layer_idx not in retain:
+                self.release_layer(layer_idx)
 
     @torch.compiler.disable
     def _activate_residency(self) -> None:
@@ -1099,11 +1143,16 @@ class LayerwiseOffloadManager:
             self._courier_inflight.discard(layer_idx)
             self.prefetch_layer(layer_idx, non_blocking=False)
             return
+        compute_stream = torch.get_device_module().current_stream()
+        compute_stream.wait_event(event)
         with torch.inference_mode(False), torch.no_grad():
             for name, gpu_tensor in tensors.items():
+                # wait_event orders the copy; record_stream keeps its storage
+                # live until the consuming kernels finish.
+                if gpu_tensor.device.type != "cpu":
+                    gpu_tensor.record_stream(compute_stream)
                 target = self.get_target_with_name(name)
                 target.data = self._wrap_for_target(target, gpu_tensor)
-        torch.get_device_module().current_stream().wait_event(event)
         self._courier_inflight.discard(layer_idx)
         self._gpu_layers.add(layer_idx)
 
@@ -1293,7 +1342,17 @@ class LayerwiseOffloadManager:
                 )
 
             dtype = meta["dtype"]
-            if meta.get("preserve_strides", False):
+            if meta.get("mapped", False):
+                # The mapping is a read-only view of the checkpoint, so the new
+                # values cannot be written into it. Own the storage from here
+                # on; every reader of this store copies out of whatever tensor
+                # it holds. This trades mapped bytes for anonymous ones on the
+                # configuration that chose mapping because host memory was
+                # short, so it costs the updated weight's bytes.
+                self._mapped_cpu_weights[layer_idx][name] = (
+                    local_loaded_weight.detach().to(dtype=dtype).contiguous()
+                )
+            elif meta.get("preserve_strides", False):
                 self._strided_cpu_weights[layer_idx][name].copy_(
                     local_loaded_weight.to(dtype=dtype)
                 )
@@ -1361,6 +1420,13 @@ class LayerwiseOffloadManager:
                 if i == 0:
                     self._activate_residency()
                     self.prepare_for_next_req(non_blocking=False)
+                elif (
+                    self._last_forwarded_layer is not None
+                    and i > self._last_forwarded_layer + 1
+                ):
+                    self._release_skip_gap(
+                        last_ran=self._last_forwarded_layer, next_ran=i
+                    )
                 if i not in self._gpu_layers:
                     # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
@@ -1395,6 +1461,7 @@ class LayerwiseOffloadManager:
             def hook(module, input, output):
                 # previous, we wait here, until the copy stream for next layer is finished,
                 # now with any prefetch_size, only wait for the copy stream, when the copy stream is for the next layer
+                self._last_forwarded_layer = i
                 self.release_layer(i)
 
             return hook
@@ -1429,6 +1496,109 @@ class LayerwiseOffloadableModuleMixin:
     # under layerwise offload. See _host_resident_tables for what qualifies.
     host_resident_table_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
+
+    # Whether to park non-layer parameters on the host between uses. Costs a
+    # transfer per request and is worth it only when device memory is the
+    # binding constraint, so it follows --performance-mode memory.
+    park_non_layer_weights_between_uses: bool = False
+
+    def _managed_layer_parameter_names(self) -> set:
+        """Parameter names some layerwise manager already streams."""
+        return {
+            name
+            for manager in self.layerwise_offload_managers
+            for names in manager._weight_metadata.values()
+            for name in names
+        }
+
+    def park_non_layer_weights(self) -> None:
+        """Move the parameters no manager streams back to the host.
+
+        A layerwise component holds its non-layer parameters on the device for
+        the whole request. That is right while it is the component being used
+        and pure cost afterwards. Measured on H3 at 864x480 / 124 frames: the
+        DiT keeps 2.09 GB and the text encoder 1.40 GB through a VAE decode
+        that touches neither, and the decode is exactly where the budget runs
+        out -- with the VAE's blocks held resident it needs 11.86 GiB against a
+        12 GiB card, and fails for want of 20 MiB.
+
+        Buffers are left where they are. Layerwise offload keeps them resident
+        on purpose, because a shared buffer such as a RoPE cache is referenced
+        by many layers.
+        """
+        if not self.park_non_layer_weights_between_uses:
+            return
+        if current_platform.is_mps():
+            # MPS parks its own non-layer weights, scoped to subphases
+            return
+        managed = self._managed_layer_parameter_names()
+        resident = [
+            (name, parameter)
+            for name, parameter in self.named_parameters()
+            if name not in managed and parameter.device.type != "cpu"
+        ]
+        holds = sum(p.numel() * p.element_size() for _, p in resident)
+        if holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
+            # There is room. Give back any host copies rather than hold them.
+            # Restore any parameters still bound to placeholders first so we
+            # do not leave weights as (1,) tensors after clearing the copies.
+            self.restore_non_layer_weights()
+            self._parked_non_layer_weights.clear()
+            return
+
+        parked = self._parked_non_layer_weights
+        with torch.inference_mode(False), torch.no_grad():
+            for name, parameter in resident:
+                if name not in parked:
+                    parked[name] = parameter.detach().to("cpu", copy=True)
+                parameter.data = self._park_placeholder(parameter)
+
+    def _device_headroom_bytes(self) -> int:
+        """What an allocation could get without the allocator growing its pool.
+
+        `get_available_gpu_memory` reports driver-level free memory, which
+        excludes blocks the caching allocator has already reserved and not
+        handed out. On a warm process that undercounts the real headroom badly,
+        so the allocator's own unused reserve is added back.
+        """
+        free = int(
+            current_platform.get_available_gpu_memory(empty_cache=False) * (1 << 30)
+        )
+        device_module = torch.get_device_module()
+        unused_reserve = (
+            device_module.memory_reserved() - device_module.memory_allocated()
+        )
+        return free + max(0, unused_reserve)
+
+    def _park_placeholder(self, parameter: torch.Tensor) -> torch.Tensor:
+        """One shared stand-in per (device, dtype), not one per parked weight."""
+        key = (parameter.device, parameter.dtype)
+        placeholder = self._park_placeholders.get(key)
+        if placeholder is None:
+            placeholder = torch.empty(
+                (1,), dtype=parameter.dtype, device=parameter.device
+            )
+            self._park_placeholders[key] = placeholder
+        return placeholder
+
+    def restore_non_layer_weights(self) -> None:
+        """Bring parked parameters back before this component is used again."""
+        parked = self._parked_non_layer_weights
+        if not parked:
+            return
+        device = current_platform.get_local_torch_device()
+        parameters = dict(self.named_parameters())
+        with torch.inference_mode(False), torch.no_grad():
+            for name, host_tensor in parked.items():
+                parameter = parameters.get(name)
+                if parameter is None:
+                    continue
+                # The parked copy is pageable, so this transfer stages through
+                # the driver's own pinned buffer and is synchronous whatever is
+                # asked for. Pinning it instead would make the copy async, at
+                # the price of host memory the kernel can never reclaim -- the
+                # wrong trade on the hosts this path exists for.
+                parameter.data = host_tensor.to(device)
 
     def _capture_mps_cpu_non_layer_weights(self) -> None:
         managed_names = {
@@ -1522,6 +1692,22 @@ class LayerwiseOffloadableModuleMixin:
             for name, tensor in self._mps_cpu_buffers.items():
                 buffers[name].data = tensor
 
+    @property
+    def _parked_non_layer_weights(self) -> dict:
+        store = self.__dict__.get("_parked_non_layer_weight_store")
+        if store is None:
+            store = {}
+            self.__dict__["_parked_non_layer_weight_store"] = store
+        return store
+
+    @property
+    def _park_placeholders(self) -> dict:
+        store = self.__dict__.get("_park_placeholder_store")
+        if store is None:
+            store = {}
+            self.__dict__["_park_placeholder_store"] = store
+        return store
+
     def configure_layerwise_offload(
         self,
         server_args: ServerArgs,
@@ -1529,9 +1715,12 @@ class LayerwiseOffloadableModuleMixin:
         pin_budget: HostPinBudget | None = None,
         component_name: str | None = None,
     ):
+        self.park_non_layer_weights_between_uses = (
+            server_args.performance_mode == "memory"
+        )
         self.layerwise_offload_managers = []
         named_modules = dict(self.named_modules())
-        configured_layer_names = []
+        layer_specs = []
         # `--dit-*` is the group default these fall back to, not a scope.
         prefetch_value, resident_value, residency_policy = (
             server_args.layerwise_tuning_for(
@@ -1561,6 +1750,32 @@ class LayerwiseOffloadableModuleMixin:
             else:
                 resident_layers = min(num_layers, int(resident_value))
 
+            layer_specs.append((layer_name, num_layers, prefetch_size, resident_layers))
+
+        if not layer_specs:
+            logger.debug(
+                "No layerwise-offloadable ModuleList found for %s. Candidates: %s",
+                self.__class__.__name__,
+                self.layer_names,
+            )
+            return
+
+        component_label = (
+            f"{component_name} ({self.__class__.__name__})"
+            if component_name is not None
+            else self.__class__.__name__
+        )
+        logger.info(
+            "Configuring layerwise offload for %s: %s",
+            component_label,
+            ", ".join(
+                f"{layer_name} ({num_layers} layers)"
+                for layer_name, num_layers, _, _ in layer_specs
+            ),
+        )
+        started_at = perf_counter()
+
+        for layer_name, num_layers, prefetch_size, resident_layers in layer_specs:
             # Pinning these weights is what lets the copy stream run ahead of
             # compute, but pinned pages are the ones the kernel cannot reclaim,
             # so they are handed out only while the budget lasts. The budget goes
@@ -1583,7 +1798,6 @@ class LayerwiseOffloadableModuleMixin:
                 residency_policy=residency_policy,
             )
             self.layerwise_offload_managers.append(manager)
-            configured_layer_names.append(layer_name)
 
         if current_platform.is_mps():
             for manager in self.layerwise_offload_managers:
@@ -1620,18 +1834,26 @@ class LayerwiseOffloadableModuleMixin:
             for manager in enabled_managers:
                 manager._finalize_initialization()
 
-        if configured_layer_names:
-            logger.debug(
-                "Enabled layerwise offload for %s on modules: %s",
-                self.__class__.__name__,
-                configured_layer_names,
-            )
-        else:
-            logger.debug(
-                "No layerwise-offloadable ModuleList found for %s. Candidates: %s",
-                self.__class__.__name__,
-                self.layer_names,
-            )
+        managers = self.layerwise_offload_managers
+        prefetch_sizes = ", ".join(
+            str(value)
+            for value in sorted({manager.prefetch_size for manager in managers})
+        )
+        policies = ", ".join(sorted({manager.residency_policy for manager in managers}))
+        total_layers = sum(manager.num_layers for manager in managers)
+        resident_layers = sum(manager.resident_layers for manager in managers)
+        logger.info(
+            "Layerwise offload ready for %s in %.2fs: groups=%d, layers=%d, "
+            "prefetch/group=%s, resident=%d/%d, policy=%s",
+            component_label,
+            perf_counter() - started_at,
+            len(managers),
+            total_layers,
+            prefetch_sizes,
+            resident_layers,
+            total_layers,
+            policies,
+        )
 
     def prepare_for_next_req(self):
         if self.layerwise_offload_managers is None:
@@ -1947,7 +2169,7 @@ def configure_layerwise_offload_modules(
         reverse=True,
     )
     pin_budget = HostPinBudget()
-    logger.info("Layerwise offload: %s", describe_host_memory())
+    logger.info("Layerwise offload host memory: %s", describe_host_memory())
 
     for component_name in selected_pipeline_component_names:
         module = modules[component_name]
@@ -1982,7 +2204,7 @@ def configure_layerwise_offload_modules(
         )
 
         logger.info(
-            "Enabled layerwise offload for pipeline components: %s",
+            "Layerwise offload summary: %s",
             ", ".join(
                 f"{name} ({format_component_residency(modules[name])})"
                 for name in configured_component_names
@@ -1991,3 +2213,99 @@ def configure_layerwise_offload_modules(
     elif warn_missing:
         logger.debug("No selected pipeline component enabled layerwise offload")
     return configured_component_names
+
+
+class LayerwiseUsageTracker:
+    """Temporary per-layer call counters for one calibration request.
+
+    Managers cannot provide this information when layerwise offload has not
+    been configured yet or was disabled by a resident placement. Observe the
+    declared layer groups directly and remove every hook before returning, so
+    ordinary serving requests pay no counter or hook-dispatch cost.
+    """
+
+    def __init__(
+        self,
+        modules: Mapping[str, object],
+        *,
+        stage_name_provider: Callable[[], str | None] | None = None,
+    ) -> None:
+        self._handles: list[Any] = []
+        self._counts: dict[str, dict[str, list[int]]] = {}
+        self._counts_by_stage: dict[str, dict[str, dict[str, list[int]]]] = {}
+        self._stage_name_provider = stage_name_provider
+        for component_name, module in modules.items():
+            if not isinstance(module, LayerwiseOffloadableModuleMixin):
+                continue
+            named_modules = dict(module.named_modules())
+            component_counts: dict[str, list[int]] = {}
+            for layer_name in module.layer_names:
+                layers = named_modules.get(layer_name)
+                if not isinstance(layers, (torch.nn.ModuleList, torch.nn.Sequential)):
+                    continue
+                counts = [0] * len(layers)
+                if not counts:
+                    continue
+                component_counts[layer_name] = counts
+                for layer_index, layer in enumerate(layers):
+
+                    def record_use(
+                        _module,
+                        _inputs,
+                        *,
+                        target_counts=counts,
+                        target_index=layer_index,
+                        target_component_name=component_name,
+                        target_layer_name=layer_name,
+                        target_layer_count=len(layers),
+                    ) -> None:
+                        target_counts[target_index] += 1
+                        if self._stage_name_provider is None:
+                            return
+                        stage_name = self._stage_name_provider()
+                        if stage_name is None:
+                            return
+                        stage_counts = self._counts_by_stage.setdefault(stage_name, {})
+                        component_stage_counts = stage_counts.setdefault(
+                            target_component_name, {}
+                        )
+                        layer_stage_counts = component_stage_counts.setdefault(
+                            target_layer_name, [0] * target_layer_count
+                        )
+                        layer_stage_counts[target_index] += 1
+
+                    self._handles.append(layer.register_forward_pre_hook(record_use))
+            if component_counts:
+                self._counts[component_name] = component_counts
+
+    def finish(self) -> dict[str, dict[str, tuple[int, ...]]]:
+        counts, _ = self.finish_with_stages()
+        return counts
+
+    def finish_with_stages(
+        self,
+    ) -> tuple[
+        dict[str, dict[str, tuple[int, ...]]],
+        dict[str, dict[str, dict[str, tuple[int, ...]]]],
+    ]:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        counts = {
+            component_name: {
+                layer_name: tuple(counts)
+                for layer_name, counts in component_counts.items()
+            }
+            for component_name, component_counts in self._counts.items()
+        }
+        counts_by_stage = {
+            stage_name: {
+                component_name: {
+                    layer_name: tuple(counts)
+                    for layer_name, counts in component_counts.items()
+                }
+                for component_name, component_counts in stage_counts.items()
+            }
+            for stage_name, stage_counts in self._counts_by_stage.items()
+        }
+        return counts, counts_by_stage

@@ -96,6 +96,29 @@ curl -sS "http://localhost:30010/v1/models/wan-t2v"
 
 ## Endpoints
 
+### Model-specific request fields
+
+The image and video request schemas contain only OpenAI fields and stable
+SGLang extensions shared across model families. Put model-specific controls in
+`extra_body` when using the OpenAI Python client:
+
+```python Python
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30010/v1")
+response = client.images.generate(
+    model="ideogram-ai/ideogram-4-nf4",
+    prompt="A typeset poster",
+    extra_body={"preset": "V4_QUALITY_48"},
+)
+```
+
+Raw JSON requests may send these fields at the top level. Multipart video
+requests may send individual declared form fields or one JSON object in
+`extra_params`. SGLang forwards model-specific extensions only when the active
+model declares them, so a field for one model family does not silently change
+another model.
+
 ### Image Generation
 
 The server implements an OpenAI-compatible Images API under the `/v1/images` namespace.
@@ -106,7 +129,7 @@ The server implements an OpenAI-compatible Images API under the `/v1/images` nam
 
 #### Request quality
 
-`quality` selects a model-owned sampling level when that model advertises one: use `lossless` for the reference path or `high` for a validated accelerated path. Omit it (or send OpenAI's default `auto`) to keep the runtime default. It is distinct from `output_quality`, which controls only output-file compression. The same extension is accepted by image edits and video requests.
+`quality` selects a cumulative request-level optimization tier: `lossless` keeps the selected deployment's reference path and all unconditional bit-exact replacements; `extra-high` additionally enables only request-gated DiT/VAE kernel fusions; `high` includes the full `extra-high` set and may also enable model-owned sparse, caching, lower-precision, or other approximate paths. The tier does not override separately configured quantization, attention, or caching options. Omit it (or send OpenAI's default `auto`) to keep the `lossless` runtime default. It is distinct from `output_quality`, which controls only output-file compression. The same extension is accepted by image edits and video requests.
 
 **Python Example (b64_json response):**
 

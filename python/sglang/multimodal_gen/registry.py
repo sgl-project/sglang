@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
     Cosmos3Config,
+    FastH3PipelineConfig,
     FastHunyuanConfig,
     FluxPipelineConfig,
     HeliosDistilledConfig,
@@ -74,6 +75,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImageEditPipelineConfig,
     LongCatImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
@@ -150,6 +152,8 @@ from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageEditSamplingParams,
+    LongCatImageEditTurboSamplingParams,
     LongCatImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
@@ -159,7 +163,10 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX23SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
-from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+    FastH3SamplingParams,
+    MiniMaxH3SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
@@ -272,11 +279,6 @@ def _discover_and_register_pipelines():
                             cls.pipeline_config_cls,
                             cls.sampling_params_cls,
                         )
-                        logger.debug(
-                            f"Auto-registered config classes for pipeline '{cls.pipeline_name}': "
-                            f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
-                            f"SamplingParams={cls.sampling_params_cls.__name__}"
-                        )
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
@@ -336,6 +338,7 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
+    "fastvideo/fastvideo-fasth3-4-step-preview-v1-vsa-datafree": "FastH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
@@ -781,9 +784,11 @@ def _register_configs():
         hf_model_paths=["Lightricks/LTX-2"],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: "ltx-2" in path.lower()
-            and "ltx-2.3" not in path.lower()
-            and "ltx-2.5" not in path.lower(),
+            lambda path: (
+                "ltx-2" in path.lower()
+                and "ltx-2.3" not in path.lower()
+                and "ltx-2.5" not in path.lower()
+            ),
         ],
     )
     register_configs(
@@ -970,8 +975,21 @@ def _register_configs():
             "MiniMax/MiniMax-H3",
         ],
         model_detectors=[
-            lambda model_id: "minimaxh3"
-            in model_id.lower().replace("-", "").replace("_", "")
+            lambda model_id: (
+                "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FastH3SamplingParams,
+        pipeline_config_cls=FastH3PipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+            )
         ],
     )
     # FLUX
@@ -1177,7 +1195,7 @@ def _register_configs():
         ],
         model_detectors=[
             # Match "sana-wm" or "sana_wm" but NOT plain T2I "sana" checkpoints.
-            lambda hf_id: ("sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower()),
+            lambda hf_id: "sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower(),
         ],
     )
 
@@ -1189,9 +1207,7 @@ def _register_configs():
             "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
         ],
         model_detectors=[
-            lambda hf_id: (
-                "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
-            )
+            lambda hf_id: "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
         ],
     )
 
@@ -1279,8 +1295,10 @@ def _register_configs():
             "jdopensource/JoyAI-Echo",
         ],
         model_detectors=[
-            lambda hf_id: ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
-            and "image-edit" not in hf_id.lower(),
+            lambda hf_id: (
+                ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
+                and "image-edit" not in hf_id.lower()
+            ),
         ],
     )
 
@@ -1329,6 +1347,38 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
+        ],
+    )
+
+    # LongCat-Image-Edit-Turbo (registered before Edit so its detector wins)
+    register_configs(
+        sampling_param_cls=LongCatImageEditTurboSamplingParams,
+        pipeline_config_cls=LongCatImageEditPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image-Edit-Turbo",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "longcat" in hf_id.lower()
+                and "edit" in hf_id.lower()
+                and "turbo" in hf_id.lower()
+            ),
+        ],
+    )
+
+    # LongCat-Image-Edit
+    register_configs(
+        sampling_param_cls=LongCatImageEditSamplingParams,
+        pipeline_config_cls=LongCatImageEditPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image-Edit",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "longcat" in hf_id.lower()
+                and "edit" in hf_id.lower()
+                and "turbo" not in hf_id.lower()
+            ),
         ],
     )
 

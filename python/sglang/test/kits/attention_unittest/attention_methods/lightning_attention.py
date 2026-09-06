@@ -326,6 +326,7 @@ class MockLightningModelRunner(ModelRunner):
             enable_alt_stream=False,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -1054,7 +1055,7 @@ def make_lightning_token_padded_inputs(
 def lightning_attention_layers(fixture: LightningAttentionFixture) -> list:
     """Return the RadixAttention layers the backend forwards through. The
     split-op runner uses this list to install per-layer
-    `num_token_non_padded_cpu` metadata before forward."""
+    `global_num_token_non_padded_cpu` metadata before forward."""
     return [fixture.actual_module.attn]
 
 

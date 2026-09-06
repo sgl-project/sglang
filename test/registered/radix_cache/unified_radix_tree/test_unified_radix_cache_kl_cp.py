@@ -1,6 +1,5 @@
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import get_input_ids
@@ -9,6 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=950, stage="extra-b", runner_config="4-gpu-h100")
@@ -39,7 +39,9 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "4",
                 "--attn-cp-size",
                 "2",
-                "--enable-prefill-context-parallel",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "zigzag",
                 "--mem-fraction-static",
                 "0.8",
                 "--cuda-graph-max-bs-decode",
@@ -67,7 +69,7 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
 
 if __name__ == "__main__":

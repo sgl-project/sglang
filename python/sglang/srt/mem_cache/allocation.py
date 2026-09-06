@@ -114,16 +114,15 @@ def get_last_loc(
         "torch_native",
     ) and decode_backend not in ("ascend", "torch_native")
 
-    if _is_hip and uses_triton_dispatch:
-        # HIP-only: the legacy get_last_loc_triton kernel emits a
+    if (_is_hip or _is_npu) and uses_triton_dispatch:
+        # HIP and NPU DSV4: the legacy get_last_loc_triton kernel emits a
         # mixed-width int32->int64 store that Triton mis-compiles on HIP,
         # producing out-of-range last_loc values under EAGLE +
         # page_size>1 (e.g. with aiter unified attention or the triton
-        # attention backend). The bug is in the Triton HIP codegen, not
-        # in any particular attention backend, so route every HIP path
-        # that would otherwise use get_last_loc_triton through the
-        # int32-safe variant. Non-HIP hardware keeps the original
-        # dispatcher below.
+        # attention backend), and can fault in the equivalent NPU DSV4
+        # allocation path. Route those paths through the variant whose
+        # in-kernel result remains int32 and is promoted only after launch.
+        # Other hardware/backends keep the original dispatcher below.
         return get_last_loc_triton_safe(
             req_to_token, req_pool_indices_tensor, prefix_lens_tensor
         )
@@ -258,7 +257,9 @@ def alloc_req_slots(
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+                tree_cache.evict_for_alloc(
+                    EvictParams(num_tokens=0, mamba_num=mamba_num)
+                )
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(
@@ -295,14 +296,16 @@ def alloc_for_extend(
 
     reuse_kv = None
     if batch.is_dllm():
-        reuse_kv = [
-            r.req_pool_idx is not None and bool(r.dllm_incomplete_ids)
-            for r in batch.reqs
-        ]
+        reuse_kv = [r.kv.holds_kv and bool(r.dllm_incomplete_ids) for r in batch.reqs]
 
     # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    pin_memory = is_pin_memory_available(batch.device)
+    prefix_lens_cpu = torch.tensor(
+        batch.prefix_lens, dtype=torch.int64, pin_memory=pin_memory
+    )
+    extend_lens_cpu = torch.tensor(
+        batch.extend_lens, dtype=torch.int64, pin_memory=pin_memory
+    )
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
@@ -310,7 +313,9 @@ def alloc_for_extend(
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
-    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    req_pool_indices_cpu = torch.tensor(
+        req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
+    )
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
@@ -359,6 +364,14 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+    try:
+        batch.req_to_token_pool.alloc_aux_to_lengths(
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            target_seq_lens_cpu=batch.seq_lens_cpu,
+        )
+    except Exception:
+        batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
+        raise
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
@@ -369,13 +382,9 @@ def alloc_for_extend(
             batch.seq_lens_cpu,
         )
 
-    from sglang.srt.managers.schedule_batch import ReqKvInfo
-
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
-        if req.kv is None:
-            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
-        else:
-            req.kv.kv_allocated_len = seq_len
+        req.kv.kv_allocated_len = seq_len
+        req.kv.kv_committed_len = seq_len
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
@@ -400,7 +409,7 @@ def _alloc_extend_loc_with_kv_reuse(
         retained_len = len(req.dllm_incomplete_ids)
         if extend_len != retained_len:
             raise RuntimeError("dLLM FDFO retained KV must be reused as a full block.")
-        if req.kv is None or prefix_len + extend_len > req.kv.kv_allocated_len:
+        if prefix_len + extend_len > req.kv.kv_allocated_len:
             raise RuntimeError("dLLM FDFO retained KV is missing.")
 
     alloc_extend_lens = [
@@ -559,8 +568,18 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             token_per_req,
         )
 
+    try:
+        batch.req_to_token_pool.alloc_aux_to_lengths(
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+            target_seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+        )
+    except Exception:
+        batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
+        raise
+
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
+        req.kv.kv_committed_len += token_per_req
 
     return out_cache_loc
 
@@ -688,5 +707,6 @@ def alloc_for_spec_decode(
             len(reqs),
         )
 
-    for i, req in enumerate(reqs):
-        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
+    nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
+    for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):
+        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, nxt_kv_len)

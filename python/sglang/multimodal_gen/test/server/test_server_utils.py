@@ -405,7 +405,7 @@ class ServerManager:
             "--log-level=debug",
         ]
         if self.extra_args.strip():
-            command.extend(self.extra_args.strip().split())
+            command.extend(shlex.split(self.extra_args))
         access_log_exclude_flag = "--uvicorn-access-log-exclude-prefixes"
         if not any(arg.startswith(access_log_exclude_flag) for arg in command):
             command.extend(["--uvicorn-access-log-exclude-prefixes", "/health"])
@@ -590,25 +590,120 @@ class PerformanceValidator:
         summary: PerformanceSummary,
         expected_load_peak_vram_mb: float,
         expected_runtime_peak_vram_mb: float,
+        expected_warmup_peak_vram_mb: float | None = None,
+        expected_load_peak_allocated_mb: float | None = None,
+        expected_runtime_peak_allocated_mb: float | None = None,
     ) -> None:
         assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
         assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
-        self._assert_le(
+        self._assert_peak_vram(
             "Load Peak VRAM",
-            summary.load_peak_vram_mb,
-            expected_load_peak_vram_mb,
-            self.tolerances.load_peak_vram,
-            min_abs_tolerance=128.0,
-            unit=" MiB",
+            reserved=summary.load_peak_vram_mb,
+            allocated=summary.load_peak_allocated_mb,
+            expected_reserved=expected_load_peak_vram_mb,
+            expected_allocated=expected_load_peak_allocated_mb,
+            tolerance=self.tolerances.load_peak_vram,
         )
-        self._assert_le(
+        self._assert_peak_vram(
             "Runtime Peak VRAM",
-            summary.runtime_peak_vram_mb,
-            expected_runtime_peak_vram_mb,
-            self.tolerances.runtime_peak_vram,
+            reserved=summary.runtime_peak_vram_mb,
+            allocated=summary.runtime_peak_allocated_mb,
+            expected_reserved=expected_runtime_peak_vram_mb,
+            expected_allocated=expected_runtime_peak_allocated_mb,
+            tolerance=self.tolerances.runtime_peak_vram,
+        )
+        # the full-shape warmup probe keeps its own budget, separate from serving
+        if expected_warmup_peak_vram_mb is not None and summary.warmup_peak_vram_mb > 0:
+            self._assert_le(
+                "Warmup Peak VRAM",
+                summary.warmup_peak_vram_mb,
+                expected_warmup_peak_vram_mb,
+                self.tolerances.runtime_peak_vram,
+                min_abs_tolerance=128.0,
+                unit=" MiB",
+            )
+
+    def _assert_peak_vram(
+        self,
+        name: str,
+        *,
+        reserved: float,
+        allocated: float,
+        expected_reserved: float,
+        expected_allocated: float | None,
+        tolerance: float,
+    ) -> None:
+        """Enforce the allocated peak when the baseline has one, else reserved.
+
+        Reserved peaks include the caching allocator's pool, which follows the
+        allocation history of everything run before the request (warmup shapes,
+        load-time leftovers) and moves a few percent for identical work. The
+        allocated peak is what the model and its activations actually use.
+        """
+        if expected_allocated is not None and allocated > 0:
+            self._assert_le(
+                f"{name} (allocated)",
+                allocated,
+                expected_allocated,
+                tolerance,
+                min_abs_tolerance=128.0,
+                unit=" MiB",
+            )
+            logger.info(
+                "%s reserved %.0f MiB (baseline %.0f MiB, reported only)",
+                name,
+                reserved,
+                expected_reserved,
+            )
+            return
+        self._assert_le(
+            name,
+            reserved,
+            expected_reserved,
+            tolerance,
             min_abs_tolerance=128.0,
             unit=" MiB",
         )
+
+    def validate_peak_host_anon(
+        self,
+        summary: PerformanceSummary,
+        expected_load_mb: float | None,
+        expected_runtime_mb: float | None,
+    ) -> None:
+        """Anonymous-host budget: peaks must stay at or under the baseline.
+
+        Skipped wholesale when the baseline carries no host figures (older
+        scenarios) or the record has none (non-Linux, or a server predating
+        the sampler) -- the VRAM checks do not imply anything about the host,
+        as the LoRA-merge blow-up showed: VRAM green, host budget gone.
+        """
+        if expected_load_mb is None and expected_runtime_mb is None:
+            return
+        if summary.runtime_peak_host_anon_mb <= 0:
+            logger.warning(
+                "Host-anon baseline present but the record has no host peaks; "
+                "skipping the host budget check"
+            )
+            return
+        if expected_load_mb is not None:
+            self._assert_le(
+                "Load Peak Host Anon",
+                summary.load_peak_host_anon_mb,
+                expected_load_mb,
+                self.tolerances.host_anon,
+                min_abs_tolerance=256.0,
+                unit=" MiB",
+            )
+        if expected_runtime_mb is not None:
+            self._assert_le(
+                "Runtime Peak Host Anon",
+                summary.runtime_peak_host_anon_mb,
+                expected_runtime_mb,
+                self.tolerances.host_anon,
+                min_abs_tolerance=256.0,
+                unit=" MiB",
+            )
 
     def validate(
         self, perf_record: RequestPerfRecord, *args, **kwargs

@@ -148,7 +148,7 @@ def test_text_mlp_uses_single_rank_when_intermediate_size_is_not_tp_divisible(
     assert isinstance(layer.mlp.down_proj, ReplicatedLinear)
 
 
-def test_explicit_attention_mask_is_limited_to_cached_generation(monkeypatch):
+def test_explicit_attention_mask_is_honored_without_a_cache(monkeypatch):
     attention = Qwen2_5_VLAttention.__new__(Qwen2_5_VLAttention)
     nn.Module.__init__(attention)
     attention.q_proj = nn.Identity()
@@ -174,9 +174,19 @@ def test_explicit_attention_mask_is_limited_to_cached_generation(monkeypatch):
         "position_ids": torch.zeros(3, 1, 2, dtype=torch.long),
     }
 
+    # LongCat opts into masking the padded body on the cache-free path.
+    attention.honor_cache_free_padding_mask = True
     attention(**kwargs, use_cache=False)
     attention(**kwargs, use_cache=True)
+    assert attention.attn.masks[0] is explicit_mask
+    assert attention.attn.masks[1] is explicit_mask
 
+    # Every other pipeline keeps the original behavior: mask dropped when
+    # cache-free, honored only under cached generation.
+    attention.attn.masks.clear()
+    attention.honor_cache_free_padding_mask = False
+    attention(**kwargs, use_cache=False)
+    attention(**kwargs, use_cache=True)
     assert attention.attn.masks[0] is None
     assert attention.attn.masks[1] is explicit_mask
 

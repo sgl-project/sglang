@@ -272,7 +272,16 @@ for (const path of walk(CONFIGS)) {
       if (!Array.isArray(errors) || errors.length) {
         fail(where, `verifiedRecipes[${index}] fails topology validation: ${(errors || []).join("; ")}`);
       }
-      validateResolved(selection, `verifiedRecipes[${index}]`, true);
+      // A recipe may carry `unverified: true`: it supplies the card's default
+      // shape without claiming a verification run, and must resolve that way.
+      if (recipe.unverified) {
+        const resolved = validateResolved(selection, `verifiedRecipes[${index}]`);
+        if (resolved && resolved.builder.verification?.serve === "verified") {
+          fail(where, `verifiedRecipes[${index}] is declared unverified but resolves as verified`);
+        }
+      } else {
+        validateResolved(selection, `verifiedRecipes[${index}]`, true);
+      }
     }
 
     // H3's architectural contract is important enough to pin directly: exact

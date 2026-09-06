@@ -78,6 +78,25 @@ def test_negative_text_cache_key_tracks_encode_options():
     assert stage.calls == 3
 
 
+def test_component_uses_exact_encoder_precision():
+    with patch(_GLOBAL_ARGS_PATCH) as mock_global_args:
+        mock_global_args.return_value = MagicMock()
+        stage = TextEncodingStage(text_encoders=[object(), object()], tokenizers=[])
+    server_args = make_server_args(
+        component_precisions={"text_encoder_2": "fp32"},
+        pipeline_config=SimpleNamespace(
+            text_encoder_configs=[], text_encoder_precisions=["bf16", "bf16"]
+        ),
+    )
+
+    uses = stage.component_uses(server_args)
+
+    assert [(use.component_name, use.target_dtype) for use in uses] == [
+        ("text_encoder", None),
+        ("text_encoder_2", torch.float32),
+    ]
+
+
 def test_negative_text_cache_skips_warmup():
     stage = DummyTextEncodingStage()
     server_args = make_server_args()

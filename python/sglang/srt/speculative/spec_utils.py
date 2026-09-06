@@ -35,6 +35,8 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    get_self_pp_group,
+    patch_pipeline_parallel_group,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
@@ -195,9 +197,9 @@ def draft_kv_indices_buffer_width(
     num_seqs * topk branches each attend up to max_context_len KV slots; the topk
     factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
     """
-    assert (
-        num_seqs * topk * max_context_len < 2**31
-    ), "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    assert num_seqs * topk * max_context_len < 2**31, (
+        "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    )
     return num_seqs * topk * max_context_len
 
 
@@ -677,6 +679,14 @@ def load_token_map(token_map_path: str) -> List[int]:
 
 
 @contextmanager
+def draft_pp_context():
+    # The draft model is one layer and never spans pipeline stages; give it a
+    # single-member pp group so it initializes as if pp were off.
+    with patch_pipeline_parallel_group(get_self_pp_group()):
+        yield
+
+
+@contextmanager
 def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
@@ -903,6 +913,7 @@ def commit_mamba_states_after_verify(
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_circular,
             commit_gdn_replayssm_spec,
         )
         from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
@@ -912,37 +923,59 @@ def commit_mamba_states_after_verify(
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        # Advance the per-slot circular cursors by the accepted count (incl. the
-        # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
-        commit_gdn_replayssm_spec(
-            write_pos=mamba_pool.replayssm_write_pos,
-            cache_base=mamba_pool.replayssm_cache_base,
-            is_flush=mamba_pool.replayssm_is_flush,
-            num_accepted=accept_lens,  # [bs], includes the bonus token
-            state_batch_indices=state_batch_indices,
-            max_cache_len=spec_state.replayssm_d.shape[-2],
-            max_spec_len=draft_token_num,
-            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
-        )
-        # Roll back / commit the conv state to the last accepted draft step
-        # (same logic as the recurrent commit, but conv-only).
-        last_correct_step_indices, _ = _verify_commit_step_indices(
+        replay_indices = batch.req_pool_indices
+        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
             batch=batch,
             accept_index=accept_index,
             accept_lens=accept_lens,
             draft_token_num=draft_token_num,
         )
+        # Advance the per-request circular cursors by the accepted count (incl. the
+        # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
+        commit_gdn_replayssm_spec(
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            num_accepted=accept_lens,  # [bs], includes the bonus token
+            replay_indices=replay_indices,
+            max_cache_len=spec_state.replayssm_d.shape[-2],
+            max_spec_len=draft_token_num,
+            fold_every_commit=spec_state.temporal.dtype != torch.float32,
+            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+        )
+        # Capacity rows fold all layers in one launch; track rows snapshot the
+        # exact crossing state without disturbing the active circular history.
+        commit_gdn_replayssm_circular(
+            checkpoint_state=spec_state.temporal,
+            d_cache=spec_state.replayssm_d,
+            k_cache=spec_state.replayssm_k,
+            g_cache=spec_state.replayssm_g,
+            d_residual_cache=spec_state.replayssm_rawv,
+            k_residual_cache=spec_state.replayssm_rawk,
+            state_batch_indices=state_batch_indices,
+            replay_indices=replay_indices,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            accept_lens=accept_lens,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=-1,
+        )
+        # Roll back active conv state and snapshot its interval-crossing window.
         fused_conv_window_scatter_with_mask(
             spec_state.conv[0],
             spec_state.intermediate_conv_window[0],
             state_batch_indices,
             last_correct_step_indices,
         )
-        # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
-        # a device-side force-flush so `temporal` reflects the ring before a
-        # snapshot; not wired for Part B (server_args forbids extra_buffer with
-        # --enable-linear-replayssm-spec), so the per-track scatters are intentionally
-        # skipped here.
+        if batch.mamba_track_indices is not None:
+            fused_conv_window_scatter_with_mask(
+                spec_state.conv[0],
+                spec_state.intermediate_conv_window[0],
+                batch.mamba_track_indices,
+                mamba_steps_to_track,
+            )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
@@ -1040,6 +1073,12 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
+        batch.spec_info.prepare_for_decode(batch)
+    elif batch.spec_algorithm.is_uno():
+        from sglang.srt.speculative.uno_info import UnoDraftInput
+
+        if not isinstance(batch.spec_info, UnoDraftInput):
+            raise RuntimeError("UNO decode preparation requires UnoDraftInput")
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode

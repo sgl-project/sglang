@@ -67,9 +67,10 @@ def single_rank(monkeypatch, gloo_world):
         "_determine_attention_backend",
         lambda self, passed_backend: passed_backend,
     )
-    with get_parallel().override(
-        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-    ), get_context().override_server_args():
+    with (
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
+        get_context().override_server_args(),
+    ):
         yield
 
 

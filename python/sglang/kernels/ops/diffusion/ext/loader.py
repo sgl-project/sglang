@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import shutil
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import torch
 
@@ -81,6 +83,28 @@ def _is_recoverable_load_error(
     )
 
 
+@contextmanager
+def _extension_build_lock(build_directory: Path) -> Iterator[None]:
+    """Serialize builds and discard PyTorch lock files left by dead processes."""
+    build_directory.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = build_directory.parent / f".{build_directory.name}.sglang.lock"
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            torch_lock_path = build_directory / "lock"
+            if torch_lock_path.exists():
+                logger.warning(
+                    "Removing stale PyTorch extension lock for %s at %s",
+                    build_directory.name,
+                    torch_lock_path,
+                )
+                torch_lock_path.unlink(missing_ok=True)
+            build_directory.mkdir(parents=True, exist_ok=True)
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def load_extension_with_recovery(
     name: str,
     sources: Sequence[str],
@@ -90,40 +114,36 @@ def load_extension_with_recovery(
 ) -> Any:
     from torch.utils.cpp_extension import load
 
-    try:
-        return load(
-            name=name,
-            sources=list(sources),
-            extra_cflags=None if extra_cflags is None else list(extra_cflags),
-            extra_cuda_cflags=(
-                None if extra_cuda_cflags is None else list(extra_cuda_cflags)
-            ),
-            verbose=verbose,
-        )
-    except Exception as exc:
-        build_directory = _get_build_directory(name)
-        if not _is_recoverable_load_error(exc, name, build_directory):
-            raise
+    build_directory = _get_build_directory(name)
+    load_kwargs = {
+        "name": name,
+        "sources": list(sources),
+        "extra_cflags": None if extra_cflags is None else list(extra_cflags),
+        "extra_cuda_cflags": (
+            None if extra_cuda_cflags is None else list(extra_cuda_cflags)
+        ),
+        "build_directory": str(build_directory),
+        "verbose": verbose,
+    }
 
-        logger.warning(
-            "Detected a stale or broken JIT extension for %s at %s; clearing "
-            "its cache and retrying once.",
-            name,
-            build_directory,
-        )
-        sys.modules.pop(name, None)
-        if build_directory.exists():
-            shutil.rmtree(build_directory)
+    with _extension_build_lock(build_directory):
+        try:
+            return load(**load_kwargs)
+        except Exception as exc:
+            if not _is_recoverable_load_error(exc, name, build_directory):
+                raise
 
-        return load(
-            name=name,
-            sources=list(sources),
-            extra_cflags=None if extra_cflags is None else list(extra_cflags),
-            extra_cuda_cflags=(
-                None if extra_cuda_cflags is None else list(extra_cuda_cflags)
-            ),
-            verbose=verbose,
-        )
+            logger.warning(
+                "Detected a stale or broken JIT extension for %s at %s; clearing "
+                "its cache and retrying once.",
+                name,
+                build_directory,
+            )
+            sys.modules.pop(name, None)
+            if build_directory.exists():
+                shutil.rmtree(build_directory)
+            build_directory.mkdir(parents=True)
+            return load(**load_kwargs)
 
 
 __all__ = ["load_extension_with_recovery"]

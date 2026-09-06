@@ -8,10 +8,9 @@ The difference is that it is a single fused op -- it takes a BF16 activation and
 does the Hadamard rotation, dynamic per-row activation quantization, IMMA GEMM,
 dequantization and bias add without ever materializing the intermediates.
 
-Quantization is data-free (group-wise Hadamard rotation + per-output-channel
-absmax), so weights are quantized here after loading rather than read from a
-pre-quantized checkpoint. That keeps this usable with the stock BF16 checkpoint
-and avoids depending on any external file layout.
+The online path applies data-free group-wise Hadamard rotation and per-output
+channel scaling after loading a stock BF16 checkpoint. Compatible serialized
+Comfy checkpoints instead load their INT8 weights and row scales directly.
 """
 
 from __future__ import annotations
@@ -73,10 +72,18 @@ def _load_comfy_kitchen():
 
 
 class KitchenInt8LinearMethod(LinearMethodBase):
-    """Quantizes BF16 weights to INT8 after load and runs the fused kernel."""
+    """Loads or creates ConvRot INT8 weights and runs the fused kernel."""
 
-    def __init__(self, quant_config: KitchenInt8Config) -> None:
+    def __init__(
+        self,
+        quant_config: KitchenInt8Config,
+        *,
+        group_size: int,
+        is_checkpoint_serialized: bool,
+    ) -> None:
         self.quant_config = quant_config
+        self.group_size = group_size
+        self.is_checkpoint_serialized = is_checkpoint_serialized
         _load_comfy_kitchen()
 
     def create_weights(
@@ -92,35 +99,46 @@ class KitchenInt8LinearMethod(LinearMethodBase):
         # get_quant_method already screened the unsharded input size, so this
         # only fires under TP > 1, where a row-parallel layer splits the very
         # dimension the rotation groups over.
-        if input_size_per_partition % self.quant_config.group_size:
+        if input_size_per_partition % self.group_size:
             raise ValueError(
                 f"kitchen_int8 needs input_size_per_partition "
                 f"({input_size_per_partition}) divisible by group_size "
-                f"{self.quant_config.group_size}"
+                f"{self.group_size}"
             )
 
-        # Deliberately identical to UnquantizedLinearMethod: weights load as
-        # BF16 through the model's existing loaders (H3 for instance installs a
-        # custom qkv loader that reorders the grouped checkpoint layout), and
-        # only then get replaced by their quantized form.
+        # The online path initially matches UnquantizedLinearMethod so the
+        # source weights load in BF16 before quantization. Serialized weights
+        # allocate their final INT8 storage immediately.
         weight = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition,
-                dtype=params_dtype,
+                dtype=(torch.int8 if self.is_checkpoint_serialized else params_dtype),
             ),
             requires_grad=False,
         )
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
+        if self.is_checkpoint_serialized:
+            weight_scale = Parameter(
+                torch.empty(
+                    sum(output_partition_sizes),
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(weight_scale, {"output_dim": 0})
+            set_weight_attrs(weight_scale, extra_weight_attrs)
+            layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout
-
         weight = layer.weight.data
-        if weight.dtype == torch.int8:  # already processed
+        if self.is_checkpoint_serialized or weight.dtype == torch.int8:
             return
+
+        from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout
 
         # Quantization runs on CUDA, but the model may still be staged on CPU
         # for offload. Round-trip one layer at a time rather than relying on
@@ -131,7 +149,7 @@ class KitchenInt8LinearMethod(LinearMethodBase):
             is_weight=True,
             per_channel=True,
             convrot=True,
-            convrot_groupsize=self.quant_config.group_size,
+            convrot_groupsize=self.group_size,
             stochastic_rounding=0,
         )
         layer.weight = Parameter(qdata.to(home), requires_grad=False)
@@ -171,7 +189,7 @@ class KitchenInt8LinearMethod(LinearMethodBase):
                 bias,
                 out_code,
                 True,  # convrot
-                self.quant_config.group_size,
+                self.group_size,
             )
 
         n_rows, n_out = x.shape[0], layer.weight.shape[0]

@@ -123,31 +123,42 @@ def canonical_aspect_ratio(width: int, height: int) -> str:
 
 
 def build_action_prompt(
-    description: str,
+    description: str | list[str],
     view_point: str,
     num_frames: int,
     fps: float,
     height: int,
     width: int,
-) -> str:
+) -> str | list[str]:
     """Render the structured JSON action caption the action checkpoints expect."""
     duration_seconds = num_frames / fps
     minutes, secs = divmod(round(duration_seconds), 60)
-    if description and description[-1] not in ".!?":
-        description = description + "."
-    prompt = {
-        "cinematography": {
-            "framing": VIEWPOINT_TEMPLATES.get(
-                view_point, VIEWPOINT_TEMPLATES["ego_view"]
-            )
-        },
-        "actions": [{"time": f"0:00-{minutes}:{secs:02d}", "description": description}],
-        "duration": f"{int(duration_seconds)}s",
-        "fps": float(fps),
-        "resolution": {"H": int(height), "W": int(width)},
-        "aspect_ratio": canonical_aspect_ratio(int(width), int(height)),
-    }
-    return json.dumps(prompt)
+    if isinstance(description, (list, tuple)):
+        descriptions = [str(d) for d in description]
+    else:
+        descriptions = [description]
+
+    prompts = []
+    for desc in descriptions:
+        if desc and desc[-1] not in ".!?":
+            desc = desc + "."
+        prompt = {
+            "cinematography": {
+                "framing": VIEWPOINT_TEMPLATES.get(
+                    view_point, VIEWPOINT_TEMPLATES["ego_view"]
+                )
+            },
+            "actions": [{"time": f"0:00-{minutes}:{secs:02d}", "description": desc}],
+            "duration": f"{int(duration_seconds)}s",
+            "fps": float(fps),
+            "resolution": {"H": int(height), "W": int(width)},
+            "aspect_ratio": canonical_aspect_ratio(int(width), int(height)),
+        }
+        prompts.append(json.dumps(prompt))
+
+    if isinstance(description, (list, tuple)):
+        return prompts
+    return prompts[0]
 
 
 def load_action_stats(

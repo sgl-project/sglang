@@ -18,7 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_disagg, get_memory
+from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -108,6 +108,9 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
+    if server_args.enable_unified_cache_external_linker:
+        return _create_unified_radix_cache(ctx, server_args, params)
+
     if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
         from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
@@ -193,12 +196,38 @@ def _create_unified_radix_cache(
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )
+    elif server_args.enable_unified_cache_external_linker:
+        backend = server_args.unified_cache_external_linker_backend
+        if backend == "mooncake":
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+                MooncakeDirectLinker,
+            )
+
+            linker_cls = MooncakeDirectLinker
+        elif backend == "mori":
+            from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
+                UMBPDirectLinker,
+            )
+
+            linker_cls = UMBPDirectLinker
+        else:
+            raise ValueError(
+                f"Unknown unified cache external linker backend: {backend!r}"
+            )
+
+        cache.init_cache_linker(
+            linker_cls(server_args, params, components=set(cache.components))
+        )
+        counter = cache.linker.layer_done_counter
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        kvcache.register_layer_transfer_counter(counter)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
 
 
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
-    name = ctx.server_args.radix_cache_backend
+    name = get_memory().radix_cache_backend
     if name:
         factory = get_radix_cache_factory(name)
         if factory is None:
@@ -214,8 +243,8 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         source = "default"
 
     if (
-        ctx.server_args.enable_hierarchical_cache
-        and ctx.server_args.hicache_host_memory_mode == "buffer_only"
+        get_memory().enable_hierarchical_cache
+        and get_memory().hicache_host_memory_mode == "buffer_only"
     ):
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -225,7 +254,7 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 f"the unified radix tree; this model selected {type(cache).__name__}."
             )
 
-    if ctx.server_args.enable_session_radix_cache and not getattr(
+    if get_memory().enable_session_radix_cache and not getattr(
         cache, "enable_session_radix_cache", False
     ):
         raise ValueError(
@@ -237,7 +266,7 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     hicache_attached = cache.cache_controller is not None
     streaming_wrapped = False
     if (
-        ctx.server_args.enable_streaming_session
+        get_serving().enable_streaming_session
         and not cache.supports_streaming_session()
     ):
         from sglang.srt.session.streaming_session import StreamingSession

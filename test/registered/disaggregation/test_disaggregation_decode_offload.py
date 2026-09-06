@@ -3,7 +3,6 @@ import shutil
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -13,6 +12,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
+    terminate_and_kill_process_tree,
 )
 
 # Registering the test for CUDA CI with appropriate parameters
@@ -150,12 +150,9 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
 
         time.sleep(10)
 
-        kill_process_tree(self.process_prefill.pid)
-        kill_process_tree(self.process_decode.pid)
-        kill_process_tree(self.process_lb.pid)
-        self.process_prefill.wait()
-        self.process_decode.wait()
-        self.process_lb.wait()
+        terminate_and_kill_process_tree(self.process_prefill)
+        terminate_and_kill_process_tree(self.process_decode)
+        terminate_and_kill_process_tree(self.process_lb)
 
         self.start_prefill()
         self.start_decode()

@@ -298,7 +298,6 @@ def init_distributed_environment(
         )
 
         if timeout is not None:
-
             extra_args["timeout"] = datetime.timedelta(seconds=timeout)
             logger.info(f"Setting distributed timeout to {timeout} seconds")
 
@@ -325,9 +324,9 @@ def init_distributed_environment(
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(ranks, local_rank, backend)
     else:
-        assert (
-            _WORLD.world_size == torch.distributed.get_world_size()
-        ), "world group already initialized with a different world size"
+        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+            "world group already initialized with a different world size"
+        )
     _sync_srt_world_group()
 
 
@@ -648,12 +647,12 @@ def maybe_init_distributed_environment_and_model_parallel(
 
     if _WORLD is not None and model_parallel_is_initialized():
         # make sure the tp and sp sizes are correct
-        assert (
-            get_tp_world_size() == tp_size
-        ), f"You are trying to initialize model parallel groups with size {tp_size}, but they are already initialized with size {get_tp_world_size()}"
-        assert (
-            get_sp_world_size() == sp_size
-        ), f"You are trying to initialize model parallel groups with size {sp_size}, but they are already initialized with size {get_sp_world_size()}"
+        assert get_tp_world_size() == tp_size, (
+            f"You are trying to initialize model parallel groups with size {tp_size}, but they are already initialized with size {get_tp_world_size()}"
+        )
+        assert get_sp_world_size() == sp_size, (
+            f"You are trying to initialize model parallel groups with size {sp_size}, but they are already initialized with size {get_sp_world_size()}"
+        )
         return
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -701,7 +700,16 @@ def model_parallel_is_initialized() -> bool:
 
 @contextmanager
 def use_tensor_parallel_group(tp_group: GroupCoordinator):
-    """Use one TP group consistently across diffusion and reused SRT modules."""
+    """Use one TP group consistently across diffusion and reused SRT modules.
+
+    The scope replaces the module globals that ``get_tp_group()`` and srt's
+    ``get_tp_group()`` / ``get_attention_tp_group()`` read, and — like srt's
+    ``patch_tensor_parallel_group`` — the three members the runtime context
+    answers with, so that a size read from the published bag cannot disagree
+    with a rank read from the swapped group.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
     old_tp_group = get_tp_group()
     import sglang.srt.distributed.parallel_state as srt_parallel_state
 
@@ -712,7 +720,12 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
     srt_parallel_state._TP = tp_group
     srt_parallel_state._ATTN_TP = tp_group
     try:
-        yield
+        with get_parallel().override(
+            tp_size=tp_group.world_size,
+            tp_rank=tp_group.rank_in_group,
+            tp_group=tp_group,
+        ):
+            yield
     finally:
         _TP = old_tp_group
         srt_parallel_state._TP = old_srt_tp_group
@@ -759,9 +772,9 @@ def is_the_same_node_as(
     memory system (shared access to shared memory).
     """
     if isinstance(pg, ProcessGroup):
-        assert (
-            torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
-        ), "in_the_same_node_as should be tested with a non-NCCL group."
+        assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
+            "in_the_same_node_as should be tested with a non-NCCL group."
+        )
         # local rank inside the group
         rank = torch.distributed.get_rank(group=pg)
         world_size = torch.distributed.get_world_size(group=pg)
@@ -919,9 +932,9 @@ def is_pipeline_last_stage() -> bool:
 
 # CFG
 def get_cfg_group() -> GroupCoordinator:
-    assert (
-        _CFG is not None
-    ), "classifier_free_guidance parallel group is not initialized"
+    assert _CFG is not None, (
+        "classifier_free_guidance parallel group is not initialized"
+    )
     return _CFG
 
 

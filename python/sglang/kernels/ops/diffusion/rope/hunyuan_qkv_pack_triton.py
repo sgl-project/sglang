@@ -52,7 +52,10 @@ def _hunyuan_qkv_rope_pack_kernel(
     BLOCK_HEADS: tl.constexpr,
     BLOCK_HALF: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    # Merged Hunyuan projections can have row offsets above INT32_MAX at
+    # production video shapes (for example, 115200 * 21504). Keep all row
+    # address arithmetic in int64, as the other diffusion layout kernels do.
+    token = tl.program_id(0).to(tl.int64)
     head_block = tl.program_id(1)
     total_tokens = img_tokens + txt_tokens
     batch = token // total_tokens

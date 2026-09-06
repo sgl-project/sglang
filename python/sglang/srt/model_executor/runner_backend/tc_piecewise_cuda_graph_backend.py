@@ -49,7 +49,10 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+)
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -110,7 +113,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     def build_compilation_config(server_args: ServerArgs) -> CompilationConfig:
         """Construct a CompilationConfig from ServerArgs and
         register the MoE A2A split-op when DeepEP / Mooncake is in use."""
-        prefill = server_args.cuda_graph_config.prefill
+        prefill = get_exec().graph.cuda_graph_config.prefill
         num_tokens = prefill.bs
         compiler = prefill.tc_compiler
         assert num_tokens is not None, "cuda_graph_config[prefill].bs is not set"

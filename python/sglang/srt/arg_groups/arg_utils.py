@@ -75,10 +75,10 @@ class Arg:
     # When True, this field is skipped by add_cli_args_from_dataclass.
     # Use for fields that have no CLI surface (e.g. injected via Python only).
     no_cli: bool = False
-    # When True, this field may be written by config resolution (model
-    # overrides and post-process passes): it is part of the whitelist accepted
-    # by the declaration stash, and its resolved value materializes onto the
-    # field at the end of __post_init__.
+    # When True, config resolution (model overrides and post-process passes)
+    # may decide this field: the declaration stash accepts the name, and
+    # `resolution_result` and the config bags answer with the decision. The
+    # field keeps what the operator passed.
     resolvable: bool = False
 
 
@@ -117,6 +117,14 @@ def namespace_of(cls) -> dict:
                     out[field.name] = a.path
                     break
     return out
+
+
+@functools.lru_cache(maxsize=None)
+def field_names(cls) -> frozenset:
+    """Names of ``cls`` dataclass fields — what a declaration may name."""
+    if not dataclasses.is_dataclass(cls):
+        return frozenset()
+    return frozenset(field.name for field in dataclasses.fields(cls))
 
 
 @functools.lru_cache(maxsize=None)

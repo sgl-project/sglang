@@ -663,12 +663,16 @@ def maybe_download_lora(
         return os.path.join(source.local_path, selected_file)
 
     assert source.repo_id is not None
+    allow_patterns = ["*.json", selected_file]
+    selected_parent = os.path.dirname(selected_file)
+    if selected_parent:
+        allow_patterns.insert(1, f"{selected_parent}/*.json")
     local_path = maybe_download_model(
         source.repo_id,
         local_dir,
         download,
         is_lora=True,
-        allow_patterns=["*.json", selected_file],
+        allow_patterns=allow_patterns,
         revision=resolved_weight.inventory.resolved_revision or source.revision,
     )
     target = os.path.join(local_path, selected_file)
@@ -952,7 +956,28 @@ def maybe_download_model(
                 f"Cached ref for {model_name_or_path} is corrupt: resolved to the "
                 f"snapshots parent {local_path!r} instead of a revision directory."
             )
-        if not force_diffusers_model:
+        required_files = [
+            pattern for pattern in allow_patterns or () if not glob.has_magic(pattern)
+        ]
+        missing_required_files = [
+            path
+            for path in required_files
+            if not os.path.isfile(os.path.join(local_path, path))
+        ]
+        if missing_required_files:
+            if not download:
+                raise ValueError(
+                    f"Model {model_name_or_path} is cached but is missing requested "
+                    f"files: {missing_required_files}."
+                )
+            logger.info(
+                "Cached snapshot for %s is missing requested files %s; "
+                "will download them from %s",
+                model_name_or_path,
+                missing_required_files,
+                _model_hub_name(),
+            )
+        elif not force_diffusers_model:
             # maybe_download_model_index's model_index.json fetch materializes a full
             # cache entry, so this resolve reports that stub as a hit; returning it
             # would skip the download. LoRA repos declare no components.

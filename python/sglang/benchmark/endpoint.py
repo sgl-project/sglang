@@ -48,6 +48,11 @@ def _launch_server_target(launch_server_func: Callable, server_args: ServerArgs)
 
 
 def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs):
+    # Resolve in the parent, before the fork. The pipeline probes the device
+    # (the default attention backend reads the CUDA capability), and a forked
+    # child cannot re-initialize CUDA once this process has.
+    server_args.resolve_once()
+
     base_url = resolve_base_url("", server_args.host, server_args.port)
 
     # Reuse an already-running server instead of forking a second one onto the

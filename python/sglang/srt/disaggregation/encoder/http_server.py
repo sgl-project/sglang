@@ -32,6 +32,8 @@ from sglang.srt.disaggregation.encoder.runtime import (
     execute_encode_pipeline,
     launch_dp_runtime,
     launch_local_runtime,
+    send_staged_embedding,
+    validate_encode_request,
 )
 from sglang.srt.disaggregation.encoder.server import (
     EncoderProfiler,
@@ -113,11 +115,11 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
     instead of serialising sleeps in a single thread.
     """
 
-    host = server_args.host
+    host = get_serving().host
     if not host or host in ("0.0.0.0", "::"):
-        host = get_local_ip_auto(server_args.host)
+        host = get_local_ip_auto(get_serving().host)
     scheme = "https" if server_args.ssl_certfile else "http"
-    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
+    encoder_url = NetworkAddress(host, get_serving().port).to_url(scheme)
     payload = {"url": encoder_url}
     bootstrap_urls = list(server_args.encoder_register_urls)
     if not bootstrap_urls:
@@ -174,11 +176,11 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
 
 
 def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
-    host = server_args.host
+    host = get_serving().host
     if not host or host in ("0.0.0.0", "::"):
-        host = get_local_ip_auto(server_args.host)
+        host = get_local_ip_auto(get_serving().host)
     scheme = "https" if server_args.ssl_certfile else "http"
-    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
+    encoder_url = NetworkAddress(host, get_serving().port).to_url(scheme)
     payload = {"url": encoder_url}
 
     for bootstrap_url in server_args.encoder_register_urls:
@@ -206,8 +208,6 @@ def launch_server(server_args: ServerArgs):
     global dp_dispatcher, encoder, encoder_scheduler, local_runtime, send_sockets
 
     configure_logger(server_args, prefix=" encode_server")
-    # Publish before the launch path reads configuration; each encoder built
-    # below re-projects the same object in its process.
     publish(server_args, role="encoder")
     if get_parallel().dp_size > 1:
         dp_dispatcher = launch_dp_runtime(server_args)
@@ -262,8 +262,38 @@ def _summarise_dp_broadcast(results: List[dict]) -> Response:
     )
 
 
+async def _drain_health_encode(
+    health_encoder: MMEncoder, encode_task: asyncio.Task, req_id: str
+):
+    """Finish a dispatched TP probe before releasing its state and lock."""
+    result = None
+    cleanup_failed = False
+    try:
+        result = await asyncio.shield(encode_task)
+    except Exception:
+        logger.exception("Encoder health check failed for req_id=%s", req_id)
+    finally:
+        try:
+            await asyncio.shield(health_encoder.release_request(req_id))
+        except Exception:
+            cleanup_failed = True
+            logger.exception("Encoder health cleanup failed for req_id=%s", req_id)
+        finally:
+            health_encoder.encode_dispatch_lock.release()
+    return None if cleanup_failed else result
+
+
 @app.post("/encode")
 async def handle_encode_request(request: dict):
+    if err := validate_encode_request(request):
+        return ORJSONResponse(
+            status_code=HTTPStatus.BAD_REQUEST,
+            content={
+                "status": "error",
+                "message": err,
+                "req_id": request.get("req_id"),
+            },
+        )
     req_id = request["req_id"]
     start_time = time.monotonic()
     time_stats_json = request.pop("time_stats_json", None)
@@ -353,7 +383,6 @@ async def handle_send_request(request: dict):
     """Mooncake-only: drive the RDMA push of a staged embedding. The zmq
     backends deliver embeddings inline during /encode and never call /send."""
     req_id = request["req_id"]
-    receive_count = request.get("receive_count")
     if dp_dispatcher is not None:
         try:
             result = await dp_dispatcher.dispatch_send(request)
@@ -375,13 +404,23 @@ async def handle_send_request(request: dict):
                 status_code=status_code,
             )
         return ORJSONResponse(content=result.get("content"))
-    sent = await encoder.send(
-        req_id=req_id,
-        prefill_host=request["prefill_host"],
-        embedding_port=request["embedding_port"],
-        session_id=request["session_id"],
-        buffer_address=request["buffer_address"],
-    )
+    try:
+        sent = await send_staged_embedding(
+            encoder,
+            request,
+            # A pre-refcount decoder may have sibling ranks still to send.
+            release_without_count=False,
+        )
+    except Exception as error:
+        logger.error("Mooncake send failed for req_id=%s: %s", req_id, error)
+        return ORJSONResponse(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            content={
+                "status": "error",
+                "message": str(error),
+                "req_id": req_id,
+            },
+        )
     if not sent:
         # No transfer happened: fail fast rather than 200 + a phantom count.
         return ORJSONResponse(
@@ -392,11 +431,6 @@ async def handle_send_request(request: dict):
                 "req_id": req_id,
             },
         )
-    # Sibling ranks share this embedding, so free it only once all have sent.
-    # No count means a pre-refcount decoder: leave it to the sweep, as when
-    # some rank never sends at all.
-    if receive_count:
-        await server_module.meta_registry.note_send_done(req_id, receive_count)
     return ORJSONResponse(content=None)
 
 
@@ -546,10 +580,10 @@ async def health_generate():
         # No processor available, fall back to liveness check only
         return Response(status_code=200)
 
+    # uuid keeps rids unique across workers; a bare time.time() can collide.
+    req_id = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+    owns_dispatch_lock = False
     try:
-        # uuid keeps rids unique across workers; a bare time.time() can collide.
-        req_id = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
-
         dummy_request = {
             "mm_items": mm_items,
             "modality": modality.name,
@@ -562,25 +596,36 @@ async def health_generate():
         # request. Serialize its broadcast and rank-0 forward with every other
         # collective dispatch, then recheck whether traffic made the probe
         # unnecessary while it waited for the lock.
-        async with encoder.encode_dispatch_lock:
-            if encoder.has_pending_embeddings():
-                return Response(status_code=200)
-            for socket in send_sockets:
-                sock_send(socket, wrap_as_pickle(dummy_request))
+        await encoder.encode_dispatch_lock.acquire()
+        owns_dispatch_lock = True
+        if encoder.has_pending_embeddings():
+            return Response(status_code=200)
+        for socket in send_sockets:
+            sock_send(socket, wrap_as_pickle(dummy_request))
 
-            _, _, _, error_msg, _ = await asyncio.wait_for(
-                encoder.encode(
-                    mm_items=mm_items,
-                    modality=modality,
-                    req_id=req_id,
-                    num_parts=1,
-                    part_idx=0,
-                ),
-                timeout=HEALTH_CHECK_TIMEOUT,
+        encode_task = asyncio.create_task(
+            encoder.encode(
+                mm_items=mm_items,
+                modality=modality,
+                req_id=req_id,
+                num_parts=1,
+                part_idx=0,
             )
+        )
+        drain_task = asyncio.create_task(
+            _drain_health_encode(encoder, encode_task, req_id)
+        )
+        # The drain task now owns the lock and request state. A probe timeout or
+        # client disconnect must not let a later request overtake its TP work.
+        owns_dispatch_lock = False
+        result = await asyncio.wait_for(
+            asyncio.shield(drain_task),
+            timeout=HEALTH_CHECK_TIMEOUT,
+        )
 
-        # Clean up stored embedding
-        await encoder.release_request(req_id)
+        if result is None:
+            return Response(status_code=503)
+        _, _, _, error_msg, _ = result
 
         if error_msg:
             logger.error(f"Encoder health check failed: {error_msg}")
@@ -594,6 +639,9 @@ async def health_generate():
     except Exception as e:
         logger.error(f"Encoder health check failed: {e}")
         return Response(status_code=503)
+    finally:
+        if owns_dispatch_lock:
+            encoder.encode_dispatch_lock.release()
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
