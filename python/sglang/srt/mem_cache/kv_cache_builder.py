@@ -73,6 +73,9 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None
 
+    if spec_algorithm.is_dspark() and draft_worker.is_lifecycle_only_pp_prefill_rank:
+        return None
+
     # V2 draft workers exist only on their hosting PP stage; other ranks own no
     # nested draft worker or draft KV pool.
     if draft_worker.draft_worker is None:
