@@ -762,7 +762,24 @@ class MambaComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_STORAGE:
             cd = node.component_data[ct]
-            if cd.host_value is None or not node.hash_value:
+            if not node.hash_value:
+                return None
+            # Overflow-backed nodes keep their state in the reserved tail ring
+            # (host_value is None); re-attach the slot ids so the completion
+            # drain can release them back to the ring after the H->S write.
+            overflow_indices = cd.metadata.get("_mamba_overflow_indices")
+            overflow_slot_ids = cd.metadata.get("_mamba_overflow_slot_ids")
+            if overflow_indices is not None and overflow_slot_ids:
+                return [
+                    PoolTransfer(
+                        name=PoolName.MAMBA,
+                        host_indices=overflow_indices,
+                        keys=[node.hash_value[-1]],
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                        overflow_slot_ids=list(overflow_slot_ids),
+                    )
+                ]
+            if cd.host_value is None:
                 return None
             return [
                 PoolTransfer(
@@ -801,8 +818,31 @@ class MambaComponent(TreeComponent):
         if phase == CacheTransferPhase.BACKUP_HOST:
             if transfers and transfers[0].host_indices is not None:
                 cd = node.component_data[ct]
+                tr = transfers[0]
+                if tr.overflow_slot_ids:
+                    # Ring slots recycle as soon as the H->S archive acks, so
+                    # they can never serve host->device restores: do NOT mark
+                    # the node mamba-backuped. Stash for the BACKUP_STORAGE
+                    # build, which re-attaches the slot ids for ring release.
+                    cd.metadata["_mamba_overflow_indices"] = tr.host_indices.clone()
+                    cd.metadata["_mamba_overflow_slot_ids"] = list(tr.overflow_slot_ids)
+                    return
                 if cd.host_value is None:
-                    cd.host_value = transfers[0].host_indices.clone()
+                    cd.host_value = tr.host_indices.clone()
+
+        elif phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.metadata.pop("_mamba_overflow_indices", None) is not None:
+                slot_ids = cd.metadata.pop("_mamba_overflow_slot_ids", None)
+                # Archive-completion drain the BACKUP_HOST stash promised:
+                # the H->S write has acked, so the overflow ring rows are
+                # safe to recycle. Release each stashed slot back to the ring.
+                if slot_ids:
+                    host_pool = self.cache.host_pool_group.get_pool(PoolName.MAMBA)
+                    overflow_release = getattr(host_pool, "overflow_release", None)
+                    if overflow_release is not None:
+                        for slot_idx in slot_ids:
+                            overflow_release(int(slot_idx))
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers:

@@ -2830,6 +2830,21 @@ class ServerArgs:
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         NS("memory"),
     ] = None
+    mamba_overflow_size: A[
+        int,
+        Arg(
+            help=(
+                "Number of pinned overflow rows reserved at the tail of the "
+                "mamba host pool's tensors. Used when the LRU mamba host pool "
+                "is full at write-backup time so the mamba companion state is "
+                "still written to L3 storage alongside its KV page (avoiding "
+                "orphan KV-only storage entries) and the KV write is not "
+                "rolled back. Ring slots are released back by the archive-"
+                "completion drain after the H->S write acks. 0 disables."
+            ),
+        ),
+        NS("memory"),
+    ] = 8
     hicache_storage_prefetch_retry_poll_interval: A[
         int,
         Arg(

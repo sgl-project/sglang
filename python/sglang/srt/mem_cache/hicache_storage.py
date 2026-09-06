@@ -101,6 +101,12 @@ class PoolTransfer:
     device<->host path : host_indices + device_indices
     host<->storage path: host_indices + keys
     nodes_to_load      : evicted nodes this transfer covers
+    overflow_slot_ids  : when host_indices were allocated from a host
+                         pool's reserved overflow ring (mamba writeback),
+                         this carries the absolute slot ids so the H->S
+                         archive commit hook can release them back to the
+                         ring. Default None means host_indices came from
+                         the normal LRU allocator.
     """
 
     name: PoolName
@@ -110,6 +116,7 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    overflow_slot_ids: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)
@@ -656,6 +663,18 @@ class HiCacheFile(HiCacheStorage):
                         break
             if boundary:
                 hit_count[name] = boundary
+            # Verification log: the mamba gate clipped a L3 hit. This should
+            # be rare once the overflow ring keeps companion coverage high
+            # (only when the .mamba_*.bin write actually failed, e.g. ring
+            # saturation or storage error).
+            if boundary < kv_pages and name == PoolName.MAMBA:
+                logger.debug(
+                    "L3 mamba gate clipped: kv_pages=%d -> mamba_boundary=%d "
+                    "(keys[-1]=%s)",
+                    kv_pages,
+                    boundary,
+                    transfer.keys[-1] if transfer.keys else "?",
+                )
             final_pages = min(final_pages, boundary)
 
         return PoolTransferResult(final_pages, hit_count)
