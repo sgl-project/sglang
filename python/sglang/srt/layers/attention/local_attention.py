@@ -73,9 +73,25 @@ class LocalAttentionMetadataBuilder:
         }
 
     def _kernel_page_table(self, page_table: torch.Tensor) -> torch.Tensor:
+        # Eager path only: the extend metadata holds token slots, which the
+        # full->swa mapping is indexed by.
         if self.swa_translate is not None:
             return self.swa_translate(page_table).to(torch.int32)
         return page_table
+
+    def _graph_page_table(
+        self, metadata: FlashAttentionMetadata, bs: int, max_seq_len: int
+    ) -> torch.Tensor:
+        # CUDA-graph metadata already holds page ids, and swa_page_table is the
+        # same table translated into the swa pool; the token-slot mapping must
+        # not be applied to either. Columns are pages, so slice by pages.
+        table = (
+            metadata.swa_page_table
+            if self.swa_translate is not None
+            else metadata.page_table
+        )
+        num_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        return table[:bs, :num_pages]
 
     def build(
         self,
@@ -133,7 +149,7 @@ class LocalAttentionMetadataBuilder:
             self.attention_chunk_size,
             metadata.cu_seqlens_q.cpu().numpy(),
             seq_lens_capture.cpu().numpy(),
-            metadata.page_table,
+            self._graph_page_table(metadata, bs, max_seq_len),
             self.page_size,
             preserve_attn_chunk_size=True,
         )
@@ -166,12 +182,9 @@ class LocalAttentionMetadataBuilder:
             bs + 1, device=local_q_buf.device, dtype=local_q_buf.dtype
         )
         seqlens = metadata.cache_seqlens_int32[:bs]
-        # Slice to bs and the real max seq len: rows past it hold zeros or stale
-        # ids that would corrupt the replay.
+        # Rows past bs and columns past the live pages hold stale ids.
         max_seq_len = int(seqlens.max().item())
-        sliced_page_table = self._kernel_page_table(
-            metadata.page_table[:bs, :max_seq_len]
-        )
+        sliced_page_table = self._graph_page_table(metadata, bs, max_seq_len)
 
         (
             seqlens_q_local_np,
