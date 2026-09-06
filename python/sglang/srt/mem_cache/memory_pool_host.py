@@ -212,7 +212,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
         requested_bytes = self.layer_num * num_host_pages * self.item_bytes
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(self.allocator, self.gpu_device)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 paged pool {pool_name}. "
@@ -630,7 +630,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.size_per_token = self.state_page_bytes
 
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(self.allocator, self.gpu_device)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 state pool {pool_name}. "

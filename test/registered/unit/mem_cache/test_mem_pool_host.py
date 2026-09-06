@@ -12,7 +12,8 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
 )
-from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base, common
+from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.runtime_context import get_context
@@ -275,6 +276,112 @@ class TestHostMemoryBudget(CustomTestCase):
             ),
         ):
             self.assertEqual(base.ranks_per_host(), 8)
+
+    def _budget_for(self, allocator, device, available, ranks=8):
+        fake_mem = unittest.mock.Mock(available=available)
+        with (
+            unittest.mock.patch.object(base, "ranks_per_host", return_value=ranks),
+            unittest.mock.patch.object(
+                base.psutil, "virtual_memory", return_value=fake_mem
+            ),
+        ):
+            return base.host_memory_budget_bytes(allocator, device)
+
+    def test_hugetlb_pool_is_an_alternative_budget(self):
+        # One mapping is served entirely by the hugetlb pool or entirely by
+        # plain pages, so the larger of the two is the budget; the reserve is
+        # for the OS and applies to plain RAM only.
+        gib = 1024**3
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        allocator = unittest.mock.Mock(
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib)
+        )
+        budget = self._budget_for(allocator, "cuda", available=reserve + 64 * gib)
+        self.assertEqual(budget, 96 * gib // 8)
+
+    def test_plain_pages_win_when_the_hugetlb_pool_is_smaller(self):
+        gib = 1024**3
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        allocator = unittest.mock.Mock(
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=16 * gib)
+        )
+        budget = self._budget_for(allocator, "cuda", available=reserve + 64 * gib)
+        self.assertEqual(budget, 64 * gib // 8)
+
+    def test_no_hugetlb_credit_for_pin_memory_devices(self):
+        # npu/musa allocate with torch.empty(pin_memory=True) and never see the
+        # allocator, so what it could map from hugetlb does not apply.
+        gib = 1024**3
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        allocator = unittest.mock.Mock(
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib)
+        )
+        budget = self._budget_for(allocator, "npu", available=reserve + 64 * gib)
+        self.assertEqual(budget, 64 * gib // 8)
+        allocator.free_hugetlb_bytes.assert_not_called()
+
+    def test_plain_budget_is_reported_as_is_without_a_hugetlb_pool(self):
+        # A host below the reserve keeps its negative budget, and the failure
+        # message that shows it, when there is no hugetlb pool to credit.
+        gib = 1024**3
+        allocator = unittest.mock.Mock(
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=0)
+        )
+        budget = self._budget_for(allocator, "cuda", available=4 * gib)
+        self.assertEqual(
+            budget, (4 * gib - base.HICACHE_HOST_MEMORY_RESERVE_BYTES) // 8
+        )
+
+    def test_guard_passes_its_allocator_and_device(self):
+        device_pool = MHATokenToKVPool(
+            size=4,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+
+        def plain_alloc(dims, dtype, device, pin_memory, allocator, **kwargs):
+            return torch.empty(dims, dtype=dtype)
+
+        with (
+            unittest.mock.patch.object(
+                base, "host_memory_budget_bytes", return_value=1024**3
+            ) as budget,
+            unittest.mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": plain_alloc}),
+        ):
+            pool = MHATokenToKVPoolHost(
+                device_pool=device_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=2,
+                layout="layer_first",
+                pin_memory=False,
+                device="cpu",
+                allocator_type="default",
+            )
+        budget.assert_called_once_with(pool.allocator, device_pool.device)
+
+
+class TestHostTensorAllocatorHugetlb(CustomTestCase):
+    def test_only_the_mmap_allocator_reports_the_hugetlb_pool(self):
+        # Only the base allocate() maps MAP_HUGETLB; an allocator that gets its
+        # memory elsewhere must not be credited with a pool it never touches.
+        gib = 1024**3
+
+        class Elsewhere(common.HostTensorAllocator):
+            def allocate(self, dims, dtype, device):
+                raise NotImplementedError
+
+        with unittest.mock.patch.object(
+            common, "hugetlb_pool_free_bytes", return_value=4 * gib
+        ):
+            self.assertEqual(common.HostTensorAllocator().free_hugetlb_bytes(), 4 * gib)
+            self.assertEqual(common.ShmHostTensorAllocator().free_hugetlb_bytes(), 0)
+            self.assertEqual(Elsewhere().free_hugetlb_bytes(), 0)
 
 
 class TestHostPoolGroup(CustomTestCase):

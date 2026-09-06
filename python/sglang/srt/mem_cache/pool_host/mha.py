@@ -733,7 +733,9 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.size_per_token = self.get_size_per_token()
 
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(
+            self.allocator, self.device_pool.device
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "
