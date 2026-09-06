@@ -214,6 +214,35 @@ pub fn resolve_prefill(
     request_input_tokens: u64,
     snapshot: &EngineLoadSnapshot,
 ) -> Option<FinalDecision> {
+    resolve_prefill_admitted(range, proposal, request_input_tokens, snapshot).or_else(|| {
+        if !contains_worker(range, &proposal.primary) {
+            return None;
+        }
+        let backup = proposal
+            .backup
+            .as_ref()
+            .filter(|worker| contains_worker(range, worker))
+            .cloned();
+        let legal = legal_prefill_candidates(range, proposal);
+        let selected = select_with_snapshot(&legal, Some(snapshot))?;
+        Some(FinalDecision {
+            selected,
+            primary: Arc::clone(&proposal.primary),
+            backup,
+            reason: DecisionReason::CapacityFallbackPowerOfTwo,
+            candidate_range_id: range.id.to_string(),
+            load_snapshot_version: snapshot.version,
+        })
+    })
+}
+
+/// Resolves prefill admission without overcommitting a full candidate range.
+pub fn resolve_prefill_admitted(
+    range: &CandidateRange<'_>,
+    proposal: &SelectionProposal,
+    request_input_tokens: u64,
+    snapshot: &EngineLoadSnapshot,
+) -> Option<FinalDecision> {
     if !contains_worker(range, &proposal.primary) {
         return None;
     }
@@ -246,10 +275,7 @@ pub fn resolve_prefill(
         (false, Some(backup), true) => (Arc::clone(backup), DecisionReason::BackupPrimaryAdmission),
         _ => {
             let legal = legal_prefill_candidates(range, proposal);
-            range_fallback(range, &legal, request_input_tokens, snapshot).or_else(|| {
-                select_with_snapshot(&legal, Some(snapshot))
-                    .map(|worker| (worker, DecisionReason::CapacityFallbackPowerOfTwo))
-            })?
+            range_fallback(range, &legal, request_input_tokens, snapshot)?
         }
     };
     Some(FinalDecision {

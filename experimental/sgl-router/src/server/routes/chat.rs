@@ -4,7 +4,8 @@
 use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::admission::{
-    resolve_cache_candidates, resolve_prefill, CandidateDomain, CandidateRange, DecisionReason,
+    resolve_cache_candidates, resolve_decode, resolve_prefill, resolve_prefill_admitted,
+    CandidateDomain, CandidateRange, DecisionReason,
 };
 use crate::policies::buckets::BucketRequest;
 use crate::policies::decode::{
@@ -375,7 +376,8 @@ pub async fn chat_completions(
         let selection_failure_reason = Cell::new(PolicySelectionFailureReason::ProposalEmpty);
         let select_prefill_in_domain = |domain: &CandidateDomain,
                                         affinity_lookup_enabled: bool,
-                                        affinity_assignment_enabled: bool|
+                                        affinity_assignment_enabled: bool,
+                                        allow_capacity_fallback: bool|
          -> Option<Arc<Worker>> {
             let candidate_range = domain.prefill_range()?;
             let mut selection_ctx =
@@ -407,9 +409,17 @@ pub async fn chat_completions(
                 let snapshot = load_snapshot
                     .as_ref()
                     .expect("shared prefill admission requires a load snapshot");
-                let Some(decision) =
+                let decision = if allow_capacity_fallback {
                     resolve_prefill(&candidate_range, &proposal, request_input_tokens, snapshot)
-                else {
+                } else {
+                    resolve_prefill_admitted(
+                        &candidate_range,
+                        &proposal,
+                        request_input_tokens,
+                        snapshot,
+                    )
+                };
+                let Some(decision) = decision else {
                     selection_failure_reason
                         .set(PolicySelectionFailureReason::PrefillAdmissionExhausted);
                     return None;
@@ -447,6 +457,31 @@ pub async fn chat_completions(
                 Some(proposal.primary)
             }
         };
+        let select_prefill_domains =
+            |domains: &[CandidateDomain],
+             affinity_lookup_enabled: bool,
+             affinity_assignment_enabled: bool| {
+                domains
+                    .iter()
+                    .find_map(|domain| {
+                        select_prefill_in_domain(
+                            domain,
+                            affinity_lookup_enabled,
+                            affinity_assignment_enabled,
+                            false,
+                        )
+                    })
+                    .or_else(|| {
+                        domains.iter().find_map(|domain| {
+                            select_prefill_in_domain(
+                                domain,
+                                affinity_lookup_enabled,
+                                affinity_assignment_enabled,
+                                true,
+                            )
+                        })
+                    })
+            };
 
         // Cache-Aware resolves one bounded global candidate set and returns a final winner.
         let cache_winner = (ctx.config.model.policy == PolicyKind::CacheAware)
@@ -547,7 +582,7 @@ pub async fn chat_completions(
                 )
             })
             // Rebuild the backup inside the primary's own Bucket.
-            .and_then(|domain| select_prefill_in_domain(&domain, true, false));
+            .and_then(|domain| select_prefill_in_domain(&domain, true, false, false));
         cache_winner
             .or_else(|| {
                 // Materialize normal domains only when Cache-Aware has no winner.
@@ -556,23 +591,17 @@ pub async fn chat_completions(
                     .prefill_domains(&workers, prefill_bucket_request);
                 if ctx.config.model.policy == PolicyKind::CacheAware {
                     // Cache miss or failure retries ordered domains with ordinary P2.
-                    return prefill_domains
-                        .iter()
-                        .find_map(|domain| select_prefill_in_domain(domain, false, false));
+                    return select_prefill_domains(&prefill_domains, false, false);
                 }
                 global_affinity_worker.or_else(|| match session_affinity_mode {
                     SessionAffinityMode::GlobalPreserve if global_affinity_missed => {
-                        prefill_domains
-                            .iter()
-                            .find_map(|domain| select_prefill_in_domain(domain, true, true))
+                        select_prefill_domains(&prefill_domains, true, true)
                     }
-                    SessionAffinityMode::GlobalPreserve => prefill_domains
-                        .iter()
-                        .find_map(|domain| select_prefill_in_domain(domain, false, false)),
+                    SessionAffinityMode::GlobalPreserve => {
+                        select_prefill_domains(&prefill_domains, false, false)
+                    }
                     SessionAffinityMode::Bucket | SessionAffinityMode::GlobalRebind => {
-                        prefill_domains
-                            .iter()
-                            .find_map(|domain| select_prefill_in_domain(domain, true, true))
+                        select_prefill_domains(&prefill_domains, true, true)
                     }
                 })
             })
@@ -611,21 +640,24 @@ pub async fn chat_completions(
                 tps_slo,
             },
         );
-        decode_domains
-            .iter()
-            .find_map(|decode_domain| {
+        let decode_policy = build_decode_policy(ctx.config.model.decode_policy);
+        let select_decode_in_domain =
+            |decode_domain: &CandidateDomain, allow_capacity_fallback: bool| {
                 let snapshot = load_snapshot.as_ref()?;
                 let decode_ctx = DecodeSelectionContext::new()
                     .with_load_snapshot(snapshot)
                     .with_prefill_url(&worker.url);
-                let decode_policy = build_decode_policy(ctx.config.model.decode_policy);
                 let decode_proposal = decode_policy.propose(decode_domain, &decode_ctx)?;
-                let decode_decision = resolve_decode_with_capacity_fallback(
-                    decode_domain,
-                    &decode_proposal,
-                    request_kv_tokens,
-                    snapshot,
-                )?;
+                let decode_decision = if allow_capacity_fallback {
+                    resolve_decode_with_capacity_fallback(
+                        decode_domain,
+                        &decode_proposal,
+                        request_kv_tokens,
+                        snapshot,
+                    )
+                } else {
+                    resolve_decode(decode_domain, &decode_proposal, request_kv_tokens, snapshot)
+                }?;
                 tracing::debug!(
                     model = %model_str,
                     policy = ?ctx.config.model.decode_policy,
@@ -638,6 +670,14 @@ pub async fn chat_completions(
                     "decode policy decision",
                 );
                 Some(decode_decision.selected)
+            };
+        decode_domains
+            .iter()
+            .find_map(|domain| select_decode_in_domain(domain, false))
+            .or_else(|| {
+                decode_domains
+                    .iter()
+                    .find_map(|domain| select_decode_in_domain(domain, true))
             })
             .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
                 model: model_str.clone(),

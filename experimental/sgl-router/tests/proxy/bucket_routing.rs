@@ -16,6 +16,7 @@ use sgl_router::config::{
     SloBucketPolicy, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
@@ -24,7 +25,7 @@ use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
 fn bucket(id: &str, stage: BucketStage, rank: u32, worker_id: &str) -> BucketSpec {
@@ -216,6 +217,32 @@ fn worker_spec(id: &str, url: String, mode: WorkerMode) -> WorkerSpec {
     }
 }
 
+fn set_native_load(
+    ctx: &AppContext,
+    worker_url: &str,
+    num_total_tokens: u64,
+    max_total_num_tokens: u64,
+) {
+    ctx.engine_load.set(
+        worker_url,
+        0,
+        LoadStat {
+            num_running_reqs: 0,
+            num_waiting_reqs: 0,
+            num_tokens: num_total_tokens,
+            max_total_num_tokens,
+            native_cache: Some(NativeCacheRankLoad {
+                num_waiting_uncached_tokens: 0,
+                num_total_tokens,
+                max_running_requests: 64,
+                total_prefill_uncached_tokens: 1,
+                total_prefill_busy_us: 1,
+            }),
+        },
+        Instant::now(),
+    );
+}
+
 fn chat_request(ttft_slo_ms: Option<u64>, max_tokens: Option<u64>) -> Request<Body> {
     chat_request_with_content("bucket routing", ttft_slo_ms, max_tokens, None)
 }
@@ -322,6 +349,46 @@ async fn prefill_slo_first_uses_eligible_ttft_bucket_before_lower_rank_bucket() 
 }
 
 #[tokio::test]
+async fn prefill_tries_later_compatible_bucket_before_capacity_fallback() {
+    let full = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let available = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let bucket_config = BucketConfig {
+        buckets: vec![
+            bucket("p-full", BucketStage::Prefill, 10, "p-full"),
+            bucket("p-available", BucketStage::Prefill, 20, "p-available"),
+            bucket("d", BucketStage::Decode, 30, "d"),
+        ],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    };
+    let ctx = build_ctx(
+        vec![
+            worker_spec("p-full", full.url.clone(), WorkerMode::Prefill),
+            worker_spec("p-available", available.url.clone(), WorkerMode::Prefill),
+            worker_spec("d", decode.url.clone(), WorkerMode::Decode),
+        ],
+        bucket_config,
+        PolicyKind::PowerOfTwo,
+        None,
+    );
+    set_native_load(&ctx, &full.url, 100, 100);
+    set_native_load(&ctx, &available.url, 0, 10_000);
+
+    let response = build_router(ctx)
+        .oneshot(chat_request(None, Some(16)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_prefill(&available).await;
+    assert!(
+        full.captured.lock().unwrap().last_body.is_none(),
+        "capacity fallback must wait until all compatible prefill buckets are exhausted"
+    );
+}
+
+#[tokio::test]
 async fn decode_bucket_uses_input_plus_requested_output_budget() {
     let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let short_decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
@@ -370,6 +437,49 @@ async fn decode_bucket_uses_input_plus_requested_output_budget() {
     assert!(
         short_decode.captured.lock().unwrap().last_body.is_none(),
         "the incompatible short Decode Bucket must not receive the request"
+    );
+}
+
+#[tokio::test]
+async fn decode_tries_later_compatible_bucket_before_capacity_fallback() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let full = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let available = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let bucket_config = BucketConfig {
+        buckets: vec![
+            bucket("p", BucketStage::Prefill, 10, "p"),
+            bucket("d-full", BucketStage::Decode, 20, "d-full"),
+            bucket("d-available", BucketStage::Decode, 30, "d-available"),
+        ],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    };
+    let ctx = build_ctx(
+        vec![
+            worker_spec("p", prefill.url.clone(), WorkerMode::Prefill),
+            worker_spec("d-full", full.url.clone(), WorkerMode::Decode),
+            worker_spec("d-available", available.url.clone(), WorkerMode::Decode),
+        ],
+        bucket_config,
+        PolicyKind::PowerOfTwo,
+        None,
+    );
+    set_native_load(&ctx, &full.url, 100, 100);
+    set_native_load(&ctx, &available.url, 0, 10_000);
+
+    let response = build_router(ctx)
+        .oneshot(chat_request(None, Some(16)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-sgl-decode-url")
+            .and_then(|value| value.to_str().ok()),
+        Some(available.url.as_str()),
+        "capacity fallback must wait until all compatible decode buckets are exhausted"
     );
 }
 
