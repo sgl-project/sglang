@@ -1422,7 +1422,16 @@ class OpenAIServingChat(OpenAIServingBase):
             if messages[0]["role"] != "system":
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
-            if request.tools:
+            if request.tool_choice == "none":
+                # tool_choice="none" disables tool use: strip tool schemas from
+                # both request-level and message-level tools so the DSV4/DSV32
+                # encoder does not render TOOLS_TEMPLATE into the system prompt.
+                # Without this, the model sees tool definitions and may emit DSML
+                # markup that the output parser (also disabled for "none") will
+                # not intercept, leaking raw DSML into message.content.
+                for message in messages:
+                    message.pop("tools", None)
+            elif request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
 
             # Default encoding (dsv4/dsv32)
