@@ -35,6 +35,7 @@ from sglang.srt.observability.metrics_collector import (
     ExpertDispatchCollector,
     RadixCacheMetricsCollector,
     SchedulerMetricsCollector,
+    StorageMetrics,
     StorageMetricsCollector,
     TokenizerMetricsCollector,
     resolve_collector_class,
@@ -180,6 +181,12 @@ class TestDefaultBackend(unittest.TestCase):
 
 
 class TestHiCacheMetrics(unittest.TestCase):
+    @staticmethod
+    def _storage_metrics(prefetch_stats):
+        metrics = StorageMetrics()
+        metrics.prefetch_stats = prefetch_stats
+        return metrics
+
     def test_cached_tokens_uses_literal_storage_source(self):
         labels = {"model_name": "test"}
         with get_context().override_server_args(
@@ -222,6 +229,38 @@ class TestHiCacheMetrics(unittest.TestCase):
             collector.storage_prefetch_unfulfilled_tokens_total.increments,
             [({**labels, "reason": "storage_transfer"}, 4)],
         )
+
+    def test_storage_prefetch_outcomes_export_monotonic_deltas(self):
+        labels = {"model_name": "test"}
+        collector = _RecordingStorageMetricsCollector(labels=labels)
+
+        first = {"attempts": 2, "issued": 1, "revoked_full_miss": 1}
+        collector.log_storage_metrics(self._storage_metrics(first))
+        collector.log_storage_metrics(self._storage_metrics(first))
+
+        collector.log_storage_metrics(
+            self._storage_metrics(
+                {
+                    "attempts": 3,
+                    "issued": 2,
+                    "declined_rate_limited": 1,
+                    "revoked_full_miss": 1,
+                }
+            )
+        )
+        collector.log_storage_metrics(
+            self._storage_metrics({"attempts": 1, "issued": 1})
+        )
+
+        totals = {}
+        for metric_labels, value in collector.prefetch_outcomes_total.increments:
+            outcome = metric_labels["outcome"]
+            totals[outcome] = totals.get(outcome, 0) + value
+
+        self.assertEqual(totals["attempts"], 4)
+        self.assertEqual(totals["issued"], 3)
+        self.assertEqual(totals["declined_rate_limited"], 1)
+        self.assertEqual(totals["revoked_full_miss"], 1)
 
 
 if __name__ == "__main__":
