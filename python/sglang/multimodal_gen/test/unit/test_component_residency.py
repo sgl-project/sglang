@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyManager,
     ComponentUse,
     ResidencyState,
+    WarmupPhasePeak,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     ComponentResidencyError,
@@ -25,7 +26,17 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
     RealtimeTextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+def _server_args(*, supports_auto_residency=True):
+    return SimpleNamespace(
+        enable_layerwise_nvtx_marker=False,
+        pipeline_config=SimpleNamespace(
+            supports_auto_residency=supports_auto_residency,
+        ),
+    )
 
 
 def test_component_offload_releases_preferred_component_after_request():
@@ -151,7 +162,7 @@ def test_group_warmup_state_requires_every_batch_to_be_warmup():
         _stage_name_mapping={},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = _server_args()
     manager = ComponentResidencyManager(pipeline, server_args)
 
     manager.begin_request(
@@ -172,6 +183,246 @@ class _Stage:
 
     def component_uses(self, server_args, stage_name=None):
         return self.uses
+
+
+def test_warmup_records_use_and_transition_peaks(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    use = ComponentUse("denoise", "transformer")
+    stage = _Stage(use)
+    module = torch.nn.Linear(2, 2)
+    pipeline = SimpleNamespace(
+        modules={"transformer": module},
+        _stage_name_mapping={"denoise": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.strategy_for = Mock(return_value=Mock())
+    manager.refresh_pipeline(pipeline)
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+
+    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=True), server_args)
+    manager.begin_stage()
+    manager.end_stage()
+    manager.finish_request()
+
+    peaks = manager.take_warmup_phase_peaks()
+    inactive_peak = WarmupPhasePeak((), 7)
+    transformer_peak = WarmupPhasePeak(
+        ("transformer",), 7, used_components=("transformer",)
+    )
+    assert peaks["request:before-stage"] == inactive_peak
+    assert peaks["0:denoise:setup"] == inactive_peak
+    assert peaks["0:denoise:transition:idle->transformer"] == transformer_peak
+    assert peaks["0:denoise:use:transformer"] == transformer_peak
+    assert peaks["0:denoise:transition:transformer->idle"] == transformer_peak
+    assert peaks["0:denoise:between"] == inactive_peak
+    # A non-preferred component is being released during cleanup, so it is no
+    # longer part of the placement that follows this transition.
+    assert peaks["request:cleanup:transformer"] == inactive_peak
+    assert peaks["idle"] == WarmupPhasePeak(
+        active_components=(),
+        allocated_bytes=2,
+    )
+
+
+def test_warmup_skips_memory_tracking_for_unsupported_pipeline(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    stage = _Stage()
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args(supports_auto_residency=False)
+    manager = ComponentResidencyManager(pipeline, server_args)
+
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=True), server_args)
+    manager.finish_request()
+
+    assert manager._track_warmup_memory is False
+    assert manager.take_warmup_phase_peaks() == {}
+    device_module.reset_peak_memory_stats.assert_not_called()
+
+
+def test_warmup_records_full_weight_transition_without_preparing(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    stage = _Stage()
+    module = torch.nn.Linear(2, 2)
+    pipeline = SimpleNamespace(
+        modules={"transformer": module},
+        _stage_name_mapping={"lora_switch": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.strategy_for = Mock()
+    manager.refresh_pipeline(pipeline)
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+
+    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=True), server_args)
+    with manager.full_weight_transition(("transformer",)):
+        pass
+
+    assert manager._warmup_phase_peaks[
+        "0:lora_switch:full-weight-transition:transformer"
+    ] == WarmupPhasePeak(
+        (),
+        7,
+        full_weight_transition_components=("transformer",),
+    )
+    assert manager._warmup_phase_key == "0:lora_switch:setup"
+    manager.strategy_for.assert_not_called()
+
+
+def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    first = ComponentUse("stage", "transformer", target_dtype=torch.float16)
+    second = ComponentUse("stage", "transformer", target_dtype=torch.bfloat16)
+    stage = _Stage(first, second)
+    module = torch.nn.Linear(2, 2)
+    pipeline = SimpleNamespace(
+        modules={"transformer": module},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    manager = ComponentResidencyManager(pipeline, server_args)
+    strategy = Mock()
+    manager.strategy_for = Mock(return_value=strategy)
+    manager.refresh_pipeline(pipeline)
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=True), server_args)
+
+    manager.begin_use(first, module=module)
+    manager.begin_use(second, module=module)
+
+    manager._record_warmup_phase_peak()
+    assert manager._warmup_phase_peaks[
+        "0:stage:transition:transformer->transformer"
+    ] == WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
+    assert strategy.prepare_for_use.call_count == 2
+
+
+def test_warmup_attributes_prefetch_peak_to_prefetched_component(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    encoder_use = ComponentUse("encode", "text_encoder")
+    transformer_use = ComponentUse("denoise", "transformer", memory_intensive=True)
+    encode_stage = _Stage(encoder_use)
+    denoise_stage = _Stage(transformer_use)
+    modules = {
+        "text_encoder": torch.nn.Linear(2, 2),
+        "transformer": torch.nn.Linear(2, 2),
+    }
+    pipeline = SimpleNamespace(
+        modules=modules,
+        _stage_name_mapping={
+            "encode": encode_stage,
+            "denoise": denoise_stage,
+        },
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    manager = ComponentResidencyManager(pipeline, server_args)
+    strategy = Mock()
+    strategy.prefetch_for_use.return_value = True
+    manager.strategy_for = Mock(return_value=strategy)
+    manager.refresh_pipeline(pipeline)
+    manager.begin_request(
+        [encode_stage, denoise_stage],
+        SimpleNamespace(is_warmup=True),
+        server_args,
+    )
+
+    manager.before_stage(encode_stage, 0, SimpleNamespace(is_warmup=True), server_args)
+    manager.begin_stage()
+    manager.end_stage()
+    manager.before_stage(denoise_stage, 1, SimpleNamespace(is_warmup=True), server_args)
+
+    assert manager._warmup_phase_peaks[
+        "0:encode:prefetch:transformer"
+    ] == WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
+    assert manager._warmup_phase_peaks["0:encode:between"] == WarmupPhasePeak((), 7)
+
+
+def test_warmup_splits_sequential_component_transition(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    first = ComponentUse("stage", "text_encoder")
+    second = ComponentUse("stage", "transformer")
+    stage = _Stage(first, second)
+    modules = {
+        "text_encoder": torch.nn.Linear(2, 2),
+        "transformer": torch.nn.Linear(2, 2),
+    }
+    pipeline = SimpleNamespace(
+        modules=modules,
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.strategy_for = Mock(return_value=Mock())
+    manager.refresh_pipeline(pipeline)
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=True), server_args)
+
+    manager.begin_use(first)
+    manager.begin_use(second)
+    manager._record_warmup_phase_peak()
+
+    assert manager._warmup_phase_peaks["0:stage:transition:text_encoder->idle"] == (
+        WarmupPhasePeak(("text_encoder",), 7, used_components=("text_encoder",))
+    )
+    assert manager._warmup_phase_peaks["0:stage:transition:idle->transformer"] == (
+        WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
+    )
 
 
 def _manager_for_stage(stage, modules):
