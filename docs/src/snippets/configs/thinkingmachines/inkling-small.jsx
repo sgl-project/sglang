@@ -166,7 +166,7 @@ export const config = {
             "MC_FORCE_MNNVL=1",
             "NCCL_MNNVL_ENABLE=1",
             "NCCL_CUMEM_ENABLE=1",
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "SGLANG_CUSTOM_MEM_POOL=True",
           ],
           envWhen: { hw: ["gb200", "gb300"] } },
       ],

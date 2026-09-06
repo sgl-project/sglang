@@ -193,6 +193,10 @@ class EnvIntWithAlias(_DeprecatedEnvFallback, EnvInt):
     pass
 
 
+class EnvStrWithAlias(_DeprecatedEnvFallback, EnvStr):
+    pass
+
+
 class EnvFloat(EnvField):
     def parse(self, value: str) -> float:
         try:
@@ -751,7 +755,10 @@ class Envs:
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
-    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
+    # KV-cache allocator for PD transfer; shared by the Mooncake and NIXL backends.
+    SGLANG_CUSTOM_MEM_POOL = EnvStrWithAlias(
+        None, deprecated_name="SGLANG_MOONCAKE_CUSTOM_MEM_POOL"
+    )
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
@@ -1747,7 +1754,7 @@ def _invert_bool(value: str) -> str:
 # The single registry for deprecated environment variables, processed once at
 # import by _handle_deprecated_envs(). Add new deprecations here instead of
 # ad-hoc warnings. For a rename where the old name must keep working through a
-# descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
+# descriptor, use EnvBoolWithAlias / EnvIntWithAlias / EnvStrWithAlias instead.
 _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     # Renamed: the value is forwarded to the replacement.
     "SGLANG_GC_LOG": _DeprecatedEnv(replacement="SGLANG_LOG_GC"),
