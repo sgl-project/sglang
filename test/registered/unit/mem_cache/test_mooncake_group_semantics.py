@@ -205,6 +205,8 @@ def _make_config(
     should_split_heads=False,
     tp_rank=0,
     tp_size=1,
+    attn_cp_rank=0,
+    attn_cp_size=1,
     tp_lcm_size=None,
 ):
     extra_config = {
@@ -221,8 +223,8 @@ def _make_config(
         tp_size=tp_size,
         pp_rank=0,
         pp_size=1,
-        attn_cp_rank=0,
-        attn_cp_size=1,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
         is_mla_model=is_mla_model,
         enable_storage_metrics=False,
         is_page_first_layout=True,
@@ -243,6 +245,8 @@ def _make_store(
     should_split_heads=False,
     tp_rank=0,
     tp_size=1,
+    attn_cp_rank=0,
+    attn_cp_size=1,
     tp_lcm_size=None,
 ):
     fake_store_cls = _fake_store_class()
@@ -254,6 +258,8 @@ def _make_store(
         should_split_heads=should_split_heads,
         tp_rank=tp_rank,
         tp_size=tp_size,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
         tp_lcm_size=tp_lcm_size,
     )
 
@@ -362,6 +368,56 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         call = fake_store.batch_put_calls[0]
         self.assertEqual(call["keys"], ["page0__k"])
         self.assertEqual(call["args"][0].group_ids, ["sglang-hicache:page0"])
+
+    def test_mla_cp_ranks_use_distinct_v1_keys(self):
+        store0, fake_store0 = _make_store(
+            is_mla_model=True, attn_cp_rank=0, attn_cp_size=8
+        )
+        store1, fake_store1 = _make_store(
+            is_mla_model=True, attn_cp_rank=1, attn_cp_size=8
+        )
+        store0.register_mem_pool_host(FakeHostKVCache(objects_per_page=1))
+        store1.register_mem_pool_host(FakeHostKVCache(objects_per_page=1))
+
+        self.assertEqual(store0.batch_set_v1(["page0"], torch.tensor([0])), [True])
+        self.assertEqual(store1.batch_set_v1(["page0"], torch.tensor([0])), [True])
+
+        call0 = fake_store0.batch_put_calls[0]
+        call1 = fake_store1.batch_put_calls[0]
+        self.assertEqual(call0["keys"], ["page0_cp0_8_k"])
+        self.assertEqual(call1["keys"], ["page0_cp1_8_k"])
+        self.assertEqual(call0["args"][0].group_ids, ["sglang-hicache:page0:cp0_8"])
+        self.assertEqual(call1["args"][0].group_ids, ["sglang-hicache:page0:cp1_8"])
+
+    def test_mla_cp_ranks_use_distinct_v2_indexer_keys(self):
+        store0, fake_store0 = _make_store(
+            is_mla_model=True, attn_cp_rank=0, attn_cp_size=8
+        )
+        store1, fake_store1 = _make_store(
+            is_mla_model=True, attn_cp_rank=1, attn_cp_size=8
+        )
+        store0.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        store1.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+
+        def make_transfer():
+            return PoolTransfer(
+                name=PoolName.INDEXER,
+                keys=["page0"],
+                host_indices=torch.tensor([0]),
+            )
+
+        self.assertEqual(
+            store0.batch_set_v2([make_transfer()])[PoolName.INDEXER], [True]
+        )
+        self.assertEqual(
+            store1.batch_set_v2([make_transfer()])[PoolName.INDEXER], [True]
+        )
+        call0 = fake_store0.batch_put_calls[0]
+        call1 = fake_store1.batch_put_calls[0]
+        self.assertEqual(call0["keys"], ["page0_cp0_8_indexer"])
+        self.assertEqual(call1["keys"], ["page0_cp1_8_indexer"])
+        self.assertEqual(call0["args"][0].group_ids, ["sglang-hicache:page0:cp0_8"])
+        self.assertEqual(call1["args"][0].group_ids, ["sglang-hicache:page0:cp1_8"])
 
     def test_split_heads_group_ids(self):
         store, fake_store = _make_store(

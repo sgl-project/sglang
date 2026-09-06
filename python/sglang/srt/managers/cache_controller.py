@@ -50,6 +50,11 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def should_skip_mla_storage_backup(config: HiCacheStorageConfig) -> bool:
+    """Skip redundant MLA TP writers only when context parallelism is disabled."""
+    return config.is_mla_model and config.attn_cp_size == 1 and config.tp_rank != 0
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -550,12 +555,9 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        )
+        # MLA KV is TP-replicated without CP, but CP ranks own distinct token
+        # shards and must all publish their part of the cache to storage.
+        self.backup_skip = should_skip_mla_storage_backup(self.storage_config)
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory

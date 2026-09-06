@@ -42,6 +42,13 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
     )
+
+    try:
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer_mla_lf_pf
+    except ImportError:
+        # Added by the companion kernel change; keep this module importable
+        # while downstream builds pick up the new operator.
+        transfer_kv_per_layer_mla_lf_pf = None
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
@@ -386,9 +393,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
-                    raise ValueError(
-                        "Layer-sharded MLA HiCache backup with page_first layout "
-                        "requires the JIT one-layer kernel."
+                    if transfer_kv_per_layer_mla_lf_pf is None:
+                        raise RuntimeError(
+                            "Layer-sharded MLA page-first backup requires the "
+                            "per-layer LF-to-PF kernel."
+                        )
+                    transfer_kv_per_layer_mla_lf_pf(
+                        src=device_pool.kv_buffer[device_layer_id],
+                        dst=self.kv_buffer,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        layer_id=host_layer_id,
+                        item_size=self.token_stride_size,
+                        dst_layout_dim=self.layout_dim,
                     )
             else:
                 raise ValueError(
@@ -424,6 +441,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
         device_indices = self.maybe_dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):
+            # The staged all-layer JIT accepts CPU destination indices, but the
+            # generic per-layer fallback reads both index arrays on the GPU.
+            if (
+                io_backend == "kernel"
+                and self.layout == "page_first"
+                and not self.can_use_jit
+                and not host_indices.is_cuda
+            ):
+                host_indices = host_indices.to(device_indices.device, non_blocking=True)
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend
