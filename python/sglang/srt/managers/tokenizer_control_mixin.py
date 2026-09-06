@@ -455,16 +455,19 @@ class TokenizerControlMixin:
     async def _weight_update_session_call(
         self: TokenizerManager, communicator, obj
     ) -> Tuple[bool, str]:
-        """Run one weight-update session RPC under the same pause-aware locking as
-        update_weights_from_distributed: while the engine is paused the writer lock
-        is already held by whoever paused it, so taking it again would deadlock."""
+        """New, unservable versions share the inference lock; overwrites exclude it."""
         self.auto_create_handle_loop()
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
                 results = await communicator(obj)
         if not is_paused:
-            async with self.model_update_lock.writer_lock:
+            lock = (
+                self.model_update_lock.reader_lock
+                if self._weight_update_new_loras
+                else self.model_update_lock.writer_lock
+            )
+            async with lock:
                 results = await communicator(obj)
         return FanOutCommunicator.merge_results(results)
 
@@ -473,27 +476,123 @@ class TokenizerControlMixin:
         obj: BeginWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        success, message = await self._weight_update_session_call(
-            self.begin_weight_update_communicator, obj
-        )
-        if success:
+        async with self._weight_update_rpc_lock:
+            if self._weight_update_session_open:
+                return False, "A weight-update session is already open"
+            if obj.new_lora_names is not None:
+                if obj.sync_base or not obj.session_id or not obj.new_lora_names:
+                    return (
+                        False,
+                        "New LoRA versions require sync_base=False, names and a session_id",
+                    )
+                if len(set(obj.new_lora_names)) != len(obj.new_lora_names):
+                    return False, "Duplicate new LoRA version names"
+                async with self.lora_update_lock:
+                    try:
+                        self._weight_update_new_loras = (
+                            await self.lora_registry.pending_lora_ids(
+                                obj.new_lora_names
+                            )
+                        )
+                    except ValueError as error:
+                        return False, str(error)
+                    self._weight_update_session_id = obj.session_id
+                    self._weight_update_session_open = True
+            elif obj.session_id is not None:
+                return False, "session_id requires new_lora_names"
             self._weight_update_session_open = True
             self._weight_update_pending_version = None
-        return success, message
+            self._weight_update_session_failed = False
+            try:
+                success, message = await self._weight_update_session_call(
+                    self.begin_weight_update_communicator, obj
+                )
+            except BaseException:
+                self._weight_update_session_failed = True
+                raise
+            if not success:
+                self._weight_update_session_failed = True
+                if not self._weight_update_new_loras:
+                    self._weight_update_session_open = False
+            return success, message
 
     async def end_weight_update(
         self: TokenizerManager,
         obj: EndWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        success, message = await self._weight_update_session_call(
-            self.end_weight_update_communicator, obj
-        )
-        self._weight_update_session_open = False
-        if success:
-            self._update_weight_version_if_provided(self._weight_update_pending_version)
-        self._weight_update_pending_version = None
-        return success, message
+        async with self._weight_update_rpc_lock:
+            if obj.session_id != self._weight_update_session_id:
+                return False, "Weight-update session_id mismatch"
+            if obj.abort and not self._weight_update_new_loras:
+                return False, "Only a new-version LoRA session can be aborted"
+            failed = self._weight_update_session_failed
+            if self._weight_update_new_loras:
+                if failed:
+                    obj.abort = True
+                if not obj.abort and (
+                    obj.expected_lora_checksums is None
+                    or set(obj.expected_lora_checksums)
+                    != set(self._weight_update_new_loras)
+                ):
+                    return (
+                        False,
+                        "New LoRA versions require a complete checksum manifest",
+                    )
+            success, message = await self._weight_update_session_call(
+                self.end_weight_update_communicator, obj
+            )
+            if success and not obj.abort:
+                if self._weight_update_new_loras:
+                    async with self.lora_update_lock:
+                        refs = await self.lora_registry.publish(
+                            self._weight_update_new_loras
+                        )
+                        for ref in refs:
+                            self.lora_ref_cache[ref.lora_name] = ref
+            self._weight_update_session_open = False
+            if success and not obj.abort:
+                self._update_weight_version_if_provided(
+                    self._weight_update_pending_version
+                )
+            self._weight_update_new_loras = {}
+            self._weight_update_session_id = None
+            self._weight_update_pending_version = None
+            self._weight_update_session_failed = False
+            if failed:
+                return False, "Discarded a failed LoRA update session"
+            return success, message
+
+    async def _update_weights_in_session(self: TokenizerManager, communicator, obj):
+        async with self._weight_update_rpc_lock:
+            if obj.session_id != self._weight_update_session_id:
+                return False, "Weight-update session_id mismatch"
+            if self._weight_update_new_loras and (
+                obj.flush_cache
+                or obj.abort_all_requests
+                or obj.weight_version is not None
+            ):
+                return (
+                    False,
+                    "New LoRA versions cannot flush, abort requests or change the base version",
+                )
+            if obj.abort_all_requests:
+                self.abort_request(abort_all=True)
+            try:
+                success, message = await self._weight_update_session_call(
+                    communicator, obj
+                )
+            except BaseException:
+                self._weight_update_session_failed = True
+                raise
+            if not success:
+                self._weight_update_session_failed = True
+            if success and obj.flush_cache and self.mm_processor is not None:
+                self.mm_processor.clear_preprocess_cache()
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
+            return success, message
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
@@ -505,27 +604,9 @@ class TokenizerControlMixin:
             get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
-
-        # Hold is_pause_cond while updating to prevent unpause from racing.
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
+        return await self._update_weights_in_session(
+            self.update_weights_from_distributed_communicator, obj
+        )
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
@@ -565,30 +646,13 @@ class TokenizerControlMixin:
             get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
-
         obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
             obj.serialized_named_tensors
         )
 
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.flush_cache and self.mm_processor is not None:
-            self.mm_processor.clear_preprocess_cache()
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
+        return await self._update_weights_in_session(
+            self.update_weights_from_tensor_communicator, obj
+        )
 
     async def update_weights_from_ipc(
         self: TokenizerManager,
@@ -597,6 +661,8 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         """Update weights via IPC for checkpoint-engine integration."""
         self.auto_create_handle_loop()
+        if self._weight_update_new_loras:
+            return False, "Checkpoint-engine IPC cannot join a new-version LoRA session"
         try:
             # For now, we only support single data parallel instance
             assert (
@@ -755,6 +821,11 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
+            if obj.defer_publish and self.server_args.pp_size != 1:
+                raise ValueError(
+                    "Deferred LoRA publication requires pp_size=1; "
+                    "cross-stage commit acknowledgement is not supported"
+                )
             assert (
                 get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
@@ -766,14 +837,22 @@ class TokenizerControlMixin:
                 )
             async with self.lora_update_lock:
                 self._validate_lora_upsert_supported()
+                if (
+                    obj.defer_publish
+                    and await self.lora_registry.get_lora_id(obj.lora_name) is not None
+                ):
+                    raise ValueError(
+                        f"New LoRA version {obj.lora_name!r} already exists"
+                    )
                 new_adapter, reused = await self.lora_registry.register_or_reuse(
                     LoRARef(
                         lora_name=obj.lora_name,
                         lora_path="__stream__",
                         pinned=obj.pinned,
                         reloadable=False,
+                        ready=not obj.defer_publish,
                     ),
-                    upsert=True,
+                    upsert=not obj.defer_publish,
                 )
                 # No path to reload a streamed adapter from: eviction would lose the
                 # only engine-side copy, so the cap rejects new names instead.
@@ -801,6 +880,7 @@ class TokenizerControlMixin:
                     else:
                         await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+                    result.pending = obj.defer_publish
                 return result
         except ValueError as e:
             return RegisterLoRAAdapterReqOutput(
@@ -834,6 +914,10 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if obj.lora_name in self._weight_update_new_loras:
+                    raise ValueError(
+                        f"LoRA adapter {obj.lora_name!r} has an open update session"
+                    )
                 result = await self._unload_lora_adapter_locked(obj)
                 # Explicit unload is a DELETE: drop the reload-catalog entry too.
                 # The max_loaded_loras LRU loop calls _unload_lora_adapter_locked

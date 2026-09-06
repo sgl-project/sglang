@@ -1413,34 +1413,64 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.destroy_weights_update_group(obj, None)
         )
 
-    def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
+    def begin_weight_update(
+        self,
+        selector: str = "all",
+        sync_base: bool = True,
+        *,
+        new_lora_names: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+    ):
         """Open a weight-update session: unpack in-place-quantized weights on the
         selected runners so update_weights_from_{distributed,tensor} can load into
         them. sync_base=False declares an adapter-only session (no unpack; base
         tensors rejected). Must be closed with end_weight_update()."""
-        obj = BeginWeightUpdateReqInput(selector=selector, sync_base=sync_base)
+        obj = BeginWeightUpdateReqInput(
+            selector=selector,
+            sync_base=sync_base,
+            new_lora_names=new_lora_names,
+            session_id=session_id,
+        )
         return self.loop.run_until_complete(
             self.tokenizer_manager.begin_weight_update(obj, None)
         )
 
-    def end_weight_update(self, expected_lora_checksums: Optional[Dict] = None):
+    def end_weight_update(
+        self,
+        expected_lora_checksums: Optional[Dict] = None,
+        *,
+        session_id: Optional[str] = None,
+        abort: bool = False,
+    ):
         """Close the session opened by begin_weight_update(): finalize quantized
         weights into kernel layout (sync_base sessions) and apply the streamed
         LoRA stash (optionally checksum-verified)."""
-        obj = EndWeightUpdateReqInput(expected_lora_checksums=expected_lora_checksums)
+        obj = EndWeightUpdateReqInput(
+            expected_lora_checksums=expected_lora_checksums,
+            session_id=session_id,
+            abort=abort,
+        )
         return self.loop.run_until_complete(
             self.tokenizer_manager.end_weight_update(obj, None)
         )
 
     def register_lora_adapter(
-        self, lora_name: str, config_dict: Dict, pinned: bool = False
+        self,
+        lora_name: str,
+        config_dict: Dict,
+        pinned: bool = False,
+        *,
+        defer_publish: bool = False,
     ):
         """Create-or-refresh a LoRA adapter's identity and config. Weights are
         untouched by the caller (new adapters start zeroed); the bytes arrive as
         '{lora_name}:{hf_key}'-prefixed tensors in the update_weights_from_*
         stream and are applied at end_weight_update."""
         obj = RegisterLoRAAdapterReqInput(
-            lora_name=lora_name, config_dict=config_dict, pinned=pinned
+            lora_name=lora_name,
+            config_dict=config_dict,
+            pinned=pinned,
+            defer_publish=defer_publish,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.register_lora_adapter(obj, None)
@@ -1454,6 +1484,7 @@ class Engine(EngineScoreMixin, EngineBase):
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
         load_format: Optional[str] = None,
+        session_id: Optional[str] = None,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -1463,6 +1494,7 @@ class Engine(EngineScoreMixin, EngineBase):
             group_name=group_name,
             flush_cache=flush_cache,
             load_format=load_format,
+            session_id=session_id,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
@@ -1476,6 +1508,7 @@ class Engine(EngineScoreMixin, EngineBase):
         ],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        session_id: Optional[str] = None,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
@@ -1486,6 +1519,7 @@ class Engine(EngineScoreMixin, EngineBase):
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
             flush_cache=flush_cache,
+            session_id=session_id,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)

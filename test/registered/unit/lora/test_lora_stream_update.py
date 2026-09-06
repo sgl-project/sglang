@@ -2,7 +2,7 @@
 whole-adapter apply at end_weight_update."""
 
 import unittest
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -13,7 +13,12 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.io_struct import LoRAUpdateOutput
+from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    EndWeightUpdateReqInput,
+    LoRAUpdateOutput,
+    UpdateWeightsFromTensorReqInput,
+)
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _sha256_tensor,
@@ -263,10 +268,6 @@ class TestLoRAManagerStreamEntryPoints(CustomTestCase):
         self.assertIn("unregistered", result.error_message)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestWeightVersionDeferredToCommit(CustomTestCase):
     """Inside a session the version reported by a bucket must not reach the
     scheduler until end_weight_update commits; a failed commit drops it."""
@@ -297,3 +298,111 @@ class TestWeightVersionDeferredToCommit(CustomTestCase):
         mgr.scheduler.record_weight_version_change.assert_called_once_with(
             new_version="7"
         )
+
+
+class TestNewVersionStreamGuards(CustomTestCase):
+    def setUp(self):
+        self.barrier = patch("torch.distributed.barrier")
+        self.barrier.start()
+        self.addCleanup(self.barrier.stop)
+        reductions = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.monkey_patch_torch_reductions"
+        )
+        reductions.start()
+        self.addCleanup(reductions.stop)
+        self.manager = _make_manager(scheduler=Mock())
+        self.manager.tp_worker.ps.tp_rank = 0
+        self.lora = self.manager.tp_worker.model_runner.lora_manager
+        self.lora.apply_streamed_adapter.return_value = LoRAUpdateOutput(success=True)
+        result = self.manager.begin_weight_update(
+            BeginWeightUpdateReqInput(
+                sync_base=False, new_lora_names=["A@2"], session_id="fresh"
+            )
+        )
+        self.assertTrue(result.success)
+
+    def _send(self, tensors, **kwargs):
+        return self.manager.update_weights_from_tensor(
+            UpdateWeightsFromTensorReqInput(
+                serialized_named_tensors=[MultiprocessingSerializer.serialize(tensors)],
+                **({"session_id": "fresh", "flush_cache": False} | kwargs),
+            )
+        )
+
+    def test_two_buckets_apply_only_the_new_version_at_end(self):
+        a, b = torch.ones(2), torch.zeros(2)
+        self.assertTrue(self._send([(f"A@2:{LORA_A}", a)]).success)
+        self.assertTrue(self._send([(f"A@2:{LORA_B}", b)]).success)
+        self.lora.apply_streamed_adapter.assert_not_called()
+        result = self.manager.end_weight_update(
+            EndWeightUpdateReqInput(
+                session_id="fresh",
+                expected_lora_checksums={
+                    "A@2": {LORA_A: _sha256_tensor(a), LORA_B: _sha256_tensor(b)}
+                },
+            )
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(self.lora.apply_streamed_adapter.call_args.args[0], "A@2")
+        self.manager.flush_cache.assert_not_called()
+        self.manager.tp_worker.model_runner.begin_weight_update.assert_not_called()
+        self.manager.tp_worker.model_runner.end_weight_update.assert_not_called()
+
+    def test_base_and_other_adapters_are_rejected_before_any_mutation(self):
+        for name in (BASE_NAME, f"A@1:{LORA_A}", f"B:{LORA_A}", f"C:{LORA_A}"):
+            result = self._send([(name, torch.ones(2))])
+            self.assertFalse(result.success)
+            self.assertEqual(self.manager._lora_stash, {})
+        self.lora.apply_streamed_adapter.assert_not_called()
+        self.manager.tp_worker.model_runner.weight_updater.update_weights_from_tensor.assert_not_called()
+        self.manager.flush_cache.assert_not_called()
+
+    def test_foreign_session_is_rejected_before_stashing(self):
+        self.assertFalse(
+            self._send([(f"A@2:{LORA_A}", torch.ones(2))], session_id="foreign").success
+        )
+        self.assertEqual(self.manager._lora_stash, {})
+
+    def test_ipc_stash_owns_tensors_after_bucket_acknowledgement(self):
+        tensor = torch.ones(2)
+        self.assertTrue(self._send([(f"A@2:{LORA_A}", tensor)]).success)
+        tensor.zero_()
+        self.assertTrue(
+            torch.equal(self.manager._lora_stash["A@2"][LORA_A], torch.ones(2))
+        )
+
+    def test_nonzero_tp_rank_failure_prevents_successful_commit(self):
+        tensor = torch.ones(2)
+        self.assertTrue(self._send([(f"A@2:{LORA_A}", tensor)]).success)
+
+        def gather(results, local, **kwargs):
+            results[:] = [local, (False, "other TP rank failed")]
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_gather_object", side_effect=gather),
+        ):
+            result = self.manager.end_weight_update(
+                EndWeightUpdateReqInput(
+                    session_id="fresh",
+                    expected_lora_checksums={"A@2": {LORA_A: _sha256_tensor(tensor)}},
+                )
+            )
+        self.assertFalse(result.success)
+        self.assertIn("TP rank 1", result.message)
+        self.manager.scheduler.record_weight_version_change.assert_not_called()
+
+    def test_abort_discards_without_applying(self):
+        self.assertTrue(self._send([(f"A@2:{LORA_A}", torch.ones(2))]).success)
+        self.assertTrue(
+            self.manager.end_weight_update(
+                EndWeightUpdateReqInput(session_id="fresh", abort=True)
+            ).success
+        )
+        self.lora.apply_streamed_adapter.assert_not_called()
+        self.assertEqual(self.manager._lora_stash, {})
+
+
+if __name__ == "__main__":
+    unittest.main()
