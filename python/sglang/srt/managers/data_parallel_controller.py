@@ -297,6 +297,30 @@ class DataParallelController:
             self.max_dp_size,
         )
 
+    def remove_elastic_workers(self, slot_offset: int, slot_count: int):
+        """Deactivate retired slots (keeps ZMQ sockets bound for future grow-into-slot)."""
+        end = slot_offset + slot_count
+        if end > self.max_dp_size:
+            raise ValueError(
+                f"remove_elastic_workers: {slot_offset}+{slot_count} > {self.max_dp_size}"
+            )
+        for slot in range(slot_offset, end):
+            if not self.dp_active[slot]:
+                continue
+            self.dp_active[slot] = False
+            self.status[slot] = False
+        self._refresh_active_workers()
+
+    def _dispatch_elastic_scale_update(self, msg: ElasticScaleUpdateReq) -> None:
+        # A failure report carries no slots (it defaults to grow/0/0), so routing
+        # must not move on it.
+        if not msg.success:
+            return
+        if msg.direction == "shrink":
+            self.remove_elastic_workers(msg.slot_offset, msg.slot_count)
+        else:
+            self.add_elastic_workers(msg.slot_offset, msg.slot_count)
+
     def _refresh_active_workers(self) -> None:
         self._active_workers = [
             i for i, active in enumerate(self.dp_active) if active and self.status[i]
@@ -356,12 +380,7 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
-                (
-                    ElasticScaleUpdateReq,
-                    lambda msg: self.add_elastic_workers(
-                        msg.slot_offset, msg.slot_count
-                    ),
-                ),
+                (ElasticScaleUpdateReq, self._dispatch_elastic_scale_update),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -445,7 +464,7 @@ class DataParallelController:
         Returns:
             List of worker ports (same on all nodes after broadcast).
         """
-        is_joiner = server_args.is_ep_scale_joiner
+        is_joiner = server_args.is_ep_offset_joiner
         if server_args.dist_init_addr is None or is_joiner:
             na = NetworkAddress(
                 server_args.host or "127.0.0.1",
@@ -557,8 +576,8 @@ class DataParallelController:
             bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
 
         worker_ports = []
-        if server_args.is_ep_scale_joiner:
-            # Scale joiners connect to their pre-bound primary worker sockets.
+        if server_args.is_ep_offset_joiner:
+            # Offset joiners connect to their pre-bound primary worker sockets.
             primary = NetworkAddress.parse(server_args.dist_init_addr)
             primary_endpoint = NetworkAddress(
                 primary.host, primary.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
@@ -622,8 +641,8 @@ class DataParallelController:
 
         nnodes_per_tp_group = nnodes_per_pp_rank
         tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-        if server_args.is_ep_scale_joiner:
-            # Scale joiners enumerate their full local TP span.
+        if server_args.is_ep_offset_joiner:
+            # Offset joiners enumerate their full local TP span.
             tp_rank_range = range(server_args.tp_size)
             tp_size_per_node = server_args.tp_size
         else:
@@ -651,8 +670,8 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
-                    if server_args.is_ep_scale_joiner:
-                        # Scale-joiner outputs return through the primary tokenizer.
+                    if server_args.is_ep_offset_joiner:
+                        # Offset-joiner outputs return through the primary tokenizer.
                         primary_addr = NetworkAddress.parse(server_args.dist_init_addr)
                         primary_port_base = primary_addr.port + 1
                         rank_port_args.tokenizer_ipc_name = NetworkAddress(
@@ -858,7 +877,7 @@ def run_data_parallel_controller_process(
             }
         )
         # The primary owns routing for the expanded scheduler set.
-        if server_args.node_rank == 0 and not server_args.is_ep_scale_joiner:
+        if server_args.node_rank == 0 and not server_args.is_ep_offset_joiner:
             controller.event_loop()
         for proc in controller.scheduler_procs:
             proc.join()

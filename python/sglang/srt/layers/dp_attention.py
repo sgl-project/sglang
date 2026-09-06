@@ -373,7 +373,7 @@ def initialize_dp_attention(
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
         _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
-        if server_args.is_ep_scale_joiner:
+        if server_args.is_ep_offset_joiner:
             dp.joiner_skip_all_gather = True
 
     _DpGatheredBufferWrapper.set_metadata(
