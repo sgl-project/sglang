@@ -405,7 +405,7 @@ class ServerManager:
             "--log-level=debug",
         ]
         if self.extra_args.strip():
-            command.extend(self.extra_args.strip().split())
+            command.extend(shlex.split(self.extra_args))
         access_log_exclude_flag = "--uvicorn-access-log-exclude-prefixes"
         if not any(arg.startswith(access_log_exclude_flag) for arg in command):
             command.extend(["--uvicorn-access-log-exclude-prefixes", "/health"])
@@ -590,6 +590,7 @@ class PerformanceValidator:
         summary: PerformanceSummary,
         expected_load_peak_vram_mb: float,
         expected_runtime_peak_vram_mb: float,
+        expected_warmup_peak_vram_mb: float | None = None,
         expected_load_peak_allocated_mb: float | None = None,
         expected_runtime_peak_allocated_mb: float | None = None,
     ) -> None:
@@ -611,6 +612,16 @@ class PerformanceValidator:
             expected_allocated=expected_runtime_peak_allocated_mb,
             tolerance=self.tolerances.runtime_peak_vram,
         )
+        # the full-shape warmup probe keeps its own budget, separate from serving
+        if expected_warmup_peak_vram_mb is not None and summary.warmup_peak_vram_mb > 0:
+            self._assert_le(
+                "Warmup Peak VRAM",
+                summary.warmup_peak_vram_mb,
+                expected_warmup_peak_vram_mb,
+                self.tolerances.runtime_peak_vram,
+                min_abs_tolerance=128.0,
+                unit=" MiB",
+            )
 
     def _assert_peak_vram(
         self,
