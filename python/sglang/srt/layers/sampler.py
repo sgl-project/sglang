@@ -851,22 +851,22 @@ def multinomial_with_seed(
     logprobs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor
 ) -> torch.Tensor:
     """
-    Samples n elements from an input tensor `inputs` of shape (n, m) using
+    Samples n elements from an input tensor `logprobs` of shape (n, m) using
     a unique random seed for each row. This is a deterministic batched alternative to
     `torch.multinomial`.
 
     Args:
-        inputs: A float tensor of shape (n, m) representing n categorical
+        logprobs: A float tensor of shape (n, m) representing n categorical
                 distributions with m categories each. The values are treated
                 as weights and do not need to sum to 1.
         seed:   An integer tensor of shape (n,) containing the random seed
-                for each corresponding row in `inputs`.
+                for each corresponding row in `logprobs`.
         positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
 
     Returns:
         A tensor of shape (n,) where the i-th element is an index sampled
-        from the distribution in `inputs[i]` using `seed[i]`.
+        from the distribution in `logprobs[i]` using `seed[i]`.
     """
     n, m = logprobs.shape
     seed = seed.to(torch.uint64)

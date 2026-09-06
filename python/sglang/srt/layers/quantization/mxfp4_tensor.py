@@ -30,7 +30,7 @@ class MXFP4QuantizeUtil:
         """Converting a tensor to a quantized format based on MXFP4 quantization. Only E4M3 is supported.
         Args:
             input (torch.Tensor): The input tensor to be quantized.
-            block_sizes (dict | None): The block sizes for quantization.
+            block_size (int | None): The block size for quantization.
         """
 
         def cast_fp4(x):
