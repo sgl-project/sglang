@@ -43,6 +43,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
+from sglang.srt.utils import is_gfx95_supported
+
+# Triton only accepts TF32 input precision on Ampere-or-newer NVIDIA GPUs.
+_DEFAULT_DOT_PRECISION = "tf32" if is_tf32_supported else "ieee"
+_IS_GFX95 = is_gfx95_supported()
+
 
 @triton.jit
 def gdn_replayssm_spec_circular_kernel(
@@ -1259,9 +1266,9 @@ def gdn_replayssm_spec_decode(
     scale: float | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
-    block_v: int = 64,
+    block_v: int | None = None,
     num_warps: int = 1,
-    num_stages: int = 2,
+    num_stages: int | None = None,
     nk: int = 2,
     bs_min: int = 4,
     block_v_flush: int = 64,
@@ -1269,7 +1276,7 @@ def gdn_replayssm_spec_decode(
     num_stages_flush: int = 2,
     nk_flush: int = 2,
     launch_mode: str = "both",
-    dot_precision: str = "tf32",
+    dot_precision: str = _DEFAULT_DOT_PRECISION,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1286,6 +1293,26 @@ def gdn_replayssm_spec_decode(
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
+    batch_size = query_start_loc.shape[0] - 1
+    # At the Qwen3.5 MTP shape, one wide V tile avoids duplicating q/k and gate
+    # work across two programs on gfx950. Keep explicit tuning authoritative.
+    use_gfx95_wide_v = (
+        block_v is None
+        and num_stages is None
+        and (
+            _IS_GFX95
+            and batch_size >= 32
+            and max_cache_len == 16
+            and max_spec_len == 4
+            and q.shape[-1] == 128
+            and v.shape[-1] == 128
+        )
+    )
+    if use_gfx95_wide_v:
+        block_v, num_stages = 128, 1
+    else:
+        block_v = 64 if block_v is None else block_v
+        num_stages = 2 if num_stages is None else num_stages
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
 
