@@ -8,6 +8,8 @@ import torch
 
 from sglang.srt.layers.dcp import comm as dcp_comm
 from sglang.srt.layers.dcp import planner as dcp_planner
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -89,6 +91,93 @@ class TestDSADCPMetadataPlanner(CustomTestCase):
                 torch.testing.assert_close(
                     metadata.dcp_local_prefix_kv_indices,
                     torch.tensor([0, 2], dtype=torch.int32),
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_indexer_cache_covers_widened_allocator_padding(self):
+        size = 4 * 64
+        page_size = 64
+        dcp_size = 8
+        with get_parallel().override(
+            dcp_enabled=True,
+            attn_dcp_size=dcp_size,
+        ):
+            pool = DSATokenToKVPool(
+                size=size,
+                page_size=page_size,
+                kv_lora_rank=KV_LORA_RANK,
+                dtype=torch.bfloat16,
+                qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+                layer_num=1,
+                device="cpu",
+                index_head_dim=128,
+                enable_memory_saver=False,
+                kv_cache_dim=RAW_KV_ROW_WIDTH,
+            )
+
+        indexer_capacity = pool.index_k_with_scale_buffer[0].shape[0] * page_size
+        self.assertEqual(indexer_capacity, (size + page_size) * dcp_size)
+
+    def test_flashmla_metadata_uses_kernel_head_bucket(self):
+        from sglang.srt.layers.attention.dsa_backend import (
+            DeepseekSparseAttnBackend,
+        )
+
+        backend = object.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_index_topk = 2048
+        cache_seqlens = torch.ones(2, dtype=torch.int32)
+        # Default decode heads may differ from an explicit CP-prefill layout.
+        for decode_heads, prefill_heads, expected in (
+            (128, None, 128),
+            (32, None, 64),
+            (32, 128, 128),
+            (8, None, 64),
+        ):
+            with (
+                self.subTest(decode=decode_heads, prefill=prefill_heads),
+                patch(
+                    "sgl_kernel.flash_mla.get_mla_metadata", return_value=(None, None)
+                ) as get_metadata,
+            ):
+                backend.flashmla_decode_q_heads = decode_heads
+                backend._compute_flashmla_metadata(
+                    cache_seqlens, seq_len_q=1, num_q_heads=prefill_heads
+                )
+                self.assertEqual(get_metadata.call_args.kwargs["num_heads_q"], expected)
+                self.assertEqual(
+                    get_metadata.call_args.kwargs["num_q_tokens_per_head_k"], expected
+                )
+
+    def test_prefill_page_table_preserves_original_batch_segments(self):
+        from sglang.srt.layers.attention.dsa_backend import (
+            DeepseekSparseAttnBackend,
+        )
+
+        backend = object.__new__(DeepseekSparseAttnBackend)
+        dcp_meta = SimpleNamespace(
+            dcp_kv_indptr=torch.tensor([0, 2, 5, 6], dtype=torch.int32),
+            dcp_kv_indices=torch.tensor([4, 5, 10, 11, 12, 20], dtype=torch.int32),
+        )
+
+        for batch_indices, seq_lens, expected in (
+            (
+                [0, 1, 2],
+                [2, 3, 1],
+                [[4, 5, -1], [10, 11, 12], [20, -1, -1]],
+            ),
+            ([1, 2], [3, 1], [[10, 11, 12], [20, -1, -1]]),
+        ):
+            with self.subTest(batch_indices=batch_indices):
+                page_table = backend._build_dcp_prefill_page_table(
+                    seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+                    dcp_meta=dcp_meta,
+                    selected_batch_indices=batch_indices,
+                )
+
+                torch.testing.assert_close(
+                    page_table,
+                    torch.tensor(expected, dtype=torch.int32),
                     rtol=0,
                     atol=0,
                 )

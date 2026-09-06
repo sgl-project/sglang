@@ -497,6 +497,18 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             server_args._handle_multimodal_feature_transport()
 
 
+class TestDCPValidation(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_dcp_speculative_is_not_rejected_globally(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            dcp_size=8,
+            speculative_algorithm="EAGLE",
+        )
+
+        server_args._handle_dcp_validation()
+
+
 class TestMambaCacheStochasticRounding(unittest.TestCase):
     def test_rejects_fp32_ssm_cache(self):
         server_args = ServerArgs(
@@ -892,6 +904,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             attn_cp_size=1,
             tp_size=1,
             dp_size=1,
+            dcp_size=1,
             moe_dp_size=1,
             ep_size=1,
             pp_size=1,
@@ -965,6 +978,43 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
+
+    def test_dcp_prefill_cp_rejects_zigzag(self):
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            attn_cp_size=2,
+            tp_size=2,
+            dcp_size=2,
+        )
+        for cp_v2 in (False, True):
+            with (
+                self.subTest(cp_v2=cp_v2),
+                envs.SGLANG_ENABLE_CP_V2.override(cp_v2),
+                self.assertRaisesRegex(ValueError, "--cp-strategy interleave"),
+            ):
+                server_args._handle_context_parallelism()
+
+    def test_dcp_cp_strategy_validation_preserves_supported_configs(self):
+        for dcp_size, enable_prefill_cp, cp_strategy in (
+            (2, True, "interleave"),
+            (1, True, "zigzag"),
+            (2, False, None),
+        ):
+            with self.subTest(
+                dcp_size=dcp_size,
+                enable_prefill_cp=enable_prefill_cp,
+                cp_strategy=cp_strategy,
+            ):
+                server_args = self._new_cp_args(
+                    enable_prefill_cp=enable_prefill_cp,
+                    cp_strategy=cp_strategy,
+                    attn_cp_size=2 if enable_prefill_cp else 1,
+                    tp_size=2,
+                    dcp_size=dcp_size,
+                )
+                server_args._handle_context_parallelism()
+                self.assertEqual(is_cp_enabled(), enable_prefill_cp)
 
     def test_registered_cp_legacy_args_map_to_unified_strategy(self):
         cases = [

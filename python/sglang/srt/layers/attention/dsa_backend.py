@@ -350,13 +350,11 @@ class DeepseekSparseAttnBackend(
         self.dcp_enabled = parallel.dcp_enabled
         self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
         self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
-        if self.num_q_heads <= 64:
-            self.flashmla_kv_num_q_heads = 64
-        elif self.num_q_heads <= 128:
-            self.flashmla_kv_num_q_heads = 128
-        else:
-            # Keep original head count if it exceeds current padded variants.
-            self.flashmla_kv_num_q_heads = self.num_q_heads
+        decode_q_heads = self.num_q_heads
+        if parallel.enable_cp_decode_attn_tp:
+            decode_q_heads //= parallel.attn_cp_size
+        # The decode kernel sees the Q head shards gathered across the DCP group.
+        self.flashmla_decode_q_heads = decode_q_heads * self.dcp_size
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
@@ -434,13 +432,22 @@ class DeepseekSparseAttnBackend(
                 )
             if self.hisparse_coordinator is not None:
                 raise ValueError("DSA with DCP does not support HiSparse.")
+            if is_cuda() and model_runner.server_args.speculative_algorithm is not None:
+                raise ValueError(
+                    "DSA with flashmla_kv DCP does not currently support "
+                    "speculative decoding on CUDA. Disable speculative decoding "
+                    "or set --dcp-size 1."
+                )
             if model_runner.server_args.enable_dp_attention:
                 # Keep each DCP group inside one attention-DP shard so the
                 # replicated indexer sees identical requests group-wide.
-                if parallel.attn_tp_size % self.dcp_size != 0:
+                attn_dp_shard_size = parallel.attn_tp_size * parallel.attn_cp_size
+                if attn_dp_shard_size % self.dcp_size != 0:
                     raise ValueError(
-                        f"dcp_size ({self.dcp_size}) must divide attn_tp_size "
-                        f"({parallel.attn_tp_size}) under dp-attention."
+                        f"dcp_size ({self.dcp_size}) must divide the attention-DP "
+                        f"shard size ({attn_dp_shard_size} = attn_tp_size "
+                        f"{parallel.attn_tp_size} * attn_cp_size "
+                        f"{parallel.attn_cp_size})."
                     )
             if self.use_fused_topk:
                 # The fused v2 transform does not yet compose with DCP owner
@@ -868,6 +875,7 @@ class DeepseekSparseAttnBackend(
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
         # a default value of None indicates that all sequences are selected.
         bs_idx_cpu = None
+        bs_idx = None
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
@@ -1093,7 +1101,9 @@ class DeepseekSparseAttnBackend(
             if dcp_meta is None or dcp_meta.dcp_kv_buffer is None:
                 raise RuntimeError("DSA CP+DCP prefill requires a gathered KV buffer.")
             dcp_page_table_1 = self._build_dcp_prefill_page_table(
-                indexer_seq_lens_cpu, dcp_meta
+                indexer_seq_lens_cpu,
+                dcp_meta,
+                selected_batch_indices=bs_idx,
             )
 
         metadata = DSAMetadata(
@@ -1110,6 +1120,9 @@ class DeepseekSparseAttnBackend(
                 self._compute_flashmla_metadata(
                     cache_seqlens=dsa_cache_seqlens_int32,
                     seq_len_q=1,
+                    num_q_heads=(
+                        self.num_q_heads if dsa_use_prefill_cp(forward_batch) else None
+                    ),
                 )
                 if use_flashmla_kv
                 else None
@@ -1934,24 +1947,27 @@ class DeepseekSparseAttnBackend(
         self,
         seq_lens: torch.Tensor,
         dcp_meta: DecodeContextParallelMetadata,
+        selected_batch_indices: Union[List[int], torch.Tensor],
     ) -> torch.Tensor:
         """Map request-local positions into the CP+DCP gathered KV buffer."""
         kv_indices = dcp_meta.dcp_kv_indices
         kv_indptr = dcp_meta.dcp_kv_indptr
         if kv_indices is None or kv_indptr is None:
             raise RuntimeError("DSA CP+DCP prefill requires KV indices and indptr.")
-        if kv_indptr.numel() != seq_lens.numel() + 1:
-            raise RuntimeError(
-                "DSA CP+DCP KV indptr does not match the selected batch: "
-                f"indptr={kv_indptr.numel()}, batch={seq_lens.numel()}."
-            )
         device = kv_indices.device
+        batch_indices = torch.as_tensor(
+            selected_batch_indices, device=device, dtype=torch.int64
+        )
+        if batch_indices.numel() != seq_lens.numel():
+            raise RuntimeError(
+                "DSA CP+DCP selected batch does not match its sequence lengths: "
+                f"selected={batch_indices.numel()}, batch={seq_lens.numel()}."
+            )
         max_seq_len = max(int(seq_lens.max().item()), 1) if seq_lens.numel() else 1
         seq_lens = seq_lens.to(device=device, dtype=torch.int64)
-        batch_size = seq_lens.numel()
         positions = torch.arange(max_seq_len, device=device, dtype=torch.int64)
         valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
-        flat_offsets = kv_indptr[:-1].to(torch.int64).unsqueeze(1)
+        flat_offsets = kv_indptr.to(torch.int64)[batch_indices].unsqueeze(1)
         flat_offsets = torch.where(valid, flat_offsets + positions, 0)
 
         page_table = torch.full_like(flat_offsets, -1, dtype=torch.int32)
@@ -2927,7 +2943,7 @@ class DeepseekSparseAttnBackend(
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.reshape(q_all.shape[0], 1, -1, layer.head_dim)
         num_q_heads = q_all.shape[2]
-        target_q_heads = self.flashmla_kv_num_q_heads
+        target_q_heads = self._flashmla_q_head_bucket(num_q_heads)
         if target_q_heads != num_q_heads:
             q_input = q_all.new_zeros(
                 q_all.shape[0],
@@ -2943,8 +2959,7 @@ class DeepseekSparseAttnBackend(
         use_packed_fp8_kv = self.dsa_kv_cache_store_fp8
         if use_packed_fp8_kv and kv_cache.dtype != torch.float8_e4m3fn:
             raise RuntimeError(
-                "Packed DSA KV must use torch.float8_e4m3fn, "
-                f"got {kv_cache.dtype}."
+                "Packed DSA KV must use torch.float8_e4m3fn, " f"got {kv_cache.dtype}."
             )
         kv_dim = (
             self.kv_cache_dim
@@ -3553,10 +3568,26 @@ class DeepseekSparseAttnBackend(
             force_unfused_topk=force_unfused,
         )
 
-    def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
+    @staticmethod
+    def _flashmla_q_head_bucket(num_q_heads: int) -> int:
+        if num_q_heads <= 64:
+            return 64
+        if num_q_heads <= 128:
+            return 128
+        return num_q_heads
+
+    def _compute_flashmla_metadata(
+        self,
+        cache_seqlens: torch.Tensor,
+        seq_len_q: int,
+        *,
+        num_q_heads: Optional[int] = None,
+    ):
         from sgl_kernel.flash_mla import get_mla_metadata
 
-        num_heads_q = self.flashmla_kv_num_q_heads
+        if num_q_heads is None:
+            num_q_heads = self.flashmla_decode_q_heads
+        num_heads_q = self._flashmla_q_head_bucket(num_q_heads)
 
         flashmla_metadata, num_splits = get_mla_metadata(
             cache_seqlens=cache_seqlens,

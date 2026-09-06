@@ -4045,12 +4045,6 @@ class ServerArgs:
                 "requires --dcp-size / --decode-context-parallel-size > 1, but "
                 f"got dcp_size={self.dcp_size}."
             )
-        if self.dcp_size > 1 and is_cuda() and self.speculative_algorithm is not None:
-            raise ValueError(
-                "Decode context parallel (--dcp-size > 1) does not currently "
-                "support speculative decoding on CUDA. Disable speculative "
-                "decoding or set --dcp-size 1."
-            )
         if self.dcp_comm_backend == "fi_a2a" and not is_cuda():
             raise ValueError(
                 "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
@@ -6618,6 +6612,16 @@ class ServerArgs:
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(
                 "--cp-strategy must be set when --enable-prefill-cp is enabled."
+            )
+
+        if (
+            self.enable_prefill_cp
+            and self.dcp_size > 1
+            and self.cp_strategy != "interleave"
+        ):
+            raise ValueError(
+                "DCP with prefill CP currently supports only "
+                "--cp-strategy interleave."
             )
 
         if (

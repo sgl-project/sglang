@@ -238,6 +238,59 @@ class TestLSECombineEdgeCases(CustomTestCase):
             triton_result.float().cpu(), expected.cpu(), atol=1e-2, rtol=1e-2
         )
 
+    def test_all_invalid_lse_returns_zero_output(self):
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+
+        partial_outputs = torch.randn(
+            4, 2, 3, 64, device=self.device, dtype=torch.bfloat16
+        )
+        partial_outputs[1].fill_(float("nan"))
+        partial_outputs[2].fill_(float("inf"))
+        partial_lses = torch.full(
+            (4, 2, 3),
+            float("-inf"),
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        for is_base_e in (True, False):
+            with self.subTest(is_base_e=is_base_e):
+                output, lse = dcp_lse_combine_triton(
+                    partial_outputs,
+                    partial_lses,
+                    is_lse_base_on_e=is_base_e,
+                    return_lse=True,
+                )
+
+                self.assertTrue(torch.equal(output, torch.zeros_like(output)))
+                self.assertIsNotNone(lse)
+                self.assertTrue(torch.isneginf(lse).all())
+
+    def test_zero_weight_shards_ignore_nonfinite_outputs(self):
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+
+        outputs = torch.full(
+            (4, 2, 3, 64), float("nan"), device=self.device, dtype=torch.bfloat16
+        )
+        outputs[0].fill_(2.0)
+        outputs[2].fill_(6.0)
+        outputs[3].fill_(float("inf"))
+        lses = torch.full((4, 2, 3), float("-inf"), device=self.device)
+        lses[0].zero_()
+        lses[2].zero_()
+
+        for is_base_e in (True, False):
+            with self.subTest(is_base_e=is_base_e):
+                output, lse = dcp_lse_combine_triton(
+                    outputs, lses, is_lse_base_on_e=is_base_e, return_lse=True
+                )
+
+                torch.testing.assert_close(output, torch.full_like(output, 4.0))
+                self.assertIsNotNone(lse)
+                total_weight = torch.full_like(lse, 2.0)
+                expected_lse = total_weight.log() if is_base_e else total_weight.log2()
+                torch.testing.assert_close(lse, expected_lse)
+
 
 class TestCPUReference(CustomTestCase):
     """Test the CPU reference implementation independently."""
@@ -252,6 +305,41 @@ class TestCPUReference(CustomTestCase):
         result = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=True)
         self.assertEqual(result.shape, (B, H, D))
         self.assertFalse(torch.isnan(result).any())
+
+    def test_all_invalid_lse_returns_zero_output(self):
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
+
+        outputs = torch.randn(4, 2, 3, 8)
+        outputs[1].fill_(float("nan"))
+        outputs[2].fill_(float("inf"))
+        lses = torch.full((4, 2, 3), float("-inf"))
+
+        for is_base_e in (True, False):
+            with self.subTest(is_base_e=is_base_e):
+                result = _lse_weighted_combine_cpu(
+                    outputs, lses, is_lse_base_on_e=is_base_e
+                )
+
+                self.assertTrue(torch.equal(result, torch.zeros_like(result)))
+
+    def test_zero_weight_shards_ignore_nonfinite_outputs(self):
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
+
+        outputs = torch.full((4, 2, 3, 8), float("nan"))
+        outputs[0].fill_(2.0)
+        outputs[2].fill_(6.0)
+        outputs[3].fill_(float("inf"))
+        lses = torch.full((4, 2, 3), float("-inf"))
+        lses[0].zero_()
+        lses[2].zero_()
+
+        for is_base_e in (True, False):
+            with self.subTest(is_base_e=is_base_e):
+                result = _lse_weighted_combine_cpu(
+                    outputs, lses, is_lse_base_on_e=is_base_e
+                )
+
+                torch.testing.assert_close(result, torch.full_like(result, 4.0))
 
     def test_base2_vs_base_e(self):
         from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
