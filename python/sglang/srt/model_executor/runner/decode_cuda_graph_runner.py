@@ -535,14 +535,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
 
-        # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
-        # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
-        # because the full_text_row_masked_out_mask tensor will always be ones
-        is_encoder_lens_supported = (
-            torch.all(forward_batch.encoder_lens > 0)
-            if self.is_encoder_decoder
-            else True
-        )
+        # NOTE: cuda graph cannot handle mixed batch where some requests
+        # have encoder (encoder_lens > 0) and some do not (encoder_lens = 0),
+        # because the cross-attention path differs.  However, a batch where
+        # ALL requests are text-only (encoder_lens all 0) is safe: the graph
+        # was captured with cross-attention included, and at replay time the
+        # full_text_row_masked_out_mask zeros the cross-attention output,
+        # making it equivalent to skipping.  Allow graph replay when encoder
+        # lengths are uniformly zero or uniformly positive, but not mixed.
+        if self.is_encoder_decoder:
+            encoder_lens = forward_batch.encoder_lens
+            is_encoder_lens_supported = bool(
+                (encoder_lens == 0).all() or (encoder_lens > 0).all()
+            )
+        else:
+            is_encoder_lens_supported = True
 
         requested_capture_hidden_mode = max(
             forward_batch.capture_hidden_mode,
