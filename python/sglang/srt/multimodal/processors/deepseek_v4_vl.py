@@ -1,22 +1,8 @@
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0
-"""Multimodal processor for DeepSeek-V4-Flash-Vision-Exp.
-
-Ports the reference preprocessing from the HuggingFace repo
-(deepseek-ai/DeepSeek-V4-Flash-Vision-Exp, inference/image_processor.py):
-
-- each `<｜deepseek_image｜>` placeholder expands into a *variable-length*
-  sentinel block: compress_pad (aligns the block start to COMPRESS_PAD_TO),
-  IMAGE_START, an N-layout grid of IMAGE tokens with one IMAGE_NEW_LINE per
-  row (rows padded to even), trailing pad, IMAGE_END;
-- the block layout (token `types`) and the aligner-row reordering (`perm`)
-  are computed here and passed to the model via
-  MultimodalDataItem.model_specific_data, so the model only needs to run
-  ViT + aligner and scatter the result.
-
-The expanded token count computed here MUST match the number of embeddings
-produced by DeepseekV4ForCausalLM.get_image_feature, or the scheduler's
-length accounting breaks.
+"""DeepSeek-V4 image preprocessing, matching inference/image_processor.py in
+deepseek-ai/DeepSeek-V4-Flash-Vision-Exp. Block lengths must match the wrapper's
+embeddings, including compression padding and sentinels.
 """
 
 import math

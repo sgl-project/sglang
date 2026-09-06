@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.topk import (
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 
@@ -257,13 +258,7 @@ class HashTopK(nn.Module):
             and not skip_image_check
             and not torch.cuda.is_current_stream_capturing()
         ):
-            # The .any() below syncs, which is illegal under CUDA graph
-            # capture. Capture only sees dummy (pad-free) input_ids, and image
-            # batches never replay graphs (prefill-with-image runs eager;
-            # decode input_ids never contain pad sentinels), so skipping the
-            # check during capture is exact.
-            from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
-
+            # CUDA graph capture uses pad-free inputs and cannot synchronize .any().
             image_mask = input_ids >= MM_PAD_SHIFT_VALUE
             if not image_mask.any():
                 image_mask = None

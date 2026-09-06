@@ -1,18 +1,8 @@
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0
-"""DeepSeek-V4-Flash-Vision-Exp: vision-enabled wrapper for DeepseekV4.
+"""DeepSeek-V4 vision wrapper; text checkpoints use the same registry entry.
 
-The HF checkpoint of the vision model reports the same architecture string as
-the text-only model ("DeepseekV4ForCausalLM"), so — following the MiMo-V2
-precedent — this wrapper takes over the EntryClass registration from
-deepseek_v4.py and conditionally builds the vision modules when
-``config.vision_n_layers > 0``. Text-only checkpoints behave exactly as
-before: the wrapper delegates everything to the text model.
-
-Image-embedding layout (see multimodal/processors/deepseek_v4_vl.py):
-each image placeholder expands into a sentinel block of learned vectors
-(image_start / image_pad / image_newline / image_end) with ViT+aligner
-embeddings scattered into the IMAGE slots in N-layout order (via `perm`).
+The processor supplies sentinel types and the aligner permutation for each image.
 """
 
 from typing import Iterable, List, Optional, Tuple
@@ -126,13 +116,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         if forward_batch.contains_mm_inputs():
-            # embed_mm_inputs clamps forward_batch.input_ids in place
-            # (max=vocab_size-1) to embed the placeholder region. The MoE
-            # gate's bias_vl routing keys on the mm pad sentinels in those
-            # ids, so keep a pre-clamp snapshot for it to read. The
-            # image-token mask + host flag are hoisted later by
-            # DeepseekV4Model.forward from input_ids_global (the exact ids
-            # the gate sees — required for dp-attention).
+            # Preserve pad IDs for MoE routing before embedding clamps them.
             forward_batch.dsv4_routing_input_ids = forward_batch.input_ids.clone()
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
@@ -210,15 +194,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return _DeepseekV4TextLM.get_model_config_for_expert_location(config)
 
     def __getattr__(self, name: str):
-        # The wrapper replaces the text model in the registry for every
-        # DeepseekV4 checkpoint, so it must expose the text model's full
-        # public surface (get_embed_and_head for EAGLE,
-        # routed_experts_weights_of_layer for EPLB, start/end_layer for PP,
-        # get_model_config_for_expert_location, ...). Delegate anything that
-        # is not the wrapper's own parameter/buffer/submodule/attribute.
-        # `language_model` itself is resolved through nn.Module machinery so
-        # a miss before __init__ assigns it raises AttributeError instead of
-        # recursing.
+        # Resolve registered modules first; delegate the text model's remaining API.
         try:
             return super().__getattr__(name)
         except AttributeError:

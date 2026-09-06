@@ -1429,7 +1429,11 @@ class DeepseekV4AttnBackend(
         )
         # ``swa_window_size`` on the pool is its storage page size, not the
         # model's SWA window, so pass both explicitly.
-        core_attn_metadata = getattr(self.forward_metadata, "core_attn_metadata", None)
+        core_attn_metadata = (
+            self.forward_metadata.core_attn_metadata
+            if isinstance(self.forward_metadata, DSV4Metadata)
+            else None
+        )
         swa_win_starts = swa_win_lens = None
         if (
             core_attn_metadata is not None
@@ -1674,7 +1678,11 @@ class DeepseekV4AttnBackend(
         translating the zero-padded out_cache_loc writes to the dummy slot.
         """
         out_cache_loc = forward_batch.out_cache_loc
-        core = getattr(self.forward_metadata, "core_attn_metadata", None)
+        core = (
+            self.forward_metadata.core_attn_metadata
+            if isinstance(self.forward_metadata, DSV4Metadata)
+            else None
+        )
         cached = core.swa_out_cache_loc if core is not None else None
         if (
             cached is not None

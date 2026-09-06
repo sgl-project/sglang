@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
+from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_vision
 from sglang.srt.arg_groups.overrides import (
     _page_size_default,
     _pipeline_parallel_overlap_disable,
@@ -361,8 +362,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     validate_deepep_v2_speculative_draft(server_args)
     validate_deepep_v2_dispatch_token_budget(server_args)
-
-    from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_vision
 
     validate_deepseek_v4_vision(server_args)
     server_args._resolution_finished = True

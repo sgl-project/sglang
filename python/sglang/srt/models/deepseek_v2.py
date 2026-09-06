@@ -152,6 +152,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -508,10 +509,7 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = nn.Parameter(correction_bias)
         else:
             self.e_score_correction_bias = None
-        # DeepSeek-V4-Vision: image tokens are selected with bias_vl instead
-        # of the (text) correction bias. The checkpoint carries it on every
-        # MoE layer (hash and non-hash). Text-only configs never set
-        # vision_n_layers, so nothing changes for them.
+        # The vision checkpoint provides a separate routing bias for image tokens.
         self.bias_vl = (
             nn.Parameter(torch.empty(config.n_routed_experts, dtype=torch.float32))
             if getattr(config, "vision_n_layers", 0) > 0
@@ -909,7 +907,7 @@ class DeepseekV2MoE(nn.Module):
             and getattr(self.experts, "use_flashinfer_trtllm_moe", False)
             and not self._enable_a2a_moe
             and not self._fuse_shared_experts_inside_sbo
-            and not getattr(self, "is_hash", False)
+            and not self.is_hash
             and not get_exec().moe.enable_eplb
         )
 
@@ -1013,9 +1011,7 @@ class DeepseekV2MoE(nn.Module):
                 router_logits,
                 input_ids=input_ids_global,
                 image_mask=(
-                    getattr(forward_batch, "dsv4_image_mask", None)
-                    if forward_batch is not None
-                    else None
+                    forward_batch.dsv4_image_mask if forward_batch is not None else None
                 ),
                 forward_batch=forward_batch,
                 expert_location_dispatch_info=dispatch_info,
@@ -1092,23 +1088,11 @@ class DeepseekV2MoE(nn.Module):
         forward_batch=None,
         **kwargs,
     ):
-        """self.topk(...) plus the DeepSeek-V4-Vision bias_vl fallback.
-
-        Hash layers route via HashTopK (image-aware when built with bias_vl).
-        Non-hash layers: image tokens must be selected with gate.bias_vl
-        instead of the 1D correction bias the fused kernels take, so a batch
-        containing image tokens falls back to an eager per-token-bias top-k.
-        Text-only batches and non-vision models keep the fused path
-        bit-identical.
-
-        The image check uses the host-side batch flag
-        (forward_batch.dsv4_has_image_tokens) when available, so text-only
-        batches pay no GPU->CPU sync per layer.
-        """
-        skip_image_check = forward_batch is not None and not getattr(
-            forward_batch, "dsv4_has_image_tokens", False
+        """Use per-token vision bias when the fused router cannot represent it."""
+        skip_image_check = (
+            forward_batch is not None and not forward_batch.dsv4_has_image_tokens
         )
-        if getattr(self, "is_hash", False):
+        if self.is_hash:
             return self.topk(
                 hidden_states,
                 router_logits,
@@ -1124,14 +1108,8 @@ class DeepseekV2MoE(nn.Module):
             and not skip_image_check
             and not torch.cuda.is_current_stream_capturing()
         ):
-            # The .any() below syncs, which is illegal under CUDA graph
-            # capture. Capture only sees dummy (pad-free) input_ids, and image
-            # batches never replay graphs (prefill-with-image runs eager;
-            # decode input_ids never contain pad sentinels), so skipping the
-            # check during capture is exact.
+            # CUDA graph capture uses pad-free inputs and cannot synchronize .any().
             if image_mask is None:
-                from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
-
                 image_mask = input_ids >= MM_PAD_SHIFT_VALUE
                 if not image_mask.any():
                     image_mask = None
@@ -1209,9 +1187,7 @@ class DeepseekV2MoE(nn.Module):
                 router_logits,
                 input_ids=input_ids_global,
                 image_mask=(
-                    getattr(forward_batch, "dsv4_image_mask", None)
-                    if forward_batch is not None
-                    else None
+                    forward_batch.dsv4_image_mask if forward_batch is not None else None
                 ),
                 forward_batch=forward_batch,
                 expert_location_dispatch_info=dispatch_info,
@@ -1398,7 +1374,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 input_ids=input_ids_global,
-                image_mask=getattr(forward_batch, "dsv4_image_mask", None),
+                image_mask=forward_batch.dsv4_image_mask,
                 forward_batch=forward_batch,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=(
@@ -1747,7 +1723,7 @@ class DeepseekV2MoE(nn.Module):
         # Prefer the pre-clamp snapshot: embed_mm_inputs clamps
         # forward_batch.input_ids in place, which would erase the mm pad
         # sentinels the bias_vl routing keys on (EP+TBO+image path).
-        routing_ids = getattr(state.forward_batch, "dsv4_routing_input_ids", None)
+        routing_ids = state.forward_batch.dsv4_routing_input_ids
         if routing_ids is not None:
             if routing_ids.shape[0] < hidden_states.shape[0]:
                 # The child batch may pad input_ids after the slice; pad with
@@ -1772,7 +1748,7 @@ class DeepseekV2MoE(nn.Module):
                         if routing_ids is not None
                         else state.forward_batch.input_ids
                     ),
-                    image_mask=getattr(state.forward_batch, "dsv4_image_mask", None),
+                    image_mask=state.forward_batch.dsv4_image_mask,
                     forward_batch=state.forward_batch,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
                     expert_location_dispatch_info=(

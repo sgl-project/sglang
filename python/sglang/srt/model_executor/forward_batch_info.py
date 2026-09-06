@@ -474,6 +474,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
+    dsv4_routing_input_ids: Optional[torch.Tensor] = None
+    dsv4_image_mask: Optional[torch.Tensor] = None
+    dsv4_has_image_tokens: bool = False
 
     # Encoder-decoder host fields
     encoder_cached: Optional[List[bool]] = None

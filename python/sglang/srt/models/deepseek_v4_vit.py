@@ -1,25 +1,8 @@
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0
-"""Vision tower (ViT) and aligner for DeepSeek-V4-Flash-Vision-Exp.
-
-Ported from the reference implementation in the HuggingFace repo
-(deepseek-ai/DeepSeek-V4-Flash-Vision-Exp, inference/vision.py).
-
-The vision encoder is a plain bidirectional ViT with 2D RoPE:
-  - linear patch embedding (patch_size=14, no conv)
-  - pre-norm blocks: RMSNorm(fp32) -> full attention(2D RoPE) -> RMSNorm -> SwiGLU MLP
-  - final RMSNorm
-The aligner pixel-unshuffles the ViT grid by `vision_downsample_ratio` (3x3)
-and projects to the LLM hidden size with a 2-layer GELU MLP.
-
-Token-layout note: `encode_image` returns aligner outputs in row-major
-("N-layout") order. The caller (language model) is responsible for applying
-the `perm` reordering built by image_processor.build_image_block and for
-splicing in the learned sentinel embeddings (image_start / image_pad /
-image_newline / image_end), which live on the language-model side.
-
-The tower runs replicated (ReplicatedLinear) — it is small (32 layers,
-dim 1024) and is executed during multimodal embedding only.
+"""Replicated DeepSeek-V4 ViT and aligner, matching inference/vision.py in
+deepseek-ai/DeepSeek-V4-Flash-Vision-Exp. The wrapper applies the processor's
+permutation and inserts sentinel embeddings after alignment.
 """
 
 from functools import lru_cache

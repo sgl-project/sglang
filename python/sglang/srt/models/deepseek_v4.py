@@ -110,6 +110,7 @@ from sglang.srt.layers.utils.cp_utils import (
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -3072,7 +3073,7 @@ class DeepseekV4Model(nn.Module):
         # (max=vocab_size-1), which would erase the mm pad sentinels the
         # bias_vl routing keys on.
         if input_ids is None:
-            input_ids = getattr(forward_batch, "dsv4_routing_input_ids", None)
+            input_ids = forward_batch.dsv4_routing_input_ids
             if input_ids is None:
                 input_ids = forward_batch.input_ids
         # Note: the image-token mask + host flag for the bias_vl routing are
@@ -3118,8 +3119,6 @@ class DeepseekV4Model(nn.Module):
         # idle/text-only rank would skip the check while the gathered global
         # ids still contain a peer's mm pad sentinels, sending them into the
         # fused hash_topk kernel for an illegal access.)
-        from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
-
         if not torch.cuda.is_current_stream_capturing():
             image_mask = input_ids_global >= MM_PAD_SHIFT_VALUE
             if image_mask.any():
@@ -3372,7 +3371,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.dsa_enable_prefill_cp:
             cp_input_ids = input_ids
             if cp_input_ids is None:
-                cp_input_ids = getattr(forward_batch, "dsv4_routing_input_ids", None)
+                cp_input_ids = forward_batch.dsv4_routing_input_ids
             if cp_input_ids is None:
                 cp_input_ids = forward_batch.input_ids
             if can_dsa_cp_split(len(cp_input_ids), self.cp_size, True, forward_batch):

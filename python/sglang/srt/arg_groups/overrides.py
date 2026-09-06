@@ -1548,7 +1548,7 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
         # experts; the mxfp4 runner's quant method fuses the scaling factor
         # into top-k, so the combination fails at model build time.
         hf_config = model_config_of(view).hf_config
-        if getattr(hf_config, "architectures", [None])[0] == "DeepseekV4ForCausalLM":
+        if hf_config.architectures[0] == "DeepseekV4ForCausalLM":
             logger.warning(
                 "DeepSeek-V4 with the FlashInfer MXFP4 MoE runner requires "
                 "--disable-shared-experts-fusion; setting it automatically."

@@ -10,6 +10,7 @@ from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.visible_window import has_visible_window_span
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -277,10 +278,6 @@ def _dsv4_batch_needs_visible_window(local_batch: ScheduleBatch, model_config) -
     per-token visible-window overrides (eager-only)."""
     if not is_deepseek_v4(model_config.hf_config):
         return False
-    from sglang.srt.layers.attention.dsv4.visible_window import (
-        has_visible_window_span,
-    )
-
     return has_visible_window_span(
         local_batch.multimodal_inputs,
         local_batch.prefix_lens,
