@@ -13,9 +13,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
-from sglang.kernels.ops.speculative.dspark.dspark_accept import (
-    accept_sampling,
-)
+from sglang.kernels.ops.speculative.dspark.dspark_accept import accept_sampling
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -1893,7 +1891,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
             new_seq_lens = batch.seq_lens
             batch_output.new_seq_lens = new_seq_lens
-            if on_publish is not None:
+            if on_publish is not None and batch_output.mm_embedding_errors is None:
                 on_publish(batch_output.new_seq_lens)
 
             if logits_output.hidden_states is None:

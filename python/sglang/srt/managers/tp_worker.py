@@ -41,6 +41,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.utils import (
+    MM_EMBEDDING_ERRORS_KEY,
+    merge_mm_embedding_error_tensors,
+    synchronize_mm_embedding_errors,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
@@ -77,6 +82,20 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _mm_embedding_validation_indices(
+    batch: Optional[ScheduleBatch], forward_batch: ForwardBatch
+) -> List[int]:
+    if batch is not None:
+        return batch.mm_embedding_validation_indices()
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return []
+    return [
+        i
+        for i, mm_input in enumerate(forward_batch.mm_inputs or [])
+        if mm_input is not None
+    ]
 
 
 class BaseTpWorker(ABC):
@@ -305,8 +324,20 @@ class BaseTpWorker(ABC):
             self.model_runner,
             return_hidden_states_before_norm=False,
         )
+        validated_indices = batch.mm_embedding_validation_indices()
         output = self.model_runner.forward(forward_batch)
-        return output.logits_output, output.can_run_graph
+        if validated_indices:
+            output.mm_embedding_errors = synchronize_mm_embedding_errors(
+                output.mm_embedding_errors,
+                len(batch.reqs),
+                torch.device(self.device),
+                validated_indices,
+            )
+        return (
+            output.logits_output,
+            output.can_run_graph,
+            output.mm_embedding_errors,
+        )
 
 
 class TpModelWorker(BaseTpWorker):
@@ -624,10 +655,30 @@ class TpModelWorker(BaseTpWorker):
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
+        batch_size = len(batch.reqs) if batch is not None else forward_batch.batch_size
+        validated_indices = _mm_embedding_validation_indices(batch, forward_batch)
+        has_mm_inputs = bool(validated_indices)
+
         if self.pp_group.is_last_rank:
+            pp_embedding_errors = (
+                pp_proxy_tensors.tensors.get(MM_EMBEDDING_ERRORS_KEY)
+                if pp_proxy_tensors is not None
+                else None
+            )
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
+            )
+            local_mm_embedding_errors = None
+            if has_mm_inputs:
+                local_mm_embedding_errors = synchronize_mm_embedding_errors(
+                    out.mm_embedding_errors,
+                    batch_size,
+                    torch.device(self.device),
+                    validated_indices,
+                )
+            mm_embedding_errors = merge_mm_embedding_error_tensors(
+                pp_embedding_errors, local_mm_embedding_errors
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
@@ -636,6 +687,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                mm_embedding_errors=mm_embedding_errors,
             )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)
@@ -691,18 +743,38 @@ class TpModelWorker(BaseTpWorker):
 
             return batch_result
         else:
+            pp_embedding_errors = (
+                pp_proxy_tensors.tensors.get(MM_EMBEDDING_ERRORS_KEY)
+                if pp_proxy_tensors is not None
+                else None
+            )
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            local_mm_embedding_errors = None
+            if has_mm_inputs:
+                local_mm_embedding_errors = synchronize_mm_embedding_errors(
+                    out.mm_embedding_errors,
+                    batch_size,
+                    torch.device(self.device),
+                    validated_indices,
+                )
+            mm_embedding_errors = merge_mm_embedding_error_tensors(
+                pp_embedding_errors, local_mm_embedding_errors
+            )
+            if mm_embedding_errors is not None:
+                pp_proxy_tensors.tensors[MM_EMBEDDING_ERRORS_KEY] = mm_embedding_errors
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                mm_embedding_errors=mm_embedding_errors,
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
+        validated_indices = batch.mm_embedding_validation_indices()
         if batch.split_index == 0:
             forward_batch = ForwardBatch.init_new(
                 batch,
@@ -714,6 +786,14 @@ class TpModelWorker(BaseTpWorker):
         out = self.model_runner.forward(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
+        mm_embedding_errors = out.mm_embedding_errors
+        if validated_indices:
+            mm_embedding_errors = synchronize_mm_embedding_errors(
+                mm_embedding_errors,
+                len(batch.reqs),
+                torch.device(self.device),
+                validated_indices,
+            )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         if logits_output:
             next_token_ids = self.model_runner.sample(
@@ -725,6 +805,7 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
+            mm_embedding_errors=mm_embedding_errors,
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result

@@ -195,6 +195,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             input_ids=None,
             positions=None,
             mm_input_embeds=None,
+            mm_embedding_errors=None,
         )
 
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)

@@ -23,9 +23,7 @@ from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import (
-    TRTLLMMLABackend,
-)
+from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -1191,7 +1189,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Extend processed L prompt tokens; next verify iter expects same L.
             batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
+            if on_publish is not None and batch_output.mm_embedding_errors is None:
                 on_publish(batch_output.new_seq_lens)
 
             # A rank that does not host the draft (prefill-side PP builds it only on

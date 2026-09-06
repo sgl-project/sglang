@@ -43,11 +43,7 @@ from sglang.srt.multimodal.transport import (
     TensorTransportMode,
     determine_tensor_transport_mode,
 )
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_server_args,
-    get_serving,
-)
+from sglang.srt.runtime_context import get_disagg, get_server_args, get_serving
 from sglang.srt.utils import flatten_nested_list, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
@@ -459,7 +455,7 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
 
-            embedding, mask, input_ids = get_embedding_and_mask(
+            embedding, mask, input_ids, embedding_errors = get_embedding_and_mask(
                 data_embedding_func=embedder,
                 embedding_items=items,
                 placeholder_tensor=placeholder_tensor,
@@ -468,6 +464,12 @@ def embed_mm_inputs(
                 prefix_length=extend_prefix_lens,
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
+                embedding_dim=input_embedding.embedding_dim
+                * (
+                    1 + len(multimodal_model.deepstack_visual_indexes)
+                    if use_deepstack.get(modality, False)
+                    else 1
+                ),
             )
 
             if use_deepstack.get(modality, None) and embedding is not None:
@@ -480,6 +482,7 @@ def embed_mm_inputs(
             modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
+            other_info.setdefault("mm_embedding_errors", []).extend(embedding_errors)
 
     # 3. Get input embeddings
     vocab_size = input_embedding.num_embeddings
@@ -622,6 +625,11 @@ def _embed_mm_inputs_with_split(
                 ][offset : offset + req_len]
             offset += req_len
 
+        for req_idx, expected, actual in sub_info.get("mm_embedding_errors", []):
+            other_info.setdefault("mm_embedding_errors", []).append(
+                (group_req_indices[req_idx], expected, actual)
+            )
+
     return input_embeds, other_info
 
 
@@ -735,6 +743,17 @@ def general_mm_embed_routine(
                                             "cpu", non_blocking=True
                                         )
                                     )
+            mm_batch_indices = [
+                i
+                for i, mm_input in enumerate(forward_batch.mm_inputs)
+                if mm_input is not None
+            ]
+            forward_batch.mm_embedding_errors = [
+                (mm_batch_indices[req_idx], expected, actual)
+                for req_idx, expected, actual in other_info.get(
+                    "mm_embedding_errors", []
+                )
+            ]
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
         else:

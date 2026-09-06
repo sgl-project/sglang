@@ -22,6 +22,7 @@ class _FakeReq:
         # Mirrors Req.kv; the abort paths read only these two predicates.
         self.kv = SimpleNamespace(holds_kv=True, holds_mamba=False)
         self.to_finish = None
+        self.mm_embedding_abort_pending = False
         self._finished = False
 
     def finished(self):

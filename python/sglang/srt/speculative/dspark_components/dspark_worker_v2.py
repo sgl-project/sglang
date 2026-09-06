@@ -77,12 +77,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
-from sglang.srt.utils import (
-    is_cuda,
-    is_cuda_alike,
-    is_npu,
-    is_pin_memory_available,
-)
+from sglang.srt.utils import is_cuda, is_cuda_alike, is_npu, is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -546,7 +541,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
         new_seq_lens = batch.seq_lens
         batch_output.new_seq_lens = new_seq_lens
-        if on_publish is not None:
+        if on_publish is not None and batch_output.mm_embedding_errors is None:
             on_publish(batch_output.new_seq_lens)
 
         if logits_output.hidden_states is None:

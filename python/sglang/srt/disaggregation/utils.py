@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -22,9 +23,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import (
-    get_disagg,
-)
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -47,6 +46,16 @@ if is_npu():
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+logger = logging.getLogger(__name__)
+
+
+def abort_kv_transfer(req: Req) -> None:
+    """notify the sender without letting transport errors bypass local teardown"""
+    if req.disagg_kv_sender is not None:
+        try:
+            req.disagg_kv_sender.abort()
+        except Exception:
+            logger.exception("Failed to notify KV sender of abort for %s", req.rid)
 
 
 def poll_and_all_reduce_pp(

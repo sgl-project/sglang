@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    abort_kv_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsv4_c128_state_indices,
@@ -63,6 +64,10 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.utils import (
+    complete_mm_embedding_validations,
+    decode_mm_embedding_errors,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -78,11 +83,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
 )
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_parallel,
-    get_schedule,
-)
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -717,6 +718,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        mm_embedding_error_tensor = result.mm_embedding_errors
+        if mm_embedding_error_tensor is not None:
+            complete_mm_embedding_validations(batch.reqs, mm_embedding_error_tensor)
+        decoded_mm_embedding_errors = decode_mm_embedding_errors(
+            mm_embedding_error_tensor
+        )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -730,7 +737,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         logprob_pt = 0
         aborted_reqs: List[Req] = []
-        assert batch.spec_info is result.next_draft_input
+        assert decoded_mm_embedding_errors or batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
@@ -758,9 +765,29 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        mm_embedding_errors = {
+            req_idx: (expected, actual)
+            for req_idx, expected, actual in decoded_mm_embedding_errors
+        }
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            mm_embedding_error = mm_embedding_errors.get(i)
+            if mm_embedding_error is not None:
+                self.defer_mm_embedding_abort(req, *mm_embedding_error)
+            if mm_embedding_error is not None or req.mm_embedding_abort_pending:
+                advance_logprob_pt(i, req)
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                if (
+                    req.inflight_middle_chunks <= 0
+                    and req.mm_embedding_validation_count == 0
+                ):
+                    self.finish_disagg_mm_embedding_abort(req)
+                    aborted_reqs.append(req)
+                continue
+
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -906,6 +933,23 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def finish_disagg_mm_embedding_abort(self: Scheduler, req: Req) -> None:
+        if not req.mm_embedding_abort_pending:
+            return
+        if req.disagg_kv_sender is not None:
+            try:
+                req.disagg_kv_sender.clear()
+            except Exception:
+                logger.exception("Failed to clear KV sender for request %s", req.rid)
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        req.pending_bootstrap = False
+        self.disagg_prefill_inflight_queue = [
+            inflight_req
+            for inflight_req in self.disagg_prefill_inflight_queue
+            if inflight_req is not req
+        ]
+        self.batch_result_processor._finish_deferred_mm_embedding_abort(req)
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
@@ -1063,14 +1107,7 @@ class SchedulerDisaggregationPrefillMixin:
             # A bootstrap failure or earlier abort already retired it.
             return False
 
-        sender = req.disagg_kv_sender
-        if sender is not None:
-            try:
-                sender.abort()
-            except Exception:
-                # Transport notification is best effort; local ownership must
-                # still be released or the next idle invariant check will fail.
-                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
+        abort_kv_transfer(req)
 
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()
@@ -1168,7 +1205,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range.end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif req.mm_embedding_validation_count == 0:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
@@ -1186,6 +1223,8 @@ class SchedulerDisaggregationPrefillMixin:
                 running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        if req.mm_embedding_validation_count > 0:
+            return
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 

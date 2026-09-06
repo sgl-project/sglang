@@ -4,9 +4,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_draft_cache_locs_contiguous,
-)
+from sglang.kernels.ops.speculative.cache_locs import assign_draft_cache_locs_contiguous
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -664,4 +662,5 @@ def run_eagle_verify(
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
         extra_keep_alive_refs=[verify_forward_batch],
+        mm_embedding_errors=forward_batch_output.mm_embedding_errors,
     )

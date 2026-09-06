@@ -13,7 +13,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -408,10 +408,8 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     scheduler.device_module = SimpleNamespace(Event=Mock(return_value=copy_done))
     scheduler.enable_dp_attention = False
     batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(
-            is_prebuilt=lambda: False,
-            is_split_prefill=lambda: True,
-        ),
+        forward_mode=ForwardMode.SPLIT_PREFILL,
+        mm_embedding_validation_indices=lambda: [],
         reqs=[],
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
@@ -446,6 +444,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         to_finish=None,
         finished_reason=None,
         inflight_middle_chunks=0,
+        mm_embedding_abort_pending=False,
         pending_bootstrap=False,
         return_logprob=False,
         return_sampling_mask=False,

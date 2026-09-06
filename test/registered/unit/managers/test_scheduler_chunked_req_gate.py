@@ -3,7 +3,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -14,6 +14,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import complete_mm_embedding_validations
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.utils.common import Range
 
@@ -39,6 +40,7 @@ def _make_req(
     req.host_hit_length = 0
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
+    req.mm_embedding_validation_count = 0
     req.last_node = None
     req.swa_uuid_for_lock = None
     req.session = None
@@ -111,6 +113,48 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     return s
 
 
+def _scheduler_for_raw_prefill(*, chunked_req, waiting_queue) -> Scheduler:
+    s = Scheduler.__new__(Scheduler)
+    s.grammar_manager = MagicMock()
+    s.grammar_manager.has_waiting_grammars.return_value = False
+    s.enable_hierarchical_cache = False
+    s.enable_unified_cache_external_linker = False
+    s.enable_priority_preemption = False
+    s.is_hybrid_swa = False
+    s.chunked_req = chunked_req
+    s.waiting_queue = waiting_queue
+    s.min_free_slots_delayer = None
+    s.get_num_allocatable_reqs = MagicMock(return_value=1)
+    s.policy = MagicMock()
+    s.dynamic_chunk_sizer = None
+    s.chunked_prefill_size = 8
+    s.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            attn_backend=SimpleNamespace(), prefill_aware_swa=False
+        )
+    )
+    s.page_size = 1
+    s.tree_cache = MagicMock()
+    s.token_to_kv_pool_allocator = MagicMock()
+    s.new_token_ratio_tracker = SimpleNamespace(current=0.5)
+    s.max_prefill_tokens = 32
+    s.is_mixed_chunk = False
+    s.priority_scheduling_preemption_threshold = 0
+    s.max_prefill_bs = 4
+    s.max_running_requests = 4
+    s.dllm_config = None
+    s.enable_lora = False
+    s.req_to_token_pool = SimpleNamespace(mamba_allocator=None)
+    s.enable_hicache_storage = False
+    s.enable_priority_scheduling = False
+    s.model_config = MagicMock()
+    s.enable_overlap = False
+    s.spec_algorithm = MagicMock()
+    s.load_inquirer = MagicMock()
+    s.load_inquirer._get_num_pending_tokens.return_value = 0
+    return s
+
+
 class TestStashGatePreservesPrefixIndices(CustomTestCase):
     """Consumer side: real ChunkCache.cache_unfinished_req mutates
     req.prefix_indices iff stash actually runs, so prefix_indices content
@@ -178,6 +222,110 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
         self.assertIsNone(s.chunked_req)
+
+
+class TestMMEmbeddingValidationGate(CustomTestCase):
+    def _make_chunked_req(self):
+        req = Mock()
+        req.rid = "chunk-owner"
+        req.mm_embedding_validation_count = 1
+        req.inflight_middle_chunks = 0
+        req.prefix_indices = torch.arange(8)
+        req.extend_range = Range(0, 8)
+
+        def advance():
+            req.extend_range = Range(8, 16)
+
+        req.init_next_round_input.side_effect = advance
+        return req
+
+    def test_pending_validation_parks_owner_before_init_and_admission(self):
+        req = self._make_chunked_req()
+        queued = [object(), object()]
+        scheduler = _scheduler_for_raw_prefill(chunked_req=req, waiting_queue=queued)
+        scheduler.enable_priority_preemption = True
+        running_batch = SimpleNamespace(reqs=[], batch_is_full=True)
+        original_prefix = req.prefix_indices
+        original_range = req.extend_range
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.get_memory",
+                return_value=SimpleNamespace(enable_flexkv=False),
+            ),
+            patch("sglang.srt.managers.scheduler.PrefillAdder") as prefill_adder,
+        ):
+            for _ in range(3):
+                batch, returned_running = Scheduler._get_new_batch_prefill_raw(
+                    scheduler, None, running_batch
+                )
+                self.assertIsNone(batch)
+                self.assertIs(returned_running, running_batch)
+
+        self.assertIs(scheduler.chunked_req, req)
+        self.assertIs(req.prefix_indices, original_prefix)
+        self.assertEqual(req.extend_range, original_range)
+        self.assertEqual(req.inflight_middle_chunks, 0)
+        self.assertEqual(req.mm_embedding_validation_count, 1)
+        self.assertEqual(scheduler.waiting_queue, queued)
+        self.assertFalse(running_batch.batch_is_full)
+        req.init_next_round_input.assert_not_called()
+        scheduler.get_num_allocatable_reqs.assert_not_called()
+        scheduler.policy.calc_priority.assert_not_called()
+        prefill_adder.assert_not_called()
+
+    def test_completed_validation_advances_next_chunk_once(self):
+        req = self._make_chunked_req()
+        scheduler = _scheduler_for_raw_prefill(chunked_req=req, waiting_queue=[])
+        running_batch = SimpleNamespace(
+            reqs=[], batch_is_full=False, is_empty=lambda: True, return_logprob=False
+        )
+        adder = MagicMock()
+        adder.can_run_list = []
+        adder.preempt_list = []
+        adder.new_chunked_req = None
+
+        def add_chunked_req(owner):
+            adder.can_run_list.append(owner)
+            return owner
+
+        adder.add_chunked_req.side_effect = add_chunked_req
+        new_batch = MagicMock(return_logprob=False, input_embeds=None)
+
+        complete_mm_embedding_validations([req], torch.tensor([[1, 0, 0, 0]]))
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.get_memory",
+                return_value=SimpleNamespace(enable_flexkv=False),
+            ),
+            patch("sglang.srt.managers.scheduler.PrefillAdder", return_value=adder),
+            patch(
+                "sglang.srt.managers.scheduler.get_schedule",
+                return_value=SimpleNamespace(prefill_max_requests=4),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ),
+            patch("sglang.srt.managers.scheduler.PrefillStats.from_adder"),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            batch, _ = Scheduler._get_new_batch_prefill_raw(
+                scheduler, None, running_batch
+            )
+
+            req.mm_embedding_validation_count = 1
+            parked_batch, _ = Scheduler._get_new_batch_prefill_raw(
+                scheduler, None, running_batch
+            )
+
+        self.assertIs(batch, new_batch)
+        self.assertIsNone(parked_batch)
+        self.assertIs(scheduler.chunked_req, req)
+        self.assertEqual(req.extend_range, Range(8, 16))
+        self.assertEqual(req.inflight_middle_chunks, 1)
+        req.init_next_round_input.assert_called_once_with()
+        adder.add_chunked_req.assert_called_once_with(req)
 
 
 if __name__ == "__main__":

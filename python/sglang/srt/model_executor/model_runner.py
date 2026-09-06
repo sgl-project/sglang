@@ -20,17 +20,13 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import (
-    AttentionArch,
-    ModelConfig,
-    ModelImpl,
-)
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import bootstrap
@@ -74,10 +70,7 @@ from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.utils import (
-    get_cp_strategy,
-    is_cp_v2_active,
-)
+from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_v2_active
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -86,18 +79,11 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.kv_cache_configurator import (
-    KVCacheConfigurator,
-)
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.model_executor.cuda_graph_config import (
-    cuda_graph_fully_disabled,
-)
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
@@ -165,10 +151,7 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.model_executor.runner import (
-    EagerRunner,
-    get_batch_sizes_to_capture,
-)
+from sglang.srt.model_executor.runner import EagerRunner, get_batch_sizes_to_capture
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -229,11 +212,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
-from sglang.srt.utils.offloader import (
-    create_offloader,
-    get_offloader,
-    set_offloader,
-)
+from sglang.srt.utils.offloader import create_offloader, get_offloader, set_offloader
 from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
@@ -280,6 +259,7 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    mm_embedding_errors: Optional[List[Tuple[int, int, int]]] = None
 
 
 def resolve_draft_attention_backend(
@@ -1699,6 +1679,7 @@ class ModelRunner:
         if get_exec().moe.elastic_ep_backend is not None:
             self.maybe_join_ep_ranks()
 
+        output.mm_embedding_errors = forward_batch.mm_embedding_errors
         return output
 
     def _maybe_execute_deferred_mamba_cow_and_clear(

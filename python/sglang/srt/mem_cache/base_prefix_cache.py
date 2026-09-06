@@ -322,6 +322,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
 
+    def release_aborted_request(self, rid: str) -> None:
+        """release optional request-scoped cache work after an abort"""
+
     @abstractmethod
     def reset(self):
         pass

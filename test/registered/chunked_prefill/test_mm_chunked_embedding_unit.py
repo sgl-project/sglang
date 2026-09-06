@@ -6,17 +6,22 @@ two forms produce bitwise-identical chunked-prefill embeddings, and that the
 per-item form yields cache entries that own their storage (a torch.split view
 of the combined tensor pins the whole concatenated buffer).
 
-CPU-only: exercises mm_schedule internals directly, no engine or GPU.
+Runs on CPU, with an additional NCCL check when two NVIDIA GPUs are available.
 """
 
 import logging
+import sys
+from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 from sglang.srt.managers import mm_schedule
+from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.utils import synchronize_mm_embedding_errors
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -112,8 +117,14 @@ def _run_by_item_chunks(encoder):
     items = _make_items()
     return [
         mm_schedule._get_chunked_embedding_by_item(
-            encoder, items, ITEM_OFFSETS, prefix_len, extend_len, _CPU
-        )
+            encoder,
+            items,
+            ITEM_OFFSETS,
+            prefix_len,
+            extend_len,
+            _CPU,
+            embedding_dim=HIDDEN,
+        )[0]
         for prefix_len, extend_len in CHUNKS
     ]
 
@@ -124,8 +135,15 @@ def _run_full_chunks(encoder):
     input_ids = torch.zeros(TOTAL_LEN, dtype=torch.long)
     outs = []
     for prefix_len, extend_len in CHUNKS:
-        chunk, _ = mm_schedule._get_chunked_embedding_full(
-            encoder, items, ITEM_OFFSETS, prefix_len, extend_len, input_ids, _CPU
+        chunk, _, _ = mm_schedule._get_chunked_embedding_full(
+            encoder,
+            items,
+            ITEM_OFFSETS,
+            prefix_len,
+            extend_len,
+            input_ids,
+            _CPU,
+            embedding_dim=HIDDEN,
         )
         outs.append(chunk)
     return outs
@@ -164,7 +182,7 @@ def test_list_cache_entries_own_storage():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
     mm_schedule._get_chunked_embedding_by_item(
-        _encoder_list, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU
+        _encoder_list, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU, embedding_dim=HIDDEN
     )
     for item in items:
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
@@ -178,7 +196,7 @@ def test_tensor_cache_entries_share_storage():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
     mm_schedule._get_chunked_embedding_by_item(
-        _encoder_tensor, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU
+        _encoder_tensor, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU, embedding_dim=HIDDEN
     )
     total_tokens = sum(_num_tokens(item) for item in items)
     for item in items:
@@ -198,10 +216,11 @@ def test_by_item_mismatched_cache_entry_is_reencoded():
     )
     encoder = Mock(side_effect=_encoder_list)
 
-    chunk = mm_schedule._get_chunked_embedding_by_item(
-        encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU
+    chunk, error = mm_schedule._get_chunked_embedding_by_item(
+        encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU, embedding_dim=HIDDEN
     )
 
+    assert error is None
     assert chunk.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
     encoder.assert_called_once()
     assert mm_schedule.embedding_cache.get_single(first_item.hash).embedding.shape[
@@ -226,8 +245,11 @@ def test_batched_mismatched_cache_entry_is_reencoded():
     )
     encoder = Mock(side_effect=_encoder_list)
 
-    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, [request], _CPU)
+    embeddings, errors = mm_schedule._batch_encode_per_image_misses(
+        encoder, [request], _CPU, embedding_dim=HIDDEN
+    )
 
+    assert errors == {}
     assert embeddings[(first_item.hash, _num_tokens(first_item))].shape == (
         _num_tokens(first_item),
         HIDDEN,
@@ -251,8 +273,11 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
     ]
     encoder = Mock(side_effect=_encoder_list)
 
-    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
+    embeddings, errors = mm_schedule._batch_encode_per_image_misses(
+        encoder, requests, _CPU, embedding_dim=HIDDEN
+    )
 
+    assert errors == {}
     first_key = (items[0].hash, _num_tokens(items[0]))
     second_key = (items[1].hash, _num_tokens(items[1]))
     assert embeddings[first_key].shape == (_num_tokens(items[0]), HIDDEN)
@@ -274,10 +299,18 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
     encoder = Mock(side_effect=_encoder_tensor)
 
     with caplog.at_level(logging.WARNING, logger=mm_schedule.logger.name):
-        chunk, _ = mm_schedule._get_chunked_embedding_full(
-            encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU
+        chunk, _, error = mm_schedule._get_chunked_embedding_full(
+            encoder,
+            items,
+            ITEM_OFFSETS,
+            0,
+            TOTAL_LEN,
+            input_ids,
+            _CPU,
+            embedding_dim=HIDDEN,
         )
 
+    assert error is None
     assert chunk.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
     encoder.assert_called_once()
     assert "Discarding cached multimodal embedding" in caplog.text
@@ -285,7 +318,349 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
     assert "cached_tokens=1" in caplog.text
 
 
-if __name__ == "__main__":
-    import sys
+def test_mixed_fresh_embeddings_isolate_short_request_and_preserve_shape():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    good_item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=2000,
+        feature=torch.zeros(1),
+        offsets=[(0, 3)],
+    )
+    bad_item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=2001,
+        feature=torch.zeros(1),
+        offsets=[(0, 5)],
+    )
+    good_embedding = torch.ones(4, HIDDEN)
+    bad_embedding = torch.full((2, HIDDEN), 2.0)
 
+    embedding, _, errors = mm_schedule._get_chunked_prefill_embedding(
+        lambda items: [
+            good_embedding if item.hash == good_item.hash else bad_embedding
+            for item in items
+        ],
+        [good_item, bad_item],
+        [0, 1, 2],
+        [0, 0],
+        [4, 6],
+        [[(0, 3)], [(0, 5)]],
+        torch.zeros(10, dtype=torch.long),
+        embedding_dim=HIDDEN,
+    )
+
+    assert errors == [(1, 6, 2)]
+    assert embedding.shape == (10, HIDDEN)
+    torch.testing.assert_close(embedding[:4], good_embedding)
+    torch.testing.assert_close(embedding[4:], torch.zeros(6, HIDDEN))
+    assert mm_schedule.embedding_cache.get_single(good_item.hash) is not None
+    assert mm_schedule.embedding_cache.get_single(bad_item.hash) is None
+
+
+def test_short_fresh_full_embedding_is_padded_and_not_cached():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=3000,
+        feature=torch.zeros(1),
+        offsets=[(0, 1), (4, 5)],
+    )
+    input_ids = torch.zeros(6, dtype=torch.long)
+
+    embedding, _, errors = mm_schedule._get_chunked_prefill_embedding(
+        lambda _items: torch.ones(2, HIDDEN),
+        [item],
+        [0, 1],
+        [0],
+        [6],
+        [[(0, 1), (4, 5)]],
+        input_ids,
+        embedding_dim=HIDDEN,
+    )
+
+    assert errors == [(0, 4, 2)]
+    assert embedding.shape == (4, HIDDEN)
+    assert mm_schedule.embedding_cache.get([item.hash]) is None
+
+
+def test_short_combined_tensor_retry_isolates_malformed_owner():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    good_item, bad_item = _make_items()[:2]
+    requests = [
+        mm_schedule.PerImageRequestInfo(
+            req_idx=0,
+            items=[good_item],
+            items_offset=[good_item.offsets[0]],
+            extend_prefix_len=0,
+            extend_seq_len=TOTAL_LEN,
+        ),
+        mm_schedule.PerImageRequestInfo(
+            req_idx=1,
+            items=[bad_item],
+            items_offset=[bad_item.offsets[0]],
+            extend_prefix_len=0,
+            extend_seq_len=TOTAL_LEN,
+        ),
+    ]
+    encoder = Mock()
+
+    def encode(items):
+        if len(items) > 1:
+            return torch.cat(
+                [_item_embedding(good_item), _item_embedding(bad_item)[:2]], dim=0
+            )
+        embedding = _item_embedding(items[0])
+        return embedding[:2] if items[0] is bad_item else embedding
+
+    encoder.side_effect = encode
+
+    embeddings, errors = mm_schedule._batch_encode_per_image_misses(
+        encoder, requests, _CPU, embedding_dim=HIDDEN
+    )
+
+    assert errors == {(bad_item.hash, _num_tokens(bad_item)): (6, 2)}
+    assert embeddings[(good_item.hash, _num_tokens(good_item))].shape[0] == 4
+    assert mm_schedule.embedding_cache.get_single(good_item.hash) is not None
+    assert mm_schedule.embedding_cache.get_single(bad_item.hash) is None
+    assert encoder.call_count == 3
+
+
+def test_short_combined_tensor_accepts_valid_individual_retries():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()[:2]
+    requests = [
+        mm_schedule.PerImageRequestInfo(
+            req_idx=i,
+            items=[item],
+            items_offset=[item.offsets[0]],
+            extend_prefix_len=0,
+            extend_seq_len=TOTAL_LEN,
+        )
+        for i, item in enumerate(items)
+    ]
+
+    def encode(request_items):
+        if len(request_items) > 1:
+            return torch.zeros(2, HIDDEN)
+        return _item_embedding(request_items[0])
+
+    embeddings, errors = mm_schedule._batch_encode_per_image_misses(
+        encode, requests, _CPU, embedding_dim=HIDDEN
+    )
+
+    assert errors == {}
+    assert all(
+        mm_schedule.embedding_cache.get_single(item.hash) is not None for item in items
+    )
+    assert all(
+        embeddings[(item.hash, _num_tokens(item))].shape[0] == _num_tokens(item)
+        for item in items
+    )
+
+
+@pytest.mark.parametrize("bad_output", ["short", "long", "empty", "extra", "width"])
+@pytest.mark.parametrize("combined", [False, True])
+def test_malformed_fresh_output_isolated_before_cache(bad_output, combined):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()[:2]
+    good = _item_embedding(items[0])
+
+    def encode(batch):
+        if len(batch) > 1:
+            if combined:
+                return torch.zeros(sum(_num_tokens(item) for item in batch) + 1, HIDDEN)
+            if bad_output in ("empty", "extra"):
+                return []
+        outputs = []
+        for item in batch:
+            if item is items[0]:
+                outputs.append(good)
+            elif bad_output == "empty":
+                return []
+            elif bad_output == "extra":
+                return [torch.zeros(2, HIDDEN), torch.zeros(4, HIDDEN)]
+            else:
+                rows = _num_tokens(item) + (1 if bad_output == "long" else -1)
+                outputs.append(torch.zeros(rows, HIDDEN + (bad_output == "width")))
+        return outputs
+
+    for item in items:
+        item.pad_value = item.hash
+    input_ids = torch.zeros(TOTAL_LEN * 2, dtype=torch.long)
+    for i, item in enumerate(items):
+        start, end = item.offsets[0]
+        input_ids[i * TOTAL_LEN + start : i * TOTAL_LEN + end + 1] = item.pad_value
+    text_embedding = torch.nn.Embedding(4096, HIDDEN)
+    result, info = embed_mm_inputs(
+        [SimpleNamespace(mm_items=[item]) for item in items],
+        [0, 0],
+        [TOTAL_LEN, TOTAL_LEN],
+        input_ids,
+        text_embedding,
+        data_embedding_func_mapping={Modality.IMAGE: encode},
+    )
+
+    assert [error[0] for error in info["mm_embedding_errors"]] == [1]
+    torch.testing.assert_close(result[2:6], good)
+    assert torch.isfinite(result).all()
+    assert mm_schedule.embedding_cache.get_single(items[0].hash) is not None
+    assert mm_schedule.embedding_cache.get_single(items[1].hash) is None
+
+
+@pytest.mark.parametrize("rows", [0, 3, 5])
+def test_precomputed_embedding_mismatch_is_request_local(rows):
+    items = _make_items()[:1]
+    items[0].precomputed_embeddings = torch.zeros(rows, HIDDEN)
+    items[0].pad_value = items[0].hash
+    input_ids = torch.zeros(TOTAL_LEN, dtype=torch.long)
+    input_ids[2:6] = items[0].pad_value
+    encoder = Mock(side_effect=AssertionError("precomputed input must not rerun ViT"))
+    embedding, _, _, errors = mm_schedule.get_embedding_and_mask(
+        encoder,
+        items,
+        torch.tensor([items[0].pad_value]),
+        input_ids,
+        [0, 1],
+        [0],
+        [TOTAL_LEN],
+        [items[0].offsets],
+        HIDDEN,
+    )
+    assert errors == [(0, 4, rows)]
+    assert embedding.shape == (4, HIDDEN)
+    assert torch.count_nonzero(embedding) == 0
+    encoder.assert_not_called()
+
+
+def test_combined_wrong_width_retries_to_isolate_the_bad_image():
+    items = _make_items()[:2]
+    good = _item_embedding(items[0])
+    calls = []
+
+    def encode(batch):
+        calls.append(len(batch))
+        if len(batch) > 1:
+            return torch.zeros(10, HIDDEN + 1)
+        if batch[0] is items[0]:
+            return good
+        return torch.zeros(6, HIDDEN + 1)
+
+    outputs, errors = mm_schedule._validate_per_item_embeddings(
+        encode, items, encode(items), [4, 6], HIDDEN, _CPU
+    )
+
+    assert calls == [2, 1, 1]
+    assert errors == {1: (6, -1)}
+    torch.testing.assert_close(outputs[0], good)
+    assert outputs[1].shape == (6, HIDDEN)
+    assert torch.count_nonzero(outputs[1]) == 0
+
+
+def _distributed_embedding_validation(rank, rendezvous, backend, malformed):
+    device = torch.device("cuda", rank) if backend == "nccl" else _CPU
+    if backend == "nccl":
+        torch.cuda.set_device(device)
+    torch.distributed.init_process_group(
+        backend,
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=45),
+    )
+    override = get_context().override_server_args(tp_size=2)
+    override.install()
+    try:
+        group = SimpleNamespace(
+            world_size=2, device_group=torch.distributed.group.WORLD
+        )
+        with get_parallel().override(
+            attn_tp_rank=rank,
+            attn_tp_size=2,
+            attn_cp_size=1,
+            attn_tp_group=group,
+            attn_cp_group=SimpleNamespace(world_size=1),
+        ):
+            items = _make_items()[:2]
+            calls = []
+
+            def encode(batch):
+                calls.append(len(batch))
+                # one rank sees a malformed combined output; both must retry
+                if len(batch) > 1:
+                    rows = 9 if rank == 0 and malformed == "rows" else 10
+                    width = HIDDEN + (rank == 0 and malformed == "width")
+                    return torch.zeros(rows, width, device=device)
+                return (
+                    torch.zeros(3 if rank == 0 else 4, HIDDEN, device=device)
+                    if batch[0] is items[0]
+                    else torch.zeros(6, HIDDEN, device=device)
+                )
+
+            _, errors = mm_schedule._validate_per_item_embeddings(
+                encode, items, encode(items), [4, 6], HIDDEN, device
+            )
+            assert calls == [2, 1, 1]
+            result = synchronize_mm_embedding_errors(
+                [(i, *error) for i, error in errors.items()], 2, device, [0, 1]
+            )
+            assert result.tolist() == [[1, 1, 4, 3], [1, 0, 0, 0]]
+    finally:
+        override.restore()
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "gloo",
+        pytest.param(
+            "nccl",
+            marks=pytest.mark.skipif(
+                torch.version.hip is not None or torch.cuda.device_count() < 2,
+                reason="requires two NVIDIA GPUs",
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("malformed", ["rows", "width"])
+def test_retry_and_error_consensus_across_real_ranks(tmp_path, backend, malformed):
+    torch.multiprocessing.spawn(
+        _distributed_embedding_validation,
+        args=((tmp_path / "rendezvous").as_uri(), backend, malformed),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_output", ["short", "long", "empty", "extra", "width", "scalar"]
+)
+def test_bundled_malformed_output_never_enters_cache(bad_output):
+    mm_schedule.init_mm_embedding_cache(1 << 20)
+    item = _make_items()[0]
+    outputs = {
+        "short": torch.ones(3, HIDDEN),
+        "long": torch.ones(5, HIDDEN),
+        "empty": [],
+        "extra": [torch.ones(4, HIDDEN), torch.ones(4, HIDDEN)],
+        "width": torch.ones(4, HIDDEN + 1),
+        "scalar": torch.tensor(1.0),
+    }
+    embedding, _, error = mm_schedule._get_chunked_embedding_full(
+        Mock(return_value=outputs[bad_output]),
+        [item],
+        item.offsets,
+        0,
+        TOTAL_LEN,
+        torch.zeros(TOTAL_LEN, dtype=torch.long),
+        _CPU,
+        HIDDEN,
+    )
+    assert error == (4, {"short": 3, "long": 5}.get(bad_output, -1))
+    assert embedding.shape == (4, HIDDEN)
+    assert torch.count_nonzero(embedding) == 0
+    assert mm_schedule.embedding_cache.get([item.hash]) is None
+
+
+if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

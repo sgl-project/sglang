@@ -100,10 +100,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import (
-    alloc_for_decode,
-    alloc_for_extend,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1066,6 +1063,8 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+        self.mm_embedding_abort_pending = False
+        self.mm_embedding_validation_count = 0
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -2415,6 +2414,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def batch_size(self):
         return len(self.reqs)
+
+    def mm_embedding_validation_indices(self) -> List[int]:
+        if (
+            not self.forward_mode.is_extend_without_speculative()
+            or self.multimodal_inputs is None
+            or self.prefix_lens is None
+            or self.extend_lens is None
+        ):
+            return []
+        indices = []
+        for i, (mm_input, start, length) in enumerate(
+            zip(
+                self.multimodal_inputs,
+                self.prefix_lens,
+                self.extend_lens,
+                strict=True,
+            )
+        ):
+            if mm_input is None:
+                continue
+            end = start + length
+            if any(
+                item_start < end and item_end >= start
+                for item in mm_input.mm_items
+                for item_start, item_end in item.offsets
+            ):
+                indices.append(i)
+        return indices
 
     def is_empty(self):
         return len(self.reqs) == 0

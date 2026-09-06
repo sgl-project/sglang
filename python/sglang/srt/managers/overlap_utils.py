@@ -8,10 +8,7 @@ import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -144,6 +141,21 @@ class RelayPayload:
     # ngram delays the draft extend (ngram update)
     accept_tokens: Optional[torch.Tensor] = None
     accept_lens: Optional[torch.Tensor] = None
+
+    def select_rows(self, keep: torch.Tensor) -> RelayPayload:
+        def select(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            return None if tensor is None else tensor[keep.to(tensor.device)]
+
+        return RelayPayload(
+            bonus_tokens=select(self.bonus_tokens),
+            topk_p=select(self.topk_p),
+            topk_index=select(self.topk_index),
+            hidden_states=select(self.hidden_states),
+            draft_probs=select(self.draft_probs),
+            dsa_topk_indices=select(self.dsa_topk_indices),
+            accept_tokens=select(self.accept_tokens),
+            accept_lens=select(self.accept_lens),
+        )
 
     @classmethod
     def from_ngram(cls, draft_input: NgramVerifyInput) -> RelayPayload:
