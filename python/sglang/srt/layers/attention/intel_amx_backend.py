@@ -73,7 +73,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         In TARGET_VERIFY mode the batch carries no extend_* fields, so they are
         derived from spec_info (mirrors the CUDA unified path in
         triton_backend.py); each request extends by exactly num_draft_tokens
-        tokens. Outside spec decoding the fields are passed through.
+        tokens, unless a DFLASH-family ragged verify layout carries planned
+        per-request extend lengths. Outside spec decoding the fields are
+        passed through.
         """
         bs = forward_batch.batch_size
         seq_lens = forward_batch.seq_lens
@@ -88,18 +90,29 @@ class IntelAMXAttnBackend(AttentionBackend):
                     "speculative verify batches."
                 )
             num_draft_tokens = spec_info.draft_token_num
-            extend_seq_lens = torch.full(
-                (bs,), num_draft_tokens, dtype=torch.int32, device=self.device
-            )
-            # Uniform extend lengths: start locations form a plain range.
-            extend_start_loc = torch.arange(
-                0,
-                bs * num_draft_tokens,
-                num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            seq_lens = forward_batch.seq_lens + num_draft_tokens
+            # Only DFLASH-family verify inputs carry a ragged layout (DSpark
+            # cap-accept/compact modes plan per-request verify budgets). It
+            # needs no padding here: CPUGraphRunner rejects speculative
+            # inference, so a verify batch is never replayed into wider
+            # captured slots.
+            layout = spec_info.ragged_verify_layout
+            if layout is not None:
+                extend_seq_lens = layout.verify_lens
+                extend_start_loc = layout.extend_start_loc
+                seq_lens = forward_batch.seq_lens + extend_seq_lens
+            else:
+                extend_seq_lens = torch.full(
+                    (bs,), num_draft_tokens, dtype=torch.int32, device=self.device
+                )
+                # Uniform extend lengths: start locations form a plain range.
+                extend_start_loc = torch.arange(
+                    0,
+                    bs * num_draft_tokens,
+                    num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                seq_lens = forward_batch.seq_lens + num_draft_tokens
             # Speculative verify with a token tree: each draft token may only
             # attend to its ancestors among the draft tokens (the committed
             # prefix stays fully visible).

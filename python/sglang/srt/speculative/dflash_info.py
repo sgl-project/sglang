@@ -56,6 +56,13 @@ class DFlashVerifyInput(SpecInput):
             self.num_tokens_per_req = int(self.draft_token_num)
         self.num_tokens_for_logprob_per_req = int(self.draft_token_num)
 
+    @property
+    def tree_topk(self) -> int:
+        """Branching factor passed to the tree-verify kernels; DFLASH verify
+        is a linear chain, so backends gating tree metadata on it (e.g.
+        intel_amx) take their mask-free causal path."""
+        return self.topk
+
     def prepare_for_verify(
         self,
         batch: ScheduleBatch,

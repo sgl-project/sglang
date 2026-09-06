@@ -187,10 +187,12 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not (cfg.device.startswith("cuda") or cfg.device == "npu"):
+    if not (cfg.device.startswith("cuda") or cfg.device in ("npu", "cpu")):
         raise ValueError(
-            "DFLASH speculative decoding only supports CUDA and NPU devices."
+            "DFLASH speculative decoding only supports CUDA, NPU and CPU devices."
         )
+
+    _disable_overlap_schedule_for_cpu(server_args)
 
     if resolved_view(server_args).enable_dp_attention:
         raise ValueError(
@@ -503,10 +505,12 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu")):
+    if not cfg.device.startswith(("cuda", "npu", "cpu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA or NPU device."
+            "DSpark speculative decoding only supports CUDA, NPU or CPU device."
         )
+
+    _disable_overlap_schedule_for_cpu(server_args)
 
     # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
     if cfg.enable_dp_attention and cfg.dp_size > 1:
@@ -718,9 +722,13 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         "triton",
         "trtllm_mha",
         "ascend",
+        "intel_amx",
     )
-    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
-    fallback_backend = "triton" if get_platform().is_hip else "flashinfer"
+    # Use intel_amx on CPU, triton on ROCm (no FlashInfer), flashinfer on CUDA.
+    if cfg.device == "cpu":
+        fallback_backend = "intel_amx"
+    else:
+        fallback_backend = "triton" if get_platform().is_hip else "flashinfer"
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:

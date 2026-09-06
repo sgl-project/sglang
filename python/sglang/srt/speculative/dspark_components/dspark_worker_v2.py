@@ -78,6 +78,7 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import (
+    is_cpu,
     is_cuda,
     is_cuda_alike,
     is_npu,
@@ -87,6 +88,7 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 
 @runtime_checkable
@@ -146,6 +148,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
 
         self._draft_is_moe = draft_is_deepseek_v4()
+        if self._draft_is_moe and _is_cpu:
+            raise ValueError(
+                "DSpark with a DeepSeek-V4 (MoE) draft is not supported on "
+                "CPU; use a dense draft model."
+            )
         self._draft_dp_context_enabled = (
             get_parallel().enable_dp_attention and not self._draft_is_moe
         )
@@ -431,7 +438,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = self._decode_graph_allowed
+        # CPU keeps the draft eager (like EAGLE); the target's own graphs are
+        # initialized elsewhere and unaffected.
+        capture_decode_cuda_graph = self._decode_graph_allowed and not _is_cpu
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
             self.device,
@@ -512,16 +521,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if get_parallel().enable_dp_attention:
@@ -531,7 +541,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             return self._decode_idle_result(on_publish=on_publish)
 
         batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
@@ -676,9 +688,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        if not _is_cpu:
+            batch.seq_lens.record_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
