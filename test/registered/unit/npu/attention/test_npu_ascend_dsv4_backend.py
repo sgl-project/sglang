@@ -698,6 +698,7 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                 self.subTest(is_arch35=is_arch35),
                 patch(self._ARCH35_PATCH_TARGET, return_value=is_arch35),
                 patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
+                patch("torch.ops.npu", MagicMock(), create=True),
             ):
                 backend = DeepseekV4AscendAttnBackend.__new__(
                     DeepseekV4AscendAttnBackend
