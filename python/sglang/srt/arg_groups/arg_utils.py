@@ -124,9 +124,12 @@ class Derived:
     ``publish`` and stored as an ordinary bag leaf -- a plain attribute load,
     which is what a read inside compiled model code needs.
 
-    A declaration without ``fn`` is one whose namespace resolves it itself.
-    Only ``parallel`` does: its quotients can change after publish, because an
-    elastic scale-up restamps them, so they cannot be frozen into a leaf.
+    Every declaration carries ``fn`` today, the parallel quotients included:
+    they are a function of the configured leaves, so they are computed at
+    publish like the rest. What is special about them is not how they are
+    computed but that a stamp can move one afterwards -- an elastic scale-up
+    restamps ``attn_dp_size`` -- which ``ParallelContext`` answers above the
+    published leaf.
     """
 
     doc: str = ""

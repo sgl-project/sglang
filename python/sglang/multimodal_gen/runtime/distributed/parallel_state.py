@@ -164,19 +164,53 @@ def _clear_srt_world_group() -> None:
 
 
 def _sync_srt_tp_group() -> None:
+    """Lend this package's TP group to `srt`, and state the widths it implies.
+
+    Shared `srt` layers run inside this package -- `srt/layers/attention/vision.py`
+    builds a `VisionAttention` and asks `get_parallel().attn_tp_size` for how to
+    shard its heads. The published `srt` config cannot answer that: the worker
+    publishes a dummy carrying **this package's** `tp_size` (`gpu_worker.py`),
+    which is 1 for a sequence-parallel launch, while the group lent below is as
+    wide as the world. Without a stamp the quotient would come back 1 while the
+    group it describes is 2 -- silently wrong, where an unpublished process at
+    least fails loudly.
+
+    So stamping here is the same move `srt.initialize_model_parallel` makes as
+    its last statement: the widths are recorded as the groups are built, and the
+    group is the thing they describe.
+
+    Only tensor parallelism folds in this way -- no attention DP, no attention
+    CP, no expert parallelism, no decode context parallelism -- so the widths
+    come out of the shared derivation with every other dimension at one.
+    """
     import sglang.srt.distributed.parallel_state as srt_parallel_state
+    from sglang.srt.runtime_context import derive_parallel_widths, get_parallel
 
     if srt_parallel_state._TP is None:
         srt_parallel_state._TP = _TP
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
+    if srt_parallel_state._ATTN_TP is _TP:
+        get_parallel().stamp_derived_widths(
+            **derive_parallel_widths(
+                tp_size=_TP.world_size,
+                attn_cp_size=1,
+                attn_dp_size=1,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                dcp_size=1,
+                dcp_enabled=False,
+            )
+        )
 
 
 def _clear_srt_tp_group() -> None:
     import sglang.srt.distributed.parallel_state as srt_parallel_state
+    from sglang.srt.runtime_context import get_parallel
 
     if srt_parallel_state._ATTN_TP is _TP:
         srt_parallel_state._ATTN_TP = None
+        get_parallel().clear_derived_widths()
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
 
@@ -704,11 +738,20 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
 
     The scope replaces the module globals that ``get_tp_group()`` and srt's
     ``get_tp_group()`` / ``get_attention_tp_group()`` read, and — like srt's
-    ``patch_tensor_parallel_group`` — the three members the runtime context
-    answers with, so that a size read from the published bag cannot disagree
-    with a rank read from the swapped group.
+    ``patch_tensor_parallel_group`` — the members the runtime context answers
+    with, so that a size read from the published bag cannot disagree with a rank
+    read from the swapped group.
+
+    The parallel quotients are part of that set. They used to be read back off
+    the group this scope swaps, so they followed it for free; they are values in
+    the config bag now, and the published config describes the *launch* (`tp=1`
+    for a sequence-parallel run), not the group folded in here. Left out, an
+    encoder built in this scope reads `attn_tp_size == 1` and keeps its heads
+    whole while the `QKVParallelLinear` beside it reads `tp_size == 2` and
+    shards -- which is a `narrow` past the end of the checkpoint tensor, not a
+    wrong number.
     """
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import derive_parallel_widths, get_parallel
 
     old_tp_group = get_tp_group()
     import sglang.srt.distributed.parallel_state as srt_parallel_state
@@ -724,6 +767,17 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
             tp_size=tp_group.world_size,
             tp_rank=tp_group.rank_in_group,
             tp_group=tp_group,
+            # Only tensor parallelism folds here, so every other dimension is
+            # one and the quotients come out of the shared derivation.
+            **derive_parallel_widths(
+                tp_size=tp_group.world_size,
+                attn_cp_size=1,
+                attn_dp_size=1,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                dcp_size=1,
+                dcp_enabled=False,
+            ),
         ):
             yield
     finally:
