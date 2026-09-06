@@ -33,6 +33,18 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
+@pytest.fixture(autouse=True)
+def _discrete_host_for_residency_tests(monkeypatch):
+    # finish_request drops the allocator pool only on a shared host/device
+    # pool (see test_shared_pool_finish_request_drops_the_allocator_pool);
+    # the device stubs below describe the discrete case.
+    monkeypatch.setattr(
+        type(current_platform),
+        "device_shares_host_memory",
+        classmethod(lambda cls: False),
+    )
+
+
 def _server_args(*, supports_auto_residency=True):
     return SimpleNamespace(
         enable_layerwise_nvtx_marker=False,
@@ -281,6 +293,35 @@ def test_warmup_skips_memory_tracking_for_unsupported_pipeline(monkeypatch):
     assert manager._track_warmup_memory is False
     assert manager.take_warmup_phase_peaks() == {}
     device_module.reset_peak_memory_stats.assert_not_called()
+
+
+def test_shared_pool_finish_request_drops_the_allocator_pool(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+        empty_cache=Mock(),
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        type(current_platform),
+        "device_shares_host_memory",
+        classmethod(lambda cls: True),
+    )
+
+    stage = _Stage()
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args(supports_auto_residency=False)
+    manager = ComponentResidencyManager(pipeline, server_args)
+
+    manager.begin_request([stage], SimpleNamespace(is_warmup=False), server_args)
+    manager.finish_request()
+
+    device_module.empty_cache.assert_called_once_with()
 
 
 def test_warmup_records_full_weight_transition_without_preparing(monkeypatch):

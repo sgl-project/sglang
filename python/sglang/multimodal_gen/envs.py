@@ -23,6 +23,10 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
+    SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
+    SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ: bool = False
+    SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
+    SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
@@ -303,6 +307,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory instead of a file-backed cache mapping the page cache can drop.
     "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE"
+    ),
+    # Kill-switch: do not madvise(MADV_WILLNEED) mapped layers ahead of the
+    # courier; their pages arrive at fault-time readahead beats instead.
+    "SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED"
+    ),
+    # Kill-switch: on a shared host/device pool the courier reads mapped layers
+    # from their checkpoint files with O_DIRECT instead of through the page
+    # cache. This forces the mmap path.
+    "SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ"
+    ),
+    # Debug: after auto residency settles, log where this process's host memory
+    # sits -- per component and per kind (anonymous, mapped, pinned) -- next to
+    # the kernel's view of the process.
+    "SGLANG_DIFFUSION_DEBUG_HOST_MEMORY": _lazy_bool(
+        "SGLANG_DIFFUSION_DEBUG_HOST_MEMORY"
+    ),
+    # Debug: at the end of every layerwise stage, log where the courier and the
+    # compute thread spent their time (populate, memcpy, H2D, waits).
+    "SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING": _lazy_bool(
+        "SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING"
     ),
     # Kill-switch: keep LoRA-merged weights in anonymous host memory instead
     # of the file-backed LoRA merge cache.

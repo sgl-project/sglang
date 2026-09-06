@@ -55,6 +55,11 @@ def test_pageable_penalty_disappears_on_a_shared_pool(monkeypatch):
     )
 
 
+def test_cold_advice_is_harmless_on_an_ordinary_tensor():
+    layerwise_offload._advise_mapped_source_cold(torch.zeros(4096, dtype=torch.uint8))
+    layerwise_offload._advise_mapped_source_cold(torch.zeros(0))
+
+
 def _pin_frontier() -> tuple[ResidencyTarget, ResidencyTarget]:
     pageable = ResidencyTarget(
         component_name="transformer",
@@ -236,6 +241,12 @@ def test_shared_pool_keeps_only_the_measured_and_streamed_layouts():
     assert auto_residency._shared_pool_resident_targets([(0, 50), (0, 0)], None) == [
         (0, 0)
     ]
+
+
+def test_populate_mapped_source_is_harmless_on_anonymous_memory():
+    # Anonymous pages are already present; the advice must not raise or copy.
+    layerwise_offload.populate_mapped_source([torch.zeros(1 << 16, dtype=torch.uint8)])
+    layerwise_offload.populate_mapped_source([torch.zeros(0)])
 
 
 def test_mapped_stream_cost_applies_when_the_cache_cannot_hold_the_cycle(monkeypatch):
@@ -520,6 +531,125 @@ def test_shared_pool_promotes_the_dit_when_the_cycle_misses_the_cache(
         plan.skip_reason,
         caplog.text,
     )
+
+
+def test_single_iteration_probe_counts_repeated_stage_layers_per_iteration():
+    """A 2-step probe of a pipeline that runs steps-1 iterations sees every DiT
+    layer once. Those layers are per-iteration, not one-shot."""
+    from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+        WarmupMemoryRecord,
+        estimate_layerwise_layer_uses,
+    )
+
+    stage = "MiniMaxH3DenoisingStage"
+    record = WarmupMemoryRecord(
+        width=864,
+        height=480,
+        num_frames=124,
+        baseline_allocated_bytes=0,
+        peak_allocated_bytes=1,
+        succeeded=True,
+        phase_used_components={
+            f"7:{stage}:use:transformer": ("transformer",),
+            "2:MiniMaxH3TextEncodingStage:use:text_encoder": ("text_encoder",),
+        },
+        layerwise_layer_uses={
+            "transformer": {"blocks": (1, 1, 1)},
+            "text_encoder": {"layers": (1, 1)},
+        },
+        layerwise_layer_uses_by_stage={
+            stage: {"transformer": {"blocks": (1, 1, 1)}},
+            "MiniMaxH3TextEncodingStage": {"text_encoder": {"layers": (1, 1)}},
+        },
+        num_inference_steps=2,
+        stage_iterations={stage: (1, 19)},
+    )
+    uses = estimate_layerwise_layer_uses(
+        records=[record],
+        target_units=None,
+        target_num_inference_steps=20,
+    )
+    assert uses["transformer"] == {"blocks": (19, 19, 19)}
+    assert uses["text_encoder"] == {"layers": (1, 1)}
+
+
+def test_mapped_populator_populates_each_layer_once_per_request():
+    populator = layerwise_offload._MappedPopulator(workers=2)
+    try:
+        tensor = torch.zeros(1 << 16, dtype=torch.uint8)
+        assert populator.submit(3, [tensor]) is True
+        assert populator.submit(3, [tensor]) is False
+        assert populator.wait(3) is True
+        assert populator.wait(4) is False
+        assert populator.submit(5, []) is False
+        populator.reset()
+        assert populator.submit(3, [tensor]) is True
+        assert populator.wait(3) is True
+    finally:
+        populator.close()
+
+
+def test_stage_end_pages_out_the_head_that_will_not_fit(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        layerwise_offload,
+        "_advise_mapped_source_cold",
+        lambda tensor, reclaim=False: calls.append((tensor.numel(), reclaim)),
+    )
+    manager = layerwise_offload.LayerwiseOffloadManager.__new__(
+        layerwise_offload.LayerwiseOffloadManager
+    )
+    manager._streamed_order = [0, 1, 2, 3]
+    manager._mapped_cpu_weights = {
+        idx: {"w": torch.zeros(1024, dtype=torch.uint8)} for idx in range(4)
+    }
+    # Everything fits: cold only.
+    assert manager.advise_mapped_pages_cold(room_bytes=8192) == 0
+    assert [reclaim for _, reclaim in calls] == [False] * 4
+    calls.clear()
+    # Two layers do not fit: the first two are paged out, the rest left cold.
+    assert manager.advise_mapped_pages_cold(room_bytes=2048) == 2048
+    assert [reclaim for _, reclaim in calls] == [True, True, False, False]
+    calls.clear()
+    # No room figure: the old behaviour.
+    assert manager.advise_mapped_pages_cold() == 0
+    assert [reclaim for _, reclaim in calls] == [False] * 4
+
+
+def test_direct_reader_locates_mapped_tensors_and_reads_them(tmp_path):
+    import os
+
+    import numpy as np
+
+    if not hasattr(os, "O_DIRECT"):
+        return
+    path = tmp_path / "shard.bin"
+    payload = np.arange(3 * 4096 + 100, dtype=np.uint8)
+    payload.tofile(path)
+    mapped = np.memmap(path, dtype=np.uint8, mode="r")
+    tensor = torch.from_numpy(
+        np.asarray(mapped[4100 : 4100 + 8000]).copy()
+    )  # anonymous
+    view = torch.frombuffer(memoryview(mapped)[4100 : 4100 + 8000], dtype=torch.uint8)
+    reader = layerwise_offload._DirectReader()
+    try:
+        assert reader.locate(tensor) is None
+        located = reader.locate(view)
+        assert located is not None
+        located_path, file_offset, nbytes = located
+        assert os.path.realpath(located_path) == os.path.realpath(path)
+        assert (file_offset, nbytes) == (4100, 8000)
+        start, span = layerwise_offload._aligned_span(file_offset, nbytes)
+        assert (start, span) == (4096, 2 * 4096)
+        buffer = bytearray(span)
+        try:
+            reader.read_into(memoryview(buffer), located_path, start, span)
+        except OSError:
+            return  # filesystem without O_DIRECT (tmpfs)
+        skew = file_offset - start
+        assert bytes(buffer[skew : skew + 16]) == payload[4100:4116].tobytes()
+    finally:
+        reader.close()
 
 
 def test_shared_pool_keeps_the_full_layout_when_asked():
