@@ -286,6 +286,43 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
             ) from e
 
 
+class _HybridWindowAttentionH3BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
+
+    # The window rides FlashAttention varlen (FA3 on Hopper, FA4 on Blackwell).
+    # SM120 (RTX PRO 6000 Blackwell) runs FA4's sm120 forward kernel.
+    supported_capabilities = {(9, 0), (10, 0), (10, 3), (12, 0)}
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "hybrid_window_attn_h3 (VDN-H3) needs compute capability 9.0 "
+                "(Hopper), 10.0 (B200 / GB200), 10.3 (B300 / GB300) or 12.0 "
+                f"(RTX PRO 6000 Blackwell); this device reports {found}."
+            )
+        if not platform._prepare_flash_attention_for_blackwell():
+            raise RuntimeError(
+                "hybrid_window_attn_h3 requires FlashAttention for its dense legs"
+            )
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (  # noqa: F401
+                HybridWindowAttentionH3Backend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3.HybridWindowAttentionH3Backend"
+        except Exception as e:
+            logger.error("Failed to import hybrid_window_attn_h3 backend: %s", str(e))
+            raise ImportError(
+                "hybrid_window_attn_h3 needs FlashAttention and Triton."
+            ) from e
+
+
 class _CubeSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.CUBE_SPARSE_ATTN
 
@@ -481,6 +518,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SpargeAttentionBackendResolver,
         _VideoSparseAttentionBackendResolver,
         _VideoSparseAttentionH3BackendResolver,
+        _HybridWindowAttentionH3BackendResolver,
         _CubeSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,
@@ -639,7 +677,10 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def _prepare_flash_attention_for_blackwell(cls) -> bool:
-        if not cls.is_blackwell():
+        # SM100/SM103 and SM120 all take FA4 (the CuTe package ships an sm120
+        # forward kernel); the generic FA backend still resolves to SDPA on
+        # SM120 before reaching this, so only explicit FA4 users are affected.
+        if not (cls.is_blackwell() or cls.is_sm120()):
             return True
 
         try:

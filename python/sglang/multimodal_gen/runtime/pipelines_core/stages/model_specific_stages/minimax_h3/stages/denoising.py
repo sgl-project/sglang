@@ -747,6 +747,19 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 server_args=server_args,
                 device=device,
             )
+            if build_vsa_h3_step_metadata is None:
+                from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
+                    prepare_hybrid_attention_metadata,
+                )
+
+                build_vsa_h3_step_metadata = prepare_hybrid_attention_metadata(
+                    model=model,
+                    packed=packed,
+                    latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+                    condition_rows=ctx.is_ref2va or ctx.include_cond,
+                    server_args=server_args,
+                    device=device,
+                )
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],

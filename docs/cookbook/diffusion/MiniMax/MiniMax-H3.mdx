@@ -735,7 +735,75 @@ SGLang port. Use base MiniMax-H3 when output quality matters more than
 latency.
 </Note>
 
-## 7. Sampling and output controls
+## 7. VDN-H3: hybrid attention, 8-step distill
+
+[OpenVDN/vdn-minimax-h3](https://huggingface.co/OpenVDN/vdn-minimax-h3)
+(Video DeltaNet MiniMax-H3, [openvdn.github.io](https://openvdn.github.io/))
+replaces every DiT block's dense self-attention with a hybrid of two branches:
+an exact, gated softmax over a chunk-aligned frame window (chunk 5, radius 1,
+the first and last frames dense as anchors, text and audio dense both ways)
+and a frame-wise linear-attention branch (the Video Delta rule, scanned
+forward and backward over frames) that covers exactly the rest. The released
+`stage-dmd-step-250` checkpoint is an 8-NFE DMD2 distill and adds a 4.3 GB
+linear branch plus two small LoRA adapters on top of the untouched MiniMax-H3
+backbone. Only T2VA was trained: requests must use `task: "t2va"`, and `fl2va`
+/ `ref2va` requests are rejected. The weights inherit the MiniMax-H3 Community
+License, including its territorial exclusions.
+
+Pass the repository directly to `--model-path`. A registered model overlay
+materializes the base-H3 layout once: both LoRA adapters are prefused into the
+transformer weights (a real 62 GB write), the linear branch is attached as an
+extra shard, the Qwen3-VL conditioner is linked from `MiniMaxAI/MiniMax-H3`,
+and the video VAE is re-serialized as for FastH3. Point
+`SGLANG_DIFFUSION_CACHE_ROOT` at a volume with at least 90 GB free before the
+first launch.
+
+```bash 4×B200 hybrid window attention
+sglang serve \
+  --model-path OpenVDN/vdn-minimax-h3 \
+  --num-gpus 4 \
+  --attention-backend hybrid_window_attn_h3 \
+  --performance-mode speed \
+  --warmup-num-frames 345 \
+  --warmup-resolutions 1344x768 \
+  --port 30010
+```
+
+`--warmup-num-frames` / `--warmup-resolutions` make the startup warmup run
+at the clip length and canvas you will serve (here the 14.375 s paper
+workload; the H3 warmup honors them since sgl-project/sglang#37945). Without them H3 warms up on a 5-second clip, and the first
+forward of the first longer request pays allocator growth and kernel setup
+in every DiT block (2 to 3 s on this workload, for base H3 as well).
+
+Requests use the same asynchronous video endpoint as the base model, with
+`task: "t2va"`, `conditions: []`, and a target such as
+`{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 14.375}`. The
+request default is `num_inference_steps: 9`: nine points on the standard
+shift-12/shift-3 sigma grid, i.e. the eight distilled DiT evaluations (VDN
+counts NFEs, SGLang counts grid points). Any other step count is rejected. The
+paper workload is 1344×768 at 24 fps for 14.375 s: 345 frames, already 17n+5
+aligned, 102 latent frames and about 104.5k packed rows.
+
+`hybrid_window_attn_h3` is required for the transformer: a dense backend on
+these weights would silently skip the linear branch and the softmax gates and
+produce the wrong model, so it is rejected. The window softmax runs as a union
+of dense FlashAttention varlen calls, exact to bf16 rounding. The
+linear branch runs on fused Triton kernels (temporal conv + SiLU + L2 norm,
+statistics prologue, gated RMSNorm epilogue). On Blackwell (SM100 / SM103,
+and SM120 such as the RTX PRO 6000) the transformer defaults to online MXFP8
+(`--quantization fp8` selects it too, `--quantization bf16` opts out); the
+gates, beta, alpha and the conv stay bf16. Before SM100 `--quantization fp8`
+is the per-channel fp8 path of base H3. Ulysses sequence parallelism is supported;
+`--model-variant`, `quality: "high"`, `--ring-degree` greater than 1,
+`torch.compile`, and breakable CUDA graph execution are rejected. See
+[Attention Backends](/docs/sglang-diffusion/attention_backends) for the
+backend options.
+
+Measured latencies for the 4× B200 recipe are in
+[VDN-H3 on B200](#vdn-h3-on-b200); single-card and PCIe multi-card numbers
+for the RTX PRO 6000 are in [VDN-H3 on RTX PRO 6000](#vdn-h3-on-rtx-pro-6000).
+
+## 8. Sampling and output controls
 
 MiniMax-H3 supports more than one output per prompt. The video API accepts
 `num_outputs_per_prompt` (or OpenAI-compatible `n`) from 1 through 10. Offline
@@ -910,7 +978,7 @@ has completed, but the `quality: "high"` path above remains fail-closed
 to the audited 4×H200 workload.
 </Warning>
 
-## 8. Feature contracts and advanced recipes
+## 9. Feature contracts and advanced recipes
 
 The generated command already contains the recommended topology and encoder
 setting. Use the detailed reference below only when applying an optional
@@ -1151,7 +1219,7 @@ fold decision is not node-boundary aware:
 
 </Tabs>
 
-## 9. Configuration notes
+## 10. Configuration notes
 
 - MiniMax-H3 produces the canonical 24 fps output; request duration is expressed through `target.duration_seconds`.
 - `target.duration_seconds` must be between 4 and 15 seconds, inclusive. The command picker defaults to the verified 5-second profile.
@@ -1170,7 +1238,7 @@ fold decision is not node-boundary aware:
 - `speed` keeps model components resident, while `auto` applies the model-aware 120 GiB residency threshold. `memory` prioritizes avoiding OOM and includes the executable VAE decoder in its default layerwise set. A measured recipe with sufficient headroom can opt into `--component-residency vae=resident`; the 2×H100 CI recipe does this because the VAE's 4.8 GiB/GPU cost avoids repeated decoder transfers during tiled decode. DiT residency and prefetch knobs remain scoped to the DiT. Use `speed` only after confirming that the complete target workload fits.
 - Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.
 
-## 10. Benchmarks
+## 11. Benchmarks
 
 The picker exposes resident and FSDP profiles on NVIDIA datacenter GPUs. GPU
 counts are properties of the selected recipes, not a claim that every platform
@@ -1304,6 +1372,107 @@ competitive at 5 s, and VSA-H3 pulls ahead from 10 s on. At 5 s,
 TP2 + Ulysses2 (3.42 s, 62,290 MB), FSDP + Ulysses4 (3.42 s, 50,984 MB), and
 online `--quantization fp8` (2.93 s, 64,204 MB) trade a little latency for
 peak memory.
+
+### VDN-H3 on B200
+
+A 4× B200 (SM100, 183 GB) host served [VDN-H3](#7-vdn-h3-hybrid-attention-8-step-distill)
+on the paper workload: 1344×768 at 24 fps with audio for 14.375 s (345 frames,
+102 latent frames, about 104k packed rows), `task: "t2va"`,
+`num_inference_steps: 9` (8 DiT forwards), seed 1000, `hybrid_window_attn_h3`
+with the decomposed window kernel, eager, and the warmup run at the served
+clip shape (`--warmup-num-frames 345 --warmup-resolutions 1344x768`), so
+every forward of the served request is steady state; without those flags the
+first forward pays about 3 s of allocator growth and kernel setup. "Steady
+s/NFE" is the mean of forwards 2 to 8. The OpenVDN reference rows ran the released
+inference stack (`8nfe_tuned_fp8.yaml`, `infer_ulysses.py`) on the same host
+and the same clip length:
+
+| Config | Steady s/NFE | Denoise (8 forwards) | Decode | Peak/GPU |
+| --- | ---: | ---: | ---: | ---: |
+| OpenVDN published, FP8, 8× B200 Ulysses 5+3 ([openvdn.github.io](https://openvdn.github.io/)) | 1.40 | 11.2 s | – | – |
+| OpenVDN reference, BF16 (`8nfe_tuned.yaml`), 1× B200 | 7.91 | 63.3 s | – | – |
+| OpenVDN reference, FP8, 1× B200 | 6.47 | 51.7 s | – | – |
+| OpenVDN reference, FP8, 4× B200 Ulysses (standard / 3+1 branch-parallel) | 2.68 / 2.61 | 21.4 / 20.9 s | – | – |
+| SGLang, BF16, 1× B200, DiT layerwise offload (auto policy) | 7.86 | 64.1 s | 9.5 s | 147,608 MB |
+| SGLang, FP8, 1× B200, DiT layerwise offload (auto policy) | 7.49 | 61.7 s | 9.4 s | 111,616 MB |
+| SGLang, FP8, 1× B200, DiT resident (`--layerwise-offload-components text_encoder`) | 7.49 | 61.1 s | 9.3 s | 63,922 MB |
+| SGLang, `--quantization bf16`, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.53** | **20.3 s** | 3.5 s | 97,894 MB |
+| SGLang, FP8, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.34** | **18.7 s** | 3.4 s | 63,022 MB |
+| SGLang default (online `mxfp8`), 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.93** | **7.45 s** | 1.5 s | 77,704 MB |
+| SGLang, per-channel fp8 weight scales (the online `fp8` path of other models), 8× B200 Ulysses8 | 1.05 | 8.4 s | 1.5 s | 76,828 MB |
+
+On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.93 s/NFE
+(7.5 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
+branch-parallel layout; the whole request (text encoding, 8 forwards, joint
+decode) completes in 9.3 s after warmup. At this GPU count the step is
+launch- and copy-bound in the linear branch rather than FLOP-bound: the scans
+fold the 102 frames into per-chunk composites plus one chain over the chunks
+with both directions per launch (the chunked window only reads states at
+chunk boundaries), q/k/v and the per-head scalars travel as four async
+field-major all-to-alls that land contiguous (no relayout copies for the
+window K/V gathers or the branch's conv), only the 128-wide output-gate
+hidden crosses the fabric (the gate's `up` runs on the head shard), the frame
+mean is a reshape-sum instead of an atomic index_add, and the transformer
+runs online `mxfp8` by default (e4m3 with one E8M0 scale per 32 elements into
+cuBLASLt's block-scaled GEMM; the activation quant is fused into the adaLN
+modulation and SwiGLU producers, so no standalone quant pass runs). The
+prompt's text state joins
+the frames' Cholesky batch as a virtual frame. OpenVDN's branch-parallel layout was measured slower here (1.39
+s/NFE at 5+3, 1.49 at 6+2): with 11 to 12 heads per softmax rank the window
+attention and its gathers grow faster than the linear ranks shrink; splitting
+each rank's heads into two pipelined all-to-all groups also lost (1.10 s/NFE)
+to smaller attention kernels and doubled branch launches. The profile of one
+rank is 31% window FlashAttention, 24% fp8 GEMM, 12% NCCL, the rest small
+kernels.
+Against the published 8× B200 headline (1.40 s/NFE, 11.2
+GPU-seconds per NFE), the SGLang 4× B200 FP8 run spends 9.8 GPU-seconds per
+NFE, with half the GPUs and half the all-to-all fan-out. On the same host and GPU count the
+SGLang path is 10-13% faster per NFE than the released stack (2.34 vs 2.61 /
+2.68 s), and the 8-forward denoise is 18.7 s against their 20.9 / 21.4 s. In BF16 the single-GPU path matches the released tuned BF16 stack
+(7.86 vs 7.91 s/NFE); the single-GPU FP8 gap (7.49 vs 6.47 s) is the online
+FP8 GEMM path, not the hybrid attention.
+
+On one B200 the auto memory policy streams the DiT layers from host memory
+(the 62 GB DiT, the 66 GB conditioner and the VAEs do not all fit resident
+with the 120 GB headroom the policy keeps); keeping the FP8 DiT resident with
+`--layerwise-offload-components text_encoder` changes nothing measurable, so
+the single-GPU rows are compute-bound. The BF16 DiT does not fit resident at
+this clip length on one 183 GB card (the 104k-row activations alone take
+about 100 GB). Per DiT block the hybrid attention costs about 117 ms at this
+shape (window FlashAttention 46 ms, projections 24 ms, the linear branch and
+its fused kernels the rest). A static-tile block-sparse Triton kernel was
+measured at 226 ms against 169 ms for the decomposed FlashAttention path and
+is not shipped.
+
+### VDN-H3 on RTX PRO 6000
+
+The same paper workload (1344×768, 345 frames, 8 DiT forwards, seed 1000,
+`hybrid_window_attn_h3`, `--performance-mode speed`, served-shape warmup) on
+RTX PRO 6000 Blackwell Server Edition cards (SM120, 96 GB, PCIe, no NVLink).
+The window runs on FA4's sm120 kernel and the transformer defaults to online
+`mxfp8` (a cutlass sm120 block-scaled GEMM); `--quantization fp8` maps to it.
+One card needs `--layerwise-offload-components text_encoder`: the fp8 DiT
+(33 GB) and the bf16 text encoder (48 GB) do not both fit, and the whole-module
+`--text-encoder-cpu-offload` re-homes the encoder in one piece and runs out of
+memory when it is used. Multi-card Ulysses goes over PCIe; the all-to-all is
+the bulk of the step there (54% of GPU time at 8 cards), so the per-card
+efficiency drops with count. A 2-card run should use a pair on one PCIe
+switch (`nvidia-smi topo -m` shows `PIX`): a pair across the CPU root complex
+measured 15.7 to 17.0 s/NFE on a shared host.
+
+| Config | Steady s/NFE | Denoise (8 forwards) | Decode | Peak/GPU |
+| --- | ---: | ---: | ---: | ---: |
+| 1× RTX PRO 6000, `--layerwise-offload-components text_encoder` (default `mxfp8`) | **20.27** | **160.0 s** | 20.6 s | 95,790 MB |
+| 1× RTX PRO 6000, same, per-channel `fp8` path (before this mapping) | 22.85 | 180.3 s | 20.7 s | 95,160 MB |
+| 2× RTX PRO 6000 Ulysses2, one PCIe switch (default `mxfp8`) | 13.61 | 107.4 s | 10.6 s | 93,846 MB |
+| 2× RTX PRO 6000 Ulysses2, one PCIe switch, per-channel `fp8` | 14.97 | 118.1 s | 10.6 s | 94,700 MB |
+| 4× RTX PRO 6000 Ulysses4 (default `mxfp8`) | 7.98 | 63.0 s | 5.6 s | 82,178 MB |
+| 4× RTX PRO 6000 Ulysses4, per-channel `fp8` | 8.23 | 65.1 s | 5.6 s | 82,422 MB |
+| 8× RTX PRO 6000 Ulysses8 (default `mxfp8`) | 5.43 | 43.1 s | 3.5 s | 77,704 MB |
+| 8× RTX PRO 6000 Ulysses8, per-channel `fp8` | 5.47 | 43.4 s | 3.5 s | 77,236 MB |
+
+For comparison the same code on B200 measures 6.23 / 3.34 / 1.73 / 0.89 s/NFE
+at 1 / 2 / 4 / 8 cards (NVLink, 87% parallel efficiency at 8).
 
 ### H200 topology comparison
 

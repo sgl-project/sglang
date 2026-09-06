@@ -22,10 +22,14 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_mxfp8_swizzled,
+    can_use_silu_mul_mxfp8,
     fused_inplace_qknorm_rope,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
+    indexed_scale_shift_mxfp8_,
+    silu_mul_mxfp8,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
@@ -78,6 +82,9 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     native_adaln_weight_files,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
+    MiniMaxH3VDNHybridAttention,
 )
 from sglang.multimodal_gen.runtime.models.parameter import BlockQuantScaleParameter
 from sglang.multimodal_gen.runtime.platforms import (
@@ -360,6 +367,12 @@ def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSN
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = torch.chunk(x, 2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
+
+
+def _accepts_mxfp8_input(linear: nn.Module) -> bool:
+    return linear.quant_method is not None and linear.quant_method.accepts_mxfp8_input(
+        linear
+    )
 
 
 def _modulate_scale_shift(
@@ -827,6 +840,10 @@ class MiniMaxH3Attention(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.to_gate_compress",
             )
+        # VDN-H3: None for the dense model and for the token refiner
+        self.hybrid = MiniMaxH3VDNHybridAttention.build(
+            arch, quant_config, prefix=prefix, local_heads=self.num_heads
+        )
 
     def _set_attention_backend(self, backend) -> None:
         if (
@@ -1032,8 +1049,11 @@ class MiniMaxH3Attention(nn.Module):
         subblock_sparse_query_block_mask: torch.Tensor | None = None,
         ulysses_active: bool = False,
         ring_active: bool = False,
+        x_prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
+
+        ``x_prequant``: ``x`` already quantized for ``qkv_proj`` as ``(fp8, scales)``.
 
         Operation order: fused qkv projection -> per-head q/k RMSNorm -> RoPE
         on q/k -> variable-length non-causal flash attention -> output projection.
@@ -1054,11 +1074,29 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
         v = v.view(total, self.num_heads, self.head_dim)
+        if (
+            self.hybrid is not None
+            and self._attention_backend_enum
+            is AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
+        ):
+            return self.hybrid(
+                self,
+                x,
+                q,
+                k,
+                v,
+                rope_cache=rope_cache,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+                ulysses_active=ulysses_active,
+                ring_active=ring_active,
+            )
         if rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
@@ -1160,7 +1198,7 @@ class MiniMaxH3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.device.type == "mps":
+        if not isinstance(x, tuple) and x.device.type == "mps":
             out = torch.empty_like(x)
             for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
                 stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
@@ -1173,6 +1211,9 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
+        if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
+            out, _ = self.fc2(silu_mul_mxfp8(hidden))
+            return out
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
@@ -1384,11 +1425,20 @@ class MiniMaxH3DiTBlock(nn.Module):
         # a block-local buffer.
         residual = x
         h = self.norm1(x)
-        h = _modulate_scale_shift(
-            h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
-        )
+        h_prequant = None
+        if _accepts_mxfp8_input(self.attn.qkv_proj) and can_use_mxfp8_swizzled(h):
+            # the bf16 modulated rows stay in h for the VDN branch projections
+            h, h_q, h_s = indexed_scale_shift_mxfp8_(
+                h, shift_msa, scale_msa, combined_indices, keep_bf16=True
+            )
+            h_prequant = (h_q, h_s)
+        else:
+            h = _modulate_scale_shift(
+                h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
+            )
         h = self.attn(
             h,
+            x_prequant=h_prequant,
             rope_cache=rope_cache,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
@@ -1408,10 +1458,16 @@ class MiniMaxH3DiTBlock(nn.Module):
 
         residual = x
         h = self.norm2(x)
-        h = _modulate_scale_shift(
-            h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
-        )
-        h = self.mlp(h)
+        if _accepts_mxfp8_input(self.mlp.fc1) and can_use_mxfp8_swizzled(h):
+            _, h_q, h_s = indexed_scale_shift_mxfp8_(
+                h, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
+            )
+            h = self.mlp((h_q, h_s))
+        else:
+            h = _modulate_scale_shift(
+                h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
+            )
+            h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place
         # even while Cache-DiT is attached.
         return _modulate_gate(

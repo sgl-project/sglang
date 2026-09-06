@@ -186,6 +186,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-4-step-distilled-preview",
     },
     {
+      name: "VDN-H3",
+      modelIds: ["OpenVDN/vdn-minimax-h3"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",
+    },
+    {
       name: "MOVA",
       modelIds: ["OpenMOSS-Team/MOVA-360p", "OpenMOSS-Team/MOVA-720p"],
       note: "Resolved by the MOVA resolution detector.",

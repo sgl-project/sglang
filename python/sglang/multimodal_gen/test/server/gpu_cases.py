@@ -689,6 +689,47 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
         run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
+        "vdn_h3_t2va_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="OpenVDN/vdn-minimax-h3",
+            modality="video",
+            num_gpus=4,
+            extras=[
+                "--attention-backend",
+                "hybrid_window_attn_h3",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A curious raccoon peers through a vibrant field of yellow "
+                "sunflowers, its eyes wide with interest."
+            ),
+            output_size="1344x768",
+            seconds=5,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 5.0,
+                },
+                "num_inference_steps": 9,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "fasth3_t2va_vsa_4gpu_h100",
         DiffusionServerArgs(
             model_path="FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
@@ -1402,6 +1443,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
     ],
 }
 
@@ -1447,6 +1489,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+        # no model load; two small all-to-alls
+        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 60.0,
     },
 }
 
