@@ -66,13 +66,11 @@ export const benchmarks = [
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
   // 2x DGX Spark, TP=2, lmsysorg/sglang:qwen38flashnext (SGLang 593134d17a),
-  // 2026-09-04. GSM8K here is the chat-API protocol with thinking off, n=200
-  // (not the full 1,319-question set the datacenter rows use); AIME26 and
-  // MMMU-Pro not run.
+  // 2026-09-04. Accuracy (GSM8K, full 1,319-question set) is being run and
+  // will be added; AIME26 and MMMU-Pro not run.
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
-    accuracy: { gsm8k_pct: 97.5 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 457.14, tpot_ms: 19.94, tokens_per_sec_per_gpu: 116 },
@@ -85,7 +83,6 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "multi-2" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
-    accuracy: { gsm8k_pct: 97.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 416.42, tpot_ms: 39.33, tokens_per_sec_per_gpu: 60 },
@@ -96,12 +93,11 @@ export const benchmarks = [
     ],
   },
   // 1x DGX Spark, TP=1, N-gram table file-backed on NVMe (PLE Offload = On
-  // (NVMe file)), qwen4-main-squashed @ 9b2aee2283. Same GSM8K protocol and
-  // bench workload as the 2-node rows; single GPU, so per-GPU = total tok/s.
+  // (NVMe file)), qwen4-main-squashed @ 9b2aee2283. Same bench workload as
+  // the 2-node rows; single GPU, so per-GPU = total tok/s. Accuracy pending.
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "qwen4-main-squashed @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 98.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 648.92, tpot_ms: 33.59, tokens_per_sec_per_gpu: 137 },
@@ -114,7 +110,6 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "qwen4-main-squashed @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 96.5 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 580.18, tpot_ms: 61.63, tokens_per_sec_per_gpu: 80 },
@@ -127,12 +122,10 @@ export const benchmarks = [
   // nvidia/Qwen3.8-Flash-Next-NVFP4 (ModelOpt MIXED_PRECISION) on the same
   // Spark pair, measured on the qwen4-main-squashed tip 9b2aee2283 (which
   // includes sgl-project/sglang#38121) — the shipped image cannot load this
-  // export yet. Same GSM8K
-  // protocol (chat API, thinking off, n=200) and bench workload as above.
+  // export yet. Same bench workload as above; accuracy pending.
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "multi-2" },
     sglang_version: "qwen4-main-squashed @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 97.5 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 447.13, tpot_ms: 18.70, tokens_per_sec_per_gpu: 119 },
@@ -145,7 +138,6 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "multi-2" },
     sglang_version: "qwen4-main-squashed @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 97.5 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 398.49, tpot_ms: 38.62, tokens_per_sec_per_gpu: 61 },
@@ -156,13 +148,12 @@ export const benchmarks = [
     ],
   },
   // 1x DGX Spark, TP=1, nvidia export with the N-gram table file-backed on NVMe,
-  // lmsysorg/sglang:dev-qwen38-next-local (9b2aee2283), 2026-09-06. Chat-API
-  // GSM8K with thinking off, n=100 (the other DGX Spark rows are n=200); same
-  // 1024/256 bench workload. The in-checkpoint MTP head is used at TP=1.
+  // lmsysorg/sglang:dev-qwen38-next-local (9b2aee2283), 2026-09-06. Same
+  // 1024/256 bench workload; accuracy pending. The in-checkpoint MTP head is
+  // used at TP=1.
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 96.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 650.03, tpot_ms: 33.26, tokens_per_sec_per_gpu: 136 },
@@ -175,7 +166,6 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 98.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 604.33, tpot_ms: 63.54, tokens_per_sec_per_gpu: 78 },

@@ -741,8 +741,8 @@ export const config = {
     // which appends --no-ple-offload-embedding: the FP8 table stays GPU-resident
     // and TP-sharded, since on unified memory the "offloaded" pinned-host copy
     // would come out of the same pool anyway. Verified 2026-09-04 on the qwen38flashnext image
-    // (SGLang 593134d17a): GSM8K (chat API, thinking off, n=200) 97.5% low
-    // latency / 97.0% high throughput, 100k-token prefill 2,400-2,840 tok/s.
+    // (SGLang 593134d17a): 100k-token prefill 2,400-2,840 tok/s. GSM8K on the
+    // full set pending.
     //
     // Low latency: in-checkpoint MTP head (NEXTN 3/1/4), 24 concurrent
     // requests (120 mamba slots), 1.48M-token KV pool, MTP accept length
@@ -779,7 +779,7 @@ export const config = {
     // High throughput: speculation off, 96 concurrent requests. extra_buffer_lazy
     // allocates the mamba track buffer lazily (4 slots per request instead of
     // 5), so 384 slots admit 96 requests while leaving a 1.07M-token KV pool;
-    // 332 tok/s aggregate on the GSM8K run at 96-way concurrency.
+    // 332 tok/s aggregate on a 96-way chat workload.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "multi-2" },
       verified: true,
@@ -929,8 +929,8 @@ export const config = {
     // mamba state slot is ~113 MB (fp32), so concurrency is pinned low:
     // 8 requests with MTP (5 slots each), 24 without on the lazy strategy (4
     // slots each). Verified 2026-09-06 on qwen4-main-squashed @ 9b2aee2283 (the
-    // Python install path): GSM8K (chat, thinking off, n=200) 98.0% / 96.5%;
-    // boot ~10-11 min once the table file is fresh (see the chip hint).
+    // Python install path); boot ~10-11 min once the table file is fresh (see
+    // the chip hint). GSM8K on the full set pending.
     //
     // Low latency: MTP head, 8 concurrent requests (40 slots), 93k-token KV
     // pool (~11.6k per request), 27.5 tok/s single stream (TPOT 33.6 ms),
@@ -962,7 +962,7 @@ export const config = {
     },
     // High throughput: speculation off, 24 concurrent requests (96 lazy slots),
     // 286k-token KV pool (~11.9k per request); 83 tok/s output at 24
-    // (105 tok/s aggregate on GSM8K, vs 94 for the MTP cell at 8), 15.9 tok/s
+    // (105 tok/s aggregate on a chat workload, vs 94 for the MTP cell at 8), 15.9 tok/s
     // single stream. MRR 16 / 64 slots was only +10% over the MTP cell, so 24.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
@@ -1004,9 +1004,8 @@ export const config = {
     //     block-scaled MTP experts cannot be TP-sharded (640/2 = 320 is not a
     //     multiple of the 128 block) and fault on the triton fp8 path under EP.
     // Measured 2026-09-05 on the qwen4-main-squashed tip 9b2aee2283 (#38121
-    // merged), TP=2: GSM8K (chat, thinking off, n=200) 97.5% / 97.5%; bench
-    // (ISL 1024/OSL 256) ~48 tok/s single stream with MTP, 253 tok/s output at
-    // 96 concurrent without.
+    // merged), TP=2: bench (ISL 1024/OSL 256) ~48 tok/s single stream with MTP,
+    // 253 tok/s output at 96 concurrent without. GSM8K on the full set pending.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
@@ -1065,8 +1064,8 @@ export const config = {
     // At TP=1 the in-checkpoint MTP head loads directly: its fp8 block-scaled
     // experts need no sharding, so the RadixArk draft used by the 2-node cell
     // is not needed. Verified 2026-09-06 on the dev-qwen38-next-local image
-    // (9b2aee2283): GSM8K (chat, thinking off, n=100) 96.0% (MTP, accept 3.0-3.6) / 98.0%;
-    // boot ~11-12 min with a fresh table file. The smaller fp8 draft leaves a
+    // (9b2aee2283): MTP accept 3.0-3.6; boot ~11-12 min with a fresh table
+    // file. GSM8K on the full set pending. The smaller fp8 draft leaves a
     // 174k-token KV pool with MTP (vs 93k for the RDXA cell) and 300k without.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
