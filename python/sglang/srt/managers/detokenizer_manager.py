@@ -172,7 +172,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if tool_call_parser != "gpt-oss" or self.tokenizer is None:
             return None
 
-        token_id = self.tokenizer.convert_tokens_to_ids("<|call|>")
+        convert_tokens_to_ids = getattr(self.tokenizer, "convert_tokens_to_ids", None)
+        if not callable(convert_tokens_to_ids):
+            return None
+
+        token_id = convert_tokens_to_ids("<|call|>")
         if (
             isinstance(token_id, int)
             and token_id >= 0

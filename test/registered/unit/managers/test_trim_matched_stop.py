@@ -104,6 +104,13 @@ class TestResolveHarmonyCallTokenId(unittest.TestCase):
         self.assertIsNone(token_id)
         tokenizer.convert_tokens_to_ids.assert_not_called()
 
+    def test_tokenizer_without_token_conversion_returns_none(self):
+        manager = SimpleNamespace(tokenizer=SimpleNamespace())
+
+        token_id = DetokenizerManager._resolve_harmony_call_token_id(manager, "gpt-oss")
+
+        self.assertIsNone(token_id)
+
 
 if __name__ == "__main__":
     unittest.main()
