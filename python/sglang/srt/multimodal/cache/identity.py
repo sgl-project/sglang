@@ -72,8 +72,11 @@ class MediaSnapshot:
 
 
 def _snapshot_pil(image: Image.Image) -> MediaSnapshot:
-    snapshot = image.copy()
-    snapshot.load()
+    try:
+        snapshot = image.copy()
+        snapshot.load()
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
     payload = snapshot.tobytes()
     palette = snapshot.palette.tobytes() if snapshot.palette is not None else b""
     palette_mode = (
@@ -295,8 +298,7 @@ def _canonicalize(value: Any) -> Any:
             "items": items,
         }
     raise ValueError(
-        "Unsupported value in multimodal cache identity: "
-        f"{_qualified_type_name(value)}"
+        f"Unsupported value in multimodal cache identity: {_qualified_type_name(value)}"
     )
 
 

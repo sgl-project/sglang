@@ -126,8 +126,7 @@ def get_model_path(extra_argv):
             )
         else:
             raise Exception(
-                "Error: --model-path is required. "
-                "Please provide the path to the model."
+                "Error: --model-path is required. Please provide the path to the model."
             )
     return model_path
 

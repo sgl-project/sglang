@@ -49,10 +49,11 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
 
     def test_deepep_v2_reads_buffer_head(self):
         cap, buf = self._capturer()
-        with mock.patch.object(
-            re_mod, "is_dp_attention_enabled", return_value=True
-        ), mock.patch.object(
-            re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep_v2")
+        with (
+            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep_v2")
+            ),
         ):
             out = self._slice(cap, n_local=5)
         self.assertTrue(torch.equal(out, buf[0:5, :, : self.K]))
@@ -61,22 +62,23 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
         cap, _ = self._capturer()
         outs = []
         for backend in ("deepep", "deepep_v2"):
-            with mock.patch.object(
-                re_mod, "is_dp_attention_enabled", return_value=True
-            ), mock.patch.object(
-                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend(backend)
+            with (
+                mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
+                mock.patch.object(
+                    re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend(backend)
+                ),
             ):
                 outs.append(self._slice(cap, n_local=7))
         self.assertTrue(torch.equal(outs[0], outs[1]))
 
     def test_tp_moe_reads_global_offset(self):
         cap, buf = self._capturer()
-        with mock.patch.object(
-            re_mod, "is_dp_attention_enabled", return_value=True
-        ), mock.patch.object(
-            re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
-        ), mock.patch.object(
-            re_mod, "get_dp_local_slice_cpu", return_value=(6, 4)
+        with (
+            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
+            ),
+            mock.patch.object(re_mod, "get_dp_local_slice_cpu", return_value=(6, 4)),
         ):
             out = self._slice(cap, n_local=999)
         self.assertTrue(torch.equal(out, buf[6:10, :, : self.K]))

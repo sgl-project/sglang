@@ -266,7 +266,7 @@ def main():
 
             print(
                 f"Daemon pp_rank={pp_rank} tp_rank={tp_rank} ready "
-                f"({time.time()-start:.0f}s)"
+                f"({time.time() - start:.0f}s)"
             )
         if error_found:
             break
@@ -278,7 +278,7 @@ def main():
         sys.exit(1)
 
     print(
-        f"\nAll {total_ranks} daemons ready! Total load time: {time.time()-start:.1f}s"
+        f"\nAll {total_ranks} daemons ready! Total load time: {time.time() - start:.1f}s"
     )
 
     # Query config from daemon (pp_rank=0, tp_rank=0)

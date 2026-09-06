@@ -30,7 +30,6 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 
 class TestLoRABackend(CustomTestCase):
-
     def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters

@@ -127,8 +127,8 @@ def benchmark(batch_size, provider, N, K):
             lambda: vllm_scaled_mm(a, b, scale_a, scale_b, torch.float16, bias),
             quantiles=quantiles,
         )
-    gbps = (
-        lambda ms: (
+    gbps = lambda ms: (
+        (
             (2 * M * N * K - M * N) * a.element_size()
             + (3 * M * N) * scale_a.element_size()
         )

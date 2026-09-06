@@ -31,6 +31,7 @@ def test_flashinfer_prefill_returns_standard_combine_input():
     wrapper.run.return_value = expected_output
     quant_info = SimpleNamespace(
         wrapper=wrapper,
+        quant_mode="w4a4",
         use_per_token_activation=False,
         a1_scale=torch.tensor(1.0),
         a2_scale=torch.tensor(1.0),

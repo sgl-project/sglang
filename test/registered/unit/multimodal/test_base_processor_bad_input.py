@@ -8,11 +8,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import base64
 import binascii
+import io
 import unittest
 from unittest.mock import MagicMock, patch
 
 import requests
+from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -62,6 +65,18 @@ class TestBadInputIsClientError(CustomTestCase):
         # PIL raises UnidentifiedImageError, an OSError -- not a ValueError.
         self._assert_client_error(b"definitely not an image", Modality.IMAGE)
 
+    def test_lazy_pil_decode_failure(self):
+        malformed_png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
+        )
+        for media in (malformed_png, Image.open(io.BytesIO(malformed_png))):
+            with self.subTest(media_type=type(media).__name__):
+                with self.assertRaisesRegex(
+                    ValueError, "Could not decode image"
+                ) as ctx:
+                    _StubProcessor._load_single_item(media, Modality.IMAGE)
+                self.assertIsInstance(ctx.exception.__cause__.__cause__, OSError)
+
     def test_undecodable_audio_bytes(self):
         # soundfile raises LibsndfileError, a RuntimeError -- not a ValueError.
         self._assert_client_error(b"definitely not audio", Modality.AUDIO)
@@ -90,6 +105,14 @@ class TestServerFaultStaysServerError(CustomTestCase):
 
     def test_decoder_oom(self):
         self._assert_server_error(MemoryError("out of memory"))
+
+    def test_image_source_os_error(self):
+        with patch(
+            "sglang.srt.utils.common.get_image_bytes",
+            side_effect=OSError("too many open files"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "too many open files"):
+                _StubProcessor._load_single_item("file:///image.png", Modality.IMAGE)
 
 
 class TestClientMediaExceptions(CustomTestCase):

@@ -28,7 +28,6 @@ _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
 
 
 class SDPABackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -49,7 +48,6 @@ class SDPABackend(AttentionBackend):
 
 
 class SDPAImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,
@@ -268,7 +266,7 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
                 # cuDNN raises "No available kernel" for some shapes; pin the
                 # FA fail-safe path for this layer and keep going.
                 logger.warning(
-                    "cuDNN SDPA failed (%s); falling back to FlashAttention " "for %s.",
+                    "cuDNN SDPA failed (%s); falling back to FlashAttention for %s.",
                     e,
                     type(self).__name__,
                 )

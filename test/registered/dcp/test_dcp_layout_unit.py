@@ -70,7 +70,9 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
         return torch.cat(runs) if runs else torch.empty(0, dtype=torch.int64)
 
     def _owner_rule(self, kv, dcp_size, dcp_rank):
-        return kv[kv % dcp_size == dcp_rank] // dcp_size
+        # Selection only: the filters leave ids WIDENED and the collapse now
+        # happens once, in KVIndexTranslator.translate_dcp_read_ids.
+        return kv[kv % dcp_size == dcp_rank]
 
     def _run(self, starts, lens, dcp_size, dcp_rank, seed=0):
         kv = self._build_chunk(starts, lens, dcp_size, seed)
@@ -409,10 +411,13 @@ class TestGetDcpLens(CustomTestCase):
             )
             # The allocator widens from get_parallel(), not from the injected
             # server_args stand-in -- drive the cause, not the effect.
-            with patch(
-                "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
-                return_value=False,
-            ), rc.get_parallel().override(attn_dcp_size=dcp_size):
+            with (
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
+                    return_value=False,
+                ),
+                rc.get_parallel().override(attn_dcp_size=dcp_size),
+            ):
                 allocators[dcp_size] = (
                     KVCacheConfigurator._build_token_to_kv_pool_allocator(
                         configurator,

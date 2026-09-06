@@ -671,6 +671,8 @@ class SanaWMStreamingRefinerStage(SanaWMLTX2RefinerStage):
             )
             return batch
         n_blocks = math.ceil(n_active / self.block_size)
+        total_iterations = n_blocks * (len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1)
+        batch.record_stage_iterations(total_iterations, total_iterations)
         self.log_info(
             "SANA-WM streaming refiner: latent=%s, sink=%d, block=%d, blocks=%d, kv_max=%d, seed=%d",
             tuple(latents.shape),

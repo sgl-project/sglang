@@ -314,8 +314,7 @@ async def _concurrent_logprob_run(base_url: str, tokenizer: Any, **gen_kwargs) -
                 tasks = []
                 for s in range(CONCURRENT_LOGPROB_SESSIONS):
                     text = (
-                        f"S{s} T{turn}: "
-                        f"{LOGPROB_PROMPTS[turn % len(LOGPROB_PROMPTS)]}"
+                        f"S{s} T{turn}: {LOGPROB_PROMPTS[turn % len(LOGPROB_PROMPTS)]}"
                     )
                     ids = tokenizer.encode(text)
                     tasks.append(
@@ -360,9 +359,7 @@ async def _stress_run_all(base_url: str, tokenizer: Any) -> None:
             # Streaming requests — long prompts to trigger chunked prefill.
             for s in range(STRESS_NUM_SESSIONS):
                 offset = (s * STRESS_NUM_TURNS + turn) * 200
-                text = (
-                    f"Session {s} turn {turn}: " f"{LEAK_FILLER[offset : offset + 800]}"
-                )
+                text = f"Session {s} turn {turn}: {LEAK_FILLER[offset : offset + 800]}"
                 ids = tokenizer.encode(text)
                 tasks.append(
                     _async_generate(
