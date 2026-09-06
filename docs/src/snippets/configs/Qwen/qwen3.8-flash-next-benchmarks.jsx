@@ -177,16 +177,16 @@ export const benchmarks = [
   },
   // 1x RTX PRO 6000 Blackwell (96 GB), TP=1, lmsysorg/sglang:dev-qwen38-next-local
   // (qwen4-main-squashed 9b2aee2283), 2026-09-06: all four cells run as the
-  // command generator emits them. Same chat-API GSM8K protocol as the DGX
-  // Spark rows (thinking off, n=200) and the same 1024/256 bench workload;
+  // command generator emits them. GSM8K is the full 1,319-question set through
+  // sglang.test.run_eval --eval-name gsm8k --num-examples 1319 --max-tokens 16384
+  // (5-shot, greedy, thinking on, last-number scorer); same 1024/256 bench workload;
   // tokens_per_sec_per_gpu is (input + output) tok/s on the one GPU; output alone
   // is one fifth of it (1024 in / 256 out, range ratio 1, ignore_eos).
-  // AIME26 and MMMU-Pro not run. The RDXA cells first passed on the
-  // qwen38flashnext image (593134d17a) on 2026-09-05 at 97.0-97.5 / 97.0-98.0.
+  // AIME26 and MMMU-Pro not run.
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 97.0 },
+    accuracy: { gsm8k_pct: 97.95 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 235.23, tpot_ms: 6.21, tokens_per_sec_per_gpu: 705 },
@@ -197,7 +197,7 @@ export const benchmarks = [
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 97.0 },
+    accuracy: { gsm8k_pct: 97.79 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 162.25, tpot_ms: 11.49, tokens_per_sec_per_gpu: 415 },
@@ -207,12 +207,11 @@ export const benchmarks = [
         ttft_ms: 3212.36, tpot_ms: 54.93, tokens_per_sec_per_gpu: 4425 },
     ],
   },
-  // nvidia/Qwen3.8-Flash-Next-NVFP4 on the same card and image; second GSM8K
-  // runs on separate servers scored 97.5 (MTP) and 97.0 (no MTP).
+  // nvidia/Qwen3.8-Flash-Next-NVFP4 on the same card and image.
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 97.5 },
+    accuracy: { gsm8k_pct: 97.72 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 225.43, tpot_ms: 5.86, tokens_per_sec_per_gpu: 745 },
@@ -223,7 +222,7 @@ export const benchmarks = [
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 96.5 },
+    accuracy: { gsm8k_pct: 97.72 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 158.37, tpot_ms: 11.54, tokens_per_sec_per_gpu: 415 },
