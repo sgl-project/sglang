@@ -9,10 +9,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     estimate_prefill_extend_tile_metrics,
 )
-from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefResult,
-    IncLockRefResult,
-)
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
@@ -71,6 +68,13 @@ class TestPrefillAdder(CustomTestCase):
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
+        # get_kvcache().[_unified_kv] gates the unified-KV SWA-ring accounting
+        # path in schedule_policy.add_chunked_req / rem_swa_tokens. A bare
+        # MagicMock auto-creates any attribute access as a truthy Mock, so
+        # without this the getattr(..., "_unified_kv", False) default never
+        # triggers and these tests silently exercise the unified-KV branch
+        # instead of the standard hybrid-SWA one they intend to cover.
+        allocator.get_kvcache.return_value._unified_kv = False
         return allocator
 
     def create_running_batch(self, reqs=None) -> MagicMock:
