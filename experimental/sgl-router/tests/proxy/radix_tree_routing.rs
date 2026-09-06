@@ -1,48 +1,37 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Full HTTP routing path backed by a real in-memory Indexer gRPC server.
-
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
-use sgl_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
-use sgl_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType,
-};
-use sgl_kv_indexer::{
-    server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerService, PrefixIndexConfig,
-};
 use sgl_router::config::{AffinityConfig, CachePrefixProvider, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
-use sgl_router::policies::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
+use sgl_router::policies::kv_events::{
+    compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
+};
+use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
 use sgl_router::policies::request_tokens_for;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
-use tokio_stream::wrappers::TcpListenerStream;
 use tower::ServiceExt;
 
 use crate::common::cache_aware_fixture::{config, MODEL};
 use crate::common::mock_worker::MockWorker;
 
 #[tokio::test]
-async fn external_indexer_routes_to_the_cached_worker() {
+async fn radix_tree_routes_cache_aware_request_to_cached_worker() {
     let cached = MockWorker::start(vec![]).await;
     let uncached = MockWorker::start(vec![]).await;
     let mut cfg = config();
     cfg.model.policy = PolicyKind::CacheAware;
-    cfg.model
-        .cache_aware
-        .as_mut()
-        .expect("fixture includes cache-aware configuration")
-        .prefix_provider = CachePrefixProvider::Indexer;
+    cfg.model.cache_aware.as_mut().unwrap().prefix_provider = CachePrefixProvider::RadixTree;
     cfg.model.affinity = Some(AffinityConfig {
         cache_affinity_min_matched_tokens: Some(0),
         cache_candidate_min_workers: 1,
@@ -53,42 +42,15 @@ async fn external_indexer_routes_to_the_cached_worker() {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let body = json!({
         "model": MODEL,
-        "messages": [{"role": "user", "content": "hello there friend"}],
+        "messages": [{"role": "user", "content": "local radix cache hit"}],
     });
     let tokens = request_tokens_for(&tokenizers, &ModelId(MODEL.into()), &body)
         .expect("test prompt tokenizes");
     let hashes = compute_block_hashes(&tokens.ids, 1);
     assert!(!hashes.is_empty());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
-        server_builder()
-            .add_service(KvIndexerService::new(InMemoryKvIndexerBackend::new()).into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .unwrap();
-    });
-
-    let mut indexer = KvIndexerClient::connect(endpoint.clone()).await.unwrap();
-    indexer
-        .apply_external_kv_batch(ApplyExternalKvBatchRequest {
-            worker_id: "cached-worker".into(),
-            seq: 1,
-            actions: vec![ExternalKvAction {
-                r#type: ExternalKvActionType::ActionReport as i32,
-                tier: TierType::TierHbm as i32,
-                hashes: hashes.clone(),
-                component_masks: Vec::new(),
-                block_sizes: Vec::new(),
-                parent_block_hash: None,
-            }],
-            worker_address: cached.url.clone(),
-            cache_spec: None,
-        })
-        .await
-        .unwrap();
-
+    let tree = Arc::new(HashTree::new());
+    tree.insert(&KvWorkerId::new(cached.url.clone(), 0), None, &hashes);
     let registry = Arc::new(WorkerRegistry::default());
     for url in [&cached.url, &uncached.url] {
         registry
@@ -103,8 +65,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
     }
     let oracle = BlockSizeOracle::new();
     oracle.try_set(1).unwrap();
-    let policies =
-        Arc::new(build_registry(&cfg, Arc::new(HashTree::new()), Arc::clone(&oracle)).unwrap());
+    let policies = Arc::new(build_registry(&cfg, Arc::clone(&tree), Arc::clone(&oracle)).unwrap());
     let mut ctx = AppContext::new(
         cfg,
         tokenizers,
@@ -112,18 +73,10 @@ async fn external_indexer_routes_to_the_cached_worker() {
         registry,
         policies,
     );
-    ctx.prefix_index = Some(Arc::new(
-        GrpcPrefixIndex::new(PrefixIndexConfig {
-            endpoint,
-            query_deadline: Duration::from_secs(1),
-            max_inflight: 4,
-        })
-        .unwrap(),
-    ));
+    ctx.radix_tree_prefix_provider = Some(RadixTreePrefixProvider::new(tree, Arc::clone(&oracle)));
     ctx.block_size_oracle = oracle;
 
-    let app = build_router(Arc::new(ctx));
-    let response = app
+    let response = build_router(Arc::new(ctx))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -138,6 +91,4 @@ async fn external_indexer_routes_to_the_cached_worker() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(cached.captured.lock().unwrap().last_body.is_some());
     assert!(uncached.captured.lock().unwrap().last_body.is_none());
-
-    server.abort();
 }
