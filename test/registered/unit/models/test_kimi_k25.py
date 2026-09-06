@@ -25,6 +25,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
+from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_HASH_KEY,
+    MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+)
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.models.kimi_k25 import (
     KimiK25ForConditionalGeneration,
@@ -763,6 +767,7 @@ def _cached_k3_artifact(content_digest, artifact_key, value=1):
     return KimiK3ImagePreprocessArtifact(
         content_digest=content_digest,
         artifact_key=artifact_key,
+        feature_identity="sha256:" + "34" * 32,
         feature_hash=123,
         original_size=(1536, 1024),
         resize_config=KimiK3ResizeConfig(
@@ -793,6 +798,42 @@ def test_kimi_k3_cached_artifact_is_composed_per_prompt():
     assert second.mm_items[0].offsets == [(4, 6)]
     assert first.mm_items[0].hash == second.mm_items[0].hash == 123
     torch.testing.assert_close(first.mm_items[0].feature, second.mm_items[0].feature)
+
+
+def test_kimi_k3_featureless_artifact_keeps_hash_and_lease():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor._tokenizer = _Tokenizer()
+    processor.mm_feature_transport = "cpu"
+    processor.use_cuda_ipc = False
+    artifact = _cached_k3_artifact("sha256:" + "ab" * 32, "artifact")
+
+    output = processor.compose_request(
+        [1, 99, 2],
+        [artifact],
+        featureless_hit_mask=[True],
+        embedding_lease_id="lease",
+    )
+
+    item = output.mm_items[0]
+    assert item.feature is None
+    assert item.hash == artifact.feature_hash
+    assert (
+        item.model_specific_data[MM_EMBEDDING_CACHE_HASH_KEY] == artifact.feature_hash
+    )
+    assert item.model_specific_data[MM_EMBEDDING_CACHE_LEASE_ID_KEY] == "lease"
+
+
+def test_kimi_k3_featureless_artifact_requires_lease():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor._tokenizer = _Tokenizer()
+    processor.mm_feature_transport = "cpu"
+    processor.use_cuda_ipc = False
+    artifact = _cached_k3_artifact("sha256:" + "ab" * 32, "artifact")
+
+    with pytest.raises(ValueError, match="embedding lease"):
+        processor.compose_request([1, 99, 2], [artifact], featureless_hit_mask=[True])
 
 
 def test_kimi_k3_cached_deferred_artifact_has_model_contract():
@@ -1056,6 +1097,7 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
     processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
     processor.mm_processor_executor = None
     processor.io_executor = ThreadPoolExecutor(max_workers=2)
+    processor._preprocess_metrics_callback = None
     image = Image.new("RGB", (2, 2), color=(1, 2, 3))
     digest = snapshot_media(image).content_digest
     key = processor._artifact_key(digest, image)
@@ -1068,7 +1110,7 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
 
     processor._run_preprocess_and_build_artifact_batch = prepare
     try:
-        with pytest.raises(ValueError, match="feature hash changed"):
+        with pytest.raises(ValueError, match="feature identity or hash changed"):
             asyncio.run(processor.prepare_media_artifacts([image]))
     finally:
         processor.io_executor.shutdown()

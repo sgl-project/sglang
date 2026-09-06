@@ -152,6 +152,10 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MMEmbeddingCacheAcquireReqInput,
+    MMEmbeddingCacheAcquireReqOutput,
+    MMEmbeddingCacheLeaseMissReqOutput,
+    MMEmbeddingCacheReleaseReqInput,
     MMInputsProcessError,
     OpenSessionReqInput,
     PauseGenerationReqInput,
@@ -1714,6 +1718,8 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (MMEmbeddingCacheAcquireReqInput, self.acquire_mm_embedding_cache),
+                (MMEmbeddingCacheReleaseReqInput, self.release_mm_embedding_cache),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -1804,6 +1810,124 @@ class Scheduler(
                     self.list_external_corpora,
                 ),
             ]
+        )
+
+    def acquire_mm_embedding_cache(
+        self, recv_req: MMEmbeddingCacheAcquireReqInput
+    ) -> MMEmbeddingCacheAcquireReqOutput:
+        """Pin per-image embeddings only when every required TP rank has them."""
+        from sglang.srt.managers import mm_schedule
+
+        # The vision tower and its embedding cache live on the first PP stage.
+        # Later stages still receive control messages but must not create pins.
+        if self.ps.pp_rank != 0:
+            return MMEmbeddingCacheAcquireReqOutput(
+                rid=recv_req.rid,
+                hit_mask=[False] * len(recv_req.feature_hashes),
+                lease_id=None,
+                routed_dp_rank=self.ps.dp_rank or 0,
+            )
+
+        cache = mm_schedule.embedding_cache
+        lease_id = recv_req.rid
+        if cache is None or lease_id is None:
+            hit_mask = [False] * len(recv_req.feature_hashes)
+        else:
+            local_mask = cache.acquire_many(
+                lease_id,
+                recv_req.feature_hashes,
+                recv_req.ttl_s,
+                recv_req.feature_identities,
+            )
+            mask_tensor = torch.tensor(local_mask, dtype=torch.int32)
+            if self.dp_tp_cpu_group is not None and self.dp_tp_group.world_size > 1:
+                torch.distributed.all_reduce(
+                    mask_tensor,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.dp_tp_cpu_group,
+                )
+            hit_mask = [bool(value) for value in mask_tensor.tolist()]
+            rejected_hashes = [
+                mm_hash
+                for mm_hash, local_hit, global_hit in zip(
+                    recv_req.feature_hashes, local_mask, hit_mask
+                )
+                if mm_hash is not None and local_hit and not global_hit
+            ]
+            cache.release_lease_hashes(lease_id, rejected_hashes)
+
+        return MMEmbeddingCacheAcquireReqOutput(
+            rid=recv_req.rid,
+            hit_mask=hit_mask,
+            lease_id=lease_id if any(hit_mask) else None,
+            routed_dp_rank=self.ps.dp_rank or 0,
+        )
+
+    @staticmethod
+    def release_mm_embedding_cache(recv_req: MMEmbeddingCacheReleaseReqInput) -> None:
+        from sglang.srt.managers import mm_schedule
+
+        if mm_schedule.embedding_cache is not None:
+            mm_schedule.embedding_cache.release_lease(recv_req.lease_id)
+
+    def _validate_mm_embedding_leases(
+        self, recv_req: TokenizedGenerateReqInput
+    ) -> Optional[MMEmbeddingCacheLeaseMissReqOutput]:
+        """Reject a featureless request before it enters scheduler queues."""
+        from sglang.srt.managers import mm_schedule
+        from sglang.srt.mem_cache.multimodal_cache import (
+            MM_EMBEDDING_CACHE_IDENTITY_KEY,
+            MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+            get_mm_embedding_cache_hash,
+        )
+
+        if self.ps.pp_rank != 0:
+            return None
+
+        raw_mm_inputs = recv_req.mm_inputs
+        if raw_mm_inputs is None:
+            return None
+        items = raw_mm_inputs.mm_items
+        if not items:
+            return None
+
+        cache = mm_schedule.embedding_cache
+        lease_ids = set()
+        invalid_lease_id = None
+        for item in items:
+            lease_id = item.model_specific_data.get(MM_EMBEDDING_CACHE_LEASE_ID_KEY)
+            if lease_id is None:
+                continue
+            lease_ids.add(lease_id)
+            embedding_hash = get_mm_embedding_cache_hash(item)
+            if (
+                item.feature is not None
+                or embedding_hash is None
+                or cache is None
+                or not cache.lease_contains(
+                    lease_id,
+                    embedding_hash,
+                    item.model_specific_data.get(MM_EMBEDDING_CACHE_IDENTITY_KEY),
+                )
+            ):
+                invalid_lease_id = lease_id
+                break
+
+        if invalid_lease_id is None:
+            if cache is not None:
+                for lease_id in lease_ids:
+                    if not cache.admit_lease(lease_id):
+                        invalid_lease_id = lease_id
+                        break
+        if invalid_lease_id is None:
+            return None
+        if cache is not None:
+            for lease_id in lease_ids:
+                cache.release_lease(lease_id)
+        return MMEmbeddingCacheLeaseMissReqOutput(
+            rid=recv_req.rid,
+            lease_id=invalid_lease_id,
+            routed_dp_rank=self.ps.dp_rank or 0,
         )
 
     def _abort_on_running_timeout(self, running_batch: ScheduleBatch):
@@ -2705,12 +2829,24 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    @staticmethod
+    def _release_aborted_mm_inputs(req: Req) -> None:
+        """Release request-owned MM resources once the scheduler drops it."""
+        mm_inputs = req.multimodal_inputs
+        if mm_inputs is not None and req.session is None:
+            mm_inputs.release_features()
+            req.multimodal_inputs = None
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
         *,
         mm_input_error: Optional[str] = None,
     ):
+        lease_miss = self._validate_mm_embedding_leases(recv_req)
+        if lease_miss is not None:
+            return lease_miss
+
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -3190,6 +3326,7 @@ class Scheduler(
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self._release_aborted_mm_inputs(req)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
         return True
@@ -3235,6 +3372,7 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
+        self._release_aborted_mm_inputs(req_to_abort)
         self.ipc_channels.send_to_tokenizer.send_output(
             _make_abort_req(
                 req_to_abort,
@@ -3259,6 +3397,7 @@ class Scheduler(
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
                 self._release_aborted_request(req.rid)
+                self._release_aborted_mm_inputs(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(
                         req,
@@ -3421,6 +3560,7 @@ class Scheduler(
             req.pending_bootstrap = False
         self._release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._release_aborted_mm_inputs(req)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -4071,6 +4211,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
+                self._release_aborted_mm_inputs(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req, finished_reason=abort_reason.to_json()),
                     req,
@@ -4912,6 +5053,10 @@ class Scheduler(
             self.req_to_token_pool.reset_aux_cache_allocator()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
+            from sglang.srt.managers import mm_schedule
+
+            if mm_schedule.embedding_cache is not None:
+                mm_schedule.embedding_cache.clear()
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
@@ -5160,6 +5305,7 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req.rid)
+            self._release_aborted_mm_inputs(req)
             self.beam_coordinator.retire_group(req)
             self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
@@ -5192,6 +5338,7 @@ class Scheduler(
                 recv_req.abort_all, recv_req.rid
             ):
                 self._release_aborted_request(req.rid)
+                self._release_aborted_mm_inputs(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )

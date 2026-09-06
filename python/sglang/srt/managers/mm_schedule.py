@@ -6,7 +6,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
-from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_IDENTITY_KEY,
+    MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+    EmbeddingResult,
+    MultiModalStaticCache,
+    get_mm_embedding_cache_hash,
+)
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
@@ -18,6 +24,40 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 embedding_cache: Optional[MultiModalStaticCache] = None
+
+
+def _embedding_identity(item: MultimodalDataItem) -> Optional[str]:
+    return item.model_specific_data.get(MM_EMBEDDING_CACHE_IDENTITY_KEY)
+
+
+def _embedding_hash(item: MultimodalDataItem) -> int:
+    return get_mm_embedding_cache_hash(item)
+
+
+def _embedding_cache_key(
+    item: MultimodalDataItem, token_count: int
+) -> tuple[int, Optional[str], int]:
+    return _embedding_hash(item), _embedding_identity(item), token_count
+
+
+def _get_cached_embedding(item: MultimodalDataItem) -> Optional[EmbeddingResult]:
+    lease_id = item.model_specific_data.get(MM_EMBEDDING_CACHE_LEASE_ID_KEY)
+    if lease_id is not None:
+        cached = embedding_cache.get_leased(
+            lease_id, _embedding_hash(item), _embedding_identity(item)
+        )
+        if cached is None:
+            raise RuntimeError(
+                "Multimodal embedding-cache lease expired after scheduler "
+                "admission; this indicates an invalid cache lifecycle"
+            )
+        return cached
+    cached = embedding_cache.get_single(_embedding_hash(item))
+    if cached is None or not embedding_cache.matches_identity(
+        cached, _embedding_identity(item)
+    ):
+        return None
+    return cached
 
 
 def init_mm_embedding_cache(max_size: int = 0):
@@ -249,7 +289,7 @@ def _get_chunked_embedding_full(
     Fallback: encode all items at once, cache combined result, extract chunk.
     Used for non-bundled items or EVS results.
     """
-    item_hashes = [item.hash for item in embedding_items_per_req]
+    item_hashes = [_embedding_hash(item) for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
     embedding_per_req = embedding_cache.get(item_hashes)
 
@@ -324,19 +364,21 @@ def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
     device: torch.device,
-) -> Dict[Tuple[Optional[int], int], torch.Tensor]:
+) -> Dict[tuple[int, Optional[str], int], torch.Tensor]:
     """
     Collect cache misses across ALL per-image requests, deduplicate by hash and
     expected token count, encode in a single ViT call, and populate the cache.
 
     Returns:
-        hash_to_embedding: mapping from (item.hash, token_count) to its full
-            embedding tensor.  Including the token count prevents two
-            colliding hashes with different placeholder spans from being
-            deduplicated within the same batch.
+        hash_to_embedding: mapping from the compact hash, optional strong
+            identity, and token count to its full embedding tensor. The strong
+            identity separates compact-hash collisions while the token count
+            separates different placeholder spans for the same input.
     """
-    unique_misses: Dict[Tuple[Optional[int], int], Tuple[MultimodalDataItem, int]] = {}
-    hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor] = {}
+    unique_misses: Dict[
+        tuple[int, Optional[str], int], Tuple[MultimodalDataItem, int]
+    ] = {}
+    hash_to_embedding: Dict[tuple[int, Optional[str], int], torch.Tensor] = {}
 
     # Phase 1a: find overlapping items per request and collect cache misses
     for req_info in per_image_requests:
@@ -353,10 +395,10 @@ def _batch_encode_per_image_misses(
 
         for _idx, item, start, end in overlapping:
             expected_token_count = end - start + 1
-            cache_key = (item.hash, expected_token_count)
+            cache_key = _embedding_cache_key(item, expected_token_count)
             if cache_key in hash_to_embedding:
                 continue
-            cached = embedding_cache.get_single(item.hash)
+            cached = _get_cached_embedding(item)
             if cached is not None:
                 cached_embedding = cached.embedding
                 cached_token_count = _embedding_token_count(cached_embedding)
@@ -364,7 +406,9 @@ def _batch_encode_per_image_misses(
                     hash_to_embedding[cache_key] = cached_embedding
                 else:
                     _discard_mismatched_cached_embedding(
-                        item.hash, expected_token_count, cached_token_count
+                        _embedding_hash(item),
+                        expected_token_count,
+                        cached_token_count,
                     )
                     unique_misses[cache_key] = (item, expected_token_count)
             elif cache_key not in unique_misses:
@@ -398,7 +442,11 @@ def _batch_encode_per_image_misses(
             )
             split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
         for cache_key, emb in zip(ordered_cache_keys, split_embeddings):
-            embedding_cache.set(cache_key[0], EmbeddingResult(embedding=emb))
+            item = unique_misses[cache_key][0]
+            embedding_cache.set(
+                _embedding_hash(item),
+                EmbeddingResult(embedding=emb, identity=_embedding_identity(item)),
+            )
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
             hash_to_embedding[cache_key] = emb
 
@@ -436,8 +484,8 @@ def _get_chunked_embedding_by_item(
     cached_embeddings = {}
     miss_items = []
     for idx, item, start, end in overlapping:
+        cached = _get_cached_embedding(item)
         expected_token_count = end - start + 1
-        cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embedding = cached.embedding
             cached_token_count = _embedding_token_count(cached_embedding)
@@ -446,7 +494,7 @@ def _get_chunked_embedding_by_item(
                 _acknowledge_deferred_cuda_ipc_cache_hits([item])
             else:
                 _discard_mismatched_cached_embedding(
-                    item.hash, expected_token_count, cached_token_count
+                    _embedding_hash(item), expected_token_count, cached_token_count
                 )
                 miss_items.append((idx, item, start, end))
         else:
@@ -479,7 +527,10 @@ def _get_chunked_embedding_by_item(
 
         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
             cached_embeddings[idx] = emb
-            embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
+            embedding_cache.set(
+                _embedding_hash(item),
+                EmbeddingResult(embedding=emb, identity=_embedding_identity(item)),
+            )
 
     chunk_slices = []
     for idx, _, start, end in overlapping:
@@ -495,7 +546,7 @@ def _get_chunked_embedding_by_item(
 
 def _assemble_per_image_chunk(
     overlapping: List[Tuple[int, MultimodalDataItem, int, int]],
-    hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor],
+    hash_to_embedding: Dict[tuple[int, Optional[str], int], torch.Tensor],
     extend_prefix_len: int,
     extend_seq_len: int,
 ) -> Optional[torch.Tensor]:
@@ -511,7 +562,7 @@ def _assemble_per_image_chunk(
 
     chunk_slices = []
     for _idx, item, start, end in overlapping:
-        cache_key = (item.hash, end - start + 1)
+        cache_key = _embedding_cache_key(item, end - start + 1)
         emb = hash_to_embedding[cache_key]  # shape: (end - start + 1, hidden)
         overlap_start = max(start, chunk_start)
         overlap_end = min(end, chunk_end - 1)  # inclusive
@@ -590,7 +641,7 @@ def _get_chunked_prefill_embedding(
             full_path_requests.append(req_info)
 
     # Phase 1: batch encode all per-image cache misses in ONE ViT call
-    hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor] = {}
+    hash_to_embedding: Dict[tuple[int, Optional[str], int], torch.Tensor] = {}
     if per_image_requests:
         hash_to_embedding = _batch_encode_per_image_misses(
             data_embedding_func, per_image_requests, device

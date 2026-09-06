@@ -355,25 +355,71 @@ def resolve_multimodal_item_hash(
         value = feature if feature is not None else precomputed_embeddings
         item_hash = hash_feature(value)
 
-    if namespace is None:
-        return item_hash
+    return item_hash if namespace is None else build_feature_hash(namespace, item_hash)
 
-    if isinstance(item_hash, bool) or not isinstance(item_hash, int) or item_hash < 0:
-        raise ValueError("item hash must be a non-negative integer")
-    namespace = parse_content_hash(namespace)
-    assert namespace is not None
-    hash_bytes = item_hash.to_bytes(
-        max(1, (item_hash.bit_length() + 7) // 8), byteorder="big", signed=False
+
+def build_feature_identity(artifact_key: str, processor_output_hash: int) -> str:
+    """Bind a processor output to its complete, prompt-independent artifact."""
+    artifact_key = parse_content_hash(artifact_key)
+    if (
+        isinstance(processor_output_hash, bool)
+        or not isinstance(processor_output_hash, int)
+        or processor_output_hash < 0
+    ):
+        raise ValueError("processor_output_hash must be a non-negative integer")
+    output_hash_bytes = processor_output_hash.to_bytes(
+        max(1, (processor_output_hash.bit_length() + 7) // 8),
+        byteorder="big",
+        signed=False,
     )
-    digest = _hash_parts(
+    return _hash_parts(
         b"multimodal-feature-v1",
-        bytes.fromhex(namespace[len(CONTENT_HASH_PREFIX) :]),
-        hash_bytes,
+        bytes.fromhex(artifact_key[len(CONTENT_HASH_PREFIX) :]),
+        output_hash_bytes,
     )
+
+
+def build_feature_hash(artifact_key: str, processor_output_hash: int) -> int:
+    """Return the compact lookup key for a complete feature identity."""
+    return compact_feature_hash(
+        build_feature_identity(artifact_key, processor_output_hash)
+    )
+
+
+def compact_feature_hash(feature_identity: str) -> int:
+    """Derive the stable 64-bit lookup key from a full feature identity."""
+    digest = parse_content_hash(feature_identity)
     return int.from_bytes(
         bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :])[:8],
         byteorder="big",
         signed=False,
+    )
+
+
+def build_mm_radix_cache_namespace(
+    base_key: Optional[str], ordered_feature_identities: list[tuple[str, str]]
+) -> str:
+    """Namespace prefix KV by the ordered, full multimodal identities.
+
+    The legacy per-item pad token carries only 30 bits of an item's compact
+    hash. Keeping the full SHA-256 feature identities in the request's radix
+    namespace prevents a pad-token collision from reusing another request's
+    language-model KV.
+    """
+    if not ordered_feature_identities:
+        raise ValueError("multimodal radix namespace requires at least one identity")
+    identities = [
+        [modality, parse_content_hash(identity)]
+        for modality, identity in ordered_feature_identities
+    ]
+    return _digest_bytes(
+        _canonical_json(
+            {
+                "version": "multimodal-radix-v1",
+                "base_key": base_key,
+                "ordered_feature_identities": identities,
+            }
+        )
     )
 
 

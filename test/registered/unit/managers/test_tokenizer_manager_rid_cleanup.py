@@ -14,6 +14,7 @@ Covers:
 """
 
 import asyncio
+import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -129,6 +130,8 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
+    tm._mm_cache_retry_contexts = {}
+    tm._release_mm_embedding_cache = MagicMock()
     tm.encoder_dispatch_ready = {}
     tm.enable_metrics = False
     tm.enable_trace = False
@@ -269,6 +272,34 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
         self.assertEqual(
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
         )
+
+    def test_abort_ack_drops_embedding_cache_context(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "abort_lease_rid"
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        tm._mm_cache_retry_contexts[rid] = Mock(
+            lease_id="lease-1", routed_dp_rank=2, dispatched=True
+        )
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertNotIn(rid, tm._mm_cache_retry_contexts)
+        tm._release_mm_embedding_cache.assert_not_called()
+
+    def test_abort_request_waits_for_scheduler_before_releasing_lease(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "abort_pending_lease_rid"
+        tm.server_args.tokenizer_worker_num = 1
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        context = Mock(lease_id="lease-1", routed_dp_rank=2)
+        tm._mm_cache_retry_contexts[rid] = context
+        tm._dispatch_to_scheduler = Mock()
+
+        tm.abort_request(rid)
+
+        self.assertIs(tm._mm_cache_retry_contexts[rid], context)
+        tm._release_mm_embedding_cache.assert_not_called()
+        self.assertIsInstance(tm._dispatch_to_scheduler.call_args.args[0], AbortReq)
 
 
 class TestAbortOutputPayload(CustomTestCase):
@@ -526,6 +557,23 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         tm.rid_to_state["p1"] = _make_req_state("p1")
         tm._release_req_states_on_failure(["p1", "already_gone"])
         self.assertNotIn("p1", tm.rid_to_state)
+
+    def test_failure_releases_pending_lease_and_encoder_waiter(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "discard_lease_rid"
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        tm._mm_cache_retry_contexts[rid] = Mock(
+            lease_id="lease-2", routed_dp_rank=3, dispatched=False
+        )
+        dispatch_ready = threading.Event()
+        tm.encoder_dispatch_ready[rid] = dispatch_ready
+
+        tm._release_req_states_on_failure([rid])
+
+        self.assertNotIn(rid, tm._mm_cache_retry_contexts)
+        tm._release_mm_embedding_cache.assert_called_once_with("lease-2", 3)
+        self.assertNotIn(rid, tm.encoder_dispatch_ready)
+        self.assertTrue(dispatch_ready.is_set())
 
     def test_dispatched_single_is_aborted_and_state_kept(self):
         tm = _make_tokenizer_manager(self)
