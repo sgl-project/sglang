@@ -467,8 +467,15 @@ class KVIndexTranslator:
             return None
         virtual = forward_batch.out_cache_loc_virtual
         if virtual is None:
-            # No rebind ran for this batch (no write loc at all).
-            return None
+            loc = forward_batch.out_cache_loc
+            if loc is None:
+                return None
+            # The runner builds the capture batch outside `init_new`, so no
+            # rebind marked its virtual source. Bake this buffer holding sink
+            # ids, which is what the pre-fusion copy of the zero slot did.
+            width = int(loc.numel()) if width is None else int(width)
+            out[:width].zero_()
+            return out[: int(loc.numel())]
         n = int(virtual.numel())
         width = n if width is None else int(width)
         buf = out[:width]
