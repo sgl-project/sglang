@@ -79,6 +79,7 @@ class GPT2Attention(nn.Module):
             num_kv_heads=total_num_heads,
             layer_id=layer_id,
             quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(

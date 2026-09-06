@@ -200,7 +200,12 @@ def _get_feat_extract_output_lengths(input_lengths):
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
 
-    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig, quant_config=None):
+    def __init__(
+        self,
+        config: Qwen3OmniMoeAudioEncoderConfig,
+        quant_config=None,
+        prefix: str = "",
+    ):
         super().__init__(config)
         self.dropout = config.dropout
 
@@ -243,13 +248,20 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             config.d_model,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("conv_out", prefix),
         )
         self.proj1 = ReplicatedLinear(
-            config.d_model, config.d_model, quant_config=quant_config
+            config.d_model,
+            config.d_model,
+            quant_config=quant_config,
+            prefix=add_prefix("proj1", prefix),
         )
         self.act = ACT2FN[config.activation_function]
         self.proj2 = ReplicatedLinear(
-            config.d_model, config.output_dim, quant_config=quant_config
+            config.d_model,
+            config.output_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("proj2", prefix),
         )
         self.n_window_infer = self.config.n_window_infer
         self.conv_chunksize = self.config.conv_chunksize
@@ -493,7 +505,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         super().__init__(
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config, quant_config)
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(
+            config.audio_config,
+            quant_config,
+            prefix=add_prefix("audio_tower", prefix),
+        )
         self.visual = Qwen3OmniMoeVisionEncoder(
             config.vision_config,
             quant_config=quant_config,
