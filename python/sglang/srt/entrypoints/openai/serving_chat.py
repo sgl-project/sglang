@@ -89,6 +89,10 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.hunyuan_reasoning import (
+    normalize_hunyuan_reasoning_effort,
+    uses_hunyuan_reasoning_effort,
+)
 from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
@@ -1048,6 +1052,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+
         # Header-based opt-in (same rationale as request_headers.py).
         if raw_request is not None and not request.return_input_ids_in_sglext:
             if raw_request.headers.get("x-sglext-return-input-ids") == "1":
@@ -1057,11 +1062,16 @@ class OpenAIServingChat(OpenAIServingBase):
             if raw_request.headers.get("x-sglext-return-output-ids") == "1":
                 request.return_output_ids_in_sglext = True
 
-        reasoning_effort = (
-            request.chat_template_kwargs.pop("reasoning_effort", None)
-            if request.chat_template_kwargs
-            else None
-        )
+        reasoning_effort = None
+        if not uses_hunyuan_reasoning_effort(
+            self.reasoning_parser, self.template_manager.reasoning_config
+        ):
+            reasoning_effort = (
+                request.chat_template_kwargs.pop("reasoning_effort", None)
+                if request.chat_template_kwargs
+                else None
+            )
+
         if self.is_gpt_oss and reasoning_effort == "none":
             raise ValueError(
                 f"Harmony does not support reasoning effort {reasoning_effort}"
@@ -1204,6 +1214,10 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
+
+        normalize_hunyuan_reasoning_effort(
+            request, self.reasoning_parser, self.template_manager.reasoning_config
+        )
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -2575,7 +2589,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return
 
         if self.reasoning_parser == "hunyuan":
-            request.reasoning_effort = "medium" if enabled else "no_think"
+            config = self.template_manager.reasoning_config
+            if config is not None and config.special_case == "hunyuan_effort":
+                request.reasoning_effort = "high" if enabled else "no_think"
+            else:
+                request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
         if self.reasoning_parser == "inkling":
@@ -2644,6 +2662,9 @@ class OpenAIServingChat(OpenAIServingBase):
             ) == "enabled"
 
         if self.reasoning_parser == "hunyuan":
+            config = self.template_manager.reasoning_config
+            if config is not None and config.special_case == "hunyuan_effort":
+                return request.reasoning_effort not in ("none", "no_think")
             # Hy3-preview template emits no <think> when reasoning_effort is
             # "no_think" / "none" / unset; forcing reasoning would route all
             # output into reasoning_content.

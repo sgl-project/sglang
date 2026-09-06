@@ -114,6 +114,23 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     return int(cell_size) * get_parallel().attn_dcp_size
 
 
+def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
+    """Global layer ids represented by the local DSA pool's dense layer slots."""
+    if kvc.mambaish_config and not kvc.is_draft_worker:
+        layer_ids = [
+            layer_id
+            for layer_id in kvc.mambaish_config.full_attention_layer_ids
+            if kvc.layer_info.start_layer <= layer_id < kvc.layer_info.end_layer
+        ]
+    else:
+        layer_ids = list(range(kvc.layer_info.start_layer, kvc.layer_info.end_layer))
+    # Draft pools and a few platform-specific pools may expose a synthetic layer
+    # count. They do not use indexShare, so only the length matters for sizing.
+    if len(layer_ids) != num_layers:
+        return list(range(num_layers))
+    return layer_ids
+
+
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -150,6 +167,27 @@ class MemoryPoolConfigurator:
         self, config: MemoryPoolConfig
     ) -> MemoryPoolConfig:
         return config
+
+    @staticmethod
+    def validate_swa_pool_size(
+        swa_tokens: int, sliding_window_size: Optional[int], page_size: int
+    ) -> None:
+        """Reject an SWA pool too small to ever admit a request.
+
+        Prefill charges min(extend + decode, window) + page_size of SWA headroom
+        per request, so a pool at or below that floor rejects every request no
+        matter how far it drains: the scheduler spins in the waiting queue and
+        the server hangs at warmup instead of failing here.
+        """
+        if sliding_window_size is None:
+            return
+        if sliding_window_size + page_size >= swa_tokens:
+            raise ValueError(
+                f"SWA pool ({swa_tokens} tokens) cannot hold even one request: "
+                f"the prefill admission floor is sliding_window_size "
+                f"({sliding_window_size}) + page_size ({page_size}). "
+                f"Increase --swa-full-tokens-ratio or the total KV budget."
+            )
 
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
@@ -259,8 +297,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             get_glm_dsa_layer_split_effective_num_layers,
         )
 
-        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-            kvc, num_layers
+        effective_num_layers = (
+            num_layers
+            if kvc.server_args.enable_hisparse
+            else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -391,18 +431,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             _should_elide_dsa_index_k,
         )
 
-        if allocate_all_layers or not _should_elide_dsa_index_k(
-            is_draft_worker=kvc.is_draft_worker
+        if (
+            allocate_all_layers
+            or kvc.server_args.enable_hisparse
+            or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
         ):
             num_indexer_layers = num_layers
         else:
-            active_indexer_layers = [
-                layer_id
-                for layer_id in range(
-                    kvc.layer_info.start_layer, kvc.layer_info.end_layer
-                )
-                if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
-            ]
             from sglang.srt.layers.cp.utils import (
                 get_glm_dsa_cp_layer_shard_info,
                 get_layer_shard_range,
@@ -410,6 +445,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             _, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
             if shard_size > 1:
+                # Preserve the existing LayerSplit sizing semantics. GLM-5.3
+                # hybrid-layer support is intentionally limited to the normal
+                # (non-LayerSplit) pool below.
+                active_indexer_layers = [
+                    layer_id
+                    for layer_id in range(
+                        kvc.layer_info.start_layer, kvc.layer_info.end_layer
+                    )
+                    if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                ]
                 active_set = set(active_indexer_layers)
                 max_owned = 0
                 for rank in range(shard_size):
@@ -423,7 +468,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                 num_indexer_layers = max_owned + 1
             else:
-                num_indexer_layers = len(active_indexer_layers)
+                num_indexer_layers = sum(
+                    not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                    for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
+                )
 
         return int(
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
@@ -658,16 +706,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
 
-        if (
-            self._sliding_window_size is not None
-            and self._sliding_window_size + self._page_size >= swa_tokens
-        ):
-            raise ValueError(
-                f"SWA pool ({swa_tokens} tokens) cannot hold even one request: "
-                f"the prefill admission floor is sliding_window_size "
-                f"({self._sliding_window_size}) + page_size ({self._page_size}). "
-                f"Increase --swa-full-tokens-ratio or the total KV budget."
-            )
+        self.validate_swa_pool_size(
+            swa_tokens, self._sliding_window_size, self._page_size
+        )
 
         logger.info(
             f"Use sliding window memory pool. "
@@ -860,6 +901,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
+        self.sliding_window_size = kvc.sliding_window_size
         self.swa_ratio = get_schedule().swa_full_tokens_ratio
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
@@ -995,6 +1037,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        self.validate_swa_pool_size(swa_tokens, self.sliding_window_size, page_size)
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,

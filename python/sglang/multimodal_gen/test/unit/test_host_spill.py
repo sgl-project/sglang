@@ -61,7 +61,8 @@ def test_spill_disables_itself_when_the_disk_is_full(tmp_path, monkeypatch):
     assert spill.count_written == 0
 
 
-def test_fused_weights_are_concatenated_into_the_provided_tensor(tmp_path):
+@pytest.mark.parametrize("strict", [False, True])
+def test_fused_weights_are_concatenated_into_the_provided_tensor(tmp_path, strict):
     spill = HostSpill(tmp_path, "ckpt")
     q = torch.full((2, 3), 1.0)
     k = torch.full((2, 3), 2.0)
@@ -73,7 +74,7 @@ def test_fused_weights_are_concatenated_into_the_provided_tensor(tmp_path):
 
     weights = [("blocks.0.q", q), ("blocks.0.k", k), ("blocks.0.v", v)]
     merged, _ = hf_to_custom_state_dict(
-        iter(weights), mapping, fused_tensor_factory=spill.tensor
+        iter(weights), mapping, fused_tensor_factory=spill.tensor, strict=strict
     )
     fused = merged["blocks.0.qkv"]
     assert torch.equal(fused, torch.cat([q, k, v], dim=0))
@@ -88,6 +89,7 @@ def test_fused_weights_are_concatenated_into_the_provided_tensor(tmp_path):
         iter([(n, torch.zeros_like(t)) for n, t in weights]),
         mapping,
         fused_tensor_factory=reused_spill.tensor,
+        strict=strict,
     )
     assert torch.equal(merged_again["blocks.0.qkv"], torch.cat([q, k, v], dim=0))
     assert reused_spill.count_reused == 1
