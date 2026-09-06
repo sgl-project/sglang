@@ -12,6 +12,7 @@ import logging
 import multiprocessing as mp
 import traceback
 from concurrent import futures
+from http import HTTPStatus
 from typing import List
 
 import grpc
@@ -21,7 +22,12 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
-from sglang.srt.disaggregation.encoder.server import MMEncoder, launch_encoder
+from sglang.srt.disaggregation.encoder.runtime import validate_encode_request
+from sglang.srt.disaggregation.encoder.server import (
+    MMEncoder,
+    await_task_completion_on_cancel,
+    launch_encoder,
+)
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.runtime_context import (
@@ -87,6 +93,11 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self.send_sockets = send_sockets
         self.server_args = server_args
 
+    async def _dispatch_encode(self, request_dict: dict):
+        for socket in self.send_sockets:
+            await async_sock_send(socket, wrap_as_pickle(request_dict))
+        return await self.encoder.encode_request(request_dict, Modality.IMAGE)
+
     async def Encode(
         self, request: sglang_encoder_pb2.EncodeRequest, context
     ) -> sglang_encoder_pb2.EncodeResponse:
@@ -98,21 +109,33 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 "num_parts": request.num_parts,
                 "part_idx": request.part_idx,
             }
-            for socket in self.send_sockets:
-                await async_sock_send(socket, wrap_as_pickle(request_dict))
+            if err := validate_encode_request(request_dict):
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details(err)
+                return sglang_encoder_pb2.EncodeResponse()
 
             # gRPC encode is image-only; the request follows the configured
-            # cache and transfer backend.
-            (
-                nbytes,
-                embedding_len,
-                embedding_dim,
-                error_msg,
-                error_code,
-            ) = await self.encoder.encode_request(request_dict, Modality.IMAGE)
+            # cache and transfer backend. Keep TP dispatch and rank-0 collective
+            # launch order identical when gRPC handlers run concurrently.
+            async with self.encoder.encode_dispatch_lock:
+                encode_task = asyncio.create_task(self._dispatch_encode(request_dict))
+                result = await await_task_completion_on_cancel(
+                    encode_task, f"Encoder request {request.req_id}"
+                )
+                (
+                    nbytes,
+                    embedding_len,
+                    embedding_dim,
+                    error_msg,
+                    error_code,
+                ) = result
             if error_msg is not None:
                 await self.encoder.release_request(request.req_id)
-                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_code(
+                    grpc.StatusCode.INVALID_ARGUMENT
+                    if error_code == HTTPStatus.BAD_REQUEST
+                    else grpc.StatusCode.INTERNAL
+                )
                 context.set_details(error_msg)
                 return sglang_encoder_pb2.EncodeResponse()
 
@@ -154,6 +177,14 @@ class SGLangEncoderServer(SGLangEncoderServicer):
 
             return sglang_encoder_pb2.EncodeResponse()
 
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(self.encoder.release_request(request.req_id))
+            except Exception:
+                logger.exception(
+                    "Failed to release cancelled encoder request %s", request.req_id
+                )
+            raise
         except Exception as e:
             logger.error(f"Encode error: {e}")
             traceback.print_exc()
@@ -178,6 +209,14 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             await self.encoder.release_request(request.req_id)
             return sglang_encoder_pb2.SendResponse()
 
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(self.encoder.release_request(request.req_id))
+            except Exception:
+                logger.exception(
+                    "Failed to release cancelled encoder request %s", request.req_id
+                )
+            raise
         except Exception as e:
             logger.error(f"Send error: {e}")
             traceback.print_exc()
@@ -221,7 +260,7 @@ async def serve_grpc_encoder(server_args: ServerArgs):
         ).to_tcp()
 
     send_sockets: List[zmq.Socket] = []
-    for rank in range(1, get_parallel().config.tp_size):
+    for rank in range(1, get_parallel().tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
             get_zmq_socket(zmq_ctx, zmq.PUSH, schedule_path, bind=False)

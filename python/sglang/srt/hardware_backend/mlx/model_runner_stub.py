@@ -107,6 +107,16 @@ class MlxModelRunnerStub(ModelRunner):
     # that path working instead of raising AttributeError.
     prefill_aware_swa = False
 
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        """Return zero for the base Torch loader accounting hook.
+
+        The native MLX runner materializes weights before sizing its own KV
+        pool. This stub has no Torch ``ModelLoader`` or Torch-owned weights to
+        report.
+        """
+        return 0
+
     @staticmethod
     def validate_startup_weight_load_mode(server_args) -> None:
         if server_args.is_startup_weight_load_overlap:

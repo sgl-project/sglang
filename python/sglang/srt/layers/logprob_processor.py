@@ -357,9 +357,9 @@ def compute_spec_logprobs(
     accept_index: Optional[torch.Tensor] = None,
     chain_stride: Optional[int] = None,
 ):
-    assert (accept_index is None) != (
-        chain_stride is None
-    ), "pass exactly one of accept_index / chain_stride"
+    assert (accept_index is None) != (chain_stride is None), (
+        "pass exactly one of accept_index / chain_stride"
+    )
 
     bs = len(batch.seq_lens)
     next_token_logits = logits_output.next_token_logits
@@ -667,9 +667,9 @@ class InputLogprobProcessor:
 
         # Restore the full-pruned lm_head batch_info after chunk iteration.
         if num_chunks > 1 and hasattr(lm_head, "reset_lm_head_pass"):
-            assert hasattr(
-                lm_head, "set_lm_head_pass"
-            ), "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
+            assert hasattr(lm_head, "set_lm_head_pass"), (
+                "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
+            )
             lm_head.reset_lm_head_pass()
 
         # Concatenate the results

@@ -79,6 +79,7 @@ class MockTemplateManager:
         self.completion_template_name = None
         self.reasoning_config = None
         self.force_reasoning = False
+        self.jinja_template_may_reorder_tool_results = False
 
 
 def make_serving(*, is_multimodal: bool = False) -> OpenAIServingResponses:

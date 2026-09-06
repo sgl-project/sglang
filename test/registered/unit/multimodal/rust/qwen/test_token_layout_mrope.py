@@ -3,7 +3,7 @@
 Covers ``layout_by_placeholder`` / ``apply_layout`` in
 ``rust/sglang-mm/src/common/token_layout.rs`` and ``mrope_image_only`` in
 ``rust/sglang-mm/src/qwen_vl/mod.rs`` (via the
-``_core.qwen_vl.process_native_mm`` and ``mrope_image_only_py``
+``_core.qwen_vl.process_mm`` and ``mrope_image_only_py``
 bindings), against ``BaseMultimodalProcessor`` expansion/offsets and
 ``MRotaryEmbedding.get_rope_index``.
 """
@@ -36,7 +36,7 @@ QWEN_CORE = getattr(load_core(), "qwen_vl", None)
 
 
 @unittest.skipUnless(
-    QWEN_CORE and hasattr(QWEN_CORE, "process_native_mm"),
+    QWEN_CORE and hasattr(QWEN_CORE, "process_mm"),
     "sglang-mm native Qwen driver not built",
 )
 class TestQwenPromptGeometry(CustomTestCase):
@@ -52,7 +52,7 @@ class TestQwenPromptGeometry(CustomTestCase):
                 ids.extend((VISION_START_ID, IMAGE_TOKEN_ID, VISION_END_ID, 8))
             images = [image_bytes(96 + 8 * i, 80, i) for i in range(image_count)]
             with self.subTest(image_count=image_count):
-                actual_ids, _, grids, _, offsets, _, _ = QWEN_CORE.process_native_mm(
+                actual_ids, _, grids, _, offsets, _, _ = QWEN_CORE.process_mm(
                     ids, images, spec_json(config)
                 )
                 counts = [t * h * w // config["merge_size"] ** 2 for t, h, w in grids]

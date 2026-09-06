@@ -67,7 +67,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
 
 
 class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
-
     def test_lora_gpt_oss_20b_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,

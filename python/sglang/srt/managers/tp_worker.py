@@ -325,6 +325,7 @@ class TpModelWorker(BaseTpWorker):
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
+        random_seed: Optional[int] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -384,8 +385,11 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers.
-        # Elastic joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_joiner:
+        # Elastic joiners and last-stage-only draft workers cannot enter the WORLD
+        # broadcast, so they reuse the target's already-broadcast seed.
+        if random_seed is not None:
+            self.random_seed = random_seed
+        elif server_args.is_ep_joiner:
             self.random_seed = get_device().random_seed
         else:
             self.random_seed = broadcast_pyobj(
@@ -610,9 +614,9 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
-            assert (
-                capture_hidden_mode is None
-            ), "capture_hidden_mode override requires a ScheduleBatch input"
+            assert capture_hidden_mode is None, (
+                "capture_hidden_mode override requires a ScheduleBatch input"
+            )
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)

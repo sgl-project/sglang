@@ -12,6 +12,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
 )
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -90,9 +91,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
                         "get_moe_runner_backend",
                         return_value=MoeRunnerBackend.AUTO,
                     ),
-                    mock.patch.object(
-                        compressed_tensors, "is_sm100_supported", return_value=True
-                    ),
+                    override_platform(is_sm100=True),
                 ):
                     scheme = quant_config.get_moe_scheme(
                         torch.nn.Module(), layer_name=EXPERTS_LAYER
@@ -120,9 +119,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
                         "get_moe_runner_backend",
                         return_value=MoeRunnerBackend.AUTO,
                     ),
-                    mock.patch.object(
-                        compressed_tensors, "is_sm100_supported", return_value=True
-                    ),
+                    override_platform(is_sm100=True),
                 ):
                     scheme = quant_config.get_moe_scheme(
                         torch.nn.Module(), layer_name=EXPERTS_LAYER
@@ -157,9 +154,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
                 "get_moe_runner_backend",
                 return_value=MoeRunnerBackend.MARLIN,
             ),
-            mock.patch.object(
-                compressed_tensors, "is_sm100_supported", return_value=True
-            ),
+            override_platform(is_sm100=True),
         ):
             scheme = quant_config.get_moe_scheme(
                 torch.nn.Module(), layer_name=EXPERTS_LAYER
@@ -178,9 +173,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
                 "get_moe_runner_backend",
                 return_value=MoeRunnerBackend.AUTO,
             ),
-            mock.patch.object(
-                compressed_tensors, "is_sm100_supported", return_value=True
-            ),
+            override_platform(is_sm100=True),
         ):
             scheme = quant_config.get_moe_scheme(
                 torch.nn.Module(), layer_name=EXPERTS_LAYER

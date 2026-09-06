@@ -37,9 +37,10 @@ class TestIpcInputA2AQkvGuard(unittest.TestCase):
         # group lookup to prove the guard is not what rejected it.
         q = torch.zeros(1, 128, 8, 64)
         group = mock.MagicMock(return_value=None)
-        with mock.patch.object(
-            usp, "get_ulysses_parallel_world_size", lambda: 2
-        ), mock.patch.object(usp, "_ipc_ready_group", group):
+        with (
+            mock.patch.object(usp, "get_ulysses_parallel_world_size", lambda: 2),
+            mock.patch.object(usp, "_ipc_ready_group", group),
+        ):
             self.assertIsNone(usp._ipc_input_a2a_qkv(q, q.clone(), q.clone()))
         # Reached the group lookup, so the shape guard did not reject it.
         self.assertEqual(group.call_count, 1)

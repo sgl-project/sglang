@@ -6,8 +6,13 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
 if TYPE_CHECKING:
@@ -43,7 +48,6 @@ def set_default_server_args(args: "ServerArgs"):
     """
     Set default server arguments for NPU backend.
     """
-    from sglang.srt.arg_groups.overrides import resolving_view
 
     cfg = resolving_view(args)
 
@@ -71,7 +75,6 @@ def set_default_server_args(args: "ServerArgs"):
         )
 
     # NPU memory settings
-    decode = cfg.cuda_graph_config.decode
     npu_mem = get_npu_memory_capacity()
     if npu_mem <= 32 * 1024:
         # Ascend 910B4,910B4_1
@@ -82,11 +85,27 @@ def set_default_server_args(args: "ServerArgs"):
                 "set_default_server_args",
                 chunked_prefill_size=4 * 1024,
             )
-        if decode.max_bs is None:
+        if cfg.cuda_graph_config.decode.max_bs is None:
             if cfg.tp_size < 4:
-                decode.max_bs = 16
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=16,
+                    ),
+                )
             else:
-                decode.max_bs = 64
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=64,
+                    ),
+                )
     elif npu_mem <= 64 * 1024:
         # Ascend 910B1,910B2,910B2C,910B3,910_9391,910_9392,910_9381,910_9382,910_9372,910_9362
         # (chunked_prefill_size 8k, max_bs 64 if tp < 4 else 256)
@@ -96,11 +115,27 @@ def set_default_server_args(args: "ServerArgs"):
                 "set_default_server_args",
                 chunked_prefill_size=8 * 1024,
             )
-        if decode.max_bs is None:
+        if cfg.cuda_graph_config.decode.max_bs is None:
             if cfg.tp_size < 4:
-                decode.max_bs = 64
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=64,
+                    ),
+                )
             else:
-                decode.max_bs = 256
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=256,
+                    ),
+                )
 
     # NPU does not support CustomAllReduce
     declare_resolution(
@@ -116,7 +151,7 @@ def set_default_server_args(args: "ServerArgs"):
             "set_default_server_args",
             hicache_io_backend="kernel_ascend",
         )
-        if args.use_mla_backend():
+        if use_mla_backend(args):
             declare_resolution(
                 args,
                 "set_default_server_args",

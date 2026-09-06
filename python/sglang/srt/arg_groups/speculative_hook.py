@@ -6,10 +6,16 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.overrides import (
+    _speculative_moe_runner_default,
+    attention_backends_of,
     declare_direct_writes,
     declare_resolution,
+    model_config_of,
+    resolved_view,
     resolving_view,
+    run_post_process_pass,
 )
+from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -86,10 +92,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
     # Moved to the resolution pipeline (arg_groups/overrides.py:
     # _speculative_moe_runner_default), invoked here at its legacy slot.
-    from sglang.srt.arg_groups.overrides import (
-        _speculative_moe_runner_default,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _speculative_moe_runner_default)
 
@@ -184,7 +186,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    from sglang.srt.arg_groups.overrides import resolved_view
 
     if not (cfg.device.startswith("cuda") or cfg.device == "npu"):
         raise ValueError(
@@ -325,14 +326,169 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
+
+def _handle_uno(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+
+    if not cfg.device.startswith("cuda"):
+        raise ValueError("UNO only supports CUDA.")
+    if cfg.speculative_draft_model_path is not None:
+        raise ValueError(
+            "UNO reuses the target model and does not accept "
+            "--speculative-draft-model-path."
+        )
+    if cfg.uno_lora_path is None:
+        raise ValueError("UNO requires --uno-lora-path.")
+    if cfg.enable_deterministic_inference:
+        raise ValueError(
+            "UNO does not support --enable-deterministic-inference because its "
+            "sampling path does not use per-request seeds."
+        )
+    if cfg.enable_strict_thinking:
+        raise ValueError(
+            "UNO does not support --enable-strict-thinking because it requires "
+            "grammar decoding."
+        )
+
+    verify_width = cfg.speculative_num_draft_tokens
+    if verify_width is None or int(verify_width) < 1:
+        raise ValueError(
+            "UNO requires --speculative-num-draft-tokens to be a positive "
+            "integer denoting the linear width or tree verify width Q."
+        )
+    verify_width = int(verify_width)
+    declare_resolution(
+        server_args,
+        "_handle_uno",
+        speculative_num_draft_tokens=verify_width,
+    )
+
+    candidate_top_k = (
+        1 if cfg.speculative_eagle_topk is None else int(cfg.speculative_eagle_topk)
+    )
+    if candidate_top_k < 1:
+        raise ValueError(
+            "UNO requires --speculative-eagle-topk to be at least 1, "
+            f"got {candidate_top_k}."
+        )
+
+    if candidate_top_k > 1:
+        if cfg.speculative_num_steps is None:
+            raise ValueError(
+                "UNO tree mode requires --speculative-num-steps so its draft "
+                "width F can be derived as speculative_num_steps + 1."
+            )
+        speculative_num_steps = int(cfg.speculative_num_steps)
+        if speculative_num_steps < 1:
+            raise ValueError(
+                "UNO tree mode requires --speculative-num-steps to be positive, "
+                f"got {speculative_num_steps}."
+            )
+
+        draft_width = speculative_num_steps + 1
+        if verify_width < draft_width:
+            raise ValueError(
+                f"UNO tree mode requires Q >= F; got Q={verify_width}, F={draft_width}."
+            )
+        if verify_width > 128:
+            raise ValueError(
+                "UNO tree mode currently supports at most Q=128 verify nodes, "
+                f"got Q={verify_width}."
+            )
+        frontier_slots = verify_width * candidate_top_k
+        if frontier_slots > 2048:
+            raise ValueError(
+                "UNO tree mode currently supports Q*K <= 2048; got "
+                f"Q*K={verify_width}*{candidate_top_k}={frontier_slots}."
+            )
+
+        tree_capacity = 1
+        nodes_at_depth = 1
+        for _ in range(speculative_num_steps):
+            nodes_at_depth *= candidate_top_k
+            tree_capacity += nodes_at_depth
+            if tree_capacity >= verify_width:
+                break
+        if verify_width > tree_capacity:
+            raise ValueError(
+                "UNO tree mode cannot build the requested Q from F and K: "
+                f"Q={verify_width} exceeds capacity={tree_capacity} for "
+                f"F={draft_width}, K={candidate_top_k}."
+            )
+
+        parent_width = candidate_top_k * max(speculative_num_steps - 1, 0) + 1
+        if verify_width - 1 > parent_width:
+            raise ValueError(
+                "UNO tree mode cannot represent the requested Q in EAGLE's "
+                "parent-list ABI: "
+                f"Q-1={verify_width - 1} exceeds "
+                f"K*(F-2)+1={parent_width} for "
+                f"F={draft_width}, K={candidate_top_k}."
+            )
+
+        if cfg.enable_pdmux:
+            raise ValueError("UNO tree mode does not yet support PDMux.")
+        if cfg.enable_two_batch_overlap:
+            raise ValueError("UNO tree mode does not yet support two-batch overlap.")
+        if (
+            cfg.speculative_accept_threshold_single != 1.0
+            or cfg.speculative_accept_threshold_acc != 1.0
+        ):
+            raise ValueError(
+                "UNO tree mode reuses EAGLE target-only sampling and requires "
+                "both speculative accept thresholds to be 1.0."
+            )
+        declare_resolution(
+            server_args,
+            "_handle_uno",
+            speculative_num_steps=speculative_num_steps,
+            speculative_eagle_topk=candidate_top_k,
+        )
+    else:
+        for field in ("speculative_num_steps", "speculative_eagle_topk"):
+            old_value = getattr(cfg, field)
+            if old_value not in (None, 1):
+                logger.warning("UNO uses %s=1; overriding %s.", field, old_value)
+        declare_resolution(
+            server_args,
+            "_handle_uno",
+            speculative_num_steps=1,
+            speculative_eagle_topk=1,
+        )
+
+    if (cfg.tp_size, cfg.pp_size) != (1, 1):
+        raise ValueError("UNO requires TP=PP=1.")
+    if cfg.enable_dp_attention or cfg.attn_cp_size != 1:
+        raise ValueError("UNO does not support DP attention or context parallelism.")
+    if cfg.enable_lora or cfg.lora_paths:
+        raise ValueError("UNO does not support public Multi-LoRA serving.")
+    declare_resolution(
+        server_args,
+        "_handle_uno",
+        enable_lora_overlap_loading=False,
+        lora_strict_loading=True,
+    )
+
+    if cfg.speculative_use_rejection_sampling:
+        raise ValueError(
+            "UNO manages its own stochastic verification and does not use "
+            "--speculative-use-rejection-sampling."
+        )
     if cfg.enable_mixed_chunk:
         declare_resolution(
             server_args,
-            "_handle_dflash",
+            "_handle_uno",
             enable_mixed_chunk=False,
         )
         logger.warning(
-            "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+            "Mixed chunked prefill is disabled for UNO speculative decoding."
+        )
+
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
+    if (prefill_backend, decode_backend) != ("fa3", "fa3"):
+        raise ValueError(
+            "UNO requires FA3 for both prefill and decode attention; "
+            f"got prefill={prefill_backend!r}, decode={decode_backend!r}."
         )
 
 
@@ -341,7 +497,7 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
         checkpoint_bundles_dspark_draft,
     )
 
-    return checkpoint_bundles_dspark_draft(server_args.get_model_config().hf_config)
+    return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
 def _handle_dspark(server_args: ServerArgs) -> None:
@@ -523,16 +679,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    if cfg.enable_mixed_chunk:
-        declare_resolution(
-            server_args,
-            "_handle_dspark",
-            enable_mixed_chunk=False,
-        )
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
-        )
-
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
         read_ragged_verify_mode,
@@ -564,7 +710,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     draft modes).
     """
     cfg = resolving_view(server_args)
-    from sglang.srt.utils import is_hip
 
     supported_draft_backends = (
         "flashinfer",
@@ -575,15 +720,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         "ascend",
     )
     # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
-    fallback_backend = "triton" if is_hip() else "flashinfer"
+    fallback_backend = "triton" if get_platform().is_hip else "flashinfer"
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-            resolved_view,
-        )
-
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
     if draft_backend is None:
         draft_backend = fallback_backend
@@ -662,11 +802,8 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 
 def _handle_eagle_family(server_args: ServerArgs) -> None:
+
     cfg = resolving_view(server_args)
-    from sglang.srt.arg_groups.overrides import (
-        attention_backends_of,
-        resolved_view,
-    )
 
     if (
         cfg.speculative_algorithm == "STANDALONE"
@@ -695,18 +832,23 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "speculative decoding."
         )
 
-    if cfg.enable_mixed_chunk:
+    # Mixed steps degrade running requests to a plain 1-token decode.
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+    if cfg.enable_mixed_chunk and not algo.supports_mixed_chunk():
         declare_resolution(
             server_args,
             "_handle_eagle_family",
             enable_mixed_chunk=False,
         )
         logger.warning(
-            "Mixed chunked prefill is disabled because of using "
-            "eagle speculative decoding."
+            "Mixed chunked prefill is disabled: %s speculative decoding does "
+            "not support it.",
+            cfg.speculative_algorithm,
         )
 
-    model_arch = server_args.get_model_config().hf_config.architectures[0]
+    model_arch = model_config_of(server_args).hf_config.architectures[0]
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
@@ -720,6 +862,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        "HYV4ForCausalLM",
     ]:
         if cfg.speculative_draft_model_path is None:
             declare_resolution(
@@ -795,8 +938,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "--enable-deterministic-inference; the sampling kernel draws "
                 "coins from the global RNG and is not batch-invariant."
             )
-
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         if (
             resolved_view(server_args).enable_multi_layer_eagle
@@ -911,8 +1052,6 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         "The mixed chunked prefill are disabled because of "
         "using ngram speculative decoding."
     )
-
-    from sglang.srt.arg_groups.overrides import resolved_view
 
     view = resolved_view(server_args)
     if (

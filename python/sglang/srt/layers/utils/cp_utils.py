@@ -63,18 +63,18 @@ class ContextParallelMetadata:
 
 
 def is_prefill_context_parallel_enabled():
-    return get_parallel().config.enable_prefill_context_parallel
+    return get_parallel().enable_prefill_context_parallel
 
 
 def is_prefill_cp_in_seq_split():
     return (
         is_prefill_context_parallel_enabled()
-        and get_parallel().config.prefill_cp_mode == "in-seq-split"
+        and get_parallel().prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_mla_prefill_cp_enabled() -> bool:
-    return get_parallel().config.enable_prefill_context_parallel and uses_mla_backend()
+    return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
 
 
 def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
@@ -137,9 +137,9 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
     if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_parallel().attn_cp_size
-        assert (
-            input_.shape[0] % cp_size == 0
-        ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
+        assert input_.shape[0] % cp_size == 0, (
+            f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
+        )
         return dsa_cp_round_robin_split_data(input_)
 
     input_list = list(

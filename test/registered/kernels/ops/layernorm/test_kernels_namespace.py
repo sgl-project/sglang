@@ -25,11 +25,26 @@ EXPECTED = {
     "activation.relu2": {"jit", "torch", "torch_compile"},
     "layernorm.rmsnorm": {"aot", "jit", "aiter", "torch_npu", "torch", "torch_compile"},
     "layernorm.gemma_rmsnorm": {"aot", "jit", "torch_npu", "torch", "torch_compile"},
-    "gemm.fp8_scaled_mm": {"aot"},
+    "gemm.fp8_scaled_mm": {"aot", "torch", "torch_compile"},
     "moe.moe_align_block_size": {"aot", "jit"},
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
     "diffusion.apply_group_norm_silu": {"triton"},
+    "diffusion.norm_scale_shift": {"KDA", "cute_dsl", "flydsl"},
+    "diffusion.scale_residual_norm_scale_shift": {
+        "KDA",
+        "triton",
+        "cute_dsl",
+        "flydsl",
+    },
+    "diffusion.residual_gate_add": {"KDA"},
+    "diffusion.ltx2_qknorm_split_rope": {"KDA"},
+    "diffusion.causal_conv3d_cat_pad": {"KDA", "triton"},
+    "diffusion.flux2_layernorm_modulate_fp8_quant": {"KDA"},
+    "diffusion.flux2_qkv_epilogue": {"KDA"},
+    "diffusion.flux2_token_cat_fp8": {"KDA"},
+    "gemm.qwen3x_nvfp4": {"KDA"},
+    "gemm.sm120_fp8_linear": {"KDA"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
@@ -83,8 +98,53 @@ def test_sparse_linear_attention_registry_targets_forward_kernel():
     assert spec.target.endswith(":_attn_fwd")
 
 
+@pytest.mark.parametrize(
+    "op, target_suffix",
+    (
+        ("diffusion.norm_scale_shift", ":kda_norm_scale_shift"),
+        (
+            "diffusion.scale_residual_norm_scale_shift",
+            ":kda_scale_residual_norm_scale_shift",
+        ),
+        ("diffusion.residual_gate_add", ":residual_gate_add"),
+        (
+            "diffusion.ltx2_qknorm_split_rope",
+            ":ltx2_qknorm_split_rope_cuda",
+        ),
+        (
+            "diffusion.causal_conv3d_cat_pad",
+            ":fused_causal_conv3d_cat_pad_cuda",
+        ),
+    ),
+)
+def test_merged_diffusion_kda_provenance_backend(op, target_suffix):
+    spec = K.registry.get_backend(op, KernelBackend.KDA)
+    assert spec.target.endswith(target_suffix)
+
+
+def test_kda_backend_implementations_live_in_kda_home():
+    specs = [
+        spec for spec in K.registry.all_specs() if spec.backend is KernelBackend.KDA
+    ]
+    assert specs
+    assert all(spec.target.startswith("sglang.kernels.kda_kernels.") for spec in specs)
+
+
 def test_single_backend_resolves_without_backend():
-    assert K.select_kernel("gemm.fp8_scaled_mm").backend is KernelBackend.AOT
+    assert (
+        K.select_kernel("kvcache.reshape_and_cache_flash").backend
+        is KernelBackend.TRITON
+    )
+
+
+def test_fp8_scaled_mm_requires_explicit_registry_backend(monkeypatch):
+    monkeypatch.setattr(sel, "_platform", lambda: _SM90)
+    with pytest.raises(ValueError, match="multiple backends"):
+        K.select_kernel("gemm.fp8_scaled_mm")
+    assert (
+        K.select_kernel("gemm.fp8_scaled_mm", backend=KernelBackend.AOT).backend
+        is KernelBackend.AOT
+    )
 
 
 def test_unknown_op_or_backend_raises():

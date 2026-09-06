@@ -98,9 +98,7 @@ def construct_variable_block_sizes(
         t_sizes[:, None, None]  # [n_t, 1,   1]
         * h_sizes[None, :, None]  # [1,   n_h, 1]
         * w_sizes[None, None, :]  # [1,   1,   n_w]
-    ).reshape(
-        -1
-    )  # [n_t * n_h * n_w]
+    ).reshape(-1)  # [n_t * n_h * n_w]
 
     return block_sizes
 

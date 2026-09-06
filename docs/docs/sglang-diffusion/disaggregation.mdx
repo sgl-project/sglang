@@ -153,6 +153,118 @@ sglang serve --model-path ... --disagg-role server \
     --decoder-urls  "tcp://10.0.0.5:35000"
 ```
 
+### GLM-Image distributed mode
+
+GLM-Image can batch AR generation in the head and dispatch the resulting prior
+tokens to distributed denoiser workers. Each worker runs prompt/glyph preparation,
+DiT, and VAE decoding locally; no latent or embedding tensors are transferred.
+
+The following 16-device deployment uses devices 0-1 for the external AR server
+and devices 2-15 for 14 independent batch-1 Cache-DiT denoisers.
+
+```bash
+# Run 14 distributed denoisers
+DISAGG_SERVER="tcp://127.0.0.1:19655"
+MODEL_PATH="zai-org/GLM-Image"
+BASE_MASTER_PORT=29005
+
+export SGLANG_CACHE_DIT_FN=2
+export SGLANG_CACHE_DIT_BN=1
+export SGLANG_CACHE_DIT_WARMUP=4
+export SGLANG_CACHE_DIT_RDT=0.4
+export SGLANG_CACHE_DIT_MC=4
+export SGLANG_CACHE_DIT_TAYLORSEER=true
+export SGLANG_CACHE_DIT_TS_ORDER=2
+export SGLANG_CACHE_DIT_ENABLED=true
+
+worker_pids=()
+
+cleanup() {
+    trap - EXIT
+    if ((${#worker_pids[@]})); then
+        kill "${worker_pids[@]}" 2>/dev/null || true
+        wait "${worker_pids[@]}" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+for i in $(seq 2 15); do
+    scheduler_port=$((19001 + i))
+    master_port=$((BASE_MASTER_PORT + i))
+
+    sglang serve \
+        --model-path "$MODEL_PATH" \
+        --disagg-role denoiser \
+        --disagg-server-addr "$DISAGG_SERVER" \
+        --srt-encoder-url http://127.0.0.1:30020 \
+        --scheduler-port "$scheduler_port" \
+        --master-port "$master_port" \
+        --num-gpus 1 \
+        --base-gpu-id "$i" \
+        --denoiser-sp 1 \
+        --cfg-parallel-size 1 \
+        --batching-max-size 1 \
+        --dit-cpu-offload false \
+        --attention-backend fa &
+    worker_pids+=("$!")
+done
+
+# Stop all denoisers if any worker exits or fails during startup.
+wait -n "${worker_pids[@]}"
+```
+
+Run the external AR server:
+
+```bash
+sglang serve \
+  --model-path ./zai-org/GLM-Image/vision_language_encoder/ \
+  --tokenizer-path ./zai-org/GLM-Image/processor/ \
+  --enable-multimodal \
+  --cuda-graph-max-bs 28 \
+  --device npu \
+  --attention-backend ascend \
+  --disable-fast-image-processor \
+  --tp-size 2 \
+  --host 0.0.0.0 \
+  --port 30020 \
+  --mem-fraction-static 0.8
+```
+
+Run the public head. `--encoder-urls` and `--decoder-urls` are intentionally
+omitted for this topology.
+
+```bash
+sglang serve \
+  --model-path zai-org/GLM-Image \
+  --disagg-role server \
+  --srt-encoder-url http://127.0.0.1:30020 \
+  --srt-encoder-timeout 300 \
+  --denoiser-urls "tcp://127.0.0.1:19003;tcp://127.0.0.1:19004;tcp://127.0.0.1:19005;tcp://127.0.0.1:19006;tcp://127.0.0.1:19007;tcp://127.0.0.1:19008;tcp://127.0.0.1:19009;tcp://127.0.0.1:19010;tcp://127.0.0.1:19011;tcp://127.0.0.1:19012;tcp://127.0.0.1:19013;tcp://127.0.0.1:19014;tcp://127.0.0.1:19015;tcp://127.0.0.1:19016" \
+  --batching-mode dynamic \
+  --batching-max-size 28 \
+  --batching-delay-ms 30 \
+  --enable-batching-metrics \
+  --host 0.0.0.0 \
+  --port 30052 \
+  --scheduler-port 19655 \
+  --output-path ./outputs
+```
+
+Workers return decoded pixels to the head, which saves and serves the final
+files from `--output-path`. The PR benchmark used
+[longtext-bench.zip](https://github.com/user-attachments/files/29779516/longtext-bench.zip):
+
+```bash
+python fetch_images.py \
+  --base-url http://localhost:30052/v1 \
+  --model GLM-Image-distributed-test \
+  --output-dir generated_images \
+  --max-concurrency 56
+```
+
 ## Port Convention
 
 Result endpoints are derived deterministically from the head node's `--scheduler-port` (default: 5555):
@@ -195,6 +307,9 @@ Role instances derive their result endpoint automatically from `--disagg-server-
 Tensor data between roles (encoder→denoiser, denoiser→decoder) is transferred via a P2P transfer engine. The DiffusionServer only routes lightweight control messages (alloc/push/ready); actual tensor data flows directly between instances.
 
 **mooncake-transfer-engine** is required for disaggregated diffusion. It provides RDMA for direct GPU-to-GPU data movement.
+
+The GLM-Image distributed mode is an exception: it relays only prior token IDs
+and request metadata over ZMQ and does not require Mooncake.
 
 ```bash
 pip install mooncake-transfer-engine

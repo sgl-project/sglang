@@ -69,6 +69,20 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(model_config.swa_head_dim, 64)
         self.assertEqual(model_config.swa_v_head_dim, 48)
 
+    def test_v_head_dim_zero_falls_back_to_head_dim(self):
+        # deepseek-vl2-tiny's language_config sets use_mla=False + v_head_dim=0
+        # as an MLA-disabled sentinel. The non-MLA KV pool sizes its V buffer
+        # from v_head_dim directly, so a literal 0 collapses V-cache to a
+        # zero-width tensor and `v_cache[indices] = v` fails with a shape
+        # mismatch inside `_set_kv_buffer_impl`. v_head_dim=0 must be treated
+        # identically to `None` and fall back to head_dim.
+        text_config = _make_text_config(head_dim=128, v_head_dim=0)
+
+        model_config = self._derive_shapes(text_config)
+
+        self.assertEqual(model_config.v_head_dim, 128)
+        self.assertEqual(text_config.v_head_dim, 128)
+
     def test_ling_mla_nope_shapes(self):
         text_config = _make_text_config(
             architectures=["BailingMoeV3ForCausalLM"],

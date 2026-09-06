@@ -31,7 +31,6 @@ _ROUTER_SHAPES = ((6144, 768), (3072, 384))
     "requires HPC-Ops (https://github.com/Tencent/hpc-ops) and a Hopper GPU",
 )
 class TestLinearBf16Fp32Hpc(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mark_hpc_bf16xfp32_gemm_enabled()

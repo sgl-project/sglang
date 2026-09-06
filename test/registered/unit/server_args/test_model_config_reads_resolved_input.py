@@ -30,12 +30,26 @@ _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 # Two quantities sharing one name.
 _READ_BEFORE_RESOLUTION = frozenset({"is_embedding"})
 
-# Declared after the first `get_model_config()`, so the cached configuration
+# Declared after the first `model_config_of()`, so the cached configuration
 # holds the earlier value. Nothing reads the stale copy today (its one consumer
 # is on the `is_draft_model` branch, built after resolution), and fixing it
 # means moving the build or the hook. Pinned so a second field in this position
 # has to be looked at.
 _STALE_IN_THE_MODEL_CONFIG = frozenset({"speculative_algorithm"})
+
+# Behind the expert-pack build. `expert_pack_hook.handle_expert_pack` builds a
+# model configuration, and it always did -- the walk stopped at the record's
+# file and never saw it, so these three read as decided before the first build.
+# The call sits behind `load_format != "expert_pack": return`, so it is the
+# first build only on an expert-pack launch. Pre-existing; named rather than
+# fixed, because fixing it means moving the build or the hook.
+_STALE_BEHIND_THE_EXPERT_PACK_BUILD = frozenset(
+    {
+        "_speculative_draft_quantization_explicitly_set",
+        "model_path",
+        "speculative_draft_model_quantization",
+    }
+)
 
 # The same staleness through the registries: `_handle_model_specific_adjustments`
 # builds the model configuration and *then* collects the override declarations,
@@ -95,16 +109,30 @@ def _registry_collection_is_after_the_build():
 
     Handler-local ordering only -- the caller still has to compare against the
     pipeline-wide first build, which sits in an *earlier* step: hoisting the
-    collection above this handler's own `get_model_config()` call does not move
+    collection above this handler's own `model_config_of()` call does not move
     it above the configuration another handler already cached.
     """
-    tree = _parsed(_SRT / "server_args.py")
-    handler = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_handle_model_specific_adjustments"
-    )
+    handler = None
+    for source, wanted in (
+        (_SRT / "server_args.py", "_handle_model_specific_adjustments"),
+        *(
+            (path, "handle_model_specific_adjustments")
+            for path in sorted((_SRT / "arg_groups").glob("*.py"))
+        ),
+    ):
+        for node in ast.walk(_parsed(source)):
+            if isinstance(node, ast.FunctionDef) and node.name == wanted:
+                if any(
+                    isinstance(child, ast.Call)
+                    and getattr(child.func, "attr", getattr(child.func, "id", None))
+                    == "collect_model_override_declarations"
+                    for child in ast.walk(node)
+                ):
+                    handler = node
+                    break
+        if handler is not None:
+            break
+    assert handler is not None, "the model-specific handler was not found"
     build = collect = None
     for node in ast.walk(handler):
         if not isinstance(node, ast.Call):
@@ -117,7 +145,7 @@ def _registry_collection_is_after_the_build():
             name = func.id
         else:
             continue
-        if name == "get_model_config" and build is None:
+        if name == "model_config_of" and build is None:
             build = node.lineno
         if name == "collect_model_override_declarations" and collect is None:
             collect = node.lineno
@@ -164,11 +192,12 @@ def _server_args_names(tree, path):
                 and value.args[0].id in names
             )
             # `resolved = self._resolved()` is the same view, spelled as the
-            # record's own member.
+            # resolution vocabulary.
             member = (
                 isinstance(value, ast.Call)
                 and isinstance(value.func, ast.Attribute)
-                and value.func.attr == "_resolved"
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "resolved_view"
                 and isinstance(value.func.value, ast.Name)
                 and value.func.value.id in names
             )
@@ -239,7 +268,7 @@ def _late_resolution_fields():
                 if isinstance(node.func, ast.Attribute)
                 else getattr(node.func, "id", "")
             )
-            if called in ("_late_resolution", "declare_late_resolution"):
+            if called == "declare_late_resolution":
                 fields |= {kw.arg for kw in node.keywords if kw.arg}
     return fields
 
@@ -283,6 +312,26 @@ def _hook_declarations(dispatch, source_module):
     return out
 
 
+# The dispatcher's own file: its imports are what map a bare-name call in it
+# to the family that defines the callable.
+_DISPATCH_MODULE = _SRT / "arg_groups" / "pipeline.py"
+
+
+def _hook_functions():
+    """Module-level resolution functions under `arg_groups/`.
+
+    A handler that moved out of the record leaves a slot behind that imports
+    one of these and calls it. Without following that hop the scan stops at
+    the slot and silently loses everything the handler does.
+    """
+    functions = {}
+    for path in sorted((_SRT / "arg_groups").glob("*.py")):
+        for node in _parsed(path).body:
+            if isinstance(node, ast.FunctionDef):
+                functions.setdefault(node.name, node)
+    return functions
+
+
 def _pipeline():
     """(ordered steps, {step: methods it reaches}) for the resolution dispatch."""
     tree = _parsed(_SRT / "server_args.py")
@@ -294,16 +343,33 @@ def _pipeline():
     methods = {
         node.name: node for node in record.body if isinstance(node, ast.FunctionDef)
     }
-    dispatch = methods["_run_resolution_pipeline"]
+    # The dispatcher calls its hooks by bare name, so the walk resolves those
+    # against `arg_groups/` alongside the record's own methods.
+    hooks = _hook_functions()
+    methods.update({name: node for name, node in hooks.items() if name not in methods})
+    dispatch = methods["run_resolution_pipeline"]
+    # A step is either a record method (`self._x()`) or a bare-name hook call.
     steps = [
         name
         for _line, name in sorted(
-            (node.lineno, node.func.attr)
+            (
+                node.lineno,
+                (
+                    node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else node.func.id
+                ),
+            )
             for node in ast.walk(dispatch)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "self"
+            and (
+                (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                )
+                or (isinstance(node.func, ast.Name) and node.func.id in hooks)
+            )
         )
     ]
 
@@ -313,25 +379,31 @@ def _pipeline():
             return seen
         seen.add(name)
         for node in ast.walk(methods[name]):
+            if not isinstance(node, ast.Call):
+                continue
             if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "self"
                 and node.func.attr in methods
             ):
                 reaches(node.func.attr, seen)
+            elif isinstance(node.func, ast.Name) and node.func.id in hooks:
+                reaches(node.func.id, seen)
         return seen
 
     step_lines = {}
     for node in ast.walk(dispatch):
+        if not isinstance(node, ast.Call):
+            continue
         if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
+            isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "self"
         ):
             step_lines.setdefault(node.func.attr, node.lineno)
+        elif isinstance(node.func, ast.Name) and node.func.id in hooks:
+            step_lines.setdefault(node.func.id, node.lineno)
     return steps, methods, {name: reaches(name) for name in steps}, step_lines
 
 
@@ -417,14 +489,14 @@ def _declaration_positions():
     wanted = _constructor_reads()
 
     def build_site():
-        """(step index, method name, line) of the first `get_model_config()`."""
+        """(step index, method name, line) of the first `model_config_of()`."""
         for index, step in enumerate(steps):
             for method in reached[step]:
                 for node in ast.walk(methods[method]):
                     if (
                         isinstance(node, ast.Call)
-                        and isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "get_model_config"
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "model_config_of"
                     ):
                         return index, step, method, node.lineno
         return None
@@ -435,7 +507,7 @@ def _declaration_positions():
     build_index, build_step, build_method, build_line_in_body = site
     first_build = (build_index, build_step)
 
-    source_module = _SRT / "server_args.py"
+    source_module = _DISPATCH_MODULE
     imported = {}
     for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
@@ -461,8 +533,8 @@ def _declaration_positions():
                 same_body = index == build_index and method == build_method
                 rank = 0 if same_body and node.lineno < build_line_in_body else 1
                 if (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "_declare"
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "declare_resolution"
                 ):
                     fields = {kw.arg for kw in node.keywords if kw.arg}
                 # A handler that calls an imported hook (the Kimi and DeepSeek
@@ -485,9 +557,9 @@ def _declaration_positions():
     # the dispatcher*: a handler body sits further down the file than the
     # dispatcher that calls it, so a line number taken from one scope says
     # nothing about ordering against the other.
-    dispatch = methods["_run_resolution_pipeline"]
+    dispatch = methods["run_resolution_pipeline"]
     build_line = step_lines[first_build[1]]
-    for field, line in _hook_declarations(dispatch, _SRT / "server_args.py").items():
+    for field, line in _hook_declarations(dispatch, _DISPATCH_MODULE).items():
         if field in wanted and line > build_line:
             declared_at[field] = max(
                 declared_at.get(field, (build_index, 1)), (10**6, 1)
@@ -512,6 +584,7 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
             _READ_BEFORE_RESOLUTION
             | _STALE_IN_THE_MODEL_CONFIG
             | _STALE_FROM_THE_REGISTRIES
+            | _STALE_BEHIND_THE_EXPERT_PACK_BUILD
         )
         late = sorted(
             field
@@ -589,16 +662,16 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
         documents a hazard that no longer exists and hides the day one appears.
         """
         steps, methods, reached, step_lines = _pipeline()
-        dispatch = methods["_run_resolution_pipeline"]
-        hooks = _hook_declarations(dispatch, _SRT / "server_args.py")
+        dispatch = methods["run_resolution_pipeline"]
+        hooks = _hook_declarations(dispatch, _DISPATCH_MODULE)
         build_line = min(
             step_lines[step]
             for step in steps
             for method in reached[step]
             if any(
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "get_model_config"
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "model_config_of"
                 for node in ast.walk(methods[method])
             )
         )
@@ -628,8 +701,8 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
         then, rather than keeping a note about a hazard that is gone.
         """
         steps, methods, reached, step_lines = _pipeline()
-        dispatch = methods["_run_resolution_pipeline"]
-        positions = _opaque_callback_positions(dispatch, _SRT / "server_args.py")
+        dispatch = methods["run_resolution_pipeline"]
+        positions = _opaque_callback_positions(dispatch, _DISPATCH_MODULE)
         self.assertEqual(
             sorted(positions),
             [

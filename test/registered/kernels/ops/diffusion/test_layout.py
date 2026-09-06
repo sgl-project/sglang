@@ -31,6 +31,7 @@ from sglang.kernels.ops.diffusion import (
 from sglang.kernels.ops.diffusion import (
     fused_causal_conv3d_cat_pad_cuda,
     fused_pack_qkv,
+    fused_pack_segmented_qkv,
     fused_scatter_to_padded,
     pack_qkv_destination_major,
     usp_merge_heads,
@@ -213,6 +214,28 @@ def test_varlen_pack_matches_index_select(dtype, shape):
 
 @pytest.mark.parametrize("dtype", VARLEN_DTYPES)
 @pytest.mark.parametrize("shape", VARLEN_SHAPES, ids=lambda s: s[0])
+def test_varlen_segmented_pack_matches_materialized_joint(dtype, shape):
+    _, bs, s_txt, s_img, num_heads, head_dim, valid_txt_lens = shape
+    torch.manual_seed(42)
+    indices, _ = _build_meta(_build_mask(bs, s_txt, s_img, valid_txt_lens))
+    txt_qkv = tuple(
+        torch.randn(bs, s_txt, num_heads, head_dim, dtype=dtype, device=DEVICE)
+        for _ in range(3)
+    )
+    img_qkv = tuple(
+        torch.randn(bs, s_img, num_heads, head_dim, dtype=dtype, device=DEVICE)
+        for _ in range(3)
+    )
+
+    got = fused_pack_segmented_qkv(*txt_qkv, *img_qkv, indices)
+    for actual, txt, img in zip(got, txt_qkv, img_qkv, strict=True):
+        joint = torch.cat([txt, img], dim=1)
+        expected = joint.flatten(0, 1).index_select(0, indices)
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", VARLEN_DTYPES)
+@pytest.mark.parametrize("shape", VARLEN_SHAPES, ids=lambda s: s[0])
 def test_varlen_scatter_matches_index_copy(dtype, shape):
     _, bs, s_txt, s_img, num_heads, head_dim, valid_txt_lens = shape
     torch.manual_seed(1)
@@ -342,6 +365,45 @@ def _varlen_path(q, k, v, key_mask, softmax_scale):
         # unit-wise above on every lane.
         pytest.skip(f"FlashAttention varlen v{_fa_backend.fa_ver} unavailable: {exc}")
     return fused_scatter_to_padded(out_unpad, meta["inv_indices"], bs, seq)
+
+
+@pytest.mark.parametrize("dtype", VARLEN_DTYPES)
+def test_fa_dense_scheduler_matches_single_sequence_varlen(dtype):
+    torch.manual_seed(7)
+    batch_size, seq, num_heads, head_dim = 1, 256, 4, 128
+    q, k, v = (
+        torch.randn(
+            batch_size,
+            seq,
+            num_heads,
+            head_dim,
+            dtype=dtype,
+            device=DEVICE,
+        )
+        for _ in range(3)
+    )
+    cu_seqlens = torch.tensor([0, seq], dtype=torch.int32, device=DEVICE)
+    kwargs = dict(
+        max_seqlen_q=seq,
+        max_seqlen_k=seq,
+        softmax_scale=head_dim**-0.5,
+        causal=False,
+        ver=_fa_backend.fa_ver,
+    )
+    try:
+        varlen = flash_attn_varlen_func(
+            q.flatten(0, 1),
+            k.flatten(0, 1),
+            v.flatten(0, 1),
+            cu_seqlens,
+            cu_seqlens,
+            **kwargs,
+        ).view_as(q)
+        dense = flash_attn_varlen_func(q, k, v, None, None, **kwargs)
+    except ImportError as exc:  # pragma: no cover - image-dependent
+        pytest.skip(f"FlashAttention unavailable: {exc}")
+
+    torch.testing.assert_close(dense, varlen, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("dtype", VARLEN_DTYPES)
