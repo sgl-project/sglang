@@ -980,6 +980,16 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
+            if _is_cpu:
+                assert (
+                    _is_cpu_amx_available
+                ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
+                # The AMX kernel consumes (N, K) weights; undo the (K, N) transpose.
+                layer.weight = Parameter(
+                    layer.weight.data.t().contiguous(), requires_grad=False
+                )
+                _amx_process_weight_after_loading(layer, ["weight"])
+
         if self.use_marlin:
             if self.block_quant:
                 layer.weight_block_size = self.quant_config.weight_block_size
@@ -1063,6 +1073,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+            )
+
+        if use_intel_amx_backend(layer) and not isinstance(x, tuple):
+            return torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+                True,  # is_vnni
             )
 
         if isinstance(x, tuple):
