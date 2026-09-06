@@ -192,9 +192,11 @@ def test_sparse_mla_q8kv8_prefill_corner_cases(
     _run_and_check(d_qk, with_sink, s_q=s_q, topk=topk, s_kv=s_kv)
 
 
-# topk_length WITHOUT attn_sink (the production early-exit path for
-# SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH): rows with a trailing -1 pad run must
-# be BITWISE identical to the full-topk dispatch that masks those pads, and
+# topk_length WITHOUT attn_sink (the production early-exit path, fed by the
+# metadata-derived per-row valid-topk count): rows with a trailing -1 pad run
+# must be BITWISE identical to the full-topk dispatch that masks those pads
+# (which holds for these specific length patterns; arbitrary lengths that
+# change the block-iteration count may perturb `out` by 1 bf16 ULP), and
 # must match the fp32 reference on the truncated index range.
 @pytest.mark.skipif(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
@@ -681,43 +683,93 @@ def test_sparse_mla_q8kv8_prefill_large_skv():
     assert cos > 0.99, f"cos {cos:.4f} <= 0.99"
 
 
-# Backend-side topk_length derivation (backscan Triton kernel): must equal the
-# reference "last non-negative position + 1 (min 1)" on every pad pattern the
-# production topk output can produce (trailing runs), plus adversarial ones
-# (interleaved -1s, all-pad, full rows) where the trailing-run semantics still
-# define the correct consumed range.
+# Metadata-derived topk_length: production passes dsa_cache_seqlens_int32
+# (seqlens clipped to topk) instead of a count derived from the indices
+# themselves. The metadata value can only meet or exceed the exact
+# last-valid-position count (in-range -1 sentinels are clamp+masked either
+# way), so both sources must be BITWISE interchangeable. All-pad rows are the
+# one place the two sources disagree numerically (metadata 0 -- e.g. DP/CP
+# padding rows, which pad_dsa_cache_seqlens fills with zeros -- vs the
+# index-derived floor of 1): both must yield the empty-row sentinel outputs
+# (zero out, max_logits=-inf, lse=+inf) without wedging the kernel's
+# producer/consumer handshake.
 @pytest.mark.skipif(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
-@pytest.mark.parametrize("s_q,topk", [(437, 2048), (7, 128), (65, 256), (4096, 2048)])
-def test_q8kv8_topk_length_backscan(s_q: int, topk: int):
-    from sglang.kernels.ops.kvcache.cache_ops import (
-        q8kv8_topk_length_from_indices,
+@pytest.mark.parametrize(
+    "s_q,topk,s_kv", [(437, 2048, 4096), (65, 256, 592), (128, 128, 512)]
+)
+def test_q8kv8_topk_length_metadata_equivalence(s_q: int, topk: int, s_kv: int):
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
     )
 
+    d_qk = 576
     generator = torch.Generator(device="cuda")
     generator.manual_seed(4000 + s_q + topk)
-    indices = torch.randint(
-        0, 1 << 20, (s_q, topk), dtype=torch.int32, device="cuda", generator=generator
+    q = _make_fp8_tensor((s_q, H_Q, d_qk), seed=s_q)
+    kv = _make_fp8_tensor((s_kv, H_KV, d_qk), seed=s_kv)
+    one = torch.ones(1, dtype=torch.float32, device="cuda")
+    sm_scale = 1.0 / math.sqrt(d_qk)
+
+    # Metadata analogue: per-row seqlens clipped to topk, with all-pad rows
+    # (value 0) mixed in like the DP/CP padding helpers produce.
+    seqlens = torch.randint(
+        1, topk + 1, (s_q,), dtype=torch.int32, device="cuda", generator=generator
     )
-    # Row patterns: full, trailing pad runs of every length, all-pad,
-    # interleaved -1s inside the valid range.
-    for i in range(s_q):
-        mode = i % 5
-        if mode == 1:
-            indices[i, max(1, i % topk) :] = -1
-        elif mode == 2:
-            indices[i, :] = -1
-        elif mode == 3:
-            indices[i, i % topk :: 7] = -1  # interleaved + trailing mix
-        elif mode == 4:
-            indices[i, topk - 1 :] = -1
+    seqlens[::5] = 0
+    indices = torch.randint(
+        0,
+        s_kv,
+        (s_q, H_KV, topk),
+        dtype=torch.int32,
+        device="cuda",
+        generator=generator,
+    )
+    ramp = torch.arange(topk, dtype=torch.int32, device="cuda").view(1, 1, topk)
+    indices = torch.where(
+        ramp < seqlens.view(-1, 1, 1), indices, torch.full_like(indices, -1)
+    )
+    # In-range -1 sentinels: exercise the clamp+mask path inside the consumed
+    # range (makes the index-derived count strictly smaller than the metadata
+    # value on some rows).
+    sprinkle = (
+        torch.rand((s_q, 1, topk), device="cuda", generator=generator) < 0.02
+    ) & (ramp < seqlens.view(-1, 1, 1))
+    indices = torch.where(sprinkle, torch.full_like(indices, -1), indices)
 
-    got = q8kv8_topk_length_from_indices(indices)
+    # Exact index-derived count = last non-negative position + 1 (min 1), the
+    # semantics of the deleted backend-side backscan derivation.
+    ramp1 = torch.arange(1, topk + 1, dtype=torch.int32, device="cuda")
+    exact = ((indices.squeeze(1) >= 0).int() * ramp1).amax(dim=-1).clamp_(min=1)
 
-    ramp = torch.arange(1, topk + 1, dtype=torch.int32, device="cuda")
-    ref = ((indices >= 0).int() * ramp).amax(dim=-1).clamp_(min=1)
-    assert torch.equal(got, ref)
+    outs = {}
+    for name, topk_length in (("metadata", seqlens), ("exact", exact)):
+        outs[name] = sparse_mla_q8kv8_prefill_fwd(
+            q=q,
+            kv=kv,
+            indices=indices,
+            sm_scale=sm_scale,
+            q_scale=one,
+            kv_scale=one,
+            d_v=D_V,
+            attn_sink=None,
+            topk_length=topk_length,
+        )
+    torch.cuda.synchronize()
+
+    for (om, mlm, lsem), (oe, mle, lsee) in ((outs["metadata"], outs["exact"]),):
+        assert torch.equal(om, oe)
+        assert torch.equal(mlm, mle)
+        assert torch.equal(lsem, lsee)
+
+    # All-pad rows: empty-row sentinels from both sources.
+    allpad = seqlens == 0
+    assert bool(allpad.any())
+    out_m, ml_m, lse_m = outs["metadata"]
+    assert bool((out_m[allpad] == 0).all())
+    assert bool((ml_m[allpad] == float("-inf")).all())
+    assert bool((lse_m[allpad] == float("inf")).all())
 
 
 if __name__ == "__main__":

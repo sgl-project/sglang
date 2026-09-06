@@ -1521,13 +1521,6 @@ class Envs:
     # different GEMM accumulation order), hence default OFF until accuracy-
     # gated (oracle + full-set gsm8k).
     SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q = EnvBool(False)
-    # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: pass a
-    # per-row valid-topk count (derived from the trailing -1 pad run of the
-    # topk indices) so the kernel skips whole pad-only topk blocks instead of
-    # computing masked zero contributions.  Bit-exact by construction: skipped
-    # blocks contain only -1 pads, and -1 entries inside the consumed range
-    # still take the in-kernel clamp+mask path.
-    SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH = EnvBool(False)
     # Opt-in: run the born-fp8 q-prep (absorbed bmm + concat + fp8 cast,
     # ~173us/layer-call) on alt_stream underneath the DSA indexer — the two
     # chains fork independently from the q_a_layernorm output.  Requires

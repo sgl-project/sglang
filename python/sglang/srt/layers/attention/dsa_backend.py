@@ -37,7 +37,6 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
-    q8kv8_topk_length_from_indices,
     seqlens_expand_triton,
 )
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
@@ -444,12 +443,6 @@ class DeepseekSparseAttnBackend(
         # the gather kernel fuses that in.  Same single-stream reuse
         # argument as `_q8kv8_qpad_buf`.
         self._q8kv8_kv_buf: Optional[torch.Tensor] = None
-        # Per-row valid-topk early-exit (SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH):
-        # rows whose topk indices end in a -1 pad run skip whole topk blocks
-        # in-kernel.
-        self._q8kv8_topk_length_enabled: bool = (
-            envs.SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH.get()
-        )
         # Persistent (grow-only) kernel-output buffers (out/max_logits/lse).
         self._q8kv8_out_bufs: Optional[tuple] = None
         # Fused non-prefix KV prep (cast-concat k/k_rope directly into the
@@ -2078,6 +2071,7 @@ class DeepseekSparseAttnBackend(
                             sm_scale=layer.scaling,
                             v_head_dim=layer.v_head_dim,
                             layer_id=layer.layer_id,
+                            topk_length=metadata.dsa_cache_seqlens_int32,
                         )
                     if self._q8kv8_kv_cat_fusion:
                         # Fused path: no bf16 concat materialization — k and
@@ -2095,6 +2089,7 @@ class DeepseekSparseAttnBackend(
                             sm_scale=layer.scaling,
                             v_head_dim=layer.v_head_dim,
                             layer_id=layer.layer_id,
+                            topk_length=metadata.dsa_cache_seqlens_int32,
                         )
                     kv_cache = _cat([k, k_rope], dim=-1)
                     return self._forward_flashmla_sparse_q8kv8(
@@ -2107,6 +2102,7 @@ class DeepseekSparseAttnBackend(
                         sm_scale=layer.scaling,
                         v_head_dim=layer.v_head_dim,
                         layer_id=layer.layer_id,
+                        topk_length=metadata.dsa_cache_seqlens_int32,
                     )
 
                 # bf16 path (dsa_impl == "flashmla_sparse").
@@ -2581,6 +2577,7 @@ class DeepseekSparseAttnBackend(
         layer_id: Optional[int] = None,
         kv_k: Optional[torch.Tensor] = None,
         kv_k_rope: Optional[torch.Tensor] = None,
+        topk_length: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Native FP8 (q8 x kv8) sparse-prefill attention (SM90 JIT kernel).
 
@@ -2588,10 +2585,11 @@ class DeepseekSparseAttnBackend(
         FP8 ``sparse_mla_q8kv8_prefill_fwd`` kernel.  Identity per-tensor
         scales (scalar 1.0) are used: a raw bf16->fp8 cast of q/kv is accurate
         on real DeepSeek-V3 magnitudes, so no dynamic rescaling is applied.
-        The kernel runs via its fixed full-topk entry (``attn_sink`` /
-        ``topk_length`` left None), keeping control flow identical across DP
-        ranks; -1 topk sentinels are clamped to distinct zero pad rows inside
-        the kernel.
+        ``topk_length`` (``dsa_cache_seqlens_int32``, the same metadata the
+        bf16 ``_forward_flashmla_sparse`` path consumes) is a device tensor,
+        so host-side control flow stays identical across DP ranks; -1 topk
+        sentinels are masked out in-kernel (their KV loads are predicated
+        off).
 
         Two KV paths:
           * non-prefix extend: ``kv_bf16`` (the gathered bf16 KV) is cast into
@@ -2738,15 +2736,20 @@ class DeepseekSparseAttnBackend(
             kv_padded[num_kv_tokens:].zero_()
             kv_padded = kv_padded.view(-1, 1, head_dim)
 
-        # Per-row valid-topk count = last non-pad position + 1.  Bit-exact
-        # vs topk_length=None: the skipped tail blocks contain only -1 pads
-        # (masked to zero contribution today), and -1 entries inside the
-        # consumed range still take the kernel's clamp+mask path.  The
-        # backscan's cost is proportional to the trailing pad run, so rows
-        # with a full topk (all rows at long context) pay ~one block read.
-        topk_length = None
-        if self._q8kv8_topk_length_enabled:
-            topk_length = q8kv8_topk_length_from_indices(page_table_1)
+        # Per-row valid-topk early-exit: topk_length is the per-row count of
+        # valid indices (`dsa_cache_seqlens_int32` = seqlens clipped to
+        # `index_topk`), the same metadata source the bf16
+        # `_forward_flashmla_sparse` path uses. Rows whose context is shorter
+        # than `index_topk` have their indices tail-padded with -1; the valid
+        # length lets the kernel skip whole pad-only topk blocks instead of
+        # computing masked zero contributions (-1 entries inside the consumed
+        # range are still masked out in-kernel, and the metadata
+        # value can only exceed the position of the last valid index).
+        if topk_length is not None and topk_length.shape[0] != num_tokens:
+            # Metadata rows are expected to match q rows (the DP/CP padding
+            # helpers keep them aligned); fall back to full-width compute if
+            # they ever diverge.
+            topk_length = None
 
         # Persistent kernel-output buffers (out / max_logits / lse): the
         # wrapper otherwise torch.empty's all three per layer-call.  The
