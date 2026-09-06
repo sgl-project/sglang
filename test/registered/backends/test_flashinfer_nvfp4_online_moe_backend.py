@@ -82,8 +82,16 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4Online(
 ):
     backend = "flashinfer_trtllm"
     model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+    extra_args = [
+        "--dp-size",
+        "4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend",
+        "none",
+    ]
     eval_args = {"api": "completion", "max_tokens": 512}
     extra_env = {
+        "SGLANG_MOE_NVFP4_DISPATCH": "1",
         "FLASHINFER_NVFP4_4OVER6": "1",
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
@@ -95,12 +103,23 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4Online(
     }
 
 
+class TestFlashinferTrtllmRoutedMoeBackendNvFp4Online(
+    TestFlashinferTrtllmGenMoeBackendNvFp4Online
+):
+    backend = "flashinfer_trtllm_routed"
+
+
 class TestFlashinferCuteDSLMoeBackendNvFp4Online(
     FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
 ):
     backend = "flashinfer_cutedsl"
     model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
     extra_args = [
+        "--dp-size",
+        "4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend",
+        "none",
         "--reasoning-parser",
         "nemotron_3",
         "--tool-call-parser",
@@ -117,6 +136,7 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
     eval_args = {"max_tokens": 16000, "temperature": 1.0, "top_p": 0.95}
     spec_accept_length_threshold = 2.5
     extra_env = {
+        "SGLANG_MOE_NVFP4_DISPATCH": "1",
         "FLASHINFER_NVFP4_4OVER6": "1",
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",

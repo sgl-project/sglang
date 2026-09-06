@@ -1287,10 +1287,25 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hidden_states_scale = dispatch_output.hidden_states_scale
     per_token_scale = None
     if hidden_states_scale is not None:
-        # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
+        # NVFP4 dispatch: inputs are already FP4-quantized by
         # the dispatcher, so pass them through unchanged.
         hs_fp4 = hidden_states
         hs_scale_linear = hidden_states_scale
+        per_token_scale = getattr(
+            dispatch_output, "hidden_states_per_token_scale", None
+        )
+        assert (per_token_scale is not None) == quant_info.use_per_token_activation
+        if hidden_states.shape[0] == 0:
+            # The native TRT-LLM FP4 kernel does not support an empty token batch.
+            # Return to the dispatcher so every rank still participates in combine.
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                return StandardCombineInput(
+                    hidden_states.new_empty(
+                        (0, hidden_states.shape[1] * 2), dtype=torch.bfloat16
+                    )
+                )
     elif quant_info.use_per_token_activation:
         from flashinfer import SfLayout, nvfp4_quantize
 
@@ -1324,9 +1339,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
             hidden_states, quant_info.w13_input_scale_quant
         )
-    hs_scale = hs_scale_linear.view(torch.float8_e4m3fn).reshape(
-        *hs_scale_linear.shape[:-1], -1
-    )
+    hs_scale = hs_scale_linear.view(torch.float8_e4m3fn)
     activation_type = get_activation_type(
         runner_config.activation, is_gated=runner_config.is_gated
     )
@@ -1348,7 +1361,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
-        # the MoE output is bf16 rather than the input dtype.
+        # the native FP4 MoE kernel requires bf16 output.
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )

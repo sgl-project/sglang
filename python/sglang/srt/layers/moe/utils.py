@@ -621,17 +621,39 @@ def filter_moe_weight_param_global_expert(name, x, num_local_experts):
     )
 
 
-def should_use_flashinfer_cutlass_moe_fp4_allgather():
+def should_use_flashinfer_moe_fp4_allgather():
+    """Quantize DP-local NVFP4 MoE inputs before the standard all-gather.
+
+    CUTLASS retains its automatic enablement. TRT-LLM and CuTe DSL opt in
+    with SGLANG_MOE_NVFP4_DISPATCH for static or per-token activation scales.
     """
-    Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
-    """
+    moe = get_flags().moe
+    parallel = get_parallel()
+    if (
+        moe.disable_fp4_allgather
+        or not get_moe_a2a_backend().is_none()
+        or not is_dp_attention_enabled()
+        or parallel.moe_ep_size != parallel.attn_dp_size
+    ):
+        return False
+    backend = get_moe_runner_backend()
+    if backend.is_flashinfer_cutlass():
+        return moe.quantization == "modelopt_fp4"
     return (
-        not get_flags().moe.disable_fp4_allgather
-        and get_moe_a2a_backend().is_none()
-        and get_moe_runner_backend().is_flashinfer_cutlass()
-        and is_dp_attention_enabled()
-        and get_flags().moe.quantization == "modelopt_fp4"
-        and get_parallel().moe_ep_size == get_parallel().attn_dp_size
+        envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+        and backend
+        in (
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+            MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
+            MoeRunnerBackend.FLASHINFER_CUTEDSL,
+        )
+        and moe.quantization in ("modelopt_fp4", "nvfp4_online")
+        and parallel.tp_size == parallel.attn_dp_size
+        and parallel.attn_dp_size > 1
+        and not (
+            backend.is_flashinfer_cutedsl()
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
     )
 
 
@@ -639,7 +661,7 @@ def is_moe_input_scattered_across_dp_ranks() -> bool:
     """Whether sparse MoE routing runs on a DP-local token shard."""
     return (
         not get_moe_a2a_backend().is_none()
-        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        or should_use_flashinfer_moe_fp4_allgather()
         or get_parallel().dwdp_size > 1
     )
 
@@ -656,7 +678,7 @@ def should_use_dp_reduce_scatterv():
     Configurations with partial attention TP fall back to all-reduce + dp_scatter.
     """
     return (
-        not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        not should_use_flashinfer_moe_fp4_allgather()
         and get_moe_a2a_backend().is_none()
         and is_dp_attention_enabled()
         and get_parallel().attn_dp_size > 1
@@ -688,9 +710,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
         an all-reduce.
       - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
         path replaces the all-reduce with a reduce-scatterv.
-      - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
-        the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
-        the post-experts TP all-reduce. Not relevant to the EP all-reduce.
+      - ``should_use_flashinfer_moe_fp4_allgather()``: the standard
+        dispatcher's reduce-scatter already combines the expert outputs.
       - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
         dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
         MoE outputs back to the source rank, so any further EP/TP all-reduce
@@ -708,7 +729,7 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
         return True
     if should_use_dp_reduce_scatterv():
         return True
-    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+    if should_use_flashinfer_moe_fp4_allgather():
         return True
     if get_moe_a2a_backend().is_flashinfer():
         return True

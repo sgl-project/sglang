@@ -2591,7 +2591,7 @@ class ServerArgs:
     ] = False
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool,
-        "Disables quantize before all-gather for flashinfer cutlass moe.",
+        "Disables quantize before all-gather for FlashInfer NVFP4 MoE runners.",
         NS("exec.moe"),
     ] = False
     disable_shared_experts_fusion: A[

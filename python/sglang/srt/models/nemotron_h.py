@@ -55,6 +55,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
+    should_use_flashinfer_moe_fp4_allgather,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -235,6 +236,7 @@ class NemotronHMoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_flashinfer()
+                    or should_use_flashinfer_moe_fp4_allgather()
                     else {}
                 ),
                 prefix=f"{prefix}.shared_experts",
@@ -279,6 +281,12 @@ class NemotronHMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if hidden_states.shape[0] == 0 and should_use_flashinfer_moe_fp4_allgather():
+            # Idle DP ranks skip local GEMMs but still join dispatch/combine.
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            if self.use_latent_moe:
+                hidden_states = hidden_states.new_empty((0, self.moe_hidden_size))
+            return self.experts(hidden_states, topk_output), None
         if _is_cuda and (
             not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
@@ -341,7 +349,10 @@ class NemotronHMoE(nn.Module):
         final_hidden_states, shared_output = self._forward_core(hidden_states)
 
         if self.use_latent_moe:
-            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
+            if num_tokens == 0 and should_use_flashinfer_moe_fp4_allgather():
+                final_hidden_states = hidden_states.new_empty((0, hidden_dim))
+            else:
+                final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
 
         if shared_output is not None:
             final_hidden_states += shared_output
