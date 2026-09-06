@@ -535,6 +535,11 @@ class RadixCache(BasePrefixCache):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
+    def supports_cache_unfinished_at_launch(self) -> bool:
+        # Subclasses layer host/storage write-through or SWA bookkeeping on
+        # insert and keep the result-time path until audited.
+        return type(self) is RadixCache
+
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
