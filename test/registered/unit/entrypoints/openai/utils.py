@@ -121,18 +121,27 @@ def find_completed_event(events: list[str]) -> dict:
     raise AssertionError("response.completed event missing from stream")
 
 
-def engine_chunk(text, completion_tokens=1, *, finish=False):
-    return {
-        "text": text,
-        "meta_info": {
-            "id": "rid",
-            "prompt_tokens": 5,
-            "completion_tokens": completion_tokens,
-            "cached_tokens": 0,
-            "reasoning_tokens": 0,
-            "finish_reason": {"type": "stop"} if finish else None,
-        },
+def engine_chunk(
+    text,
+    completion_tokens=1,
+    *,
+    finish=False,
+    token_logprobs=None,
+    top_logprobs=None,
+):
+    meta = {
+        "id": "rid",
+        "prompt_tokens": 5,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0,
+        "finish_reason": {"type": "stop"} if finish else None,
     }
+    if token_logprobs is not None:
+        meta["output_token_logprobs"] = token_logprobs
+    if top_logprobs is not None:
+        meta["output_top_logprobs"] = top_logprobs
+    return {"text": text, "meta_info": meta}
 
 
 class StreamFixture:
