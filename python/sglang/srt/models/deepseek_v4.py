@@ -2865,7 +2865,7 @@ class DeepseekV4Model(nn.Module):
             # TBO child batches drop mm metadata (the split sets mm_inputs=None),
             # which would silently degrade image-span visible-window attention
             # to causal. Fall back to the normal path for mm batches.
-            and not forward_batch.contains_mm_inputs()
+            and not forward_batch.dsv4_has_image_tokens
             and path_ok
             and self.pp_group.world_size == 1
         )

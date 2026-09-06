@@ -15,6 +15,7 @@ from sglang.srt.batch_overlap.operations import (
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.dsv4.visible_window import iter_image_spans
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSummableTensorPairFn,
@@ -444,6 +445,12 @@ class TboDPAttentionPreparer:
                 and enable_a2a_moe
                 and (resolved_deepep_mode.is_low_latency())
             )
+            # TBO child batches do not preserve image attention metadata.
+            if local_can_run_tbo and local_batch.is_extend_in_batch:
+                local_can_run_tbo = not any(
+                    any(iter_image_spans(mm_input))
+                    for mm_input in (local_batch.multimodal_inputs or [])
+                )
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
