@@ -165,6 +165,11 @@ class GDNKernelDispatcher:
 
             cutedsl_kernel = CuteDSLGDNKernel()
             self.decode_kernel = cutedsl_kernel
+        elif decode_backend.is_cudnn():
+            raise ValueError(
+                "cuDNN GDN is prefill-only. Use "
+                "--linear-attn-prefill-backend cudnn with Triton decode."
+            )
         elif decode_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
@@ -210,6 +215,14 @@ class GDNKernelDispatcher:
                     "(requires SM100+). Falling back to Triton for prefill."
                 )
                 self.extend_kernel = triton_kernel
+        elif prefill_backend.is_cudnn():
+            if not is_cuda():
+                raise ValueError("GDN cuDNN backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.gdn_cudnn import (
+                CudnnGDNKernel,
+            )
+
+            self.extend_kernel = CudnnGDNKernel()
         elif prefill_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
@@ -261,6 +274,13 @@ class GDNKernelDispatcher:
     @property
     def extend_uses_state_checkpoints(self) -> bool:
         return self.extend_kernel.uses_state_checkpoints
+
+    def prepare_state_checkpoint_plan(
+        self, forward_batch, forward_metadata, device
+    ) -> None:
+        self.extend_kernel.prepare_state_checkpoint_plan(
+            forward_batch, forward_metadata, device
+        )
 
     def packed_decode(
         self,
@@ -404,6 +424,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
         backends = model_runner.linear_attn_backends
+        if (
+            backends.prefill.is_cudnn()
+            and model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
+            != torch.float32
+        ):
+            raise ValueError("cuDNN GDN prefill requires --mamba-ssm-dtype float32.")
         self.linear_attn_backends = backends
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
@@ -428,11 +454,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ]
             )
             if self.kernel_dispatcher.extend_uses_state_checkpoints:
-                from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
-                    maybe_build_flashinfer_checkpoint_plan,
-                )
-
-                maybe_build_flashinfer_checkpoint_plan(
+                self.kernel_dispatcher.prepare_state_checkpoint_plan(
                     forward_batch, self.forward_metadata, self.device
                 )
 
@@ -900,6 +922,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 num_state_checkpoints=forward_metadata.num_state_checkpoints,
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
+                ),
+                batch_invariant=(
+                    get_exec().deterministic.enable_deterministic_inference
                 ),
                 output=kwargs.get("linear_attn_output"),
             )

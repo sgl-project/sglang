@@ -259,6 +259,26 @@ def handle_linear_attn_backend(server_args: Any):
     # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
     decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
 
+    # cuDNN 1.28 provides a GDN prefill implementation, not SGLang's decode
+    # or speculative-verify contracts. An explicit decode override is an
+    # error; selecting it as the base keeps cuDNN for prefill and uses Triton
+    # for decode.
+    if decode == "cudnn":
+        if cfg.linear_attn_decode_backend == "cudnn":
+            raise ValueError(
+                "--linear-attn-decode-backend cudnn is not supported: cuDNN "
+                "GDN is prefill-only. Use --linear-attn-prefill-backend cudnn."
+            )
+        declare_resolution(
+            server_args,
+            "_handle_linear_attn_backend",
+            linear_attn_decode_backend="triton",
+        )
+        decode = "triton"
+        logger.info(
+            "cuDNN GDN is prefill-only; using Triton for linear-attention decode."
+        )
+
     # FlashKDA is a prefill-only KDA kernel (no decode kernel) but shares the
     # backend choice list, so guard it from being selected for decode: error
     # on an explicit --linear-attn-decode-backend flashkda, and fall back to
@@ -312,6 +332,14 @@ def handle_linear_attn_backend(server_args: Any):
     # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
     # for correctness and best performance.
     prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
+    if prefill == "cudnn" and cfg.enable_prefill_cp:
+        raise ValueError(
+            "--linear-attn-prefill-backend cudnn does not support prefill "
+            "context parallelism: cuDNN FROST GDN has no cross-rank recurrent-"
+            "state propagation. Disable --enable-prefill-cp (and its legacy "
+            "aliases) or use a linear-attention backend with CP support."
+        )
+
     cuda_version = torch.version.cuda
     cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
     if (

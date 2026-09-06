@@ -617,6 +617,7 @@ FROM framework AS framework_final
 ARG BRANCH_TYPE
 ARG BUILD_TYPE
 ARG CUDA_VERSION
+ARG CUTLASS_DSL_VERSION=4.7.1
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 
@@ -670,6 +671,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
     && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
+
+# quack-kernels pins CUTLASS DSL 4.6.2, while the cuDNN Frontend 1.28 FROST
+# GDN engine requires 4.7.0 or newer. Quack is compatible with the newer DSL
+# (the CUDA 13.4 image already applies the same override).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        python3 -m pip uninstall -y \
+            nvidia-cutlass-dsl \
+            nvidia-cutlass-dsl-libs-base \
+            nvidia-cutlass-dsl-libs-core \
+            nvidia-cutlass-dsl-libs-cu12 \
+            nvidia-cutlass-dsl-libs-cu13 \
+        && python3 -m pip install \
+            "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"; \
+    fi
 
 ENV SGLANG_RUST_BUILD_MODE=never
 
