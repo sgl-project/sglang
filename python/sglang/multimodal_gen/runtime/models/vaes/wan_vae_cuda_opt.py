@@ -24,7 +24,9 @@ logger = init_logger(__name__)
 
 try:
     from sglang.kernels.ops.diffusion import (
+        can_use_nearest_upsample_nhwc,
         can_use_wan_rmsnorm_silu,
+        nearest_upsample_nhwc,
         wan_rmsnorm_silu,
     )
 
@@ -74,6 +76,11 @@ class GatedChannelsLastUpsample(nn.Module):
     NHWC conv2d is not guaranteed to pick the same cuDNN algorithm as the NCHW
     one, so the stride canonicalisation stays behind the quality gate; with
     the gate off the layout is left exactly as the eager module sees it.
+
+    The upsample itself then runs the Triton ``nearest_upsample_nhwc`` gather
+    (bit-exact vs ``nn.Upsample`` for integer factors) instead of aten's
+    ``upsample_nearest2d_nhwc`` kernel, which is several times slower than
+    its NCHW sibling on the same bytes.
     """
 
     def __init__(self, upsample: nn.Upsample, gate: VaeFastPathGate) -> None:
@@ -98,6 +105,16 @@ class GatedChannelsLastUpsample(nn.Module):
             and x.is_contiguous(memory_format=torch.channels_last)
         ):
             x = x.as_strided(x.shape, canonical)
+        # With canonical NHWC strides aten itself would run its NHWC kernel
+        # and return a dense channels_last tensor, so the Triton gather is a
+        # layout- and value-identical replacement: it runs on the lossless
+        # path too (the gate only controls the stride canonicalisation above).
+        if (
+            up.size is None
+            and x.stride() == canonical
+            and can_use_nearest_upsample_nhwc(x, up.scale_factor, up.mode)
+        ):
+            return nearest_upsample_nhwc(x, up.scale_factor)
         return up(x)
 
 
@@ -105,8 +122,9 @@ def _install_module_gates(
     decoder: nn.Module, gate: VaeFastPathGate, module_classes: tuple[type, ...]
 ) -> int:
     """Hand the gate to layout-sensitive modules that consult ``_sgl_gate`` in
-    their own forward (the attention block's residual operand order, so the
-    sum keeps the channels_last_3d layout)."""
+    their own forward: the ``Resample`` (channels_last_3d ``upsample3d`` frame
+    interleave, see ``resample_forward``) and the attention block (residual
+    operand order, so the sum keeps the channels_last_3d layout)."""
     count = 0
     for m in decoder.modules():
         if type(m) in module_classes:
@@ -198,9 +216,12 @@ def maybe_optimize_wan_vae(vae: nn.Module) -> nn.Module:
     """Install the quality-gated CUDA Wan VAE decoder fast path."""
     from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
         AutoencoderKLWan,
+        WanAttentionBlock,
         WanDecoder3d,
+        WanResample,
         WanResidualBlock,
         WanRMS_norm,
+        WanUpsample,
     )
 
     if not isinstance(vae, AutoencoderKLWan):
@@ -210,6 +231,8 @@ def maybe_optimize_wan_vae(vae: nn.Module) -> nn.Module:
         decoder_cls=WanDecoder3d,
         residual_block_cls=WanResidualBlock,
         rms_norm_cls=WanRMS_norm,
+        upsample_cls=WanUpsample,
+        gated_module_classes=(WanResample, WanAttentionBlock),
         label="Wan VAE",
     )
 

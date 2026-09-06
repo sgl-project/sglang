@@ -354,6 +354,45 @@ class WanUpsample(nn.Upsample):
         return super().forward(x.float()).type_as(x)
 
 
+def _interleave_time_pairs(self, x, b, c, t, h, w):
+    """``time_conv`` doubles the channels; split them into two frame halves
+    and interleave along time: ``[B, 2C, T, H, W] -> [B, C, 2T, H, W]``.
+
+    The eager ``reshape / stack / reshape`` materialises the result in NCDHW,
+    which sends the following 2D upsample and conv2d down their NCHW paths
+    and hands every up block an NCDHW tensor (the fused RMSNorm+SiLU then
+    falls back and the residual adds run strided). With the decode-scoped
+    fast-path gate on and a channels_last_3d input, write the same values
+    straight into a channels_last_3d buffer with one copy instead. Values are
+    identical either way; the layout change is gated because the NHWC conv2d
+    it enables need not pick the same cuDNN algorithm as the NCHW one.
+    """
+    gate = getattr(self, "_sgl_gate", None)
+    if (
+        gate is not None
+        and gate.enabled
+        and not torch.compiler.is_compiling()
+        # Dense channels_last_3d (2C >= 2 channels, so this fixes stride(C) == 1
+        # and the channel split below is a view).
+        and x.is_contiguous(memory_format=torch.channels_last_3d)
+    ):
+        out = torch.empty(
+            (b, c, t * 2, h, w),
+            device=x.device,
+            dtype=x.dtype,
+            memory_format=torch.channels_last_3d,
+        )
+        # out viewed as [B, C, T, 2, H, W] receives x viewed as [B, 2, C, T, H, W]
+        # with the pair axis moved next to time.
+        out.view(b, c, t, 2, h, w).copy_(
+            x.view(b, 2, c, t, h, w).permute(0, 2, 3, 1, 4, 5)
+        )
+        return out
+    x = x.reshape(b, 2, c, t, h, w)
+    x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
+    return x.reshape(b, c, t * 2, h, w)
+
+
 def resample_forward(self, x):
     b, c, t, h, w = x.size()
     first_frame = is_first_frame.get()
@@ -370,17 +409,12 @@ def resample_forward(self, x):
             else:
                 x = _run_cached_causal_conv(self.time_conv, x, _feat_cache, idx)
                 _feat_idx += 1
-
-                x = x.reshape(b, 2, c, t, h, w)
-                x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-                x = x.reshape(b, c, t * 2, h, w)
+                x = _interleave_time_pairs(self, x, b, c, t, h, w)
             feat_cache.set(_feat_cache)
             feat_idx.set(_feat_idx)
         elif not first_frame and hasattr(self, "time_conv"):
             x = self.time_conv(x)
-            x = x.reshape(b, 2, c, t, h, w)
-            x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-            x = x.reshape(b, c, t * 2, h, w)
+            x = _interleave_time_pairs(self, x, b, c, t, h, w)
     t = x.shape[2]
     x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
     x = self.resample(x)
@@ -476,6 +510,14 @@ def attention_block_forward(self, x):
     x = x.view(batch_size, num_frames, channels, height, width)
     x = x.permute(0, 2, 1, 3, 4)
 
+    gate = getattr(self, "_sgl_gate", None)
+    if gate is not None and gate.enabled and not torch.compiler.is_compiling():
+        # ``identity`` carries the decoder's channels_last_3d layout; putting
+        # it first lets the sum inherit that layout so the next block's fused
+        # RMSNorm+SiLU applies. The add itself is commutative, but the layout
+        # changes the reduction order of the *eager* norm that follows under
+        # fp32 autocast, so this is quality-gated rather than lossless.
+        return identity + x
     return x + identity
 
 
