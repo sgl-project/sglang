@@ -117,6 +117,8 @@ Generated Shared Prefix flags (for `generated-shared-prefix`):
 - `--gsp-system-prompt-len`
 - `--gsp-question-len`
 - `--gsp-output-len`
+- `--gsp-prewarm-prefixes`: populate every generated prefix group after the optional cache flush and before measured traffic. Priming requests are excluded from benchmark metrics. Use an SGLang backend.
+- `--gsp-prewarm-concurrency`: maximum concurrent priming requests (default: `1`).
 - `--gsp-group-distribution {uniform,zipf}`: per-request prefix-group sampling distribution (default: `uniform`). With `zipf`, each request's group is sampled by rank with `p(rank) = (1/rank**alpha) / sum_k(1/k**alpha)`; rank starts at 1 and group index 0 is the hottest. The on-disk dataset cache uses a distinct key per `(group_distribution, zipf_alpha)`, so uniform-mode caches are never mixed with zipf-mode caches.
 - `--gsp-zipf-alpha FLOAT`: Zipf exponent for `--gsp-group-distribution=zipf`. Must be a finite float strictly greater than 0; larger values concentrate requests on lower-ranked (hotter) groups. Required when the distribution is `zipf`; must be omitted otherwise.
 
@@ -360,6 +362,9 @@ python3 -m sglang.bench_serving \
   --gsp-system-prompt-len 2048 --gsp-question-len 128 --gsp-output-len 256 \
   --num-prompts 1024
 ```
+
+For controlled prefix-cache priming and resumable hit-rate matrices, see the
+[prefix-cache benchmark README](https://github.com/sgl-project/sglang/tree/main/benchmark/prefix_cache).
 
 Zipfian / power-law prefix popularity (opt-in via `--gsp-group-distribution=zipf`):
 
