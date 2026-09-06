@@ -227,6 +227,14 @@ class Wan2_2_TI2V_5B_SamplingParam(Wan2_2_Base_SamplingParams):
     )
 
 
+# Calibrated via tools/teacache_calibrate.py; one set per MoE expert.
+_WAN_2_2_A14B_EXPERT_COEFFICIENTS = {
+    "high": [3343659.82, -780127.00, 26239.45, -276.915, 1.1724],
+    "low": [1713.908, -633.165, 62.123, 0.58611, 0.184166],
+}
+_WAN_2_2_A14B_EXPERT_THRESH = {"high": 0.30, "low": 0.30}
+
+
 @dataclass
 class Wan2_2_T2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
     guidance_scale: float = 4.0  # high_noise
@@ -235,6 +243,16 @@ class Wan2_2_T2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
     fps: int = 16
 
     num_frames: int = 81
+
+    teacache_params: TeaCacheParams = field(
+        default_factory=lambda: TeaCacheParams(
+            use_ret_steps=True,
+            start_skipping=2,
+            end_skipping=-1,
+            expert_coefficients=_WAN_2_2_A14B_EXPERT_COEFFICIENTS,
+            expert_thresh=_WAN_2_2_A14B_EXPERT_THRESH,
+        )
+    )
 
     # Wan2.2 T2V A14B supported resolutions
     supported_resolutions: list[tuple[int, int]] | None = field(
