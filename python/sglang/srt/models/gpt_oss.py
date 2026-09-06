@@ -332,12 +332,6 @@ class GptOssSparseMoeBlock(nn.Module):
             topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
-        # With DP attention and a2a none, postprocess_layer combines the
-        # expert partials with reduce_scatterv (when TP == attn DP == EP).
-        # All-reducing here first would make that sum count every rank's
-        # contribution once more per rank -- e.g. a ~4x-scaled MoE output on
-        # TP4/DP4/EP4. Use the centralized ownership predicate so exactly one
-        # component performs the post-experts reduction.
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
@@ -617,6 +611,7 @@ class GptOssDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
             is_last_layer=(
                 self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
@@ -650,7 +645,14 @@ class GptOssDecoderLayer(nn.Module):
             )
         )
 
-        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
             hidden_states = self.mlp(hidden_states, forward_batch)
 
         if fuse_mlp_allreduce:
