@@ -79,6 +79,24 @@ def _mtp_quant_config(quant_config):
             for layer in exclude_layers
         ):
             return None
+    # ModelSlim (NPU) ships the MTP module of an otherwise-quantized checkpoint
+    # in bf16: every `mtp.*` entry in quant_model_description.json is "FLOAT".
+    # Drop the quant config so the whole draft model -- not just the layers that
+    # individually fall back -- takes the unquantized path, including the bf16
+    # MoE dispatch overrides in Qwen3_5ForCausalLMMTP.forward().
+    if quant_config and quant_config.get_name() == "modelslim":
+        quant_description = getattr(quant_config, "quant_description", {})
+        mtp_schemes = [
+            value
+            for key, value in quant_description.items()
+            if isinstance(key, str) and key.startswith("mtp.")
+        ]
+        if mtp_schemes and all(scheme == "FLOAT" for scheme in mtp_schemes):
+            logger.info_once(
+                "ModelSlim checkpoint stores the MTP module unquantized; "
+                "loading the draft model in bf16."
+            )
+            return None
     return quant_config
 
 
