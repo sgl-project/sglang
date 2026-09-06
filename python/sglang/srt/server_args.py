@@ -3508,9 +3508,21 @@ class ServerArgs:
             "Useful when each admission is disproportionately expensive, e.g. "
             "speculative decoding with a separate draft prefill pass. An "
             "explicit value always wins, capped by max-running-requests "
-            "(1 disables). When unset, DFlash workloads auto-enable the "
-            "formula; other workloads stay disabled. Not supported with "
-            "pipeline parallelism."
+            "(1 disables). When unset, DFlash workloads scale the formula "
+            "from active request demand; other workloads stay disabled. Not "
+            "supported with pipeline parallelism; bypassed when priority "
+            "preemption is enabled."
+        ),
+        NS("schedule"),
+    ] = None
+    min_free_slots_max_delay_passes: A[
+        Optional[int],
+        (
+            "Maximum scheduler passes to wait while accumulating the "
+            "requested free slots. Unset waits at most the observed running-"
+            "request target in scheduler passes; 0 disables waiting. Only "
+            "applies when the min-free-slots delay is explicitly or "
+            "automatically enabled."
         ),
         NS("schedule"),
     ] = None

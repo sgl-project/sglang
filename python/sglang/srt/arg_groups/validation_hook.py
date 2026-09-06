@@ -413,6 +413,15 @@ def validate_experimental_sgl_marlin(server_args: Any):
     validate_experimental_sgl_marlin_server_args(server_args, view)
 
 
+def validate_min_free_slots_max_delay_passes(server_args: Any):
+    cfg = resolving_view(server_args)
+    if (
+        cfg.min_free_slots_max_delay_passes is not None
+        and cfg.min_free_slots_max_delay_passes < 0
+    ):
+        raise ValueError("--min-free-slots-max-delay-passes must be non-negative.")
+
+
 def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.prefill_decode_interval < 0:

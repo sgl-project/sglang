@@ -1167,7 +1167,11 @@ class Scheduler(
         )
         if min_free_slots is not None:
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
-                min_free_slots=min_free_slots
+                min_free_slots=min_free_slots,
+                scale_with_observed_target=(
+                    get_schedule().min_free_slots_delay is None
+                ),
+                max_delay_passes=get_schedule().min_free_slots_max_delay_passes,
             )
         if not get_parallel().pp_max_micro_batch_size:
             get_context().override(
@@ -3697,18 +3701,25 @@ class Scheduler(
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
-        # Skipped during a chunked prefill: that pass must proceed regardless.
-        if (
+        track_min_free_slots_admission = (
             self.min_free_slots_delayer is not None
             and self.chunked_req is None
-            and self.min_free_slots_delayer.should_delay(
+            and not running_batch.is_prefill_only
+            and not self.enable_priority_preemption
+        )
+        # Chunked prefills must proceed, and priority preemption must inspect the
+        # queue before any refill-batching delay can hold an admission.
+        if track_min_free_slots_admission:
+            active_running_bs = sum(not req.finished() for req in running_batch.reqs)
+            if self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
+                active_running_bs=active_running_bs,
                 num_allocatable_reqs=self.get_num_allocatable_reqs(
                     running_bs, running_batch=running_batch
                 ),
-            )
-        ):
-            return None, running_batch
+                waiting_bs=len(self.waiting_queue),
+            ):
+                return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
@@ -3903,6 +3914,12 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None, running_batch
+
+        if track_min_free_slots_admission:
+            self.min_free_slots_delayer.on_prefill_admitted(
+                active_running_bs=sum(not req.finished() for req in running_batch.reqs),
+                admitted_bs=len(can_run_list),
+            )
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]

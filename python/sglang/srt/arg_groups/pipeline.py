@@ -93,10 +93,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_hicache_ratio_default(server_args)
     from sglang.srt.arg_groups.validation_hook import (
         validate_experimental_sgl_marlin,
+        validate_min_free_slots_max_delay_passes,
         validate_prefill_decode_interval,
     )
 
     validate_prefill_decode_interval(server_args)
+    validate_min_free_slots_max_delay_passes(server_args)
 
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.
