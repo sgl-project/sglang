@@ -8,6 +8,9 @@ A lightweight HTTP sidecar is started alongside the gRPC server to expose:
 The sidecar is started on --smg-http-sidecar-port (default: --port + 1)
 once the gRPC request manager is ready, regardless of whether --enable-metrics
 is set.
+
+Profiling endpoints follow the HTTP server's API/admin key policy; metrics
+remain accessible without authentication.
 """
 
 import inspect
@@ -19,9 +22,31 @@ from aiohttp import web
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
+from sglang.srt.utils.auth import AuthLevel, decide_request_auth
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+
+def _create_sidecar_app(*, api_key=None, admin_api_key=None):
+    @web.middleware
+    async def authenticate(request, handler):
+        # The sidecar exposes management operations and public metrics only.
+        decision = decide_request_auth(
+            method=request.method,
+            path=request.path,
+            authorization_header=request.headers.get("Authorization"),
+            api_key=api_key,
+            admin_api_key=admin_api_key,
+            auth_level=AuthLevel.ADMIN_OPTIONAL,
+        )
+        if not decision.allowed:
+            return web.json_response(
+                {"error": "Unauthorized"}, status=decision.error_status_code
+            )
+        return await handler(request)
+
+    return web.Application(middlewares=[authenticate])
 
 
 async def _start_sidecar_server(host: str, port: int, app):
@@ -173,7 +198,9 @@ async def serve_grpc(server_args, model_info=None):
     # declarations for what it needs before the engine exists.
     cfg = resolving_view(server_args)
 
-    sidecar_app = web.Application()
+    sidecar_app = _create_sidecar_app(
+        api_key=cfg.api_key, admin_api_key=cfg.admin_api_key
+    )
     sidecar_runner = None
     sidecar_port = (
         server_args.smg_http_sidecar_port
