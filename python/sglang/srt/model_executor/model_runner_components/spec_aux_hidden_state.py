@@ -8,7 +8,6 @@ import msgspec
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.runtime_context import (
     get_model,
-    get_parallel,
     get_spec,
 )
 
@@ -208,6 +207,7 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
+            server_args=server_args,
         )
 
 
@@ -215,6 +215,7 @@ def _resolve_dflash_draft_cell_size(
     *,
     draft_model_config: ModelConfig,
     draft_num_layers: int,
+    server_args: ServerArgs,
 ) -> int | None:
     """Bytes/token the DFLASH draft KV pool will cost the target's pool budget.
 
@@ -223,6 +224,7 @@ def _resolve_dflash_draft_cell_size(
     leaving callers on layer-count scaling.
     """
     from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+    from sglang.srt.runtime_context import derive_attention_widths
     from sglang.srt.speculative.dflash_utils import dflash_draft_cell_size_per_token
 
     try:
@@ -239,11 +241,21 @@ def _resolve_dflash_draft_cell_size(
                 get_spec().speculative_draft_attention_backend
             ),
         )
+        # The draft KV pool builders shard heads by attn_tp_size, so the
+        # reservation must too. Derived from the configured leaves rather than
+        # read off get_parallel(): this runs before init_torch_distributed, so
+        # the attention TP group does not exist yet.
+        _, attn_tp_size = derive_attention_widths(
+            tp_size=server_args.tp_size,
+            attn_cp_size=server_args.attn_cp_size,
+            dp_size=server_args.dp_size,
+            enable_dp_attention=server_args.enable_dp_attention,
+        )
         return dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=get_parallel().tp_size,
+            tp_size=attn_tp_size,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
