@@ -368,6 +368,37 @@ def handle_a2a_moe(server_args: Any):
                 "(chunked_prefill_size, or the decode cuda-graph batch size)"
             )
 
+    # Validate after runner and A2A resolution (e.g. auto and Waterfill).
+    if (
+        envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+        and not cfg.disable_flashinfer_cutlass_moe_fp4_allgather
+        and cfg.moe_runner_backend
+        in ("flashinfer_trtllm", "flashinfer_trtllm_routed", "flashinfer_cutedsl")
+        and cfg.moe_a2a_backend == "none"
+        and cfg.enable_dp_attention
+        and cfg.tp_size == cfg.ep_size == cfg.dp_size > 1
+        and not (
+            cfg.moe_runner_backend == "flashinfer_cutedsl"
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
+    ):
+        model_config = model_config_of(server_args)
+        architecture = model_config.hf_config.architectures[0]
+        if model_config.quantization in (
+            "modelopt_fp4",
+            "nvfp4_online",
+        ) and architecture in (
+            "KimiK3ForConditionalGeneration",
+            "KimiK3LinearForCausalLM",
+            "InklingForConditionalGeneration",
+            "InklingForConditionalGenerationMTP",
+        ):
+            raise ValueError(
+                f"FP4 all-gather does not support {architecture}'s custom MoE layout. "
+                "Unset SGLANG_MOE_NVFP4_DISPATCH or set "
+                "--disable-flashinfer-cutlass-moe-fp4-allgather."
+            )
+
 
 def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
     """Reject an explicit or inherited DeepEP v2 draft backend."""

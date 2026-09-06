@@ -11,7 +11,6 @@ from sglang.srt.arg_groups.model_override_base import (
     _dspark_verify_on_decode_backend,
     _is_mxfp4_pack_quantized,
     _register_for,
-    _should_disable_fp4_allgather_for_custom_moe,
     attention_backends_of,
     is_attention_backend_not_set,
     resolving_view,
@@ -20,13 +19,6 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import get_device_name, is_mnnvl_fabric_device
 
 logger = logging.getLogger(__name__)
-
-
-@_register_for("KimiK3ForConditionalGeneration", "KimiK3LinearForCausalLM")
-def _kimi_k3_fp4_dispatch_overrides(server_args: Any, hf_config: Any) -> dict:
-    if _should_disable_fp4_allgather_for_custom_moe(server_args, "Kimi-K3"):
-        return {"disable_flashinfer_cutlass_moe_fp4_allgather": True}
-    return {}
 
 
 def _require_kimi_k3_cutedsl_dcp_support() -> None:

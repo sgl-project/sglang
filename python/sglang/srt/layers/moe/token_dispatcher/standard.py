@@ -25,7 +25,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -137,17 +137,8 @@ class StandardDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
 
-        hidden_states_per_token_scale = None
         if should_use_flashinfer_moe_fp4_allgather():
-            (
-                hidden_states,
-                hidden_states_scale,
-                hidden_states_per_token_scale,
-                topk_output,
-            ) = self._dispatch_allgather(hidden_states, topk_output)
-        else:
-            hidden_states = hidden_states
-            hidden_states_scale = None
+            return self._dispatch_allgather(hidden_states, topk_output)
 
         if (
             self.moe_ep_size > 1
@@ -208,9 +199,8 @@ class StandardDispatcher(BaseDispatcher):
 
         return StandardDispatchOutput(
             hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
+            hidden_states_scale=None,
             topk_output=topk_output,
-            hidden_states_per_token_scale=hidden_states_per_token_scale,
         )
 
     def _quantize_fp4(self, hidden_states: torch.Tensor, global_scale: torch.Tensor):
@@ -253,7 +243,9 @@ class StandardDispatcher(BaseDispatcher):
             per_token_scale,
         )
 
-    def _dispatch_allgather(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def _dispatch_allgather(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> StandardDispatchOutput:
         x, x_sf, per_token_scale = hidden_states, None, None
         global_scale = self.quant_config.get("input_global_scale")
         if global_scale is not None:
@@ -283,13 +275,9 @@ class StandardDispatcher(BaseDispatcher):
                 router_logits = topk_output.router_logits.float()
             topk_output = topk_output._replace(router_logits=router_logits)
             routing_fields = ["router_logits"]
-        elif TopKOutputChecker.format_is_packed(topk_output):
-            routing_fields = ["packed_topk_ids"]
         else:
             assert TopKOutputChecker.format_is_standard(topk_output)
             routing_fields = ["topk_weights", "topk_ids"]
-            if hasattr(topk_output, "packed_topk_ids"):
-                routing_fields.append("packed_topk_ids")
         payloads.extend(getattr(topk_output, name) for name in routing_fields)
         gathered = get_tp_group().all_gatherv(
             payloads, sizes=get_dp_global_num_tokens()
@@ -307,14 +295,16 @@ class StandardDispatcher(BaseDispatcher):
                 **routing, hidden_states=x, num_token_non_padded=None
             )
         else:
-            topk_output = topk_output._replace(**routing, router_logits=None)
+            topk_output = StandardTopKOutput(**routing, router_logits=None)
         # Communicate linear block scales; only CUTLASS needs a swizzle.
         if x_sf is not None:
             if self.enable_flashinfer_cutlass_moe:
                 x_sf = nvfp4_block_scale_interleave_flashinfer(x_sf)
             else:
                 x_sf = x_sf.view(torch.float8_e4m3fn)
-        return x, x_sf, per_token_scale, topk_output
+        return StandardDispatchOutput(
+            x, x_sf, topk_output, hidden_states_per_token_scale=per_token_scale
+        )
 
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
