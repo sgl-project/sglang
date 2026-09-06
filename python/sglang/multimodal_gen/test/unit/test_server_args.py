@@ -32,6 +32,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
+    LTX23PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -1548,8 +1549,10 @@ class TestOffloadDefaults(unittest.TestCase):
         sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
-        self.assertEqual(sana_wm_deployment.keep_resident_min_available_gb, 120)
-        self.assertEqual(sana_wm_deployment.keep_resident_components, ("dit", "vae"))
+        self.assertEqual(sana_wm_deployment.keep_resident_min_available_gb, 70)
+        self.assertEqual(
+            sana_wm_deployment.keep_resident_components, ("text_encoder", "vae")
+        )
 
         helios_deployment = HeliosDistilledConfig().get_model_deployment_config()
         self.assertEqual(helios_deployment.keep_resident_min_available_gb, 120)
@@ -1565,6 +1568,108 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.residency_mode("transformer"), RESIDENT)
 
+    def test_pipeline_configs_declare_auto_tune_hints(self):
+        qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
+        cosmos3_deployment = Cosmos3Config(
+            model_path="nvidia/Cosmos3-Nano"
+        ).get_model_deployment_config()
+        cosmos3_super_deployment = Cosmos3Config(
+            model_path="nvidia/Cosmos3-Super"
+        ).get_model_deployment_config()
+        local_cosmos3_nano_deployment = Cosmos3Config(
+            model_path="/models/custom-checkpoint", is_nano=True
+        ).get_model_deployment_config()
+        wan_deployment = WanT2V480PConfig().get_model_deployment_config()
+        mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
+        zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
+        lingbot_deployment = LingBotWorldCausalDMDConfig().get_model_deployment_config()
+        ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
+        ltx23_config = LTX23PipelineConfig()
+        longlive_deployment = LongLive2T2VConfig().get_model_deployment_config()
+        sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
+
+        self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
+        self.assertEqual(qwen_deployment.dit_layerwise_offload_modes, ())
+
+        self.assertEqual(cosmos3_deployment.keep_resident_min_available_gb, 90)
+        self.assertEqual(cosmos3_deployment.keep_resident_components, ("dit", "vae"))
+        self.assertEqual(cosmos3_super_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(
+            local_cosmos3_nano_deployment.keep_resident_min_available_gb, 90
+        )
+
+        self.assertIsNone(wan_deployment.fsdp_auto_min_available_memory_gb)
+        self.assertEqual(wan_deployment.dit_layerwise_offload_modes, ("memory",))
+        self.assertEqual(wan_deployment.keep_resident_min_available_gb, 60)
+        self.assertEqual(wan_deployment.keep_resident_components, ("dit",))
+
+        self.assertIsNone(mova_deployment.fsdp_auto_min_available_memory_gb)
+        self.assertEqual(
+            mova_deployment.dit_layerwise_offload_modes, ("auto", "memory")
+        )
+        self.assertEqual(mova_deployment.keep_resident_min_available_gb, 130)
+        self.assertEqual(mova_deployment.keep_resident_components, ("dit", "vae"))
+
+        self.assertEqual(zimage_deployment.fsdp_auto_min_available_memory_gb, 40)
+        self.assertEqual(zimage_deployment.keep_resident_min_available_gb, 30)
+        self.assertTrue(zimage_deployment.fsdp_auto_requires_cfg)
+        self.assertEqual(zimage_deployment.dit_layerwise_offload_modes, ())
+
+        self.assertEqual(lingbot_deployment.dit_layerwise_offload_modes, ("memory",))
+        self.assertEqual(lingbot_deployment.keep_resident_min_available_gb, 70)
+        self.assertEqual(lingbot_deployment.keep_resident_components, ("dit",))
+
+        self.assertEqual(ltx_deployment.keep_resident_min_available_gb, 70)
+        self.assertEqual(ltx_deployment.keep_resident_components, ("dit",))
+        self.assertEqual(
+            ltx_deployment.auto_cfg_parallel_degree_by_num_gpus, ((4, 1), (8, 1))
+        )
+        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(4), 1)
+        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(8), 1)
+        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(2), 2)
+        self.assertEqual(longlive_deployment.keep_resident_min_available_gb, 60)
+        self.assertEqual(
+            longlive_deployment.keep_resident_components,
+            ("dit", "text_encoder", "vae"),
+        )
+        self.assertFalse(
+            LTX2PipelineConfig().dit_config.arch_config.enable_packed_qkv_input_a2a
+        )
+        self.assertFalse(
+            ltx23_config.dit_config.arch_config.enable_packed_qkv_input_a2a
+        )
+        self.assertFalse(ltx23_config.supports_auto_residency)
+        self.assertFalse(QwenImageLayeredPipelineConfig().supports_auto_residency)
+
+        self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
+        self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
+        self.assertEqual(sana_wm_deployment.keep_resident_min_available_gb, 70)
+        self.assertEqual(
+            sana_wm_deployment.keep_resident_components, ("text_encoder", "vae")
+        )
+
+        fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
+        self.assertEqual(fast_hunyuan_deployment.keep_resident_min_available_gb, 60)
+        self.assertEqual(
+            fast_hunyuan_deployment.keep_resident_components, ("dit", "vae")
+        )
+
+        fast_wan_deployment = FastWan2_2_TI2V_5B_Config().get_model_deployment_config()
+        self.assertEqual(fast_wan_deployment.keep_resident_min_available_gb, 60)
+        self.assertEqual(fast_wan_deployment.keep_resident_components, ("dit",))
+
+        for dual_dit_config in (
+            Wan2_2_T2V_A14B_Config(),
+            Wan2_2_I2V_A14B_Config(),
+        ):
+            dual_dit_deployment = dual_dit_config.get_model_deployment_config()
+            self.assertIsNone(dual_dit_deployment.keep_resident_min_available_gb)
+            self.assertEqual(dual_dit_deployment.keep_resident_components, ("vae",))
+
+        # default keeps only vae resident (encoders are large, dit owned by FSDP)
+        self.assertEqual(qwen_deployment.keep_resident_components, ("vae",))
+        self.assertIsNone(qwen_deployment.keep_resident_min_available_gb)
+
     def test_longlive_residency_scales_with_available_memory(self):
         high_memory_args = self._from_dict_with_pipeline_config(
             LongLive2T2VConfig(),
@@ -1578,6 +1683,25 @@ class TestOffloadDefaults(unittest.TestCase):
         constrained_args = self._from_dict_with_pipeline_config(
             LongLive2T2VConfig(),
             memory_gb=50,
+            kwargs={"performance_mode": "auto"},
+        )
+        constrained_offload = constrained_args.layerwise_offload_components or []
+        self.assertIn("text_encoder", constrained_offload)
+        self.assertIn("vae", constrained_offload)
+
+    def test_sana_wm_residency_scales_with_available_memory(self):
+        high_memory_args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            memory_gb=80,
+            kwargs={"performance_mode": "auto"},
+        )
+        high_memory_offload = high_memory_args.layerwise_offload_components or []
+        self.assertNotIn("text_encoder", high_memory_offload)
+        self.assertNotIn("vae", high_memory_offload)
+
+        constrained_args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            memory_gb=60,
             kwargs={"performance_mode": "auto"},
         )
         constrained_offload = constrained_args.layerwise_offload_components or []

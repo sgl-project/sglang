@@ -165,11 +165,15 @@ class SanaWMPipelineConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("memory",),
+            # The two-stage path is not numerically invariant when its text
+            # encoders or VAE use layerwise offload. Keep them resident when
+            # there is enough headroom, while preserving the low-memory
+            # layerwise path on consumer GPUs.
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("text_encoder", "vae"),
             # Conservative auto-FSDP gate for the 720p world-model path. Users
             # can still force FSDP explicitly on smaller cards.
             fsdp_auto_min_available_memory_gb=60,
-            keep_resident_min_available_gb=120,
-            keep_resident_components=("dit", "vae"),
         )
 
     # --- Latent shape ---

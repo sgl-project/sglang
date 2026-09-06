@@ -289,24 +289,41 @@ class LoRAPipeline(ComposedPipelineBase):
             yield []
             return
 
-        # clear device cache to free up unused memory
-        if torch.get_device_module().is_available():
-            torch.get_device_module().synchronize()
-            torch.get_device_module().empty_cache()
+        offloaded_module_names = [
+            module_name
+            for module_name in module_names
+            if (
+                (module := self.modules.get(module_name)) is not None
+                and is_layerwise_offloaded_module(module)
+            )
+        ]
+        # Record every target, including coarse component offload. The current
+        # coarse path can already materialize the full component here, and the
+        # planner must preserve that phase if it later chooses layerwise mode.
+        residency_transition = (
+            self.component_residency_manager.full_weight_transition(module_names)
+            if self.component_residency_manager is not None
+            else nullcontext()
+        )
 
-        offload_disabled_modules = []
-        for module_name in module_names:
-            module = self.modules.get(module_name)
-            if module is not None and is_layerwise_offloaded_module(module):
+        with residency_transition:
+            # clear device cache to free up unused memory
+            if torch.get_device_module().is_available():
+                torch.get_device_module().synchronize()
+                torch.get_device_module().empty_cache()
+
+            offload_disabled_modules = []
+            for module_name in offloaded_module_names:
+                module = self.modules[module_name]
                 module.disable_offload()
                 offload_disabled_modules.append(module)
 
-        try:
-            yield offload_disabled_modules
-        finally:
-            # Re-enable layerwise offload: sync weights to CPU and restore hooks
-            for module in offload_disabled_modules:
-                module.enable_offload()
+            try:
+                yield offload_disabled_modules
+            finally:
+                # Re-enable layerwise offload: sync weights to CPU and restore hooks
+                for module in offload_disabled_modules:
+                    module.enable_offload()
 
     def _needs_lora_weight_update_context(
         self,
