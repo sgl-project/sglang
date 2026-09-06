@@ -14,8 +14,11 @@ the cap is read directly from whichever cgroup version is mounted.
 """
 
 import os
+from collections.abc import Iterable
 
 import psutil
+import torch
+from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -168,8 +171,18 @@ def host_copies_would_not_fit(weight_bytes: int) -> bool:
     return weight_bytes >= host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
 
 
+def host_pin_reserve_bytes(available_bytes: int) -> int:
+    return max(
+        int(available_bytes * HOST_RESERVE_FRACTION),
+        MIN_HOST_RESERVE_BYTES,
+    )
+
+
 class HostPinBudget:
     """Hands out pinned-host-memory allowances until the headroom runs out.
+
+    This enforces a capacity selected elsewhere; it does not choose component
+    placement independently from the VRAM planner.
 
     Pinning is not all-or-nothing per process: a component whose weights stream
     once per request gains far less from pinning than one re-streamed on every
@@ -184,18 +197,58 @@ class HostPinBudget:
     it only fires when the bytes genuinely do not fit.
     """
 
-    def __init__(self, available_bytes: int | None = None) -> None:
+    def __init__(
+        self,
+        available_bytes: int | None = None,
+        *,
+        reserve_bytes: int | None = None,
+    ) -> None:
         if available_bytes is None:
             available_bytes = host_memory_available_bytes()
         self.available_bytes = available_bytes
-        self.reserve_bytes = max(
-            int(available_bytes * HOST_RESERVE_FRACTION), MIN_HOST_RESERVE_BYTES
+        self.reserve_bytes = (
+            host_pin_reserve_bytes(available_bytes)
+            if reserve_bytes is None
+            else reserve_bytes
         )
+        # This worker's non-overlapping share of the node-wide planner budget.
+        # Auto placement may later assign a different execution quota, but the
+        # next joint solve must still see the original node capacity.
+        self.planning_capacity_bytes = max(0, self.available_bytes - self.reserve_bytes)
         self.committed_bytes = 0
+
+    @classmethod
+    def for_local_worker(cls, local_worker_count: int) -> "HostPinBudget":
+        """Give one worker a non-overlapping share of the node allowance."""
+        worker_count = max(1, local_worker_count)
+        node_available = host_memory_available_bytes()
+        node_spendable = max(0, node_available - host_pin_reserve_bytes(node_available))
+        return cls(
+            available_bytes=node_spendable // worker_count,
+            reserve_bytes=0,
+        )
 
     @property
     def spendable_bytes(self) -> int:
         return max(0, self.available_bytes - self.reserve_bytes - self.committed_bytes)
+
+    def set_spendable_capacity(self, capacity_bytes: int) -> tuple[int, int]:
+        """Replace this worker's quota and return its previous budget state.
+
+        The startup default is an equal, non-overlapping node share. Once all
+        ranks have reported their real layer-store sizes, the joint placement
+        planner can safely replace that provisional share with an asymmetric
+        quota whose node-wide sum stays within the same allowance.
+        """
+        if capacity_bytes < 0:
+            raise ValueError("host pin capacity must be non-negative")
+        previous = (self.available_bytes, self.reserve_bytes)
+        self.available_bytes = capacity_bytes
+        self.reserve_bytes = 0
+        return previous
+
+    def restore_capacity(self, state: tuple[int, int]) -> None:
+        self.available_bytes, self.reserve_bytes = state
 
     def request(self, *, component_name: str, weight_bytes: int) -> bool:
         """Whether `component_name` may pin `weight_bytes`, and book it if so.
@@ -223,6 +276,16 @@ class HostPinBudget:
         )
         return False
 
+    def release(self, weight_bytes: int) -> None:
+        """Return a previously committed allowance after buffers are unpinned."""
+        if weight_bytes <= 0:
+            return
+        if weight_bytes > self.committed_bytes:
+            raise ValueError(
+                "cannot release more pinned-host memory than was committed"
+            )
+        self.committed_bytes -= weight_bytes
+
 
 def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:
     """Host-to-device bytes a pin would cover for one request.
@@ -234,22 +297,30 @@ def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:
     return max(0, weight_bytes) * max(1, uses_per_request)
 
 
-def module_weight_bytes(module) -> int:
-    """Bytes of parameters and buffers a module would hand to the host."""
-    seen: set[int] = set()
+def tensor_storage_bytes(tensors: Iterable[torch.Tensor]) -> int:
+    """Physical bytes backing tensors, deduplicated across aliases and views."""
+    seen: set[tuple[torch.device, int]] = set()
     total = 0
-    for tensor in list(module.parameters()) + list(module.buffers()):
+    for tensor in tensors:
+        if isinstance(tensor, DTensor):
+            tensor = tensor.to_local()
         try:
             storage = tensor.untyped_storage()
             pointer = storage.data_ptr()
             storage_bytes = storage.nbytes()
-        except RuntimeError:
+        except (AttributeError, RuntimeError):
             continue
-        if pointer == 0 or pointer in seen:
+        storage_key = (tensor.device, pointer)
+        if pointer == 0 or storage_key in seen:
             continue
-        seen.add(pointer)
+        seen.add(storage_key)
         total += storage_bytes
     return total
+
+
+def module_weight_bytes(module) -> int:
+    """Physical bytes of parameters and buffers a module would hand to the host."""
+    return tensor_storage_bytes((*module.parameters(), *module.buffers()))
 
 
 def describe_host_memory() -> str:

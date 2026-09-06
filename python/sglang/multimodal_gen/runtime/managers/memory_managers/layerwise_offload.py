@@ -1,4 +1,5 @@
 import bisect
+import gc
 import queue
 import re
 import threading
@@ -2213,6 +2214,69 @@ def configure_layerwise_offload_modules(
     elif warn_missing:
         logger.debug("No selected pipeline component enabled layerwise offload")
     return configured_component_names
+
+
+def _align_numel_offset(
+    offset: int, dtype: torch.dtype, alignment_bytes: int = 32
+) -> int:
+    element_size = torch.empty((), dtype=dtype).element_size()
+    alignment_numel = max(1, alignment_bytes // element_size)
+    remainder = offset % alignment_numel
+    return offset if remainder == 0 else offset + alignment_numel - remainder
+
+
+def estimate_layer_weight_bytes(
+    layers: torch.nn.ModuleList | torch.nn.Sequential,
+) -> dict[int, int]:
+    """Physical per-layer store sizes using the real manager's packing rules."""
+    grouped: dict[int, dict[torch.dtype, list[torch.Tensor]]] = {}
+    for name, tensor in layers.named_parameters():
+        layer_index_text, separator, _ = name.partition(".")
+        if not separator or not layer_index_text.isdigit():
+            continue
+        layer_index = int(layer_index_text)
+        local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+        grouped.setdefault(layer_index, {}).setdefault(local_tensor.dtype, []).append(
+            local_tensor
+        )
+
+    totals = {layer_index: 0 for layer_index in range(len(layers))}
+    for layer_index, dtype_to_tensors in grouped.items():
+        for dtype, tensors in dtype_to_tensors.items():
+            contiguous_numel = 0
+            for tensor in tensors:
+                if tensor.is_contiguous():
+                    contiguous_numel = _align_numel_offset(contiguous_numel, dtype)
+                    contiguous_numel += tensor.numel()
+                    continue
+                storage_numel = (
+                    0
+                    if tensor.numel() == 0
+                    else 1
+                    + sum(
+                        (size - 1) * abs(stride)
+                        for size, stride in zip(tensor.shape, tensor.stride())
+                    )
+                )
+                totals[layer_index] += storage_numel * tensor.element_size()
+            totals[layer_index] += (
+                contiguous_numel * torch.empty((), dtype=dtype).element_size()
+            )
+    return totals
+
+
+def release_unused_pinned_memory() -> None:
+    """Return unreferenced cached HostPin blocks to the CUDA driver.
+
+    ``torch.cuda.empty_cache()`` only covers device allocations. PyTorch's
+    host caching allocator currently exposes its corresponding operation via
+    this internal binding; keeping the call isolated makes the compatibility
+    boundary explicit until a public API is available.
+    """
+    if not current_platform.is_cuda():
+        return
+    gc.collect()
+    torch._C._host_emptyCache()
 
 
 class LayerwiseUsageTracker:
