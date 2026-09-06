@@ -1,6 +1,6 @@
 import inspect
 import re
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Type, Union
 
 from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
@@ -75,6 +75,7 @@ class BaseReasoningFormatDetector:
         thinks_internally: bool = False,
         reasoning_default: str = "always",
         force_nonempty_content: bool = False,
+        skipped_think_as_content: bool = False,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
@@ -92,6 +93,15 @@ class BaseReasoningFormatDetector:
 
         self._force_nonempty_content = force_nonempty_content
         self._accumulated_reasoning = ""
+
+        # Reasoning the template opened but the model never closed is the
+        # answer when generation stopped on its own (EOS), and truncated
+        # thinking when it was cut (max_tokens or a stop string). Only the
+        # caller knows which, via set_finish_reason(). Only meaningful for
+        # detectors on the base detect_and_parse()/finish() paths.
+        self.skipped_think_as_content = skipped_think_as_content
+        self._finish_reason: Optional[str] = None
+        self._finish_matched: Any = None
 
         self.continue_final_message = continue_final_message
         if self.continue_final_message:
@@ -112,6 +122,30 @@ class BaseReasoningFormatDetector:
         if self._force_nonempty_content and not ret.normal_text:
             ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
         return ret
+
+    def set_finish_reason(
+        self, finish_reason: Union[str, Mapping[str, Any], None]
+    ) -> None:
+        """Record how generation ended before the final parse: the engine's
+        finish_reason dict ({"type": "stop", "matched": <token id | stop str>})
+        or just its type. None keeps the finish-reason-agnostic behaviour."""
+        if isinstance(finish_reason, Mapping):
+            self._finish_reason = finish_reason.get("type")
+            self._finish_matched = finish_reason.get("matched")
+        else:
+            self._finish_reason = finish_reason
+            self._finish_matched = None
+
+    def _skipped_thinking(self) -> bool:
+        return (
+            self.skipped_think_as_content
+            and self._finish_reason == "stop"
+            # A user stop string also reports "stop" but cut the model off; only
+            # its own EOS token (matched is an id, not a str) says it chose to answer.
+            and not isinstance(self._finish_matched, str)
+            # A block the client's assistant prefix opened is not the template's.
+            and self.think_start_token not in self.previous_content
+        )
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
@@ -152,6 +186,8 @@ class BaseReasoningFormatDetector:
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
+            if self._skipped_thinking():
+                return StreamingParseResult(normal_text=processed_text)
             # Assume reasoning was truncated before end token
             return StreamingParseResult(reasoning_text=processed_text)
 
@@ -179,7 +215,7 @@ class BaseReasoningFormatDetector:
             Streams reasoning content as it arrives
         """
         ret = self._parse_streaming_increment_impl(new_text)
-        if self._force_nonempty_content:
+        if self._force_nonempty_content or self.skipped_think_as_content:
             if self._in_reasoning:
                 self._accumulated_reasoning += ret.reasoning_text
             else:
@@ -303,6 +339,17 @@ class BaseReasoningFormatDetector:
             if normal_text:
                 return StreamingParseResult(normal_text=normal_text)
             return StreamingParseResult()
+
+        if self._skipped_thinking():
+            # The trace already streamed as reasoning; re-emit it whole as the
+            # answer. Only a held-back tail still needs to complete that
+            # stream -- a block that never streamed is emitted once, as content.
+            normal_text = self._accumulated_reasoning + buffer
+            self._accumulated_reasoning = ""
+            return StreamingParseResult(
+                normal_text=normal_text,
+                reasoning_text=buffer if self.stream_reasoning else "",
+            )
 
         if buffer:
             return StreamingParseResult(reasoning_text=buffer)
@@ -767,6 +814,7 @@ class Glm45Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         reasoning_default: str = "enable_thinking",
+        skipped_think_as_content: bool = True,
     ):
         think_excluded_tokens = [
             "<tool_call>",
@@ -787,6 +835,7 @@ class Glm45Detector(BaseReasoningFormatDetector):
             force_nonempty_content=force_nonempty_content,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            skipped_think_as_content=skipped_think_as_content,
         )
 
 
@@ -801,8 +850,8 @@ class Ling3Detector(Glm45Detector):
 
     If non-streaming output only contains reasoning text and no tool call, Ling3
     moves that text into normal content as a client-experience fallback. Streaming
-    parsing still emits reasoning increments as they arrive because this parser
-    does not receive a final end-of-generation signal.
+    parsing still emits reasoning increments as they arrive; the base finish()
+    re-emits them as content once the stream ends.
     """
 
     def __init__(
@@ -2129,8 +2178,19 @@ class ReasoningParser:
 
         self.detector = detector_class(**kwargs)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:
+        # Set as an attribute rather than a ctor kwarg so every detector can be
+        # toggled per request, whichever arguments its __init__ happens to take.
+        skipped_think_as_content = chat_template_kwargs.get("skipped_think_as_content")
+        if isinstance(skipped_think_as_content, bool):
+            self.detector.skipped_think_as_content = skipped_think_as_content
+
+    def parse_non_stream(
+        self,
+        full_text: str,
+        finish_reason: Union[str, Mapping[str, Any], None] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Non-streaming call: one-time parsing"""
+        self.detector.set_finish_reason(finish_reason)
         ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
 
@@ -2154,8 +2214,11 @@ class ReasoningParser:
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
 
-    def parse_stream_end(self) -> Tuple[Optional[str], Optional[str]]:
+    def parse_stream_end(
+        self, finish_reason: Union[str, Mapping[str, Any], None] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: flush any detector-specific buffered state once
         the stream ends."""
+        self.detector.set_finish_reason(finish_reason)
         ret = self.detector.finish()
         return ret.reasoning_text, ret.normal_text

@@ -4075,6 +4075,82 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(msg.content, "")
         self.assertEqual(msg.reasoning_content, "42")
 
+    # --- glm45: template-opened <think> that never closes ---
+
+    SKIPPED_THINK_ANSWER = '```json\n{"kind": "tool", "operation": "alerts"}\n```'
+
+    def _setup_glm45(self):
+        self.tm.server_args.reasoning_parser = "glm45"
+        self.chat.reasoning_parser = "glm45"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+
+    def test_build_chat_response_glm45_stop_without_think_end_is_content(self):
+        """GLM's template opens <think> for the model. Output that ends on EOS
+        without ever closing it is the model skipping thinking and answering
+        directly, so it is content; a max_tokens cut stays reasoning."""
+        self._setup_glm45()
+        answer = self.SKIPPED_THINK_ANSWER
+        req = ChatCompletionRequest(
+            model="zai-org/GLM-5.2",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+        for finish, expected in (
+            ({"type": "stop", "matched": 154827}, (answer, None)),
+            ({"type": "length", "length": 20}, ("", answer)),
+            ({"type": "stop", "matched": "\n\n"}, ("", answer)),
+        ):
+            with self.subTest(finish_reason=finish):
+                ret_item = {
+                    "text": answer,
+                    "meta_info": {
+                        "id": f"chatcmpl-{uuid.uuid4()}",
+                        "prompt_tokens": 10,
+                        "completion_tokens": 20,
+                        "weight_version": "default",
+                        "finish_reason": finish,
+                    },
+                    "index": 0,
+                }
+                response = self.chat._build_chat_response(req, [ret_item], created=0)
+                msg = response.choices[0].message
+                self.assertEqual((msg.content, msg.reasoning_content), expected)
+
+    def test_process_reasoning_stream_glm45_reemits_skipped_think_on_stop(self):
+        """Streaming cannot know the block will never close, so it streams the
+        text as reasoning; the finishing step re-emits it as content on stop
+        and leaves it as reasoning on a max_tokens cut."""
+        self._setup_glm45()
+        answer = self.SKIPPED_THINK_ANSWER
+        head, tail = answer[:10], answer[10:]
+        req = ChatCompletionRequest(
+            model="zai-org/GLM-5.2",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+        )
+        for finish, expected_delta in (
+            ({"type": "stop", "matched": 154827}, answer),
+            ({"type": "length", "length": 20}, ""),
+            ({"type": "stop", "matched": "\n\n"}, ""),
+        ):
+            with self.subTest(finish_reason=finish):
+                parsers = {}
+                reasoning, delta = self.chat._process_reasoning_stream(
+                    0, head, parsers, {"meta_info": {}}, req, None
+                )
+                self.assertEqual((reasoning, delta), (head, ""))
+                reasoning, delta = self.chat._process_reasoning_stream(
+                    0,
+                    tail,
+                    parsers,
+                    {"meta_info": {"finish_reason": finish}},
+                    req,
+                    finish["type"],
+                )
+                self.assertEqual(reasoning, tail)
+                self.assertEqual(delta, expected_delta)
+
     # --- poolside_v1 (Laguna-XS.2) regression tests ---
 
     def test_poolside_v1_enable_thinking_dispatch(self):
