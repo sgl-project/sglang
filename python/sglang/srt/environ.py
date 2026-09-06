@@ -1178,6 +1178,10 @@ class Envs:
     # ===================================================================
     # Kernel selection and fused backends
     # ===================================================================
+    # Opt-in Kimi-K3 gfx950 MLA decode path: fuse identity-RoPE Q
+    # materialization, Q concat and latent KV-cache write into AITER's
+    # per-head kernel. Fail closed to the existing split/cat/cache chain.
+    SGLANG_K3_AITER_MLA_Q_CACHE_FUSION = EnvBool(False)
     # MiniCPM sparse attention developer switches
     SGLANG_MINICPM_FUSE_TOPK = EnvBool(False)
     SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
