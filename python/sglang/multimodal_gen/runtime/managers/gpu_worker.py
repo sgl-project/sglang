@@ -1076,9 +1076,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         The probe runs a shape serving may never see. Its cached allocator
         blocks would become the floor of every runtime peak measurement, and
-        the IPC all-to-all staging buffers it created stay allocated at its
-        message size. The request after the probe (the bounded re-warm)
-        regrows both at a serving-sized shape.
+        the all-to-all staging buffers it created (IPC and Ulysses) stay
+        allocated at its message size. The request after the probe (the
+        bounded re-warm) regrows all of them at a serving-sized shape.
         """
         if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
             self._release_warmup_pool_before_serving = True
@@ -1091,8 +1091,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
             IPC_A2A,
         )
+        from sglang.multimodal_gen.runtime.layers.usp import drop_a2a_staging_buffers
 
         IPC_A2A.drop_staging()
+        drop_a2a_staging_buffers()
         torch.get_device_module().empty_cache()
 
     def _record_output_peak_memory(
