@@ -96,8 +96,11 @@ def test_performance_summary_separates_load_and_runtime_peaks():
         _perf_record(
             {
                 "after_forward": {"peak_reserved_mb": 1024.0},
-                "load_peak": {"peak_reserved_mb": 4096.0},
-                "runtime_peak": {"peak_reserved_mb": 3072.0},
+                "load_peak": {"peak_reserved_mb": 4096.0, "peak_allocated_mb": 3900.0},
+                "runtime_peak": {
+                    "peak_reserved_mb": 3072.0,
+                    "peak_allocated_mb": 2900.0,
+                },
             }
         ),
         step_fractions=(),
@@ -105,6 +108,8 @@ def test_performance_summary_separates_load_and_runtime_peaks():
 
     assert summary.load_peak_vram_mb == 4096.0
     assert summary.runtime_peak_vram_mb == 3072.0
+    assert summary.load_peak_allocated_mb == 3900.0
+    assert summary.runtime_peak_allocated_mb == 2900.0
 
 
 def test_worker_records_replica_load_and_runtime_peaks():
@@ -114,11 +119,13 @@ def test_worker_records_replica_load_and_runtime_peaks():
     worker._load_peak_reserved_mb = 4096.0
     worker._runtime_peak_reserved_mb = 0.0
     worker._warmup_peak_reserved_mb = 0.0
+    worker._load_peak_allocated_mb = 3000.0
+    worker._runtime_peak_allocated_mb = 0.0
     output = OutputBatch()
     metrics = RequestMetrics("request")
     replica_group = Mock()
     replica_group.all_reduce.return_value = torch.tensor(
-        [5120.0, 3584.0, 6144.0], dtype=torch.float64
+        [5120.0, 3584.0, 6144.0, 3500.0, 2560.0], dtype=torch.float64
     )
     snapshots = [
         MemorySnapshot(0.0, 0.0, 2048.0, 3072.0),
@@ -142,8 +149,11 @@ def test_worker_records_replica_load_and_runtime_peaks():
     assert output.peak_memory_mb == 3072.0
     assert worker._load_peak_reserved_mb == 4096.0
     assert worker._runtime_peak_reserved_mb == 3072.0
+    assert worker._runtime_peak_allocated_mb == 2048.0
     assert metrics.memory_snapshots["load_peak"].peak_reserved_mb == 5120.0
     assert metrics.memory_snapshots["runtime_peak"].peak_reserved_mb == 3584.0
+    assert metrics.memory_snapshots["load_peak"].peak_allocated_mb == 3500.0
+    assert metrics.memory_snapshots["runtime_peak"].peak_allocated_mb == 2560.0
     assert metrics.memory_snapshots["warmup_peak"].peak_reserved_mb == 6144.0
 
 
@@ -452,6 +462,7 @@ def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
                         "expected_median_denoise_ms": 1.0,
                         "load_peak_vram_mb": 1234.5,
                         "runtime_peak_vram_mb": 2345.6,
+                        "runtime_peak_allocated_mb": 2000.5,
                     }
                 },
             }
@@ -464,6 +475,8 @@ def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
     scenario = config.scenarios["case"]
     assert scenario.load_peak_vram_mb == 1234.5
     assert scenario.runtime_peak_vram_mb == 2345.6
+    assert scenario.load_peak_allocated_mb is None
+    assert scenario.runtime_peak_allocated_mb == 2000.5
     assert config.tolerances.load_peak_vram == 0.01
     assert config.tolerances.runtime_peak_vram == 0.02
 
@@ -510,6 +523,78 @@ def test_peak_vram_validation_uses_independent_tolerances():
             validator.validate_peak_vram(load_regression, 10_000.0, 10_000.0)
         with pytest.raises(AssertionError, match="Runtime Peak VRAM"):
             validator.validate_peak_vram(runtime_regression, 10_000.0, 10_000.0)
+
+
+def test_peak_vram_validation_enforces_allocated_when_baselined():
+    validator = PerformanceValidator(
+        scenario=ScenarioConfig({}, {}, 0.0, 0.0, 0.0),
+        tolerances=ToleranceConfig(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            load_peak_vram=0.01,
+            runtime_peak_vram=0.02,
+        ),
+        step_fractions=(),
+    )
+    # reserved drifts with allocator pool history: +5% is not a regression
+    # once the allocated peak is baselined and unchanged
+    reserved_drift = PerformanceSummary(
+        0.0,
+        0.0,
+        0.0,
+        {},
+        [],
+        {},
+        {},
+        load_peak_vram_mb=10_000.0,
+        runtime_peak_vram_mb=10_500.0,
+        load_peak_allocated_mb=8_000.0,
+        runtime_peak_allocated_mb=8_000.0,
+    )
+    allocated_regression = PerformanceSummary(
+        0.0,
+        0.0,
+        0.0,
+        {},
+        [],
+        {},
+        {},
+        load_peak_vram_mb=10_000.0,
+        runtime_peak_vram_mb=10_000.0,
+        load_peak_allocated_mb=8_000.0,
+        runtime_peak_allocated_mb=8_300.0,
+    )
+
+    with patch.object(current_platform, "is_hip", return_value=False):
+        validator.validate_peak_vram(
+            reserved_drift,
+            10_000.0,
+            10_000.0,
+            expected_runtime_peak_allocated_mb=8_000.0,
+        )
+        with pytest.raises(AssertionError, match=r"Runtime Peak VRAM \(allocated\)"):
+            validator.validate_peak_vram(
+                allocated_regression,
+                10_000.0,
+                10_000.0,
+                expected_runtime_peak_allocated_mb=8_000.0,
+            )
+        # without an allocated baseline the reserved figure is still enforced
+        with pytest.raises(AssertionError, match="Runtime Peak VRAM"):
+            validator.validate_peak_vram(reserved_drift, 10_000.0, 10_000.0)
+
+        reserved_drift.warmup_peak_vram_mb = 12_000.0
+        with pytest.raises(AssertionError, match="Warmup Peak VRAM"):
+            validator.validate_peak_vram(
+                reserved_drift,
+                10_000.0,
+                10_000.0,
+                expected_warmup_peak_vram_mb=10_000.0,
+                expected_runtime_peak_allocated_mb=8_000.0,
+            )
 
 
 @pytest.mark.parametrize(
@@ -636,9 +721,9 @@ def test_warmup_peak_stays_out_of_the_runtime_peak():
 
     worker = gpu_worker_module.GPUWorker.__new__(gpu_worker_module.GPUWorker)
     worker._runtime_peak_reserved_mb = 0.0
+    worker._runtime_peak_allocated_mb = 0.0
     worker._warmup_peak_reserved_mb = 0.0
     worker.is_output_rank = False
-    peaks = iter([40000.0, 20000.0])
     with (
         mock.patch.object(
             gpu_worker_module.current_platform, "is_cpu", return_value=False
@@ -646,13 +731,17 @@ def test_warmup_peak_stays_out_of_the_runtime_peak():
         mock.patch.object(
             gpu_worker_module,
             "capture_memory_snapshot",
-            side_effect=lambda: SimpleNamespace(peak_reserved_mb=next(peaks)),
+            side_effect=[
+                MemorySnapshot(0.0, 0.0, 35000.0, 40000.0),
+                MemorySnapshot(0.0, 0.0, 15000.0, 20000.0),
+            ],
         ),
     ):
         worker._record_output_peak_memory(SimpleNamespace(), is_warmup=True)
         worker._record_output_peak_memory(SimpleNamespace(), is_warmup=False)
     assert worker._warmup_peak_reserved_mb == 40000.0
     assert worker._runtime_peak_reserved_mb == 20000.0
+    assert worker._runtime_peak_allocated_mb == 15000.0
 
 
 def _warmup_req(*, probe: bool = False) -> SimpleNamespace:

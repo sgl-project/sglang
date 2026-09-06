@@ -223,11 +223,16 @@ def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
 def detach_host_resident_tables(
     model: torch.nn.Module,
 ) -> List[Tuple[torch.nn.Module, torch.Tensor]]:
-    """Swap large vocab tables for placeholders so a `.to(device)` skips them."""
+    """Park large vocab tables on the host so a `.to(device)` skips them."""
     detached = []
     for module in _host_resident_tables(model):
         weight = module.weight
-        detached.append((module, weight.data))
+        # Most loaders leave the table on the host, but model-owned loading
+        # paths may already have placed it on the accelerator.  The input hook
+        # below always sends indices to the host, so retaining accelerator data
+        # here would restore a CUDA weight and create a CPU-index/CUDA-weight
+        # mismatch in the embedding gather.
+        detached.append((module, weight.data.to("cpu")))
         weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
     return detached
 
@@ -2621,6 +2626,9 @@ class LayerwiseOffloadableModuleMixin:
         holds = sum(p.numel() * p.element_size() for _, p in resident)
         if holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
             # There is room. Give back any host copies rather than hold them.
+            # Restore any parameters still bound to placeholders first so we
+            # do not leave weights as (1,) tensors after clearing the copies.
+            self.restore_non_layer_weights()
             self._parked_non_layer_weights.clear()
             return
 
