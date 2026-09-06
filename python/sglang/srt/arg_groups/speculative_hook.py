@@ -985,7 +985,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    if cfg.device not in ("cuda", "cpu"):
+    if cfg.device not in ("cuda", "cpu", "npu"):
         raise ValueError(
             "Ngram speculative decoding only supports CUDA or CPU devices."
         )
