@@ -211,7 +211,12 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={**os.environ, **cls.extra_env, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
+            env={
+                **os.environ,
+                **cls.extra_env,
+                "SGLANG_ENABLE_JIT_DEEPGEMM": "False",
+                "SGLANG_MOE_NVFP4_DISPATCH": "1",
+            },
             other_args=[
                 "--moe-runner-backend",
                 cls.backend,
@@ -219,6 +224,11 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
                 "4",
                 "--ep-size",
                 "4",
+                "--dp-size",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "none",
                 "--mem-fraction-static",
                 "0.7",
             ],
@@ -253,6 +263,21 @@ class TestFlashinferTrtllmGenMoeBackendNVFP4(
     FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm"
+    extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0"}
+
+
+class TestFlashinferTrtllmRoutedMoeBackendNVFP4(
+    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
+):
+    backend = "flashinfer_trtllm_routed"
+    extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0"}
+
+
+class TestFlashinferCuteDSLMoeBackendNVFP4(
+    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
+):
+    backend = "flashinfer_cutedsl"
+    extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0"}
 
 
 class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(

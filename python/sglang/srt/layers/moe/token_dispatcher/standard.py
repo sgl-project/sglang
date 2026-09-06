@@ -25,13 +25,13 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_flashinfer_moe_fp4_allgather,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
@@ -54,7 +54,7 @@ try:
         nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
     )
 
-    from sglang.srt.layers.quantization.modelopt_quant import (
+    from sglang.srt.layers.quantization.fp4_utils import (
         fp4_quantize as fp4_quantize_flashinfer,
     )
 except ImportError:
@@ -73,6 +73,8 @@ class StandardDispatchOutput(NamedTuple):
     # multiple of 4). Consumed by the standard->triton fused runner so it can
     # skip its own activation quant; ``hidden_states`` itself stays bf16.
     hidden_states_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # FP32 row scales accompanying per-token NVFP4 activation dispatch.
+    hidden_states_per_token_scale: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -135,50 +137,14 @@ class StandardDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
 
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
-            # all-gather fp4 hidden states
-            if (
-                fp4_quantize_flashinfer is None
-                or nvfp4_block_scale_interleave_flashinfer is None
-            ):
-                raise RuntimeError(
-                    "FlashInfer fp4_quantize and nvfp4_block_scale_interleave "
-                    "are required for the flashinfer_cutlass FP4 all-gather "
-                    "path."
-                )
-            global_scale = self.quant_config.get("input_global_scale", None)
-            assert global_scale is not None, "input_global_scale is not set"
-            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-
-            # Quantize before comm, swizzle after.
-            with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                if hidden_states.shape[0] > 0:
-                    x, x_sf = fp4_quantize_flashinfer(
-                        hidden_states, global_scale, is_sf_swizzled_layout=False
-                    )
-                else:
-                    x_col = hidden_states.shape[1]
-                    x = torch.zeros(
-                        0, x_col // 2, dtype=torch.uint8, device=hidden_states.device
-                    )
-                    x_sf = torch.zeros(
-                        0, x_col // 16, dtype=torch.uint8, device=hidden_states.device
-                    )
-            topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
-                [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
-            )
-            # TODO: fuse into cutlass moe
-            x_sf = nvfp4_block_scale_interleave_flashinfer(x_sf)
-
-            hidden_states = x
-            hidden_states_scale = x_sf
-            topk_output = StandardTopKOutput(
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                router_logits=topk_output.router_logits,  # never tested
-            )
+        hidden_states_per_token_scale = None
+        if should_use_flashinfer_moe_fp4_allgather():
+            (
+                hidden_states,
+                hidden_states_scale,
+                hidden_states_per_token_scale,
+                topk_output,
+            ) = self._dispatch_allgather(hidden_states, topk_output)
         else:
             hidden_states = hidden_states
             hidden_states_scale = None
@@ -244,11 +210,115 @@ class StandardDispatcher(BaseDispatcher):
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
             topk_output=topk_output,
+            hidden_states_per_token_scale=hidden_states_per_token_scale,
         )
+
+    def _quantize_fp4(self, hidden_states: torch.Tensor, global_scale: torch.Tensor):
+        per_token_activation = self.quant_config.get("use_per_token_activation", False)
+        per_token_scale = None
+        num_tokens, hidden_size = hidden_states.shape
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            if num_tokens == 0:
+                x = hidden_states.new_empty((0, hidden_size // 2), dtype=torch.uint8)
+                x_sf = hidden_states.new_empty(
+                    (0, hidden_size // 16), dtype=torch.uint8
+                )
+                if per_token_activation:
+                    per_token_scale = hidden_states.new_empty((0,), dtype=torch.float32)
+            elif per_token_activation:
+                from flashinfer import SfLayout, nvfp4_quantize
+
+                x, x_sf, per_token_scale = nvfp4_quantize(
+                    hidden_states,
+                    global_scale,
+                    sfLayout=SfLayout.layout_linear,
+                    per_token_activation=True,
+                    backend="cute-dsl",
+                )
+            else:
+                if fp4_quantize_flashinfer is None:
+                    raise RuntimeError(
+                        "FlashInfer fp4_quantize is required for FP4 all-gather"
+                    )
+                x, x_sf = fp4_quantize_flashinfer(
+                    hidden_states, global_scale, is_sf_swizzled_layout=False
+                )
+
+        return (
+            x.reshape(num_tokens, hidden_size // 2),
+            x_sf.view(torch.uint8).reshape(num_tokens, hidden_size // 16),
+            per_token_scale,
+        )
+
+    def _dispatch_allgather(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        x, x_sf, per_token_scale = hidden_states, None, None
+        global_scale = self.quant_config.get("input_global_scale")
+        if global_scale is not None:
+            x, x_sf, per_token_scale = self._quantize_fp4(hidden_states, global_scale)
+        # Layers excluded from NVFP4 (e.g. SGLANG_FP4_IGNORED_LAYERS) retain
+        # their input precision, with the same token gather/combine geometry.
+        payloads = [x]
+        if x_sf is not None:
+            payloads.append(x_sf)
+        if per_token_scale is not None:
+            payloads.append(per_token_scale)
+        routing_offset = len(payloads)
+        if TopKOutputChecker.format_is_bypassed(topk_output):
+            # An empty DP rank has no router invocation to supply the logits
+            # width or dtype. Use logical routed experts and FP32 on every
+            # rank; converting BF16/FP16 logits to FP32 preserves their values.
+            if hidden_states.shape[0] == 0:
+                num_routed_experts = (
+                    self.num_experts
+                    - self.num_local_shared_experts
+                    - get_exec().moe.ep_num_redundant_experts
+                )
+                router_logits = hidden_states.new_empty(
+                    (0, num_routed_experts), dtype=torch.float32
+                )
+            else:
+                router_logits = topk_output.router_logits.float()
+            topk_output = topk_output._replace(router_logits=router_logits)
+            routing_fields = ["router_logits"]
+        elif TopKOutputChecker.format_is_packed(topk_output):
+            routing_fields = ["packed_topk_ids"]
+        else:
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            routing_fields = ["topk_weights", "topk_ids"]
+            if hasattr(topk_output, "packed_topk_ids"):
+                routing_fields.append("packed_topk_ids")
+        payloads.extend(getattr(topk_output, name) for name in routing_fields)
+        gathered = get_tp_group().all_gatherv(
+            payloads, sizes=get_dp_global_num_tokens()
+        )
+        x = gathered[0]
+        if x_sf is not None:
+            x_sf = gathered[1]
+        if per_token_scale is not None:
+            per_token_scale = gathered[2]
+        routing = dict(zip(routing_fields, gathered[routing_offset:]))
+        if TopKOutputChecker.format_is_bypassed(topk_output):
+            # Keep routing inside the non-routed TRT-LLM kernel. Its logits
+            # must have the same global token order as the packed activations.
+            topk_output = topk_output._replace(
+                **routing, hidden_states=x, num_token_non_padded=None
+            )
+        else:
+            topk_output = topk_output._replace(**routing, router_logits=None)
+        # Communicate linear block scales; only CUTLASS needs a swizzle.
+        if x_sf is not None:
+            if self.enable_flashinfer_cutlass_moe:
+                x_sf = nvfp4_block_scale_interleave_flashinfer(x_sf)
+            else:
+                x_sf = x_sf.view(torch.float8_e4m3fn)
+        return x, x_sf, per_token_scale, topk_output
 
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        if should_use_flashinfer_moe_fp4_allgather():
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,

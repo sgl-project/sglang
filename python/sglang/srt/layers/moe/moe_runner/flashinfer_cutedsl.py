@@ -462,7 +462,17 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    if quant_info.use_per_token_activation:
+    x_sf = dispatch_output.hidden_states_scale
+    if quant_info.quant_mode == "w4a16":
+        assert x_sf is None, "CuTe DSL W4A16 requires unquantized activations."
+        x_fp4 = hidden_states
+        per_token_scale = None
+    elif x_sf is not None:
+        # Standard dispatch gathers packed FP4 and linear block scales together.
+        x_fp4 = hidden_states
+        per_token_scale = dispatch_output.hidden_states_per_token_scale
+        assert (per_token_scale is not None) == quant_info.use_per_token_activation
+    elif quant_info.use_per_token_activation:
         from flashinfer import SfLayout, nvfp4_quantize
 
         x_fp4, x_sf, per_token_scale = nvfp4_quantize(
@@ -472,10 +482,6 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
             per_token_activation=True,
             backend="cute-dsl",
         )
-    elif quant_info.quant_mode == "w4a16":
-        x_fp4 = hidden_states
-        x_sf = None
-        per_token_scale = None
     else:
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
@@ -486,10 +492,9 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         per_token_scale = None
 
     if quant_info.quant_mode != "w4a16":
-        seq_len, hidden_size = hidden_states.shape
-        x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
+        seq_len, packed_hidden_size = x_fp4.shape
         x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
-            seq_len, hidden_size // _FP4_SF_VEC_SIZE
+            seq_len, packed_hidden_size * 2 // _FP4_SF_VEC_SIZE
         )
 
     output = quant_info.wrapper.run(
