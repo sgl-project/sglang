@@ -250,6 +250,22 @@ class TestHostPinBudget:
         budget = HostPinBudget(available_bytes=0)
         assert budget.request(component_name="scheduler", weight_bytes=0)
 
+    def test_planner_quota_can_be_applied_and_restored(self):
+        budget = HostPinBudget(
+            available_bytes=40 * GIB_BYTES,
+            reserve_bytes=2 * GIB_BYTES,
+        )
+
+        previous = budget.set_spendable_capacity(12 * GIB_BYTES)
+        assert budget.available_bytes == 12 * GIB_BYTES
+        assert budget.reserve_bytes == 0
+        assert budget.planning_capacity_bytes == 38 * GIB_BYTES
+
+        budget.restore_capacity(previous)
+        assert budget.available_bytes == 40 * GIB_BYTES
+        assert budget.reserve_bytes == 2 * GIB_BYTES
+        assert budget.planning_capacity_bytes == 38 * GIB_BYTES
+
 
 class TestModuleWeightBytes:
     def test_parameters_and_buffers_are_counted(self):
