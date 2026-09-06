@@ -533,6 +533,30 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def maybe_supplemental_poll_final_chunks(self: Scheduler) -> List[Req]:
+        """Give newly submitted final chunks one bounded chance to finish."""
+        final_rooms = getattr(self, "_disagg_final_chunk_rooms", set())
+        self._disagg_final_chunk_rooms = set()
+        timeout_ms = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get()
+        if timeout_ms <= 0 or not final_rooms:
+            return []
+
+        remaining_rooms = {
+            req.bootstrap_room
+            for req in self.disagg_prefill_inflight_queue
+            if req.bootstrap_room in final_rooms
+        }
+        if not remaining_rooms:
+            return []
+
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        wait_for_rooms = getattr(kv_mgr, "wait_for_transfer_rooms", None)
+        if wait_for_rooms is None:
+            return []
+
+        wait_for_rooms(remaining_rooms, timeout_ms / 1000.0)
+        return self.process_disagg_prefill_inflight_queue()
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
@@ -636,6 +660,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+            self.maybe_supplemental_poll_final_chunks()
 
             # Update last_batch
             self.last_batch = batch
@@ -685,6 +710,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+            self.maybe_supplemental_poll_final_chunks()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1235,6 +1261,12 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
+        if last_chunk:
+            final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
+            if final_rooms is None:
+                final_rooms = self._disagg_final_chunk_rooms = set()
+            final_rooms.add(req.bootstrap_room)
+
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
