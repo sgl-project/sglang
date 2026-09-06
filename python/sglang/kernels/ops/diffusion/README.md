@@ -38,6 +38,7 @@ modulate/    adaLN modulate, gating, timestep conditioning
 rope/        rotary embeddings and the QK-norm chains fused into them
 activation/  SiLU / GLU / GELU fusions
 attention/   sparse linear attention, gated delta-net
+routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
 common/      numerics primitives, platform predicates, non-Triton fallbacks
 sites/       request-scoped mount policy — NOT kernels (see below)
@@ -49,7 +50,7 @@ ext/         JIT C++/CUDA extensions (Hunyuan3D raster/inpaint) — NOT kernels
 
 **Bit-exact (`torch.equal` vs the eager chain) → mounted unconditionally.**
 These kernels reproduce every aten rounding boundary, sometimes down to the
-reduction tree: `norm/layernorm_modulate_triton.py` replicates torch 2.11's
+reduction tree: `../../kda_kernels/layernorm_modulate_triton.py` replicates torch 2.11's
 `vectorized_layer_norm_kernel` (128-thread Welford, `_rcp4` guarded
 reciprocal, `shfl.down` fold order, `div.rn` + `MUFU.RSQ`), and
 `norm/rmsnorm_scale_shift_bitexact.py` replicates flashinfer's CuTe-DSL
@@ -139,7 +140,7 @@ tensor copy per residual site.
 |---|---|---|
 | `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact; supports compact and full-width NeoX/interleaved caches |
 | `fused_qknorm_rope_pack_kv` | JIT CUDA | as above, also packs prefix K/V |
-| `try_fused_flux2_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
+| `try_fused_flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM100+ |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
 | `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
@@ -149,6 +150,12 @@ tensor copy per residual site.
 | `apply_rotary_embedding` | Triton (+fallbacks) | close; the generic entry point |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact; packs QKV and applies RoPE in one pass |
 
+### MoE routing
+
+| Entry point | Backend | Contract | Applies to |
+|---|---|---|---|
+| `group_limited_topk` | Triton | selected expert-id set matches the guarded CUDA `torch.topk(..., sorted=False)` chain; output order is unspecified | LingBot Video's default-on sigmoid+bias group-limited routing; contiguous fp32 `[tokens, experts]`, at least two power-of-two experts per group |
+
 ### Data movement and quantized layout producers
 
 `usp_merge_heads`, `pack_qkv_destination_major`, `fused_pack_qkv`,
@@ -156,9 +163,10 @@ tensor copy per residual site.
 `fused_causal_conv3d_cat_pad_cuda`,
 `cat_pad_channels_last_3d`, `dup_up3d_add`, `fused_temb_table_slices`,
 and `ltx2_ada_values9` are bit-exact data movement or same-order arithmetic.
-`try_flux2_token_cat_fp8` and `try_flux2_token_cat_nvfp4` fuse branch
-concatenation directly into the quantized representation selected by the
-FLUX.2 checkpoint path.
+`fused_layernorm_modulate_fp8_quant_raw` folds FLUX.2 LayerNorm, adaLN
+modulation, and static FP8 quantization. `try_flux2_token_cat_fp8` and
+`try_flux2_token_cat_nvfp4` fuse branch concatenation directly into the
+quantized representation selected by the FLUX.2 checkpoint path.
 
 `fused_temb_table_slices` is worth knowing about: the eager
 `(table + temb.float()).chunk(6, dim=2)` materializes ~8 GB of fp32 at
