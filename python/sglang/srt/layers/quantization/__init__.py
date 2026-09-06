@@ -3,163 +3,165 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 from __future__ import annotations
 
-from typing import Dict, Type
+import importlib
+from collections.abc import Iterator, Mapping
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
-from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
-from sglang.srt.layers.quantization.awq import (
-    AWQConfig,
-    AWQCPUConfig,
-    AWQMarlinConfig,
-    AWQXPUConfig,
-)
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
-from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
-from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.gguf import GGUFConfig
-from sglang.srt.layers.quantization.gptq import (
-    CPUGPTQConfig,
-    GPTQAscendConfig,
-    GPTQConfig,
-    GPTQMarlinConfig,
-    GPTQXPUConfig,
-)
-from sglang.srt.layers.quantization.humming import HummingConfig
-from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptFp4Config,
-    ModelOptFp8Config,
-    ModelOptMixedPrecisionConfig,
-)
-from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
-from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
-from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
-from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import Mxfp4W4A4Config
-from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
-from sglang.srt.layers.quantization.petit import PetitNvFp4Config
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
-from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
-from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
-from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
-from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.platforms import current_platform
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
-    is_cuda,
-    is_gfx95_supported,
-    is_mps,
-    is_npu,
-    is_xpu,
+from sglang.srt.layers.quantization.registry import (
+    CPU_SUPPORTED_METHOD_SPECS,
+    PLATFORM_OVERRIDE_SPECS,
+    QUANTIZATION_METHOD_SPECS,
+    all_config_class_specs,
 )
 
-_is_gfx95_supported = is_gfx95_supported()
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
-# Base quantization methods
-BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
-    "fp8": Fp8Config,
-    "mxfp8": Fp8Config,
-    "blockwise_int8": BlockInt8Config,
-    "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
-    "modelopt_fp8": ModelOptFp8Config,
-    "modelopt_fp4": ModelOptFp4Config,
-    "nvfp4_online": NvFp4OnlineConfig,
-    "modelopt_mixed": ModelOptMixedPrecisionConfig,
-    "w8a8_int8": W8A8Int8Config,
-    "w8a8_fp8": W8A8Fp8Config,
-    "awq": AWQConfig,
-    "awq_marlin": AWQMarlinConfig,
-    "bitsandbytes": BitsAndBytesConfig,
-    "gguf": GGUFConfig,
-    "gptq": GPTQConfig,
-    "gptq_marlin": GPTQMarlinConfig,
-    "moe_wna16": MoeWNA16Config,
-    "compressed-tensors": CompressedTensorsConfig,
-    "w4afp8": W4AFp8Config,
-    "petit_nvfp4": PetitNvFp4Config,
-    "quark": QuarkConfig,
-    "quark_mxfp4": QuarkConfig,
-    "auto-round": AutoRoundConfig,
-    "auto-round-int8": W8A8Int8Config,
-    "modelslim": ModelSlimConfig,
-    "quark_int4fp8_moe": QuarkInt4Fp8Config,
-    "humming": HummingConfig,
-    "mxfp_w4a8": Mxfp4W4A8Config,
-}
+# Importing this package used to import all 28 config modules, so asking
+# "which methods exist" -- or resolving any single one of them -- pulled in
+# every third-party quantization dependency. Resolution of a spec to its config
+# class is deferred to first use instead, which is why the tables below are
+# lazy mappings rather than plain dicts. Keep this module's own imports free of
+# torch and of any config module.
 
 
-# On XPU the OCP-MoE `Mxfp4Config` path is served by the sgl-kernel-xpu grouped
-# GEMM, which consumes the packed e2m1 + ue8m0 g32 checkpoint layout directly.
-# Other backends without that kernel keep the existing "unknown quantization
-# method" error rather than falling through to a bf16 upcast.
-if is_cpu() or is_cuda() or _is_gfx95_supported or is_xpu():
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "mxfp4": Mxfp4Config,
-        }
+def _resolve_spec(spec: str) -> Type["QuantizationConfig"]:
+    module_path, _, class_name = spec.rpartition(":")
+    return getattr(importlib.import_module(module_path), class_name)
+
+
+def _platform_conditions() -> Dict[str, Callable[[], bool]]:
+    from sglang.srt.utils import (
+        is_cpu,
+        is_cuda,
+        is_gfx95_supported,
+        is_mps,
+        is_npu,
+        is_xpu,
+    )
+
+    return {
+        "mxfp4_capable": lambda: (
+            is_cpu() or is_cuda() or is_gfx95_supported() or is_xpu()
+        ),
+        "npu": is_npu,
+        "xpu": is_xpu,
+        "mps": is_mps,
+    }
+
+
+def _active_method_specs() -> Dict[str, str]:
+    """Base specs with this platform's overrides applied, in table order."""
+    conditions = _platform_conditions()
+    unknown = [c for c, _ in PLATFORM_OVERRIDE_SPECS if c not in conditions]
+    if unknown:
+        raise KeyError(
+            f"PLATFORM_OVERRIDE_SPECS names condition(s) {unknown} that "
+            f"_platform_conditions() does not define; add them there. "
+            f"Known conditions: {sorted(conditions)}"
+        )
+    specs = dict(QUANTIZATION_METHOD_SPECS)
+    for condition, overrides in PLATFORM_OVERRIDE_SPECS:
+        if conditions[condition]():
+            specs.update(overrides)
+    return specs
+
+
+class _LazyMethodMap(Mapping):
+    """Maps method name -> config class, importing a config on first lookup.
+
+    Reads like the plain dict it replaces (`in`, `[...]`, `.keys()`,
+    `.items()`, `[*...]`), and preserves its iteration order. Membership tests
+    and key iteration resolve nothing; `[...]` resolves the one entry asked
+    for, and only `.items()` / `.values()` force every config module to
+    import.
+    """
+
+    def __init__(self, specs_factory: Callable[[], Dict[str, str]]) -> None:
+        self._specs_factory = specs_factory
+        self._specs: Optional[Dict[str, str]] = None
+        self._resolved: Dict[str, Type["QuantizationConfig"]] = {}
+
+    @property
+    def specs(self) -> Dict[str, str]:
+        if self._specs is None:
+            self._specs = self._specs_factory()
+        return self._specs
+
+    def __getitem__(self, name: str) -> Type["QuantizationConfig"]:
+        if name not in self._resolved:
+            self._resolved[name] = _resolve_spec(self.specs[name])
+        return self._resolved[name]
+
+    def __contains__(self, name: object) -> bool:
+        # Must not fall through to __getitem__: `Mapping.__contains__` would
+        # import a config module just to answer a membership test, and would
+        # let an ImportError escape a check expected to be exception-free.
+        return name in self.specs
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.specs)
+
+    def __len__(self) -> int:
+        return len(self.specs)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({list(self.specs)!r})"
+
+
+# Base quantization methods, plus this platform's overrides.
+BASE_QUANTIZATION_METHODS: Mapping[str, Type["QuantizationConfig"]] = _LazyMethodMap(
+    _active_method_specs
+)
+
+# Subset of the above supported on CPU with AMX.
+CPU_QUANTIZATION_METHODS: Mapping[str, Type["QuantizationConfig"]] = _LazyMethodMap(
+    lambda: dict(CPU_SUPPORTED_METHOD_SPECS)
+)
+
+QUANTIZATION_METHODS = BASE_QUANTIZATION_METHODS
+
+_CONFIG_CLASS_SPECS = all_config_class_specs()
+
+
+def __getattr__(name: str) -> object:
+    """Serve the config classes the package has always re-exported.
+
+    Keeps `from sglang.srt.layers.quantization import Fp8Config` (and every
+    other `*Config`) working now that they are no longer imported eagerly.
+    Unknown names must raise `AttributeError` so `from ... import <submodule>`
+    still falls through to the import machinery.
+    """
+    if name == "QuantizationConfig":
+        from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+        return QuantizationConfig
+    spec = _CONFIG_CLASS_SPECS.get(name)
+    if spec is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return _resolve_spec(spec)
+
+
+def __dir__() -> list[str]:
+    return sorted(
+        [*globals(), *_CONFIG_CLASS_SPECS, "QuantizationConfig"],
     )
 
 
-if is_npu():
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "gptq": GPTQAscendConfig,
-            # On NPU, `mxfp4` means single-level W4A4 MXFP4 for dense LLM (the
-            # upstream `Mxfp4Config` OCP-MoE path is only registered on
-            # cpu/cuda/hip above, so there is no collision here).
-            "mxfp4": Mxfp4W4A4Config,
-        }
-    )
-
-
-if is_xpu():
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "gptq": GPTQXPUConfig,
-            "awq": AWQXPUConfig,
-        }
-    )
-
-
-if is_mps():
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "mlx_q4": MlxQuantizationConfig,
-            "mlx_q8": MlxQuantizationConfig,
-        }
-    )
-
-# subset of above quant methods, supported on CPU
-CPU_QUANTIZATION_METHODS = {
-    "fp8": Fp8Config,
-    "w8a8_int8": W8A8Int8Config,
-    "compressed-tensors": CompressedTensorsConfig,
-    "awq": AWQCPUConfig,
-    "gptq": CPUGPTQConfig,
-    "mxfp4": Mxfp4Config,
-    "auto-round": AutoRoundConfig,
-}
-
-QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}
-
-
-def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
+def get_quantization_config(quantization: str) -> Type["QuantizationConfig"]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(
             f"Invalid quantization method: {quantization}. "
             f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
         )
-    from sglang.srt.utils import is_cpu
+    from sglang.srt.platforms import current_platform
+    from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
     if is_cpu() and cpu_has_amx_support():
         if quantization not in CPU_QUANTIZATION_METHODS:
             raise ValueError(
                 f"Invalid quantization method on CPU: {quantization}. "
-                f"Available methods on CPU: {list(QUANTIZATION_METHODS.keys())}"
+                f"Available methods on CPU: {list(CPU_QUANTIZATION_METHODS.keys())}"
             )
         else:
             return CPU_QUANTIZATION_METHODS[quantization]
