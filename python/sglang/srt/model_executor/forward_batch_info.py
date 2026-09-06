@@ -1300,9 +1300,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     extend_prefix_len : extend_prefix_len + extend_seq_len,
                 ]
                 if mrope_positions.numel() == 0:
+                    # Precomputed positions span only the prompt; an extend past it
+                    # needs one position per token, delta-shifted like decode.
                     mrope_positions = self._expand_mrope_from_input(
-                        mm_input, seq_lens_cpu[batch_idx]
-                    )
+                        mm_input, extend_prefix_len + 1
+                    ) + torch.arange(extend_seq_len, dtype=torch.int64)
             mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
