@@ -28,7 +28,9 @@ class TestElasticCudaGraphSetup(unittest.TestCase):
                 graph_setup, "EagerRunner", return_value=eager_runner
             ) as eager_cls,
             patch.object(graph_setup, "capture_prefill_graph", return_value=prefill),
-            patch.object(graph_setup, "_configure_deep_gemm_standard_layout") as setup,
+            patch.object(
+                graph_setup, "refresh_deep_gemm_layout_memory_budget"
+            ) as setup,
             patch.object(graph_setup, "finalize_cuda_graph_capture") as finalize,
         ):
             capture = graph_setup.capture_cuda_graphs(
@@ -64,7 +66,7 @@ class TestElasticCudaGraphSetup(unittest.TestCase):
             patch.object(graph_setup.current_platform, "empty_cache"),
             patch.object(graph_setup, "set_global_graph_memory_pool"),
             patch.object(graph_setup.gc, "collect"),
-            patch.object(graph_setup, "_configure_deep_gemm_standard_layout"),
+            patch.object(graph_setup, "refresh_deep_gemm_layout_memory_budget"),
             patch.object(
                 graph_setup,
                 "capture_decode_graph",
@@ -81,6 +83,25 @@ class TestElasticCudaGraphSetup(unittest.TestCase):
 
         decode_runner.backend.cleanup.assert_called_once_with()
         self.assertIs(result, capture)
+
+    def test_post_start_budget_refresh_skips_scale_joiner(self):
+        model_runner = SimpleNamespace(device="cuda")
+        exec_config = SimpleNamespace(moe=SimpleNamespace(ep_join_mode="scale"))
+
+        with (
+            patch.object(
+                graph_setup.envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT,
+                "get",
+                return_value="auto",
+            ),
+            patch.object(graph_setup, "get_exec", return_value=exec_config),
+            patch.object(graph_setup, "get_available_gpu_memory") as get_memory,
+        ):
+            graph_setup.refresh_deep_gemm_layout_memory_budget(
+                model_runner, only_if_initialized=True
+            )
+
+        get_memory.assert_not_called()
 
 
 if __name__ == "__main__":

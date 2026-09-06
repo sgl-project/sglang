@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
+_deep_gemm_layout_memory_budget_initialized = False
 
 
 def _align_pipeline_layers(layers: list, layer_model) -> list:
@@ -244,38 +245,55 @@ def sync_elastic_cuda_graph_config(
         )
 
 
-def _configure_deep_gemm_standard_layout(model_runner: ModelRunner) -> None:
-    if model_runner.is_draft_worker:
-        moe_runner_backend = (
-            get_spec().speculative_moe_runner_backend
-            or get_exec().moe.moe_runner_backend
-        )
-        moe_a2a_backend = (
-            get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
-        )
-    else:
-        moe_runner_backend = get_exec().moe.moe_runner_backend
-        moe_a2a_backend = get_exec().moe.moe_a2a_backend
-
-    uses_deep_gemm_moe_runner = moe_runner_backend == "deep_gemm"
-    if moe_runner_backend == "auto" and model_runner.model_config.quantization in (
-        "fp8",
-        "mxfp8",
-    ):
-        from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
-        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
-
-        uses_deep_gemm_moe_runner = Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
-            MoeRunnerBackend(moe_runner_backend),
-            MoeA2ABackend(moe_a2a_backend),
-        )
-
+def refresh_deep_gemm_layout_memory_budget(
+    model_runner: ModelRunner, *, only_if_initialized: bool = False
+) -> None:
+    """Set the all-rank budget before capture, then refresh after startup."""
+    global _deep_gemm_layout_memory_budget_initialized
     if (
         model_runner.device != "cuda"
         or envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower() != "auto"
-        or not uses_deep_gemm_moe_runner
     ):
         return
+
+    if only_if_initialized:
+        # Scale joiners refresh with all expanded ranks during recapture.
+        if get_exec().moe.ep_join_mode == "scale":
+            return
+        # Target and draft share the budget. Its pre-capture initialization
+        # already used a world-wide collective, so this guard is rank-uniform
+        # and also covers a draft-only DeepGEMM backend outside draft context.
+        if not _deep_gemm_layout_memory_budget_initialized:
+            return
+    else:
+        if model_runner.is_draft_worker:
+            moe_runner_backend = (
+                get_spec().speculative_moe_runner_backend
+                or get_exec().moe.moe_runner_backend
+            )
+            moe_a2a_backend = (
+                get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
+            )
+        else:
+            moe_runner_backend = get_exec().moe.moe_runner_backend
+            moe_a2a_backend = get_exec().moe.moe_a2a_backend
+
+        uses_deep_gemm_moe_runner = moe_runner_backend == "deep_gemm"
+        if moe_runner_backend == "auto" and model_runner.model_config.quantization in (
+            "fp8",
+            "mxfp8",
+        ):
+            from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+            from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+            uses_deep_gemm_moe_runner = (
+                Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
+                    MoeRunnerBackend(moe_runner_backend),
+                    MoeA2ABackend(moe_a2a_backend),
+                )
+            )
+        if not uses_deep_gemm_moe_runner:
+            return
 
     from sglang.srt.layers.moe.moe_runner.deep_gemm import (
         set_masked_standard_layout_memory_budget,
@@ -291,6 +309,7 @@ def _configure_deep_gemm_standard_layout(model_runner: ModelRunner) -> None:
     budget_bytes = set_masked_standard_layout_memory_budget(
         int(available_memory_gb * (1 << 30))
     )
+    _deep_gemm_layout_memory_budget_initialized = True
     logger.info(
         "DeepGEMM masked layout budget: %.2f GiB from %.2f GiB free.",
         budget_bytes / (1 << 30),
@@ -302,7 +321,7 @@ def recapture_elastic_cuda_graph(
     *,
     model_runner: ModelRunner,
 ) -> GraphCapture:
-    _configure_deep_gemm_standard_layout(model_runner)
+    refresh_deep_gemm_layout_memory_budget(model_runner)
     # Warmup may communicate, so every rank repeats it after the rendezvous.
     model_runner._kernel_warmed_up = False
     capture = capture_decode_graph(model_runner=model_runner)
@@ -354,7 +373,7 @@ def capture_cuda_graphs(
     eager_runner = EagerRunner(model_runner, run_warmup=not defer_distributed_setup)
 
     if not defer_distributed_setup:
-        _configure_deep_gemm_standard_layout(model_runner)
+        refresh_deep_gemm_layout_memory_budget(model_runner)
 
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill
