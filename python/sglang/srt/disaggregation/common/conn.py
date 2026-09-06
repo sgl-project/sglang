@@ -217,6 +217,7 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        self._request_status_lock = threading.RLock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
@@ -360,18 +361,43 @@ class CommonKVManager(BaseKVManager):
         )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
-        return self.request_status[bootstrap_room]
+        with self._request_status_guard():
+            return self.request_status[bootstrap_room]
+
+    def get_status(self, bootstrap_room: int) -> Optional[KVPoll]:
+        with self._request_status_guard():
+            return self.request_status.get(bootstrap_room)
+
+    def is_room_failed_or_cleared(self, bootstrap_room: int) -> bool:
+        with self._request_status_guard():
+            return self.request_status.get(bootstrap_room) in (None, KVPoll.Failed)
+
+    def _request_status_guard(self) -> threading.RLock:
+        # A few focused unit tests instantiate managers with object.__new__.
+        # Production managers always create this lock in __init__.
+        lock = getattr(self, "_request_status_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._request_status_lock = lock
+        return lock
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            # Do not resurrect a cleared entry with Failed: once clear() has
-            # popped the room from request_status, any late update_status(Failed)
-            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
-            # pollute a future request that reuses the same bootstrap_room.
-            if status == KVPoll.Failed:
+        with self._request_status_guard():
+            current = self.request_status.get(bootstrap_room)
+            if current is None:
+                # Do not resurrect a cleared entry with Failed: once clear() has
+                # popped the room from request_status, any late update_status(Failed)
+                # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
+                # pollute a future request that reuses the same bootstrap_room.
+                if status == KVPoll.Failed:
+                    return
+                self.request_status[bootstrap_room] = status
                 return
-            self.request_status[bootstrap_room] = status
-        else:
+
+            # Failure is terminal until clear() removes the room. In particular,
+            # a transfer finishing after AbortReq must not publish Success.
+            if current == KVPoll.Failed:
+                return
             if status == KVPoll.Failed:
                 self.request_status[bootstrap_room] = KVPoll.Failed
             else:
@@ -1336,7 +1362,8 @@ class CommonKVSender(BaseKVSender):
         return KVPoll.Failed
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr._request_status_guard():
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
@@ -1618,7 +1645,8 @@ class CommonKVReceiver(BaseKVReceiver):
         return KVPoll.Failed
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr._request_status_guard():
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 

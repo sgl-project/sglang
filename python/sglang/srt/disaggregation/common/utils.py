@@ -2,6 +2,7 @@ import ctypes
 import dataclasses
 import struct
 import threading
+import time
 from collections import deque
 from typing import List, Optional, Tuple, Union
 
@@ -32,6 +33,10 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
+    # Queue observability. The selected shard is assigned by the backend before
+    # enqueue; enqueue_time is refreshed on every enqueue/re-enqueue.
+    enqueue_time: float = dataclasses.field(default_factory=time.perf_counter)
+    shard_idx: Optional[int] = None
     # Mori early-send: CUDA event to synchronize before RDMA (optional).
     wait_event: Optional[object] = None
 
@@ -76,6 +81,8 @@ class FastQueue:
 
     def put(self, item):
         with self._cond:
+            if hasattr(item, "enqueue_time"):
+                item.enqueue_time = time.perf_counter()
             self._buf.append(item)
             # wake up a thread of wait()
             self._cond.notify()
@@ -86,6 +93,10 @@ class FastQueue:
             while not self._buf:
                 self._cond.wait()
             return self._buf.popleft()
+
+    def qsize(self):
+        with self._cond:
+            return len(self._buf)
 
 
 class AuxDataCodec:

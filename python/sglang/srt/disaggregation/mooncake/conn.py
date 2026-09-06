@@ -13,7 +13,7 @@ from typing import List, Optional, Set, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import zmq
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge, Histogram
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -79,6 +79,39 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
+
+MOONCAKE_TRANSFER_QUEUE_WAIT = Histogram(
+    "sglang:mooncake_transfer_queue_wait_seconds",
+    "Time a Mooncake KV chunk waits before a transfer worker dequeues it.",
+    ("rank", "shard", "policy"),
+    buckets=(0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5),
+)
+MOONCAKE_TRANSFER_WORKER_SERVICE = Histogram(
+    "sglang:mooncake_transfer_worker_service_seconds",
+    "Time a Mooncake transfer worker spends processing one KV chunk.",
+    ("rank", "shard", "policy"),
+    buckets=(0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5),
+)
+MOONCAKE_TRANSFER_QUEUE_DEPTH = Gauge(
+    "sglang:mooncake_transfer_queue_depth",
+    "Current number of Mooncake KV chunks waiting in a transfer queue.",
+    ("rank", "shard", "policy"),
+)
+MOONCAKE_TRANSFER_QUEUE_EVENTS = Counter(
+    "sglang:mooncake_transfer_queue_events_total",
+    "Mooncake transfer queue lifecycle events.",
+    ("rank", "shard", "policy", "event"),
+)
+
+_U64_MASK = (1 << 64) - 1
+
+
+def _mix_u64(value: int) -> int:
+    """Stable mixer so queue sharding does not reuse DP-routing low bits."""
+    value = (value + 0x9E3779B97F4A7C15) & _U64_MASK
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _U64_MASK
+    return value ^ (value >> 31)
 
 
 # decode
@@ -236,6 +269,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if transfer_thread_pool_size is None:
                 transfer_thread_pool_size = min(max(4, int(0.5 * cpu_count) // 8), 12)
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+            if transfer_queue_size < 1:
+                raise ValueError(
+                    "SGLANG_DISAGGREGATION_QUEUE_SIZE must be at least 1, "
+                    f"got {transfer_queue_size}."
+                )
+            self.transfer_queue_policy = (
+                envs.SGLANG_MOONCAKE_TRANSFER_QUEUE_POLICY.get().strip().lower()
+            )
+            if self.transfer_queue_policy not in ("session", "room"):
+                raise ValueError(
+                    "SGLANG_MOONCAKE_TRANSFER_QUEUE_POLICY must be one of "
+                    f"'session' or 'room', got {self.transfer_queue_policy!r}."
+                )
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
@@ -243,12 +289,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
                 f"greater than or equal to SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
             )
+            base_threads, extra_threads = divmod(
+                transfer_thread_pool_size, transfer_queue_size
+            )
+            self.executor_thread_counts = [
+                base_threads + (1 if i < extra_threads else 0)
+                for i in range(transfer_queue_size)
+            ]
             self.executors = [
                 concurrent.futures.ThreadPoolExecutor(
-                    transfer_thread_pool_size // transfer_queue_size
+                    thread_count,
+                    thread_name_prefix=f"mooncake-xfer-{i}",
                 )
-                for _ in range(transfer_queue_size)
+                for i, thread_count in enumerate(self.executor_thread_counts)
             ]
+            self._transfer_metric_rank = (
+                f"dp{self.attn_dp_rank}-tp{self.attn_tp_rank}-"
+                f"cp{self.attn_cp_rank}-pp{self.pp_rank}"
+            )
+            logger.info(
+                "Mooncake transfer queues initialized: policy=%s queues=%d "
+                "thread_pool_size=%d executor_threads=%s",
+                self.transfer_queue_policy,
+                transfer_queue_size,
+                transfer_thread_pool_size,
+                self.executor_thread_counts,
+            )
             self.enable_custom_mem_pool, self.custom_mem_pool_type = (
                 check_mooncake_custom_mem_pool_enabled()
             )
@@ -1715,6 +1781,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                shard_idx = (
+                    kv_chunk.shard_idx
+                    if kv_chunk.shard_idx is not None
+                    else worker_index
+                )
+                metric_labels = self._queue_metric_labels(shard_idx)
+                worker_start_time = time.perf_counter()
+                MOONCAKE_TRANSFER_QUEUE_DEPTH.labels(*metric_labels).set(queue.qsize())
+                MOONCAKE_TRANSFER_QUEUE_WAIT.labels(*metric_labels).observe(
+                    max(0.0, time.perf_counter() - kv_chunk.enqueue_time)
+                )
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1730,13 +1807,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding[kv_chunk.room] += 1
                     kv_chunk.staging_counted = True
 
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Failed
-                ):
+                if self.is_room_failed_or_cleared(kv_chunk.room):
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
                     )
+                    MOONCAKE_TRANSFER_QUEUE_EVENTS.labels(
+                        *metric_labels, "room_skipped"
+                    ).inc()
                     if self.enable_trace:
                         kv_chunk.trace_ctx.trace_slice_end(
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
@@ -1747,6 +1824,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
+                    MOONCAKE_TRANSFER_WORKER_SERVICE.labels(*metric_labels).observe(
+                        time.perf_counter() - worker_start_time
+                    )
                     continue
 
                 if (
@@ -1772,11 +1852,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
                 for req in reqs_to_be_processed:
+                    if self.is_room_failed_or_cleared(kv_chunk.room):
+                        break
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
                         # Early exit if the request has failed
                         with self.session_lock:
                             if req.mooncake_session_id in self.failed_sessions:
+                                MOONCAKE_TRANSFER_QUEUE_EVENTS.labels(
+                                    *metric_labels, "failed_session_skipped"
+                                ).inc()
                                 self.record_failure(
                                     kv_chunk.room,
                                     f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
@@ -1945,6 +2030,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             )
                             break
 
+                        # Abort can arrive while the synchronous Mooncake call is
+                        # in flight. Do not start state/AUX work or publish Success.
+                        if self.is_room_failed_or_cleared(kv_chunk.room):
+                            break
+
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
                                 state_rc = self.maybe_send_extra(
@@ -1976,6 +2066,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     )
                                     break
 
+                                if self.is_room_failed_or_cleared(kv_chunk.room):
+                                    break
+
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
                                 req,
@@ -1986,6 +2079,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
                             )
+
+                            if self.is_room_failed_or_cleared(kv_chunk.room):
+                                break
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
@@ -2020,9 +2116,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
 
                 if staging_deferred:
+                    MOONCAKE_TRANSFER_WORKER_SERVICE.labels(*metric_labels).observe(
+                        time.perf_counter() - worker_start_time
+                    )
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
+                MOONCAKE_TRANSFER_QUEUE_EVENTS.labels(
+                    *metric_labels, "worker_completed"
+                ).inc()
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -2032,13 +2134,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
                 # follow), not on the last chunk alone since an earlier deferred
                 # chunk may still need to transfer.
+                room_status = self.get_status(kv_chunk.room)
                 if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                    or (
-                        kv_chunk.is_last_chunk
-                        and self.check_status(kv_chunk.room) == KVPoll.Failed
-                    )
+                    room_status is None
+                    or room_status == KVPoll.Success
+                    or (kv_chunk.is_last_chunk and room_status == KVPoll.Failed)
                 ):
                     self._staging_outstanding.pop(kv_chunk.room, None)
                     if kv_chunk.room in self.transfer_infos:
@@ -2051,6 +2151,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             if key[0] == kv_chunk.room:
                                 self._staging_ctx.prefetch_requested.discard(key)
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
+                MOONCAKE_TRANSFER_WORKER_SERVICE.labels(*metric_labels).observe(
+                    time.perf_counter() - worker_start_time
+                )
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -2266,6 +2369,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()
 
+    def _select_transfer_shard(self, bootstrap_room: int) -> int:
+        if self.transfer_queue_policy == "room":
+            shard_key = _mix_u64(bootstrap_room)
+        else:
+            dst_infos = self.transfer_infos[bootstrap_room].keys()
+            shard_key = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
+        return shard_key % len(self.transfer_queues)
+
+    def _queue_metric_labels(self, shard_idx: int) -> tuple[str, str, str]:
+        return (
+            self._transfer_metric_rank,
+            str(shard_idx),
+            self.transfer_queue_policy,
+        )
+
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -2280,10 +2398,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
-        if (
-            bootstrap_room not in self.request_status
-            or self.check_status(bootstrap_room) == KVPoll.Failed
-        ):
+        if self.is_room_failed_or_cleared(bootstrap_room):
             logger.debug(
                 "Request with bootstrap_room=%s already failed", bootstrap_room
             )
@@ -2295,17 +2410,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # add further chunks into the transfer queue.
             return
 
-        # NOTE(shangming): sharding according to the dst_infos to make sure
-        # requests with the same dst_sessions will be added into the same
-        # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
+        shard_idx = self._select_transfer_shard(bootstrap_room)
+        logger.debug(
+            "Mooncake transfer room %s assigned to queue %d using %s policy",
+            bootstrap_room,
+            shard_idx,
+            self.transfer_queue_policy,
+        )
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
+        queue = self.transfer_queues[shard_idx]
+        queue.put(
             TransferKVChunk(
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
@@ -2315,8 +2432,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                shard_idx=shard_idx,
             )
         )
+        labels = self._queue_metric_labels(shard_idx)
+        MOONCAKE_TRANSFER_QUEUE_DEPTH.labels(*labels).set(queue.qsize())
+        MOONCAKE_TRANSFER_QUEUE_EVENTS.labels(*labels, "enqueued").inc()
 
     def get_session_id(self):
         return self.engine.get_session_id()
