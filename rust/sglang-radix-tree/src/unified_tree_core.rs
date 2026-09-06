@@ -1492,7 +1492,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             track_adopted_ranges: state.track_adopted_ranges,
         };
         if self.arena.node(node_id).evicted() {
-            self.unevict_node_on_insert_with_session_id_(
+            self.unevict_node_on_insert_(
                 node_id,
                 &state.value.narrow(0, cursor as i64, prefix_len as i64),
                 state.session_id.as_deref(),
@@ -1833,7 +1833,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             value,
             priority,
             KeyNamespaceRef::new(extra_key, /* cache_salt = */ None),
-            None,
+            /* session_id = */ None,
         )
     }
 
@@ -1874,11 +1874,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Restore an evicted node's Full device value from fresh KV indices
     /// during insert.
-    pub fn unevict_node_on_insert_(&mut self, node_id: NodeIdx_, fresh_value: &Tensor) {
-        self.unevict_node_on_insert_with_session_id_(node_id, fresh_value, None);
-    }
-
-    fn unevict_node_on_insert_with_session_id_(
+    pub fn unevict_node_on_insert_(
         &mut self,
         node_id: NodeIdx_,
         fresh_value: &Tensor,
@@ -3655,7 +3651,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             );
         for loaded_id in nodes_to_load.unwrap_or_default() {
             let loaded_idx = self.arena.resolve(loaded_id);
-            self.record_store_event_(loaded_idx, StorageMedium::Gpu, None);
+            self.record_store_event_(loaded_idx, StorageMedium::Gpu, /* session_id = */ None);
         }
         for (component_type, transfers) in comp_xfers {
             self.component_by_type_(component_type)
@@ -3743,7 +3739,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 node.write_through_pending_id = None;
                 self.update_full_coexisting_host_tracking_(node_idx);
             }
-            self.record_store_event_(node_idx, StorageMedium::Cpu, None);
+            self.record_store_event_(node_idx, StorageMedium::Cpu, /* session_id = */ None);
         }
     }
 

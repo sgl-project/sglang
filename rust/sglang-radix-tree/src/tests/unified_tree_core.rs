@@ -1126,7 +1126,7 @@ fn unevict_restores_the_value_and_the_leaf_sets() {
         .set_device_value(p, FULL, Tensor::from_slice(&[0i64]));
     tc.evictable_device_leaves.add(p);
     let mut fresh = Tensor::from_slice(&[20i64]);
-    tc.unevict_node_on_insert_(c, &fresh);
+    tc.unevict_node_on_insert_(c, &fresh, /* session_id = */ None);
     assert_eq!(tc.evictable_size_(FULL), 1);
     assert!(tc.evictable_device_leaves.contains(c));
     assert!(!tc.evictable_device_leaves.contains(p));
@@ -1155,7 +1155,11 @@ fn unevict_panics_on_a_node_that_still_has_its_value() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    tc.unevict_node_on_insert_(a, &Tensor::from_slice(&[1i64]));
+    tc.unevict_node_on_insert_(
+        a,
+        &Tensor::from_slice(&[1i64]),
+        /* session_id = */ None,
+    );
 }
 
 fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
