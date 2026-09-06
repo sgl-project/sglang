@@ -5,6 +5,7 @@ import os
 import socket
 import tempfile
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -2247,8 +2248,10 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
 
 class TestCuteDslW4A16Args(CustomTestCase):
     def setUp(self):
-        self.enterContext(override_platform(is_sm100=True))
-        self.enterContext(
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(override_platform(is_sm100=True))
+        stack.enter_context(
             patch.dict(os.environ, SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16="1")
         )
         # Only the W4A16 opt-in is needed; leave the W4A4 flags unset.
