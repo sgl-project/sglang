@@ -95,6 +95,35 @@ export const benchmarks = [
         ttft_ms: 19531.95, tpot_ms: 301.92, tokens_per_sec_per_gpu: 603 },
     ],
   },
+  // 1x DGX Spark, TP=1, N-gram table file-backed on NVMe (PLE Offload = On
+  // (NVMe file)), qwen4-main-squashed @ 9b2aee2283. Same GSM8K protocol and
+  // bench workload as the 2-node rows; single GPU, so per-GPU = total tok/s.
+  {
+    match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "qwen4-main-squashed @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 98.0 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
+        ttft_ms: 648.92, tpot_ms: 33.59, tokens_per_sec_per_gpu: 137 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 4 },
+        ttft_ms: 1089.20, tpot_ms: 60.10, tokens_per_sec_per_gpu: 288 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 8 },
+        ttft_ms: 1341.05, tpot_ms: 94.64, tokens_per_sec_per_gpu: 358 },
+    ],
+  },
+  {
+    match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "qwen4-main-squashed @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 96.5 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
+        ttft_ms: 580.18, tpot_ms: 61.63, tokens_per_sec_per_gpu: 80 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
+        ttft_ms: 7281.52, tpot_ms: 181.30, tokens_per_sec_per_gpu: 386 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 24 },
+        ttft_ms: 8336.78, tpot_ms: 241.20, tokens_per_sec_per_gpu: 415 },
+    ],
+  },
   // nvidia/Qwen3.8-Flash-Next-NVFP4 (ModelOpt MIXED_PRECISION) on the same
   // Spark pair, measured on the qwen4-main-squashed tip 9b2aee2283 (which
   // includes sgl-project/sglang#38121) — the shipped image cannot load this

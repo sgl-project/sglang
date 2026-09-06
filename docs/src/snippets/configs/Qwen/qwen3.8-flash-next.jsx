@@ -12,8 +12,10 @@
 // runs on a single GPU, and the AMD cells run TP8. That fits because 6B active
 // params keeps compute small and the N-gram table is the only large weight block.
 // The one multi-node shape is NVFP4 on a pair of DGX Sparks (GB10): the 126 GiB
-// checkpoint does not fit one 128 GB unified-memory box, so it runs TP=2 across
-// two of them over the 200GbE ConnectX-7 link. NVFP4 also runs on one 96 GB
+// checkpoint does not fit one 128 GB unified-memory box with the N-gram table
+// resident, so it runs TP=2 across two of them over the 200GbE ConnectX-7 link;
+// a single Spark serves it with the table file-backed on the local NVMe (the
+// "On (NVMe file)" PLE Offload chip). NVFP4 also runs on one 96 GB
 // RTX PRO 6000 Blackwell (SM120) once the 47.7 GiB FP8 N-gram table is offloaded
 // to pinned host memory (--ple-offload-embedding), leaving ~81 GiB of weights on
 // the card.
@@ -79,9 +81,13 @@ export const config = {
       // DGX Spark (GB10) is unified memory: the pinned-host copy comes out of
       // the same 128 GB pool as the GPU weights, so offloading to RAM frees
       // nothing there and Auto (which resolves to on for this checkpoint) and
-      // On are greyed out — Off is the only pick, and the engine falls back to
-      // it. Re-enable On for DGX Spark once an NVMe-backed PLE table ships
-      // (sgl-project/sglang#37068 / #36567).
+      // On are greyed out. The 2-node cells force Off (the TP-sharded table
+      // fits in GPU memory); the single-Spark cells force "On (NVMe file)": the
+      // file backend from sgl-project/sglang#37068 maps the table from a sparse
+      // file on the local NVMe and the gather kernel reads it through the host
+      // page tables, so it never has to be resident — the only way the 126 GiB
+      // checkpoint boots on one 128 GB Spark. The engine snaps to the single
+      // usable option in each case.
       //
       // RTX PRO 6000 is the opposite case: on a 96 GB discrete card the FP8
       // N-gram table (47.7 GiB) has to leave the GPU for the remaining ~81 GiB
@@ -102,9 +108,27 @@ export const config = {
           disableReason: "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). Off is the verified setting until NVMe-backed PLE lands.",
           flags: ["--ple-offload-embedding"] },
         { id: "off",  label: "Off",
-          disabled: (sel) => sel.hw === "rtx6000",
-          disableReason: "RTX PRO 6000 (96 GB) cannot hold the 47.7 GiB FP8 N-gram table alongside the ~81 GiB of NVFP4 weights; the table must be offloaded to pinned host RAM (On).",
+          disabled: (sel) => sel.hw === "rtx6000" || (sel.hw === "dgx-spark" && sel.nodes === "single"),
+          disableReason: (sel) => sel.hw === "dgx-spark"
+            ? "A single DGX Spark cannot hold the 126 GiB checkpoint in its 128 GB of unified memory; the verified single-Spark cells keep the 47.7 GiB FP8 N-gram table in a file on the local NVMe (On (NVMe file))."
+            : "RTX PRO 6000 (96 GB) cannot hold the 47.7 GiB FP8 N-gram table alongside the ~81 GiB of NVFP4 weights; the table must be offloaded to pinned host RAM (On).",
           flags: ["--no-ple-offload-embedding"] },
+        // File-backed table (sgl-project/sglang#37068, merged into qwen4-main-squashed):
+        // a sparse 47.7 GiB file under $SGLANG_CACHE_DIR/ple/<model> (override
+        // with --ple-offload-dir), created and filled by the server on boot and
+        // read by the gather kernel through the host page tables. Requires the
+        // device attribute cudaDevAttrPageableMemoryAccessUsesHostPageTables,
+        // which GB10 has; hidden on other hardware. Verified only single-node —
+        // the 2-node cells keep the table GPU-resident instead.
+        { id: "file", label: "On (NVMe file)",
+          showWhen: (sel) => sel.hw === "dgx-spark",
+          disabled: (sel) => sel.nodes !== "single",
+          disableReason: "The file-backed table is verified for the single-Spark cells; the 2-node cells shard the table across both GPUs instead (Off).",
+          flags: ["--ple-offload-embedding", "--ple-offload-backend file"],
+          hints: [
+            "PLE table -> sparse 47.7 GiB file under $SGLANG_CACHE_DIR/ple/<model> (put it on local NVMe; --ple-offload-dir relocates it).",
+            "Delete the previous table file before each boot until the rewrite is fixed upstream: rewriting a populated file runs at ~17 MB/s (~55 min), a fresh sparse file at GB/s (~8 min).",
+          ] },
       ],
     },
   ],
@@ -878,6 +902,72 @@ export const config = {
         "--mamba-ssm-dtype bfloat16",
         "--reasoning-parser qwen3",
         "--mem-fraction-static 0.93",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ==== NVFP4 (RDXA) on 1x DGX Spark — PLE table file-backed on NVMe ====
+    // TP=1 on one GB10: ~80 GiB of weights resident, the 47.7 GiB FP8 N-gram
+    // table lives in a sparse file on the NVMe (the forced "On (NVMe file)" chip
+    // appends --ple-offload-embedding --ple-offload-backend file). At
+    // --mem-fraction-static 0.85 the two pools share ~12-18 GB, and at TP=1 a
+    // mamba state slot is ~113 MB (fp32), so concurrency is pinned low:
+    // 8 requests with MTP (5 slots each), 24 without on the lazy strategy (4
+    // slots each). Verified 2026-09-06 on qwen4-main-squashed @ 9b2aee2283 (the
+    // Python install path): GSM8K (chat, thinking off, n=200) 98.0% / 96.5%;
+    // boot ~10-11 min once the table file is fresh (see the chip hint).
+    //
+    // Low latency: MTP head, 8 concurrent requests (40 slots), 93k-token KV
+    // pool (~11.6k per request), 27.5 tok/s single stream (TPOT 33.6 ms),
+    // 71.7 tok/s output at 8; MTP accept length 2.9-3.5 on non-thinking output.
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      warn: "Single DGX Spark (GB10, 128 GB unified). The N-gram table is a 47.7 GiB sparse file on the local NVMe (PLE Offload = On (NVMe file)); keep ~50 GB free there and mount that directory into the container. Boot writes the whole table each time: delete the previous file first (a populated file rewrites at ~17 MB/s). Concurrency is memory-bound at 8 with MTP. See [DGX Spark notes](#spark-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--quantization modelopt_fp4",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--page-size 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--max-running-requests 8",
+        "--max-mamba-cache-size 40",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // High throughput: speculation off, 24 concurrent requests (96 lazy slots),
+    // 286k-token KV pool (~11.9k per request); 83 tok/s output at 24
+    // (105 tok/s aggregate on GSM8K, vs 94 for the MTP cell at 8), 15.9 tok/s
+    // single stream. MRR 16 / 64 slots was only +10% over the MTP cell, so 24.
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      warn: "Single DGX Spark (GB10, 128 GB unified). The N-gram table is a 47.7 GiB sparse file on the local NVMe (PLE Offload = On (NVMe file)); keep ~50 GB free there and mount that directory into the container. Boot writes the whole table each time: delete the previous file first (a populated file rewrites at ~17 MB/s). At 24 concurrent requests the KV pool is ~286k tokens; lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--quantization modelopt_fp4",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--page-size 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--max-running-requests 24",
+        "--max-mamba-cache-size 96",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
