@@ -1642,7 +1642,6 @@ class ModelConfig:
         ]
         optimized_quantization_methods = [
             "fp8",
-            "marlin",
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
