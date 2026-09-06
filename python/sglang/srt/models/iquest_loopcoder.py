@@ -452,7 +452,7 @@ class IQuestLoopCoderForCausalLM(nn.Module):
                 continue
 
             # Handle gate_projections weights
-            if name.startswith("gate_projections."):
+            if name.startswith("model.gate_projections."):
                 if name.endswith(".weight"):
                     sglang_name = name.replace(".weight", ".gate_proj.weight")
                 elif name.endswith(".bias"):
