@@ -193,17 +193,6 @@ def bind_inplace(
     bind_inplace_kernel[grid](v, p, v2p, p2v, N, BLOCK=ALLOC_BIND_BLOCK)
 
 
-# ---------------------------------------------------------------------------
-# Fused virtual WRITE loc -> kernel-facing id.
-#
-# The eager form of this is a chain of ~6 torch ops (floor_divide, remainder,
-# take, mul, add, clamp), and ~12 once the DCP owner rule is resolved on top
-# (remainder, eq, floor_divide, zeros_like, where, copy). It runs per forward
-# on the write loc, OUTSIDE any cuda graph, so every op is a real launch on the
-# critical path. That is invisible next to a Hopper decode step and is not
-# next to a Blackwell one, which is why this is one kernel.
-# ---------------------------------------------------------------------------
-
 WRITE_LOC_BLOCK = 512
 
 

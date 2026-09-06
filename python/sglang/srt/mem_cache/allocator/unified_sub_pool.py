@@ -1003,12 +1003,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         out: Optional[torch.Tensor] = None,
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
-        """One launch for the read and write conversions alike.
-
-        Eagerly this was ~6 torch ops, and ~12 with the DCP owner rule on top,
-        every one a launch on the forward's critical path outside any cuda
-        graph. See `write_loc_to_kernel_ids`.
-        """
+        """One launch for the read and write conversions alike; see
+        `write_loc_to_kernel_ids`."""
         if out is not None:
             assert out.dtype == torch.int64, (
                 f"translate_kv_loc_for_kernel: out= dtype must be int64 (matches v2p), "
