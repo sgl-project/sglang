@@ -26,10 +26,37 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    build_kv_event_publishers,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestKvEventPublisherDiscovery(CustomTestCase):
+    def test_maps_dp_attention_publishers_to_their_nodes(self):
+        publishers = build_kv_event_publishers(
+            endpoint_host="*",
+            endpoint_port_base=5557,
+            node_hosts={0: "10.0.0.1", 1: "10.0.0.2"},
+            nnodes=2,
+            dp_size=8,
+            tp_size=8,
+            pp_size=1,
+            attn_cp_size=1,
+            enable_dp_attention=True,
+        )
+
+        self.assertEqual(
+            publishers,
+            [
+                {
+                    "dp_rank": rank,
+                    "endpoint": f"tcp://10.0.0.{1 if rank < 4 else 2}:{5557 + rank}",
+                }
+                for rank in range(8)
+            ],
+        )
 
 
 _BASE_LOAD = msgspec.structs.replace(
