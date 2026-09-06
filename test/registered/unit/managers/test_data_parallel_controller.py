@@ -12,6 +12,7 @@ is exercised as the real method, no mock.
 """
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -27,7 +28,9 @@ from sglang.srt.managers.data_parallel_controller import (
     DPBudget,
     LoadBalanceMethod,
 )
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -207,6 +210,63 @@ class TestRoundRobinScheduler(CustomTestCase):
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
         ctl.workers[0].send_pyobj.assert_called_once()
+
+
+def _keyed_req(routing_key):
+    """Real TokenizedGenerateReqInput: the routing-key scheduler type-narrows on it."""
+    return TokenizedGenerateReqInput(
+        input_text="",
+        input_ids=array("q", [1, 2]),
+        input_embeds=None,
+        mm_inputs=None,
+        token_type_ids=None,
+        sampling_params=SamplingParams(),
+        return_logprob=False,
+        logprob_start_len=0,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
+        stream=False,
+        routing_key=routing_key,
+    )
+
+
+class TestRoutingKeyScheduler(CustomTestCase):
+    def test_same_key_always_lands_on_same_worker(self):
+        ctl = _make_controller(dp_size=4)
+        for _ in range(6):
+            ctl.routing_key_scheduler(_keyed_req("rollout-7"))
+        counts = [w.send_pyobj.call_count for w in ctl.workers]
+        self.assertEqual(sorted(counts), [0, 0, 0, 6], counts)
+
+    def test_distinct_keys_spread_across_workers(self):
+        ctl = _make_controller(dp_size=2)
+        for i in range(64):
+            ctl.routing_key_scheduler(_keyed_req(f"rollout-{i}"))
+        counts = [w.send_pyobj.call_count for w in ctl.workers]
+        self.assertEqual(sum(counts), 64)
+        self.assertTrue(min(counts) >= 16, f"hash imbalance: {counts}")
+
+    def test_keyed_request_never_lands_on_inactive_worker(self):
+        ctl = _make_controller(dp_size=4)
+        ctl.status[2] = False
+        ctl._active_workers = [0, 1, 3]
+        for i in range(32):
+            ctl.routing_key_scheduler(_keyed_req(f"rollout-{i}"))
+        ctl.workers[2].send_pyobj.assert_not_called()
+
+    def test_keyless_request_falls_back_to_round_robin(self):
+        ctl = _make_controller(dp_size=4)
+        ctl.routing_key_scheduler(_keyed_req(None))
+        ctl.routing_key_scheduler(_keyed_req(None))
+        ctl.workers[0].send_pyobj.assert_called_once()
+        ctl.workers[1].send_pyobj.assert_called_once()
+
+    def test_routed_dp_rank_wins_over_key(self):
+        ctl = _make_controller(dp_size=4)
+        req = _keyed_req("rollout-7")
+        req.routed_dp_rank = 3
+        ctl.routing_key_scheduler(req)
+        ctl.workers[3].send_pyobj.assert_called_once()
 
 
 class TestFollowBootstrapRoomScheduler(CustomTestCase):

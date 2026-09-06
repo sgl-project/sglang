@@ -945,6 +945,7 @@ class GenerateReqInput:
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
+            routing_key=self.routing_key,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,
