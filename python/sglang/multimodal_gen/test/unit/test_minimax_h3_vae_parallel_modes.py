@@ -150,7 +150,5 @@ def test_audio_snake_first_call_matches_repeated_calls():
             ),
         ],
         check=True,
-        capture_output=True,
-        text=True,
         timeout=120,
     )
