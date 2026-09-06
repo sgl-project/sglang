@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -2239,6 +2240,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             supports_mamba_cache_extra_buffer,
         )
 
+        # Every expectation below is a non-CPU one; a CPU host resolves to
+        # no_buffer, which the tail of this test covers explicitly.
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(override_platform(is_cpu=False))
+
         def _view(arch, layer_types=None, **kw):
             hf = SimpleNamespace(architectures=[arch])
             if layer_types is not None:
@@ -2351,6 +2358,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 "Qwen3_5MoeForConditionalGeneration",
             )
         )
+        # CPU keeps linear_attn_backend="triton" but rolls back to the CPU
+        # kernels, which implement no_buffer only.
+        with override_platform(is_cpu=True):
+            self.assertFalse(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="triton"),
+                    "Qwen3_5ForConditionalGeneration",
+                )
+            )
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view("Qwen3_5ForConditionalGeneration")),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "no_buffer",
+                    "disable_overlap_schedule": True,
+                },
+            )
 
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_5 import (
