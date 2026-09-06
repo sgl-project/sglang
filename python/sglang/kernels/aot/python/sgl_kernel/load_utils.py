@@ -4,6 +4,7 @@ import importlib.util
 import logging
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import List
 
@@ -43,6 +44,47 @@ def _filter_compiled_extensions(file_list):
 
     # Return compiled files first, then others
     return compiled_files + other_files
+
+
+def _iter_installed_sgl_kernel_dirs(current_dir: Path):
+    """Yield sibling installed sgl_kernel package dirs from sys.path.
+
+    Editable/source-mounted trees can leave the compiled common_ops extension in
+    site-packages while Python resolves this package from the source checkout.
+    Search those alternate package roots before falling back to bare
+    ``import common_ops`` so source-first validation can still load the built
+    extension.
+    """
+
+    seen = {str(current_dir.resolve())}
+    for root in sys.path:
+        if not root:
+            continue
+        try:
+            candidate = (Path(root) / current_dir.name).resolve()
+        except OSError:
+            continue
+        if not candidate.is_dir():
+            continue
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield candidate
+
+
+def _load_common_ops_module(ops_path: Path):
+    spec = importlib.util.spec_from_file_location("common_ops", str(ops_path))
+    if spec is None:
+        raise ImportError(f"Could not create module spec for {ops_path}")
+
+    common_ops = importlib.util.module_from_spec(spec)
+    if spec.loader is None:
+        raise ImportError(f"Module spec has no loader for {ops_path}")
+
+    logger.debug(f"[sgl_kernel] Loading module from {ops_path}...")
+    spec.loader.exec_module(common_ops)
+    return common_ops
 
 
 def _load_architecture_specific_ops():
@@ -85,17 +127,7 @@ def _load_architecture_specific_ops():
         ops_path = Path(matching_files[0])  # Use the first prioritized file
         logger.debug(f"[sgl_kernel] Found architecture-specific library: {ops_path}")
         try:
-            # Load the module from specific path using importlib
-            spec = importlib.util.spec_from_file_location("common_ops", str(ops_path))
-            if spec is None:
-                raise ImportError(f"Could not create module spec for {ops_path}")
-
-            common_ops = importlib.util.module_from_spec(spec)
-            if spec.loader is None:
-                raise ImportError(f"Module spec has no loader for {ops_path}")
-
-            logger.debug(f"[sgl_kernel] Loading module from {ops_path}...")
-            spec.loader.exec_module(common_ops)
+            common_ops = _load_common_ops_module(ops_path)
             logger.debug(f"[sgl_kernel] ✓ Successfully loaded {variant_name}")
             logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
             return common_ops
@@ -123,16 +155,7 @@ def _load_architecture_specific_ops():
         alt_path = Path(alt_matching_files[0])  # Use the first prioritized file
         logger.debug(f"[sgl_kernel] Found fallback library: {alt_path}")
         try:
-            spec = importlib.util.spec_from_file_location("common_ops", str(alt_path))
-            if spec is None:
-                raise ImportError(f"Could not create module spec for {alt_path}")
-
-            common_ops = importlib.util.module_from_spec(spec)
-            if spec.loader is None:
-                raise ImportError(f"Module spec has no loader for {alt_path}")
-
-            logger.debug(f"[sgl_kernel] Loading fallback module from {alt_path}...")
-            spec.loader.exec_module(common_ops)
+            common_ops = _load_common_ops_module(alt_path)
             logger.debug(f"[sgl_kernel] ✓ Successfully loaded fallback library")
             logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
             return common_ops
@@ -146,6 +169,39 @@ def _load_architecture_specific_ops():
         logger.debug(
             f"[sgl_kernel] ✗ Fallback library not found matching pattern: {alt_pattern}"
         )
+
+    # Try sibling installed package roots (e.g. site-packages in editable/source-first envs).
+    for sibling_dir in _iter_installed_sgl_kernel_dirs(sgl_kernel_dir):
+        for candidate_pattern in (
+            str(sibling_dir / ops_subdir / "common_ops.*"),
+            str(sibling_dir / "common_ops.*"),
+        ):
+            raw_candidate_files = glob.glob(candidate_pattern)
+            candidate_files = _filter_compiled_extensions(raw_candidate_files)
+            logger.debug(
+                f"[sgl_kernel] Attempting sibling package fallback: {candidate_pattern}"
+            )
+            logger.debug(
+                f"[sgl_kernel] Found sibling package files: {raw_candidate_files}"
+            )
+            if not candidate_files:
+                continue
+            candidate_path = Path(candidate_files[0])
+            logger.debug(
+                f"[sgl_kernel] Found sibling package library: {candidate_path}"
+            )
+            try:
+                common_ops = _load_common_ops_module(candidate_path)
+                logger.debug(
+                    "[sgl_kernel] ✓ Successfully loaded sibling package library"
+                )
+                logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
+                return common_ops
+            except Exception as e:
+                previous_import_errors.append(e)
+                logger.debug(
+                    f"[sgl_kernel] ✗ Failed to load sibling package library from {candidate_path}: {type(e).__name__}: {e}"
+                )
 
     # Final attempt: try standard Python import (for backward compatibility)
     logger.debug(

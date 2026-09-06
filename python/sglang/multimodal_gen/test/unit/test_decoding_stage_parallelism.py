@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import Decodin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
     LTX2RefinementStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+    MiniMaxH3DecodingStage,
+)
 
 
 class FakeVAE(nn.Module):
@@ -72,6 +75,24 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 stage.parallelism_type,
                 StageParallelismType.REPLICATED,
             )
+
+    def test_minimax_h3_component_use_keeps_fp32_residency(self):
+        """Decode autocast precision must not downcast FP32-resident VAE weights."""
+        stage = MiniMaxH3DecodingStage(FakeVAE(), FakeVAE())
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                vae_precision="fp32",
+                vae_decode_precision="fp16",
+                audio_vae_precision="fp32",
+            )
+        )
+
+        for decode_precision in ("fp16", "bf16", "fp32"):
+            with self.subTest(decode_precision=decode_precision):
+                server_args.pipeline_config.vae_decode_precision = decode_precision
+                uses = stage.component_uses(server_args)
+                self.assertEqual(uses[0].target_dtype, torch.float32)
+                self.assertEqual(uses[1].target_dtype, torch.float32)
 
     def test_torch_compile_decode_cache_is_replaced_for_new_vae_instance(self):
         vae = FakeVAE()
