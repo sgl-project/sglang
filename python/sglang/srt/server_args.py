@@ -2166,6 +2166,14 @@ class ServerArgs:
         "unaffected either way.",
         NS("spec"),
     ] = None
+    speculative_dspark_asd_config_path: A[
+        Optional[str],
+        "DSPARK only. Optional path to an ASD (approximate speculative decoding) "
+        "acceptance configuration JSON. Relaxes strict greedy verify by admitting "
+        "bounded-regret draft tokens; omit to keep strict (lossless) greedy "
+        "verification. Requires the optional ASD package when set.",
+        NS("spec"),
+    ] = None
     speculative_dspark_align_verify_tokens_to_graph_tier: A[
         bool,
         "DSPARK compact ragged-verify only. Fill the per-request verify lengths so "

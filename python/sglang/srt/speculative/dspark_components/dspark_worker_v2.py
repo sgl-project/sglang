@@ -39,6 +39,10 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
 )
+from sglang.srt.speculative.dspark_components.asd_dspark import (
+    DSparkASDAdapter,
+    DSparkASDSettings,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
@@ -346,6 +350,24 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._simulate_acc_len}."
             )
 
+        self._asd_adapter = DSparkASDAdapter(
+            settings=DSparkASDSettings.from_server_args(server_args),
+            gamma=self.gamma,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            device=self.device,
+        )
+        self._asd_adapter.require_supported_runtime(
+            disable_cuda_graph=server_args.disable_cuda_graph,
+            disable_overlap_schedule=server_args.disable_overlap_schedule,
+            ragged_verify_mode=self._verify_planner.mode_value,
+            simulate_accept_length=self._simulate_acc_len,
+        )
+        if self.ps.tp_rank == 0 and self._asd_adapter.active:
+            logger.info(
+                "DSpark ASD acceptance enabled (config fingerprint %s)",
+                self._asd_adapter.settings.fingerprint,
+            )
+
         self._verify_executor = TargetVerifyExecutor(
             target_worker=self.target_worker,
             gamma=self.gamma,
@@ -506,6 +528,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
+        self._asd_adapter.note_request_finished(rid=rid)
 
     def forward_batch_generation(
         self,
@@ -530,6 +553,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
+        self._asd_adapter.bind_batch(batch)
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
@@ -816,6 +840,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+            asd_adapter=(self._asd_adapter if self._asd_adapter.active else None),
+            req_pool_indices=batch.req_pool_indices,
         )
         if batch.return_logprob:
             compute_spec_logprobs(
