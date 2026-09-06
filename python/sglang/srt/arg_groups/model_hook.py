@@ -68,6 +68,14 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
         )
 
 
+def _apply_sm120_fp8_wo_a_gemm_default() -> None:
+    """Keep an explicit setting or the global default on capable builds."""
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
+
+    if not DEEPGEMM_SCALE_UE8M0:
+        envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+
+
 def _rocm_fp8_wo_a_supported() -> bool:
     """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 + aiter)."""
     try:
@@ -368,9 +376,8 @@ def handle_model_specific_adjustments(server_args: Any):
         validate_deepseek_v4_mega_moe_token_budget(server_args)
 
         if get_platform().is_sm120:
-            # SM120 lacks tcgen05/TMEM: disable features that depend on
-            # DeepGEMM or require >99KB SMEM (topk_v2).
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # Preserve the FP8 W_o_A default only on capable DeepGEMM builds.
+            _apply_sm120_fp8_wo_a_gemm_default()
             envs.SGLANG_OPT_USE_TOPK_V2.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)

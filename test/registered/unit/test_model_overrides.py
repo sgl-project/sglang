@@ -1685,6 +1685,34 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "flashinfer_trtllm_routed",
         )
 
+    def test_sm120_fp8_wo_a_gemm_default_gates_on_deepgemm_capability(self):
+        """The SM120 FP8 W_o_A GEMM override is capability-gated, not a force.
+
+        Only a build without the DeepGEMM ue8m0 capability gets the GEMM turned
+        off; a capable build must be left untouched so the global default or an
+        explicit setting survives to the later DeepGEMM capability check.
+        """
+        from sglang.srt.arg_groups.model_hook import _apply_sm120_fp8_wo_a_gemm_default
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.deep_gemm_wrapper import configurer
+
+        field = envs.SGLANG_OPT_FP8_WO_A_GEMM
+
+        def _run(capable):
+            """Call the helper with a stubbed capability; return recorded set()."""
+            with (
+                patch.object(configurer, "DEEPGEMM_SCALE_UE8M0", capable),
+                patch.object(field, "set") as mock_set,
+            ):
+                _apply_sm120_fp8_wo_a_gemm_default()
+                return mock_set
+
+        # Incapable build: forced off.
+        _run(capable=False).assert_called_once_with(False)
+
+        # Capable build: untouched, keeping the default or explicit setting.
+        _run(capable=True).assert_not_called()
+
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,
