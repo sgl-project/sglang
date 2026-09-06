@@ -3085,7 +3085,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ok = allocator.check_decode_capacity(
             num_tokens=num_tokens, tree_cache=self.tree_cache
         )
-        if not ok and getattr(allocator.get_kvcache(), "_unified_kv", False):
+        if not ok and getattr(allocator.get_kvcache(), "_unified_kv", False) is True:
             self._log_unified_swa_bottleneck(allocator, num_tokens, selected_indices)
         return ok
 

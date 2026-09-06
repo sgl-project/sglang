@@ -110,15 +110,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self._kvcache = kvcache
 
-        # Unified-KV (DSV4): SWA is a per-request ring addressed by state_slot
-        # (== req_pool_idx) + position inside the DSV4 kernels. The paged SWA
-        # indices / full_to_swa_index_mapping produced here are NOT consumed on
-        # that path, so treating SWA as a linearly-consumed token pool
-        # over-throttles admission and decode retract. Instead account for it as
-        # a fixed per-request ring slot; the real bound is concurrency
-        # (num_req_slots), already enforced by req_to_token_pool /
-        # max_running_requests.
-        self._unified = getattr(kvcache, "_unified_kv", False)
+        # Unified-KV DSV4: the DSV4 kernels address SWA as a per-request ring, so
+        # the paged indices built here are unused and the bound is num_req_slots.
+        self._unified = getattr(kvcache, "_unified_kv", False) is True
         self._req_to_token_pool = req_to_token_pool
         if self._unified:
             ring_size = getattr(kvcache, "unified_swa_ring_size", self.page_size)
@@ -189,7 +183,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def debug_print(self) -> str:
         msg = ""
-        msg += f"#swa-available-size: {self.swa_attn_allocator.available_size()}, "
+        msg += f"#swa-available-size: {self.swa_available_size()}, "
         msg += (
             f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
         )

@@ -337,26 +337,19 @@ class KVCacheConfigurator:
         )
 
         swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
-        # Unified-KV DSV4: SWA is a fixed per-request ring, so the allocator
-        # reports ring capacity (free_req_slots * ring_cost) from
-        # swa_available_size(), while swa_max_total_num_tokens was sized from
-        # the (vestigial, unallocated) full_token-scaled SWA pool. The idle
-        # pool-leak invariant requires swa total == swa available, so
-        # reconcile the reported SWA total to the allocator's actual idle ring
-        # capacity. Safe: on unified_kv swa_kv_pool is None, so no real buffer
-        # is resized -- this only fixes token accounting / usage reporting.
+        # Unified-KV DSV4: swa_max_total_num_tokens was sized from the vestigial
+        # SWA pool; reconcile it to real ring capacity so the idle-leak invariant
+        # holds. Safe: swa_kv_pool is None here, so no buffer is resized.
         if (
             self.is_hybrid_swa
             and not self.is_draft_worker
-            and getattr(pools.token_to_kv_pool, "_unified_kv", False)
+            and getattr(pools.token_to_kv_pool, "_unified_kv", False) is True
         ):
             alloc = pools.token_to_kv_pool_allocator
             if hasattr(alloc, "swa_available_size"):
                 ring_capacity = int(alloc.swa_available_size())
-                # Only reconcile downward to the (smaller) ring capacity. A
-                # value >= the current total means swa_available_size() hit a
-                # non-binding fallback (e.g. req_to_token pool not wired), in
-                # which case leave the reported total untouched.
+                # Only reconcile downward: a value >= the current total means
+                # swa_available_size() hit its non-binding fallback.
                 if 0 < ring_capacity < swa_max_total_num_tokens:
                     logger.info(
                         "Unified-KV: reconciling swa_max_total_num_tokens "
