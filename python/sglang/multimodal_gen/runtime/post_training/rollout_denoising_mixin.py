@@ -5,6 +5,7 @@ Moved out of DenoisingStage to keep the core stage lean.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -24,6 +25,18 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
+def _trajectory_sigmas(batch: Req) -> torch.Tensor | None:
+    scheduler = getattr(batch, "scheduler", None)
+    sigmas = getattr(scheduler, "sigmas", None) if scheduler is not None else None
+    if sigmas is None:
+        sigmas = getattr(batch, "sigmas", None)
+    if isinstance(sigmas, torch.Tensor):
+        return sigmas.detach().cpu().clone()
+    if isinstance(sigmas, (list, tuple)):
+        return torch.tensor(sigmas, dtype=torch.float32)
+    return None
+
+
 def _kwargs_to_cpu(d: Any) -> Any:
     if isinstance(d, torch.Tensor):
         return d.detach().cpu()
@@ -37,6 +50,30 @@ def _kwargs_to_cpu(d: Any) -> Any:
 
 
 class RolloutDenoisingMixin:
+    def step_latents(
+        self,
+        batch: Req,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        step_index: int,
+        apply: Callable[[], torch.Tensor | None],
+    ) -> torch.Tensor:
+        """Record ``x_t`` if this is a rollout, then run the caller's step.
+
+        ``apply`` is the real update: ``lambda: scheduler.step(...)[0]`` or an
+        in-place Euler that returns ``None``. ``log π`` still comes from
+        ``SchedulerRLMixin`` inside ``scheduler.step``.
+        """
+        batch._rollout_loop_step_index = step_index
+        self._maybe_append_dit_trajectory_step(
+            batch=batch,
+            latents=latents,
+            timestep_value=timestep,
+            step_index=step_index,
+        )
+        updated = apply()
+        return latents if updated is None else updated
+
     def _maybe_prepare_rollout(self, batch: Req):
         """Prepare denoising loop for rollout."""
         scheduler = batch.scheduler
@@ -185,7 +222,7 @@ class RolloutDenoisingMixin:
             batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
                 latents=step_latents_tensor.cpu(),
                 timesteps=torch.stack(step_timesteps, dim=0).cpu(),
-                sigmas=batch.scheduler.sigmas.detach().cpu().clone(),
+                sigmas=_trajectory_sigmas(batch),
             )
 
         if env is not None and batch.rollout_return_denoising_env:

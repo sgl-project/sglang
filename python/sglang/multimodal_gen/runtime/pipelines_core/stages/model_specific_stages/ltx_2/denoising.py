@@ -1960,19 +1960,19 @@ class LTX2DenoisingStage(DenoisingStage):
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
-                if batch.rollout:
-                    ctx.scheduler._step_index = step.step_index
-                    ctx.latents = ctx.scheduler.step(
+                ctx.latents = self.step_latents(
+                    batch,
+                    ctx.latents,
+                    step.t_device,
+                    step.step_index,
+                    apply=lambda: ctx.scheduler.step(
                         model_video,
                         step.t_device,
                         ctx.latents,
                         return_dict=False,
                         **self._scheduler_step_kwargs(batch, ctx.scheduler),
-                    )[0]
-                else:
-                    ctx.latents = ctx.scheduler.step(
-                        model_video, step.t_device, ctx.latents, return_dict=False
-                    )[0]
+                    )[0],
+                )
                 ctx.audio_latents = ctx.audio_scheduler.step(
                     model_audio, step.t_device, ctx.audio_latents, return_dict=False
                 )[0]
