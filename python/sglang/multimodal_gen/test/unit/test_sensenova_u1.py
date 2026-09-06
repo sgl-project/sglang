@@ -376,6 +376,8 @@ def test_sensenova_u1_clears_auto_tuned_runtime_defaults():
         quantization=None,
         quantization_ignored_layers=None,
         transformer_weights_path=None,
+        component_paths={"model": "/tmp/component"},
+        component_weights_paths={"model": "/tmp/model.safetensors"},
         component_quantizations={},
         component_quantization_ignored_layers={},
         component_precisions={},
@@ -395,6 +397,8 @@ def test_sensenova_u1_clears_auto_tuned_runtime_defaults():
     assert args.vae_cpu_offload is False
     assert args.dit_layerwise_offload is False
     assert args.layerwise_offload_components is None
+    assert args.component_paths == {}
+    assert args.component_weights_paths == {}
     assert args.attention_backend is None
     assert args.component_attention_backends == {}
     assert args.attention_backend_config is None
@@ -417,6 +421,8 @@ def test_sensenova_u1_allows_explicit_resident_component_residency():
         quantization=None,
         quantization_ignored_layers=None,
         transformer_weights_path=None,
+        component_paths={},
+        component_weights_paths={},
         component_quantizations={},
         component_quantization_ignored_layers={},
         component_precisions={},
@@ -453,6 +459,11 @@ def test_sensenova_u1_allows_explicit_resident_component_residency():
             {"transformer_weights_path": "/tmp/transformer.safetensors"},
             "pre-quantized transformer weights",
         ),
+        ({"component_paths": {"model": "/tmp/component"}}, "component path overrides"),
+        (
+            {"component_weights_paths": {"model": "/tmp/model.safetensors"}},
+            "component weight path overrides",
+        ),
         ({"component_quantizations": {"transformer": "fp8"}}, "component quantization"),
         (
             {"component_quantization_ignored_layers": {"transformer": ["foo"]}},
@@ -484,6 +495,8 @@ def test_sensenova_u1_rejects_unsupported_runtime_modes(override, expected):
         "quantization": None,
         "quantization_ignored_layers": None,
         "transformer_weights_path": None,
+        "component_paths": {},
+        "component_weights_paths": {},
         "component_quantizations": {},
         "component_quantization_ignored_layers": {},
         "component_precisions": {},

@@ -57,6 +57,8 @@ def _set_compatible_runtime_defaults(server_args) -> None:
         "quantization": None,
         "quantization_ignored_layers": None,
         "transformer_weights_path": None,
+        "component_paths": {},
+        "component_weights_paths": {},
         "component_quantizations": {},
         "component_quantization_ignored_layers": {},
         "component_precisions": {},
@@ -124,6 +126,8 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
             "quantization": "quantization",
             "quantization_ignored_layers": "quantization ignored layers",
             "transformer_weights_path": "pre-quantized transformer weights",
+            "component_paths": "component path overrides",
+            "component_weights_paths": "component weight path overrides",
             "component_quantizations": "component quantization",
             "component_quantization_ignored_layers": (
                 "component quantization ignored layers"
