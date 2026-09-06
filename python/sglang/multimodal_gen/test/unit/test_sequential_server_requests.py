@@ -296,6 +296,8 @@ def test_baseline_generation_keeps_worst_of_both_requests(harness, monkeypatch):
     records = [_perf_record(), _perf_record()]
     records[0].total_duration_ms = 200
     records[0].memory_snapshots["load_peak"]["peak_allocated_mb"] = 900
+    records[0].memory_snapshots["warmup_peak"] = {"peak_reserved_mb": 4000}
+    records[1].memory_snapshots["warmup_peak"] = {"peak_reserved_mb": 2000}
     records[1].memory_snapshots["runtime_peak"]["peak_reserved_mb"] = 3000
     records[1].memory_snapshots["runtime_peak"]["peak_allocated_mb"] = 2500
     monkeypatch.setattr(
@@ -312,6 +314,7 @@ def test_baseline_generation_keeps_worst_of_both_requests(harness, monkeypatch):
     baseline = json.loads(log.call_args.args[0].split(f'"{case.id}": ', 1)[1])
     assert baseline["expected_e2e_ms"] == 200
     assert baseline["runtime_peak_vram_mb"] == 3000
+    assert baseline["warmup_peak_vram_mb"] == 4000
     assert baseline["load_peak_allocated_mb"] == 900
     assert baseline["runtime_peak_allocated_mb"] == 2500
 

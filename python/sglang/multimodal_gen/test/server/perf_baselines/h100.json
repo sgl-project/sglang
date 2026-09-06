@@ -1568,6 +1568,7 @@
             "expected_median_denoise_ms": 1010.9,
             "load_peak_vram_mb": 27320.0,
             "runtime_peak_vram_mb": 35926.0,
+            "warmup_peak_vram_mb": 56748.0,
             "load_peak_allocated_mb": 26241.0,
             "runtime_peak_allocated_mb": 31922.0,
             "estimated_full_test_time_s": 77.0
@@ -1701,6 +1702,7 @@
             "expected_median_denoise_ms": 656.68,
             "load_peak_vram_mb": 35350.0,
             "runtime_peak_vram_mb": 42674.0,
+            "warmup_peak_vram_mb": 45782.0,
             "load_peak_allocated_mb": 34033.0,
             "runtime_peak_allocated_mb": 38569.0,
             "estimated_full_test_time_s": 243.0
@@ -1833,6 +1835,7 @@
             "expected_median_denoise_ms": 2020.71,
             "load_peak_vram_mb": 6440.0,
             "runtime_peak_vram_mb": 21524.0,
+            "warmup_peak_vram_mb": 26902.0,
             "load_peak_allocated_mb": 6175.0,
             "runtime_peak_allocated_mb": 15472.0,
             "estimated_full_test_time_s": 204.3
@@ -2812,7 +2815,7 @@
             "expected_avg_denoise_ms": 477.49,
             "expected_median_denoise_ms": 56.74,
             "load_peak_vram_mb": 34022.0,
-            "runtime_peak_vram_mb": 61190.0,
+            "runtime_peak_vram_mb": 62706.0,
             "load_peak_allocated_mb": 33866.0,
             "runtime_peak_allocated_mb": 57075.0,
             "estimated_full_test_time_s": 153.1

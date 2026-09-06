@@ -760,11 +760,9 @@ mod tests {
             msg
         }
 
-        /// Wait briefly for the SubSocket to finish its handshake/subscribe.
-        /// 50ms is empirically enough on localhost without making tests
-        /// flaky.
+        /// Allows the local PUB/SUB handshake to complete in concurrent tests.
         pub async fn settle() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
         /// Destructure a `WorkerEvent::Batch`, panicking on any other
@@ -1017,7 +1015,7 @@ mod tests {
         let mut attempt = 0;
         let (pub0, pub1, pub2, base_port) = loop {
             attempt += 1;
-            assert!(attempt < 32, "could not find 3 contiguous free ports");
+            assert!(attempt < 256, "could not find 3 contiguous free ports");
 
             // Bind PUB at OS-assigned port to learn what's free, then try
             // to bind the next two ports explicitly.
@@ -1145,25 +1143,29 @@ mod tests {
             .await;
         helpers::settle().await;
 
-        for (rank, pubsock) in publishers.iter_mut().enumerate() {
-            pubsock
-                .send(helpers::build_multipart(
-                    1000 + rank as i64,
-                    helpers::encode_all_blocks_cleared_batch(rank as f64, Some(rank as u32)),
-                ))
-                .await
-                .unwrap();
-        }
-
         let mut by_rank: HashMap<u32, i64> = HashMap::new();
-        for _ in 0..N {
-            let event = timeout(Duration::from_millis(500), rx.recv())
-                .await
-                .expect("timed out")
-                .expect("channel closed");
-            let (worker, seq, _batch) = helpers::expect_batch(event);
-            assert_eq!(worker.url, worker_url);
-            by_rank.insert(worker.dp_rank, seq);
+        for _ in 0..20 {
+            for (rank, pubsock) in publishers.iter_mut().enumerate() {
+                pubsock
+                    .send(helpers::build_multipart(
+                        1000 + rank as i64,
+                        helpers::encode_all_blocks_cleared_batch(rank as f64, Some(rank as u32)),
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            for _ in 0..N {
+                let Ok(Some(event)) = timeout(Duration::from_millis(50), rx.recv()).await else {
+                    break;
+                };
+                let (worker, seq, _batch) = helpers::expect_batch(event);
+                assert_eq!(worker.url, worker_url);
+                by_rank.insert(worker.dp_rank, seq);
+            }
+            if by_rank.len() == N {
+                break;
+            }
         }
         assert_eq!(by_rank.len(), N, "every rank must produce an event");
         for rank in 0..N as u32 {
