@@ -47,6 +47,13 @@ class EnvField:
 
     def __init__(self, default: Any, secret: bool = False):
         self.default = default
+        # get() is traced by Dynamo (models read envs in their forwards), which
+        # cannot trace `callable()`. Moving the check out of get() is not enough:
+        # Dynamo mis-models an lru_cache default as a bound method carrying `self`
+        # at the *attribute load*, so calling it fails too. functools.partial is safe.
+        self._default_factory = (
+            functools.partial(default) if callable(default) else None
+        )
         # NOTE: environ can only accept str values, so we need a flag to indicate
         # whether the env var is explicitly set to None.
         self._set_to_none = False
@@ -62,7 +69,9 @@ class EnvField:
     def _resolve_default(self) -> Any:
         # Support a callable default for lazily/platform-computed defaults
         # (e.g. EnvBool(_default_hip)); evaluated only when the env is unset.
-        return self.default() if callable(self.default) else self.default
+        if self._default_factory is None:
+            return self.default
+        return self._default_factory()
 
     def get(self) -> Any:
         value = os.getenv(self.name)

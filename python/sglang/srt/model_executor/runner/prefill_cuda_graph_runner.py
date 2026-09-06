@@ -99,6 +99,9 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+    TcPiecewiseCudaGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
@@ -131,6 +134,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
     is_cuda,
     is_npu,
     require_attn_tp_gather,
@@ -311,22 +315,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
-        # Hidden-state capture mode cases:
-        # - Breakable EAGLE draft: LAST.
-        # - EAGLE target: FULL.
-        # - Return-hidden-states or DFLASH: FULL.
-        # - Otherwise: NULL.
+        # EAGLE prefill asks for FULL on the target (it feeds the draft) and
+        # LAST on the draft, regardless of the prefill backend: a graph captured
+        # below the requested mode is rejected on every replay.
         is_eagle = model_runner.spec_algorithm.is_eagle()
-        is_breakable_eagle_draft = (
-            self.prefill_backend_name == Backend.BREAKABLE
-            and is_eagle
-            and model_runner.is_draft_worker
-        )
-        if is_breakable_eagle_draft:
+        if is_eagle and model_runner.is_draft_worker:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif (is_eagle and not model_runner.is_draft_worker) or (
-            model_runner.spec_algorithm.is_dflash_family()
-        ):
+        elif is_eagle or model_runner.spec_algorithm.is_dflash_family():
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:
             self.capture_hidden_mode = self.return_hidden_states_mode
@@ -538,12 +533,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     dtype=model_runner.dtype,
                 )
 
-        # Some attention backends (e.g. DSV4) opt into a captured-metadata
-        # contract under BCG: capture-time builds a per-bucket metadata
-        # object the backend then refreshes in place at replay. We honor
-        # the contract only when the backend is Breakable; FullCG and
-        # TC_PIECEWISE use the eager init_forward_metadata path.
-        if isinstance(self.backend, BreakableCudaGraphBackend):
+        # Some attention backends (e.g. DSV4) opt into a captured-metadata contract:
+        # capture builds one metadata object per bucket, the backend refreshes it in
+        # place at replay. TC_PIECEWISE needs it too -- rebuilding metadata per batch
+        # moves the shapes Dynamo guards on, and the recompiled entry holds no CUDA
+        # graph, so prefill silently runs eager.
+        _wants_captured_metadata = isinstance(
+            self.backend, BreakableCudaGraphBackend
+        ) or (
+            isinstance(self.backend, TcPiecewiseCudaGraphBackend)
+            and not get_bool_env_var("SGLANG_PIECEWISE_NO_CAPTURED_METADATA")
+        )
+        if _wants_captured_metadata:
             self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
             self.use_captured_attn_metadata = False
@@ -733,7 +734,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.dp_padding_mode.is_max_len(),
             forward_batch.global_num_tokens_cpu,
         )
-        set_is_extend_in_batch(False)
+        # Prefill graphs only serve EXTEND batches. Capturing under False makes the
+        # flag disagree with what prepare_mlp_sync_batch sets at serving time, which
+        # invalidates every captured shape on first replay under DP.
+        set_is_extend_in_batch(True)
 
         with self._prefill_forward_context(forward_batch):
             pp_proxy_tensors = self._capture_pp_proxy_tensors(num_tokens)
@@ -817,7 +821,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             fb.dp_padding_mode.is_max_len(),
             fb.global_num_tokens_cpu,
         )
-        set_is_extend_in_batch(False)
+        # See _run_forward.
+        set_is_extend_in_batch(True)
 
         with (
             forward_context(
@@ -1320,20 +1325,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         def _slot(name):
             return registry.get_slot(name).slice_for(bs, num_tokens)
 
+        # The dummy batch never returns logprobs, so its logprob token count is
+        # one per request -- the same invariant the scheduler asserts in
+        # _dp_gather_info. Reusing num_tokens here makes the logits-side DP
+        # gather read num_tokens rows out of a pruned_states that only has bs,
+        # which walks off the end of the buffer.
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_for_logprob_cpu = [bs] * self.dp_size
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
+            global_num_tokens_for_logprob_cpu = [bs]
         else:
             global_num_tokens_cpu = None
+            global_num_tokens_for_logprob_cpu = None
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
-            num_tokens_tensor = torch.tensor(
+            global_num_tokens_gpu = torch.tensor(
                 global_num_tokens_cpu, dtype=torch.int32, device=self.device
             )
-            global_num_tokens_gpu = num_tokens_tensor
-            global_num_tokens_for_logprob_gpu = num_tokens_tensor
+            global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_for_logprob_cpu, dtype=torch.int32, device=self.device
+            )
         else:
             global_dp_buffer_len = None
             global_num_tokens_gpu = None
