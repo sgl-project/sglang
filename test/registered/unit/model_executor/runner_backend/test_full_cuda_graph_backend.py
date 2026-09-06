@@ -20,7 +20,9 @@ profiler stepping) is pure-Python and runs on CPU.
 """
 
 import contextlib
+import gc
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -29,6 +31,9 @@ import torch
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
+)
+from sglang.srt.model_executor.runner_utils.capture_owner import (
+    retain_full_cuda_graph_owner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -56,6 +61,7 @@ def _make_backend(runner):
     backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
     backend._graphs = {}
     backend._outputs = {}
+    backend._capture_owners = {}
     backend._pool = None
     backend._capture_stream = None
     backend._precarve = SimpleNamespace(
@@ -136,6 +142,57 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         self.assertEqual(small.shape, (2, 2))
         self.assertEqual(large.data_ptr(), small.data_ptr())
         self.assertEqual(backend._output_buffer.shape, (4, 2))
+
+    def test_retains_only_capture_owners_and_releases_on_replacement(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        backend = _make_backend(runner)
+        shape_key = ShapeKey(size=4)
+        captured_refs = []
+
+        class Owner:
+            pass
+
+        def forward_fn():
+            owner = Owner()
+            if retain_full_cuda_graph_owner(owner):
+                captured_refs.append(weakref.ref(owner))
+            return object()
+
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH-1"):
+            backend.capture_one(shape_key, forward_fn)
+
+        self.assertEqual(len(captured_refs), 1)
+        self.assertIsNotNone(captured_refs[0]())
+        self.assertEqual(len(backend._capture_owners[shape_key]), 1)
+
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH-2"):
+            backend.capture_one(shape_key, forward_fn)
+        gc.collect()
+
+        self.assertEqual(len(captured_refs), 2)
+        self.assertIsNone(captured_refs[0]())
+        self.assertIsNotNone(captured_refs[1]())
+        self.assertEqual(len(backend._capture_owners[shape_key]), 1)
+
+        backend.cleanup()
+        gc.collect()
+        self.assertIsNone(captured_refs[1]())
+        self.assertEqual(backend._capture_owners, {})
+
+    def test_capture_inputs_are_retained_with_the_shape(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        backend = _make_backend(runner)
+        shape_key = ShapeKey(size=2)
+        capture_inputs = object()
+
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+            backend.capture_one(
+                shape_key, lambda: object(), capture_inputs=capture_inputs
+            )
+
+        self.assertIn(capture_inputs, backend._capture_owners[shape_key])
+        backend.cleanup()
+        self.assertEqual(backend._capture_owners, {})
 
     def test_enable_flag_set_but_no_profiler_attr_does_not_step(self):
         # The runner advertises the flag but never created a profiler; the
