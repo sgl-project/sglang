@@ -54,6 +54,58 @@ def granitemoe_split_expert_weights(
             yield name, weight
 
 
+def _match_split_expert(
+    name: str,
+    expert_params_mapping: list[tuple[str, str, int, str]],
+) -> Optional[tuple[str, int, str]]:
+    """Resolve a split-expert tensor name to (param_name, expert_id, shard_id)."""
+    for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+        if weight_name in name:
+            # The mapped name keeps the checkpoint's trailing suffix (`.weight`
+            # vs `.weight_scale`), which is what routes a scale to the scale
+            # branch of FusedMoE's loader.
+            return name.replace(weight_name, param_name), expert_id, shard_id
+    return None
+
+
+def _is_packed_expert(name: str) -> bool:
+    """Whether an expert tensor is the packed layout, already split to w1/w2/w3."""
+    return any(f".{shard}." in name for shard in ("w1", "w2", "w3"))
+
+
+def granitemoe_load_split_experts(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    expert_params_mapping: list[tuple[str, str, int, str]],
+    params_dict: dict[str, torch.nn.Parameter],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Load per-expert quantized experts, yielding the tensors it does not claim.
+
+    Compressed-tensors checkpoints store one tensor per expert per projection
+    (`experts.{e}.gate_proj.weight`, `.weight_scale`, ...). Anything left is
+    yielded for the caller's generic (packed-layout) handling.
+    """
+    for name, loaded_weight in weights:
+        match = _match_split_expert(name, expert_params_mapping)
+
+        if match is None:
+            # Packed-layout experts load downstream; any other expert tensor
+            # would be dropped silently and generate garbage, so fail loudly.
+            if ".block_sparse_moe.experts." in name and not _is_packed_expert(name):
+                raise ValueError(f"unmatched MoE expert tensor: {name}")
+            yield name, loaded_weight
+            continue
+
+        mapped_name, expert_id, shard_id = match
+        param = params_dict[mapped_name]
+        param.weight_loader(
+            param,
+            loaded_weight,
+            mapped_name,
+            shard_id=shard_id,
+            expert_id=expert_id,
+        )
+
+
 class GraniteMoeMoE(nn.Module):
     """A tensor-parallel MoE implementation for GraniteMoe that shards each
     expert across all ranks.
@@ -443,9 +495,25 @@ class GraniteMoeForCausalLM(nn.Module):
         else:
             return self.pooler(hidden_states, forward_batch)
 
+    def _split_expert_params_mapping(self) -> list[tuple[str, str, int, str]]:
+        # llmcompressor emits one tensor per expert per projection
+        # (`experts.{e}.gate_proj.weight`, `.weight_scale`, ...), not the packed
+        # input_linear/output_linear that granitemoe_split_expert_weights maps.
+        return FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_local_experts,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = granitemoe_split_expert_weights(
             self.hf_to_sglang_mapper.apply(weights)
+        )
+        weights = granitemoe_load_split_experts(
+            weights,
+            expert_params_mapping=self._split_expert_params_mapping(),
+            params_dict=dict(self.named_parameters()),
         )
         mixtral.MixtralForCausalLM.load_weights(self, weights)
 
