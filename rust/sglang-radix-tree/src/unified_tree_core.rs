@@ -1383,11 +1383,14 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     /// `prefix_len`. Only the suffix key and value enter the resumable walk, so
     /// decode or chunked-prefill growth skips a second root walk.
     ///
-    /// The retained prefix is not revisited: unlike [`Self::insert`], its nodes
-    /// get no access-tick or LRU refresh, no hit-count bump (so no write-through
-    /// backup trigger), and no component overlap hooks such as SWA tombstone
-    /// recovery. Only the anchor itself is touched. Callers that need those
-    /// effects on the prefix should use a root insert.
+    /// A non-chunked insert replays what a root walk does to the retained prefix,
+    /// root first: access tick and LRU refresh, priority floor, hit count, and the
+    /// write-through backup trigger, at O(depth) cost. A chunked insert never bumps
+    /// hit counts, so it touches only the anchor and stays O(1): use it for
+    /// per-step growth and finish the request with a non-chunked insert. The
+    /// component overlap hooks (SWA tombstone recovery, duplicate-slot release)
+    /// are never replayed because they need the prefix KV, which this API does
+    /// not receive.
     pub fn insert_suffix_from_node(
         &mut self,
         prefix_node_id: NodeId,
@@ -1535,13 +1538,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             });
         }
         self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
+        let mut prefix_actions = Vec::new();
+        self.visit_retained_prefix_(prefix_node_idx, params, &mut prefix_actions);
         if aligned_key_len == prefix_len {
-            // An empty suffix still touches its retained boundary.
-            self.touch_node_(prefix_node_idx);
-            {
-                let node = self.arena.node_mut(prefix_node_idx);
-                node.priority = node.priority.max(params.priority);
-            }
+            // An empty suffix still visited its retained boundary above.
             return Ok(InsertStepResult {
                 actions: Vec::new(),
                 result: Some(InsertResult {
@@ -1554,14 +1554,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     // adopted and the caller keeps (and frees) it.
                     mamba_exist: true,
                     adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
-                    cache_actions: Vec::new(),
+                    cache_actions: prefix_actions,
                 }),
             });
-        }
-        self.touch_node_(prefix_node_idx);
-        {
-            let node = self.arena.node_mut(prefix_node_idx);
-            node.priority = node.priority.max(params.priority);
         }
         // The walk owns only [prefix_len, aligned_key_len); the ragged tail and
         // retained prefix never enter the resumable state.
@@ -1589,7 +1584,63 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             }),
             pending_actions: Vec::new(),
         });
+        if !prefix_actions.is_empty() {
+            // A root walk suspends right after the step that emits a write-through
+            // trigger; hand the replayed ones to the controller before the suffix
+            // walk starts.
+            return Ok(InsertStepResult {
+                actions: prefix_actions,
+                result: None,
+            });
+        }
         Ok(self.advance_insert_())
+    }
+
+    /// Apply the per-node effects of reaching `anchor` to the retained prefix.
+    ///
+    /// A root walk touches every node it passes, raises its priority floor, and
+    /// bumps its hit count, which is where write-through backups originate. A
+    /// non-chunked continuation replays that root first so LRU, LFU/SLRU, and
+    /// write-through behavior match a root insert. Chunked inserts never bump hit
+    /// counts, so they touch only the anchor and stay O(1).
+    fn visit_retained_prefix_(
+        &mut self,
+        anchor: NodeIdx_,
+        params: &InsertParams<'_, K, V>,
+        actions: &mut Vec<CacheAction<V>>,
+    ) {
+        if params.chunked || self.arena.node(anchor).is_root() {
+            self.touch_node_(anchor);
+            let node = self.arena.node_mut(anchor);
+            node.priority = node.priority.max(params.priority);
+            return;
+        }
+        let mut path = vec![anchor];
+        while let Some(parent) = self
+            .arena
+            .node(*path.last().expect("non-empty"))
+            .try_parent()
+        {
+            path.push(parent);
+        }
+        // One action suffices: the deepest trigger's chain already covers every
+        // unbacked ancestor, which is what a root walk's barriers converge to.
+        let mut backup_from = None;
+        for &node_id in path.iter().rev() {
+            self.touch_node_(node_id);
+            let is_root = {
+                let node = self.arena.node_mut(node_id);
+                node.priority = node.priority.max(params.priority);
+                node.is_root()
+            };
+            if !is_root && self.inc_hit_count_and_check_(node_id, params.chunked) {
+                backup_from = Some(node_id);
+            }
+        }
+        if let Some(node_id) = backup_from {
+            let backup = self.build_backup_kv_action_(self.arena.node(node_id), false);
+            actions.push(CacheAction::BackupKV(backup));
+        }
     }
 
     /// Continue the suspended insert after its step actions were executed.

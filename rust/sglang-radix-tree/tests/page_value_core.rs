@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use sglang_radix_tree::{
-    CacheInitParams, FULL, InsertParams, InsertResult, KeyNamespaceRef, MAMBA, MatchPrefixParams,
-    PageValue, RadixValue, TreeCoreRuntimeError, UnifiedTreeCore,
+    BackupKV, CacheAction, CacheInitParams, FULL, InsertParams, InsertResult, KeyNamespaceRef,
+    MAMBA, MatchPrefixParams, PageValue, RadixValue, TreeCoreRuntimeError, UnifiedTreeCore,
 };
 
 type TestCore = UnifiedTreeCore<Vec<i64>, PageValue<u32>>;
@@ -187,6 +187,71 @@ fn full_kv_prefix_len_is_the_full_hit_not_the_admitted_prefix_on_mamba_trees() {
     assert_eq!(read_only, 2);
     assert_eq!(admitted.full_kv_hit_length, read_only);
     assert_eq!(admitted.device_indices.len(), 0);
+}
+
+fn continuation(
+    tree: &mut TestCore,
+    anchor: sglang_radix_tree::NodeId,
+    key: &[i64],
+    values: &[u32],
+    chunked: bool,
+) -> InsertResult<PageValue<u32>> {
+    tree.insert_suffix_from_node(
+        anchor,
+        2,
+        &InsertParams {
+            key: &key.to_vec(),
+            namespace: KeyNamespaceRef::default(),
+            value: PageValue::from_vec(values.to_vec()),
+            prev_prefix_len: 2,
+            swa_evicted_seqlen: 0,
+            mamba_value: None,
+            chunked,
+            priority: 0,
+            track_adopted_ranges: false,
+        },
+    )
+}
+
+fn backups(result: &InsertResult<PageValue<u32>>) -> Vec<&BackupKV> {
+    result
+        .cache_actions
+        .iter()
+        .filter_map(|action| match action {
+            CacheAction::BackupKV(backup) => Some(backup),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn finished_continuation_inserts_replay_hit_counts_and_write_through_on_the_prefix() {
+    let mut tree = TestCore::new(
+        CacheInitParams {
+            enable_hicache: true,
+            write_through_threshold: 2,
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    insert(&mut tree, &[10, 20, 30, 40], &[1, 2, 3, 4]);
+    let anchor = tree
+        .match_prefix(&MatchPrefixParams {
+            key: &vec![10, 20],
+            namespace: KeyNamespaceRef::default(),
+        })
+        .last_device_node_id;
+
+    // Per-step growth is chunked: no hit count moves, so nothing reaches the threshold.
+    let grown = continuation(&mut tree, anchor, &[10, 20, 50, 60], &[5, 6], true);
+    assert!(backups(&grown).is_empty());
+
+    // Finishing a second request through the prefix is its second hit, which a
+    // root walk turns into a write-through backup of the anchor.
+    let finished = continuation(&mut tree, anchor, &[10, 20, 70, 80], &[7, 8], false);
+    let triggered = backups(&finished);
+    assert_eq!(triggered.len(), 1);
+    assert_eq!(triggered[0].node_ids, vec![anchor]);
 }
 
 #[test]
