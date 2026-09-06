@@ -155,8 +155,8 @@ export const benchmarks = [
   },
   // 1x DGX Spark, TP=1, nvidia export with the N-gram table file-backed on NVMe,
   // lmsysorg/sglang:dev-qwen38-next-local (9b2aee2283), 2026-09-06. Same
-  // 1024/256 bench workload; accuracy pending. The in-checkpoint MTP head is
-  // used at TP=1.
+  // 1024/256 bench workload; GSM8K as in the 2-node rows (full set, 2026-09-06).
+  // The in-checkpoint MTP head is used at TP=1.
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
@@ -172,6 +172,7 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 97.2 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 604.33, tpot_ms: 63.54, tokens_per_sec_per_gpu: 78 },
