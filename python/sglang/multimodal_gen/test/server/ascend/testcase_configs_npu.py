@@ -176,6 +176,12 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "SGLANG_CACHE_DIT_TAYLORSEER": "true",
                 "SGLANG_CACHE_DIT_TS_ORDER": "2",
                 "HCCL_BUFFSIZE": "256",
+                # Cgroup memory.current includes reclaimable page cache from
+                # previously loaded models, so host_memory_budget reports ~0
+                # GiB available and layerwise offload degrades to the slow
+                # checkpoint-mapping path. Force a sane budget so text-encoder
+                # layers are pinned normally.
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "32",
             },
         ),
         DiffusionSamplingParams(
@@ -227,6 +233,12 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             num_gpus=2,
             tp_size=2,
             dit_layerwise_offload=True,
+            env_vars={
+                # Same page-cache contamination as minimax_h3_t2va_2npu: force
+                # the host memory budget so DiT layerwise offload pins layers
+                # instead of falling back to the checkpoint mapping.
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "64",
+            },
             extras=EXTRAS_DISABLE_WARMUP,
         ),
         run_consistency_check=False,
