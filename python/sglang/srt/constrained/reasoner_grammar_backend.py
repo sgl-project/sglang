@@ -294,7 +294,8 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             raise ValueError(
                 "Strict reasoning format requested but the grammar backend does not "
                 "support token filtering. Use a grammar backend that supports token "
-                "filtering (e.g., xgrammar) or disable strict reasoning mode."
+                "filtering (e.g., xgrammar or llguidance) or disable strict reasoning "
+                "mode."
             )
         self._token_filter_fn = (
             self.grammar_backend.set_token_filter if self.enable_token_filter else None
