@@ -4,6 +4,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -138,6 +140,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     logits_output=SimpleNamespace(
                         hidden_states=hidden_states,
                         customized_info=None,
+                        sampling_mask_output=None,
                     ),
                     next_token_ids=torch.tensor([0, 1]),
                     extend_input_len_per_req=[2, 3],
@@ -165,6 +168,134 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 self.assertEqual(last.hidden_states, [[22.0]])
 
 
+class TestPrefillSkippedOutput(CustomTestCase):
+    def test_sampling_mask_middle_chunk_does_not_require_logits_output(self):
+        """A non-token-producing PP chunk may omit its logits output."""
+        req = _PrefillReq(
+            rid="middle",
+            inflight_middle_chunks=1,
+            return_hidden_states=False,
+        )
+        req.return_sampling_mask = True
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            spec_info=None,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=None,
+            next_token_ids=torch.zeros(1, dtype=torch.int64),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=True,
+        )
+        processor = _make_processor(self)
+
+        with patch.object(
+            envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM,
+            "get",
+            return_value=True,
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(req.inflight_middle_chunks, 0)
+        self.assertEqual(req.output_ids, [])
+        processor.output_streamer.stream_output.assert_called_once_with(
+            [req], False, req
+        )
+
+
+class TestDecodeWithoutLogits(CustomTestCase):
+    def test_pipeline_result_commits_token_without_sampling_metadata(self):
+        processor = _make_processor(self)
+        req = _DecodeReq()
+        req.return_hidden_states = False
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            batch_size=lambda: 1,
+        )
+        result = GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.tensor([8]),
+        )
+
+        with (
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor, "_handle_finish_state_updated_req"
+            ),
+        ):
+            processor.process_batch_result_decode(batch, result)
+
+        self.assertEqual(req.output_ids, [8])
+        self.assertEqual(processor.metrics_reporter.num_generated_tokens, 1)
+        processor.output_streamer.stream_output.assert_called_once_with([req], False)
+
+
+class TestSamplingMaskStatusErrors(CustomTestCase):
+    def test_decode_abort_releases_cache_without_committing_token(self):
+        processor = _make_processor(self)
+        req = _DecodeReq()
+        req.output_ids = [7]
+        req.return_sampling_mask = True
+        req.multimodal_inputs = None
+        req.update_finish_state = Mock()
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            batch_size=lambda: 1,
+        )
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=None,
+                next_token_sampling_mask_status=[SamplingMaskStatus.OVERFLOW],
+            ),
+            next_token_ids=torch.tensor([8]),
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
+        ) as release:
+            processor.process_batch_result_decode(batch, result)
+
+        self.assertEqual(req.output_ids, [7])
+        self.assertEqual(req.to_finish.status_code, 400)
+        req.update_finish_state.assert_called_once_with(0)
+        processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(req)
+        release.assert_called_once_with(req, processor.tree_cache, is_insert=False)
+        processor.output_streamer.stream_output.assert_called_once_with([req], False)
+
+    def test_overflow_and_invalid_have_distinct_http_errors(self):
+        processor = _make_processor(self)
+
+        overflow = processor.get_sampling_mask_finish_reason(
+            status=SamplingMaskStatus.OVERFLOW
+        )
+        self.assertEqual(overflow.status_code, 400)
+        self.assertEqual(overflow.err_type, "BadRequestError")
+        self.assertIn("cutoff ties", overflow.message)
+
+        invalid = processor.get_sampling_mask_finish_reason(
+            status=SamplingMaskStatus.INVALID
+        )
+        self.assertEqual(invalid.status_code, 500)
+        self.assertEqual(invalid.err_type, "InternalServerError")
+
+
 class TestDecodeHiddenStateRetention(CustomTestCase):
     def test_last_mode_multi_step_storage_stays_bounded(self):
         processor = _make_processor(self)
@@ -180,7 +311,9 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
 
         def result(hidden_states):
             return GenerationBatchResult(
-                logits_output=SimpleNamespace(hidden_states=hidden_states),
+                logits_output=SimpleNamespace(
+                    hidden_states=hidden_states, sampling_mask_output=None
+                ),
                 speculative_num_draft_tokens=4,
             )
 

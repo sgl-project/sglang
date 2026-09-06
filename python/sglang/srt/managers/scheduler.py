@@ -309,7 +309,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -1501,6 +1500,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
@@ -1547,6 +1547,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
@@ -2884,30 +2885,18 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if (
-            req.return_sampling_mask
-            and self.disaggregation_mode != DisaggregationMode.NULL
-            and not self.disagg_metadata_buffers.enable_sampling_mask
-        ):
-            error_msg = (
-                "return_sampling_mask with disaggregation requires "
-                "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
-        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
-            error_msg = (
-                "return_sampling_mask requires finite top_k; top_p-only sampling "
-                "is valid but can return huge masks in the tail, blowing up "
-                "metadata, so we need a safety cap."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
+        if req.return_sampling_mask:
+            top_k = req.sampling_params.top_k
+            sampling_mask_cap = self.server_args.sampling_mask_max_tokens
+            if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
+                error_msg = (
+                    "return_sampling_mask requires top_k=1 for greedy sampling "
+                    f"or finite 1 < top_k <= {sampling_mask_cap}; got top_k="
+                    f"{top_k}. Lower top_k or increase "
+                    "--sampling-mask-max-tokens."
+                )
+                self._reject_sampling_mask_request(req, error_msg)
+                return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
             # Spec workers do not emit one sampling support per accepted token, so
@@ -2916,9 +2905,7 @@ class Scheduler(
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding."
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            self._reject_sampling_mask_request(req, error_msg)
             return
 
         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
@@ -2928,9 +2915,7 @@ class Scheduler(
                 "return_sampling_mask is not supported with the ascend "
                 "sampling backend."
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            self._reject_sampling_mask_request(req, error_msg)
             return
 
         # Handle multimodal inputs
@@ -3168,6 +3153,13 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
+        """Return a sampling-mask validation error without running the model."""
+        logger.error(f"{error_msg}, {req.rid=}")
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""

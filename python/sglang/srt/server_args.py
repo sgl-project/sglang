@@ -3645,6 +3645,14 @@ class ServerArgs:
         "Enable returning indexer topk indices of layers with indexer with responses.",
         NS("exec.features"),
     ] = False
+    sampling_mask_max_tokens: A[
+        int,
+        "The maximum number of token IDs in a returned sampling mask. Requests "
+        "are aborted if their realized sampling support exceeds this limit. "
+        "Use the same value on disaggregated prefill and decode nodes; clients "
+        "should set top_k below the limit to leave headroom for cutoff ties.",
+        NS("exec.features"),
+    ] = 4096
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
