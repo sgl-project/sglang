@@ -8,14 +8,14 @@ Example usage:
 
 python save_remote_state.py \
     --model-path /path/to/load \
-    --tensor-parallel-size 8 \
+    --tp-size 8 \
     --remote-model-save-url [protocol]://[host]:[port]/[model_name] \
 
 Then, the model can be loaded with
 
 llm = Engine(
     model_path="[protocol]://[host]:[port]/[model_name]",
-    tensor_parallel_size=8,
+    tp_size=8,
 )
 """
 
