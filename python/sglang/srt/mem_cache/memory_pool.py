@@ -1460,6 +1460,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
             "Not enough space for mamba ping pong idx, "
             "try to increase --mamba-full-memory-ratio."
         )
+        # ReplaySSM: a recycled slot carries its previous owner's ring cursor,
+        # and `replayssm_write_pos` is documented as "reset on slot (re)alloc".
+        # `alloc` does this for the live decode slot; do the same here so a
+        # ping-pong slot also enters the buffer with an empty ring.
+        if self.mamba_pool.replayssm_write_pos is not None:
+            self.mamba_pool.replayssm_write_pos[slots] = 0
         buf = torch.full(
             (self.mamba_ping_pong_track_buffer_size,),
             -1,
@@ -1483,6 +1489,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         set_mamba_track_indices_from_reqs reads correct slot indices.
         """
         req.kv.mamba_ping_pong_track_buffer[idx] = value
+        # ReplaySSM: this is the single point where an already-allocated slot
+        # enters a ping-pong buffer (the donate swap and both lazy on-demand
+        # paths), so resetting here upholds the invariant for all of them. A
+        # device-side id must not be compared on the host -- that would force a
+        # cudaStreamSynchronize -- and only the "clear this entry" callers pass
+        # a host-side -1, so branch on the type rather than the value.
+        write_pos_buf = self.mamba_pool.replayssm_write_pos
+        if write_pos_buf is not None:
+            if isinstance(value, torch.Tensor) or value >= 0:
+                write_pos_buf[value] = 0
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.kv.req_pool_idx] = (
             req.kv.mamba_ping_pong_track_buffer
         )
@@ -1507,6 +1523,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 f"next_track_idx={req.kv.mamba_next_track_idx}, "
                 f"rid={req.rid}"
             )
+        # The ReplaySSM ring cursor of the donated slot is already 0 (it was
+        # reset when the slot entered the buffer and only live decode slots
+        # advance the cursor), and set_mamba_ping_pong_slot resets new_slot as
+        # it goes in, so the donated checkpoint and the replacement tracking
+        # window are both consistent without an explicit reset here.
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 

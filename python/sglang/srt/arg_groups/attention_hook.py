@@ -40,6 +40,22 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _replayssm_is_kda(model_config: Any) -> bool:
+    """Arg-time predicate for the KDA gate the pool later exposes as
+    `MambaPool.replayssm_is_kda`.
+
+    Reading `mamba2_cache_params.is_kda` -- what the pool itself reads -- is not
+    an option here: building the cache params needs the parallel widths, and
+    this handler runs before the process groups exist. `KimiLinearCacheParams`
+    is the only params class whose `is_kda` is True and it has exactly two
+    producers, `KimiLinearConfig` and `BailingHybridConfig` with `use_kda`,
+    which is precisely what `kimi_linear_config` matches.
+    """
+    from sglang.srt.configs.hybrid_arch import kimi_linear_config
+
+    return kimi_linear_config(model_config) is not None
+
+
 def handle_attention_backend_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
@@ -333,12 +349,17 @@ def handle_linear_attn_backend(server_args: Any):
     # the COW copy-into-slot path resets the ring cursor) -- so the
     # --disable-radix-cache requirement is dropped.
     #
-    # Slice 2b only wires the no_buffer mamba scheduler strategy (the
-    # default). The extra_buffer strategy donates the track snapshot via
-    # `donate_mamba_ping_pong_slot` with a separate ping-pong slot swap that
-    # does NOT route through MambaPool.copy_from, so the ReplaySSM ring
-    # cursor of the donated/kept slot would not be reset there. Handling
-    # that donation path is a follow-up; for now require no_buffer.
+    # Both mamba scheduler strategies are wired for GDN. no_buffer resets the
+    # ReplaySSM ring cursor in MambaPool.copy_from; under extra_buffer every slot
+    # enters a ping-pong buffer with a zero cursor, and the decode kernel
+    # force-flushes the ring into temporal[slot] at the radix track boundary, so
+    # a donated track snapshot is a complete checkpoint.
+    #
+    # KDA still requires no_buffer: HybridLinearAttnBackend only builds
+    # `replayssm_force_flush` when not is_kda, so a KDA track snapshot would be
+    # taken with ring entries still unfolded -- the ping-pong swap copies the SSM
+    # state but not the pending ring. Lift this once KDA force-flushes at radix
+    # tracking boundaries.
     if cfg.enable_linear_replayssm:
         if decode not in {"triton", "helion"}:
             raise ValueError(
@@ -347,11 +368,15 @@ def handle_linear_attn_backend(server_args: Any):
                 f"--linear-attn-decode-backend={decode!r}."
             )
 
-        if mamba_extra_buffer_of(resolved_view(server_args)):
+        if mamba_extra_buffer_of(resolved_view(server_args)) and _replayssm_is_kda(
+            model_config_of(server_args)
+        ):
             raise ValueError(
-                "--enable-linear-replayssm requires --mamba-radix-cache-strategy "
-                "no_buffer (the default); the extra_buffer ping-pong "
-                "donation path is not yet supported (follow-up). Got "
+                "--enable-linear-replayssm on a KDA model requires "
+                "--mamba-radix-cache-strategy no_buffer (the default); the "
+                "extra_buffer ping-pong donation path does not force-flush the "
+                "KDA ReplaySSM ring at radix tracking boundaries, so the donated "
+                "snapshot would miss pending ring entries. Got "
                 f"--mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
             )
         if cfg.disaggregation_mode != "null":
