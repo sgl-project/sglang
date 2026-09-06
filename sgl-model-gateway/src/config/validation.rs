@@ -321,6 +321,16 @@ impl ConfigValidator {
             });
         }
 
+        if let Some(header) = &config.source_label_header {
+            if header.parse::<http::HeaderName>().is_err() {
+                return Err(ConfigError::InvalidValue {
+                    field: "source_label_header".to_string(),
+                    value: header.clone(),
+                    reason: "Must be a valid HTTP header name".to_string(),
+                });
+            }
+        }
+
         if config.tcp_keepalive_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "tcp_keepalive_secs".to_string(),
@@ -711,6 +721,22 @@ mod tests {
             PolicyConfig::Random,
         );
 
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_source_label_header() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        config.source_label_header = Some("x-request-source".to_string());
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.source_label_header = Some("not a header name".to_string());
         assert!(ConfigValidator::validate(&config).is_err());
     }
 
