@@ -18,10 +18,11 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -34,6 +35,13 @@ if _is_cuda or _is_hip:
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
     )
+if _is_npu:
+    from sgl_kernel_npu.kvcacheio import TransferDirection
+
+    try:
+        from sgl_kernel_npu.kvcacheio import transfer_mamba_state
+    except ImportError:
+        transfer_mamba_state = None
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +329,13 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            # Per-layer indexed copy: this method transfers a single layer
+            # (layer_first layout). The all-layer kernel path is handled by
+            # _copy_tensor_all_layers_lf_pf / load_to_device_per_layer.
+            dst[dst_indices.to(dst.device)] = src[src_indices.to(src.device)].to(
+                dst.device
+            )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -361,6 +376,13 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            # NPU fallback: page-first host buffer -> per-layer device buffer.
+            # host buffer layout is (size, num_layers, 1, *shape); the trailing 1
+            # is the page placeholder dim, so index it out explicitly.
+            dst[dst_indices.to(dst.device)] = src[
+                src_indices.to(src.device), layer_id, 0
+            ].to(dst.device)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -404,6 +426,24 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            # NPU: mirror the load path — the dedicated kernel transfers all
+            # layers at once via a single 2D strided copy
+            # (device layer-first -> host page-first).
+            if transfer_mamba_state is not None:
+                transfer_mamba_state(
+                    device_buf=src_layers,
+                    host_buf=dst,
+                    device_indices=src_indices,
+                    host_indices=dst_indices,
+                    direction=TransferDirection.D2H,
+                )
+            else:
+                # Per-layer fallback when the dedicated kernel is unavailable.
+                for lid in range(num_layers):
+                    dst[dst_indices.to(dst.device), lid, 0] = src_layers[lid][
+                        src_indices.to(dst.device)
+                    ].to(dst.device)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -418,27 +458,47 @@ class MambaPoolHost(HostKVCache):
         is_draft: bool = False,
     ):
         if self.layout in ["page_first", "page_first_direct"]:
-            # no ssm state on conv-only models: nothing to transfer
-            if self.temporal_state_elem_size > 0:
-                self._copy_tensor_pf_lf(
-                    src=self.temporal_buffer,
-                    dst=device_pool.mamba_cache.temporal[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    num_layers=self.num_mamba_layers,
-                    io_backend=io_backend,
-                )
-            for conv_idx in range(len(self.conv_state_shapes)):
-                self._copy_tensor_pf_lf(
-                    src=self.conv_buffer[conv_idx],
-                    dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    num_layers=self.num_mamba_layers,
-                    io_backend=io_backend,
-                )
+            if io_backend == "kernel_ascend" and transfer_mamba_state is not None:
+                # NPU: transfer all layers at once via dedicated kernel.
+                # layer_id == 0 covers every layer, so later calls must skip.
+                if layer_id == 0:
+                    transfer_mamba_state(
+                        device_buf=device_pool.mamba_cache.temporal,
+                        host_buf=self.temporal_buffer,
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        direction=TransferDirection.H2D,
+                    )
+                    for conv_idx in range(len(self.conv_state_shapes)):
+                        transfer_mamba_state(
+                            device_buf=device_pool.mamba_cache.conv[conv_idx],
+                            host_buf=self.conv_buffer[conv_idx],
+                            device_indices=device_indices,
+                            host_indices=host_indices,
+                            direction=TransferDirection.H2D,
+                        )
+            else:
+                # no ssm state on conv-only models: nothing to transfer
+                if self.temporal_state_elem_size > 0:
+                    self._copy_tensor_pf_lf(
+                        src=self.temporal_buffer,
+                        dst=device_pool.mamba_cache.temporal[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        num_layers=self.num_mamba_layers,
+                        io_backend=io_backend,
+                    )
+                for conv_idx in range(len(self.conv_state_shapes)):
+                    self._copy_tensor_pf_lf(
+                        src=self.conv_buffer[conv_idx],
+                        dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        num_layers=self.num_mamba_layers,
+                        io_backend=io_backend,
+                    )
         else:
             self._copy_tensor(
                 self.temporal_buffer[layer_id],

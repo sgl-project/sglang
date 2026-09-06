@@ -279,9 +279,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
-    if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
-        not tree_cache.supports_mamba()
-    ):
+    supports_mamba = tree_cache.supports_mamba()
+    is_hybrid = isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool)
+    if is_hybrid and (not supports_mamba):
         assert req.kv.holds_mamba, (
             "mamba state is freed while the tree cache does not manage mamba states"
         )
