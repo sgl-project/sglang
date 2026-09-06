@@ -236,10 +236,19 @@ class MinimaxM2Detector(BaseFormatDetector):
             self._tool_indices = self._get_tool_indices(tools)
 
         while True:
-            # If we're not in a tool call and don't see a start token, return normal text
+            # If we're not in a tool call and don't see a start token, return normal text.
+            # Hold back a trailing prefix of the start token; streamed one
+            # character at a time it would otherwise never accumulate.
             if not self._in_tool_call and self.tool_call_start_token not in self._buf:
-                normal += self._buf
-                self._buf = ""
+                partial = self._ends_with_partial_token(
+                    self._buf, self.tool_call_start_token
+                )
+                if partial:
+                    normal += self._buf[:-partial]
+                    self._buf = self._buf[-partial:]
+                else:
+                    normal += self._buf
+                    self._buf = ""
                 break
 
             # Look for tool call start
@@ -341,6 +350,17 @@ class MinimaxM2Detector(BaseFormatDetector):
                             self.streamed_args_for_tool[self.current_tool_id] = (
                                 current_streamed + "}"
                             )
+                    else:
+                        # A call with no <parameter> blocks still has arguments:
+                        # the empty object. Emitting nothing leaves them pending.
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters="{}",
+                            )
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] = "{}"
 
                     # Complete the tool call
                     self._buf = self._buf[

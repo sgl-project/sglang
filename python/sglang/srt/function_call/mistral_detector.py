@@ -126,7 +126,14 @@ class MistralDetector(BaseFormatDetector):
         current_text = self._buffer
 
         # No marker: either flush as normal text or keep buffering a partial marker.
-        if self._tool_calls_marker not in current_text:
+        # The marker only appears once per JSON-array sequence, so once a call has
+        # completed the remaining calls arrive behind the separator instead. Treat
+        # that (and any prefix of it) as "still a tool call" rather than prose.
+        mid_sequence = self.current_tool_id > 0 and (
+            current_text.startswith(self.tool_call_separator)
+            or self._ends_with_partial_token(current_text, self.tool_call_separator)
+        )
+        if self._tool_calls_marker not in current_text and not mid_sequence:
             if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
                 normal_text = self._buffer
                 self._buffer = ""
@@ -189,7 +196,7 @@ class MistralDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text="", calls=calls)
 
         # Canonical format delegates to the BaseFormatDetector JSON streaming logic.
-        if self.bot_token in current_text:
+        if self.bot_token in current_text or mid_sequence:
             return super().parse_streaming_increment(new_text="", tools=tools)
 
         # Otherwise, keep buffering.
