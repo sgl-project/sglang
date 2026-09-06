@@ -221,6 +221,42 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
+std::tuple<torch::Tensor, torch::Tensor> convrot_rotate_quantize_activation(const torch::Tensor& x, int64_t group_size);
+torch::Tensor convrot_int8_fused_linear(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_q,
+    const torch::Tensor& weight_scale,
+    const c10::optional<torch::Tensor>& bias,
+    int64_t group_size);
+torch::Tensor convrot_int8_fused_linear_gelu_input(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_q,
+    const torch::Tensor& weight_scale,
+    const c10::optional<torch::Tensor>& bias,
+    int64_t group_size);
+torch::Tensor convrot_int8_fused_linear_out(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_q,
+    const torch::Tensor& weight_scale,
+    const c10::optional<torch::Tensor>& bias,
+    int64_t group_size,
+    torch::Tensor out);
+torch::Tensor convrot_int8_linear_prequant(
+    const torch::Tensor& xq,
+    const torch::Tensor& xs,
+    const torch::Tensor& weight_q,
+    const torch::Tensor& weight_scale,
+    const c10::optional<torch::Tensor>& bias,
+    int64_t group_size);
+torch::Tensor convrot_int8_linear_prequant_out(
+    const torch::Tensor& xq,
+    const torch::Tensor& xs,
+    const torch::Tensor& weight_q,
+    const torch::Tensor& weight_scale,
+    const c10::optional<torch::Tensor>& bias,
+    int64_t group_size,
+    torch::Tensor out);
+std::vector<int64_t> convrot_int8_supported_sm_versions();
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
