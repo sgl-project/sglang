@@ -15,6 +15,13 @@ ARG SG_LANG_BRANCH=main
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
 ARG SG_LANG_KERNEL_BRANCH=main
 
+# sgl-kernel-xpu's DeviceDetection.cmake auto-detect can't run inside
+# `docker build` (no XPU exposed to BuildKit); short-circuit it here.
+# Override with `--build-arg BUILD_TARGET_DEVICE=cri` etc. per workflow.
+ARG BUILD_TARGET_DEVICE=bmg
+ENV BUILD_TARGET_DEVICE=${BUILD_TARGET_DEVICE}
+ENV DPCPP_SYCL_TARGET=${BUILD_TARGET_DEVICE}
+
 USER root
 
 # Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
