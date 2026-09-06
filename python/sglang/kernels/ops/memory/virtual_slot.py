@@ -267,6 +267,13 @@ def write_loc_to_kernel_ids(
     tail cleared here instead of by a follow-up ``zero_``.
     """
     N = int(loc.numel())
+    # The kernel flat-indexes `loc` and `out` (`ptr + offs`), so a strided view
+    # would be silently mis-addressed; the torch chain this replaced tolerated
+    # one.
+    assert loc.is_contiguous(), (
+        f"write_loc_to_kernel_ids: loc must be contiguous, got shape "
+        f"{tuple(loc.shape)} stride {tuple(loc.stride())}"
+    )
     if out is None:
         out = torch.empty_like(loc, dtype=torch.int64)
     width = N if out_width is None else int(out_width)
@@ -277,7 +284,7 @@ def write_loc_to_kernel_ids(
     if out_width is None:
         # Element-for-element: `out` mirrors `loc`, whatever its shape -- a 2-D
         # page table is a legitimate destination.
-        assert out.shape == loc.shape, (
+        assert out.shape == loc.shape and out.is_contiguous(), (
             f"write_loc_to_kernel_ids: out shape {tuple(out.shape)} must match "
             f"loc shape {tuple(loc.shape)}"
         )
