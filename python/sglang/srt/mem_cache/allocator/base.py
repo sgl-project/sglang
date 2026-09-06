@@ -121,10 +121,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         virtual-id pools must override."""
         return kv_indices
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError()
 
     def alloc_extend(self, *args, **kwargs):

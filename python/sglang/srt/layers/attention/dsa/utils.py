@@ -71,8 +71,18 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
-    return original_seq_lens.clamp(max=dsa_index_topk)
+def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int, index_kpool: int = 1):
+    if index_kpool <= 1:
+        return original_seq_lens.clamp(max=dsa_index_topk)
+
+    # Clamp only complete pools; the unfinished tail must remain selectable
+    # outside the pooled top-k budget.
+    full_pool_tokens = (
+        torch.div(original_seq_lens, index_kpool, rounding_mode="floor") * index_kpool
+    )
+    selected_history_tokens = full_pool_tokens.clamp(max=dsa_index_topk)
+    tail_tokens = original_seq_lens - full_pool_tokens
+    return selected_history_tokens + tail_tokens
 
 
 def should_remap_pd_dsa_seed_to_local_slots() -> bool:
