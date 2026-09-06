@@ -13,6 +13,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion import (
+    mount_helios_gated_residual,
+    unmount_helios_gated_residual,
+)
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows_kernel_fusions,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -106,6 +113,26 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
+        self._quality_fusions_mounted = False
+
+    def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
+        # Mount the request-scoped Helios gated-residual fast path for
+        # quality="extra-high"/"high"; "lossless" keeps the reference
+        # FP32-multiply form bit-for-bit.
+        quality = getattr(batch.sampling_params, "quality", "lossless")
+        want = quality_allows_kernel_fusions(quality)
+        if want == self._quality_fusions_mounted:
+            return
+        self._quality_fusions_mounted = want
+        if self.transformer is None:
+            return
+        if want:
+            if mount_helios_gated_residual(self.transformer):
+                logger.info(
+                    "Mounted Helios per-token gated residual for quality=%s", quality
+                )
+        else:
+            unmount_helios_gated_residual(self.transformer)
 
     @property
     def role_affinity(self) -> RoleType:
@@ -481,6 +508,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the Helios chunked denoising loop."""
+        self._maybe_toggle_quality_fusions(batch)
         pipeline_config = server_args.pipeline_config
         scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = (
