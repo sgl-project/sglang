@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kda_kernels import _cuda_source
+from sglang.kernels.opauto import can_use_or_demote
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -128,27 +129,32 @@ def _is_transposed_dense_residual(
 def can_use_residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
-    return (
-        residual.dtype in _SUPPORTED_DTYPES
-        and residual.dtype == update.dtype
-        and residual.dtype == gate.dtype
-        and residual.is_cuda
-        and update.is_cuda
-        and gate.is_cuda
-        and residual.device == update.device == gate.device
-        and residual.dim() >= 2
-        and residual.numel() > 0
-        and update.shape == residual.shape
-        and (
-            gate.shape == residual.shape
-            or _is_row_broadcast_gate(residual, gate)
-            or _is_per_token_gate(residual, gate)
+    def _probe() -> bool:
+        return (
+            residual.dtype in _SUPPORTED_DTYPES
+            and residual.dtype == update.dtype
+            and residual.dtype == gate.dtype
+            and residual.is_cuda
+            and update.is_cuda
+            and gate.is_cuda
+            and residual.device == update.device == gate.device
+            and residual.dim() >= 2
+            and residual.numel() > 0
+            and update.shape == residual.shape
+            and (
+                gate.shape == residual.shape
+                or _is_row_broadcast_gate(residual, gate)
+                or _is_per_token_gate(residual, gate)
+            )
+            and (
+                (residual.is_contiguous() and update.is_contiguous())
+                or _is_transposed_dense_residual(residual, update, gate)
+            )
+            and gate.is_contiguous()
         )
-        and (
-            (residual.is_contiguous() and update.is_contiguous())
-            or _is_transposed_dense_residual(residual, update, gate)
-        )
-        and gate.is_contiguous()
+
+    return can_use_or_demote(
+        "diffusion.residual_gate_add", _probe, backend="jit"
     )
 
 

@@ -1189,6 +1189,12 @@ class Envs:
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    # OpAuto: optional runtime policy over BaseFusedOp / can_use probes.
+    # Off by default (static priority / main behavior). When on: cold-skip JIT,
+    # sticky demote failed backends, optional persist under JIT cache.
+    SGLANG_OPAUTO = EnvBool(False)
+    SGLANG_OPAUTO_COLD_SKIP_JIT = EnvBool(True)
+    SGLANG_OPAUTO_STATE = EnvStr(None)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
 
