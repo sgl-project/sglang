@@ -36,7 +36,12 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai import (
+    chat_encoding,
+    encoding_dsv4,
+    encoding_dsv32,
+    encoding_glm,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -314,6 +319,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
+        self._glm_tool_result_template = encoding_glm.resolve_glm_tool_result_template(
+            hf_config=self.tokenizer_manager.model_config.hf_config,
+            tokenizer=self.tokenizer_manager.tokenizer,
+        )
         self._dsv4_reasoning_effort_profile = (
             chat_encoding.resolve_dsv4_reasoning_effort_profile(
                 model_path=self.tokenizer_manager.model_path,
@@ -1490,11 +1499,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._handle_last_assistant_message(openai_compatible_messages, request)
             )
 
+            glm_tool_result_template = encoding_glm.glm_template_for_request(
+                self._glm_tool_result_template, request.chat_template_kwargs
+            )
+            if glm_tool_result_template is not None:
+                openai_compatible_messages = encoding_glm.order_glm_tool_results(
+                    openai_compatible_messages
+                )
+
             extra_template_kwargs = {}
             if request.reasoning_effort is not None:
                 extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
+            if glm_tool_result_template is not None:
+                extra_template_kwargs["chat_template"] = glm_tool_result_template
 
             rc = self.template_manager.reasoning_config
             if rc is not None and rc.effort_kwarg is not None:
