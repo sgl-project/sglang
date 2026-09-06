@@ -388,7 +388,8 @@ template <
     int kTmaStages = kNumChunks,
     bool kUsePDL = false>
 // Shapes below use K3's per-TP-rank sizing (linear_attn_config: num_heads=96 over
-// TP={8,16,32} -> H=HV={12,6,3} local heads; head_dim=128 -> kDimK=kDimV=128; kSeg = H*128;
+// TP={4,8,16,32} -> H=HV={24,12,6,3} local heads; head_dim=128 ->
+// kDimK=kDimV=128; kSeg = H*128;
 // short_conv_kernel_size=4 -> kKernelWidth=4, kConvStateWidth=3). B is the live
 // (post-padding, under kUseStaticDecodeLayout) decode batch size; slots is the
 // recurrent-state / conv-cache pool capacity, addressed by ssm_state_indices, not B.
@@ -881,7 +882,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 }
 
 // K3 decode configuration of the many-heads kernel: onorm fused, static
-// H = HV in {3, 6, 12} layout with a (B, HV) grid, onorm params preloaded, next state
+// H = HV in {3, 6, 12, 24} layout with a (B, HV) grid, onorm params preloaded, next state
 // chunk prefetched, active onorm reduction, conv cache updated in place,
 // beta sigmoid in-kernel. Both forget-gate variants are compiled (softplus
 // and lower-bounded sigmoid) and selected at launch from the model config.
@@ -948,7 +949,8 @@ struct KdaFusedDecodeKernel {
     using namespace host;
 
     const int64_t kH = A_log.shape()[0];
-    RuntimeCheck(kH == 3 || kH == 6 || kH == 12, "KDA fused decode supports local head counts 3, 6, or 12, got ", kH);
+    RuntimeCheck(kH == 3 || kH == 6 || kH == 12 || kH == 24,
+                 "KDA fused decode supports local head counts 3, 6, 12, or 24, got ", kH);
     const int64_t kSeg = kH * 128;  // q, k and v segment width
 
     auto B_ = SymbolicSize{"batch"};
@@ -1014,7 +1016,8 @@ struct KdaFusedDecodeKernel {
     }
     auto kernel = kH == 3 ? select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages)
                           : (kH == 6 ? select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages)
-                                     : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages));
+                                     : (kH == 12 ? select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages)
+                                                 : select_kda_fused_decode_k3_kernel<24, kUsePDL>(use_lower_bound, tma_stages)));
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
     const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
     host::RuntimeDeviceCheck(
