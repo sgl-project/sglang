@@ -20,11 +20,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_CPU_AMX_BACKEND = "sglang.multimodal_gen.runtime.layers.attention.backends.cpu_amx.CPUAMXAttentionBackend"
-_SDPA_BACKEND = (
-    "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-)
-
 
 class CpuPlatform(Platform):
     _enum = PlatformEnum.CPU
@@ -107,33 +102,16 @@ class CpuPlatform(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        can_use_cpu_amx = (
-            cls.get_cpu_architecture() == CpuArchEnum.X86
-            and dtype == torch.bfloat16
-            and head_size == 128
+        if selected_backend not in (None, AttentionBackendEnum.TORCH_SDPA):
+            logger.warning(
+                "%s is not supported on CPU; falling back to Torch SDPA.",
+                selected_backend,
+            )
+
+        logger.info("Using Torch SDPA backend for CPU.")
+        return (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
         )
-
-        if selected_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info("Using Torch SDPA backend for CPU.")
-            return _SDPA_BACKEND
-
-        if selected_backend == AttentionBackendEnum.CPU_AMX:
-            if not can_use_cpu_amx:
-                raise ValueError(
-                    "cpu_amx attention backend on CPU requires x86 + bf16 + head_size=128"
-                )
-            logger.info("Using CPU AMX packed-varlen attention backend.")
-            return _CPU_AMX_BACKEND
-
-        if selected_backend is not None:
-            raise ValueError(f"{selected_backend} is not supported on CPU")
-
-        logger.info(
-            "Using Torch SDPA backend for CPU by default (dtype=%s head_size=%s).",
-            dtype,
-            head_size,
-        )
-        return _SDPA_BACKEND
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
