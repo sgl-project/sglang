@@ -17,6 +17,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ToleranceConfig,
 )
 
+pytest_plugins = ["pytester"]
+
 
 def _perf_record():
     return RequestPerfRecord(
@@ -60,7 +62,7 @@ def harness(monkeypatch):
         ),
     )
     runner = test_server_common.DiffusionServerBase()
-    monkeypatch.setattr(type(runner), "_perf_results", [])
+    runner._perf_results = []
     monkeypatch.setattr(test_server_common, "_PENDING_BASELINE_DUMPS", {})
     monkeypatch.setattr(test_server_common, "get_generate_fn", Mock())
     monkeypatch.setattr(runner, "_validate_consistency", Mock())
@@ -225,6 +227,47 @@ def test_report_keeps_both_requests_and_replaces_retry(tmp_path):
     conftest._write_results_json(records, str(path))
     conftest._write_results_json([{**records[0], "e2e_ms": 3}], str(path))
     assert json.loads(path.read_text()) == [{**records[0], "e2e_ms": 3}, records[1]]
+
+
+def test_perf_fixture_retains_failed_case_results(pytester, monkeypatch):
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    pytester.makeconftest(
+        'pytest_plugins = ["sglang.multimodal_gen.test.server.conftest"]'
+    )
+    pytester.makepyfile(
+        """
+        import pytest
+
+        from sglang.multimodal_gen.test.server.test_server_common import DiffusionServerBase
+        from sglang.multimodal_gen.test.server.testcase_configs import (
+            DiffusionServerArgs, DiffusionTestCase, PerformanceSummary,
+        )
+
+        class TestRequests(DiffusionServerBase):
+            @pytest.mark.parametrize("case_id", ["failed", "passed"])
+            def test_diffusion_generation(self, case_id):
+                assert self._perf_results == []
+                case = DiffusionTestCase(case_id, DiffusionServerArgs("test"))
+                summary = PerformanceSummary(100, 5, 5, {}, [], {}, {})
+                for index in (1, 2):
+                    self._record_performance_result(case, summary, index)
+                if case_id == "failed":
+                    pytest.fail("recorded failure")
+
+        class TestOtherRequests(TestRequests):
+            pass
+        """
+    )
+    result = pytester.runpytest_subprocess("-q")
+    result.assert_outcomes(passed=2, failed=2)
+    records = json.loads((pytester.path / "diffusion-results.json").read_text())
+    assert len(records) == 8
+    assert {(r["class_name"], r["test_name"], r["request_index"]) for r in records} == {
+        (suite, case_id, index)
+        for suite in ("TestRequests", "TestOtherRequests")
+        for case_id in ("failed", "passed")
+        for index in (1, 2)
+    }
 
 
 def test_gt_generation_runs_both_requests(harness, monkeypatch):

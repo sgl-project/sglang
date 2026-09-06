@@ -24,7 +24,6 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     RealtimeChunkStats,
     pop_realtime_key_frames,
@@ -263,35 +262,14 @@ class DiffusionServerBase:
     Each case gets its own server instance via the parametrized fixture.
     """
 
-    _perf_results: list[dict[str, Any]] = []
-    _pytest_config = None  # Store pytest config for stash access
-
-    @classmethod
-    def setup_class(cls):
-        cls._perf_results = []
-
-    @classmethod
-    def teardown_class(cls):
-        print(
-            f"\n[DEBUG teardown_class] Called for {cls.__name__}, _perf_results has {len(cls._perf_results)} entries"
-        )
-        if cls._pytest_config:
-            # Add results to pytest stash (shared across all import contexts)
-            for result in cls._perf_results:
-                result["class_name"] = cls.__name__
-            conftest.add_perf_results(cls._pytest_config, cls._perf_results)
-            print(
-                f"[DEBUG teardown_class] Added {len(cls._perf_results)} results to stash"
-            )
-        else:
-            print(
-                "[DEBUG teardown_class] No pytest_config available, skipping stash update"
-            )
+    _perf_results: list[dict[str, Any]]
 
     @pytest.fixture(autouse=True)
-    def _capture_pytest_config(self, request):
-        """Capture pytest config for use in teardown_class."""
-        self.__class__._pytest_config = request.config
+    def _collect_perf_results(self, perf_results):
+        """Keep case results isolated and retain them even when validation fails."""
+        self._perf_results = []
+        yield
+        perf_results.extend(self._perf_results)
 
     def _client(self, ctx: ServerContext) -> OpenAI:
         """Get OpenAI client for the server."""
@@ -568,6 +546,7 @@ class DiffusionServerBase:
         request_index: int = 1,
     ) -> None:
         result = {
+            "class_name": type(self).__name__,
             "test_name": case.id,
             "request_index": request_index,
             "modality": case.server_args.modality,
@@ -590,10 +569,7 @@ class DiffusionServerBase:
                 }
             )
 
-        self.__class__._perf_results.append(result)
-        print(
-            f"[DEBUG _validate_and_record] Appended result for {case.id}, class {self.__class__.__name__} now has {len(self.__class__._perf_results)} results"
-        )
+        self._perf_results.append(result)
 
     def _print_performance_log(
         self,
