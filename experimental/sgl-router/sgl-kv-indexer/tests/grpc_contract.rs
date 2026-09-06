@@ -34,7 +34,7 @@ use sgl_kv_indexer::{
     PrefixIndex, PrefixIndexConfig, MAX_GRPC_DECODING_MESSAGE_SIZE,
 };
 use test_id::nanos;
-use test_kv::{action, apply_request, hbm};
+use test_kv::{action, action_with_parent, apply_request, hbm};
 use test_net::free_addr;
 
 async fn start_backend(
@@ -211,6 +211,27 @@ fn apply_report(
     )
 }
 
+fn apply_report_with_parent(
+    worker: &str,
+    addr: &str,
+    seq: u64,
+    tier: i32,
+    parent_block_hash: Option<i64>,
+    hashes: &[i64],
+) -> ApplyExternalKvBatchRequest {
+    apply_request(
+        worker,
+        addr,
+        seq,
+        vec![action_with_parent(
+            ExternalKvActionType::ActionReport,
+            tier,
+            parent_block_hash,
+            hashes,
+        )],
+    )
+}
+
 #[tokio::test]
 async fn multiple_workers_share_one_indexer_server() {
     let mut indexer = start().await;
@@ -225,7 +246,7 @@ async fn multiple_workers_share_one_indexer_server() {
             "10.0.0.1:9000",
             1,
             hbm(),
-            &[hash_0, shared_hash],
+            &[shared_hash, hash_0],
         ))
         .await
         .expect("apply worker-0");
@@ -235,7 +256,7 @@ async fn multiple_workers_share_one_indexer_server() {
             "10.0.0.2:9000",
             1,
             hbm(),
-            &[hash_1, shared_hash],
+            &[shared_hash, hash_1],
         ))
         .await
         .expect("apply worker-1");
@@ -309,6 +330,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
             hashes: vec![1],
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
+            parent_block_hash: None,
         }],
     };
     let err = c
@@ -358,12 +380,14 @@ async fn prefix_query_scans_more_than_one_apply_chunk_over_grpc() {
     let mut indexer = start().await;
     let hashes: Vec<i64> = (0..=APPLY_CHUNK_SIZE as i64).collect();
     for (seq, chunk) in hashes.chunks(APPLY_CHUNK_SIZE).enumerate() {
+        let parent_block_hash = (seq > 0).then_some(chunk[0] - 1);
         indexer
-            .apply_external_kv_batch(apply_report(
+            .apply_external_kv_batch(apply_report_with_parent(
                 "large-prefix-worker",
                 "10.0.0.1:9000",
                 seq as u64,
                 hbm(),
+                parent_block_hash,
                 chunk,
             ))
             .await

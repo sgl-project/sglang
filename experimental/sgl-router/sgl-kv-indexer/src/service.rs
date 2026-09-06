@@ -775,6 +775,7 @@ mod tests {
             hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
+            parent_block_hash: None,
         }
     }
 

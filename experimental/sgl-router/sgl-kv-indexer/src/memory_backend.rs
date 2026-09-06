@@ -7,7 +7,7 @@
 //! atomic and every query a consistent snapshot. The state is soft: not shared
 //! with another server, and lost when the process exits.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tonic::Status;
@@ -16,17 +16,32 @@ use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
     ExternalKvNodeMatch, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
     HitCountEntry, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
-    MatchExternalKvRequest, MatchExternalKvResponse, TierHashes, WorkerCacheSpec,
+    MatchExternalKvRequest, MatchExternalKvResponse, TierHashes, TierType, WorkerCacheSpec,
 };
-use crate::service::{assemble_prefix_response, prefix_limit, WorkerPrefixScanner};
+use crate::service::{assemble_prefix_response, prefix_limit, WorkerPrefixScanner, COMPONENT_FULL};
 use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ParentLink {
+    #[default]
+    Unknown,
+    Root,
+    Hash(i64),
+}
 
 #[derive(Debug, Default)]
 struct BlockRecord {
+    /// Chain relationship reported by the worker. Prefix-derived state is valid
+    /// only along links rooted at `Root`.
+    parent: ParentLink,
+    children: HashSet<i64>,
     /// Shared block token count. A zero value means legacy/unspecified.
     token_count: u32,
     /// Resident component snapshot for each `(worker, tier)`.
     placements: HashMap<(String, i32), u32>,
+    /// Workers for which the root-to-this-block prefix is complete and this
+    /// boundary is servable by the Legacy/FULL-only fast path.
+    prefix_complete_workers: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -35,6 +50,9 @@ struct WorkerRecord {
     spec: Option<WorkerCacheSpec>,
     /// Reverse index used by CLEAR_ALL_AT_TIER.
     holdings: HashMap<i32, HashSet<i64>>,
+    /// Number of non-legacy component placements. A spec-less worker can use
+    /// the derived fast path only while this is zero.
+    component_placement_count: usize,
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +75,12 @@ struct PrefixCandidate {
     worker_id: String,
     address: String,
     scanner: WorkerPrefixScanner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastPathKind {
+    Legacy,
+    FullOnly { tier_mask: u32 },
 }
 
 /// Single-process, soft-state KV placement index.
@@ -89,6 +113,8 @@ impl InMemoryKvIndexerBackend {
         let mut state = self.write_state()?;
         let worker_id = req.worker_id;
 
+        let previous_fast_path = state.workers.get(&worker_id).and_then(fast_path_kind);
+
         // Address and spec are snapshots carried on every batch. Empty address
         // makes the worker unroutable; absent spec returns it to legacy mode.
         {
@@ -97,16 +123,18 @@ impl InMemoryKvIndexerBackend {
             worker.spec = req.cache_spec;
         }
 
+        let mut dirty_roots = Vec::new();
+        let mut revoked_hashes = Vec::new();
+        let mut recompute_from_graph_roots = false;
         for action in req.actions {
             match ExternalKvActionType::try_from(action.r#type) {
                 Ok(ExternalKvActionType::ActionReport) => {
                     let has_masks = !action.component_masks.is_empty();
                     let has_sizes = !action.block_sizes.is_empty();
+                    let hashes = action.hashes;
+                    link_report_chain(&mut state, action.parent_block_hash, &hashes)?;
 
-                    // REPORT is a REPLACE snapshot. Keep the final occurrence
-                    // when a coalesced action repeats one hash.
-                    let mut last_by_hash: HashMap<i64, (u32, u32)> = HashMap::new();
-                    for (index, hash) in action.hashes.into_iter().enumerate() {
+                    for (index, hash) in hashes.iter().copied().enumerate() {
                         let mask = if has_masks {
                             action.component_masks[index]
                         } else {
@@ -117,18 +145,22 @@ impl InMemoryKvIndexerBackend {
                         } else {
                             0
                         };
-                        last_by_hash.insert(hash, (mask, token_count));
-                    }
-
-                    for (hash, (mask, token_count)) in last_by_hash {
-                        let block = state.blocks.entry(hash).or_default();
-                        block
+                        let old_mask = state
+                            .blocks
+                            .entry(hash)
+                            .or_default()
                             .placements
                             .insert((worker_id.clone(), action.tier), mask);
+                        adjust_component_placement_count(
+                            &mut state,
+                            &worker_id,
+                            old_mask,
+                            Some(mask),
+                        );
                         // A legacy report carries no size, so 0 means
                         // "unknown" and must not erase a known count.
                         if token_count > 0 {
-                            block.token_count = token_count;
+                            state.blocks.entry(hash).or_default().token_count = token_count;
                         }
                         state
                             .workers
@@ -139,13 +171,20 @@ impl InMemoryKvIndexerBackend {
                             .or_default()
                             .insert(hash);
                     }
+                    if let Some(first) = hashes.first() {
+                        dirty_roots.push(*first);
+                    }
                 }
                 Ok(ExternalKvActionType::ActionRevoke) => {
+                    recompute_from_graph_roots = true;
                     for hash in action.hashes {
                         revoke_one(&mut state, &worker_id, &hash, action.tier);
+                        dirty_roots.push(hash);
+                        revoked_hashes.push(hash);
                     }
                 }
                 Ok(ExternalKvActionType::ActionClearAllAtTier) => {
+                    recompute_from_graph_roots = true;
                     let hashes = state
                         .workers
                         .get(&worker_id)
@@ -154,12 +193,33 @@ impl InMemoryKvIndexerBackend {
                         .unwrap_or_default();
                     for hash in hashes {
                         revoke_one(&mut state, &worker_id, &hash, action.tier);
+                        dirty_roots.push(hash);
+                        revoked_hashes.push(hash);
                     }
                 }
                 Ok(ExternalKvActionType::ActionUnknown) | Err(_) => {
                     return Err(Status::invalid_argument("unsupported action type"));
                 }
             }
+        }
+
+        let current_fast_path = state.workers.get(&worker_id).and_then(fast_path_kind);
+        if previous_fast_path != current_fast_path {
+            for block in state.blocks.values_mut() {
+                block.prefix_complete_workers.remove(&worker_id);
+            }
+            recompute_from_graph_roots = true;
+        }
+        if recompute_from_graph_roots {
+            dirty_roots = state
+                .blocks
+                .iter()
+                .filter_map(|(hash, block)| (block.parent == ParentLink::Root).then_some(*hash))
+                .collect();
+        }
+        recompute_worker_subtrees(&mut state, &worker_id, dirty_roots);
+        for hash in revoked_hashes {
+            prune_empty_leaf(&mut state, hash);
         }
 
         Ok(ApplyExternalKvBatchResponse {})
@@ -302,11 +362,28 @@ impl InMemoryKvIndexerBackend {
                 blocks_read: 1,
             });
         };
+        let known_prefix_len = known_request_prefix_len(&state, hashes).unwrap_or(0);
+        let fast_worker_ids: HashSet<&str> = if known_prefix_len > 0 {
+            first
+                .prefix_complete_workers
+                .iter()
+                .filter_map(|worker_id| {
+                    state.workers.get(worker_id).and_then(|worker| {
+                        (fast_path_kind(worker).is_some() && !worker.address.is_empty())
+                            .then_some(worker_id.as_str())
+                    })
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let mut seen = HashSet::new();
         let mut candidates: Vec<PrefixCandidate> = first
             .placements
             .keys()
-            .filter(|(worker, _)| seen.insert(worker.as_str()))
+            .filter(|(worker, _)| {
+                !fast_worker_ids.contains(worker.as_str()) && seen.insert(worker.as_str())
+            })
             .map(|(worker, _)| {
                 let metadata = state.workers.get(worker);
                 PrefixCandidate {
@@ -332,41 +409,61 @@ impl InMemoryKvIndexerBackend {
                 tier_masks: Vec::new(),
             })
             .collect();
-
-        for hash in hashes {
-            present.fill(false);
-            for block in &mut block_views {
-                block.token_count = 0;
-                block.tier_masks.clear();
+        let mut entries = Vec::with_capacity(fast_worker_ids.len() + candidates.len());
+        let mut unresolved = fast_worker_ids;
+        for (index, hash) in hashes[..known_prefix_len].iter().enumerate().rev() {
+            if unresolved.is_empty() {
+                break;
             }
             if let Some(block) = state.blocks.get(hash) {
-                for ((worker, tier), mask) in &block.placements {
-                    let Some(&index) = candidate_by_id.get(worker) else {
+                for worker_id in &block.prefix_complete_workers {
+                    if !unresolved.remove(worker_id.as_str()) {
                         continue;
-                    };
-                    present[index] = true;
-                    block_views[index].token_count = block.token_count;
-                    block_views[index].tier_masks.push((*tier, *mask));
+                    }
+                    if let Some(worker) = state.workers.get(worker_id) {
+                        entries.push((
+                            worker_id.clone(),
+                            worker.address.clone(),
+                            (index + 1) as u32,
+                        ));
+                    }
                 }
-            }
-            for (index, candidate) in candidates.iter_mut().enumerate() {
-                candidate
-                    .scanner
-                    .push(present[index].then_some(&block_views[index]));
             }
         }
 
-        let entries = candidates
-            .into_iter()
-            .filter_map(|candidate| {
-                let prefix = candidate.scanner.prefix();
-                (!candidate.address.is_empty() && prefix > 0).then_some((
-                    candidate.worker_id,
-                    candidate.address,
-                    prefix,
-                ))
-            })
-            .collect();
+        if !candidates.is_empty() {
+            for hash in hashes {
+                present.fill(false);
+                for block in &mut block_views {
+                    block.token_count = 0;
+                    block.tier_masks.clear();
+                }
+                if let Some(block) = state.blocks.get(hash) {
+                    for ((worker, tier), mask) in &block.placements {
+                        let Some(&index) = candidate_by_id.get(worker) else {
+                            continue;
+                        };
+                        present[index] = true;
+                        block_views[index].token_count = block.token_count;
+                        block_views[index].tier_masks.push((*tier, *mask));
+                    }
+                }
+                for (index, candidate) in candidates.iter_mut().enumerate() {
+                    candidate
+                        .scanner
+                        .push(present[index].then_some(&block_views[index]));
+                }
+            }
+        }
+
+        entries.extend(candidates.into_iter().filter_map(|candidate| {
+            let prefix = candidate.scanner.prefix();
+            (!candidate.address.is_empty() && prefix > 0).then_some((
+                candidate.worker_id,
+                candidate.address,
+                prefix,
+            ))
+        }));
         Ok(assemble_prefix_response(entries, limit as u32))
     }
 
@@ -392,12 +489,162 @@ impl InMemoryKvIndexerBackend {
     }
 }
 
-fn revoke_one(state: &mut State, worker_id: &str, hash: &i64, tier: i32) {
-    let mut remove_block = false;
-    if let Some(block) = state.blocks.get_mut(hash) {
-        block.placements.remove(&(worker_id.to_string(), tier));
-        remove_block = block.placements.is_empty();
+fn fast_path_kind(worker: &WorkerRecord) -> Option<FastPathKind> {
+    match worker.spec.as_ref() {
+        None if worker.component_placement_count == 0 => Some(FastPathKind::Legacy),
+        Some(spec) if spec.version <= 1 && spec.components == COMPONENT_FULL => {
+            Some(FastPathKind::FullOnly {
+                tier_mask: spec.full_tier_mask,
+            })
+        }
+        _ => None,
     }
+}
+
+fn tier_in_mask(mask: u32, tier: i32) -> bool {
+    tier >= 0 && mask & (1u32 << tier) != 0
+}
+
+fn block_servable(state: &State, hash: i64, worker_id: &str, kind: FastPathKind) -> bool {
+    match kind {
+        // A globally component-free legacy worker only needs membership, which
+        // its reverse holdings index answers without scanning every other
+        // worker placed on this popular block.
+        FastPathKind::Legacy => state.workers.get(worker_id).is_some_and(|worker| {
+            worker
+                .holdings
+                .values()
+                .any(|hashes| hashes.contains(&hash))
+        }),
+        FastPathKind::FullOnly { tier_mask } => {
+            let indexer_tiers =
+                (1 << (TierType::TierHbm as u32)) | (1 << (TierType::TierDram as u32));
+            state.blocks.get(&hash).is_some_and(|block| {
+                block.placements.iter().any(|((worker, tier), mask)| {
+                    worker == worker_id
+                        && mask & COMPONENT_FULL != 0
+                        && tier_in_mask(indexer_tiers & tier_mask, *tier)
+                })
+            })
+        }
+    }
+}
+
+fn link_report_chain(
+    state: &mut State,
+    parent_block_hash: Option<i64>,
+    hashes: &[i64],
+) -> Result<(), Status> {
+    let mut parent = parent_block_hash.map_or(ParentLink::Root, ParentLink::Hash);
+    for hash in hashes {
+        if parent == ParentLink::Hash(*hash) {
+            return Err(Status::invalid_argument(
+                "block hash cannot be its own parent",
+            ));
+        }
+        let existing = state
+            .blocks
+            .get(hash)
+            .map(|block| block.parent)
+            .unwrap_or_default();
+        if existing != ParentLink::Unknown && existing != parent {
+            return Err(Status::invalid_argument(format!(
+                "block hash {hash} was reported with conflicting parents"
+            )));
+        }
+        if let ParentLink::Hash(parent_hash) = parent {
+            state
+                .blocks
+                .entry(parent_hash)
+                .or_default()
+                .children
+                .insert(*hash);
+        }
+        state.blocks.entry(*hash).or_default().parent = parent;
+        parent = ParentLink::Hash(*hash);
+    }
+    Ok(())
+}
+
+fn adjust_component_placement_count(
+    state: &mut State,
+    worker_id: &str,
+    old_mask: Option<u32>,
+    new_mask: Option<u32>,
+) {
+    let worker = state.workers.entry(worker_id.to_string()).or_default();
+    if old_mask.is_some_and(|mask| mask != 0) {
+        worker.component_placement_count = worker.component_placement_count.saturating_sub(1);
+    }
+    if new_mask.is_some_and(|mask| mask != 0) {
+        worker.component_placement_count = worker.component_placement_count.saturating_add(1);
+    }
+}
+
+fn recompute_worker_subtrees(
+    state: &mut State,
+    worker_id: &str,
+    roots: impl IntoIterator<Item = i64>,
+) {
+    let kind = state.workers.get(worker_id).and_then(fast_path_kind);
+    let mut queue: VecDeque<i64> = roots.into_iter().collect();
+    let mut visited = HashSet::new();
+    while let Some(hash) = queue.pop_front() {
+        if !visited.insert(hash) {
+            continue;
+        }
+        let Some(block) = state.blocks.get(&hash) else {
+            continue;
+        };
+        let parent_complete = match block.parent {
+            ParentLink::Unknown => false,
+            ParentLink::Root => true,
+            ParentLink::Hash(parent) => state
+                .blocks
+                .get(&parent)
+                .is_some_and(|parent| parent.prefix_complete_workers.contains(worker_id)),
+        };
+        let complete = kind
+            .is_some_and(|kind| parent_complete && block_servable(state, hash, worker_id, kind));
+        let children: Vec<i64> = block.children.iter().copied().collect();
+        let block = state.blocks.get_mut(&hash).expect("block exists");
+        if complete {
+            block.prefix_complete_workers.insert(worker_id.to_string());
+        } else {
+            block.prefix_complete_workers.remove(worker_id);
+        }
+        queue.extend(children);
+    }
+}
+
+/// Returns the length of the longest leading request chain already known to the
+/// Indexer. A missing block starts the normal uncached suffix; a present block
+/// with the wrong parent is a chain conflict and disables the derived fast path.
+fn known_request_prefix_len(state: &State, hashes: &[i64]) -> Option<usize> {
+    let mut known = 0;
+    for (index, hash) in hashes.iter().enumerate() {
+        let expected = if index == 0 {
+            ParentLink::Root
+        } else {
+            ParentLink::Hash(hashes[index - 1])
+        };
+        let Some(block) = state.blocks.get(hash) else {
+            break;
+        };
+        if block.parent != expected {
+            return None;
+        }
+        known += 1;
+    }
+    Some(known)
+}
+
+fn revoke_one(state: &mut State, worker_id: &str, hash: &i64, tier: i32) {
+    let mut removed_mask = None;
+    if let Some(block) = state.blocks.get_mut(hash) {
+        removed_mask = block.placements.remove(&(worker_id.to_string(), tier));
+    }
+    adjust_component_placement_count(state, worker_id, removed_mask, None);
 
     if let Some(worker) = state.workers.get_mut(worker_id) {
         if let Some(hashes) = worker.holdings.get_mut(&tier) {
@@ -408,9 +655,35 @@ fn revoke_one(state: &mut State, worker_id: &str, hash: &i64, tier: i32) {
         }
     }
 
-    if remove_block {
-        state.blocks.remove(hash);
+    if state
+        .blocks
+        .get(hash)
+        .is_some_and(|block| block.placements.is_empty())
+    {
         state.hit_counts.remove(hash);
+    }
+}
+
+fn prune_empty_leaf(state: &mut State, mut hash: i64) {
+    loop {
+        let Some(block) = state.blocks.get(&hash) else {
+            return;
+        };
+        if !block.placements.is_empty()
+            || !block.children.is_empty()
+            || !block.prefix_complete_workers.is_empty()
+        {
+            return;
+        }
+        let parent = block.parent;
+        state.blocks.remove(&hash);
+        let ParentLink::Hash(parent_hash) = parent else {
+            return;
+        };
+        if let Some(parent) = state.blocks.get_mut(&parent_hash) {
+            parent.children.remove(&hash);
+        }
+        hash = parent_hash;
     }
 }
 
@@ -496,5 +769,15 @@ mod tests {
             .unwrap();
         drop(read_guard);
         query.join().unwrap();
+    }
+
+    #[test]
+    fn known_request_prefix_stops_at_uncached_suffix_and_rejects_conflicts() {
+        let mut state = State::default();
+        link_report_chain(&mut state, None, &[1, 2, 3]).unwrap();
+        link_report_chain(&mut state, None, &[9]).unwrap();
+
+        assert_eq!(known_request_prefix_len(&state, &[1, 2, 3, 4, 5]), Some(3));
+        assert_eq!(known_request_prefix_len(&state, &[1, 9]), None);
     }
 }
