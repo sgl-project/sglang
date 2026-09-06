@@ -8,6 +8,8 @@ import os
 
 import aiter
 import torch
+import triton
+import triton.language as tl
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -36,20 +38,132 @@ if _use_fp8_attn:
     logger.info("DiT FP8 attention enabled via SGLANG_DIFFUSION_AITER_FP8_ATTN=1")
 
 
-@torch.compile(dynamic=False)
+@triton.jit
+def _per_tensor_quant_fp8_kernel(
+    x_ptr,
+    y_ptr,
+    scale_ptr,
+    scratch_ptr,  # int32[3]: [0] = barrier counter, [1]/[2] = amax bits (ping-pong)
+    n_elements,
+    gen,  # launch generation, monotonically increasing
+    INV_FP8_MAX: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    MAX_SPIN: tl.constexpr,
+):
+    """Grid-wide amax reduction plus rescale-and-cast, in a single launch.
+
+    The grid is persistent (one program per CU) and the two phases are separated
+    by a grid-wide barrier, so all ``NUM_PROGRAMS`` programs must be co-resident.
+    No host-side scratch reset is needed: the amax slot ping-pongs between two
+    generations, and each launch clears the slot the next one reduces into.
+    """
+    pid = tl.program_id(0)
+    cur = 1 + (gen % 2)
+    nxt = 1 + ((gen + 1) % 2)
+    stride = NUM_PROGRAMS * BLOCK
+
+    # phase 1: per-program amax, folded into one global atomic_max
+    local_amax = 0.0
+    start = pid * BLOCK
+    while start < n_elements:
+        off = start + tl.arange(0, BLOCK)
+        mask = off < n_elements
+        x = tl.load(x_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        local_amax = tl.maximum(local_amax, tl.max(tl.abs(x)))
+        start += stride
+
+    # amax is non-negative, so int ordering of the bit pattern matches float order
+    tl.atomic_max(scratch_ptr + cur, local_amax.to(tl.int32, bitcast=True))
+
+    # Grid-wide barrier. The spin has to be a *bounded* loop: with the trip count
+    # driven only by the atomic, the compiler hoists the load out of the loop and
+    # the kernel hangs on any grid large enough that a program actually spins.
+    tl.debug_barrier()
+    tl.atomic_add(scratch_ptr, 1)
+    target = (gen + 1) * NUM_PROGRAMS
+    i = 0
+    while i < MAX_SPIN:
+        if tl.atomic_add(scratch_ptr, 0) >= target:
+            i = MAX_SPIN
+        else:
+            i += 1
+
+    amax = tl.atomic_add(scratch_ptr + cur, 0).to(tl.float32, bitcast=True)
+    # Multiply by the reciprocal rather than divide: torch lowers ``amax / 448.0``
+    # that way, and the two differ by 1 ULP -- enough to move the elements that
+    # saturate and so to break bit-exactness with aiter.
+    scale = amax * INV_FP8_MAX
+
+    if pid == 0:
+        tl.store(scale_ptr, scale)
+        tl.store(scratch_ptr + nxt, 0)
+
+    # phase 2: rescale + cast
+    start = pid * BLOCK
+    while start < n_elements:
+        off = start + tl.arange(0, BLOCK)
+        mask = off < n_elements
+        x = tl.load(x_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        y = tl.fdiv(x, scale, ieee_rounding=True)
+        tl.store(y_ptr + off, y.to(y_ptr.dtype.element_ty), mask=mask)
+        start += stride
+
+
+_QUANT_MAX_PROGRAMS = 256  # gfx950 CU count
+_QUANT_BLOCK = 16384  # with num_warps=4, swept best on the Wan2.2 q/k/v shapes
+_QUANT_NUM_WARPS = 4
+
+# Per device: the persistent grid size and the int32[3] barrier/amax scratch.
+_quant_grid: dict[torch.device, int] = {}
+_quant_scratch: dict[torch.device, torch.Tensor] = {}
+_quant_gen: dict[torch.device, int] = {}
+
+
 def _per_tensor_quant_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Bit-exact drop-in for ``aiter.per_tensor_quant(x, quant_dtype=fp8)``, 5.6x
-    faster on [1, 90000, 40, 128] bf16 (3.43 ms -> 0.61 ms on gfx950).
+    """Bit-exact drop-in for ``aiter.per_tensor_quant(x, quant_dtype=fp8)``, 6.6x
+    faster on [1, 90000, 40, 128] bf16 (3.36 ms -> 0.50 ms on gfx950).
 
     aiter's reference upcasts to fp32 and runs abs/max/div/cast as four more eager
     kernels; its fused HIP/Triton paths decompose over rows of ``size(-1)``, which
     at head_dim 128 is one workgroup per 128 elements contending on one atomic.
-    ``dynamic=False`` is load-bearing: with ``dynamic=True`` this is both slower
-    and no longer bit-exact.
+    The reduction has to be decomposed over elements instead, which is what the
+    persistent kernel above does -- in one launch, at the ~2.3 GB traffic floor.
     """
-    min_val, max_val = torch.aminmax(x)
-    scale = torch.maximum(-min_val.float(), max_val.float()) / _FP8_MAX
-    return (x.float() / scale).to(_fp8_dtype), scale.reshape(1)
+    xc = x.contiguous()
+    y = torch.empty_like(xc, dtype=_fp8_dtype)
+    scale = torch.empty(1, dtype=torch.float32, device=xc.device)
+
+    device = xc.device
+    grid = _quant_grid.get(device)
+    if grid is None:
+        # The barrier requires a co-resident grid, so never ask for more
+        # programs than the device has CUs (partitioned GPUs report fewer).
+        grid = min(
+            _QUANT_MAX_PROGRAMS,
+            torch.cuda.get_device_properties(device).multi_processor_count,
+        )
+        _quant_grid[device] = grid
+        _quant_scratch[device] = torch.zeros(3, dtype=torch.int32, device=device)
+        _quant_gen[device] = 0
+    gen = _quant_gen[device]
+    _quant_gen[device] = gen + 1
+
+    _per_tensor_quant_fp8_kernel[(grid,)](
+        xc,
+        y,
+        scale,
+        _quant_scratch[device],
+        xc.numel(),
+        gen,
+        INV_FP8_MAX=1.0 / _FP8_MAX,
+        BLOCK=_QUANT_BLOCK,
+        NUM_PROGRAMS=grid,
+        MAX_SPIN=100_000_000,
+        num_warps=_QUANT_NUM_WARPS,
+        num_stages=1,
+    )
+    return y.view(x.shape), scale
 
 
 def _can_use_fmha_fp8_prefill(
