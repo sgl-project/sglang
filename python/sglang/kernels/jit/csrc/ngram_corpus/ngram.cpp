@@ -1,6 +1,8 @@
 #include "ngram.h"
 
+#include "global_tree.h"
 #include "trie.h"
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -151,6 +153,69 @@ Result Ngram::batchMatch(
 
   std::unique_lock<std::mutex> lock(mutex_);
 
+  switch (param_.global_tree_mode) {
+    case GlobalTreeMode::DISABLED:
+      return batchMatchLegacy_(state_ids, tokens, total_lens);
+    case GlobalTreeMode::PATH_PROBABILITY:
+    case GlobalTreeMode::SPECIFICITY_PATH_PROBABILITY:
+      return batchMatchGlobalTree_(state_ids, tokens, total_lens);
+    default:
+      throw std::runtime_error("Unknown global tree mode");
+  }
+}
+
+Result Ngram::batchMatchGlobalTree_(
+    const std::vector<int64_t>& state_ids,
+    const std::vector<std::vector<int32_t>>& tokens,
+    const std::vector<size_t>& total_lens) {
+  const auto proposal_budget = param_.get_draft_token_num(tokens.size());
+
+  std::vector<std::pair<std::string, const SuffixAutomaton*>> sorted_sams;
+  sorted_sams.reserve(sams_.size());
+  for (const auto& [corpus_id, sam] : sams_) {
+    sorted_sams.emplace_back(corpus_id, sam.get());
+  }
+  std::sort(
+      sorted_sams.begin(), sorted_sams.end(), [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+
+  Result merged;
+  for (size_t i = 0; i < state_ids.size(); ++i) {
+    const auto& suffix = tokens[i];
+    if (suffix.empty()) {
+      throw std::runtime_error("batchMatch received an empty token tail");
+    }
+
+    auto& state = match_state_[state_ids[i]];
+    auto trie_anchor = trie_->longestExpandableMatch(suffix.data(), suffix.size(), state, total_lens[i]);
+
+    std::vector<SamAnchor> sam_anchors;
+    sam_anchors.reserve(sorted_sams.size());
+    for (const auto& sam_entry : sorted_sams) {
+      const auto* sam = sam_entry.second;
+      if (auto sam_match = sam->longestExpandableMatch(suffix.data(), suffix.size(), param_.max_trie_depth)) {
+        sam_anchors.push_back(*sam_match);
+      }
+    }
+
+    GlobalTree tree(
+        proposal_budget,
+        param_.max_bfs_breadth,
+        param_.max_trie_depth,
+        param_.global_tree_mode,
+        std::move(trie_anchor),
+        std::move(sam_anchors));
+    tree.generate();
+    auto result = tree.materialize(suffix.back());
+    merged.token.insert(merged.token.end(), result.token.begin(), result.token.end());
+    merged.mask.insert(merged.mask.end(), result.mask.begin(), result.mask.end());
+  }
+  return merged;
+}
+
+Result Ngram::batchMatchLegacy_(
+    const std::vector<int64_t>& state_ids,
+    const std::vector<std::vector<int32_t>>& tokens,
+    const std::vector<size_t>& total_lens) {
   using TrieResultBuildFn =
       Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
   using SamResultBuildFn = Result (SuffixAutomaton::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;

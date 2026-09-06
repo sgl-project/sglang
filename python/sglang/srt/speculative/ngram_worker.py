@@ -116,6 +116,7 @@ class NGRAMWorker(BaseSpecWorker):
             min_bfs_breadth=get_spec().speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=get_spec().speculative_ngram_max_bfs_breadth,
             match_type=get_spec().speculative_ngram_match_type,
+            global_tree_mode=get_spec().speculative_ngram_global_tree_mode,
             capacity=get_spec().speculative_ngram_capacity,
             max_trie_depth=get_spec().speculative_ngram_max_trie_depth,
             draft_token_num=get_spec().speculative_num_draft_tokens,

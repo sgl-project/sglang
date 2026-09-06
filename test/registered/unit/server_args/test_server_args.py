@@ -1606,6 +1606,7 @@ class TestNgramExternalSamArgs(CustomTestCase):
         args.speculative_algorithm = "NGRAM"
         args.speculative_num_draft_tokens = 12
         args.device = "cuda"
+        args.page_size = 1
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
@@ -1615,6 +1616,7 @@ class TestNgramExternalSamArgs(CustomTestCase):
             speculative_num_draft_tokens=4,
             speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
             speculative_ngram_external_sam_budget=4,
+            speculative_ngram_global_tree_mode="disabled",
         )
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
@@ -1629,6 +1631,46 @@ class TestNgramExternalSamArgs(CustomTestCase):
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+    def test_global_tree_mode_does_not_require_legacy_sam_budget(self):
+        args = self._make_dummy_ngram_args(
+            speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+            speculative_ngram_external_sam_budget=0,
+            speculative_ngram_global_tree_mode="path_probability",
+        )
+        handle_speculative_decoding(args)
+        self.assertEqual(args.speculative_ngram_global_tree_mode, "path_probability")
+
+    def test_global_tree_mode_defaults_to_disabled(self):
+        args = self._make_dummy_ngram_args()
+        handle_speculative_decoding(args)
+        self.assertEqual(args.speculative_ngram_global_tree_mode, "disabled")
+        self.assertEqual(
+            resolution_result(args, "speculative_ngram_global_tree_mode"),
+            "disabled",
+        )
+        self.assertEqual(
+            args.resolved_dict()["speculative_ngram_global_tree_mode"],
+            "disabled",
+        )
+
+    def test_global_tree_mode_cli_defaults_to_disabled(self):
+        args = prepare_server_args(["--model-path", "dummy"])
+        self.assertEqual(args.speculative_ngram_global_tree_mode, "disabled")
+
+    def test_global_tree_mode_cli_round_trip(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--speculative-ngram-global-tree-mode",
+                "specificity_path_probability",
+            ]
+        )
+        self.assertEqual(
+            args.speculative_ngram_global_tree_mode,
+            "specificity_path_probability",
+        )
 
 
 class TestDecoupledSpecArgs(CustomTestCase):

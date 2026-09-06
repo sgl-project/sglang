@@ -114,6 +114,7 @@ void SuffixAutomaton::propagateOccurrencesAndRecency_() {
   for (auto& state : states_) {
     state.children_by_freq.clear();
     state.children_by_recency.clear();
+    state.outgoing_occurrence_mass = 0;
     state.children_by_freq.reserve(state.next.size());
     state.children_by_recency.reserve(state.next.size());
     for (const auto& [token, child_state] : state.next) {
@@ -122,6 +123,7 @@ void SuffixAutomaton::propagateOccurrencesAndRecency_() {
       }
       state.children_by_freq.emplace_back(token, child_state);
       state.children_by_recency.emplace_back(token, child_state);
+      state.outgoing_occurrence_mass += states_[child_state].occ_count;
     }
 
     std::sort(state.children_by_freq.begin(), state.children_by_freq.end(), [this](const auto& lhs, const auto& rhs) {
@@ -167,7 +169,7 @@ std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len
   std::vector<SamAnchor> anchors;
   while (state > 0 && matched_len > 0) {
     if (!states_[state].children_by_freq.empty()) {
-      anchors.push_back({state, matched_len});
+      anchors.push_back({this, state, matched_len});
     }
     state = states_[state].link;
     if (state <= 0) {
@@ -176,6 +178,36 @@ std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len
     matched_len = std::min<int32_t>(matched_len, states_[state].max_len);
   }
   return anchors;
+}
+
+std::optional<SamAnchor>
+SuffixAutomaton::longestExpandableMatch(const int32_t* context, size_t len, size_t max_depth) const {
+  auto anchors = match(context, len, max_depth);
+  if (anchors.empty()) {
+    return std::nullopt;
+  }
+  return anchors.front();
+}
+
+uint64_t SuffixAutomaton::frequencyTransitions(
+    int state, size_t max_breadth, std::vector<SamFrequencyTransition>& ranked) const {
+  ranked.clear();
+  if (state < 0 || state >= static_cast<int>(states_.size()) || max_breadth == 0) {
+    return 0;
+  }
+
+  const auto& sam_state = states_[state];
+  if (sam_state.outgoing_occurrence_mass == 0) {
+    return 0;
+  }
+  ranked.reserve(std::min(max_breadth, sam_state.children_by_freq.size()));
+  for (const auto& [token, child_state] : sam_state.children_by_freq) {
+    ranked.push_back(SamFrequencyTransition{token, child_state, states_[child_state].occ_count});
+    if (ranked.size() >= max_breadth) {
+      break;
+    }
+  }
+  return sam_state.outgoing_occurrence_mass;
 }
 
 Result SuffixAutomaton::buildRecency(
@@ -190,7 +222,7 @@ Result SuffixAutomaton::buildRecency(
   for (const auto& anchor : anchors) {
     std::queue<std::tuple<int, double, int>> queue;
     queue.push(
-        {root, (max_match_depth - anchor.matched_len) * bfs_breadth_scale + param.min_bfs_breadth, anchor.state});
+        {root, (max_match_depth - anchor.matched_length) * bfs_breadth_scale + param.min_bfs_breadth, anchor.state});
     while (!queue.empty() && cursor <= static_cast<int>(draft_token_num)) {
       auto [parent, cur_breadth, state] = queue.front();
       queue.pop();
