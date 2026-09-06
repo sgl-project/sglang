@@ -371,6 +371,28 @@ class TestNewVersionStreamGuards(CustomTestCase):
             torch.equal(self.manager._lora_stash["A@2"][LORA_A], torch.ones(2))
         )
 
+    def test_nonzero_tp_rank_failure_prevents_successful_commit(self):
+        tensor = torch.ones(2)
+        self.assertTrue(self._send([(f"A@2:{LORA_A}", tensor)]).success)
+
+        def gather(results, local, **kwargs):
+            results[:] = [local, (False, "other TP rank failed")]
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_gather_object", side_effect=gather),
+        ):
+            result = self.manager.end_weight_update(
+                EndWeightUpdateReqInput(
+                    session_id="fresh",
+                    expected_lora_checksums={"A@2": {LORA_A: _sha256_tensor(tensor)}},
+                )
+            )
+        self.assertFalse(result.success)
+        self.assertIn("TP rank 1", result.message)
+        self.manager.scheduler.record_weight_version_change.assert_not_called()
+
     def test_abort_discards_without_applying(self):
         self.assertTrue(self._send([(f"A@2:{LORA_A}", torch.ones(2))]).success)
         self.assertTrue(

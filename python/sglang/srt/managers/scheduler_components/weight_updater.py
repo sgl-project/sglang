@@ -301,6 +301,7 @@ class SchedulerWeightUpdaterManager:
                     "ModelRunner are partially updated. Please discard the whole weights."
                 )
                 logger.error(message)
+            success, message = self._merge_new_lora_results(success, message)
             if success:
                 if base_tensors:
                     self._weight_update_loaded = True
@@ -339,9 +340,10 @@ class SchedulerWeightUpdaterManager:
             try:
                 self._validate_new_lora_tensors(recv_req, base_tensors, lora_tensors)
             except ValueError as error:
+                success, message = self._merge_new_lora_results(False, str(error))
                 torch.distributed.barrier(group=self.tp_cpu_group)
                 return UpdateWeightsFromTensorReqOutput(
-                    success=False, message=str(error)
+                    success=success, message=message
                 )
             self._stash_lora_tensors(lora_tensors, copy_tensors=True)
             success, message = True, "Success"
@@ -358,6 +360,7 @@ class SchedulerWeightUpdaterManager:
                         break
                 if success:
                     self._weight_update_loaded = True
+            success, message = self._merge_new_lora_results(success, message)
             if success:
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
@@ -471,12 +474,32 @@ class SchedulerWeightUpdaterManager:
             for _, runner in self.get_model_runners(self._weight_update_selector):
                 runner.end_weight_update(run_post_load=run_post_load)
         success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
+        success, message = self._merge_new_lora_results(success, message)
         self._weight_update_in_progress = False
         if success:
             self.record_weight_version_after_update(self._weight_update_pending_version)
         self._weight_update_pending_version = None
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=success, message=message)
+
+    def _merge_new_lora_results(self, success: bool, message: str) -> Tuple[bool, str]:
+        """Only TP rank zero replies to the tokenizer; include every rank's vote."""
+        if (
+            self._weight_update_new_lora_names is None
+            or not torch.distributed.is_initialized()
+        ):
+            return success, message
+        size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+        if size == 1:
+            return success, message
+        results = [None] * size
+        torch.distributed.all_gather_object(
+            results, (success, message), group=self.tp_cpu_group
+        )
+        errors = [
+            f"TP rank {rank}: {msg}" for rank, (ok, msg) in enumerate(results) if not ok
+        ]
+        return not errors, "; ".join(errors) if errors else message
 
     def _validate_new_lora_tensors(self, recv_req, base_tensors, lora_tensors):
         if self._weight_update_new_lora_names is None:
