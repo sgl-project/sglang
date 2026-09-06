@@ -1,6 +1,7 @@
 """A preallocation timeout must enter rank consensus before queue mutation."""
 
 import tempfile
+import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -31,6 +32,8 @@ def _check_two_rank_timeout(rank, rendezvous):
         receiver = object.__new__(NixlKVReceiver)
         receiver.kv_mgr = SimpleNamespace(
             waiting_timeout=5,
+            connection_lock=threading.Lock(),
+            connection_pool={},
             check_status=lambda room: status[0],
             record_failure=lambda room, message: None,
             update_status=lambda room, value: status.__setitem__(0, value),
