@@ -454,7 +454,7 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} --random-range-ratio 1.0 \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --flush-cache`,
+  --warmup-requests 64 --flush-cache`,
     // num_prompts = 5 × concurrency (measured floor 16).
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
   },
@@ -1013,8 +1013,7 @@ export const config = {
     {
       match: { hw: "b300", pdMode: "unified", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       // No --enable-symm-mem: it makes the fused all-reduce auto-probe skip.
       flags: [
@@ -1031,8 +1030,7 @@ export const config = {
     {
       match: { hw: "b300", pdMode: "unified", strategy: "balanced" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",

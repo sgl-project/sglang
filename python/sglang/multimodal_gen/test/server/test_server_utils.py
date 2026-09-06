@@ -591,28 +591,28 @@ class PerformanceValidator:
         expected_load_peak_vram_mb: float,
         expected_runtime_peak_vram_mb: float,
         expected_warmup_peak_vram_mb: float | None = None,
+        expected_load_peak_allocated_mb: float | None = None,
+        expected_runtime_peak_allocated_mb: float | None = None,
     ) -> None:
         assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
         assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
-        self._assert_le(
+        self._assert_peak_vram(
             "Load Peak VRAM",
-            summary.load_peak_vram_mb,
-            expected_load_peak_vram_mb,
-            self.tolerances.load_peak_vram,
-            min_abs_tolerance=128.0,
-            unit=" MiB",
+            reserved=summary.load_peak_vram_mb,
+            allocated=summary.load_peak_allocated_mb,
+            expected_reserved=expected_load_peak_vram_mb,
+            expected_allocated=expected_load_peak_allocated_mb,
+            tolerance=self.tolerances.load_peak_vram,
         )
-        self._assert_le(
+        self._assert_peak_vram(
             "Runtime Peak VRAM",
-            summary.runtime_peak_vram_mb,
-            expected_runtime_peak_vram_mb,
-            self.tolerances.runtime_peak_vram,
-            min_abs_tolerance=128.0,
-            unit=" MiB",
+            reserved=summary.runtime_peak_vram_mb,
+            allocated=summary.runtime_peak_allocated_mb,
+            expected_reserved=expected_runtime_peak_vram_mb,
+            expected_allocated=expected_runtime_peak_allocated_mb,
+            tolerance=self.tolerances.runtime_peak_vram,
         )
-        # The warmup probe runs the default workload's full shape before any
-        # placement is promoted: a card that cannot hold it fails at startup,
-        # so its peak is held to a baseline of its own once one exists.
+        # the full-shape warmup probe keeps its own budget, separate from serving
         if expected_warmup_peak_vram_mb is not None and summary.warmup_peak_vram_mb > 0:
             self._assert_le(
                 "Warmup Peak VRAM",
@@ -622,6 +622,48 @@ class PerformanceValidator:
                 min_abs_tolerance=128.0,
                 unit=" MiB",
             )
+
+    def _assert_peak_vram(
+        self,
+        name: str,
+        *,
+        reserved: float,
+        allocated: float,
+        expected_reserved: float,
+        expected_allocated: float | None,
+        tolerance: float,
+    ) -> None:
+        """Enforce the allocated peak when the baseline has one, else reserved.
+
+        Reserved peaks include the caching allocator's pool, which follows the
+        allocation history of everything run before the request (warmup shapes,
+        load-time leftovers) and moves a few percent for identical work. The
+        allocated peak is what the model and its activations actually use.
+        """
+        if expected_allocated is not None and allocated > 0:
+            self._assert_le(
+                f"{name} (allocated)",
+                allocated,
+                expected_allocated,
+                tolerance,
+                min_abs_tolerance=128.0,
+                unit=" MiB",
+            )
+            logger.info(
+                "%s reserved %.0f MiB (baseline %.0f MiB, reported only)",
+                name,
+                reserved,
+                expected_reserved,
+            )
+            return
+        self._assert_le(
+            name,
+            reserved,
+            expected_reserved,
+            tolerance,
+            min_abs_tolerance=128.0,
+            unit=" MiB",
+        )
 
     def validate_peak_host_anon(
         self,
