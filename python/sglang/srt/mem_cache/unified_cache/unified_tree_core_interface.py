@@ -151,6 +151,8 @@ class UnifiedTreeCoreInterface(ABC):
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
+    # Whether the host tier stages one node per FIFO backup intent.
+    is_host_memory_buffer_only: bool
     kv_events: KVCacheEventRecorder
 
     # ==== Tree API ====
@@ -436,6 +438,11 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def set_hicache_enabled(self) -> None:
         """Mark the host tier (HiCache) as wired."""
+        ...
+
+    @abstractmethod
+    def set_host_memory_buffer_only(self) -> None:
+        """Mark the host tier as buffer-only: one node staged per backup intent."""
         ...
 
     @abstractmethod

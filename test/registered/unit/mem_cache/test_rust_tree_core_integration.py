@@ -99,6 +99,7 @@ def _pump_insert(core: RustUnifiedTreeCore, params: InsertParams) -> InsertResul
         prefix_len=step.result.prefix_len,
         last_device_node=step.result.last_device_node,
         mamba_exist=step.result.mamba_exist,
+        swa_branch_inserted=step.result.swa_branch_inserted,
         cache_actions=actions,
     )
 
@@ -1994,6 +1995,30 @@ def test_bigram_insert_value_shorter_than_the_bigram_count_raises():
                 value=torch.tensor([10, 11], dtype=torch.int64),
             ),
         )
+
+
+# ---- SWA branching-point caching ----
+
+
+def _swa_hicache_core(window: int = 8) -> RustUnifiedTreeCore:
+    core = _swa_tree_core(window=window)
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    return core
+
+
+def test_insert_reports_whether_it_reached_the_swa_branch_boundary():
+    for branching_seqlen, expected in [(2, True), (3, False), (None, False)]:
+        core = _swa_hicache_core()
+        result = _pump_insert(
+            core,
+            InsertParams(
+                key=_key([1, 2]),
+                value=torch.tensor([10, 11], dtype=torch.int64),
+                swa_branching_seqlen=branching_seqlen,
+            ),
+        )
+        assert result.swa_branch_inserted is expected, branching_seqlen
 
 
 if __name__ == "__main__":

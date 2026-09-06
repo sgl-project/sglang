@@ -545,6 +545,7 @@ fn insert_params_swa<'k>(
         mamba_value: None,
         prev_prefix_len,
         swa_evicted_seqlen,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
         track_adopted_ranges: false,
@@ -3567,6 +3568,7 @@ fn build_transfers_are_gated_off_until_the_swa_host_pool_is_wired() {
 #[test]
 fn backup_host_build_wraps_the_device_value_as_int64() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    tc.set_has_swa_host_pool();
     let [a] = chain::<1>(&mut tc);
     tc.arena
         .set_device_value(a, SWA, Tensor::from_slice(&[5i32]));
@@ -3590,7 +3592,10 @@ fn backup_host_build_wraps_the_device_value_as_int64() {
     assert_eq!(device_indices.kind(), Kind::Int64);
     assert!(device_indices.equal(&Tensor::from_slice(&[5i64])));
     assert!(xfer.host_indices.is_none());
-    assert!(xfer.nodes_to_load.is_none());
+    assert_eq!(
+        xfer.nodes_to_load.as_deref(),
+        Some(&[tc.arena.node(a).id][..])
+    );
 }
 
 #[test]
@@ -3615,6 +3620,7 @@ fn backup_host_build_returns_none_for_a_tombstone() {
 #[test]
 fn backup_spec_reads_the_swa_value_recovered_by_an_earlier_action() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    tc.set_has_swa_host_pool();
     let [a] = chain::<1>(&mut tc);
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[9i64]));
@@ -3891,26 +3897,38 @@ fn load_back_commit_asserts_the_loaded_length_matches_the_host_indices() {
 }
 
 #[test]
-fn backup_host_commit_sets_the_host_value_once() {
+fn backup_host_commit_sets_the_host_value() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
+    set_swa_device(&mut tc, a);
+    commit_backup(&mut tc, a, &[30i64], /* nodes_to_load = */ None);
+    assert!(
+        tc.arena
+            .host_value(a, SWA)
+            .equal(&Tensor::from_slice(&[30i64]))
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not device-only")]
+fn backup_host_commit_rejects_a_target_that_is_already_backed_up() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    let [a] = chain::<1>(&mut tc);
+    set_swa_device(&mut tc, a);
+    set_swa_host(&mut tc, a);
+    let a_id = tc.arena.node(a).id;
+    commit_backup(&mut tc, a, &[30i64], Some(vec![a_id]));
+}
+
+#[test]
+fn backup_host_commit_without_offsets_attaches_the_whole_span_once() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    let [a] = chain::<1>(&mut tc);
+    // A hand-built transfer carries no offsets to scatter by, so the legacy
+    // single-node attach still applies and stays idempotent.
     for host in [30i64, 31] {
-        let transfer = PoolTransfer {
-            name: PoolName::Swa,
-            host_indices: Some(Tensor::from_slice(&[host])),
-            ..Default::default()
-        };
-        swa_component(4).commit_hicache_transfer(
-            &mut tc,
-            a,
-            CacheTransferPhase::BackupHost,
-            vec![transfer],
-            &mut Vec::new(),
-            /* insert_result = */ None,
-            /* pool_storage_result = */ None,
-        );
+        commit_backup(&mut tc, a, &[host], /* nodes_to_load = */ None);
     }
-    // The second commit is a no-op: the first host value sticks.
     assert!(
         tc.arena
             .host_value(a, SWA)
@@ -4891,4 +4909,293 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
     assert!(tc.arena.has_device_value(leaf, SWA));
     assert!(tc.arena.has_device_value(leaf, FULL));
     tc.sanity_check(&[], &[]);
+}
+
+// ==== SWA branching-point caching ====
+
+// A [Full, Swa] core with both the host tier and the SWA host pool wired.
+fn swa_hicache_core(window: usize, page_size: usize) -> UnifiedTreeCore<Vec<i64>> {
+    let mut tc = swa_core(window, page_size);
+    tc.set_hicache_enabled();
+    tc.set_has_swa_host_pool();
+    tc
+}
+
+fn set_swa_device_value(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeIdx_, value: i64) {
+    tc.arena
+        .set_device_value(node, SWA, Tensor::from_slice(&[value]));
+}
+
+fn backup_transfers(
+    tc: &UnifiedTreeCore<Vec<i64>>,
+    window: usize,
+    node: NodeIdx_,
+) -> Option<Vec<PoolTransfer>> {
+    swa_component(window)
+        .build_hicache_transfers(
+            tc,
+            node,
+            CacheTransferPhase::BackupHost,
+            /* mamba_pool_idx = */ None,
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* last_hash = */ None,
+        )
+        .unwrap()
+}
+
+// The node ids one backup transfer covers, and the device indices it moves.
+fn backup_plan(
+    tc: &UnifiedTreeCore<Vec<i64>>,
+    window: usize,
+    node: NodeIdx_,
+) -> (Vec<NodeId>, Vec<i64>) {
+    let transfers = backup_transfers(tc, window, node).expect("a backup transfer");
+    assert_eq!(transfers.len(), 1);
+    let xfer = &transfers[0];
+    assert_eq!(xfer.name, PoolName::Swa);
+    let device_indices = xfer.device_indices.as_ref().expect("device indices");
+    assert_eq!(device_indices.kind(), Kind::Int64);
+    (
+        xfer.nodes_to_load.clone().expect("nodes_to_load"),
+        Vec::<i64>::try_from(device_indices).unwrap(),
+    )
+}
+
+fn commit_backup(
+    tc: &mut UnifiedTreeCore<Vec<i64>>,
+    node: NodeIdx_,
+    host_indices: &[i64],
+    nodes_to_load: Option<Vec<NodeId>>,
+) {
+    swa_component(4).commit_hicache_transfer(
+        tc,
+        node,
+        CacheTransferPhase::BackupHost,
+        vec![PoolTransfer {
+            name: PoolName::Swa,
+            host_indices: Some(Tensor::from_slice(host_indices)),
+            nodes_to_load,
+            ..Default::default()
+        }],
+        &mut Vec::new(),
+        /* insert_result = */ None,
+        /* pool_storage_result = */ None,
+    );
+}
+
+#[test]
+fn backup_host_build_covers_every_device_only_node_in_the_window() {
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b, c] = chain::<3>(&mut tc);
+    for (node, value) in [(a, 10i64), (b, 11), (c, 12)] {
+        set_swa_device_value(&mut tc, node, value);
+    }
+    let (nodes, device_indices) = backup_plan(&tc, /* window = */ 4, c);
+    // Ancestors first, so the publish side links each store event to its parent.
+    let expected = [a, b, c].map(|node| tc.arena.node(node).id);
+    assert_eq!(nodes, expected.to_vec());
+    assert_eq!(device_indices, vec![10, 11, 12]);
+}
+
+#[test]
+fn backup_host_build_stops_at_a_node_another_ack_owns() {
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b, c] = chain::<3>(&mut tc);
+    for (node, value) in [(a, 10i64), (b, 11), (c, 12)] {
+        set_swa_device_value(&mut tc, node, value);
+    }
+    let b_id = tc.arena.node(b).id;
+    tc.mark_write_through_pending(vec![b_id], /* ack_id = */ b_id);
+
+    // `b`'s ack already owns `b` and everything above it, so this backup takes
+    // only what is left below it: two acks never claim the same node.
+    let (nodes, device_indices) = backup_plan(&tc, /* window = */ 4, c);
+    assert_eq!(nodes, vec![tc.arena.node(c).id]);
+    assert_eq!(device_indices, vec![12]);
+}
+
+#[test]
+fn backup_host_build_stops_at_the_sliding_window_edge() {
+    let mut tc = swa_hicache_core(/* window = */ 2, /* page_size = */ 1);
+    let [a, b, c] = chain::<3>(&mut tc);
+    for (node, value) in [(a, 10i64), (b, 11), (c, 12)] {
+        set_swa_device_value(&mut tc, node, value);
+    }
+    let (nodes, device_indices) = backup_plan(&tc, /* window = */ 2, c);
+    assert_eq!(nodes, vec![tc.arena.node(b).id, tc.arena.node(c).id]);
+    assert_eq!(device_indices, vec![11, 12]);
+}
+
+#[test]
+fn backup_host_build_walks_past_a_node_that_is_already_backed_up() {
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b, c] = chain::<3>(&mut tc);
+    for (node, value) in [(a, 10i64), (b, 11), (c, 12)] {
+        set_swa_device_value(&mut tc, node, value);
+    }
+    set_swa_host(&mut tc, b);
+
+    // `b` is backed up already: it consumes window budget but is not re-sent,
+    // and the walk continues to the unbacked ancestor above it.
+    let (nodes, device_indices) = backup_plan(&tc, /* window = */ 4, c);
+    assert_eq!(nodes, vec![tc.arena.node(a).id, tc.arena.node(c).id]);
+    assert_eq!(device_indices, vec![10, 12]);
+}
+
+#[test]
+fn backup_host_build_is_none_without_an_swa_host_pool() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    let [a] = chain::<1>(&mut tc);
+    set_swa_device_value(&mut tc, a, 10);
+    assert!(backup_transfers(&tc, /* window = */ 4, a).is_none());
+}
+
+#[test]
+fn backup_host_commit_scatters_the_host_span_across_the_covered_nodes() {
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b, c] = chain::<3>(&mut tc);
+    for (node, value) in [(a, 10i64), (b, 11), (c, 12)] {
+        set_swa_device_value(&mut tc, node, value);
+    }
+    let (nodes, _) = backup_plan(&tc, /* window = */ 4, c);
+    commit_backup(&mut tc, c, &[100i64, 101, 102], Some(nodes));
+
+    for (node, host) in [(a, 100i64), (b, 101), (c, 102)] {
+        assert!(
+            tc.arena
+                .host_value(node, SWA)
+                .equal(&Tensor::from_slice(&[host]))
+        );
+    }
+}
+
+#[test]
+fn needs_incremental_backup_tracks_the_unbacked_window() {
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b] = chain::<2>(&mut tc);
+    let swa = swa_component(4);
+    assert!(!TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+
+    // A device-only ancestor is enough, even when the target itself is clean.
+    set_swa_device_value(&mut tc, a, 10);
+    set_swa_device_value(&mut tc, b, 11);
+    set_swa_host(&mut tc, b);
+    assert!(TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+
+    set_swa_host(&mut tc, a);
+    assert!(!TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+}
+
+#[test]
+fn write_back_reinsert_still_backs_up_an_unbacked_swa_window() {
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            is_write_back: true,
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            ..swa_params_with_window(4)
+        },
+        vec![FULL, SWA],
+    );
+    let key = vec![1, 2];
+    tc.insert(&insert_params_swa(&key, &[10, 11], 0, 0));
+    let leaf_idx = child_of(&tc, tc.arena.root(), &[1]);
+    let leaf = tc.arena.node(leaf_idx).id;
+    // The cache applied the SwaRebuild; Full is on host, SWA is still device-only.
+    store_swa_device(&mut tc, leaf_idx);
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new());
+
+    let result = tc.insert(&insert_params_swa(&key, &[20, 21], 0, 0));
+    let backups: Vec<_> = result
+        .cache_actions
+        .iter()
+        .filter_map(|action| match action {
+            CacheAction::BackupKV(backup) => Some(backup.node_ids.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(backups, vec![vec![leaf]]);
+
+    let (full_device_indices, comp_xfers) = tc.build_backup_spec(leaf);
+    assert_eq!(full_device_indices.numel(), 0);
+    assert_eq!(comp_xfers[&SWA][0].nodes_to_load, Some(vec![leaf]));
+}
+
+// Finalize an otherwise-empty match carrying the given Full-KV reach.
+fn finalize_branching(
+    tc: &UnifiedTreeCore<Vec<i64>>,
+    device_len: usize,
+    host_hit_length: usize,
+    full_kv_hit_length: usize,
+) -> Option<usize> {
+    swa_component(4)
+        .finalize_match_result_in_tree_core(
+            tc,
+            MatchResult {
+                device_indices: Tensor::from_slice(&vec![0i64; device_len]),
+                host_hit_length,
+                full_kv_hit_length,
+                ..tc.empty_match_result()
+            },
+            &MatchPrefixParams {
+                key: &Vec::new(),
+                namespace: Default::default(),
+            },
+            &[],
+            0,
+        )
+        .swa_branching_seqlen
+}
+
+#[test]
+fn match_reports_the_page_aligned_swa_branching_seqlen() {
+    let tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 4);
+    // Full KV reaches 11 tokens, the SWA boundary only 2; 11 aligns down to 8.
+    assert_eq!(
+        finalize_branching(&tc, /* device = */ 2, /* host_hit = */ 0, 11),
+        Some(8)
+    );
+    // Host-loaded Full KV counts toward the boundary the branch must beat.
+    assert_eq!(
+        finalize_branching(&tc, /* device = */ 2, /* host_hit = */ 6, 11),
+        None
+    );
+}
+
+#[test]
+fn swa_branching_seqlen_is_none_when_no_aligned_page_lies_beyond_the_window() {
+    let tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 4);
+    // Full KV reaches 3 tokens, which aligns down to 0: nothing to branch at.
+    assert_eq!(
+        finalize_branching(&tc, /* device = */ 0, /* host_hit = */ 0, 3),
+        None
+    );
+    // The aligned position must lie strictly beyond the boundary.
+    assert_eq!(
+        finalize_branching(&tc, /* device = */ 8, /* host_hit = */ 0, 11),
+        None
+    );
+}
+
+#[test]
+fn insert_reports_whether_it_reached_the_branch_boundary() {
+    for (branching_seqlen, expected) in [(Some(3), true), (Some(4), false), (None, false)] {
+        let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+        let result = tc.insert(&InsertParams {
+            swa_branching_seqlen: branching_seqlen,
+            ..insert_params_swa(&vec![1, 2, 3], &[10, 11, 12], 0, 0)
+        });
+        assert_eq!(
+            result.swa_branch_inserted, expected,
+            "swa_branching_seqlen={branching_seqlen:?}"
+        );
+    }
 }
