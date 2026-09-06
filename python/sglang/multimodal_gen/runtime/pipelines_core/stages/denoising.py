@@ -169,6 +169,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     CompiledModuleRegistry,
+    apply_inductor_config,
     build_torch_compile_kwargs,
     maybe_enable_inductor_compute_comm_overlap,
     resolve_torch_compile_mode,
@@ -552,6 +553,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         else:
             maybe_enable_inductor_compute_comm_overlap()
             dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
+            apply_inductor_config(
+                getattr(dit_config, "torch_compile_inductor_config", {})
+            )
             mode = resolve_torch_compile_mode(
                 "SGLANG_TORCH_COMPILE_MODE",
                 config=dit_config,
