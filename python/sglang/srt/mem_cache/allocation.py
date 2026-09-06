@@ -673,7 +673,7 @@ def alloc_for_spec_decode(
     nxt_kv_lens: torch.Tensor,
     nxt_kv_lens_cpu: torch.Tensor,
     num_needed_tokens: int,
-    batch: Optional[ScheduleBatch] = None,
+    batch: ScheduleBatch,
 ) -> None:
     if num_needed_tokens > 0:
         if tree_cache.token_to_kv_pool_allocator.page_size == 1:
@@ -706,6 +706,18 @@ def alloc_for_spec_decode(
             out_cache_loc,
             len(reqs),
         )
+
+    # A failed aux grow leaves freed slot ids in req_to_token; nothing reads them:
+    # the raise precedes any forward, and teardown stops at kv_allocated_len.
+    try:
+        req_to_token_pool.alloc_aux_to_lengths(
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+            target_seq_lens_cpu=nxt_kv_lens_cpu,
+        )
+    except Exception:
+        if num_needed_tokens > 0:
+            tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
+        raise
 
     nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
     for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):
