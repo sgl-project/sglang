@@ -4015,6 +4015,19 @@ class Scheduler(
                 else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            # Retraction frees each request's req_to_token row and KV slots
+            # without the finish path's pre-release hook. Notify the model
+            # worker so backend-private per-request state (e.g. the MLX
+            # runner's decode caches) is disposed before the freed row can be
+            # reused by a later prefill; otherwise a stale rid can sync its
+            # decode KV through the reused row on the next extend forward
+            # (issue #33547).
+            prepare_retraction = getattr(self.tp_worker, "prepare_for_retraction", None)
+            if callable(prepare_retraction):
+                for req in retracted_reqs:
+                    prepare_retraction(req)
+                for req in reqs_to_abort:
+                    prepare_retraction(req)
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
