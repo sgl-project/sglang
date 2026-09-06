@@ -201,8 +201,11 @@ class HiCacheHF3FS(HiCacheStorage):
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
         enable_storage_metrics: bool = False,
+        kv_cache_dtype: Optional[str] = None,
     ):
         self.rank = rank
+        self.kv_cache_dtype = kv_cache_dtype
+        self._dtype_key_prefix = f"dtype_{kv_cache_dtype}_" if kv_cache_dtype else ""
         self.file_path = file_path
         self.file_size = file_size
         self.numjobs = numjobs
@@ -285,6 +288,7 @@ class HiCacheHF3FS(HiCacheStorage):
         )
 
         use_mock_client = False
+        kv_cache_dtype = None
         if storage_config is not None:
             rank, is_mla_model, is_page_first_layout = (
                 storage_config.tp_rank,
@@ -296,6 +300,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 use_mock_client = storage_config.extra_config.get(
                     "use_mock_hf3fs_client", False
                 )
+                kv_cache_dtype = storage_config.kv_cache_dtype
         else:
             rank, is_mla_model, is_page_first_layout = (
                 0,
@@ -359,10 +364,11 @@ class HiCacheHF3FS(HiCacheStorage):
             metadata_client = Hf3fsLocalMetadataClient()
 
         rank_for_path = 0 if is_mla_model else rank
+        dtype_segment = f".{kv_cache_dtype}" if kv_cache_dtype else ""
         return HiCacheHF3FS(
             rank=rank,
             # Let all ranks use the same file path for MLA model
-            file_path=f"{config['file_path_prefix']}.{rank_for_path}.bin",
+            file_path=f"{config['file_path_prefix']}{dtype_segment}.{rank_for_path}.bin",
             file_size=int(config["file_size"]),
             numjobs=int(config["numjobs"]),
             bytes_per_page=bytes_per_page,
@@ -374,6 +380,7 @@ class HiCacheHF3FS(HiCacheStorage):
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
             enable_storage_metrics=storage_config.enable_storage_metrics,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
     def _batch_get(
@@ -381,6 +388,7 @@ class HiCacheHF3FS(HiCacheStorage):
         keys: List[str],
         values: List[torch.Tensor],
     ) -> List[bool]:
+        keys = [f"{self._dtype_key_prefix}{key}" for key in keys]
         page_indices = self.metadata_client.get_page_indices(self.rank, keys)
         if len(page_indices) != len(keys):
             logger.error(
@@ -438,6 +446,9 @@ class HiCacheHF3FS(HiCacheStorage):
         if self.skip_backup:
             return True
 
+        # Must match the read side (_batch_get); a dtype-scoped key that is
+        # stored unprefixed can never be found again.
+        keys = [f"{self._dtype_key_prefix}{key}" for key in keys]
         # Todo: Add prefix block's hash key
         key_with_prefix = [(key, "") for key in keys]
         indices = self.metadata_client.reserve_and_allocate_page_indices(
@@ -510,10 +521,12 @@ class HiCacheHF3FS(HiCacheStorage):
         return results
 
     def delete(self, key: str) -> None:
-        self.metadata_client.delete_keys(self.rank, [key])
+        self.metadata_client.delete_keys(self.rank, [f"{self._dtype_key_prefix}{key}"])
 
     def exists(self, key: str) -> bool:
-        result = self.metadata_client.exists(self.rank, [key])
+        result = self.metadata_client.exists(
+            self.rank, [f"{self._dtype_key_prefix}{key}"]
+        )
         return result[0] if result else False
 
     def batch_exists(
@@ -524,6 +537,7 @@ class HiCacheHF3FS(HiCacheStorage):
             keys = self._get_mha_zero_copy_keys(keys)
             factor = 2
 
+        keys = [f"{self._dtype_key_prefix}{key}" for key in keys]
         results = self.metadata_client.exists(self.rank, keys)
 
         i = 0
