@@ -20,6 +20,11 @@ _UNO_INTERNAL_LORA_NAME = "__uno_draft__"
 _UNO_LORA_POOL_CAPACITY = 2
 
 
+def uno_lora_backend_for_device(device: str) -> str:
+    """Select the internal UNO LoRA backend for the execution device."""
+    return "ascend" if str(device).startswith("npu") else "uno_cublas"
+
+
 def init_uno_lora_manager(
     model_runner: ModelRunner,
 ) -> tuple[LoRAManager, str]:
@@ -44,7 +49,7 @@ def init_uno_lora_manager(
         load_config=model_runner.load_config,
         dtype=model_runner.dtype,
         server_args=model_runner.server_args,
-        lora_backend="uno_cublas",  # fast path
+        lora_backend=uno_lora_backend_for_device(model_runner.device),
         tp_size=model_runner.ps.tp_size,
         tp_rank=model_runner.ps.tp_rank,
         # Infer these from the one trained adapter.

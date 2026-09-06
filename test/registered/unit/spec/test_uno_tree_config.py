@@ -12,6 +12,28 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestUnoTreeConfig(CustomTestCase):
+    def test_npu_rejects_tree_sampler_before_cuda_only_setup(self):
+        server_args = SimpleNamespace(
+            device="npu",
+            enable_deterministic_inference=False,
+            enable_strict_thinking=False,
+            speculative_draft_model_path=None,
+            uno_lora_path="/tmp/uno-lora",
+            speculative_num_draft_tokens=8,
+            speculative_num_steps=3,
+            speculative_eagle_topk=2,
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.speculative_hook.resolving_view",
+                side_effect=lambda args: args,
+            ),
+            patch("sglang.srt.arg_groups.speculative_hook.declare_resolution"),
+            self.assertRaisesRegex(ValueError, "only the linear sampler"),
+        ):
+            _handle_uno(server_args)
+
     def test_unsupported_runtime_modes_are_rejected_at_startup(self):
         cases = {
             "deterministic inference": (
