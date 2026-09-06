@@ -205,6 +205,14 @@ class Glm53FlashDetector(BaseFormatDetector):
                         func_name, missing_key,
                     )
                     return {missing_key: arguments}
+            # No matching array property found — return empty dict so the
+            # API doesn't reject "arguments must be an object"
+            logger.info(
+                "GLM-5.3-Flash: list args for '%s' have no matching array "
+                "property, returning {} to satisfy object requirement",
+                func_name,
+            )
+            return {}
 
         return arguments
 
