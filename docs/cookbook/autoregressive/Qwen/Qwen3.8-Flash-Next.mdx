@@ -80,6 +80,7 @@ The NVFP4 checkpoint is 126 GiB — 78 GiB of experts and dense weights plus a 4
 - **Concurrency.** The hybrid GDN/QSA model reserves mamba state slots per running request (5 with the default `extra_buffer` radix strategy, 4 with `extra_buffer_lazy`), and the scheduler caps `--max-running-requests` to what the mamba pool admits — read the effective value from the startup log, not from `/get_server_info`. The cells pin `--max-mamba-cache-size` to requests × slots (24 × 5 = 120 for low latency, 96 × 4 = 384 for high throughput); raising concurrency further takes memory from the KV pool one-for-one.
 - **Flags.** The cells are the model card's TP=2 recipe without `--mamba-track-interval 64`: the default of 256 tokens satisfies the constraints (a multiple of the 64-token page, at least the 4 draft tokens) and leaves a ~40% larger KV pool (1.48M tokens at 24 concurrent with MTP, 1.07M at 96 without), at the cost of coarser prefix-cache reuse of the recurrent state. `--trust-remote-code` is not needed; the architecture is native to SGLang.
 - **Measured.** GSM8K via the chat API with thinking off, n=200: 97.5% (low latency, 24 concurrent) and 97.0% (high throughput, 96 concurrent); 100k-token prefill at 2,400–2,840 tok/s; MTP accept length 3.5–3.7 of 4 draft tokens on non-thinking output (lower, ~2.5, on thinking output).
+- **NVIDIA export (NVFP4 (NVDA)).** `nvidia/Qwen3.8-Flash-Next-NVFP4` is a ModelOpt MIXED_PRECISION checkpoint (NVFP4 experts, FP8 N-gram table, FP8 block-scaled MTP experts) and needs the loader from [#38121](https://github.com/sgl-project/sglang/pull/38121), which the `qwen38flashnext` image does not include yet — hence the in-progress badge. Do not pass `--quantization` for it (it resolves to `modelopt_mixed`), and pass `--moe-runner-backend flashinfer_cutlass` explicitly: the mixed-precision auto-default picks `flashinfer_trtllm` on GB10, which the NVFP4 MoE method rejects at autotune. Its MTP experts are FP8 block-scaled with 128-wide blocks and cannot be split across two ranks (640 / 2 = 320), so the low-latency cell reads the MTP draft from the RadixArk export — the same trained head, kept in BF16 there. Measured on the `qwen4-main-squashed` tip `9b2aee2283` (#38121 merged) at TP=2: GSM8K 97.5% for both cells, 47.4 tok/s single-stream with MTP, 253 tok/s output at 96 concurrent without — the same as the RadixArk export.
 
 </Accordion>
 
@@ -151,9 +152,14 @@ Each precision is its own repository:
       <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300, MI350X, MI355X</td>
     </tr>
     <tr style={{background: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}><strong>NVFP4</strong></td>
+      <td style={{padding: "9px 12px"}}><strong>NVFP4 (RDXA)</strong></td>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4">RadixArk/Qwen3.8-Flash-Next-NVFP4</a></td>
       <td style={{padding: "9px 12px"}}>B200, B300, GB300, RTX PRO 6000, 2x DGX Spark (Blackwell only)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>NVFP4 (NVDA)</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4">nvidia/Qwen3.8-Flash-Next-NVFP4</a> (ModelOpt MIXED_PRECISION)</td>
+      <td style={{padding: "9px 12px"}}>2x DGX Spark, with <a href="https://github.com/sgl-project/sglang/pull/38121">#38121</a> (in progress)</td>
     </tr>
   </tbody>
 </table>

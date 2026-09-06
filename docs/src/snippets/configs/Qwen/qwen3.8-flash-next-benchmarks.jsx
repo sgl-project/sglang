@@ -73,11 +73,58 @@ export const benchmarks = [
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
     accuracy: { gsm8k_pct: 97.5 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
+        ttft_ms: 457.14, tpot_ms: 19.94, tokens_per_sec_per_gpu: 116 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
+        ttft_ms: 2027.14, tpot_ms: 79.16, tokens_per_sec_per_gpu: 379 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 24 },
+        ttft_ms: 2301.03, tpot_ms: 101.95, tokens_per_sec_per_gpu: 464 },
+    ],
   },
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "multi-2" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
     accuracy: { gsm8k_pct: 97.0 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
+        ttft_ms: 416.42, tpot_ms: 39.33, tokens_per_sec_per_gpu: 60 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
+        ttft_ms: 4035.18, tpot_ms: 90.87, tokens_per_sec_per_gpu: 372 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 96 },
+        ttft_ms: 19531.95, tpot_ms: 301.92, tokens_per_sec_per_gpu: 603 },
+    ],
+  },
+  // nvidia/Qwen3.8-Flash-Next-NVFP4 (ModelOpt MIXED_PRECISION) on the same
+  // Spark pair, measured on the qwen4-main-squashed tip 9b2aee2283 (which
+  // includes sgl-project/sglang#38121) — the shipped image cannot load this
+  // export yet. Same GSM8K
+  // protocol (chat API, thinking off, n=200) and bench workload as above.
+  {
+    match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "multi-2" },
+    sglang_version: "qwen4-main-squashed @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 97.5 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
+        ttft_ms: 447.13, tpot_ms: 18.70, tokens_per_sec_per_gpu: 119 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
+        ttft_ms: 2161.72, tpot_ms: 73.20, tokens_per_sec_per_gpu: 415 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 24 },
+        ttft_ms: 1608.84, tpot_ms: 97.80, tokens_per_sec_per_gpu: 496 },
+    ],
+  },
+  {
+    match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "multi-2" },
+    sglang_version: "qwen4-main-squashed @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 97.5 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
+        ttft_ms: 398.49, tpot_ms: 38.62, tokens_per_sec_per_gpu: 61 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
+        ttft_ms: 4949.99, tpot_ms: 90.58, tokens_per_sec_per_gpu: 364 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 96 },
+        ttft_ms: 17962.94, tpot_ms: 289.52, tokens_per_sec_per_gpu: 632 },
+    ],
   },
   // 1x RTX PRO 6000 Blackwell (96 GB), TP=1, lmsysorg/sglang:qwen38flashnext
   // (SGLang 593134d17a), 2026-09-05. Same chat-API GSM8K protocol as the DGX

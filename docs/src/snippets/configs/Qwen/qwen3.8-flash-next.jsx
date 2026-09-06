@@ -877,6 +877,77 @@ export const config = {
       ],
     },
 
+    // ==== NVFP4 (NVDA) on 2x DGX Spark — nvidia/Qwen3.8-Flash-Next-NVFP4 ====
+    // ModelOpt MIXED_PRECISION export: NVFP4 routed experts, FP8 N-gram table,
+    // FP8_BLOCK_SCALES (128-wide) MTP experts. Loading it needs the mixed-
+    // precision loader from sgl-project/sglang#38121, which the qwen38flashnext
+    // image does not carry yet — hence in-progress. Same TP=2 shape and flags as
+    // the RDXA cells, with two differences forced by this export:
+    //   - `--quantization` is NOT passed (the checkpoint resolves to
+    //     modelopt_mixed), and `--moe-runner-backend flashinfer_cutlass` is
+    //     explicit: the modelopt_mixed auto-default picks flashinfer_trtllm on
+    //     GB10, which the NVFP4 MoE method rejects at flashinfer autotune.
+    //   - Low latency takes the MTP draft from the RadixArk export
+    //     (`--speculative-draft-model-path` + `modelopt_fp4`): it is the same
+    //     trained head kept in BF16 there, whereas this export's fp8
+    //     block-scaled MTP experts cannot be TP-sharded (640/2 = 320 is not a
+    //     multiple of the 128 block) and fault on the triton fp8 path under EP.
+    // Measured 2026-09-05 on the qwen4-main-squashed tip 9b2aee2283 (#38121
+    // merged), TP=2: GSM8K (chat, thinking off, n=200) 97.5% / 97.5%; bench
+    // (ISL 1024/OSL 256) ~48 tok/s single stream with MTP, 253 tok/s output at
+    // 96 concurrent without.
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "multi-2" },
+      verified: true,
+      verificationStatus: "in-progress",
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7). Needs the ModelOpt MIXED_PRECISION loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), not yet in the qwen38flashnext image — run the Python command from that PR's branch until it lands. The MTP draft is read from the RadixArk export (same head, BF16) because this export's fp8 block-scaled MTP experts cannot be split across two ranks. See [DGX Spark notes](#spark-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--page-size 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path RadixArk/Qwen3.8-Flash-Next-NVFP4",
+        "--speculative-draft-model-quantization modelopt_fp4",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--max-running-requests 24",
+        "--max-mamba-cache-size 120",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "multi-2" },
+      verified: true,
+      verificationStatus: "in-progress",
+      warn: "2x DGX Spark only (GB10 pair, TP=2 over ConnectX-7). Needs the ModelOpt MIXED_PRECISION loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), not yet in the qwen38flashnext image — run the Python command from that PR's branch until it lands. At 96 concurrent requests the KV pool is ~1.1M tokens; lower --max-running-requests for long-context workloads. See [DGX Spark notes](#spark-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--fp4-gemm-backend flashinfer_cutlass",
+        "--page-size 64",
+        "--chunked-prefill-size 4096",
+        "--context-length 262144",
+        "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--max-running-requests 96",
+        "--max-mamba-cache-size 384",
+        "--reasoning-parser qwen3",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
     // ==== AMD CDNA4 (MI350X / MI355X) ====
     // One recipe, identical for BF16 and FP8 and for both cards (same gfx950,
     // same 288GB, same ROCm image) — hence `balanced` on all four cells. This is
