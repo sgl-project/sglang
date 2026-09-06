@@ -766,13 +766,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if self.kv_index_translator.is_translating and (
             forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
         ):
-            # One launch: translate the batch's live prefix straight into the
-            # capture-stable buffer and clear the tail. Replay-prep receives the
-            # RAW (unpadded) out_cache_loc (build_replay_fb_view) while the
-            # captured write kernel consumes the whole buffer, so a stale tail
-            # left by an earlier larger replay would scatter pad-row garbage
-            # into live KV pages; zeroing sends those rows to the sink (row 0),
-            # mirroring the runner's PaddingPolicy.ZERO on its own slot.
+            # The captured kernel consumes the whole buffer, so the tail a
+            # shorter replay leaves must go to slot 0 rather than live pages.
             self._decode_kernel_loc = self.kv_index_translator.fill_capture_write_loc(
                 out=self.cuda_graph_out_cache_loc_kernel,
                 forward_batch=forward_batch,

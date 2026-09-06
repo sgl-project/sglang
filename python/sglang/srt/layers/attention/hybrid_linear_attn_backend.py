@@ -70,9 +70,6 @@ class MambaAttnBackendBase(AttentionBackend):
         # backends on runners without a real model_config.
         self._model_runner = model_runner
         self._mamba_chunk_size: Optional[int] = None
-        # Fused replay-prep state-indices fast path: the pool decides, since
-        # only it knows whether `fused_replay_state_indices` can reproduce its
-        # own mamba translate.
         pool = self.req_to_token_pool
         self._fused_state_indices_ok = (
             torch.device(self.device).type == "cuda"
