@@ -172,6 +172,7 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:token_usage",
             "sglang:gen_throughput",
             "sglang:num_queue_reqs",
+            "sglang:avg_request_queue_latency",
             "sglang:num_grammar_queue_reqs",
             "sglang:cache_hit_rate",
             "sglang:spec_accept_length",

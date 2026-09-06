@@ -76,6 +76,7 @@ class SchedulerStats:
     # Basics
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    avg_request_queue_latency: float = 0.0
     num_grammar_queue_reqs: int = 0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
@@ -285,6 +286,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.num_queue_reqs = Gauge(
             name="sglang:num_queue_reqs",
             documentation="The number of requests in the waiting queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.avg_request_queue_latency = Gauge(
+            name="sglang:avg_request_queue_latency",
+            documentation="The average wait time in seconds of requests currently in the waiting queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1364,6 +1371,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Basics
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
+        self._log_gauge(self.avg_request_queue_latency, stats.avg_request_queue_latency)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
