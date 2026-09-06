@@ -532,7 +532,31 @@ def test_precomputed_embedding_mismatch_is_request_local(rows):
     encoder.assert_not_called()
 
 
-def _distributed_embedding_validation(rank, rendezvous, backend):
+def test_combined_wrong_width_retries_to_isolate_the_bad_image():
+    items = _make_items()[:2]
+    good = _item_embedding(items[0])
+    calls = []
+
+    def encode(batch):
+        calls.append(len(batch))
+        if len(batch) > 1:
+            return torch.zeros(10, HIDDEN + 1)
+        if batch[0] is items[0]:
+            return good
+        return torch.zeros(6, HIDDEN + 1)
+
+    outputs, errors = mm_schedule._validate_per_item_embeddings(
+        encode, items, encode(items), [4, 6], HIDDEN, _CPU
+    )
+
+    assert calls == [2, 1, 1]
+    assert errors == {1: (6, -1)}
+    torch.testing.assert_close(outputs[0], good)
+    assert outputs[1].shape == (6, HIDDEN)
+    assert torch.count_nonzero(outputs[1]) == 0
+
+
+def _distributed_embedding_validation(rank, rendezvous, backend, malformed):
     device = torch.device("cuda", rank) if backend == "nccl" else _CPU
     if backend == "nccl":
         torch.cuda.set_device(device)
@@ -563,7 +587,9 @@ def _distributed_embedding_validation(rank, rendezvous, backend):
                 calls.append(len(batch))
                 # one rank sees a malformed combined output; both must retry
                 if len(batch) > 1:
-                    return torch.zeros(9 if rank == 0 else 10, HIDDEN, device=device)
+                    rows = 9 if rank == 0 and malformed == "rows" else 10
+                    width = HIDDEN + (rank == 0 and malformed == "width")
+                    return torch.zeros(rows, width, device=device)
                 return (
                     torch.zeros(3 if rank == 0 else 4, HIDDEN, device=device)
                     if batch[0] is items[0]
@@ -596,10 +622,11 @@ def _distributed_embedding_validation(rank, rendezvous, backend):
         ),
     ],
 )
-def test_retry_and_error_consensus_across_real_ranks(tmp_path, backend):
+@pytest.mark.parametrize("malformed", ["rows", "width"])
+def test_retry_and_error_consensus_across_real_ranks(tmp_path, backend, malformed):
     torch.multiprocessing.spawn(
         _distributed_embedding_validation,
-        args=((tmp_path / "rendezvous").as_uri(), backend),
+        args=((tmp_path / "rendezvous").as_uri(), backend, malformed),
         nprocs=2,
         join=True,
     )

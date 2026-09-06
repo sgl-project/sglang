@@ -213,7 +213,10 @@ def _validate_per_item_embeddings(
         outputs = []
     else:
         embedding = embedding.reshape(-1, embedding.shape[-1])
-        retry = embedding.shape[0] != sum(token_counts)
+        retry = (
+            embedding.shape[0] != sum(token_counts)
+            or embedding.shape[1] != embedding_dim
+        )
         outputs = [] if retry else list(embedding.split(token_counts))
 
     # every participating rank must agree before re-entering a TP-aware encoder
