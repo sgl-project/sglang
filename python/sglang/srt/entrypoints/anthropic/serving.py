@@ -43,6 +43,11 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     ToolUseBlock,
     is_server_tool,
 )
+from sglang.srt.entrypoints.anthropic.tool_reference import (
+    make_tool_reference_part,
+    should_forward_tool,
+    template_supports_deferred_tool_loading,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -190,8 +195,10 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
-        self._merge_inline_system = not detect_inline_system_support(
-            self._chat_template()
+        chat_template = self._chat_template()
+        self._merge_inline_system = not detect_inline_system_support(chat_template)
+        self._native_deferred_tool_loading = template_supports_deferred_tool_loading(
+            chat_template
         )
 
     def _chat_template(self) -> Optional[str]:
@@ -231,6 +238,7 @@ class AnthropicServing:
     ) -> ChatCompletionRequest:
         """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
         openai_messages = []
+        referenced_tool_names: set[str] = set()
 
         def _convert_anthropic_image_source_to_openai_part(
             source: Any,
@@ -330,8 +338,12 @@ class AnthropicServing:
                         # matches on `name`. Translate at the boundary.
                         ref_name = item.get("tool_name") or item.get("name")
                         if ref_name:
+                            referenced_tool_names.add(ref_name)
                             tool_content_parts.append(
-                                {"type": "tool_reference", "name": ref_name}
+                                make_tool_reference_part(
+                                    ref_name,
+                                    native_support=self._native_deferred_tool_loading,
+                                )
                             )
                     elif item_type == "search_result":
                         search_text = _text_from_search_result(item)
@@ -651,9 +663,11 @@ class AnthropicServing:
                 anthropic_request.betas,
             )
 
-        # Convert tools. Deferred tools stay in the list with defer_loading=True;
-        # the chat template hides them from the initial <tools> block and renders
-        # them on demand when a tool_reference block names them.
+        # Native templates receive the full deferred catalog and expand schemas
+        # inline at tool_reference blocks. Generic templates cannot do that, so
+        # expose only non-deferred tools and deferred tools referenced by prior
+        # ToolSearch results. This preserves discovery semantics without sending
+        # an unsupported structured content part to the template.
         if anthropic_request.tools:
             converted_tools = []
             for tool in anthropic_request.tools:
@@ -671,12 +685,24 @@ class AnthropicServing:
                     )
                     continue
 
+                if not should_forward_tool(
+                    name=tool.name,
+                    defer_loading=tool.defer_loading,
+                    referenced_names=referenced_tool_names,
+                    native_support=self._native_deferred_tool_loading,
+                ):
+                    continue
+
                 # Custom tools always have a validated input_schema
                 # (enforced at Pydantic parse time).
                 converted_tools.append(
                     Tool(
                         type="function",
-                        defer_loading=tool.defer_loading,
+                        defer_loading=(
+                            tool.defer_loading
+                            if self._native_deferred_tool_loading
+                            else None
+                        ),
                         function={
                             "name": tool.name,
                             "description": tool.description or "",

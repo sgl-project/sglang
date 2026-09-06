@@ -147,6 +147,9 @@ class TestAnthropicServing(unittest.TestCase):
         "{%- endfor %}"
     )
     GLM_TOOL_RESULT_TEMPLATE = """
+{%- for tool in tools if not tool.function.defer_loading -%}
+{{ tool.function.name }}
+{%- endfor -%}
 {%- for message in messages if message.role == "tool" -%}
 {%- if loop.first -%}<|observation|>{%- endif -%}
 {%- if message.content is string -%}
@@ -424,7 +427,9 @@ class TestAnthropicServing(unittest.TestCase):
             ]
         )
 
-        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        chat_request = self._serving(
+            chat_template=self.GLM_TOOL_RESULT_TEMPLATE
+        )._convert_to_chat_completion_request(request)
         messages = chat_request.model_dump(exclude_none=True)["messages"]
 
         self.assertEqual([message["role"] for message in messages], ["tool"] * 3)
@@ -455,7 +460,9 @@ class TestAnthropicServing(unittest.TestCase):
             ],
         )
 
-        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        chat_request = self._serving(
+            chat_template=self.GLM_TOOL_RESULT_TEMPLATE
+        )._convert_to_chat_completion_request(request)
         payload = chat_request.model_dump(exclude_none=True)
         prompt = template.render(messages=payload["messages"], tools=payload["tools"])
 
@@ -471,7 +478,9 @@ class TestAnthropicServing(unittest.TestCase):
             ]
         )
 
-        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        chat_request = self._serving(
+            chat_template=self.GLM_TOOL_RESULT_TEMPLATE
+        )._convert_to_chat_completion_request(request)
         messages = chat_request.model_dump(exclude_none=True)["messages"]
 
         self.assertEqual(len(messages), 1)
@@ -480,6 +489,50 @@ class TestAnthropicServing(unittest.TestCase):
             [
                 {"type": "tool_reference", "name": "Bash"},
                 {"type": "tool_reference", "name": "Read"},
+            ],
+        )
+
+    def test_tool_reference_degrades_to_text_without_template_support(self):
+        request = self._tool_result_request(
+            [
+                {"type": "text", "text": "Tool loaded: Bash"},
+                {"type": "tool_reference", "tool_name": "Bash"},
+            ]
+        )
+
+        chat_request = self._serving(
+            chat_template=self.INLINE_SYSTEM_TEMPLATE
+        )._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+
+        self.assertEqual([message["role"] for message in messages], ["tool"])
+        self.assertEqual(
+            messages[0]["content"],
+            [
+                {"type": "text", "text": "Tool loaded: Bash"},
+                {"type": "text", "text": "[tool reference: Bash]"},
+            ],
+        )
+
+    def test_reference_only_tool_result_degrades_to_text_without_template_support(self):
+        request = self._tool_result_request(
+            [
+                {"type": "tool_reference", "tool_name": "Bash"},
+                {"type": "tool_reference", "tool_name": "Read"},
+            ]
+        )
+
+        chat_request = self._serving(
+            chat_template=self.INLINE_SYSTEM_TEMPLATE
+        )._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(
+            messages[0]["content"],
+            [
+                {"type": "text", "text": "[tool reference: Bash]"},
+                {"type": "text", "text": "[tool reference: Read]"},
             ],
         )
 
