@@ -545,6 +545,35 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 )
 
 
+def _no_buffer_overlap_ok(model_arch: str) -> bool:
+    """Whether ``model_arch`` may keep the overlap scheduler with the
+    ``no_buffer`` mamba radix-cache strategy.
+
+    Overlap + ``no_buffer`` is safe only when the model's conv/mamba state is
+    a *windowed* (finite-context) short conv whose per-request state is either
+    (a) not restored from the radix cache on a prefix hit, or (b) refreshed
+    from a checkpoint that cannot race the in-flight forward. LFM2's depthwise
+    gated short conv (``causal_conv1d``) keeps a fixed-size rolling window per
+    request slot; the radix path restores it from a ``copy_from`` checkpoint
+    that is quiescent by the time the overlapped next batch launches, so the
+    ping-pong ``extra_buffer`` double-buffering (which LFM2's
+    ``ShortConvAttnBackend`` does not implement) is unnecessary. Dense hybrids
+    like LFM2 are exactly the models most hurt by disabling overlap, since the
+    synchronous loop serializes host dispatch behind every tiny decode step.
+    """
+    return model_arch in _NO_BUFFER_OVERLAP_ARCHS
+
+
+# Architectures permitted to run the overlap scheduler with the ``no_buffer``
+# mamba radix-cache strategy. Membership requires the windowed-conv safety
+# argument documented in ``_no_buffer_overlap_ok``.
+_NO_BUFFER_OVERLAP_ARCHS = frozenset(
+    {
+        "Lfm2ForCausalLM",
+    }
+)
+
+
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
@@ -592,6 +621,10 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
             view, model_arch
         ):
             declared["mamba_radix_cache_strategy"] = "extra_buffer"
+        elif wants_overlap and _no_buffer_overlap_ok(model_arch):
+            # Keep overlap on for windowed short-conv hybrids whose conv state
+            # does not need the extra_buffer ping-pong (see _no_buffer_overlap_ok).
+            declared["mamba_radix_cache_strategy"] = "no_buffer"
         else:
             declared["mamba_radix_cache_strategy"] = "no_buffer"
             declared["disable_overlap_schedule"] = True
