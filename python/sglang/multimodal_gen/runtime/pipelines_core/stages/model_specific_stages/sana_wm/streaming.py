@@ -630,6 +630,8 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
                 len(explicit_sigmas),
                 do_cfg,
             )
+            total_iterations = num_chunks * len(explicit_sigmas)
+            batch.record_stage_iterations(total_iterations, total_iterations)
 
             for chunk_idx in self.progress_bar(range(num_chunks), batch=batch):
                 chunk_kv, sink_num = self._accumulate_kv_cache(
