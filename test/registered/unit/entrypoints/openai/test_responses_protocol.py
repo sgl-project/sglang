@@ -28,6 +28,25 @@ def _in_progress_response(request: ResponsesRequest) -> ResponsesResponse:
 
 
 class ResponsesRequestTestCase(CustomTestCase):
+    def test_pd_routing_fields(self):
+        with self.assertWarns(DeprecationWarning):
+            request = ResponsesRequest(
+                model="x",
+                input="hi",
+                bootstrap_host="10.0.0.1",
+                bootstrap_port=8998,
+                bootstrap_room=42,
+                data_parallel_rank=1,
+                disagg_prefill_dp_rank=0,
+                store=False,
+            )
+
+        self.assertEqual(request.bootstrap_host, "10.0.0.1")
+        self.assertEqual(request.bootstrap_port, 8998)
+        self.assertEqual(request.bootstrap_room, 42)
+        self.assertEqual(request.routed_dp_rank, 1)
+        self.assertEqual(request.disagg_prefill_dp_rank, 0)
+
     def test_function_tool_accepted(self):
         request = ResponsesRequest(
             model="x",
