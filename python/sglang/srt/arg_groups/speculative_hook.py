@@ -1012,6 +1012,16 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         "_handle_ngram",
         speculative_eagle_topk=cfg.speculative_ngram_max_bfs_breadth,
     )
+    max_sam_match_depth = cfg.speculative_ngram_max_sam_match_depth
+    if max_sam_match_depth is None:
+        max_sam_match_depth = cfg.speculative_ngram_max_trie_depth
+        declare_resolution(
+            server_args,
+            "_handle_ngram",
+            speculative_ngram_max_sam_match_depth=max_sam_match_depth,
+        )
+    if max_sam_match_depth <= 0:
+        raise ValueError("--speculative-ngram-max-sam-match-depth must be positive.")
     if cfg.speculative_num_draft_tokens is None:
         declare_resolution(
             server_args,
