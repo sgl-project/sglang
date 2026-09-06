@@ -498,8 +498,8 @@ class DSparkDraftMixin:
                 config, quant_config, prefix
             )
         else:
-            self.markov_head = build_markov_head(config)
-        self.confidence_head = build_confidence_head(config)
+            self.markov_head = self._build_markov_head(config, dspark_config)
+        self.confidence_head = self._build_confidence_head(config, dspark_config)
         self.lm_head: Optional[nn.Module] = None
         # Expose the draft's own layer count so the draft ModelRunner sizes the
         # draft KV pool correctly. Some DSpark draft checkpoints inherit the
@@ -510,6 +510,12 @@ class DSparkDraftMixin:
         # out of range. DSv4 (MoE) drafts expose this via ``num_stages``; mirror
         # that convention for dense DSpark drafts.
         self.num_stages = int(config.num_hidden_layers)
+
+    def _build_markov_head(self, config, dspark_config) -> Optional[nn.Module]:
+        return build_markov_head(config)
+
+    def _build_confidence_head(self, config, dspark_config) -> Optional[nn.Module]:
+        return build_confidence_head(config)
 
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module

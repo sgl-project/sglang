@@ -165,6 +165,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
+        # Set the draft block-row convention BEFORE the draft runner exists:
+        # its CG capture widths / logits buffers derive from
+        # get_num_tokens_per_req_for_target_verify at construction.
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            read_draft_checkpoint_is_mask_filling,
+        )
+        from sglang.srt.speculative.spec_info import (
+            set_dspark_mask_filling_convention,
+        )
+
+        # No fallback: a draft config that cannot be read here would silently
+        # serve the wrong verify geometry (bs*(gamma-1) rows reshaped as
+        # (-1, gamma)); fail at startup instead.
+        set_dspark_mask_filling_convention(
+            read_draft_checkpoint_is_mask_filling(server_args=server_args)
+        )
+
         with self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -346,9 +363,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._simulate_acc_len}."
             )
 
-        self._verify_executor = TargetVerifyExecutor(
+        self._verify_executor = self._build_verify_executor(
             target_worker=self.target_worker,
-            gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             model_runner=self.model_runner,
             kv_injector=self._kv_injector,
@@ -467,10 +483,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
-    def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
+    def _maybe_build_draft_sampler(self, *, available_memory_gb: float, **overrides):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
+            num_drafts=self.verify_num_draft_tokens - 1,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self.ps.tp_rank,
@@ -486,6 +503,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            **overrides,
         )
 
     def clear_cache_pool(self):
@@ -519,6 +537,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             return self._forward_prefill(batch, on_publish)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
+
+    def _build_verify_executor(self, **kwargs) -> TargetVerifyExecutor:
+        """Hook: subclasses substitute a specialized TargetVerifyExecutor;
+        kwargs are the base construction arguments, forward them through."""
+        return TargetVerifyExecutor(**kwargs)
+
+    def _on_prefill_target_hidden(self, batch, target_hidden) -> None:
+        """Hook: called with the CaptureHiddenMode.FULL prefill hiddens
+        ([sum(extend_lens), T*H], batch request order) just before they are
+        dropped. Idle prefill never reaches this (no injection)."""
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
@@ -598,6 +626,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
         )
+        # Last point where the FULL prefill capture is reachable; subclasses
+        # that stage per-request draft features read it here.
+        self._on_prefill_target_hidden(batch, logits_output.hidden_states)
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 
@@ -744,6 +775,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
+        # Contract joint: anchor + drafts must equal the verify width every
+        # site downstream (CG buffers, ragged layout, result rail) is sized to.
+        assert draft_tokens.shape[1] + 1 == self.verify_num_draft_tokens, (
+            draft_tokens.shape,
+            self.verify_num_draft_tokens,
+            self.gamma,
+        )
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()

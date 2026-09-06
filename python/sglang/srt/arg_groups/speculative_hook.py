@@ -642,20 +642,35 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if gamma is not None:
-        verify_window = int(gamma) + 1
+        # Resolve the verify width from the draft checkpoint's convention.
+        # AR-readout heads emit gamma drafts, so the verify window is the
+        # anchor row plus gamma draft rows (gamma + 1). Mask-filling heads
+        # (dspark_mask_filling: true in the draft config) carry the anchor
+        # inside the block and emit gamma - 1 drafts, so their faithful
+        # verify width is exactly gamma -- a gamma + 1 window would append a
+        # junk token sampled from the clamped last slot.
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            read_draft_checkpoint_is_mask_filling,
+        )
+
+        mask_filling = read_draft_checkpoint_is_mask_filling(server_args=server_args)
+        # Here we only validate the user-facing width arithmetic; the runtime
+        # convention global is set by DSparkWorkerV2.__init__.
+        verify_width = int(gamma) if mask_filling else int(gamma) + 1
         if (
             cfg.speculative_num_draft_tokens is not None
-            and int(cfg.speculative_num_draft_tokens) != verify_window
+            and int(cfg.speculative_num_draft_tokens) != verify_width
         ):
             raise ValueError(
-                "DSpark speculative_num_draft_tokens must equal gamma + 1 "
-                f"(= {verify_window} for gamma={gamma}), but got "
+                "DSpark speculative_num_draft_tokens must equal "
+                f"{'gamma (mask-filling head)' if mask_filling else 'gamma + 1'} "
+                f"(= {verify_width} for gamma={gamma}), but got "
                 f"speculative_num_draft_tokens={cfg.speculative_num_draft_tokens}."
             )
         declare_resolution(
             server_args,
             "_handle_dspark",
-            speculative_num_draft_tokens=verify_window,
+            speculative_num_draft_tokens=verify_width,
         )
 
     if cfg.speculative_num_draft_tokens is None:

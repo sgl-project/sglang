@@ -67,6 +67,12 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    # Mask-filling heads (slot 0 = anchor, slots 1..gamma-1 = predictions)
+    # emit gamma-1 real drafts per block, so their faithful verify width is
+    # gamma (= config block_size), not gamma+1. Declared by the draft
+    # checkpoint config (dspark_mask_filling); builtin AR heads keep
+    # drafts = gamma and verify = gamma+1.
+    mask_filling: bool = False
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -97,12 +103,28 @@ def resolve_runtime_config(
             f"markov_rank={draft_config.markov_rank}."
         )
 
+    mask_filling = draft_config.mask_filling
     if speculative_num_draft_tokens is None:
         gamma = int(draft_config.resolve_gamma(default=None) or 0)
         if gamma < 1:
             raise ValueError(
                 "DSpark could not resolve gamma from the draft config and "
                 "speculative_num_draft_tokens is unset."
+            )
+    elif mask_filling:
+        gamma = int(speculative_num_draft_tokens)
+        if gamma < 2:
+            raise ValueError(
+                "DSpark(mask-filling) speculative_num_draft_tokens must be >= 2 "
+                f"(= gamma = block_size), got {speculative_num_draft_tokens}."
+            )
+        config_gamma = draft_config.resolve_gamma(default=None)
+        if config_gamma is not None and int(config_gamma) != gamma:
+            raise ValueError(
+                "Faithful DSpark(mask-filling) contract: "
+                f"speculative_num_draft_tokens ({gamma}) must equal the draft "
+                f"config block_size ({config_gamma}); verify width = block_size "
+                "with drafts = block_size - 1."
             )
     else:
         gamma = dspark_gamma_from_num_draft_tokens(int(speculative_num_draft_tokens))
@@ -129,7 +151,7 @@ def resolve_runtime_config(
 
     return DSparkRuntimeConfig(
         gamma=gamma,
-        verify_num_draft_tokens=gamma + 1,
+        verify_num_draft_tokens=gamma if mask_filling else gamma + 1,
         mask_token_id=mask_token_id,
     )
 
@@ -143,6 +165,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
     silently drops the checkpoint's gamma and the cross-check with
     `--speculative-num-draft-tokens` along with it.
     """
+    from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     resolving = resolved_view(server_args)
@@ -159,6 +182,12 @@ def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
     return read_draft_checkpoint_config(server_args=server_args).resolve_gamma(
         default=None
     )
+
+
+def read_draft_checkpoint_is_mask_filling(*, server_args: ServerArgs) -> bool:
+    """Mask-filling heads (slot 0 = anchor) serve verify width = gamma, not
+    gamma + 1. See resolve_runtime_config."""
+    return read_draft_checkpoint_config(server_args=server_args).mask_filling
 
 
 def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
@@ -260,9 +289,15 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         raise ValueError(
             "DSpark requires markov_head_type when markov_rank > 0, got None."
         )
+    mask_filling = bool(_cfg_get(draft_hf_config, "dspark_mask_filling", False))
     if markov_head_type is not None:
         markov_head_type = str(markov_head_type).lower()
-        if markov_head_type not in SUPPORTED_DSPARK_MARKOV_HEAD_TYPES:
+        # Mask-filling configs name an out-of-tree head; only builtin head
+        # names are checked here.
+        if (
+            not mask_filling
+            and markov_head_type not in SUPPORTED_DSPARK_MARKOV_HEAD_TYPES
+        ):
             raise ValueError(
                 f"Unsupported DSpark markov_head_type={markov_head_type!r}. "
                 f"Supported: {SUPPORTED_DSPARK_MARKOV_HEAD_TYPES}."
@@ -313,4 +348,5 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        mask_filling=mask_filling,
     )

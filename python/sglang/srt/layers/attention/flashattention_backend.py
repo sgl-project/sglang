@@ -126,6 +126,14 @@ class FlashAttentionMetadata:
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
+    # fa `causal` for forwards driven by this metadata; False = attend
+    # bidirectionally over exactly the page table's keys (window off).
+    # Consumed by the forward_extend swa-sub-metadata branch.
+    causal: bool = True
+    # The page table holds TOKEN rows (req_to_token), not page_size-divided
+    # page ids; the KV cache must be viewed with page size 1.
+    token_granular_page_table: bool = False
+
 
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
@@ -1420,6 +1428,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         # Get the appropriate page table based on whether we're using local attention
+        token_granular_pages = False
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
             page_table = local_metadata.local_block_table
@@ -1433,6 +1442,12 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
+            if not swa_spec_metadata.causal:
+                window_size = (-1, -1)
+                causal = False
+            if swa_spec_metadata.token_granular_page_table:
+                # Same page-size-1 KV view pattern as the cascade expand call.
+                token_granular_pages = True
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:
@@ -1453,6 +1468,11 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = self.get_paged_mha_kv_cache(
                 layer,
             )
+            if token_granular_pages:
+                key_cache = key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim)
+                value_cache = value_cache.view(
+                    -1, 1, layer.tp_v_head_num, layer.v_head_dim
+                )
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
