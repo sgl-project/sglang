@@ -638,7 +638,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             hf_config=self.hf_config,
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
-            attention_mask=getattr(ret, "attention_mask", None),
+            attention_mask=None,
         )
         mrope_positions = mrope_positions.squeeze(1)
 
