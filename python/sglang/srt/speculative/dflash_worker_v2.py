@@ -120,7 +120,8 @@ class _DflashDraftSampler:
         self.org_vocab_start = int(org_vocab_start)
         self.tp_group = tp_group
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
-        max_tokens = int(max_bs) * (self.block_size - 1)
+        self.max_bs = int(max_bs)
+        max_tokens = self.max_bs * (self.block_size - 1)
         device = weight.device
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         if self.tp_size > 1:
@@ -228,6 +229,7 @@ class _SelectorDraftSampler:
         self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
+        self.max_bs = max_bs
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
@@ -679,6 +681,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
         )
+
+    def _prepare_draft_sampler(self, *, batch, bs: int) -> bool:
+        """Stage graph-folded sampling only for captured batch sizes.
+
+        Batches larger than the largest captured CUDA graph run eagerly.  The
+        folded sampler's static buffers are sized to that graph limit, so they
+        must not be staged for an eager fallback batch.
+        """
+        sampler = self._draft_sampler
+        if sampler is None or bs > sampler.max_bs:
+            return False
+        if self.selector is not None:
+            sampler.stage_sampling_params(bs=bs, sampling_info=batch.sampling_info)
+        return True
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -2127,17 +2143,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self.selector is not None:
             self._selector_sample = None
-            if self._draft_sampler is not None:
-                # Consumed by the in-graph sample; must be staged before the replay.
-                self._draft_sampler.stage_sampling_params(
-                    bs=bs, sampling_info=batch.sampling_info
-                )
+        # Consumed by the in-graph sample; must be staged before the replay.
+        draft_sampler_ready = self._prepare_draft_sampler(batch=batch, bs=bs)
 
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        folded = self._draft_sampler is not None and draft_out.can_run_graph
+        folded = draft_sampler_ready and draft_out.can_run_graph
         if folded:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
