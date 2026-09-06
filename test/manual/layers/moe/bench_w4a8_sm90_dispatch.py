@@ -26,7 +26,7 @@ Run on H200:
 
 from __future__ import annotations
 
-import argparse
+import os
 from typing import Callable, Dict, List, Optional, Tuple
 
 import msgspec
@@ -36,7 +36,8 @@ from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
 GROUP_SIZE = 128
-CUDA_GRAPH_MAX_TOKENS = 2048  # decode-sized batches run under a captured graph in production
+# Decode-sized batches run under a captured graph in production.
+CUDA_GRAPH_MAX_TOKENS = 2048
 L2_FLUSH_BYTES = 256 * 1024 * 1024
 
 
@@ -319,8 +320,6 @@ def run_one_shape(shape: Shape, weights: dict):
 def _init_single_rank_runtime():
     """cutlass_w4a8_moe reads get_parallel().moe_ep_size -- needs a TP/EP
     group even at world_size=1."""
-    import os
-
     from sglang.srt.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
@@ -347,9 +346,6 @@ def _init_single_rank_runtime():
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.parse_args()
-
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required.")
     cap = torch.cuda.get_device_capability()
