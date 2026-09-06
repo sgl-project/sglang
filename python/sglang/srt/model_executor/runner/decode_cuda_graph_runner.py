@@ -29,6 +29,7 @@ import contextlib
 import inspect
 import logging
 import os
+from itertools import product
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -46,6 +47,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
+    CudaGraphVariantManager,
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -568,13 +570,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(
-        self, size, stream_idx=None, variant_label=None, dsa_variant=None
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        dsa_variant=None,
+        attention_variant=None,
     ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
             dsa_variant=dsa_variant,
+            attention_variant=attention_variant,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -599,6 +607,35 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # No length info: be safe and use the correct-for-all sparse graph.
             return "sparse"
         return "dense" if max_kv_len <= self.dsa_index_topk else "sparse"
+
+    def _resolve_attention_variant(
+        self, forward_batch: ForwardBatch, padded_batch_size: int
+    ):
+        variant_manager = self._get_attention_variant_manager(
+            self._replay_attn_backend(), forward_batch.forward_mode
+        )
+        if variant_manager is None:
+            return None
+        variant = variant_manager.select_cuda_graph_variant(
+            forward_batch, padded_batch_size
+        )
+        variant_manager.set_cuda_graph_variant(variant)
+        return variant
+
+    @staticmethod
+    def _get_attention_variant_manager(
+        attn_backend, forward_mode
+    ) -> Optional[CudaGraphVariantManager]:
+        get_manager = getattr(attn_backend, "get_cuda_graph_variant_manager", None)
+        return get_manager(forward_mode) if get_manager is not None else None
+
+    @staticmethod
+    def _set_attention_variant(attn_backend, forward_mode, variant) -> None:
+        variant_manager = DecodeCudaGraphRunner._get_attention_variant_manager(
+            attn_backend, forward_mode
+        )
+        if variant_manager is not None:
+            variant_manager.set_cuda_graph_variant(variant)
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not getattr(self, "record_nolora_graph", False):
@@ -707,10 +744,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
+        if not self.disable_padding and cuda_graph_bs > self.max_bs:
+            return False
+
+        padded_batch_size = (
+            cuda_graph_bs
+            if self.disable_padding
+            else self._pad_to_bucket(cuda_graph_bs, self.capture_bs)
+        )
+        attention_variant = self._resolve_attention_variant(
+            forward_batch, padded_batch_size
+        )
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
+            attention_variant=attention_variant,
         )
 
         is_bs_supported = (
@@ -1124,6 +1173,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variants = (
             ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
         )
+        attn_backend = (
+            self.attn_backend
+            if stream_idx is None
+            else self.model_runner.decode_attn_backend_group[stream_idx]
+        )
+        variant_manager = self._get_attention_variant_manager(
+            attn_backend, self.capture_forward_mode
+        )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1135,9 +1192,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
+            attention_batch_size = (
+                self._ragged_capture_slots(bs * self.captured_req_width)
+                if getattr(self, "ragged_verify_mode", False)
+                else bs
+            )
+            attention_variants = (
+                variant_manager.get_cuda_graph_capture_variants(
+                    attention_batch_size, self.capture_forward_mode
+                )
+                if variant_manager is not None
+                else (None,)
+            )
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
-                for dsa_variant in dsa_variants:
+                for dsa_variant, attention_variant in product(
+                    dsa_variants, attention_variants
+                ):
                     _set_capture_dsa_variant(dsa_variant)
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
@@ -1145,14 +1216,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         num_tokens=bs * self.captured_req_width,
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
-                        if dsa_variant is None:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
-                            )
-                        else:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label, dsa_variant
-                            )
+                        extra_variants = (
+                            ()
+                            if dsa_variant is None and attention_variant is None
+                            else (dsa_variant, attention_variant)
+                        )
+                        self.capture_one_shape(
+                            bs, forward, stream_idx, variant_label, *extra_variants
+                        )
+        self._set_attention_variant(attn_backend, self.capture_forward_mode, None)
         _set_capture_dsa_variant(None)
 
     def capture_one_shape(
@@ -1162,6 +1234,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         dsa_variant: Optional[str] = None,
+        attention_variant=None,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -1174,6 +1247,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
+        )
+        self._set_attention_variant(
+            attn_backend, self.capture_forward_mode, attention_variant
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
@@ -1251,6 +1327,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                     dsa_variant,
+                    attention_variant,
                 )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
@@ -1321,9 +1398,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             dsa_variant = self._resolve_dsa_variant(forward_batch)
+            attention_variant = self._resolve_attention_variant(
+                forward_batch, self.bs
+            )
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, dsa_variant
+                graph_size_key,
+                stream_idx,
+                variant_label,
+                dsa_variant,
+                attention_variant,
             )
             return
 
@@ -1358,6 +1442,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 bs=bs, num_tokens=padded_num_tokens
             )
 
+        attention_variant = self._resolve_attention_variant(forward_batch, bs)
         self.buffer_registry.fill_from(
             forward_batch,
             raw_bs=raw_bs,
@@ -1425,6 +1510,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     bs,
                     str(self.capture_forward_mode),
                     str(fb_view.actual_forward_mode),
+                    attention_variant,
                 ),
             )
         else:
@@ -1443,7 +1529,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variant = self._resolve_dsa_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, dsa_variant
+            graph_size_key,
+            stream_idx,
+            variant_label,
+            dsa_variant,
+            attention_variant,
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:

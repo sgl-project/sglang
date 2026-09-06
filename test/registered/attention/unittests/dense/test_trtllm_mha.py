@@ -1,8 +1,15 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.trtllm_mha_backend import (
+    TRTLLMHAAttnBackend,
+    TRTLLMMHACudaGraphVariant,
+    select_trtllm_mha_decode_seq_len_splits,
+    should_reorder_trtllm_mha_decode_requests,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
@@ -30,6 +37,63 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+
+
+class TestTRTLLMMHADecodeAdaptiveScheduler(CustomTestCase):
+    RAGGED_PATTERN = (1, 4, 8, 16, 24, 29)
+
+    @classmethod
+    def ragged(cls, batch_size):
+        return (cls.RAGGED_PATTERN * batch_size)[:batch_size]
+
+    def test_selects_cta_aware_split_without_uniform_regressions(self):
+        for batch_size, expected in [(32, 2), (64, 4), (128, 6), (256, 1)]:
+            with self.subTest(batch_size=batch_size):
+                self.assertEqual(
+                    select_trtllm_mha_decode_seq_len_splits([16] * batch_size, 152),
+                    1,
+                )
+                self.assertEqual(
+                    select_trtllm_mha_decode_seq_len_splits(
+                        self.ragged(batch_size), 152
+                    ),
+                    expected,
+                )
+
+        ragged = self.ragged(192)
+        self.assertTrue(should_reorder_trtllm_mha_decode_requests(ragged, 152))
+        self.assertFalse(
+            should_reorder_trtllm_mha_decode_requests(
+                sorted(ragged, reverse=True), 152
+            )
+        )
+        self.assertFalse(
+            should_reorder_trtllm_mha_decode_requests([16] * 192, 152)
+        )
+
+    def test_backend_owns_graph_variant_selection(self):
+        backend = object.__new__(TRTLLMHAAttnBackend)
+        backend.decode_adaptive_scheduler = True
+        backend._decode_num_sms = 152
+        backend.get_cuda_graph_seq_len_fill_value = lambda: 1
+        ragged = self.ragged(192)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_cpu=torch.tensor(ragged),
+            spec_info=None,
+        )
+
+        self.assertEqual(
+            backend.select_cuda_graph_variant(forward_batch, 192),
+            TRTLLMMHACudaGraphVariant(reorder_requests=True),
+        )
+        self.assertEqual(
+            backend.get_cuda_graph_capture_variants(32, ForwardMode.DECODE),
+            (
+                TRTLLMMHACudaGraphVariant(),
+                TRTLLMMHACudaGraphVariant(seq_len_splits=2),
+            ),
+        )
 
 
 @unittest.skipIf(
@@ -191,8 +255,11 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                 )
 
     def test_runner_mode_cuda_graph_decode_cases(self):
-        for case in self.CUDA_GRAPH_DECODE_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
+        for case_index, case in enumerate(self.CUDA_GRAPH_DECODE_CASES):
+            splits = 2 if case_index == 0 else 1
+            with self.subTest(
+                case=case.name, backend=case.backend
+            ), envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(splits):
                 run_dense_cuda_graph_decode_case(
                     self,
                     case,
