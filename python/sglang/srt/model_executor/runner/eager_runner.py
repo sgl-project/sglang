@@ -275,6 +275,7 @@ class EagerRunner(BaseRunner):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         model_runner = self.model_runner
+        caller_batch = forward_batch
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
         if not self.enable_pdmux:
@@ -374,6 +375,8 @@ class EagerRunner(BaseRunner):
                     forward_batch,
                     **kwargs,
                 )
+        # load_batch returns a private view; validation must reach the worker.
+        caller_batch.mm_embedding_errors = forward_batch.mm_embedding_errors
         return ret
 
     def _execute_extend_cp_v2(

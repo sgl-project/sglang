@@ -1826,6 +1826,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
         finally:
             self.layer_model.forward = original_layer_forward
+            # The eager multimodal wrapper writes errors on the private tail view.
+            forward_batch.mm_embedding_errors = tail_batch.mm_embedding_errors
 
     def _execute_tc_piecewise(
         self,
