@@ -173,6 +173,45 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
 
+def _warn_if_mamba_checkpoint_capacity_is_insufficient(
+    *,
+    token_capacity: int,
+    chunked_prefill_size: Optional[int],
+    max_mamba_cache_size: Optional[int],
+) -> None:
+    """Warn when the KV budget can hold more prefill checkpoints than Mamba slots.
+
+    A chunked-prefill handoff can donate one Mamba prefix checkpoint. This is
+    therefore a conservative capacity estimate rather than a prediction of a
+    particular workload's cache occupancy.
+    """
+    if (
+        token_capacity <= 0
+        or chunked_prefill_size is None
+        or chunked_prefill_size <= 0
+        or max_mamba_cache_size is None
+        or max_mamba_cache_size <= 0
+    ):
+        return
+
+    estimated_checkpoint_demand = math.ceil(token_capacity / chunked_prefill_size)
+    if estimated_checkpoint_demand <= max_mamba_cache_size:
+        return
+
+    logger.warning(
+        "Hybrid Mamba prefix-cache checkpoint capacity may be insufficient: "
+        "the KV cache can hold up to %d checkpoint(s) for %d tokens at "
+        "chunked_prefill_size=%d, but max_mamba_cache_size=%d. Prefix-cache "
+        "branch reuse may degrade under LRU pressure. Consider increasing "
+        "--max-mamba-cache-size, adjusting --mamba-full-memory-ratio when the "
+        "Mamba pool is auto-sized, or increasing --chunked-prefill-size.",
+        estimated_checkpoint_demand,
+        token_capacity,
+        chunked_prefill_size,
+        max_mamba_cache_size,
+    )
+
+
 def _pp_local_per_request_bytes(
     total_bytes: int,
     layer_ids: list[int],
@@ -2198,6 +2237,13 @@ class KVCacheConfigurator:
 
         capped_by_mamba = False
         if self.mambaish_config is not None:
+            if not get_memory().disable_radix_cache:
+                _warn_if_mamba_checkpoint_capacity_is_insufficient(
+                    token_capacity=token_capacity,
+                    chunked_prefill_size=get_schedule().chunked_prefill_size,
+                    max_mamba_cache_size=get_schedule().max_mamba_cache_size,
+                )
+
             ratio = self._calculate_mamba_ratio()
             mamba_cap = get_schedule().max_mamba_cache_size // ratio
             if mamba_cap < max_num_reqs:
