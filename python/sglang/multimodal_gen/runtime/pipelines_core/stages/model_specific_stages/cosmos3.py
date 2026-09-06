@@ -808,36 +808,6 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         self.log_info(f"Prepared latents with shape {shape}")
 
-        # Transfer (control-video) conditioning: VAE-encode each control clip
-        # into clean latents the transformer prepends to the GEN sequence. Stored
-        # as a list (one block per hint) so multi-hint transfer (edge + depth …)
-        # threads through the denoiser uniformly with the single-hint case.
-        preprocessed_control = batch.extra.get("preprocessed_control")
-        if preprocessed_control is not None:
-            control_blocks = (
-                preprocessed_control
-                if isinstance(preprocessed_control, list)
-                else [preprocessed_control]
-            )
-            vae_dtype = next(self.vae.parameters()).dtype
-            control_latents_list: list[torch.Tensor] = []
-            for control_pixels_t in control_blocks:
-                control_pixels = control_pixels_t.to(device=device, dtype=vae_dtype)
-                with torch.no_grad():
-                    control_latent = self._vae_encode(control_pixels).to(dtype)
-                if control_latent.shape[-2:] != latents.shape[-2:]:
-                    raise ValueError(
-                        "control latent spatial dims "
-                        f"{tuple(control_latent.shape[-2:])} must match the target "
-                        f"latents {tuple(latents.shape[-2:])}"
-                    )
-                control_latents_list.append(control_latent)
-            batch.extra["control_latents"] = control_latents_list
-            self.log_info(
-                f"Prepared {len(control_latents_list)} control latent block(s) "
-                f"with shape {tuple(control_latents_list[0].shape)}"
-            )
-
         sound_duration = float(getattr(batch, "sound_duration", 0.0) or 0.0)
         if sound_duration > 0.0:
             if not getattr(self.transformer, "sound_gen", False):
@@ -1608,6 +1578,9 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         for i, t in progress_bar:
+            # Precision is chosen once per step, before any transformer call,
+            # so all CFG branches of the step share the same selection.
+            self.transformer.set_denoising_step(step_index=i, num_steps=len(timesteps))
             batch_dim = batch.latents.shape[0] if batch.latents is not None else 1
             timestep = t.unsqueeze(0).expand(batch_dim) if t.dim() == 0 else t
             # Outside the CFG window the effective scale collapses to 1.0,
@@ -1868,6 +1841,11 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
             if batch.profile and not batch.is_warmup:
                 self.step_profile()
+
+        # Hygiene only: the set_denoising_step at each loop head is what
+        # actually selects precision, so stale state cannot leak into the
+        # next request's steps.
+        self.transformer.reset_denoising_step()
 
         if batch.rollout:
             self._postprocess_rollout_outputs(

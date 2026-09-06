@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -18,6 +19,13 @@ WeightSourceKind = Literal["local", "huggingface"]
 _WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".bin", ".pt", ".pth", ".ckpt")
 _SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
 _WEIGHT_REFERENCE_SUFFIXES = _WEIGHT_SUFFIXES + (_SAFETENSORS_INDEX_SUFFIX,)
+_PRECISION_VARIANT_SUFFIX_RE = re.compile(
+    r"^(?P<stem>.+?)\.(?:fp16|bf16|fp32)(?:-\d+-of-\d+)?"
+    r"(?P<suffix>\.safetensors(?:\.index\.json)?)$"
+)
+_CANONICAL_SAFETENSORS_SUFFIX_RE = re.compile(
+    r"^(?P<stem>.+?)(?:-\d+-of-\d+)?" r"(?P<suffix>\.safetensors(?:\.index\.json)?)$"
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,33 @@ class ResolvedWeightSet:
 
 class NoSafetensorsWeightsError(FileNotFoundError):
     """The source has no safetensors payload to resolve as a weight set."""
+
+
+def filter_duplicate_precision_variant_safetensors(
+    safetensors_files: Sequence[str],
+) -> list[str]:
+    """Prefer canonical files over precision-suffixed copies in each family.
+
+    A precision-only family remains valid. Sharded and unsharded copies are
+    compared by family so one export cannot be loaded twice merely because its
+    shard layout differs between variants.
+    """
+    canonical_families: set[tuple[str, str]] = set()
+    for path in safetensors_files:
+        if _PRECISION_VARIANT_SUFFIX_RE.match(path) is not None:
+            continue
+        if match := _CANONICAL_SAFETENSORS_SUFFIX_RE.match(path):
+            canonical_families.add((match.group("stem"), match.group("suffix")))
+
+    selected: list[str] = []
+    for path in safetensors_files:
+        match = _PRECISION_VARIANT_SUFFIX_RE.match(path)
+        family = (
+            (match.group("stem"), match.group("suffix")) if match is not None else None
+        )
+        if family is None or family not in canonical_families:
+            selected.append(path)
+    return selected
 
 
 def is_explicit_weight_file_reference(source: str) -> bool:
@@ -442,6 +477,8 @@ def resolve_safetensors_weight_set(
             _read_safetensors_index(inventory, selected),
             index_file=selected,
         )
+    weights = tuple(filter_duplicate_precision_variant_safetensors(weights))
+    indexes = tuple(filter_duplicate_precision_variant_safetensors(indexes))
     if len(indexes) == 1:
         return ResolvedWeightSet(
             inventory,

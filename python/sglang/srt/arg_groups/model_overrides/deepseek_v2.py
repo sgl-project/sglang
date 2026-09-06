@@ -1,6 +1,6 @@
 """Config-time override declarations for deepseek_v2.
 
-Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, GlmMoeDsaForCausalLM, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
+Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
 """
 
 import logging
@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
     "MistralLarge3ForCausalLM",
     "PixtralForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
+    "HYV4ForCausalLM",
+    "HYV4ForCausalLMNextN",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
@@ -35,9 +37,49 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     before it by _set_default_dsa_kv_cache_dtype) and the env writes stay in
     the branch."""
     cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import (
+        is_deepseek_dsa,
+        unwrap_modelopt_quantization_config,
+    )
+
+    model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
+    if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+        if cfg.enable_prefill_cp:
+            raise ValueError(
+                "--enable-prefill-cp is not supported for HYV4 because its "
+                "attention path does not implement DSA context-parallel metadata "
+                f"and sharding. Got architecture={model_arch!r} and "
+                f"enable_prefill_cp={cfg.enable_prefill_cp!r}."
+            )
+        dcp_size = getattr(cfg, "dcp_size", 1)
+        if dcp_size > 1:
+            raise ValueError(
+                "--dcp-size > 1 is not supported for HYV4 because decode context "
+                "parallelism gathers query heads across DCP ranks but does not "
+                "provide single-owner semantics for learnable attention sinks. "
+                f"Got architecture={model_arch!r} and dcp_size={dcp_size!r}."
+            )
 
     overrides: Dict[str, Any] = {}
+
+    if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+        quant_cfg = getattr(hf_config, "quantization_config", None) or {}
+        quant_algo = unwrap_modelopt_quantization_config(quant_cfg).get(
+            "quant_algo", ""
+        )
+        if str(quant_algo).upper() == "MXFP8":
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            # auto would otherwise select an unqualified FP8/MoE path for HYV4 MXFP8.
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                if cfg.moe_runner_backend == "auto":
+                    overrides["moe_runner_backend"] = "deep_gemm"
+                if cfg.fp8_gemm_runner_backend == "auto":
+                    overrides["fp8_gemm_runner_backend"] = "deep_gemm"
+                if overrides:
+                    logger.info(
+                        "HYV4 MXFP8: defaulting MoE/FP8 GEMM backends to deep_gemm."
+                    )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
