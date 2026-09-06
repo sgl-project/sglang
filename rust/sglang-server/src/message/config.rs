@@ -145,9 +145,10 @@ pub struct ServerArgs {
     /// `RustServer._build_server_args` stamps it in, so both sides count alike.
     pub num_reserved_tokens: u64,
     /// Launch-time stamps (not `server_args` fields): sglang package version
-    /// and the scheduler-derived KV token capacity, reported by `/server_info`.
+    /// and the scheduler-derived KV token capacities, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    pub max_total_num_tokens_per_dcp_rank: u64,
 }
 
 #[pyo3::pymethods]
@@ -181,6 +182,7 @@ impl ServerArgs {
         num_reserved_tokens,
         version,
         max_total_num_tokens,
+        max_total_num_tokens_per_dcp_rank,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
     #[allow(clippy::too_many_arguments)]
@@ -212,6 +214,7 @@ impl ServerArgs {
         num_reserved_tokens: u64,
         version: String,
         max_total_num_tokens: u64,
+        max_total_num_tokens_per_dcp_rank: u64,
     ) -> Self {
         Self {
             model_path,
@@ -241,6 +244,7 @@ impl ServerArgs {
             num_reserved_tokens,
             version,
             max_total_num_tokens,
+            max_total_num_tokens_per_dcp_rank,
         }
     }
 }
@@ -278,6 +282,7 @@ impl Default for ServerArgs {
             num_reserved_tokens: 0,
             version: String::new(),
             max_total_num_tokens: 0,
+            max_total_num_tokens_per_dcp_rank: 0,
         }
     }
 }

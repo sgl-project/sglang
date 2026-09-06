@@ -171,6 +171,7 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
         "tokenizer_path": server_args.tokenizer_path,
         "max_context_length": server_args.model_config.context_len,
         "max_total_num_tokens": server_args.max_total_num_tokens,
+        "max_total_num_tokens_per_dcp_rank": server_args.max_total_num_tokens_per_dcp_rank,
         "version": server_args.version,
         "internal_states": [serde_json::Value::Object(state_out)],
     });
@@ -216,6 +217,8 @@ mod tests {
         // scheduler dump shaped above.
         let sa = ServerArgs {
             model_path: "/m".into(),
+            max_total_num_tokens: 4096,
+            max_total_num_tokens_per_dcp_rank: 1024,
             ..Default::default()
         };
         let out = shape_server_info(&msgpack, &sa).unwrap();
@@ -239,5 +242,7 @@ mod tests {
         assert!(state0.get("api_key").is_none());
         // Curated top-level config comes from typed accessors, not the dump.
         assert_eq!(v["model_path"], "/m");
+        assert_eq!(v["max_total_num_tokens"], 4096);
+        assert_eq!(v["max_total_num_tokens_per_dcp_rank"], 1024);
     }
 }
