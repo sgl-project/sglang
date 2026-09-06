@@ -499,6 +499,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
+            # NIXL caches terminal ERR, which does not prove that the transfer
+            # is quiescent. Keep every ERR or otherwise unresolved handle alive
+            # and leave its transfer group counted so it can never enable an
+            # abort ack or be finalized after ownership was forgotten.
+            self._failed_transfer_handles: Dict[int, List[Any]] = defaultdict(list)
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -1113,9 +1118,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     kv_chunk.staging_counted = True
 
                 if self.check_status(room) == KVPoll.Failed:
-                    self._staging_outstanding.pop(room, None)
+                    # This chunk was counted above but never posted. Remove only
+                    # its count: an earlier ERR group for the room deliberately
+                    # remains outstanding and must not be erased here.
+                    self._staging_outstanding[room] -= 1
+                    if self._staging_outstanding[room] <= 0:
+                        self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
-                        # Skipped => nothing written for this aborted room; ack.
+                        # Ack only if this skipped chunk was the room's final
+                        # outstanding group. An ERR group keeps the count nonzero.
                         self._maybe_ack_drained_abort(room)
                     continue
 
@@ -1353,24 +1364,41 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
-                while handles:
-                    all_done = True
-                    for handle in handles:
+                pending_handles = list(handles)
+                while pending_handles:
+                    still_pending = []
+                    unproven_handles = []
+                    num_handle_errors = 0
+                    for handle in pending_handles:
                         state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
                         if state != "DONE":
-                            all_done = False
-                    if all_done:
-                        break
-                    time.sleep(0)
+                            unproven_handles.append(handle)
+                        if state == "ERR":
+                            num_handle_errors += 1
+                        elif state != "DONE":
+                            still_pending.append(handle)
+
+                    if num_handle_errors:
+                        # ERR is terminal at the public NIXL handle but does not
+                        # establish backend quiescence. Retain the ERR handles
+                        # and every sibling still unresolved after this poll
+                        # sweep, then promptly return to the worker loop. DONE
+                        # siblings need no retained ownership.
+                        self._failed_transfer_handles[room].extend(unproven_handles)
+                        raise RuntimeError(
+                            "NIXL transfer encountered ERR "
+                            f"room={room} handles={num_handle_errors}/{len(handles)}"
+                        )
+
+                    pending_handles = still_pending
+                    if pending_handles:
+                        time.sleep(0)
 
                 self._staging_outstanding[room] -= 1
                 if self.enable_deferred_decode_kv_release:
-                    # Handles all DONE => this room's writes landed; ack if it
-                    # was aborted and nothing else is outstanding.
+                    # Every handle is DONE, so this room's already-posted writes
+                    # are quiescent. Ack an aborted room only after every other
+                    # transfer group is also drained.
                     self._maybe_ack_drained_abort(room)
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
@@ -1411,8 +1439,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
-                # No ack here on purpose: the DONE barrier bails on the first
-                # ERR, so siblings may still be writing; fall back to the timeout.
+                # Do not decrement or ack setup, posting, polling, or handle
+                # errors: none proves that every already-posted write is
+                # quiescent. After a NIXL ERR, the polling path above retains
+                # each ERR or unresolved handle without waiting for unresolved
+                # siblings to finish.
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2793,9 +2824,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # Deferred KV release: register only after the status flip above (see
         # register_deferred_ack_target), then try once -- the room may already be
         # quiescent and never revisited by the worker. A concluded/unknown room is
-        # acked only when nothing is still counted for it: the ERR path abandons
-        # sibling handles that may still be writing and clear() then drops the
-        # room, so "unknown" alone does not imply quiescent.
+        # acked only when nothing is still counted for it: errored groups remain
+        # counted because ERR does not prove their writes are quiescent, so
+        # "unknown" alone does not imply quiescent.
         if self.enable_deferred_decode_kv_release and decode_port is not None:
             if room_active:
                 self.register_deferred_ack_target(

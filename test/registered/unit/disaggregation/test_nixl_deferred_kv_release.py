@@ -138,9 +138,9 @@ class TestNixlAbortNotification(CustomTestCase):
         self.assertEqual(mgr._deferred_ack_targets, {})
 
     def test_cleared_room_with_outstanding_chunk_does_not_ack(self):
-        # The ERR path abandons sibling handles that may still be writing and
-        # leaves the chunk counted; clear() then drops the room. Acking on
-        # "unknown room" alone would release decode pages under those writes.
+        # An ERR group may still be writing and remains counted even after
+        # clear() drops the room. Acking on "unknown room" alone would release
+        # decode pages under those writes.
         mgr = self._mgr(status=None)  # room absent == cleared/unknown
         mgr._staging_outstanding[11] = 1
         self.assertTrue(mgr._handle_abort_notification(self._abort_msg()))
