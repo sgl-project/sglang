@@ -47,13 +47,24 @@ from sglang.srt.models.minimax_vl_common import (
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
+from sglang.srt.utils import (
+    add_prefix,
+    get_device_sm,
+    is_cuda,
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_hip,
+    log_info_on_rank0,
+)
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_gfx942_supported = is_gfx942_supported()
+_is_gfx95_supported = is_gfx95_supported()
 _device_sm = get_device_sm()
 
 
@@ -151,10 +162,12 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if (_device_sm is not None) and (_device_sm < 80):
+        if not (_is_cuda or _is_hip):
+            return "Shared experts fusion currently requires CUDA or ROCm devices."
+        if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
+        if _is_hip and not (_is_gfx942_supported or _is_gfx95_supported):
+            return "Shared experts fusion requires gfx942 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
             return (
                 "Shared experts fusion is not supported together with expert "
