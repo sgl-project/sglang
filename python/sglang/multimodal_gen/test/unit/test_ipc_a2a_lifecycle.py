@@ -77,3 +77,17 @@ def test_drop_staging_clears_cached_buffers_and_nothing_else():
     assert state.staging == OrderedDict()
     assert state.inited is True and state.calls == 7
     state.drop_staging()  # idempotent on an empty cache
+
+
+def test_drop_a2a_staging_buffers_clears_the_ulysses_cache():
+    import torch
+
+    from sglang.multimodal_gen.runtime.layers import usp
+
+    usp._A2A_STAGING_BUFFERS[("qkv", torch.float16, 0)] = torch.empty(
+        8, dtype=torch.float16
+    )
+    with patch.object(torch.cuda, "is_available", return_value=False):
+        usp.drop_a2a_staging_buffers()
+        usp.drop_a2a_staging_buffers()  # idempotent on an empty cache
+    assert usp._A2A_STAGING_BUFFERS == {}
