@@ -37,6 +37,7 @@ fn config_for(_worker_url: &str) -> Config {
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            affinity: None,
             fused: None,
             eligibility: None,
         },
