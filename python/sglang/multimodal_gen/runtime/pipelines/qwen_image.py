@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from diffusers.image_processor import VaeImageProcessor
 
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlus_2511_PipelineConfig,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -83,6 +86,19 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
 
 class QwenImageEditPlusPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageEditPlusPipeline"
+
+    @property
+    def preload_residency_excluded_components(self) -> frozenset[str]:
+        # The 2511 DiT fits on an H100, but making it resident before warmup
+        # causes reversible-frontier construction to exceed server startup.
+        # Keep its proven load path; post-warmup calibration can still promote
+        # it once the real request shape is known.
+        if isinstance(
+            self.server_args.pipeline_config,
+            QwenImageEditPlus_2511_PipelineConfig,
+        ):
+            return frozenset(("transformer",))
+        return frozenset()
 
 
 def prepare_mu_layered(batch: Req, server_args: ServerArgs):

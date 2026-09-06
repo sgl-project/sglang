@@ -40,6 +40,10 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     set_default_torch_dtype,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inventory import (
+    ComponentWeightSource,
+    infer_safetensors_weight_stats_by_prefix,
+)
 from sglang.multimodal_gen.runtime.models.dits.hunyuan3d_paint import (
     Hunyuan3DPaintUNet,
 )
@@ -493,6 +497,99 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
 
         return components
 
+    @classmethod
+    def _texture_component_weight_sources(
+        cls,
+        server_args: ServerArgs,
+        config: Hunyuan3D2PipelineConfig,
+    ) -> list[ComponentWeightSource]:
+        paint_dir = cls._resolve_model_subfolder(
+            server_args.model_path,
+            config.paint_subfolder,
+            (
+                "vae/config.json",
+                "unet/config.json",
+                "scheduler/scheduler_config.json",
+            ),
+        )
+        target_element_size = PRECISION_TO_TYPE[config.dit_precision].itemsize
+        sources = [
+            ComponentWeightSource(
+                "paint_vae",
+                os.path.join(paint_dir, "vae"),
+                target_element_size=target_element_size,
+            ),
+            ComponentWeightSource(
+                "paint_transformer",
+                os.path.join(paint_dir, "unet"),
+                target_element_size=target_element_size,
+            ),
+        ]
+        if not config.delight_enable:
+            return sources
+
+        delight_dir = cls._resolve_model_subfolder(
+            server_args.model_path,
+            config.delight_subfolder,
+            (
+                "vae/config.json",
+                "unet/config.json",
+                "scheduler/scheduler_config.json",
+                "text_encoder/config.json",
+                "tokenizer/tokenizer_config.json",
+            ),
+        )
+        sources.extend(
+            [
+                ComponentWeightSource(
+                    "delight_vae",
+                    os.path.join(delight_dir, "vae"),
+                    target_element_size=target_element_size,
+                ),
+                ComponentWeightSource(
+                    "delight_transformer",
+                    os.path.join(delight_dir, "unet"),
+                    target_element_size=target_element_size,
+                ),
+                ComponentWeightSource(
+                    "delight_text_encoder",
+                    os.path.join(delight_dir, "text_encoder"),
+                    target_element_size=target_element_size,
+                ),
+            ]
+        )
+        return sources
+
+    @staticmethod
+    def _shape_component_weight_sources(
+        ckpt_path: str, use_safetensors: bool, target_element_size: int
+    ) -> list[ComponentWeightSource]:
+        prefix_stats = (
+            infer_safetensors_weight_stats_by_prefix(ckpt_path)
+            if use_safetensors
+            else None
+        )
+        if prefix_stats is None:
+            return [ComponentWeightSource("hy3dshape_checkpoint", ckpt_path)]
+
+        component_names = {
+            "model": "hy3dshape_model",
+            "vae": "hy3dshape_vae",
+            "conditioner": "hy3dshape_conditioner",
+        }
+        return [
+            ComponentWeightSource(
+                component_name=component_names.get(prefix, prefix),
+                component_model_path=ckpt_path,
+                checkpoint_bytes=checkpoint_bytes,
+                parameter_count=parameter_count,
+                target_element_size=target_element_size,
+            )
+            for prefix, (checkpoint_bytes, parameter_count) in sorted(
+                prefix_stats.items()
+            )
+        ]
+
     # Module loading override
     def load_modules(
         self,
@@ -515,6 +612,24 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             config.shape_subfolder,
             config.shape_use_safetensors,
             config.shape_variant,
+        )
+
+        self.prepare_component_weight_inventory(
+            server_args,
+            self._shape_component_weight_sources(
+                ckpt_path,
+                config.shape_use_safetensors,
+                (
+                    torch.bfloat16.itemsize
+                    if config.shape_variant and "bf16" in config.shape_variant
+                    else torch.float16.itemsize
+                ),
+            )
+            + (
+                self._texture_component_weight_sources(server_args, config)
+                if config.paint_enable
+                else []
+            ),
         )
 
         with open(config_path, "r") as f:

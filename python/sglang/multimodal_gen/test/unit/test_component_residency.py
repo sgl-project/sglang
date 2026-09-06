@@ -867,3 +867,38 @@ def test_warmup_preserves_repeated_phase_layouts(monkeypatch):
     assert manager._warmup_phase_peaks[
         "0:stage:between:occurrence:1"
     ] == WarmupPhasePeak(("transformer",), 7)
+
+
+def test_failed_warmup_phase_survives_cleanup(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    use = ComponentUse("denoise", "transformer")
+    stage = _Stage(use)
+    pipeline = SimpleNamespace(
+        modules={"transformer": torch.nn.Linear(2, 2)},
+        _stage_name_mapping={"denoise": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=True), server_args)
+    manager._begin_warmup_prefetch(use)
+
+    manager.capture_failed_warmup_phase()
+    manager._warmup_phase_peaks = {}
+    manager._completed_warmup_phase_peaks = {"request:cleanup": WarmupPhasePeak((), 2)}
+
+    peaks = manager.take_warmup_phase_peaks()
+    assert peaks["0:denoise:prefetch:transformer"] == WarmupPhasePeak(
+        ("transformer",), 7, prefetched_components=("transformer",)
+    )
+    assert peaks["request:cleanup"] == WarmupPhasePeak((), 2)

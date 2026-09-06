@@ -239,16 +239,34 @@ def _forward_diffusers_video_only(
         batch_size, -1, hidden_states.size(-1)
     )
 
-    for block in transformer.transformer_blocks:
-        hidden_states = _forward_diffusers_video_block(
-            block=block,
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            temb=temb,
-            video_rotary_emb=video_rotary_emb,
-            encoder_attention_mask=encoder_attention_mask,
-            n_context_tokens=n_context_tokens,
+    layerwise_manager = None
+    if isinstance(transformer, OfficialDiffusersLTX2RefinerModule):
+        layerwise_manager = next(
+            (
+                manager
+                for manager in transformer.layerwise_offload_managers
+                if manager.layers_attr_str == "module.transformer_blocks"
+                and manager.enabled
+            ),
+            None,
         )
+
+    for block_idx, block in enumerate(transformer.transformer_blocks):
+        if layerwise_manager is not None:
+            layerwise_manager.prepare_layer_for_forward(block_idx)
+        try:
+            hidden_states = _forward_diffusers_video_block(
+                block=block,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                video_rotary_emb=video_rotary_emb,
+                encoder_attention_mask=encoder_attention_mask,
+                n_context_tokens=n_context_tokens,
+            )
+        finally:
+            if layerwise_manager is not None:
+                layerwise_manager.finish_layer_forward(block_idx)
 
     scale_shift_values = (
         transformer.scale_shift_table[None, None] + embedded_timestep[:, :, None]

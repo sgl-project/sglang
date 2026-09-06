@@ -9,6 +9,10 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlus_2511_PipelineConfig,
+    QwenImageEditPlusPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
@@ -41,6 +45,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     format_applied_changes,
     measured_failed_workload_phase_peaks,
     plan_auto_residency,
+    pre_warmup_residency_targets,
     rank_candidates_by_h2d_savings,
     resolve_measured_default_workload,
     rollback_residency_changes,
@@ -2566,6 +2571,306 @@ class TestPlanAutoResidency:
 
         assert current_placement_reserve_shortfall_bytes([report]) == 2 * GIB_BYTES
 
+    def test_pre_warmup_report_enforces_weight_feasibility_without_oom(self):
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=11 * GIB_BYTES,
+            h2d_bytes_per_request=11 * GIB_BYTES,
+            permanent_residency=True,
+            target_device_weight_bytes=11 * GIB_BYTES,
+            current_placement=True,
+        )
+        layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            active_device_delta_bytes=-9 * GIB_BYTES,
+            inactive_device_delta_bytes=-10 * GIB_BYTES,
+            target_device_weight_bytes=GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=12,
+                    estimated_gib=11,
+                    phase_peaks_gib={"static:transformer": 11},
+                    phase_components={"static:transformer": ("transformer",)},
+                    candidates=[resident, layerwise],
+                    require_feasible_placement=True,
+                )
+            ]
+        )
+
+        assert not plan.recovering_from_oom
+        assert [candidate.target_mode() for candidate in plan.changes] == [
+            LAYERWISE_OFFLOAD
+        ]
+
+    def test_pre_warmup_plan_keeps_feasible_current_placement(self):
+        current = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            target_device_weight_bytes=GIB_BYTES,
+            current_placement=True,
+        )
+        component_offload = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=11 * GIB_BYTES,
+            target_device_weight_bytes=0,
+        )
+        less_layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=7 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            target_device_weight_bytes=0,
+        )
+        candidates = [current, less_layerwise, component_offload]
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=12,
+                    estimated_gib=2,
+                    phase_peaks_gib={"static:transformer": 2},
+                    phase_components={"static:transformer": ("transformer",)},
+                    candidates=candidates,
+                    require_feasible_placement=True,
+                    estimated_request_duration_ns=1,
+                    candidate_latency_savings_ns={
+                        candidate.option_key(): int(candidate.current_placement)
+                        for candidate in candidates
+                    },
+                )
+            ]
+        )
+
+        assert plan.changes == []
+
+    def test_pre_warmup_targets_defer_device_weight_promotion(self):
+        current = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=8 * GIB_BYTES,
+            target_device_weight_bytes=0,
+            current_placement=True,
+        )
+        resident = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=8 * GIB_BYTES,
+            h2d_bytes_per_request=0,
+            target_device_weight_bytes=8 * GIB_BYTES,
+        )
+
+        assert pre_warmup_residency_targets([current, resident]) == [current]
+
+    def test_pre_warmup_targets_keep_active_working_set_demotion(self):
+        current = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_device_weight_bytes=0,
+            current_placement=True,
+        )
+        layerwise = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_device_weight_bytes=GIB_BYTES,
+            active_device_delta_bytes=-16 * GIB_BYTES,
+            inactive_device_delta_bytes=GIB_BYTES,
+            device_transition_delta_bytes=GIB_BYTES,
+        )
+
+        assert pre_warmup_residency_targets([current, layerwise]) == [
+            current,
+            layerwise,
+        ]
+
+    def test_pre_warmup_report_uses_weight_model_below_legacy_threshold(
+        self, monkeypatch
+    ):
+        from sglang.multimodal_gen.runtime.managers import gpu_worker
+
+        current = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=8 * GIB_BYTES,
+            target_device_weight_bytes=0,
+            current_placement=True,
+        )
+        modules = {"transformer": object()}
+        collect_calls = []
+
+        def collect_targets(_workload, *, allow_host_pin_reallocation=True):
+            collect_calls.append(allow_host_pin_reallocation)
+            return [current]
+
+        worker = SimpleNamespace(
+            rank=0,
+            pipeline=SimpleNamespace(preload_residency_excluded_components=frozenset()),
+            server_args=SimpleNamespace(
+                num_gpus=1,
+                nnodes=1,
+                node_rank=0,
+                host_pin_budget=lambda: None,
+            ),
+            _auto_residency_budget_bytes=lambda: 30 * GIB_BYTES,
+            _collect_auto_residency_targets=collect_targets,
+            _auto_residency_modules=lambda: modules,
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_runtime_weight_bytes",
+            lambda _modules: {"transformer": 8 * GIB_BYTES},
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_current_device_weight_bytes",
+            lambda _modules: {"transformer": 0},
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_pinned_host_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_host_pin_capacity_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "host_memory_available_bytes", lambda: 100 * GIB_BYTES
+        )
+        monkeypatch.setattr(
+            gpu_worker.torch,
+            "get_device_module",
+            lambda: SimpleNamespace(memory_allocated=lambda: 2 * GIB_BYTES),
+        )
+
+        report = gpu_worker.GPUWorker._build_pre_warmup_auto_residency_report(
+            worker,
+            workload=DefaultWorkload(
+                width=832,
+                height=480,
+                num_frames=24,
+                num_inference_steps=50,
+            ),
+        )
+
+        assert report.budget_bytes == 30 * GIB_BYTES
+        assert report.estimated_peak_bytes == 10 * GIB_BYTES
+        assert report.candidates == [current]
+        assert report.skip_reason is None
+        assert report.estimated_request_duration_ns == 1
+        assert report.candidate_latency_savings_ns == {current.option_key(): 1}
+        assert collect_calls == [False]
+
+    def test_pre_warmup_report_keeps_excluded_components_fixed(self, monkeypatch):
+        from sglang.multimodal_gen.runtime.managers import gpu_worker
+
+        transformer = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=20 * GIB_BYTES,
+            permanent_residency=True,
+        )
+        vae = ResidencyTarget(
+            component_name="vae",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=GIB_BYTES,
+            permanent_residency=True,
+            target_device_weight_bytes=GIB_BYTES,
+            current_placement=True,
+        )
+        modules = {"transformer": object(), "vae": object()}
+        worker = SimpleNamespace(
+            rank=0,
+            pipeline=SimpleNamespace(
+                preload_residency_excluded_components=frozenset(("transformer",))
+            ),
+            server_args=SimpleNamespace(
+                num_gpus=1,
+                nnodes=1,
+                node_rank=0,
+                host_pin_budget=lambda: None,
+            ),
+            _auto_residency_budget_bytes=lambda: 80 * GIB_BYTES,
+            _collect_auto_residency_targets=lambda _workload, **_kwargs: [
+                transformer,
+                vae,
+            ],
+            _auto_residency_modules=lambda: modules,
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_runtime_weight_bytes",
+            lambda _modules: {"transformer": 20 * GIB_BYTES, "vae": GIB_BYTES},
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_current_device_weight_bytes",
+            lambda _modules: {"transformer": 0, "vae": 0},
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_pinned_host_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_host_pin_capacity_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "host_memory_available_bytes", lambda: 100 * GIB_BYTES
+        )
+        monkeypatch.setattr(
+            gpu_worker.torch,
+            "get_device_module",
+            lambda: SimpleNamespace(memory_allocated=lambda: 2 * GIB_BYTES),
+        )
+
+        report = gpu_worker.GPUWorker._build_pre_warmup_auto_residency_report(
+            worker,
+            workload=DefaultWorkload(
+                width=1920,
+                height=1088,
+                num_frames=24,
+                num_inference_steps=15,
+            ),
+        )
+
+        assert [candidate.component_name for candidate in report.candidates] == ["vae"]
+        assert report.estimated_peak_bytes_by_phase["static:transformer"] == (
+            22 * GIB_BYTES
+        )
+        assert report.used_components_by_phase["static:transformer"] == ("transformer",)
+
 
 class _FakeLayerwiseManager:
     def __init__(
@@ -4737,7 +5042,7 @@ class TestAutoResidencySkipReason:
         "overrides, expected_fragment",
         [
             ({"warmup_mode": "request"}, "server warmup"),
-            ({"disagg_role": "denoiser"}, "server warmup"),
+            ({"disagg_role": "denoiser"}, "disaggregated role"),
             ({"backend": "diffusers"}, "diffusers"),
             (
                 {"ltx2_two_stage_device_mode": "original"},
@@ -4853,6 +5158,19 @@ class TestAutoResidencySkipReason:
         )
         assert reason is None or reason == "requires CUDA"
 
+    def _static_skip_reason(self, args):
+        from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+            auto_residency_static_skip_reason,
+        )
+
+        return auto_residency_static_skip_reason(args)
+
+    def test_static_planning_does_not_require_warmup(self, monkeypatch):
+        monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
+        monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        assert self._static_skip_reason(self._base_args(warmup_mode="off")) is None
+        assert "server warmup" in self._skip_reason(self._base_args(warmup_mode="off"))
+
 
 class TestEstimateAllocatorHeadroom:
     def test_uses_covering_workload_allocator_gap(self):
@@ -4884,3 +5202,21 @@ class TestEstimateAllocatorHeadroom:
             )
             == 4 * GIB_BYTES
         )
+
+
+def test_qwen_image_2511_excludes_transformer_only_during_preload():
+    from sglang.multimodal_gen.runtime.pipelines.qwen_image import (
+        QwenImageEditPlusPipeline,
+    )
+
+    pipeline = QwenImageEditPlusPipeline.__new__(QwenImageEditPlusPipeline)
+
+    pipeline.server_args = SimpleNamespace(
+        pipeline_config=QwenImageEditPlus_2511_PipelineConfig()
+    )
+    assert pipeline.preload_residency_excluded_components == frozenset(("transformer",))
+
+    pipeline.server_args = SimpleNamespace(
+        pipeline_config=QwenImageEditPlusPipelineConfig()
+    )
+    assert pipeline.preload_residency_excluded_components == frozenset()

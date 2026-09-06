@@ -867,6 +867,13 @@ class ComponentResidencyManager:
         self._completed_warmup_phase_peaks = {}
         return peaks
 
+    def capture_failed_warmup_phase(self) -> None:
+        """Preserve failure attribution before request cleanup changes phase."""
+        if not self._track_warmup_memory:
+            return
+        self._record_warmup_phase_peak()
+        self._failed_warmup_phase_peaks = dict(self._warmup_phase_peaks)
+
     def current_device_components(self) -> tuple[str, ...]:
         """Components whose complete module is currently on the device.
 

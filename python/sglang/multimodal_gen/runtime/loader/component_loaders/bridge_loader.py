@@ -7,5 +7,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 
 
 class BridgeLoader(PlainStateDictComponentLoader):
+    """Loader for MOVA dual tower bridge with FSDP support."""
+
+    supports_fsdp_loading = True
+
     component_names = ["dual_tower_bridge"]
     config_classes = {"dual_tower_bridge": MOVADualTowerConfig}

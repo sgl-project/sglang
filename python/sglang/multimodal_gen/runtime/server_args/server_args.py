@@ -975,6 +975,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 configured,
             )
 
+        if mode == "resident":
+            # This structural mode owns both DiTs and is excluded from the
+            # generic residency planner. Keep the ordinary component flags in
+            # agreement so loading does not take an offload path that no later
+            # planner can correct.
+            self.dit_cpu_offload = False
+            self.dit_layerwise_offload = False
+
         self.ltx2_two_stage_device_mode = mode
 
     def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
@@ -1200,6 +1208,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"{component_name!r}, expected one of {RESIDENCY_POLICIES}"
             )
         return prefetch, resident, policy
+
+    def is_layerwise_residency_policy_explicit(
+        self, component_name: str, *, dit_group: bool
+    ) -> bool:
+        """Whether auto placement must preserve this component's policy."""
+        policy_map = self._parse_component_value_map(
+            self.layerwise_residency_policy,
+            option="--layerwise-residency-policy",
+        )
+        return component_name in policy_map or (
+            dit_group and self.is_arg_explicitly_set("dit_layerwise_residency_policy")
+        )
 
     @staticmethod
     def _parse_component_attention_backend_map(
@@ -2602,9 +2622,9 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Which layers --dit-layerwise-resident-layers keeps resident. "
             "'leading' (default) keeps the first N, which crams the whole "
             "weight stream into the tail of each step. 'strided' spreads the "
-            "resident layers evenly over the stack so the same bytes move over "
-            "the whole step instead: same VRAM, same bytes, only a different "
-            "schedule. Worth trying when weight streaming overlaps "
+            "resident layers evenly over the stack so traffic moves over the "
+            "whole step instead. The layer count is unchanged; exact bytes can "
+            "differ when layer sizes are nonuniform. Worth trying when streaming overlaps "
             "memory-bound compute -- the transfers stop competing with it for "
             "L2 and DRAM bandwidth, which is where the gain comes from.",
         )
