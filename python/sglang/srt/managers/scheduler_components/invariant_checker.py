@@ -152,6 +152,16 @@ class SchedulerInvariantChecker:
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
+        kv = allocator.get_kvcache()
+        if getattr(kv, "_unified_kv", False) is True:
+            # Unified-KV DSV4: a per-request SWA ring does not satisfy the token-pool
+            # invariant; ring-slot leaks are caught by the req_to_token check instead.
+            return False, (
+                "[swa] unified ring (leak-check skipped): "
+                f"available={ps.swa_available_size}, "
+                f"evictable={ps.swa_evictable_size}, "
+                f"total={self.swa_tokens_per_layer}"
+            )
         swa_available = ps.swa_available_size
         if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
             # Tri-pool: same floating-boundary phantom as the full pool -- use the
@@ -388,6 +398,13 @@ class SchedulerInvariantChecker:
         # Sub-allocators to check: a flat allocator is its own single sub; a
         # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator.
         alloc = self.token_to_kv_pool_allocator
+        # Unified-KV DSV4-HiSparse nests the real SWA allocator one level
+        # down; elsewhere the wrapper is the object this invariant asserts on.
+        if (
+            getattr(getattr(alloc, "get_kvcache", lambda: None)(), "_unified_kv", False)
+            is True
+        ):
+            alloc = getattr(alloc, "logical_attn_allocator", alloc)
         sub_allocs = (
             [alloc]
             if getattr(alloc, "free_pages", None) is not None

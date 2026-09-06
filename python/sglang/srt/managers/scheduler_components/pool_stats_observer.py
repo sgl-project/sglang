@@ -301,6 +301,11 @@ class SchedulerPoolStatsObserver:
             swa_available_size = allocator.swa_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
+        # Unified-KV DSV4: the SWA ring is released with the req slot, but cached
+        # radix prefixes still report swa_evictable; counting it drives usage negative.
+        _swa_kv = self.token_to_kv_pool_allocator.get_kvcache()
+        if getattr(_swa_kv, "_unified_kv", False) is True:
+            swa_evictable_size = 0
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size
         )

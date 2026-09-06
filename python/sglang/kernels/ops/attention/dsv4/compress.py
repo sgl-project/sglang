@@ -162,6 +162,7 @@ class CompressorDecodePlan(NamedTuple):
         seq_lens: torch.Tensor,
         swa_page_size: int,
         ring_size: int,
+        use_req_ring: bool = False,
     ) -> CompressorDecodePlan:
         if _is_xpu:
             fn = plan_compress_decode
@@ -169,7 +170,7 @@ class CompressorDecodePlan(NamedTuple):
             module = _jit_compress_plan_module()
             fn = module.plan_decode
 
-        plan_d = fn(
+        args = (
             req_pool_indices,
             req_to_token,
             full_to_state,
@@ -178,6 +179,12 @@ class CompressorDecodePlan(NamedTuple):
             int(swa_page_size),
             int(ring_size),
         )
+        # The XPU plan builder has no use_req_ring parameter, so unified-KV
+        # request-ring addressing cannot be expressed there.
+        assert not (_is_xpu and use_req_ring), (
+            "use_req_ring is not supported by the XPU compress plan builder"
+        )
+        plan_d = fn(*args) if _is_xpu else fn(*args, bool(use_req_ring))
         return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
 
     @staticmethod
@@ -247,6 +254,7 @@ class CompressorPrefillPlan(NamedTuple):
         ring_size: int,
         num_q_tokens: int,
         use_cuda_graph: bool = False,
+        use_req_ring: bool = False,
     ) -> CompressorPrefillPlan:
         is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
         pin_buffer = torch.empty(
@@ -274,7 +282,7 @@ class CompressorPrefillPlan(NamedTuple):
             module = _jit_compress_plan_module()
             fn = module.plan_prefill
 
-        plan_c, plan_w = fn(
+        args = (
             req_pool_indices,
             req_to_token,
             full_to_state,
@@ -285,7 +293,15 @@ class CompressorPrefillPlan(NamedTuple):
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
-            bool(use_cuda_graph),
+        )
+        # See plan_decode: XPU cannot express the unified-KV request ring.
+        assert not (_is_xpu and use_req_ring), (
+            "use_req_ring is not supported by the XPU compress plan builder"
+        )
+        plan_c, plan_w = (
+            fn(*args, bool(use_cuda_graph))
+            if _is_xpu
+            else fn(*args, bool(use_req_ring), bool(use_cuda_graph))
         )
         return CompressorPrefillPlan(
             compress_ratio,

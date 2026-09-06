@@ -338,6 +338,27 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
+        swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
+        # Unified-KV DSV4: swa_max_total_num_tokens was sized from the vestigial
+        # SWA pool; reconcile to real ring capacity. swa_kv_pool is None here.
+        if (
+            self.is_hybrid_swa
+            and not self.is_draft_worker
+            and getattr(pools.token_to_kv_pool, "_unified_kv", False) is True
+        ):
+            alloc = pools.token_to_kv_pool_allocator
+            if hasattr(alloc, "swa_available_size"):
+                ring_capacity = int(alloc.swa_available_size())
+                # Only reconcile downward: a value >= the current total means
+                # swa_available_size() hit its non-binding fallback.
+                if 0 < ring_capacity < swa_max_total_num_tokens:
+                    logger.info(
+                        "Unified-KV: reconciling swa_max_total_num_tokens "
+                        f"{swa_max_total_num_tokens} -> {ring_capacity} "
+                        "(fixed per-request SWA ring capacity)."
+                    )
+                    swa_max_total_num_tokens = ring_capacity
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -347,7 +368,7 @@ class KVCacheConfigurator:
             max_total_num_tokens=sizes.max_total_num_tokens,
             max_running_requests=sizes.max_running_requests,
             full_max_total_num_tokens=sizes.full_max_total_num_tokens,
-            swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
             req_to_token_pool=pools.req_to_token_pool,
             token_to_kv_pool=pools.token_to_kv_pool,
             token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
@@ -1981,6 +2002,7 @@ class KVCacheConfigurator:
                         device=self.device,
                         kvcache=token_to_kv_pool,
                         need_sort=need_sort,
+                        req_to_token_pool=req_to_token_pool,
                     )
                 else:
                     if get_memory().enable_hisparse:
@@ -2277,6 +2299,12 @@ class KVCacheConfigurator:
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
+        # calculate_pool_sizes_from_max_tokens takes a token count, not a byte
+        # budget; it cannot re-subtract the fixed pools, so capacity must not rise.
+        assert max_tokens <= config.max_total_num_tokens, (
+            f"token constraints must not raise capacity: {max_tokens} > "
+            f"{config.max_total_num_tokens}"
+        )
         if max_tokens != config.max_total_num_tokens:
             # Token-capped re-derivation: the profiled budget no longer
             # applies; the recalced config's unified_total_bytes stays None

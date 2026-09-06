@@ -71,6 +71,9 @@ class TestPrefillAdder(CustomTestCase):
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
+        # A bare MagicMock auto-creates a truthy `_unified_kv`, silently flipping
+        # these tests onto the unified-KV branch; pin it to the hybrid-SWA path.
+        allocator.get_kvcache.return_value._unified_kv = False
         return allocator
 
     def create_running_batch(self, reqs=None) -> MagicMock:
