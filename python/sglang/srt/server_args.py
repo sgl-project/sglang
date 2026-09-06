@@ -40,6 +40,7 @@ import functools
 import logging
 import tempfile
 import uuid
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
@@ -269,6 +270,11 @@ class ServerArgs:
             )
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
+        # Sealed for the duration, not just afterwards: everything below this
+        # line reads the input and declares against it, and the one channel
+        # that still writes the record (`declare_direct_writes`, for
+        # out-of-tree platform plugins) asks for the seal to be lifted by name.
+        self._input_frozen = True
         try:
             run_resolution_pipeline(self)
         except BaseException:
@@ -276,10 +282,29 @@ class ServerArgs:
             # idempotent over their own output.
             self._resolution_failed = True
             raise
+        finally:
+            self._input_frozen = False
         # Set here too, because the dummy/absent-model path returns before the
         # end of the pipeline that normally sets it: the gate is about whether
         # the handlers ran, not how far they got.
         self._resolution_finished = True
+
+    @property
+    def launch_command(self) -> Optional[str]:
+        """How this record was created, verbatim.
+
+        `resolved_dict` answers with what resolution decided; this answers with
+        what the operator asked for, which is a different question and the one
+        "why is this server configured like this?" usually means. The two are
+        not derivable from each other: a field the operator never set reads the
+        same as one they set to the value resolution would have picked anyway.
+
+        The launcher stores the arguments it parsed; the in-process `Engine`
+        stores the call that built the record, since there was no command line.
+        `None` on a record built directly (a fixture, a subprocess copy that
+        predates this, a config being inspected).
+        """
+        return getattr(self, "_launch_command", None)
 
     def resolved_dict(self) -> Dict[str, Any]:
         """This configuration as a plain dict of resolved field values.
@@ -318,6 +343,9 @@ class ServerArgs:
         copy's deep structure in-process mutates the parent's too.
         """
         replacement = dataclasses.replace(self, **changes)
+        # Provenance, not resolution state: a copy was still launched by
+        # whatever launched its parent, resolved or not.
+        object.__setattr__(replacement, "_launch_command", self.launch_command)
         if not getattr(self, "_resolution_finished", False):
             # Not resolved yet: the copy goes through the gate itself.
             return replacement
@@ -669,19 +697,28 @@ class ServerArgs:
         return cfg.startup_weight_load_mode == "overlap"
 
     def __setattr__(self, name, value):
-        # Once resolution has finished the record is the READ-ONLY raw input
-        # the config bags were projected from. Resolved config changes go to the bags via
-        # get_context().override(source, ...); a value one runner or worker
-        # owns travels as a constructor argument to it.
-        if getattr(self, "_resolution_finished", False) and (
-            not name.startswith("_") or name in _underscore_field_names()
-        ):
-            raise AttributeError(
-                f"server_args.{name} assigned after resolution; server_args is "
-                "read-only -- use get_context().override(source, ...) to change "
-                "resolved config; a value one runner owns travels as a "
-                "constructor argument."
-            )
+        # The record holds the operator's input. It is writable while the
+        # caller is still assembling it and sealed from the moment resolution
+        # starts: a resolver that writes a field would overwrite the very thing
+        # the record exists to remember, and the decision it meant to record
+        # belongs in the stash, where it carries a source and does not destroy
+        # the input it was derived from.
+        if not name.startswith("_") or name in _underscore_field_names():
+            if getattr(self, "_input_frozen", False):
+                raise AttributeError(
+                    f"server_args.{name} assigned during resolution; the record "
+                    "is the operator's input and resolution does not write it -- "
+                    "declare the decision with declare_resolution(server_args, "
+                    "source, **fields) so it carries a source and leaves the "
+                    "input intact."
+                )
+            if getattr(self, "_resolution_finished", False):
+                raise AttributeError(
+                    f"server_args.{name} assigned after resolution; server_args is "
+                    "read-only -- use get_context().override(source, ...) to change "
+                    "resolved config; a value one runner owns travels as a "
+                    "constructor argument."
+                )
         object.__setattr__(self, name, value)
 
     def enable_mamba_extra_buffer(self) -> bool:
@@ -843,6 +880,27 @@ def get_global_server_args() -> ServerArgs:
     return get_context().server_args
 
 
+@contextmanager
+def record_writable(server_args: Any):
+    """Lift the input seal for a resolver that genuinely writes the record.
+
+    There is exactly one: `declare_direct_writes`, which hands the record to an
+    out-of-tree platform plugin that sets fields on it. Those implementations
+    live outside this tree and cannot be converted by editing a resolver here,
+    so the write stays and is captured into the stash afterwards. Naming the
+    exception is the point -- an in-tree resolver that reaches for this is
+    doing something it should be declaring instead.
+    """
+    frozen = getattr(server_args, "_input_frozen", False)
+    if frozen:
+        object.__setattr__(server_args, "_input_frozen", False)
+    try:
+        yield
+    finally:
+        if frozen:
+            object.__setattr__(server_args, "_input_frozen", True)
+
+
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -877,7 +935,12 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         force=True,
     )
 
-    return ServerArgs.from_cli_args(raw_args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+    # Not a field: the record's fields are the configuration, and this is how
+    # the configuration was asked for. It rides along on the record so a
+    # subprocess copy can answer the same question the launcher can.
+    object.__setattr__(server_args, "_launch_command", " ".join(argv))
+    return server_args
 
 
 # --------------------------------------------------------------------------
