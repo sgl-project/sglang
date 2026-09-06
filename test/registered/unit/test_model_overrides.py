@@ -2441,7 +2441,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         def _view(**kw):
-            defaults = dict(quantization=None, moe_runner_backend="auto")
+            defaults = dict(
+                quantization=None,
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+            )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
