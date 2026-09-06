@@ -99,6 +99,10 @@ class TestHiCacheHostRegister(unittest.TestCase):
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     host.indexer_layout_dim,
                 )
+                self.assertEqual(
+                    alloc.call_args.kwargs["require_single_registration"],
+                    layout == "page_first",
+                )
 
     def test_page_first_direct_mla_uses_page_registration_granularity(self):
         pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
@@ -121,6 +125,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
             alloc.call_args.kwargs["registration_granularity_bytes"],
             pool.page_size * pool.layer_num * pool.kv_cache_dim * pool.dtype.itemsize,
         )
+        self.assertFalse(alloc.call_args.kwargs["require_single_registration"])
 
     def test_page_first_direct_mha_uses_page_registration_granularity(self):
         pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
@@ -148,6 +153,34 @@ class TestHiCacheHostRegister(unittest.TestCase):
             * pool.head_dim
             * pool.dtype.itemsize,
         )
+        self.assertFalse(alloc.call_args.kwargs["require_single_registration"])
+
+    def test_page_first_mha_and_mla_require_single_registration(self):
+        cases = (
+            (MHATokenToKVPoolHost, mha_pool_host, {"head_num": 2, "head_dim": 4}),
+            (MLATokenToKVPoolHost, mla_pool_host, {"kv_cache_dim": 5}),
+        )
+        for pool_cls, pool_module, attributes in cases:
+            with self.subTest(pool=pool_cls.__name__):
+                pool = pool_cls.__new__(pool_cls)
+                pool.__dict__.update(
+                    layout="page_first",
+                    size=8,
+                    layer_num=3,
+                    page_size=2,
+                    dtype=torch.float16,
+                    device_pool=SimpleNamespace(device="cuda"),
+                    device="cpu",
+                    pin_memory=True,
+                    allocator=object(),
+                    **attributes,
+                )
+                alloc = mock.Mock(return_value=object())
+
+                with mock.patch.dict(pool_module.ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
+                    pool.init_kv_buffer()
+
+                self.assertTrue(alloc.call_args.kwargs["require_single_registration"])
 
     def test_mamba_page_layouts_use_per_buffer_page_granularity(self):
         for layout in ("page_first", "page_first_direct"):
@@ -184,6 +217,13 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         3 * 2 * 2 * torch.float32.itemsize,
                     ],
                 )
+                self.assertEqual(
+                    [
+                        call.kwargs["require_single_registration"]
+                        for call in alloc.call_args_list
+                    ],
+                    [layout == "page_first"] * 3,
+                )
 
     def test_deepseek_v4_page_layouts_use_page_registration_granularity(self):
         for layout in ("page_first", "page_first_direct"):
@@ -210,6 +250,10 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     3 * 11,
+                )
+                self.assertEqual(
+                    alloc.call_args.kwargs["require_single_registration"],
+                    layout == "page_first",
                 )
 
             with self.subTest(pool="state", layout=layout):
@@ -243,6 +287,10 @@ class TestHiCacheHostRegister(unittest.TestCase):
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     2 * 2 * 3,
                 )
+                self.assertEqual(
+                    alloc.call_args.kwargs["require_single_registration"],
+                    layout == "page_first",
+                )
 
     def test_k_only_mha_page_layouts_use_page_registration_granularity(self):
         for layout in ("page_first", "page_first_direct"):
@@ -271,6 +319,10 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     pool.page_size * pool.layout_dim,
+                )
+                self.assertEqual(
+                    alloc.call_args.kwargs["require_single_registration"],
+                    layout == "page_first",
                 )
 
     def test_asymmetric_mha_page_layouts_use_native_page_granularities(self):
@@ -306,6 +358,13 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         pool.page_size * pool._k_layout_dim(),
                         pool.page_size * pool._v_layout_dim(),
                     ],
+                )
+                self.assertEqual(
+                    [
+                        call.kwargs["require_single_registration"]
+                        for call in alloc.call_args_list
+                    ],
+                    [layout == "page_first"] * 2,
                 )
 
     def test_unregister_releases_every_registered_chunk_once(self):
@@ -372,6 +431,45 @@ class TestHiCacheHostRegister(unittest.TestCase):
             _cuda_host_register(buffer)
 
         self.assertEqual(cudart.registrations, [(base, total, 0)])
+
+    def test_kernel_addressing_forces_single_registration(self):
+        gib = 1024**3
+        base = 0x10000000
+        total = 2 * gib + 17
+        cudart = _FakeCudart()
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(
+                _FakeBuffer(base, total),
+                registration_granularity_bytes=gib,
+                require_single_registration=True,
+            )
+
+        self.assertEqual(cudart.registrations, [(base, total, 0)])
+
+    def test_kernel_registration_failure_recommends_direct_mode(self):
+        buffer = _FakeBuffer(0x10000000, 1024)
+        cudart = _FakeCudart(fail_on_registration=1)
+
+        with (
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "use page_first_direct/direct",
+            ),
+        ):
+            _cuda_host_register(
+                buffer,
+                registration_granularity_bytes=256,
+                require_single_registration=True,
+            )
 
     def test_registration_boundaries_honor_page_copy_granularity(self):
         mib = 1024**2

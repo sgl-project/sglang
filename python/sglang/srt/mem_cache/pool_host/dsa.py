@@ -174,6 +174,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
                 registration_granularity_bytes=self.indexer_layout_dim,
+                require_single_registration=self.layout == "page_first",
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")

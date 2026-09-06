@@ -122,7 +122,9 @@ def get_allocator_type() -> str:
 
 
 def _cuda_host_register(
-    buffer: torch.Tensor, registration_granularity_bytes: int | None = None
+    buffer: torch.Tensor,
+    registration_granularity_bytes: int | None = None,
+    require_single_registration: bool = False,
 ) -> None:
     # Avoid oversized cudaHostRegister calls on large host pools.
     cudart = torch.cuda.cudart()
@@ -131,11 +133,10 @@ def _cuda_host_register(
     chunk_limit_bytes = (
         max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
     )
-    # Preserve the legacy single-call behavior unless the caller provides a
-    # copy granularity. Splitting an unknown page-first layout at an arbitrary
-    # byte offset can make one cudaMemcpyBatchAsync span two registrations.
+    # Kernel pointer arithmetic requires one device alias for the full buffer:
+    # adjacent host registrations are not guaranteed adjacent device aliases.
     chunk_bytes = total
-    if registration_granularity_bytes is not None:
+    if registration_granularity_bytes is not None and not require_single_registration:
         if registration_granularity_bytes <= 0:
             raise ValueError(
                 "registration_granularity_bytes must be positive, got "
@@ -158,11 +159,19 @@ def _cuda_host_register(
             ptr = base + offset
             rc = int(cudart.cudaHostRegister(ptr, size, 0))
             if rc != 0:
+                kernel_hint = (
+                    " Kernel-backed page_first HiCache requires one contiguous "
+                    "host registration; use page_first_direct/direct if this "
+                    "allocation is too large for the runtime."
+                    if require_single_registration
+                    else ""
+                )
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
                     f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
                     f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
                     f"pinned and device transfers may silently return stale data."
+                    f"{kernel_hint}"
                 )
             registered_ranges.append((ptr, size))
             offset += size
@@ -224,6 +233,7 @@ def alloc_with_host_register(
     pin_memory: bool,
     allocator: HostTensorAllocator,
     registration_granularity_bytes: int | None = None,
+    require_single_registration: bool = False,
 ) -> torch.Tensor:
     """
     Allocate tensor and register host memory with cudaHostRegister.
@@ -231,7 +241,11 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        _cuda_host_register(buffer, registration_granularity_bytes)
+        _cuda_host_register(
+            buffer,
+            registration_granularity_bytes,
+            require_single_registration,
+        )
     return buffer
 
 
@@ -242,6 +256,7 @@ def alloc_with_pin_memory(
     pin_memory: bool,
     allocator: None,
     registration_granularity_bytes: int | None = None,
+    require_single_registration: bool = False,
 ) -> torch.Tensor:
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
