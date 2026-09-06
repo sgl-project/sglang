@@ -1090,7 +1090,7 @@ fn load_back_build_adds_the_per_request_cow_transfer() {
             &tc,
             a,
             CacheTransferPhase::LoadBack,
-            /* mamba_pool_idx = */ Some(Tensor::from_slice(&[3i64]).squeeze()),
+            /* mamba_pool_idx = */ Some(Tensor::from_slice(&[3i64])),
             None,
             None,
             0,

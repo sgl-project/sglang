@@ -848,11 +848,10 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                     return Ok(None);
                 }
                 // cd.value already holds SWA-pool indices (translated at insert time).
-                // Host pool indexing wants int64.
                 node.try_device_value(SWA).map(|value| {
                     vec![PoolTransfer {
                         name: PoolName::Swa,
-                        device_indices: Some(value.to_swa_host_indices()),
+                        device_indices: Some(value.shallow_clone()),
                         ..Default::default()
                     }]
                 })

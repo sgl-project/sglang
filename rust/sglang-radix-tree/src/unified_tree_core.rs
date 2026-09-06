@@ -422,7 +422,7 @@ impl EvictLayer {
 
 /// The request fields load-back planning reads.
 pub struct Req<V: RadixValue> {
-    /// Mamba pool slot backing the request, when one is assigned.
+    /// Mamba pool slot backing the request as a one-atom value, when assigned.
     pub mamba_pool_idx: Option<V>,
 }
 
@@ -714,7 +714,12 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         });
     }
 
-    pub fn new_with_empty(
+    /// Build a tree core for the given component types with a fresh arena.
+    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
+        Self::new_with_empty_(params, component_types, V::empty())
+    }
+
+    fn new_with_empty_(
         params: CacheInitParams,
         component_types: Vec<ComponentType>,
         empty_device_indices: V,
@@ -5040,19 +5045,15 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
 /// Storage tier of a stored/removed block.
 #[cfg(feature = "torch")]
 impl<K: ChildKeyType> UnifiedTreeCore<K, tch::Tensor> {
-    /// Build the production Tensor-backed tree on CPU.
-    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
-        Self::new_on_device(params, component_types, tch::Device::Cpu)
-    }
-
-    /// Build the production Tensor-backed tree on the requested device.
+    /// Build the production Tensor-backed tree with its empty device indices on
+    /// `device`; `new` places them on CPU.
     pub fn new_on_device(
         params: CacheInitParams,
         component_types: Vec<ComponentType>,
         device: tch::Device,
     ) -> Self {
         let empty = tch::Tensor::empty([0], (tch::Kind::Int64, device));
-        Self::new_with_empty(params, component_types, empty)
+        Self::new_with_empty_(params, component_types, empty)
     }
 }
 

@@ -8,13 +8,12 @@ use sglang_radix_tree::{
 type TestCore = UnifiedTreeCore<Vec<i64>, PageValue<u32>>;
 
 fn core(eviction_policy: &str) -> TestCore {
-    TestCore::new_with_empty(
+    TestCore::new(
         CacheInitParams {
             eviction_policy: eviction_policy.to_string(),
             ..Default::default()
         },
         vec![FULL],
-        PageValue::default(),
     )
 }
 
@@ -102,13 +101,12 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
 
 #[test]
 fn continuation_insert_rejects_a_host_only_anchor() {
-    let mut tree = TestCore::new_with_empty(
+    let mut tree = TestCore::new(
         CacheInitParams {
             enable_hicache: true,
             ..Default::default()
         },
         vec![FULL],
-        PageValue::default(),
     );
     insert(&mut tree, &[10, 20, 30, 40], &[1, 2, 3, 4]);
     let anchor = tree
@@ -159,14 +157,13 @@ fn continuation_insert_rejects_a_host_only_anchor() {
 
 #[test]
 fn empty_insert_leaves_the_donated_mamba_slot_with_the_caller() {
-    let mut tree = TestCore::new_with_empty(
+    let mut tree = TestCore::new(
         CacheInitParams {
             page_size: 2,
             mamba_cache_chunk_size: Some(2),
             ..Default::default()
         },
         vec![FULL, MAMBA],
-        PageValue::default(),
     );
     // One token under page_size 2 aligns to an empty key: nothing is inserted,
     // so the caller must free its donated slot (mamba_exist == true).

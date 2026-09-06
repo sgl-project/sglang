@@ -3569,11 +3569,11 @@ fn build_transfers_are_gated_off_until_the_swa_host_pool_is_wired() {
 }
 
 #[test]
-fn backup_host_build_wraps_the_device_value_as_int64() {
+fn backup_host_build_carries_the_device_value() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
     tc.arena
-        .set_device_value(a, SWA, Tensor::from_slice(&[5i32]));
+        .set_device_value(a, SWA, Tensor::from_slice(&[5i64]));
     let transfers = swa_component(4)
         .build_hicache_transfers(
             &tc,

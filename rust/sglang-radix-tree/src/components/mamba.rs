@@ -551,7 +551,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
                     transfers.push(PoolTransfer {
                         name: PoolName::Mamba,
                         host_indices: Some(host_value.shallow_clone()),
-                        device_indices: Some(mamba_pool_idx.to_mamba_device_indices()),
+                        device_indices: Some(mamba_pool_idx),
                         ..Default::default()
                     });
                 }

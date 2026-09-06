@@ -35,15 +35,10 @@ pub trait RadixValue: Debug + Sized + 'static {
     /// Concatenate values in path order.
     fn concat(values: &[Self]) -> Self;
 
-    /// Empty host-side value. Device-specific empty values are supplied to the
-    /// tree constructor by the backend.
+    /// Empty value; `UnifiedTreeCore::new` also uses it as the shared empty
+    /// device indices. A backend whose empties need a placement exposes its
+    /// own constructor (Tensor: `new_on_device`).
     fn empty() -> Self;
-
-    /// Convert indices to the representation expected by the SWA host pool.
-    fn to_swa_host_indices(&self) -> Self;
-
-    /// Convert a request slot to the representation expected by the Mamba pool.
-    fn to_mamba_device_indices(&self) -> Self;
 
     /// Materialize the indices as integers for inspection and canary walks.
     fn to_i64_vec(&self) -> Vec<i64>;
@@ -164,14 +159,6 @@ where
         Self::default()
     }
 
-    fn to_swa_host_indices(&self) -> Self {
-        self.shallow_clone()
-    }
-
-    fn to_mamba_device_indices(&self) -> Self {
-        self.shallow_clone()
-    }
-
     fn to_i64_vec(&self) -> Vec<i64> {
         self.as_slice()
             .iter()
@@ -216,14 +203,6 @@ impl RadixValue for tch::Tensor {
 
     fn empty() -> Self {
         tch::Tensor::empty([0], (tch::Kind::Int64, tch::Device::Cpu))
-    }
-
-    fn to_swa_host_indices(&self) -> Self {
-        self.to_kind(tch::Kind::Int64)
-    }
-
-    fn to_mamba_device_indices(&self) -> Self {
-        self.unsqueeze(0)
     }
 
     fn to_i64_vec(&self) -> Vec<i64> {

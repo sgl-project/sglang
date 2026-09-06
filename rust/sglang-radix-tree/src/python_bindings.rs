@@ -1634,8 +1634,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         node_id: NodeId,
         mamba_pool_idx: Option<PyTensor>,
     ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
+        // Python keeps the request's Mamba slot as a 0-dim tensor; the core
+        // works on one-atom values.
         let req = Req {
-            mamba_pool_idx: mamba_pool_idx.map(|t| t.0),
+            mamba_pool_idx: mamba_pool_idx.map(|t| t.0.unsqueeze(0)),
         };
         let (kv_xfer, comp_xfers) = py
             .allow_threads(move || self.core().try_build_load_back_spec(node_id, Some(&req)))
