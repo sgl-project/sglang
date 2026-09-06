@@ -308,9 +308,7 @@ def compressed_attention_tilelang(
     fused_kernel=None,
     max_cache_len=-1,
 ) -> torch.Tensor:
-    """
-    使用 tilelang online topk kernel 计算 compressed attention topk indices
-    """
+    """Compute top-k block indices with the TileLang fused kernel."""
     with torch.no_grad():
         batch_size = cu_seqlens_q.shape[0] - 1
 
@@ -367,16 +365,12 @@ def compressed_attention_tilelang(
             topk_values,
         )
 
-        # Sort with -1 values at the end (match original behavior)
-        # Replace -1 with large value, sort, then replace back
+        # Indices arrive sorted by descending score: truncate to output_topk
+        # before the index sort (-1 entries last).
         large_val = pooled_k_len + 1000  # Any value larger than max valid index
-        topk_for_sort = topk_indices.clone()
-        topk_for_sort[topk_for_sort == -1] = large_val
-        topk_idx = topk_for_sort.sort(-1).values
+        sel = topk_indices[:, :, :output_topk]
+        topk_idx = torch.where(sel == -1, large_val, sel).sort(-1).values
         topk_idx[topk_idx == large_val] = -1
-
-        # Truncate to output_topk (same as original: min(topk, num_blocks))
-        topk_idx = topk_idx[:, :, :output_topk].contiguous()
 
         return topk_idx
 

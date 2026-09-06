@@ -11,6 +11,7 @@ from tilelang import tvm
 
 from sglang.srt.layers.attention.minicpm.fuse_kernel import (
     _fused_attn_pooling_online_topk,
+    fused_attn_pooling_online_topk_decode,
     fused_attn_pooling_online_topk_prefill,
 )
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
@@ -73,6 +74,24 @@ def _run_topk(kernel, q, k, cu_seqlens_q, cu_seqlens_k, cache_lens):
         fused_kernel=kernel,
         max_cache_len=_MAX_CACHE_LEN,
     )
+
+
+def _make_decode_inputs(seq_len: int, seed: int = 0) -> tuple[torch.Tensor, ...]:
+    num_k = (seq_len - _KERNEL_SIZE) // _KERNEL_STRIDE + 1
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(
+        (1, _HEADS, _DIM), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    k = torch.randn(
+        (num_k, _HEAD_KV, _DIM),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    cu_seqlens_k = torch.tensor([0, num_k], dtype=torch.int32, device="cuda")
+    cache_lens = torch.tensor([seq_len - 1], dtype=torch.int32, device="cuda")
+    return q, k, cu_seqlens_q, cu_seqlens_k, cache_lens
 
 
 _PREFILL_GRID = 256
@@ -158,6 +177,67 @@ def test_prefill_topk_subscribed_rows_select_only_causal_blocks():
 
     topk_idx = _run_topk(check_candidates, q, k, cu_seqlens_q, cu_seqlens_k, cache_lens)
     assert (topk_idx >= 0).sum(-1).eq(_SPARSE_TOPK).all()
+
+
+@pytest.mark.parametrize("seq_len", [6500, 8500, 12000])
+def test_decode_topk_keeps_forced_blocks_beyond_output_topk(seq_len):
+    """Forced init/local blocks must survive truncation to the output capacity."""
+    q, k, cu_seqlens_q, cu_seqlens_k, cache_lens = _make_decode_inputs(seq_len)
+    kernel = _kernel(fused_attn_pooling_online_topk_decode)
+    topk_idx = _run_topk(kernel, q, k, cu_seqlens_q, cu_seqlens_k, cache_lens)
+
+    last_block = (seq_len - 1) // _BLOCK_SIZE
+    sel = topk_idx[:, 0]
+    forced = torch.cat(
+        [
+            torch.arange(_INIT_BLOCKS, device="cuda"),
+            torch.arange(last_block - _LOCAL_BLOCKS, last_block + 1, device="cuda"),
+        ]
+    )
+    assert (sel[:, None, :] == forced[None, :, None]).any(-1).all()
+
+
+def test_decode_topk_matches_unforced_score_reference():
+    """Score truncation must retain the full winning set before block-ID sorting."""
+    seq_len = 8500
+    num_k = (seq_len - _KERNEL_SIZE) // _KERNEL_STRIDE + 1
+    num_blocks = (seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+    q = torch.zeros(1, _HEADS, _DIM, dtype=torch.bfloat16)
+    q[:, :, :2] = 16
+    q[:, _GROUPS:, :2] = -16
+    key_rows = torch.arange(num_k)
+    k = torch.zeros(num_k, _HEAD_KV, _DIM, dtype=torch.bfloat16)
+    # Both components are BF16-exact; their dot product is +/- key_row / 8.
+    k[:, :, 0] = (key_rows // 128)[:, None]
+    k[:, :, 1] = ((key_rows % 128) / 128)[:, None]
+
+    logits = torch.einsum(
+        "qhgd,khd->hqgk",
+        q.double().reshape(1, _HEAD_KV, _GROUPS, _DIM),
+        k.double(),
+    ) / (_DIM**0.5)
+    probabilities = logits.softmax(-1).sum(2)
+    key_starts = key_rows * _KERNEL_STRIDE
+    block_starts = torch.arange(num_blocks) * _BLOCK_SIZE
+    overlaps = (key_starts[:, None] < block_starts[None, :] + _BLOCK_SIZE) & (
+        key_starts[:, None] + _KERNEL_SIZE > block_starts[None, :]
+    )
+    scores = probabilities[..., None].masked_fill(~overlaps, float("-inf")).amax(2)
+    assert (scores[0, 0].diff() > 0).all()
+    assert (scores[1, 0].diff() < 0).all()
+    ranked = scores.sort(dim=-1, descending=True).values
+    assert (ranked[..., _OUTPUT_TOPK - 1] > 1.04 * ranked[..., _OUTPUT_TOPK]).all()
+    expected = scores.topk(_OUTPUT_TOPK, dim=-1).indices.sort(-1).values.to(torch.int32)
+
+    kernel = fused_attn_pooling_online_topk_decode(
+        batch_size=1,
+        **dict(_KERNEL_KWARGS, init_blocks=0, local_blocks=0),
+    )
+    cu_q = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, num_k], dtype=torch.int32, device="cuda")
+    cache = torch.tensor([seq_len - 1], dtype=torch.int32, device="cuda")
+    actual = _run_topk(kernel, q.cuda(), k.cuda(), cu_q, cu_k, cache)
+    assert torch.equal(actual.cpu(), expected)
 
 
 def _tir_nodes(statement, predicate):
