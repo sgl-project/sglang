@@ -867,10 +867,11 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
         with set_default_torch_dtype(model_config.dtype):
-            self.load_weights_and_postprocess(
+            self._load_boot_weights_and_postprocess(
                 model,
                 weights_iterator(),
                 target_device,
+                model_config=model_config,
             )
         self.counter_after_loading_weights = time.perf_counter()
 
@@ -885,6 +886,12 @@ class DefaultModelLoader(BaseModelLoader):
         This method handles the common model loading logic shared between
         DefaultModelLoader (conditional) and ModelOptModelLoader (dedicated).
         """
+        if DefaultModelLoader.weight_loaded_hook is not None:
+            raise RuntimeError(
+                "ModelOpt loading bypasses DefaultModelLoader.weight_loaded_hook; "
+                "loaded weights cannot be observed before quantization/repacking"
+            )
+
         if not HAS_ACCELERATE:
             raise ImportError(
                 "accelerate is required for ModelOpt quantization. "
@@ -982,15 +989,46 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
-            self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+            self._load_boot_weights_and_postprocess(
+                model,
+                self._get_all_weights(model_config, model),
+                target_device,
+                model_config=model_config,
             )
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
+    # Runs after checkpoint weights are installed and before quantization/repacking.
+    weight_loaded_hook = None
+
+    def _load_boot_weights_and_postprocess(
+        self, model, weights, target_device, *, model_config
+    ):
+        if (
+            type(self).load_weights_and_postprocess
+            is not DefaultModelLoader.load_weights_and_postprocess
+        ):
+            if DefaultModelLoader.weight_loaded_hook is not None:
+                raise RuntimeError(
+                    f"{type(self).__name__}.load_weights_and_postprocess bypasses "
+                    "DefaultModelLoader.weight_loaded_hook; loaded weights cannot "
+                    "be observed before quantization/repacking"
+                )
+            self.load_weights_and_postprocess(model, weights, target_device)
+            return
+
+        DefaultModelLoader.load_weights_and_postprocess(
+            model,
+            weights,
+            target_device,
+            model_config=model_config,
+        )
+
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(
+        model, weights, target_device, *, model_config=None
+    ):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -1045,6 +1083,10 @@ class DefaultModelLoader(BaseModelLoader):
                 "Memory increase during load_weights: %s GiB",
                 f"{memory_start - memory_end:.3f}",
             )
+
+        hook = DefaultModelLoader.weight_loaded_hook
+        if hook is not None and model_config is not None:
+            hook(model, model_config)
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
