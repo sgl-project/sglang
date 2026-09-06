@@ -1697,7 +1697,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
             "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation "
             "scales, but the dispatch output carried none."
         )
-    assert runner_config.activation == "silu"
+    assert runner_config.activation in ("silu", "situ")
 
     if is_expanded:
         if psum_num_recv_tokens_per_expert is None:
