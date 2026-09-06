@@ -280,10 +280,12 @@ def _bf16_gemm_dispatch_impl(
         output = _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
             *x.shape[:-1], -1
         )
+    elif addend is not None:
+        # cuBLAS folds the addend in through the GEMM beta input; a bias would
+        # need a third operand, so callers must exclude it.
+        assert bias is None
+        return torch.addmm(addend, x, weight.t(), out=addend)
     else:
-        if addend is not None:
-            assert bias is None
-            return torch.addmm(addend, x, weight.t(), out=addend)
         return F.linear(x, weight, bias)
 
     if addend is not None:
@@ -296,6 +298,32 @@ def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     return _bf16_gemm_dispatch_impl(x, weight, bias)
+
+
+def _can_accumulate_into_addend(
+    *,
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    addend: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> bool:
+    if not _is_cuda or torch.compiler.is_compiling():
+        return False
+    # Batch-invariant mode overrides aten::mm and aten::addmm but not
+    # aten::addmm.out, so deterministic inference keeps the separate add.
+    if is_batch_invariant_mode_enabled():
+        return False
+    # x.is_cuda also keeps the CPU AMX route in apply().
+    if bias is not None or x.ndim != 2 or not x.is_cuda:
+        return False
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return False
+    return (
+        addend.dtype == torch.bfloat16
+        and addend.is_contiguous()
+        and addend.shape == (x.shape[0], weight.shape[0])
+        and not (x.requires_grad or addend.requires_grad or weight.requires_grad)
+    )
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -421,41 +449,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
         addend: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Return ``linear(x) + addend``, reusing ``addend`` when supported.
+        """Run an inference-only BF16 linear and add ``addend`` to the result.
 
-        The addmm path overwrites ``addend``; custom-kernel and fallback paths
-        leave it unchanged. Callers must treat it as consumed in either case.
+        Only the cuBLAS route accumulates through the GEMM beta input and
+        returns ``addend`` itself; the custom-kernel routes add separately and
+        leave it untouched. Callers must treat it as consumed either way.
         """
-        if (
-            torch.compiler.is_compiling()
-            or _use_aiter
-            or not _is_cuda
-            or is_batch_invariant_mode_enabled()
-            or not x.is_cuda
-            or x.ndim != 2
-            or x.dtype != torch.bfloat16
-            or layer.weight.dtype != torch.bfloat16
-            or addend.dtype != torch.bfloat16
-            or not addend.is_contiguous()
-            or addend.shape != (x.shape[0], layer.weight.shape[0])
-            or bias is not None
-            or x.requires_grad
-            or addend.requires_grad
-            or layer.weight.requires_grad
+        if _can_accumulate_into_addend(
+            weight=layer.weight, x=x, addend=addend, bias=bias
         ):
-            output = self.apply(layer, x, bias)
-            output.add_(addend)
-            return output
-
-        backend = get_bf16_gemm_backend()
-        if backend in (Bf16GemmBackend.AUTO, Bf16GemmBackend.TORCH):
-            return torch.addmm(addend, x, layer.weight.t(), out=addend)
-        if backend.is_optimized():
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias, addend=addend)
-
-        output = self.apply(layer, x, bias)
-        output.add_(addend)
-        return output
+        return self.apply(layer, x, bias).add_(addend)
 
     def apply_into(
         self,

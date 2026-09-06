@@ -57,6 +57,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -161,6 +162,17 @@ def _get_or_create_alt_stream(device_module):
     if _alt_stream is None:
         _alt_stream = device_module.Stream()
     return _alt_stream
+
+
+def _latent_proj_fuses_shared_add(projection: nn.Module) -> bool:
+    return (
+        # Exact type, not isinstance: LoRA swaps a wrapper module into this
+        # attribute after init, and a subclass may override forward.
+        type(projection) is ReplicatedLinear
+        # Without a bias, ReplicatedLinear.forward is a bare quant_method.apply.
+        and projection.bias is None
+        and isinstance(projection.quant_method, UnquantizedLinearMethod)
+    )
 
 
 class NemotronHMoE(nn.Module):
@@ -337,12 +349,10 @@ class NemotronHMoE(nn.Module):
         shared_output: torch.Tensor | None,
     ) -> torch.Tensor:
         projection = self.fc2_latent_proj
-        if shared_output is not None and type(projection) is ReplicatedLinear:
-            final_hidden_states, _ = projection(
-                final_hidden_states,
-                addend=shared_output,
+        if shared_output is not None and _latent_proj_fuses_shared_add(projection):
+            return projection.quant_method.apply_with_addend(
+                projection, final_hidden_states, addend=shared_output
             )
-            return final_hidden_states
 
         final_hidden_states, _ = projection(final_hidden_states)
         if shared_output is not None:
