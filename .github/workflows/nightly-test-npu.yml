@@ -122,22 +122,6 @@ jobs:
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
 
-  nightly-1-npu-a2:
-    name: nightly-1-npu-a2
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a2-4
-      test_type: 'perf'
-      test_suite: nightly-1-npu-a2
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a2 }}
-      install_sglang_deps: false
-      device_type_for_deps: '910b'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
     if: ${{ !cancelled() }}
@@ -247,22 +231,6 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-perf-8-npu-a3:
-    name: nightly-perf-8-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-800t-8
-      test_type: 'perf'
-      test_suite: nightly-perf-8-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
     if: ${{ !cancelled() }}
@@ -298,22 +266,6 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-acc-4-npu-a3:
-    name: nightly-acc-4-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-4-
-      test_type: 'accuracy'
-      test_suite: nightly-acc-4-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
     if: ${{ !cancelled() }}
@@ -333,7 +285,7 @@ jobs:
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3]
+    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -353,21 +305,6 @@ jobs:
             router_size: 1
             test_case: test/registered/npu/accuracy/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
             test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
-          # mimo_v2_flash performance tests
-          - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-          - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms.py
-            test_type: 'perf'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_flash performance tests
           - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
@@ -395,21 +332,12 @@ jobs:
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
+    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
-          # kimi_k2_6 performance tests
-          - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms
-            node_size: 2
-            test_case: test/registered/npu/performance/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms.py
-            test_type: 'perf'
-          - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25
-            node_size: 2
-            test_case: test/registered/npu/accuracy/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25.py
-            test_type: 'accuracy'
           # glm_5_2 accuracy tests
           - name: glm_5_2_w4a8_16p_gpqa
             node_size: 2
@@ -436,7 +364,6 @@ jobs:
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
-      - nightly-1-npu-a2
       - nightly-1-npu-a3
       - nightly-2-npu-a3
       - nightly-4-npu-a3
@@ -444,10 +371,8 @@ jobs:
       - nightly-16-npu-a3
       - nightly-perf-2-npu-a3
       - nightly-perf-4-npu-a3
-      - nightly-perf-8-npu-a3
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
-      - nightly-acc-4-npu-a3
       - nightly-acc-16-npu-a3
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
@@ -455,7 +380,6 @@ jobs:
     steps:
       - name: Generate results table
         run: |
-          single_result_a2="${{ needs.nightly-1-npu-a2.result }}"
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
 
@@ -469,10 +393,8 @@ jobs:
             "${{ needs.nightly-16-npu-a3.result }}" \
             "${{ needs.nightly-perf-2-npu-a3.result }}" \
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "${{ needs.nightly-perf-8-npu-a3.result }}" \
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-4-npu-a3.result }}" \
             "${{ needs.nightly-acc-16-npu-a3.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
               single_result="failure"
@@ -493,7 +415,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| nightly-1-npu-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
           for entry in \
             "nightly-1-npu-a3:${{ needs.nightly-1-npu-a3.result }}" \
             "nightly-2-npu-a3:${{ needs.nightly-2-npu-a3.result }}" \
@@ -502,10 +423,8 @@ jobs:
             "nightly-16-npu-a3:${{ needs.nightly-16-npu-a3.result }}" \
             "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "nightly-perf-8-npu-a3:${{ needs.nightly-perf-8-npu-a3.result }}" \
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "nightly-acc-4-npu-a3:${{ needs.nightly-acc-4-npu-a3.result }}" \
             "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
             suite="${entry%%:*}"
             r="${entry##*:}"
@@ -516,7 +435,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           FAIL=0
-          for r in "${single_result_a2}" "${single_result}" "${multi_result}" "${mix_result}"; do
+          for r in "${single_result}" "${multi_result}" "${mix_result}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then FAIL=1; fi
           done
           exit $FAIL

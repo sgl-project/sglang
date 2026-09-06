@@ -1532,6 +1532,9 @@ class LayerwiseOffloadableModuleMixin:
         holds = sum(p.numel() * p.element_size() for _, p in resident)
         if holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
             # There is room. Give back any host copies rather than hold them.
+            # Restore any parameters still bound to placeholders first so we
+            # do not leave weights as (1,) tensors after clearing the copies.
+            self.restore_non_layer_weights()
             self._parked_non_layer_weights.clear()
             return
 
