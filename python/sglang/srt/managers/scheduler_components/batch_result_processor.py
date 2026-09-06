@@ -77,6 +77,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_SPARSE_EMBEDDING_CONVERSION_CHUNK_SIZE = 512
+
+
+def _sparse_embeddings_to_python(
+    embeddings: torch.Tensor,
+) -> list[dict[int, float]]:
+    """Convert sparse tensor output with bounded tensor-to-Python transfers."""
+    output = [{} for _ in range(embeddings.size(0))]
+    indices = embeddings.indices()
+    values = embeddings.values()
+
+    for start in range(0, values.shape[0], _SPARSE_EMBEDDING_CONVERSION_CHUNK_SIZE):
+        end = start + _SPARSE_EMBEDDING_CONVERSION_CHUNK_SIZE
+        batch_ids, token_ids = indices[:, start:end].tolist()
+        chunk_values = values[start:end].tolist()
+        for batch_id, token_id, value in zip(batch_ids, token_ids, chunk_values):
+            output[batch_id][token_id] = value
+    return output
+
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     """Return the padded per-request width in flattened speculative output."""
@@ -470,12 +489,7 @@ class SchedulerBatchResultProcessor:
         embeddings = result.embeddings
 
         if is_sparse:
-            batch_ids, token_ids = embeddings.indices()
-            values = embeddings.values()
-
-            embeddings = [{} for _ in range(embeddings.size(0))]
-            for i in range(batch_ids.shape[0]):
-                embeddings[batch_ids[i].item()][token_ids[i].item()] = values[i].item()
+            embeddings = _sparse_embeddings_to_python(embeddings)
         else:
             if isinstance(embeddings, torch.Tensor):
                 embeddings = embeddings.tolist()
