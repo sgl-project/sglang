@@ -189,6 +189,13 @@ class NPUPlatformBase(Platform):
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
 
     @classmethod
+    def get_all_to_all_communicator_cls(cls) -> str:
+        return (
+            "sglang.multimodal_gen.runtime.distributed.device_communicators."
+            "cpu_communicator.CpuCommunicator"
+        )
+
+    @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         """Whether automatic DiT layerwise offload is enabled on this platform."""
         return False

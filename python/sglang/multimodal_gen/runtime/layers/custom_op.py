@@ -4,16 +4,16 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/custom_op.py
 
 from collections.abc import Callable
-from typing import Any
+from functools import partial
+from typing import Any, ClassVar
 
 import torch.nn as nn
 
+import sglang.multimodal_gen.runtime.platforms as platforms
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-_is_cuda = current_platform.is_cuda()
 
 
 class CustomOp(nn.Module):
@@ -21,6 +21,15 @@ class CustomOp(nn.Module):
     Base class for custom ops.
     Dispatches the forward method to the appropriate backend.
     """
+
+    _oot_forward_registry: ClassVar[dict[str, dict[type["CustomOp"], Callable]]] = {}
+
+    @staticmethod
+    def register_oot_forward(
+        op_cls: type["CustomOp"], *, fn: Callable, platform_key: str
+    ) -> None:
+        """Register ``fn`` for an exact op class and behavioral dispatch key."""
+        CustomOp._oot_forward_registry.setdefault(platform_key, {})[op_cls] = fn
 
     def __init__(self) -> None:
         super().__init__()
@@ -68,16 +77,43 @@ class CustomOp(nn.Module):
         # PyTorch-native implementation.
         return self.forward_native(*args, **kwargs)
 
+    def _defined_forward(self, method_name: str) -> Callable | None:
+        """Return an implementation defined below ``CustomOp`` in the MRO."""
+        for op_cls in type(self).__mro__:
+            if op_cls is CustomOp:
+                return None
+            if method_name in op_cls.__dict__:
+                return getattr(self, method_name)
+        return None
+
     def dispatch_forward(self) -> Callable:
-        if _is_cuda:
+        platform = platforms.current_platform
+        if platform.is_out_of_tree():
+            # An empty key would silently skip the platform forward below and
+            # dispatch everything to forward_oot instead.
+            platform_key = platform.get_dispatch_key_name().strip()
+            if not platform_key:
+                raise ValueError(
+                    "Out-of-tree diffusion platforms must return a non-empty "
+                    "get_dispatch_key_name()"
+                )
+            forward = self._oot_forward_registry.get(platform_key, {}).get(type(self))
+            if forward is not None:
+                return partial(forward, self)
+            if platform_key.isidentifier():
+                platform_forward = self._defined_forward(f"forward_{platform_key}")
+                if platform_forward is not None:
+                    return platform_forward
+            return self.forward_oot
+        elif platform.is_cuda():
             return self.forward_cuda
-        elif current_platform.is_hip():
+        elif platform.is_hip():
             return self.forward_hip
-        elif current_platform.is_npu():
+        elif platform.is_npu():
             return self.forward_npu
-        elif current_platform.is_xpu():
+        elif platform.is_xpu():
             return self.forward_xpu
-        elif current_platform.is_musa():
+        elif platform.is_musa():
             return self.forward_musa
         else:
             return self.forward_native

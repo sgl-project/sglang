@@ -1,5 +1,6 @@
+import os
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch.nn as nn
@@ -7,8 +8,12 @@ import torch.nn as nn
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
     LTX2VideoTransformer3DModel,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.mova import (
+    MOVADenoisingStage,
 )
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     CompiledModuleRegistry,
@@ -98,6 +103,85 @@ def test_out_of_tree_platform_controls_compile_kwargs(backend, options, expected
     get_compile_options.assert_called_once_with(module)
 
 
+def test_mova_uses_platform_compile_kwargs():
+    stage = MOVADenoisingStage.__new__(MOVADenoisingStage)
+    module = _CompilableModule()
+    server_args = SimpleNamespace(enable_torch_compile=True)
+    module_path = (
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.mova"
+    )
+    compile_path = "sglang.multimodal_gen.runtime.utils.torch_compile"
+
+    with (
+        # This test exercises the real mode resolver, which reads the env first.
+        patch.dict(os.environ, {}, clear=False),
+        patch(f"{module_path}.current_platform.is_hip", return_value=False),
+        patch(f"{module_path}.current_platform.is_npu", return_value=False),
+        patch(
+            f"{compile_path}.current_platform.is_npu",
+            return_value=False,
+        ),
+        patch(
+            f"{compile_path}.current_platform.is_out_of_tree",
+            return_value=True,
+        ),
+        patch(
+            f"{compile_path}.current_platform.get_compile_backend",
+            return_value="custom_backend",
+        ) as get_compile_backend,
+        patch(
+            f"{compile_path}.current_platform.get_compile_options",
+            return_value={"max_autotune": True},
+        ) as get_compile_options,
+    ):
+        os.environ.pop("SGLANG_TORCH_COMPILE_MODE", None)
+        stage._maybe_enable_torch_compile(module, server_args)
+
+    get_compile_backend.assert_called_once_with("max-autotune-no-cudagraphs")
+    get_compile_options.assert_called_once_with(module)
+    assert module.compile_calls == [
+        {
+            "backend": "custom_backend",
+            "dynamic": None,
+            "fullgraph": False,
+            "options": {"max_autotune": True},
+        }
+    ]
+
+
+def test_vae_compile_options_receive_the_target_module():
+    stage = DecodingStage.__new__(DecodingStage)
+    vae = _CompilableModule()
+    decode = MagicMock()
+    compiled_callable = MagicMock(target_id=None, compiled_module=None)
+    compiled_callable.get_or_compile.return_value = decode
+    server_args = SimpleNamespace(enable_torch_compile=True)
+    module_path = "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding"
+
+    with (
+        patch(f"{module_path}.current_platform.is_npu", return_value=False),
+        patch(
+            f"{module_path}.resolve_torch_compile_kwargs",
+            return_value=({"backend": "custom_backend"}, "default"),
+        ) as resolve_compile_kwargs,
+    ):
+        result = stage._get_vae_decode_fn(
+            vae,
+            server_args,
+            decode_fn=decode,
+            compiled_callable=compiled_callable,
+        )
+
+    assert result is decode
+    resolve_compile_kwargs.assert_called_once_with(
+        "SGLANG_VAE_TORCH_COMPILE_MODE",
+        "SGLANG_TORCH_COMPILE_MODE",
+        default="default",
+        module=vae,
+    )
+
+
 def test_ltx2_compile_conditions_match_only_direct_blocks():
     conditions = LTX2VideoTransformer3DModel._compile_conditions
 
@@ -178,17 +262,19 @@ def test_denoising_stage_selects_regional_compile():
         ),
         patch(
             "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
-            "maybe_enable_inductor_compute_comm_overlap"
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
-            "build_torch_compile_kwargs",
-            return_value=compile_kwargs,
-        ) as build_compile_kwargs,
+            "resolve_torch_compile_kwargs",
+            return_value=(compile_kwargs, "default"),
+        ) as resolve_compile_kwargs,
     ):
         stage._maybe_torch_compile(model)
 
-    build_compile_kwargs.assert_called_once_with(mode="default", module=model)
+    resolve_compile_kwargs.assert_called_once_with(
+        "SGLANG_TORCH_COMPILE_MODE",
+        config=stage.server_args.pipeline_config.dit_config,
+        default="max-autotune-no-cudagraphs",
+        module=model,
+        enable_inductor_compute_comm_overlap=True,
+    )
     assert [len(block.compile_calls) for block in model.transformer_blocks] == [1, 1]
     assert [block.compile_calls for block in model.transformer_blocks] == [
         [compile_kwargs],

@@ -160,9 +160,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     CompiledModuleRegistry,
-    build_torch_compile_kwargs,
-    maybe_enable_inductor_compute_comm_overlap,
-    resolve_torch_compile_mode,
+    resolve_torch_compile_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -521,18 +519,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self._torch_compile_registry.is_compiled(module):
             return
 
+        dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
+        compile_kwargs, mode = resolve_torch_compile_kwargs(
+            "SGLANG_TORCH_COMPILE_MODE",
+            config=dit_config,
+            default="max-autotune-no-cudagraphs",
+            module=module,
+            enable_inductor_compute_comm_overlap=True,
+        )
         if current_platform.is_npu():
-            compile_kwargs = build_torch_compile_kwargs(mode=None)
             logger.info("Compiling transformer with torchair backend on NPU")
         else:
-            maybe_enable_inductor_compute_comm_overlap()
-            dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
-            mode = resolve_torch_compile_mode(
-                "SGLANG_TORCH_COMPILE_MODE",
-                config=dit_config,
-                default="max-autotune-no-cudagraphs",
-            )
-            compile_kwargs = build_torch_compile_kwargs(mode=mode, module=module)
             logger.info(f"Compiling transformer with mode: {mode}")
 
         if getattr(self.server_args, "regional_compile", False):

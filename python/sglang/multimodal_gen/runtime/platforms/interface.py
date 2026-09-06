@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
         AttentionImpl,
     )
+    from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 
 logger = init_logger(__name__)
 
@@ -110,15 +111,14 @@ class DeviceCapability(NamedTuple):
 
 
 class Platform:
-    _enum: PlatformEnum
+    _enum: PlatformEnum = PlatformEnum.UNSPECIFIED
     device_name: str
     device_type: str
     device: torch.device | None = None  # Dummy attribute for compatibility
 
     # available dispatch keys:
     # check https://github.com/pytorch/pytorch/blob/313dac6c1ca0fa0cde32477509cce32089f8532a/torchgen/model.py#L134 # noqa
-    # use "CPU" as a fallback for platforms not registered in PyTorch
-    dispatch_key: str = "CPU"
+    dispatch_key: str = ""
 
     # The torch.compile backend for compiling simple and
     # standalone functions. The default value is "inductor" to keep
@@ -129,6 +129,17 @@ class Platform:
 
     supported_quantization: list[str] = []
 
+    def init_backend(self) -> None:
+        """One-time backend initialization, in each worker; raising aborts startup.
+
+        Where out-of-tree platforms register their custom-op forwards.
+        """
+        pass
+
+    def apply_server_args_defaults(self, server_args: ServerArgs) -> None:
+        """Apply defaults before argument normalization and validation."""
+        pass
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the backend used to compile diffusion modules."""
         return self.simple_compile_backend
@@ -136,6 +147,27 @@ class Platform:
     def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
         """Return backend-specific options for a diffusion module."""
         return None
+
+    def get_dispatch_key_name(self) -> str:
+        """Return the behavioral dispatch key used by :class:`CustomOp`.
+
+        This is intentionally separate from ``dispatch_key``, which names a
+        PyTorch dispatcher key such as ``PrivateUse1``. An out-of-tree backend
+        can return an existing key such as ``cuda`` to reuse compatible
+        ``forward_cuda`` implementations, or a vendor key backed by registered
+        forwards and ``forward_<key>`` methods.
+        """
+        return "native"
+
+    def get_torch_library_dispatch_key(self) -> str:
+        """Return the key used for direct ``torch.library`` registrations."""
+        if self.is_out_of_tree():
+            if not self.dispatch_key:
+                raise NotImplementedError(
+                    "Out-of-tree diffusion platforms must define dispatch_key"
+                )
+            return self.dispatch_key
+        return "PrivateUse1" if self.is_npu() else "CUDA"
 
     @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
@@ -176,11 +208,11 @@ class Platform:
 
     @classmethod
     def is_cuda_static(cls) -> bool:
-        return getattr(cls, "_enum", None) == PlatformEnum.CUDA
+        return cls._enum == PlatformEnum.CUDA
 
     @classmethod
     def is_rocm_static(cls) -> bool:
-        return getattr(cls, "_enum", None) == PlatformEnum.ROCM
+        return cls._enum == PlatformEnum.ROCM
 
     @lru_cache(maxsize=1)
     def is_hpu(self) -> bool:
@@ -188,11 +220,19 @@ class Platform:
 
     @lru_cache(maxsize=1)
     def is_xpu(self) -> bool:
-        return hasattr(torch, "xpu") and torch.xpu.is_available()
+        return (
+            not self.is_out_of_tree()
+            and hasattr(torch, "xpu")
+            and torch.xpu.is_available()
+        )
 
     @lru_cache(maxsize=1)
     def is_npu(self) -> bool:
-        return hasattr(torch, "npu") and torch.npu.is_available()
+        return (
+            not self.is_out_of_tree()
+            and hasattr(torch, "npu")
+            and torch.npu.is_available()
+        )
 
     def is_out_of_tree(self) -> bool:
         return self._enum == PlatformEnum.OOT
@@ -213,7 +253,11 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_musa(self):
         try:
-            return hasattr(torch, "musa") and torch.musa.is_available()
+            return (
+                not self.is_out_of_tree()
+                and hasattr(torch, "musa")
+                and torch.musa.is_available()
+            )
         except ModuleNotFoundError:
             return False
 
@@ -310,6 +354,10 @@ class Platform:
 
     @lru_cache(maxsize=1)
     def get_device(self, local_rank: int) -> torch.device:
+        if self.is_out_of_tree():
+            raise NotImplementedError(
+                "Out-of-tree diffusion platforms must implement get_device()"
+            )
         if self.is_cuda() or self.is_rocm():
             return torch.device("cuda", local_rank)
         elif self.is_npu():
@@ -341,6 +389,17 @@ class Platform:
             raise NotImplementedError(
                 "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
             )
+
+    def supports_distributed_device_id(self) -> bool:
+        """Whether torch.distributed accepts this platform's device ID."""
+        return not (
+            self.is_out_of_tree()
+            or self.is_mps()
+            or self.is_musa()
+            or self.is_npu()
+            or self.is_cpu()
+            or self.is_xpu()
+        )
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
@@ -420,10 +479,22 @@ class Platform:
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        """
-        Get device specific communicator class for distributed communication.
-        """
+        """Return the platform's default device communicator class."""
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"  # noqa
+
+    @classmethod
+    def get_all_to_all_communicator_cls(cls) -> str:
+        """Return the communicator used by ``all_to_all_4D``."""
+        qualname = cls.get_device_communicator_cls()
+        if (
+            cls._enum is PlatformEnum.OOT
+            and qualname == Platform.get_device_communicator_cls()
+        ):
+            raise NotImplementedError(
+                "Out-of-tree diffusion platforms must implement "
+                "get_all_to_all_communicator_cls()"
+            )
+        return qualname
 
     @classmethod
     def get_cpu_architecture(cls) -> CpuArchEnum:

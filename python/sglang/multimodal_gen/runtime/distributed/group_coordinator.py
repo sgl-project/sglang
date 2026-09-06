@@ -21,15 +21,13 @@ from torch.distributed import Backend, ProcessGroup
 from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
-from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
-    CpuCommunicator,
-)
 from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_stdout,
 )
+from sglang.multimodal_gen.utils import resolve_obj_by_qualname
 from sglang.srt.utils import is_shm_available
 
 try:
@@ -57,6 +55,16 @@ def get_local_torch_device() -> torch.device:
     """Return the torch device for the current rank."""
 
     return current_platform.get_local_torch_device()
+
+
+def _resolve_all_to_all_communicator_cls() -> type[DeviceCommunicatorBase]:
+    qualname = current_platform.get_all_to_all_communicator_cls()
+    communicator_cls = resolve_obj_by_qualname(qualname)
+    if not isinstance(communicator_cls, type) or not issubclass(
+        communicator_cls, DeviceCommunicatorBase
+    ):
+        raise TypeError(f"Expected a DeviceCommunicatorBase subclass: {qualname}")
+    return communicator_cls
 
 
 def _get_unique_name(name: str) -> str:
@@ -170,7 +178,7 @@ class GroupCoordinator:
     cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
     use_device_communicator: bool  # whether to use device communicator
-    device_communicator: DeviceCommunicatorBase  # device communicator
+    device_communicator: DeviceCommunicatorBase  # all_to_all_4D communicator
 
     def __init__(
         self,
@@ -210,26 +218,13 @@ class GroupCoordinator:
         self.use_device_communicator = use_device_communicator
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
         if use_device_communicator and self.world_size > 1:
-            # Platform-aware device communicator selection
-            if current_platform.is_cuda_alike():
-                from sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator import (
-                    CudaCommunicator,
-                )
-
-                self.device_communicator = CudaCommunicator(
-                    cpu_group=self.cpu_group,
-                    device=self.device,
-                    device_group=self.device_group,
-                    unique_name=self.unique_name,
-                )
-            else:
-                # For MPS and CPU, use the CPU communicator
-                self.device_communicator = CpuCommunicator(
-                    cpu_group=self.cpu_group,
-                    device=self.device,
-                    device_group=self.device_group,
-                    unique_name=self.unique_name,
-                )
+            communicator_cls = _resolve_all_to_all_communicator_cls()
+            self.device_communicator = communicator_cls(
+                cpu_group=self.cpu_group,
+                device=self.device,
+                device_group=self.device_group,
+                unique_name=self.unique_name,
+            )
 
         self.mq_broadcaster = None
         self.srt_custom_allreduce = None
