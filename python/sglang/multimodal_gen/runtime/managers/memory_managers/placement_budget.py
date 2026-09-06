@@ -36,13 +36,13 @@ class PlacementOption(msgspec.Struct, frozen=True):
     estimated_latency_savings: int
     # Lexicographic soft cost used only after latency-equivalent placements
     # have been identified. Resource budgets remain the hard safety limits.
-    placement_cost_bytes: tuple[int, ...] = ()
+    preference_cost: tuple[int, ...] = ()
 
 
 class PlacementPlan(msgspec.Struct, frozen=True):
     resource_delta_bytes: dict[str, int] = {}
     estimated_latency_savings: int = 0
-    placement_cost_bytes: tuple[int, ...] = ()
+    preference_cost: tuple[int, ...] = ()
     selections: list[PlacementOption] = []
 
 
@@ -76,8 +76,8 @@ def _dominates(candidate: _State, other: _State) -> bool:
     return (
         candidate[1] >= other[1]
         and all(left <= right for left, right in zip(candidate[0], other[0]))
-        # soft costs are summed and compared lexicographically by the final
-        # objective; this order is translation invariant across suffixes
+        # preference costs use the final lexicographic order, which is
+        # translation invariant across every possible suffix
         and candidate[2] <= other[2]
     )
 
@@ -101,47 +101,18 @@ def _pareto_prune(states: Iterable[_State]) -> list[_State]:
             _selection_key(state),
         ),
     )
-    if ordered and not ordered[0][0] and len(ordered[0][2]) == 2:
-        # with no hard resource dimension, local dominance is a 2D soft-cost
-        # skyline; a Fenwick sweep avoids the quadratic layer frontier scan
-        second_costs = sorted({state[2][1] for state in ordered})
-        second_cost_indices = {
-            cost: index + 1 for index, cost in enumerate(second_costs)
-        }
-        best_utility: list[int | None] = [None] * (len(second_costs) + 1)
-
-        def prefix_max(index: int) -> int | None:
-            result = None
-            while index > 0:
-                value = best_utility[index]
-                if value is not None and (result is None or value > result):
-                    result = value
-                index -= index & -index
-            return result
-
-        def update(index: int, utility: int) -> None:
-            while index < len(best_utility):
-                value = best_utility[index]
-                if value is None or utility > value:
-                    best_utility[index] = utility
-                index += index & -index
-
+    if ordered and not ordered[0][0]:
+        # lexicographic preference is a total order, so without hard resources
+        # the exact skyline is the strictly increasing utility envelope
         frontier = []
+        best_utility: int | None = None
         for state in sorted(
-            ordered,
-            key=lambda item: (
-                item[2][0],
-                item[2][1],
-                -item[1],
-                _selection_key(item),
-            ),
+            ordered, key=lambda item: (item[2], -item[1], _selection_key(item))
         ):
-            index = second_cost_indices[state[2][1]]
-            dominating_utility = prefix_max(index)
-            if dominating_utility is not None and dominating_utility >= state[1]:
+            if best_utility is not None and best_utility >= state[1]:
                 continue
             frontier.append(state)
-            update(index, state[1])
+            best_utility = state[1]
         return frontier
 
     frontier: list[_State] = []
@@ -225,12 +196,12 @@ def _prune_unconstrained_states(
 def _optimize_unconstrained(
     grouped: Mapping[str, list[PlacementOption]],
     *,
-    placement_cost_dimensions: int,
+    preference_dimensions: int,
     estimated_latency_tolerance: int,
     require_selection_from_every_group: bool,
 ) -> _State:
     """Solve the exact global latency window after every budget is non-binding."""
-    zero_cost = (0,) * placement_cost_dimensions
+    zero_cost = (0,) * preference_dimensions
     frontier: list[_UnconstrainedState] = [(0, zero_cost, ())]
     maximum_utility = 0
 
@@ -244,7 +215,7 @@ def _optimize_unconstrained(
         group_states = [
             (
                 group_maximum - option.estimated_latency_savings,
-                option.placement_cost_bytes or zero_cost,
+                option.preference_cost or zero_cost,
                 (option,),
             )
             for option in alternatives
@@ -304,15 +275,15 @@ def optimize_placement(
         raise ValueError("estimated_latency_tolerance must be non-negative")
 
     options = list(options)
-    placement_cost_dimensions = max(
-        (len(option.placement_cost_bytes) for option in options), default=0
+    preference_dimensions = max(
+        (len(option.preference_cost) for option in options), default=0
     )
     for option in options:
-        if option.placement_cost_bytes and (
-            len(option.placement_cost_bytes) != placement_cost_dimensions
+        if option.preference_cost and (
+            len(option.preference_cost) != preference_dimensions
         ):
             raise ValueError(
-                "all non-empty placement costs must have the same dimensions"
+                "all non-empty preference costs must have the same dimensions"
             )
 
     grouped: dict[str, list[PlacementOption]] = {}
@@ -335,7 +306,7 @@ def optimize_placement(
     # for the common case where a large-host server can pin every candidate:
     # all pin-prefix alternatives then collapse to the highest-utility one for
     # each GPU placement instead of multiplying the global frontier.
-    resource_names = tuple(
+    binding_resource_names = tuple(
         resource_name
         for resource_name in all_resource_names
         if sum(
@@ -350,6 +321,25 @@ def optimize_placement(
         )
         > resource_budget_bytes[resource_name]
     )
+
+    # Phase-level VRAM accounting commonly produces many constraints with the
+    # exact same cost for every option. Such columns describe the same left-hand
+    # side, so only the smallest budget can bind. Collapsing them before local
+    # Pareto construction is exact and avoids quadratic skyline work over dozens
+    # of duplicate stage dimensions.
+    ordered_options = sorted(options, key=lambda option: option.option_key)
+    resource_by_cost_vector: dict[tuple[int, ...], str] = {}
+    for resource_name in binding_resource_names:
+        cost_vector = tuple(
+            option.resource_delta_bytes.get(resource_name, 0)
+            for option in ordered_options
+        )
+        incumbent = resource_by_cost_vector.get(cost_vector)
+        if incumbent is None or (
+            resource_budget_bytes[resource_name] < resource_budget_bytes[incumbent]
+        ):
+            resource_by_cost_vector[cost_vector] = resource_name
+    resource_names = tuple(sorted(resource_by_cost_vector.values()))
     resource_budgets = tuple(
         int(resource_budget_bytes[name]) for name in resource_names
     )
@@ -357,7 +347,7 @@ def optimize_placement(
     if not resource_names:
         best = _optimize_unconstrained(
             grouped,
-            placement_cost_dimensions=placement_cost_dimensions,
+            preference_dimensions=preference_dimensions,
             estimated_latency_tolerance=estimated_latency_tolerance,
             require_selection_from_every_group=require_selection_from_every_group,
         )
@@ -370,7 +360,7 @@ def optimize_placement(
         return PlacementPlan(
             resource_delta_bytes=full_resource_deltas,
             estimated_latency_savings=best[1],
-            placement_cost_bytes=best[2],
+            preference_cost=best[2],
             selections=list(best[3]),
         )
 
@@ -394,7 +384,7 @@ def optimize_placement(
                 (
                     (0,) * len(resource_names),
                     0,
-                    (0,) * placement_cost_dimensions,
+                    (0,) * preference_dimensions,
                     (),
                 )
             )
@@ -405,7 +395,7 @@ def optimize_placement(
                     for resource_name in resource_names
                 ),
                 option.estimated_latency_savings,
-                option.placement_cost_bytes or (0,) * placement_cost_dimensions,
+                option.preference_cost or (0,) * preference_dimensions,
                 (option,),
             )
             for option in group_options
@@ -415,9 +405,7 @@ def optimize_placement(
     def _suffix_bounds(groups):
         minimum_resources = [(0,) * len(resource_names) for _ in range(len(groups) + 1)]
         maximum_utility = [0] * (len(groups) + 1)
-        minimum_cost = [
-            (0,) * placement_cost_dimensions for _ in range(len(groups) + 1)
-        ]
+        minimum_cost = [(0,) * preference_dimensions for _ in range(len(groups) + 1)]
         for group_index in range(len(groups) - 1, -1, -1):
             group = groups[group_index]
             minimum_resources[group_index] = tuple(
@@ -551,7 +539,7 @@ def optimize_placement(
         0,
         (0,) * len(resource_names),
         0,
-        (0,) * placement_cost_dimensions,
+        (0,) * preference_dimensions,
         (),
     )
     assert best is not None
@@ -564,6 +552,6 @@ def optimize_placement(
     return PlacementPlan(
         resource_delta_bytes=full_resource_deltas,
         estimated_latency_savings=best[1],
-        placement_cost_bytes=best[2],
+        preference_cost=best[2],
         selections=list(best[3]),
     )
