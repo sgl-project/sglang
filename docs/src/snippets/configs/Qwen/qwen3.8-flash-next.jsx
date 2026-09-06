@@ -839,7 +839,11 @@ export const config = {
     // Verified 2026-09-05 on the qwen38flashnext image (SGLang 593134d17a):
     // GSM8K (chat API, thinking off, n=200) 97.0% / 97.5% on two runs of the
     // low-latency cell, 98.0% / 97.0% on the high-throughput cell — inside the
-    // 95-98% band of the datacenter runs.
+    // 95-98% band of the datacenter runs. Re-verified 2026-09-06 on the
+    // dev-qwen38-next-local image (qwen4-main-squashed 9b2aee2283), the image
+    // the Docker tab now uses for this card: GSM8K 97.0% / 97.0%, 6.2 ms TPOT
+    // at 1 request and 613 tok/s at 16 with MTP, 885 tok/s at 64 without,
+    // same pools and peak headroom (2.8 GB / 4.0 GB left).
     //
     // Low latency: in-checkpoint MTP head (NEXTN 3/1/4), 16 concurrent
     // requests (48 state slots + 17 x 4 intermediate draft states, 6.4 GiB).
@@ -1047,30 +1051,27 @@ export const config = {
     },
 
     // ==== NVFP4 (NVDA) on 1x RTX PRO 6000 — nvidia/Qwen3.8-Flash-Next-NVFP4 ====
-    // Same ModelOpt MIXED_PRECISION export as the Spark NVDA cells. Its loader
-    // (sgl-project/sglang#38121) is merged into qwen4-main-squashed but not in
-    // the qwen38flashnext image yet, hence in-progress. Same shape, pools and
-    // headroom as the RDXA cells above, with three differences:
+    // Same ModelOpt MIXED_PRECISION export as the Spark NVDA cells; the loader
+    // (sgl-project/sglang#38121) is in the dev-qwen38-next-local image the
+    // Docker tab uses for this card. Same shape, pools, flags and headroom as
+    // the RDXA cells above, with two differences:
     //   - no `--quantization` (the checkpoint resolves to modelopt_mixed);
-    //   - no `--mamba-track-interval` (not on qwen4-main-squashed; the default
-    //     256 satisfies the page and draft-token constraints);
     //   - low latency keeps the in-checkpoint MTP head. At TP=1 its fp8
     //     block-scaled experts need no sharding, and #38121 runs them on triton
     //     under the flashinfer_cutlass pin. The RadixArk BF16 draft
     //     (--speculative-draft-model-path) measured the same on this card
     //     (accept 3.33 vs 3.31, TPOT 18.5 vs 19.1 ms at 16), so the
     //     single-checkpoint command stays.
-    // Measured 2026-09-06 on the qwen4-main-squashed tip 9b2aee2283, TP=1,
-    // 1024-in/256-out random prompts. With MTP: 6.1 ms TPOT at 1 request,
-    // 19.1 ms / 628 tok/s at 16, accept length 3.3 of 4, GSM8K (chat API,
-    // thinking off, n=200) 96.5% (97.5% on an earlier run of the same code),
-    // 2.6 GB left at peak. Without: 11.5 ms at 1, 25.4 ms at 16, 55.8 ms /
-    // 879 tok/s at 64, GSM8K 97.0%, 4.0 GB left at peak. The smaller fp8 draft
-    // leaves a ~170k-token KV pool with MTP (vs ~78k for the RDXA cell).
+    // Verified 2026-09-06 on the dev-qwen38-next-local image (9b2aee2283),
+    // TP=1, 1024-in/256-out random prompts. With MTP: 5.9 ms TPOT at 1
+    // request, 18.7 ms / 634 tok/s at 16, accept length 3.4 of 4, GSM8K (chat
+    // API, thinking off, n=200) 97.5% / 97.5% on two servers, 2.7 GB left at
+    // peak. Without: 11.5 ms at 1, 25.1 ms at 16, 55.7 ms / 871 tok/s at 64,
+    // GSM8K 96.5% / 97.0%, 4.0 GB left at peak. The smaller fp8 draft leaves a
+    // ~170k-token KV pool with MTP (vs ~78k for the RDXA cell).
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
       verified: true,
-      verificationStatus: "in-progress",
       warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~170k tokens (~10k per request at 16 concurrent). See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
@@ -1079,6 +1080,7 @@ export const config = {
         "--fp4-gemm-backend flashinfer_cutlass",
         "--moe-runner-backend flashinfer_cutlass",
         "--page-size 64",
+        "--mamba-track-interval 64",
         "--chunked-prefill-size 4096",
         "--context-length 262144",
         "--speculative-algorithm NEXTN",
@@ -1098,7 +1100,6 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      verificationStatus: "in-progress",
       warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
@@ -1107,6 +1108,7 @@ export const config = {
         "--fp4-gemm-backend flashinfer_cutlass",
         "--moe-runner-backend flashinfer_cutlass",
         "--page-size 64",
+        "--mamba-track-interval 64",
         "--chunked-prefill-size 4096",
         "--context-length 262144",
         "--mamba-radix-cache-strategy extra_buffer_lazy",

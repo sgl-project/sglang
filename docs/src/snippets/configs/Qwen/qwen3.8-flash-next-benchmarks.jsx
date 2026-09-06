@@ -155,45 +155,61 @@ export const benchmarks = [
         ttft_ms: 17962.94, tpot_ms: 289.52, tokens_per_sec_per_gpu: 632 },
     ],
   },
-  // 1x RTX PRO 6000 Blackwell (96 GB), TP=1, lmsysorg/sglang:qwen38flashnext
-  // (SGLang 593134d17a), 2026-09-05. Same chat-API GSM8K protocol as the DGX
-  // Spark rows (thinking off, n=200); AIME26 and MMMU-Pro not run.
+  // 1x RTX PRO 6000 Blackwell (96 GB), TP=1, lmsysorg/sglang:dev-qwen38-next-local
+  // (qwen4-main-squashed 9b2aee2283), 2026-09-06: all four cells run as the
+  // command generator emits them. Same chat-API GSM8K protocol as the DGX
+  // Spark rows (thinking off, n=200) and the same 1024/256 bench workload;
+  // tokens_per_sec_per_gpu is the server's output throughput (one GPU).
+  // AIME26 and MMMU-Pro not run. The RDXA cells first passed on the
+  // qwen38flashnext image (593134d17a) on 2026-09-05 at 97.0-97.5 / 97.0-98.0.
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-    sglang_version: "qwen38flashnext image @ 593134d17a",
+    sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
     accuracy: { gsm8k_pct: 97.0 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
+        ttft_ms: 235.23, tpot_ms: 6.21, tokens_per_sec_per_gpu: 141 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
+        ttft_ms: 1007.94, tpot_ms: 19.54, tokens_per_sec_per_gpu: 613 },
+    ],
   },
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "qwen38flashnext image @ 593134d17a",
-    accuracy: { gsm8k_pct: 98.0 },
-  },
-  // nvidia/Qwen3.8-Flash-Next-NVFP4 on the same card, measured 2026-09-06 on the
-  // qwen4-main-squashed tip 9b2aee2283 (#38121 merged; the shipped image cannot
-  // load this export yet). Same GSM8K protocol and bench workload; TP=1, so
-  // tokens_per_sec_per_gpu is the server's output throughput.
-  {
-    match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
-    sglang_version: "qwen4-main-squashed @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 96.5 },
+    sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 97.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
-        ttft_ms: 204.45, tpot_ms: 6.13, tokens_per_sec_per_gpu: 145 },
+        ttft_ms: 162.25, tpot_ms: 11.49, tokens_per_sec_per_gpu: 83 },
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
-        ttft_ms: 851.64, tpot_ms: 19.10, tokens_per_sec_per_gpu: 628 },
+        ttft_ms: 1327.21, tpot_ms: 25.11, tokens_per_sec_per_gpu: 529 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 64 },
+        ttft_ms: 3212.36, tpot_ms: 54.93, tokens_per_sec_per_gpu: 885 },
+    ],
+  },
+  // nvidia/Qwen3.8-Flash-Next-NVFP4 on the same card and image; second GSM8K
+  // runs on separate servers scored 97.5 (MTP) and 97.0 (no MTP).
+  {
+    match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+    sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 97.5 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
+        ttft_ms: 225.43, tpot_ms: 5.86, tokens_per_sec_per_gpu: 149 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
+        ttft_ms: 1032.11, tpot_ms: 18.74, tokens_per_sec_per_gpu: 634 },
     ],
   },
   {
     match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "qwen4-main-squashed @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 97.0 },
+    sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 96.5 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
-        ttft_ms: 164.59, tpot_ms: 11.53, tokens_per_sec_per_gpu: 82 },
+        ttft_ms: 158.37, tpot_ms: 11.54, tokens_per_sec_per_gpu: 83 },
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16 },
-        ttft_ms: 1409.63, tpot_ms: 25.40, tokens_per_sec_per_gpu: 518 },
+        ttft_ms: 1184.19, tpot_ms: 25.12, tokens_per_sec_per_gpu: 539 },
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 64 },
-        ttft_ms: 3138.67, tpot_ms: 55.82, tokens_per_sec_per_gpu: 879 },
+        ttft_ms: 3314.12, tpot_ms: 55.67, tokens_per_sec_per_gpu: 871 },
     ],
   },
   { match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
