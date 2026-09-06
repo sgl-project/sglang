@@ -39,6 +39,7 @@ annotation is equivalent to ``Arg(help=that_string)``.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import types
@@ -56,6 +57,20 @@ from typing import (
 )
 
 A = Annotated
+
+
+class _NoFallback:
+    """Sentinel for ``Arg.fallback``: this field declares none.
+
+    ``None`` cannot serve, because ``None`` is what a field *holds* when the
+    operator did not type it -- the state a fallback answers for.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<no fallback>"
+
+
+NO_FALLBACK = _NoFallback()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,6 +95,19 @@ class Arg:
     # `resolution_result` and the config bags answer with the decision. The
     # field keeps what the operator passed.
     resolvable: bool = False
+    # What the field means when nobody said anything: the operator did not type
+    # it and resolution did not decide it. Not the dataclass default -- that
+    # stays `None`, because `None` is how the record spells "not typed" and the
+    # record is the wire format. This is the bottom of the read chain instead:
+    # override, then decision, then input, then this. A model family that
+    # declares the field still wins, because a decision sits above it.
+    #
+    # Only a value fixed for the life of the configuration belongs here. A
+    # default that depends on the machine (`get_device()`), on another field
+    # (`tokenizer_path` following `model_path`), or on anything impure
+    # (`random.randint`) is a decision, and decisions stay in a hook where
+    # their order is visible.
+    fallback: Any = NO_FALLBACK
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,6 +171,52 @@ def resolvable_fields(cls) -> frozenset:
         if arg is not None and arg.resolvable:
             names.add(field.name)
     return frozenset(names)
+
+
+@functools.cache
+def fallbacks_of(cls) -> dict:
+    """``{field_name: value}`` for every field of ``cls`` that declares one.
+
+    Read the same way `resolvable_fields` reads its flag, so a fallback lives
+    beside the help text of the field it belongs to rather than in whatever
+    hook used to fill it in.
+    """
+    if not dataclasses.is_dataclass(cls):
+        return {}
+    hints = get_type_hints(cls, include_extras=True)
+    out = {}
+    for field in dataclasses.fields(cls):
+        _, arg = _unwrap_annotated(hints.get(field.name, field.type))
+        if arg is not None and arg.fallback is not NO_FALLBACK:
+            out[field.name] = arg.fallback
+    return out
+
+
+def with_fallback(cls, name: str, value: Any) -> Any:
+    """``value``, or the declared fallback when nothing has answered.
+
+    `resolution_result` calls this as its last step -- the effective surface,
+    which the config bags and `/server_info` read through.
+
+    Deliberately not the views a resolution pass is handed. Those answer with
+    what has been decided over what the operator typed, and a pass reads them
+    *while deciding*: `model_overrides/inkling.py` branches on
+    `if cfg.swa_full_tokens_ratio is None`, and a fallback answering there
+    would make that branch dead and replace the family's value with the
+    generic one. `test_declared_fallbacks.py` pins both halves.
+
+    A container fallback is copied, so a reader that mutates what it got does
+    not edit the declaration for every other reader -- the reason a dataclass
+    spells this `default_factory`.
+    """
+    if value is not None:
+        return value
+    fallback = fallbacks_of(cls).get(name, NO_FALLBACK)
+    if fallback is NO_FALLBACK:
+        return value
+    if isinstance(fallback, (list, dict, set)):
+        return copy.deepcopy(fallback)
+    return fallback
 
 
 # ---------------------------------------------------------------------------
