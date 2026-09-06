@@ -638,7 +638,6 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
-        self._visible_window_unified_warned = False
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -2224,41 +2223,18 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool,
         padded_num_tokens: int,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Per-token SWA visible-window (start, len) overrides for image spans.
-
-        Returns None (causal windows everywhere) unless this extend chunk
-        fully contains at least one image sentinel span. Spans cut by the
-        chunk boundary degrade to the causal window (with a one-time warning
-        from ``compute_visible_window_overrides``).
-        """
+        """Build variable-size image windows for an eager, non-CP prefill."""
+        if forward_batch is None or not forward_batch.contains_image_inputs():
+            return None
+        if cp_v2_active or use_prefill_cuda_graph:
+            raise ValueError(
+                "DeepSeek-V4 image prefill requires eager execution without CP."
+            )
         if (
-            forward_batch is None
-            or cp_v2_active
-            or use_prefill_cuda_graph
-            or not forward_batch.contains_image_inputs()
-            # The gpu_only ForwardBatch path leaves the *_cpu mirrors unset;
-            # without host-side lens we cannot resolve span containment, so
-            # degrade to causal windows.
-            or forward_batch.extend_prefix_lens_cpu is None
+            forward_batch.extend_prefix_lens_cpu is None
             or forward_batch.extend_seq_lens_cpu is None
         ):
-            return None
-        # unified_kv keeps SWA KV in a true sliding_window-sized ring, so
-        # positions outside [pos-127, pos] have no storage there; degrade
-        # image spans to the causal window on that (HIP-oriented) layout.
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        if is_unified_kv_triton():
-            if not self._visible_window_unified_warned:
-                logger.warning(
-                    "DSV4 visible-window attention for image spans is not "
-                    "supported with unified_kv (SWA ring holds only "
-                    "sliding_window slots); falling back to causal windows."
-                )
-                self._visible_window_unified_warned = True
-            return None
+            raise ValueError("DeepSeek-V4 image prefill requires CPU sequence lengths.")
         overrides = compute_visible_window_overrides(
             mm_inputs=forward_batch.mm_inputs,
             extend_prefix_lens=forward_batch.extend_prefix_lens_cpu,

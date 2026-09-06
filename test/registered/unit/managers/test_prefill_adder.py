@@ -94,6 +94,7 @@ class TestPrefillAdder(CustomTestCase):
         req.rid = str(rid)
         req.priority = priority
         req.prefix_indices = []
+        req.multimodal_inputs = None
         req.full_untruncated_fill_ids = []
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
@@ -474,6 +475,7 @@ class TestPrefillAdder(CustomTestCase):
 
         req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
         req.prefix_indices = []
+        req.multimodal_inputs = None
         req.full_untruncated_fill_ids = list(range(extend_input_len))
         # set_extend_range is the only writer of extend_range; the production
         # path reads req.extend_range.length right after calling it, so the mock
@@ -520,6 +522,49 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(result, req)
         req.set_extend_range.assert_not_called()
         self.assertEqual(len(adder.can_run_list), 0)
+
+    @staticmethod
+    def _image_block(start, end):
+        return SimpleNamespace(
+            mm_items=[
+                SimpleNamespace(
+                    is_image=lambda: True,
+                    offsets=[(start, end - 1)],
+                    model_specific_data={"types": [], "perm": []},
+                )
+            ]
+        )
+
+    def test_image_chunk_shrinks_within_swa_budget(self):
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=64,
+            rem_swa=320,
+            rem_chunk=1024,
+            extend_input_len=1000,
+        )
+        req.multimodal_inputs = self._image_block(100, 480)
+        self.assertIs(adder.add_chunked_req(req), req)
+        req.set_extend_range.assert_called_once_with(0, 100)
+        self.assertEqual(adder.can_run_list, [req])
+
+    def test_image_chunk_defers_without_submitting_zero_tokens(self):
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=64,
+            rem_swa=320,
+            rem_chunk=1024,
+            extend_input_len=1000,
+        )
+        req.multimodal_inputs = self._image_block(0, 380)
+        delayer = _RecordingDelayer(allow=True)
+        adder.prefill_delayer_single_pass = delayer
+        self.assertIs(adder.add_chunked_req(req), req)
+        req.set_extend_range.assert_not_called()
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(delayer.calls, [])
+        # A fresh iteration with sufficient space must make progress.
+        self.mock_token_allocator.swa_available_size.return_value = 2048
+        self.assertIsNone(adder.add_chunked_req(req))
+        req.set_extend_range.assert_called_once_with(0, 1000)
 
     def test_swa_budget_for_req(self):
         # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,

@@ -1024,6 +1024,16 @@ class PrefillAdder:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
+            req.prefix_indices
+        )
+        new_len = min(cand_extend_input_len, _rem_tokens)
+        # Image blocks must fit entirely within this iteration's budget.
+        new_len = image_span_aligned_extend_end(
+            req.multimodal_inputs, len(req.prefix_indices) + new_len
+        ) - len(req.prefix_indices)
+        if new_len <= 0:
+            return req
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
         if self.prefill_delayer_single_pass is not None:
@@ -1035,15 +1045,6 @@ class PrefillAdder:
                 waiting_queue_len=self.waiting_queue_len,
             )
 
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
-        new_len = min(cand_extend_input_len, _rem_tokens)
-        # Never cut an image span: DeepSeek-V4-Vision needs each span in one
-        # extend (may overshoot the chunk budget by up to one span).
-        new_len = image_span_aligned_extend_end(
-            req.multimodal_inputs, len(req.prefix_indices) + new_len
-        ) - len(req.prefix_indices)
         truncated = cand_extend_input_len > new_len
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
@@ -1195,9 +1196,9 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
-            # Never cut an image span: DeepSeek-V4-Vision needs each span in
-            # one extend (may overshoot the chunk budget by up to one span).
             trunc_len = image_span_aligned_extend_end(req.multimodal_inputs, trunc_len)
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1418,10 +1419,7 @@ class PrefillAdder:
                 now_input_len = now_input_len // self.page_size * self.page_size
                 trunc_len = now_input_len - len(req.prefix_indices)
 
-                # Never cut an image span: DeepSeek-V4-Vision needs each span
-                # in one extend. This may intentionally break the page
-                # alignment above when it would land inside a span (overshoots
-                # the chunk budget by up to one span).
+                # Shrink to the image block start without exceeding the KV budget.
                 trunc_len = image_span_aligned_extend_end(
                     req.multimodal_inputs, len(req.prefix_indices) + trunc_len
                 ) - len(req.prefix_indices)

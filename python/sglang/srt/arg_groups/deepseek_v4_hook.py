@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
     declare_resolution,
+    model_config_of,
     resolving_view,
     run_post_process_pass,
 )
@@ -218,3 +219,40 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         f"dp_size={cfg.dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
         f"attn_cp_size={cfg.attn_cp_size}, ep_size={cfg.ep_size}, tp_size={cfg.tp_size}"
     )
+
+
+def validate_deepseek_v4_vision(server_args: ServerArgs) -> None:
+    """Validate the execution paths and minimum budget for atomic image blocks."""
+    cfg = resolving_view(server_args)
+    hf_config = model_config_of(server_args).hf_config
+    if "DeepseekV4ForCausalLM" not in hf_config.architectures or not getattr(
+        hf_config, "vision_n_layers", 0
+    ):
+        return
+    if cfg.enable_prefill_cp or cfg.enable_dsa_prefill_context_parallel:
+        raise ValueError(
+            "DeepSeek-V4 vision does not support prefill context parallelism."
+        )
+    if (
+        get_platform().is_hip
+        and envs.SGLANG_HACK_FLASHMLA_BACKEND.get() == "unified_kv_triton"
+    ):
+        raise ValueError(
+            "DeepSeek-V4 vision requires KV storage for complete image blocks."
+        )
+    # Chunk endpoints are page-aligned before image alignment. An image may
+    # start anywhere in a page, so leave room for that partial page too.
+    max_span = hf_config.vision_max_n_token
+    page_size = cfg.page_size
+    min_chunk = ((max_span + page_size - 2) // page_size + 1) * page_size
+    if (
+        cfg.chunked_prefill_size is not None
+        and 0 < cfg.chunked_prefill_size < min_chunk
+    ):
+        raise ValueError(
+            f"DeepSeek-V4 vision requires a per-rank --chunked-prefill-size "
+            f"of at least {min_chunk} (image budget {max_span}, page size {page_size}), "
+            "or -1 to disable chunked prefill."
+        )
+    if cfg.enable_dynamic_chunking:
+        raise ValueError("DeepSeek-V4 vision does not support dynamic chunk sizes.")
