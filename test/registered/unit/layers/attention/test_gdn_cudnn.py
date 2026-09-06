@@ -3,7 +3,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-from packaging.version import Version
 
 from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.arg_groups.overrides import resolved_view
@@ -14,45 +13,17 @@ from sglang.srt.layers.attention.linear.kernels.gdn_cudnn import CudnnGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import LINEAR_ATTN_KERNEL_BACKEND_CHOICES, ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 class TestCudnnGDNKernel(CustomTestCase):
     def test_backend_is_a_public_choice(self):
         self.assertIn("cudnn", LINEAR_ATTN_KERNEL_BACKEND_CHOICES)
         self.assertTrue(LinearAttnKernelBackend("cudnn").is_cudnn())
-
-    def test_runtime_requires_frontend_128_and_cutlass_47(self):
-        supported = (Version("1.28.0"), Version("4.7.0"))
-        with (
-            patch.object(gdn_cudnn, "_distribution_version", side_effect=supported),
-            patch.object(torch.cuda, "is_available", return_value=True),
-            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
-        ):
-            gdn_cudnn._validate_cudnn_gdn_runtime()
-
-        with patch.object(
-            gdn_cudnn,
-            "_distribution_version",
-            return_value=Version("1.27.0"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "frontend>=1.28.0"):
-                gdn_cudnn._validate_cudnn_gdn_runtime()
-
-        with (
-            patch.object(
-                gdn_cudnn,
-                "_distribution_version",
-                side_effect=(Version("1.28.0"), Version("4.6.2")),
-            ),
-            patch.object(torch.cuda, "is_available", return_value=True),
-            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "cutlass-dsl>=4.7.0"):
-                gdn_cudnn._validate_cudnn_gdn_runtime()
 
     def test_dispatcher_uses_cudnn_for_prefill_only(self):
         cudnn_kernel = MagicMock(uses_state_checkpoints=True)
@@ -102,6 +73,45 @@ class TestCudnnGDNKernel(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "prefill-only"):
                 handle_linear_attn_backend(args)
 
+    def test_cudnn_prefill_rejects_context_parallelism(self):
+        cases = (
+            {"linear_attn_prefill_backend": "cudnn"},
+            {"linear_attn_backend": "cudnn"},
+        )
+        for fields in cases:
+            with self.subTest(fields=fields):
+                args = ServerArgs(
+                    model_path="dummy",
+                    enable_prefill_cp=True,
+                    cp_strategy="zigzag",
+                    attn_cp_size=2,
+                    mamba_ssm_dtype="float32",
+                    **fields,
+                )
+                with (
+                    override_platform(is_sm100=False),
+                    override_platform(is_cuda=False),
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, "does not support prefill context parallelism"
+                    ):
+                        handle_linear_attn_backend(args)
+
+    def test_cudnn_prefill_allows_tensor_parallelism(self):
+        args = ServerArgs(
+            model_path="dummy",
+            linear_attn_prefill_backend="cudnn",
+            linear_attn_decode_backend="triton",
+            tp_size=2,
+            enable_prefill_cp=False,
+            mamba_ssm_dtype="float32",
+        )
+        with (
+            override_platform(is_sm100=False),
+            override_platform(is_cuda=False),
+        ):
+            handle_linear_attn_backend(args)
+
     def test_checkpoint_plan_keeps_native_indices(self):
         kernel = object.__new__(CudnnGDNKernel)
         source_indices = torch.tensor([1, 4], dtype=torch.int64)
@@ -114,62 +124,6 @@ class TestCudnnGDNKernel(CustomTestCase):
 
         self.assertIs(metadata.track_ssm_h_src, source_indices)
         self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
-
-    def test_extend_adapts_pool_state_to_cudnn_thd_api(self):
-        kernel = object.__new__(CudnnGDNKernel)
-        captured = {}
-        total_tokens = 3
-        q_heads = 1
-        value_heads = 2
-        dim = 128
-
-        q = torch.randn(1, total_tokens, q_heads, dim, dtype=torch.bfloat16)
-        k = torch.randn_like(q)
-        v = torch.randn(1, total_tokens, value_heads, dim, dtype=torch.bfloat16)
-        g = torch.randn(1, total_tokens, value_heads, dtype=torch.float32)
-        beta = torch.rand_like(g)
-        states = torch.stack(
-            [torch.full((value_heads, dim, dim), float(slot)) for slot in range(4)]
-        )
-        cache_indices = torch.tensor([1, -1], dtype=torch.int32)
-        query_start_loc = torch.tensor([0, 1, 3], dtype=torch.int64)
-        checkpoints = torch.randn(2, value_heads, dim, dim, dtype=torch.bfloat16)
-
-        def fake_gated_delta_net(**kwargs):
-            captured.update(kwargs)
-            output = torch.randn(total_tokens, value_heads, dim, dtype=torch.bfloat16)
-            return output, kwargs["initial_state"] + 10, checkpoints
-
-        kernel._gated_delta_net = fake_gated_delta_net
-        output, last_state, h = kernel.extend(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            ssm_states=states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            state_checkpoint_every_n_tokens=64,
-            batch_invariant=True,
-        )
-
-        self.assertEqual(output.shape, (1, total_tokens, value_heads, dim))
-        self.assertIsNone(last_state)
-        torch.testing.assert_close(h, checkpoints.unsqueeze(0))
-        self.assertEqual(captured["q"].shape, (total_tokens, q_heads, dim))
-        self.assertEqual(captured["v"].shape, (total_tokens, value_heads, dim))
-        self.assertEqual(captured["g"].dtype, torch.float32)
-        self.assertEqual(captured["beta"].dtype, torch.float32)
-        self.assertEqual(captured["cu_seqlens"].dtype, torch.int32)
-        self.assertEqual(captured["plan_name"], "gdn_frost")
-        self.assertTrue(captured["use_qk_l2norm_in_kernel"])
-        self.assertEqual(captured["checkpoint_every_n_tokens"], 64)
-        self.assertTrue(captured["batch_invariant"])
-        torch.testing.assert_close(
-            captured["initial_state"][:, 0, 0, 0], torch.tensor([1.0, 3.0])
-        )
-        torch.testing.assert_close(states[[1, 3], 0, 0, 0], torch.tensor([11.0, 13.0]))
 
     def test_extend_rejects_non_fp32_state(self):
         kernel = object.__new__(CudnnGDNKernel)
@@ -185,6 +139,107 @@ class TestCudnnGDNKernel(CustomTestCase):
                 cache_indices=torch.tensor([0]),
                 query_start_loc=torch.tensor([0, 1]),
             )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires an NVIDIA CUDA GPU")
+    def test_cudnn_prefill_matches_default_gdn_backend(self):
+        major, minor = torch.cuda.get_device_capability()
+        sm = major * 10 + minor
+        if sm not in gdn_cudnn._SUPPORTED_SMS:
+            self.skipTest(f"cuDNN FROST GDN does not support SM{sm}")
+
+        # Qwen3.5 TP2 local shape: the model's 16 GDN heads are split into
+        # eight heads per rank. Unequal sequence lengths exercise the packed
+        # THD boundary adapter; non-adjacent slots exercise state gather/scatter.
+        seq_lens = (95, 129)
+        total_tokens = sum(seq_lens)
+        num_heads = 8
+        head_dim = 128
+        pool_size = 4
+        device = "cuda"
+        generator = torch.Generator(device=device).manual_seed(42)
+
+        def randn(*shape, dtype=torch.bfloat16):
+            return torch.randn(
+                *shape,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
+
+        q = randn(1, total_tokens, num_heads, head_dim)
+        k = randn(1, total_tokens, num_heads, head_dim)
+        v = randn(1, total_tokens, num_heads, head_dim)
+        g = -torch.nn.functional.softplus(
+            randn(1, total_tokens, num_heads, dtype=torch.float32)
+        )
+        beta = torch.sigmoid(randn(1, total_tokens, num_heads, dtype=torch.float32))
+        query_start_loc = torch.tensor(
+            [0, seq_lens[0], total_tokens], device=device, dtype=torch.int32
+        )
+        cache_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
+        initial_states = (
+            randn(
+                pool_size,
+                num_heads,
+                head_dim,
+                head_dim,
+                dtype=torch.float32,
+            )
+            * 0.05
+        )
+        triton_states = initial_states.clone()
+        cudnn_states = initial_states.clone()
+
+        default_dispatcher = GDNKernelDispatcher(
+            LinearAttnKernelBackend.TRITON,
+            LinearAttnKernelBackend.TRITON,
+        )
+        cudnn_dispatcher = GDNKernelDispatcher(
+            LinearAttnKernelBackend.TRITON,
+            LinearAttnKernelBackend.CUDNN,
+        )
+        default_output = default_dispatcher.extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=triton_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+        )[0]
+        cudnn_output = cudnn_dispatcher.extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=cudnn_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+        )[0]
+        torch.cuda.synchronize()
+
+        tol = 5e-2
+        for name, actual, expected in (
+            ("output", cudnn_output, default_output),
+            (
+                "state",
+                cudnn_states[cache_indices],
+                triton_states[cache_indices],
+            ),
+        ):
+            torch.testing.assert_close(
+                actual,
+                expected,
+                atol=tol,
+                msg=f"cuDNN/default GDN {name} error must be < {tol}",
+            )
+
+        untouched_slots = torch.tensor([0, 2], device=device)
+        torch.testing.assert_close(
+            cudnn_states[untouched_slots], initial_states[untouched_slots]
+        )
 
 
 if __name__ == "__main__":

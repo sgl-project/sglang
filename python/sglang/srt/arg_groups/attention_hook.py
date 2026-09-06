@@ -332,6 +332,14 @@ def handle_linear_attn_backend(server_args: Any):
     # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
     # for correctness and best performance.
     prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
+    if prefill == "cudnn" and cfg.enable_prefill_cp:
+        raise ValueError(
+            "--linear-attn-prefill-backend cudnn does not support prefill "
+            "context parallelism: cuDNN FROST GDN has no cross-rank recurrent-"
+            "state propagation. Disable --enable-prefill-cp (and its legacy "
+            "aliases) or use a linear-attention backend with CP support."
+        )
+
     cuda_version = torch.version.cuda
     cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
     if (
