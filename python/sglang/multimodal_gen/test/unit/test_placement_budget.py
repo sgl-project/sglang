@@ -117,53 +117,6 @@ def test_joint_plan_beats_independent_greedy_allocations():
     assert plan.estimated_latency_savings == 109
 
 
-def test_one_selection_vector_obeys_load_runtime_and_hostpin_budgets():
-    plan = optimize_placement(
-        [
-            PlacementOption(
-                group_key="text_encoder",
-                option_key="text-encoder-resident",
-                resource_delta_bytes={"gpu:load": 8, "gpu:runtime": 2},
-                estimated_latency_savings=60,
-            ),
-            PlacementOption(
-                group_key="text_encoder",
-                option_key="text-encoder-pinned",
-                resource_delta_bytes={"gpu:load": 1, "hostpin": 6},
-                estimated_latency_savings=50,
-            ),
-            PlacementOption(
-                group_key="transformer",
-                option_key="transformer-resident",
-                resource_delta_bytes={"gpu:load": 2, "gpu:runtime": 8},
-                estimated_latency_savings=100,
-            ),
-            PlacementOption(
-                group_key="transformer",
-                option_key="transformer-pinned",
-                resource_delta_bytes={"gpu:runtime": 1, "hostpin": 6},
-                estimated_latency_savings=20,
-            ),
-        ],
-        resource_budget_bytes={
-            "gpu:load": 9,
-            "gpu:runtime": 8,
-            "hostpin": 6,
-        },
-        require_selection_from_every_group=True,
-    )
-
-    assert [option.option_key for option in plan.selections] == [
-        "text-encoder-pinned",
-        "transformer-resident",
-    ]
-    assert plan.resource_delta_bytes == {
-        "gpu:load": 3,
-        "gpu:runtime": 8,
-        "hostpin": 6,
-    }
-
-
 def test_selects_at_most_one_option_per_group():
     plan = optimize_placement(
         [
@@ -311,32 +264,6 @@ def test_latency_tolerance_is_global_not_per_option():
     # least costly placement within that floor then keeps one of them.
     assert [option.option_key for option in plan.selections] == ["a-resident"]
     assert plan.estimated_latency_savings == 60
-
-
-def test_lexicographic_preference_prunes_irrelevant_later_dimension():
-    plan = optimize_placement(
-        [
-            PlacementOption(
-                group_key="dit",
-                option_key="partial-pin",
-                resource_delta_bytes={"gpu": 1},
-                estimated_latency_savings=90,
-                preference_cost=(0, -90, 5),
-            ),
-            PlacementOption(
-                group_key="dit",
-                option_key="full-pin",
-                resource_delta_bytes={"gpu": 1},
-                estimated_latency_savings=100,
-                preference_cost=(0, -100, 10),
-            ),
-        ],
-        resource_budget_bytes={"gpu": 1},
-        estimated_latency_tolerance=20,
-        require_selection_from_every_group=True,
-    )
-
-    assert [option.option_key for option in plan.selections] == ["full-pin"]
 
 
 def test_one_static_placement_satisfies_all_observed_phase_constraints():
@@ -679,6 +606,79 @@ def test_branch_and_bound_matches_exhaustive_multiresource_search():
         )
         assert plan.estimated_latency_savings == expected_utility
         assert plan.preference_cost == expected_cost
+
+
+def test_one_selection_vector_obeys_load_runtime_and_hostpin_budgets():
+    plan = optimize_placement(
+        [
+            PlacementOption(
+                group_key="text_encoder",
+                option_key="text-encoder-resident",
+                resource_delta_bytes={"gpu:load": 8, "gpu:runtime": 2},
+                estimated_latency_savings=60,
+            ),
+            PlacementOption(
+                group_key="text_encoder",
+                option_key="text-encoder-pinned",
+                resource_delta_bytes={"gpu:load": 1, "hostpin": 6},
+                estimated_latency_savings=50,
+            ),
+            PlacementOption(
+                group_key="transformer",
+                option_key="transformer-resident",
+                resource_delta_bytes={"gpu:load": 2, "gpu:runtime": 8},
+                estimated_latency_savings=100,
+            ),
+            PlacementOption(
+                group_key="transformer",
+                option_key="transformer-pinned",
+                resource_delta_bytes={"gpu:runtime": 1, "hostpin": 6},
+                estimated_latency_savings=20,
+            ),
+        ],
+        resource_budget_bytes={
+            "gpu:load": 9,
+            "gpu:runtime": 8,
+            "hostpin": 6,
+        },
+        require_selection_from_every_group=True,
+    )
+
+    assert [option.option_key for option in plan.selections] == [
+        "text-encoder-pinned",
+        "transformer-resident",
+    ]
+    assert plan.resource_delta_bytes == {
+        "gpu:load": 3,
+        "gpu:runtime": 8,
+        "hostpin": 6,
+    }
+
+
+def test_lexicographic_preference_prunes_irrelevant_later_dimension():
+    plan = optimize_placement(
+        [
+            PlacementOption(
+                group_key="dit",
+                option_key="partial-pin",
+                resource_delta_bytes={"gpu": 1},
+                estimated_latency_savings=90,
+                preference_cost=(0, -90, 5),
+            ),
+            PlacementOption(
+                group_key="dit",
+                option_key="full-pin",
+                resource_delta_bytes={"gpu": 1},
+                estimated_latency_savings=100,
+                preference_cost=(0, -100, 10),
+            ),
+        ],
+        resource_budget_bytes={"gpu": 1},
+        estimated_latency_tolerance=20,
+        require_selection_from_every_group=True,
+    )
+
+    assert [option.option_key for option in plan.selections] == ["full-pin"]
 
 
 def test_identical_resource_columns_keep_only_the_strictest_budget():
