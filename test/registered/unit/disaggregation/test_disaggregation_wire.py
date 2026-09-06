@@ -248,6 +248,8 @@ class TestStagingWatermark(unittest.TestCase):
         handler.staging_allocator = Mock()
         handler.staging_allocator.get_watermark.return_value = (3, 0)
         handler._wm_subscribers = {}
+        handler._wm_subscribers_lock = threading.Lock()
+        handler._wm_next_generation = 0
 
         handler.register_wm_subscriber(receiver, "session-new")
 
