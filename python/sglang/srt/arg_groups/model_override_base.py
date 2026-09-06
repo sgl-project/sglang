@@ -145,8 +145,12 @@ def _disable_fp4_allgather_for_custom_moe(server_args: Any, model_name: str) -> 
     cfg = resolving_view(server_args)
     if (
         envs.SGLANG_MOE_NVFP4_DISPATCH.get()
-        and cfg.moe_runner_backend
-        in ("flashinfer_trtllm", "flashinfer_trtllm_routed", "flashinfer_cutedsl")
+        and (
+            cfg.moe_runner_backend
+            in ("flashinfer_trtllm", "flashinfer_trtllm_routed", "flashinfer_cutedsl")
+            # The later quantization pass resolves online NVFP4's auto to TRT-LLM.
+            or (cfg.moe_runner_backend == "auto" and cfg.quantization == "nvfp4_online")
+        )
         and cfg.enable_dp_attention
         and cfg.moe_a2a_backend == "none"
         and not cfg.disable_flashinfer_cutlass_moe_fp4_allgather
