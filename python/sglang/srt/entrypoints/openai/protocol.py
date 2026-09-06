@@ -978,6 +978,10 @@ class ChatCompletionRequest(BaseModel):
         "repetition_penalty": 1.0,
     }
 
+    # Prompt tokens contributed by rendering response_format into the chat
+    # template; set by the kimi_k3 encoder for billed-token accounting.
+    _response_format_prompt_tokens: int = 0
+
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):

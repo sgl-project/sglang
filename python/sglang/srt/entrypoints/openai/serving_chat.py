@@ -614,6 +614,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 return_dict=False,
                 **template_kwargs,
             )
+            if "response_format" in template_kwargs:
+                baseline_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=request_tools,
+                    return_dict=False,
+                    **{
+                        key: value
+                        for key, value in template_kwargs.items()
+                        if key != "response_format"
+                    },
+                )
+                request._response_format_prompt_tokens = max(
+                    0, len(prompt_ids) - len(baseline_ids)
+                )
             if assistant_prefix:
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
@@ -733,12 +749,19 @@ class OpenAIServingChat(OpenAIServingBase):
             content["meta_info"].get("cached_tokens", 0)
         )
 
-    def _reported_prompt_tokens(self, meta_info: Dict[str, Any]) -> int:
+    def _reported_prompt_tokens(
+        self, meta_info: Dict[str, Any], request: ChatCompletionRequest
+    ) -> int:
         prompt_tokens = meta_info.get("prompt_tokens", 0)
         if self.chat_encoding_spec == "kimi_k3":
             # K3's three-token assistant generation stub is model input, but the
             # reference API excludes it from billed/reported prompt tokens.
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
+            # The schema block the template renders for response_format is
+            # excluded from billed prompt tokens the same way.
+            prompt_tokens = max(
+                0, prompt_tokens - request._response_format_prompt_tokens
+            )
         return prompt_tokens
 
     @staticmethod
@@ -1731,7 +1754,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
-                    content["meta_info"]
+                    content["meta_info"], request
                 )
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
@@ -2046,7 +2069,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     "meta_info": {
                         **item["meta_info"],
                         "prompt_tokens": self._reported_prompt_tokens(
-                            item["meta_info"]
+                            item["meta_info"], request
                         ),
                     },
                 }
@@ -2805,7 +2828,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
+                prompt_tokens = self._reported_prompt_tokens(
+                    content["meta_info"], request
+                )
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
                 reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
@@ -2858,7 +2883,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
+                prompt_tokens = self._reported_prompt_tokens(
+                    content["meta_info"], request
+                )
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
                 reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
