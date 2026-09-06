@@ -1006,6 +1006,27 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
+        # Write-through backup for chunked prefills (#33714). Hit-count based
+        # write-through never fires for chunked requests: the hit counter is
+        # skipped for them by design (#9776, to avoid counting a request's own
+        # in-flight chunks as hits), so a prompt longer than
+        # chunked_prefill_size is permanently ineligible for host backup and
+        # gets destroyed on eviction. Back up each newly inserted chain
+        # immediately as it lands; already-backed-up ancestors are skipped by
+        # the chain builder, so this is incremental.
+        if (
+            chunked
+            and result is not None
+            and result.last_device_node is not None
+        ):
+            tree = self.tree_core
+            if tree.enable_hicache and not tree.is_write_back:
+                node = tree.node_by_id(result.last_device_node)
+                if not node.backuped:
+                    self._apply_cache_actions(
+                        [tree._build_backup_kv_action(node)]
+                    )
+
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
