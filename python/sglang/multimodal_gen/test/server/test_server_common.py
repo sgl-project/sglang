@@ -83,7 +83,7 @@ logger = init_logger(__name__)
 
 # Track test cases missing estimated_full_test_time_s for time measurement output
 _MISSING_ESTIMATED_TIME_CASES: set[str] = set()
-_PENDING_BASELINE_DUMPS: dict[str, tuple[PerformanceSummary, bool]] = {}
+_PENDING_BASELINE_DUMPS: dict[str, list[PerformanceSummary]] = {}
 _OPENAI_REQUEST_TIMEOUT_SECS = float(
     os.environ.get("SGLANG_TEST_OPENAI_REQUEST_TIMEOUT_SECS", "600")
 )
@@ -228,12 +228,12 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
         pending_dump = _PENDING_BASELINE_DUMPS.pop(case.id, None)
         if pending_dump is not None:
-            summary, missing_scenario = pending_dump
             DiffusionServerBase()._dump_baseline_for_testcase(
                 case,
-                summary,
-                missing_scenario=missing_scenario,
+                pending_dump[-1],
+                missing_scenario=case.id not in BASELINE_CONFIG.scenarios,
                 measured_full_time=_measured_full_time,
+                repeated_summaries=pending_dump,
             )
 
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
@@ -439,7 +439,7 @@ class DiffusionServerBase:
 
         if case.run_perf_check:
             if is_baseline_generation_mode:
-                _PENDING_BASELINE_DUMPS[case.id] = (summary, missing_scenario)
+                _PENDING_BASELINE_DUMPS.setdefault(case.id, []).append(summary)
                 return
 
             if missing_scenario:
@@ -651,31 +651,48 @@ class DiffusionServerBase:
         summary: PerformanceSummary,
         missing_scenario: bool = False,
         measured_full_time: float | None = None,
+        repeated_summaries: list[PerformanceSummary] | None = None,
     ) -> None:
         """Dump performance metrics as a JSON scenario for baselines."""
         import json
 
+        # One shared baseline must cover both the first and subsequent requests.
+        summaries = repeated_summaries or [summary]
         denoise_steps_formatted = {
-            str(k): round(v, 2) for k, v in summary.all_denoise_steps.items()
+            str(k): round(max(s.all_denoise_steps[k] for s in summaries), 2)
+            for k in summary.all_denoise_steps
         }
-        stages_formatted = {k: round(v, 2) for k, v in summary.stage_metrics.items()}
+        stages_formatted = {
+            k: round(max(s.stage_metrics[k] for s in summaries), 2)
+            for k in summary.stage_metrics
+        }
 
         baseline = {
             "stages_ms": stages_formatted,
             "denoise_step_ms": denoise_steps_formatted,
-            "expected_e2e_ms": round(summary.e2e_ms, 2),
-            "expected_avg_denoise_ms": round(summary.avg_denoise_ms, 2),
-            "expected_median_denoise_ms": round(summary.median_denoise_ms, 2),
+            "expected_e2e_ms": round(max(s.e2e_ms for s in summaries), 2),
+            "expected_avg_denoise_ms": round(
+                max(s.avg_denoise_ms for s in summaries), 2
+            ),
+            "expected_median_denoise_ms": round(
+                max(s.median_denoise_ms for s in summaries), 2
+            ),
         }
 
         if current_platform.is_cuda():
             baseline.update(
                 {
-                    "load_peak_vram_mb": round(summary.load_peak_vram_mb, 2),
-                    "runtime_peak_vram_mb": round(summary.runtime_peak_vram_mb, 2),
-                    "load_peak_host_anon_mb": round(summary.load_peak_host_anon_mb, 2),
+                    "load_peak_vram_mb": round(
+                        max(s.load_peak_vram_mb for s in summaries), 2
+                    ),
+                    "runtime_peak_vram_mb": round(
+                        max(s.runtime_peak_vram_mb for s in summaries), 2
+                    ),
+                    "load_peak_host_anon_mb": round(
+                        max(s.load_peak_host_anon_mb for s in summaries), 2
+                    ),
                     "runtime_peak_host_anon_mb": round(
-                        summary.runtime_peak_host_anon_mb, 2
+                        max(s.runtime_peak_host_anon_mb for s in summaries), 2
                     ),
                 }
             )
@@ -1556,10 +1573,19 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             label = f"request {request_index}/{case.perf_repeat_requests}"
             _print_case_log_separator(case.id, f"BEGIN {label}")
             try:
-                self._test_diffusion_request(case, diffusion_server, request_index)
-            except pytest.skip.Exception:
-                if not failures:
+                with pytest.MonkeyPatch.context() as request_env:
+                    artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
+                    if artifact_dir and case.perf_repeat_requests > 1:
+                        request_env.setenv(
+                            "SGLANG_DIFFUSION_ARTIFACT_DIR",
+                            str(Path(artifact_dir) / f"request-{request_index}"),
+                        )
+                    self._test_diffusion_request(case, diffusion_server, request_index)
+            except pytest.skip.Exception as exc:
+                if request_index == 1:
                     raise
+                failures.append(f"[{label}] Required request skipped: {exc}")
+                _print_case_log_separator(case.id, f"FAILED {label}")
                 break
             except (Exception, pytest.fail.Exception) as exc:
                 failures.append(f"[{label}] {exc}")

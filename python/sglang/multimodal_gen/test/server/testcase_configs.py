@@ -347,6 +347,7 @@ class DiffusionTestCase:
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
 
+
 _REALTIME_MODEL_COMMON_EXTRAS = {
     "seed": 42,
     "num_inference_steps": 4,

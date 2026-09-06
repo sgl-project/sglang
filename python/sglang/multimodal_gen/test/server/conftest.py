@@ -108,8 +108,12 @@ def _generate_diffusion_markdown_report(results: list) -> str:
     video_results = [r for r in results if r.get("modality") == "video"]
     if video_results:
         markdown += "\n### Video Generation Metrics\n\n"
-        markdown += "| Test Name | Request | FPS | Total Frames | Avg Frame Time (ms) |\n"
-        markdown += "| --------- | ------- | --- | ------------ | ------------------- |\n"
+        markdown += (
+            "| Test Name | Request | FPS | Total Frames | Avg Frame Time (ms) |\n"
+        )
+        markdown += (
+            "| --------- | ------- | --- | ------------ | ------------------- |\n"
+        )
         for entry in video_results:
             fps = entry.get("frames_per_second", "N/A")
             frames = entry.get("total_frames", "N/A")
