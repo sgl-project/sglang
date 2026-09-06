@@ -233,14 +233,8 @@ class MambaComponent(TreeComponent):
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
         if node.component_data[self.component_type].value is None:
-            node.component_data[self.component_type].value = params.mamba_value
-            # move from host LRU to device LRU
-            host_lru = self.tree_core.host_lru_lists[self.component_type]
-            if host_lru.in_list(node):
-                host_lru.remove_node(node)
-            self.tree_core.lru_lists[self.component_type].insert_mru(node)
-            self.tree_core.component_evictable_size_[self.component_type] += len(
-                params.mamba_value
+            self.tree_core.set_component_device_value(
+                node.id, self.component_type, params.mamba_value
             )
             node.last_access_time = get_and_increase_time_counter()
             self._emit_excess_path_states_eviction(node, cache_actions)

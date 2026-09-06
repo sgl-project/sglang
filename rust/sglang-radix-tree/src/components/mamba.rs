@@ -178,16 +178,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             return;
         }
         if !tree_core.arena.has_device_value(node_id, MAMBA) {
-            // Tombstone refill: the node moves from the host LRU to the device LRU.
-            tree_core
-                .arena
-                .set_device_value(node_id, MAMBA, mamba_value.shallow_clone());
-            let host_lru = tree_core.host_lru_list_mut(MAMBA);
-            if host_lru.in_list(Some(node_id)) {
-                host_lru.remove_node(node_id);
-            }
-            tree_core.device_lru_list_mut(MAMBA).insert_mru(node_id);
-            tree_core.inc_evictable_size(MAMBA, slot_len);
+            tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.shallow_clone());
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
