@@ -15,7 +15,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache
+from sglang.kernels.ops.kvcache.kvcache import (
+    can_use_store_cache,
+    is_store_cache_quant_aligned,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -33,12 +36,17 @@ NUM_WRITES = 16
 ASYM_DIM_PAIRS = [(192, 128), (128, 192), (512, 256)]
 
 
-def _build_pool(head_dim: int, v_head_dim: int) -> MHATokenToKVPool:
+def _build_pool(
+    head_dim: int,
+    v_head_dim: int,
+    dtype: torch.dtype = DTYPE,
+    head_num: int = HEAD_NUM,
+) -> MHATokenToKVPool:
     return MHATokenToKVPool(
         size=POOL_SIZE,
         page_size=1,
-        dtype=DTYPE,
-        head_num=HEAD_NUM,
+        dtype=dtype,
+        head_num=head_num,
         head_dim=head_dim,
         v_head_dim=v_head_dim,
         layer_num=1,
@@ -60,6 +68,10 @@ class TestAsymmetricMHAPoolRowDims(unittest.TestCase):
     def test_v_row_dim_defaults_to_row_dim_when_symmetric(self):
         pool = _build_pool(128, 128)
         self.assertEqual(pool.v_row_dim, pool.row_dim)
+
+    def test_quant_store_requires_equal_row_width(self):
+        pool = _build_pool(192, 128, dtype=torch.float8_e4m3fn)
+        self.assertFalse(pool.enable_quant_store)
 
     def test_swa_dims_override_row_dims(self):
         # A hybrid sliding-window model builds a second pool through the swa_*
@@ -161,6 +173,46 @@ class TestAsymmetricMHAPoolSetKVBuffer(unittest.TestCase):
 
     def test_symmetric_roundtrip_unchanged(self):
         self._run_roundtrip(128, 128)
+
+    def test_quant_store_falls_back_for_misaligned_source_rows(self):
+        pool = _build_pool(64, 64, dtype=torch.float8_e4m3fn, head_num=1)
+        storage_k = torch.randn(259, dtype=torch.float16, device="cuda")
+        storage_v = torch.randn(259, dtype=torch.float16, device="cuda")
+        cache_k = torch.as_strided(storage_k, (4, 1, 64), (65, 64, 1))
+        cache_v = torch.as_strided(storage_v, (4, 1, 64), (65, 64, 1))
+        loc = torch.arange(1, 5, dtype=torch.int64, device="cuda")
+        expected_k = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
+        expected_v = cache_v.to(torch.float8_e4m3fn).view(torch.uint8)
+
+        self.assertTrue(pool.enable_quant_store)
+        self.assertFalse(
+            is_store_cache_quant_aligned(
+                cache_k.view(-1, pool.row_dim), cache_v.view(-1, pool.row_dim)
+            )
+        )
+        pool.set_kv_buffer(SimpleNamespace(layer_id=0), loc, cache_k, cache_v)
+
+        self.assertTrue(torch.equal(pool.k_buffer[0][loc], expected_k))
+        self.assertTrue(torch.equal(pool.v_buffer[0][loc], expected_v))
+
+    def test_quant_store_contiguous_fused_canary(self):
+        pool = _build_pool(64, 64, dtype=torch.float8_e4m3fn, head_num=1)
+        cache_k = torch.randn((4, 1, 64), dtype=torch.float16, device="cuda")
+        cache_v = torch.randn((4, 1, 64), dtype=torch.float16, device="cuda")
+        loc = torch.arange(1, 5, dtype=torch.int64, device="cuda")
+        expected_k = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
+        expected_v = cache_v.to(torch.float8_e4m3fn).view(torch.uint8)
+
+        self.assertTrue(pool.enable_quant_store)
+        self.assertTrue(
+            is_store_cache_quant_aligned(
+                cache_k.view(-1, pool.row_dim), cache_v.view(-1, pool.row_dim)
+            )
+        )
+        pool.set_kv_buffer(SimpleNamespace(layer_id=0), loc, cache_k, cache_v)
+
+        self.assertTrue(torch.equal(pool.k_buffer[0][loc], expected_k))
+        self.assertTrue(torch.equal(pool.v_buffer[0][loc], expected_v))
 
 
 @unittest.skipUnless(_HAS_CUDA, "prefix-valid tiled kernel requires CUDA")
