@@ -1012,6 +1012,36 @@ class CancelIdempotencyTestCase(CustomTestCase):
             self.assertIs(out, resp, status)
             self.assertEqual(out.status, status)
 
+    def test_cancelling_foreground_response_returns_400(self):
+        """Foreground responses (background=False) cannot be cancelled."""
+        from fastapi.responses import ORJSONResponse
+
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        serving = make_serving()
+        # Create a foreground response (background defaults to False)
+        resp = ResponsesResponse.from_request(
+            ResponsesRequest(model="x", input="hi", background=False, store=True),
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="completed",
+            usage=None,
+        )
+        serving.response_store[resp.id] = resp
+        # Note: resp.id is NOT added to background_response_ids since it's foreground
+
+        out = asyncio.run(serving.cancel_responses(resp.id))
+
+        # Should return a 400 error response, not the response itself
+        self.assertIsInstance(out, ORJSONResponse)
+        self.assertEqual(out.status_code, 400)
+
+        # Verify error message mentions background requirement
+        error_content = out.body.decode("utf-8")
+        self.assertIn("background=true", error_content)
+
 
 class StreamingLogprobsRejectionTestCase(CustomTestCase):
     def test_stream_with_logprobs_include_rejected(self):
