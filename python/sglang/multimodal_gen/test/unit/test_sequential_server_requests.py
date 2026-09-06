@@ -29,8 +29,8 @@ def _perf_record():
         steps=[5, 5],
         total_duration_ms=100,
         memory_snapshots={
-            "load_peak": {"peak_reserved_mb": 1000},
-            "runtime_peak": {"peak_reserved_mb": 2000},
+            "load_peak": {"peak_reserved_mb": 1000, "peak_allocated_mb": 800},
+            "runtime_peak": {"peak_reserved_mb": 2000, "peak_allocated_mb": 1600},
         },
     )
 
@@ -295,7 +295,9 @@ def test_baseline_generation_keeps_worst_of_both_requests(harness, monkeypatch):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "1")
     records = [_perf_record(), _perf_record()]
     records[0].total_duration_ms = 200
+    records[0].memory_snapshots["load_peak"]["peak_allocated_mb"] = 900
     records[1].memory_snapshots["runtime_peak"]["peak_reserved_mb"] = 3000
+    records[1].memory_snapshots["runtime_peak"]["peak_allocated_mb"] = 2500
     monkeypatch.setattr(
         runner, "run_and_collect", Mock(side_effect=[(r, b"output") for r in records])
     )
@@ -310,6 +312,8 @@ def test_baseline_generation_keeps_worst_of_both_requests(harness, monkeypatch):
     baseline = json.loads(log.call_args.args[0].split(f'"{case.id}": ', 1)[1])
     assert baseline["expected_e2e_ms"] == 200
     assert baseline["runtime_peak_vram_mb"] == 3000
+    assert baseline["load_peak_allocated_mb"] == 900
+    assert baseline["runtime_peak_allocated_mb"] == 2500
 
 
 def test_h3_cases_check_two_short_requests_and_audio():

@@ -445,6 +445,10 @@ class DiffusionServerBase:
                         summary,
                         expected_load_peak_vram_mb,
                         expected_runtime_peak_vram_mb,
+                        expected_load_peak_allocated_mb=scenario.load_peak_allocated_mb,
+                        expected_runtime_peak_allocated_mb=(
+                            scenario.runtime_peak_allocated_mb
+                        ),
                     )
                     validator.validate_peak_host_anon(
                         summary,
@@ -534,6 +538,8 @@ class DiffusionServerBase:
                 summary,
                 scenario.load_peak_vram_mb,
                 scenario.runtime_peak_vram_mb,
+                expected_load_peak_allocated_mb=scenario.load_peak_allocated_mb,
+                expected_runtime_peak_allocated_mb=scenario.runtime_peak_allocated_mb,
             )
         except AssertionError as e:
             logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
@@ -555,6 +561,8 @@ class DiffusionServerBase:
             "median_denoise_ms": summary.median_denoise_ms,
             "load_peak_vram_mb": summary.load_peak_vram_mb,
             "runtime_peak_vram_mb": summary.runtime_peak_vram_mb,
+            "load_peak_allocated_mb": summary.load_peak_allocated_mb,
+            "runtime_peak_allocated_mb": summary.runtime_peak_allocated_mb,
             "stage_metrics": summary.stage_metrics,
             "sampled_steps": summary.sampled_steps,
         }
@@ -585,7 +593,9 @@ class DiffusionServerBase:
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
                 f"median_denoise={summary.median_denoise_ms:.2f}ms, "
                 f"load_peak_vram={summary.load_peak_vram_mb:.0f}MiB, "
-                f"runtime_peak_vram={summary.runtime_peak_vram_mb:.0f}MiB"
+                f"runtime_peak_vram={summary.runtime_peak_vram_mb:.0f}MiB, "
+                f"load_peak_alloc={summary.load_peak_allocated_mb:.0f}MiB, "
+                f"runtime_peak_alloc={summary.runtime_peak_allocated_mb:.0f}MiB"
             ),
         ]
         if scenario is not None:
@@ -663,6 +673,12 @@ class DiffusionServerBase:
                     ),
                     "runtime_peak_vram_mb": round(
                         max(s.runtime_peak_vram_mb for s in summaries), 2
+                    ),
+                    "load_peak_allocated_mb": round(
+                        max(s.load_peak_allocated_mb for s in summaries), 2
+                    ),
+                    "runtime_peak_allocated_mb": round(
+                        max(s.runtime_peak_allocated_mb for s in summaries), 2
                     ),
                     "load_peak_host_anon_mb": round(
                         max(s.load_peak_host_anon_mb for s in summaries), 2
