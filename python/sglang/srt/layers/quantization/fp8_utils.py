@@ -1293,6 +1293,12 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous(), "MXFP8 quantization requires a contiguous 2D tensor."
     _, k = x.shape
     assert k % 32 == 0, f"{k=} must be divisible by 32"
+    if _is_hip and _is_gfx95_supported:
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            mxfp8_e4m3_quantize,
+        )
+
+        return mxfp8_e4m3_quantize(x)
     downcast_to_mxfp = _get_triton_mxfp8_downcast()
     q_input, scale_u8 = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=1)
     return q_input.contiguous(), scale_u8.contiguous()
@@ -1546,6 +1552,13 @@ def requant_weight_ue8m0(
 ):
     assert weight_block_size == [128, 128]
 
+    # 3D+ weights stack multiple experts (e.g. MoE); requant each group separately.
+    # 2D weights are a single matrix and fall through to the direct path below.
+    if weight.dim() > 2:
+        return _requant_weight_ue8m0_grouped(
+            weight, weight_scale_inv, weight_block_size
+        )
+
     *_, n, k = weight.shape
 
     weight_dequant = block_quant_dequant(
@@ -1565,14 +1578,55 @@ def requant_weight_ue8m0(
     return out_w, out_s
 
 
+def _requant_weight_ue8m0_grouped(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    weight_block_size: List[int],
+):
+    *group_dims, n, k = weight.shape
+    w_groups = weight.reshape(-1, n, k)
+    s_groups = weight_scale_inv.reshape(-1, *weight_scale_inv.shape[-2:])
+    num_groups = w_groups.shape[0]
+
+    out_w = None
+    out_s = None
+    for g in range(num_groups):
+        weight_dequant = block_quant_dequant(
+            w_groups[g],
+            s_groups[g],
+            weight_block_size,
+            torch.bfloat16,
+        )
+        w_g, s_g = quant_weight_ue8m0(
+            weight_dequant=weight_dequant,
+            weight_block_size=weight_block_size,
+        )
+        if out_w is None:
+            out_w = torch.empty(
+                (num_groups, *w_g.shape), dtype=w_g.dtype, device=w_g.device
+            )
+            out_s = torch.empty(
+                (num_groups, *s_g.shape), dtype=s_g.dtype, device=s_g.device
+            )
+        out_w[g] = w_g
+        out_s[g] = s_g
+
+    out_w = out_w.view(*group_dims, n, k)
+    out_s = out_s.view(*group_dims, *out_s.shape[-2:])
+
+    out_s = transform_scale_ue8m0(out_s, mn=n)
+
+    return out_w, out_s
+
+
 def quant_weight_ue8m0(
     weight_dequant: torch.Tensor,
     weight_block_size: List[int],
 ):
     assert weight_block_size == [128, 128]
-    assert (
-        weight_dequant.dtype == torch.bfloat16
-    ), f"{weight_dequant.dtype=} {weight_dequant.shape=}"
+    assert weight_dequant.dtype == torch.bfloat16, (
+        f"{weight_dequant.dtype=} {weight_dequant.shape=}"
+    )
 
     *batch_dims, n, k = weight_dequant.shape
 
@@ -1589,10 +1643,6 @@ def quant_weight_ue8m0(
     )
 
     return out_w, out_s
-
-
-def transform_scale_ue8m0_inplace(param, mn):
-    param.data = transform_scale_ue8m0(param.data, mn=mn)
 
 
 # NOTE copy and modified from DeepGEMM
@@ -1659,9 +1709,9 @@ def inverse_transform_scale_ue8m0(sf_packed, mn):
     sf_fp32 = _inverse_transform_scale_ue8m0_impl(sf_packed)
     # Can call consistency check every time since this is only called on startup
     sf_packed_recreated = transform_scale_ue8m0(sf_fp32, mn=mn, use_torch_impl=True)
-    assert torch.all(
-        sf_packed == sf_packed_recreated
-    ), f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
+    assert torch.all(sf_packed == sf_packed_recreated), (
+        f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
+    )
     return sf_fp32
 
 

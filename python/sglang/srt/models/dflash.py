@@ -134,8 +134,7 @@ def _get_dflash_layer_attention_params(
             config, default=AttentionType.DECODER
         )
     raise ValueError(
-        "Unsupported DFLASH draft layer type. "
-        f"layer_types[{layer_id}]={layer_type!r}."
+        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
     )
 
 

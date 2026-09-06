@@ -38,9 +38,9 @@ def get_moe_padding_size(weight_block_size):
             2,
         ], "Only len(weight_block_size) in [1, 2] is supported"
         if len(weight_block_size) == 2:
-            assert (
-                weight_block_size[0] == weight_block_size[1]
-            ), "Only weight_block_size[0] == weight_block_size[1] is supported"
+            assert weight_block_size[0] == weight_block_size[1], (
+                "Only weight_block_size[0] == weight_block_size[1] is supported"
+            )
         return weight_block_size[0]
 
     return DEFAULT_MOE_PADDING_SIZE
@@ -238,7 +238,6 @@ def adjust_config_with_unaligned_cpu_tp(
         model_config.num_attention_heads % tp_size != 0
         or model_config.get_total_num_kv_heads() % tp_size != 0
     ):
-
         if hasattr(model_config.hf_config, "qk_nope_head_dim") and hasattr(
             model_config.hf_config, "qk_rope_head_dim"
         ):

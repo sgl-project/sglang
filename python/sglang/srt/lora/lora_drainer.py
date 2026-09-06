@@ -143,14 +143,14 @@ class LoRADrainer:
 
             min_eligible_adapter = min(
                 eligible_to_drain_adapters,
-                key=lambda adapter_id: self.adapter_to_stats[
-                    adapter_id
-                ].max_remaining_tokens,
+                key=lambda adapter_id: (
+                    self.adapter_to_stats[adapter_id].max_remaining_tokens
+                ),
             )
 
-            self.adapter_to_stats[min_eligible_adapter].is_draining_for = (
-                starving_adapter
-            )
+            self.adapter_to_stats[
+                min_eligible_adapter
+            ].is_draining_for = starving_adapter
             logger.debug(
                 f"LoRA adapter {min_eligible_adapter} is draining for {starving_adapter}"
             )

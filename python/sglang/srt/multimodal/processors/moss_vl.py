@@ -537,9 +537,10 @@ class MossVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        normalized_video_data, temp_video_paths = (
-            await self._normalize_video_inputs_async(request_obj.video_data)
-        )
+        (
+            normalized_video_data,
+            temp_video_paths,
+        ) = await self._normalize_video_inputs_async(request_obj.video_data)
 
         try:
             base_output = await self.load_mm_data(

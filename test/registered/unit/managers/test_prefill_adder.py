@@ -101,6 +101,11 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.storage_hit_length = 0
+        req.storage_hit_start = None
+        req.host_hit_is_storage = False
+        req.host_loaded_length = 0
+        req.materialized_host_hit_len.return_value = 0
+        req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
@@ -119,6 +124,51 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_storage_prefetch_fulfillment_resolves_at_admission(self):
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_mock_req("storage-hit", priority=0, max_new_tokens=1)
+        req.host_hit_length = 12
+        req.host_loaded_length = 4
+        req.storage_hit_length = 8
+        req.storage_hit_start = 4
+        req.materialized_host_hit_len.return_value = 4
+        req.fulfilled_storage_hit_len.return_value = 8
+        req.needs_host_load_back.return_value = True
+
+        adder._account_prefill_cache_admission(req, prefix_len=12)
+
+        self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
+            "storage-hit",
+            fulfilled_tokens=8,
+            reason=None,
+        )
+        self.assertEqual(adder.log_device_hit_tokens, 4)
+        self.assertEqual(adder.log_host_hit_tokens, 0)
+        self.assertEqual(adder.log_storage_hit_tokens, 8)
+
+        self.mock_tree_cache.finish_storage_prefetch_admission.reset_mock()
+        req.host_loaded_length = 0
+        req.materialized_host_hit_len.return_value = 0
+        req.fulfilled_storage_hit_len.return_value = 0
+        adder._account_prefill_cache_admission(req, prefix_len=0)
+        self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
+            "storage-hit", fulfilled_tokens=0, reason="device_capacity"
+        )
+
+    def test_retracted_storage_prefetch_accounting_is_omitted(self):
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_mock_req(
+            "retracted-storage-hit", priority=0, max_new_tokens=1
+        )
+        req.retracted_stain = True
+
+        adder._account_prefill_cache_admission(req, prefix_len=8)
+
+        self.mock_tree_cache.discard_storage_prefetch_accounting.assert_called_once_with(
+            "retracted-storage-hit"
+        )
+        self.mock_tree_cache.finish_storage_prefetch_admission.assert_not_called()
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

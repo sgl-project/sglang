@@ -211,7 +211,6 @@ def _asm_context_prefill_gather_indices(
 
 
 class AiterAttnBackend(AttentionBackend):
-
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
@@ -466,9 +465,16 @@ class AiterAttnBackend(AttentionBackend):
                 intra_batch_mode = False
             # Zero-pad topology (h12->qh16): prefer Gluon decode over PS kernel.
             if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
-                _use_mla_ps_kernel = False
-                fast_mode = False
-                intra_batch_mode = False
+                # Disable ps only when gluon kernel is selected to avoid falling
+                # back to incorrect aiter kernel
+                if prefer_mla_gluon_decode(
+                    head_pad_mode=self.head_pad_mode,
+                    num_head=self.num_head,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                ):
+                    _use_mla_ps_kernel = False
+                    fast_mode = False
+                    intra_batch_mode = False
                 log_mla_gluon_capability(logger)
 
             self.max_split_per_batch = 32 if _use_mla_ps_kernel else None
@@ -1185,11 +1191,14 @@ class AiterAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+            if in_capture:
+                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+            else:
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
                 )
-            )
             self.forward_metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
                 :n
             ]

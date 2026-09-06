@@ -77,6 +77,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
     build_raw_rgb_frame_batches,
@@ -152,12 +153,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
+        load_snapshot = None if current_platform.is_cpu() else capture_memory_snapshot()
         self._load_peak_reserved_mb = (
-            0.0
-            if current_platform.is_cpu()
-            else capture_memory_snapshot().peak_reserved_mb
+            load_snapshot.peak_reserved_mb if load_snapshot is not None else 0.0
+        )
+        # Allocated peaks are the guarded figure: reserved peaks also track the
+        # allocator's pool history and move a few percent for identical work.
+        self._load_peak_allocated_mb = (
+            load_snapshot.peak_allocated_mb if load_snapshot is not None else 0.0
         )
         self._runtime_peak_reserved_mb = 0.0
+        self._runtime_peak_allocated_mb = 0.0
         self.sp_group = get_sp_group()
         self.sp_cpu_group = self.sp_group.cpu_group
         self.tp_group = get_tp_group()
@@ -434,8 +440,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     ),
                     log_reqs=[req],
                     return_req=False,
-                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
-                        req, output_batch
+                    save_output_paths=lambda output_batch, req=req: (
+                        self._save_output_paths(req, output_batch)
                     ),
                     error_context=f"grouped request {req.request_id}",
                     execution_start_time=group_start_time,
@@ -550,7 +556,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
-            self._materialize_output_transport(output_batch, req, save_output_paths)
+            req_label = req.request_id[:8] if req.request_id else "unnamed"
+            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+                self._materialize_output_transport(output_batch, req, save_output_paths)
             self._record_output_peak_memory(output_batch)
 
             collect_perf = (
@@ -572,7 +580,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 and output_batch.output is None
                 and not req.return_raw_frames
             ):
-                torch.get_device_module().empty_cache()
+                with maybe_record_function("EMPTY_CACHE"):
+                    torch.get_device_module().empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 if not req.is_warmup:
@@ -727,12 +736,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
         if current_platform.is_cpu():
             return
-        peak_reserved_mb = capture_memory_snapshot().peak_reserved_mb
+        snapshot = capture_memory_snapshot()
         self._runtime_peak_reserved_mb = max(
-            self._runtime_peak_reserved_mb, peak_reserved_mb
+            self._runtime_peak_reserved_mb, snapshot.peak_reserved_mb
+        )
+        self._runtime_peak_allocated_mb = max(
+            self._runtime_peak_allocated_mb, snapshot.peak_allocated_mb
         )
         if self.is_output_rank:
-            output_batch.peak_memory_mb = peak_reserved_mb
+            output_batch.peak_memory_mb = snapshot.peak_reserved_mb
 
     def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
         """Record replica-wide loading and runtime allocator peaks."""
@@ -740,7 +752,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return
 
         peaks = torch.tensor(
-            [self._load_peak_reserved_mb, self._runtime_peak_reserved_mb],
+            [
+                self._load_peak_reserved_mb,
+                self._runtime_peak_reserved_mb,
+                self._load_peak_allocated_mb,
+                self._runtime_peak_allocated_mb,
+            ],
             dtype=torch.float64,
             device=current_platform.get_device(self.local_rank),
         )
@@ -749,13 +766,28 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return
 
         snapshot = capture_memory_snapshot()
-        load_peak_mb, runtime_peak_mb = peaks.tolist()
+        (
+            load_peak_mb,
+            runtime_peak_mb,
+            load_peak_allocated_mb,
+            runtime_peak_allocated_mb,
+        ) = peaks.tolist()
         for metrics in output_metrics:
             metrics.record_memory_snapshot(
-                "load_peak", replace(snapshot, peak_reserved_mb=load_peak_mb)
+                "load_peak",
+                replace(
+                    snapshot,
+                    peak_reserved_mb=load_peak_mb,
+                    peak_allocated_mb=load_peak_allocated_mb,
+                ),
             )
             metrics.record_memory_snapshot(
-                "runtime_peak", replace(snapshot, peak_reserved_mb=runtime_peak_mb)
+                "runtime_peak",
+                replace(
+                    snapshot,
+                    peak_reserved_mb=runtime_peak_mb,
+                    peak_allocated_mb=runtime_peak_allocated_mb,
+                ),
             )
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:

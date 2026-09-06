@@ -26,7 +26,6 @@ register_cuda_ci(
 
 
 class TestStartProfile(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.output_dir = tempfile.mkdtemp()

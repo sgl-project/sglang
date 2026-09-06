@@ -227,15 +227,25 @@ class TestAttentionBackendFallback(unittest.TestCase):
 
         self.assertIs(backend, _FakeFABackend)
 
-    def test_explicit_dense_mismatch_fails_closed(self):
-        with self.assertRaisesRegex(
-            ValueError, "not supported by this attention layer"
-        ):
+    def test_explicit_backend_is_not_rejected_by_automatic_selection_set(self):
+        backend = self._resolve(
+            AttentionBackendEnum.AITER,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+        )
+
+        self.assertIs(backend, _FakeAITERBackend)
+        self.assertEqual(_FakePlatform.selected_backend, AttentionBackendEnum.AITER)
+
+    def test_explicit_backend_still_fails_missing_capability(self):
+        with self.assertRaisesRegex(ValueError, "packed varlen attention"):
             self._resolve(
                 AttentionBackendEnum.AITER,
                 explicit=True,
                 is_cross_attention=False,
                 supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+                attention_requirements=AttentionRequirements(packed_varlen=True),
             )
 
     def test_explicit_global_backend_uses_component_default(self):
@@ -244,6 +254,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
             explicit=True,
             is_cross_attention=False,
             supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            attention_requirements=AttentionRequirements(packed_varlen=True),
             default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
         )
 
@@ -258,24 +269,24 @@ class TestAttentionBackendFallback(unittest.TestCase):
             explicit=True,
             is_cross_attention=False,
             supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            attention_requirements=AttentionRequirements(packed_varlen=True),
             allow_global_backend_fallback=True,
         )
 
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
-    def test_explicit_component_backend_remains_strict(self):
-        with self.assertRaisesRegex(
-            ValueError, "not supported by this attention layer"
-        ):
-            self._resolve(
-                AttentionBackendEnum.FA,
-                explicit=True,
-                is_cross_attention=False,
-                supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
-                component_backend=AttentionBackendEnum.AITER,
-                allow_global_backend_fallback=True,
-            )
+    def test_explicit_component_backend_ignores_automatic_selection_set(self):
+        backend = self._resolve(
+            AttentionBackendEnum.FA,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            component_backend=AttentionBackendEnum.AITER,
+            allow_global_backend_fallback=True,
+        )
+
+        self.assertIs(backend, _FakeAITERBackend)
 
     def test_explicit_component_backend_is_consumed(self):
         backend = self._resolve(
@@ -310,16 +321,15 @@ class TestAttentionBackendFallback(unittest.TestCase):
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
-    def test_sparse_backend_mismatch_fails_for_self_attention(self):
-        with self.assertRaisesRegex(
-            ValueError, "not supported by this attention layer"
-        ):
-            self._resolve(
-                AttentionBackendEnum.LASER_ATTN,
-                explicit=True,
-                is_cross_attention=False,
-                supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
-            )
+    def test_explicit_sparse_backend_is_admitted_for_self_attention(self):
+        backend = self._resolve(
+            AttentionBackendEnum.LASER_ATTN,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+        )
+
+        self.assertIs(backend, _FakeSparseBackend)
 
 
 class TestComponentAttentionBackendScope(unittest.TestCase):
@@ -332,9 +342,24 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
                 captured_context = get_component_attn_backend_context()
                 return object()
 
+            def component_attention_backend_context(
+                self,
+                attn_backend,
+                component_attn_name: str | None,
+                require_backend_selection: bool,
+            ):
+                return component_attn_backend_context_manager(
+                    attn_backend,
+                    component_name=component_attn_name,
+                    allow_global_backend_fallback=allow_global_backend_fallback,
+                    require_backend_selection=require_backend_selection,
+                )
+
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
+            pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod
             def requested_component_attention_backend(_component_name):
@@ -348,7 +373,6 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             def should_use_fsdp_for_component(_component_name):
                 return False
 
-        _Loader.allow_global_attention_backend_fallback = allow_global_backend_fallback
         with (
             patch.object(ComponentLoader, "for_component_type", return_value=_Loader()),
             patch(
@@ -378,10 +402,22 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         self.assertFalse(context.allow_global_backend_fallback)
 
     def test_builtin_loader_scopes(self):
-        self.assertFalse(TransformerLoader.allow_global_attention_backend_fallback)
-        self.assertFalse(GenericComponentLoader.allow_global_attention_backend_fallback)
-        self.assertTrue(TextEncoderLoader.allow_global_attention_backend_fallback)
-        self.assertTrue(VAELoader.allow_global_attention_backend_fallback)
+        cases = (
+            (TransformerLoader(), "transformer", False),
+            (GenericComponentLoader(), "custom", False),
+            (TextEncoderLoader(), "text_encoder", True),
+            (VAELoader(), "vae", True),
+        )
+        for loader, component_name, expected_fallback in cases:
+            with (
+                self.subTest(loader=loader.__class__.__name__),
+                loader.component_attention_backend_context(None, component_name, False),
+            ):
+                context = get_component_attn_backend_context()
+                self.assertIsNotNone(context)
+                self.assertEqual(
+                    context.allow_global_backend_fallback, expected_fallback
+                )
 
     def test_explicit_backend_must_be_consumed(self):
         with self.assertRaisesRegex(
@@ -414,6 +450,8 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
+            pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod
             def requested_component_attention_backend(_component_name):
@@ -479,6 +517,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
             pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod
@@ -530,6 +569,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
             pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod

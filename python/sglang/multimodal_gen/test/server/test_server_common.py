@@ -244,14 +244,14 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         if needs_estimated_time and not is_baseline_generation_mode:
             _MISSING_ESTIMATED_TIME_CASES.add(case.id)
             logger.error(
-                f'\n{"=" * 60}\n'
+                f"\n{'=' * 60}\n"
                 f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
                 f"File: {get_perf_baseline_update_path()}\n\n"
                 f'    "{case.id}": {{\n'
                 f"        ...\n"
                 f'        "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
                 f"    }}\n"
-                f'{"=" * 60}\n'
+                f"{'=' * 60}\n"
             )
         _print_case_log_separator(case.id, "END diffusion testcase")
 
@@ -319,8 +319,7 @@ class DiffusionServerBase:
 
         tail = ctx.log_tail()
         message = (
-            f"{case_id}: server process exited during generation "
-            f"(code {returncode})."
+            f"{case_id}: server process exited during generation (code {returncode})."
         )
         if tail:
             message += f"\n\nServer log tail:\n{tail}"
@@ -466,6 +465,10 @@ class DiffusionServerBase:
                         summary,
                         expected_load_peak_vram_mb,
                         expected_runtime_peak_vram_mb,
+                        expected_load_peak_allocated_mb=scenario.load_peak_allocated_mb,
+                        expected_runtime_peak_allocated_mb=(
+                            scenario.runtime_peak_allocated_mb
+                        ),
                     )
                     validator.validate_peak_host_anon(
                         summary,
@@ -556,6 +559,8 @@ class DiffusionServerBase:
                 summary,
                 scenario.load_peak_vram_mb,
                 scenario.runtime_peak_vram_mb,
+                expected_load_peak_allocated_mb=scenario.load_peak_allocated_mb,
+                expected_runtime_peak_allocated_mb=scenario.runtime_peak_allocated_mb,
             )
         except AssertionError as e:
             logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
@@ -574,6 +579,8 @@ class DiffusionServerBase:
             "median_denoise_ms": summary.median_denoise_ms,
             "load_peak_vram_mb": summary.load_peak_vram_mb,
             "runtime_peak_vram_mb": summary.runtime_peak_vram_mb,
+            "load_peak_allocated_mb": summary.load_peak_allocated_mb,
+            "runtime_peak_allocated_mb": summary.runtime_peak_allocated_mb,
             "stage_metrics": summary.stage_metrics,
             "sampled_steps": summary.sampled_steps,
         }
@@ -607,7 +614,9 @@ class DiffusionServerBase:
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
                 f"median_denoise={summary.median_denoise_ms:.2f}ms, "
                 f"load_peak_vram={summary.load_peak_vram_mb:.0f}MiB, "
-                f"runtime_peak_vram={summary.runtime_peak_vram_mb:.0f}MiB"
+                f"runtime_peak_vram={summary.runtime_peak_vram_mb:.0f}MiB, "
+                f"load_peak_alloc={summary.load_peak_allocated_mb:.0f}MiB, "
+                f"runtime_peak_alloc={summary.runtime_peak_allocated_mb:.0f}MiB"
             ),
         ]
         if scenario is not None:
@@ -671,6 +680,10 @@ class DiffusionServerBase:
                 {
                     "load_peak_vram_mb": round(summary.load_peak_vram_mb, 2),
                     "runtime_peak_vram_mb": round(summary.runtime_peak_vram_mb, 2),
+                    "load_peak_allocated_mb": round(summary.load_peak_allocated_mb, 2),
+                    "runtime_peak_allocated_mb": round(
+                        summary.runtime_peak_allocated_mb, 2
+                    ),
                     "load_peak_host_anon_mb": round(summary.load_peak_host_anon_mb, 2),
                     "runtime_peak_host_anon_mb": round(
                         summary.runtime_peak_host_anon_mb, 2
@@ -1184,7 +1197,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         ), "loaded_adapters should be a non-empty list"
         assert any(
             a.get("nickname") == "default" for a in lora_info["loaded_adapters"]
-        ), f"nickname 'default' not found in loaded_adapters: {lora_info['loaded_adapters']}"
+        ), (
+            f"nickname 'default' not found in loaded_adapters: {lora_info['loaded_adapters']}"
+        )
         logger.info("[LoRA E2E] list_loras returned expected LoRA adapters")
 
         logger.info("[LoRA E2E] All LoRA API E2E tests passed for %s", case.id)
@@ -1226,9 +1241,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             json={"lora_nickname": "lora2", "lora_path": second_lora_path},
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 200
-        ), f"set_lora to second adapter failed: {resp.text}"
+        assert resp.status_code == 200, (
+            f"set_lora to second adapter failed: {resp.text}"
+        )
 
         logger.info(
             "[LoRA Switch E2E] Verifying generation with second LoRA for %s", case.id
@@ -1320,9 +1335,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 200
-        ), f"set_lora with multiple adapters failed: {resp.text}"
+        assert resp.status_code == 200, (
+            f"set_lora with multiple adapters failed: {resp.text}"
+        )
         rid, _ = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
@@ -1339,9 +1354,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 200
-        ), f"set_lora with different strengths failed: {resp.text}"
+        assert resp.status_code == 200, (
+            f"set_lora with different strengths failed: {resp.text}"
+        )
         rid, _ = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
@@ -1363,9 +1378,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 200
-        ), f"set_lora with cached adapters failed: {resp.text}"
+        assert resp.status_code == 200, (
+            f"set_lora with cached adapters failed: {resp.text}"
+        )
         rid, _ = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
@@ -1377,9 +1392,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 200
-        ), f"set_lora back to single adapter failed: {resp.text}"
+        assert resp.status_code == 200, (
+            f"set_lora back to single adapter failed: {resp.text}"
+        )
         rid, content = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
@@ -1403,28 +1418,28 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
 
         data = resp.json()
-        assert (
-            data["object"] == "list"
-        ), f"Expected object='list', got {data.get('object')}"
+        assert data["object"] == "list", (
+            f"Expected object='list', got {data.get('object')}"
+        )
         assert len(data["data"]) >= 1, "Expected at least one model in response"
 
         model = data["data"][0]
         assert "id" in model, "Model missing 'id' field"
-        assert (
-            model["object"] == "model"
-        ), f"Expected object='model', got {model.get('object')}"
-        assert (
-            model["id"] == case.server_args.model_path
-        ), f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
+        assert model["object"] == "model", (
+            f"Expected object='model', got {model.get('object')}"
+        )
+        assert model["id"] == case.server_args.model_path, (
+            f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
+        )
 
         # Verify extended diffusion-specific fields
         assert "num_gpus" in model, "Model missing 'num_gpus' field"
         assert "task_type" in model, "Model missing 'task_type' field"
         assert "dit_precision" in model, "Model missing 'dit_precision' field"
         assert "vae_precision" in model, "Model missing 'vae_precision' field"
-        assert (
-            model["num_gpus"] == case.server_args.num_gpus
-        ), f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
+        assert model["num_gpus"] == case.server_args.num_gpus, (
+            f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
+        )
         expected_task_type = get_model_task_type_for_server_args(case.server_args).name
         assert model["task_type"] == expected_task_type, (
             f"task_type mismatch: expected {expected_task_type}, "
@@ -1466,9 +1481,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
         error_data = resp.json()
         assert "error" in error_data, "404 response missing 'error' field"
-        assert (
-            error_data["error"]["code"] == "model_not_found"
-        ), f"Incorrect error code: {error_data['error'].get('code')}"
+        assert error_data["error"]["code"] == "model_not_found", (
+            f"Incorrect error code: {error_data['error'].get('code')}"
+        )
         logger.info("[Models API] GET /v1/models/non_existent returns 404 as expected")
 
         logger.info("[Models API] All /v1/models tests passed for %s", case.id)
@@ -1500,13 +1515,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             json=payload,
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        assert (
-            resp.status_code == 400
-        ), f"Expected 400 for T2V input_reference, got {resp.status_code}: {resp.text}"
+        assert resp.status_code == 400, (
+            f"Expected 400 for T2V input_reference, got {resp.status_code}: {resp.text}"
+        )
         detail = resp.json().get("detail", "")
-        assert (
-            "input_reference is not supported" in detail
-        ), f"Unexpected error detail for T2V input_reference: {detail}"
+        assert "input_reference is not supported" in detail, (
+            f"Unexpected error detail for T2V input_reference: {detail}"
+        )
 
     def test_diffusion_generation(
         self,

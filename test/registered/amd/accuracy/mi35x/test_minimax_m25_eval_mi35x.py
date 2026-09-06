@@ -179,9 +179,9 @@ class TestMiniMaxM25EvalMI35x(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

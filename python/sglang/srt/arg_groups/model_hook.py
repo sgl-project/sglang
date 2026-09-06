@@ -44,6 +44,42 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_two_batch_overlap:
+        return
+
+    index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
+    index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+    indexer_types = getattr(hf_config, "indexer_types", None)
+    if (
+        index_topk_freq > 1
+        or (index_topk_pattern is not None and "S" in index_topk_pattern)
+        or (indexer_types is not None and "shared" in indexer_types)
+    ):
+        raise ValueError(
+            "--enable-two-batch-overlap is not supported with DSA "
+            "index-topk sharing: the TBO op path does not propagate topk "
+            "indices across layers, so shared layers would run sparse "
+            "attention without indices. Got "
+            f"index_topk_freq={index_topk_freq!r}, "
+            f"index_topk_pattern={index_topk_pattern!r}, and "
+            f"indexer_types={indexer_types!r}."
+        )
+
+
+def _rocm_fp8_wo_a_supported() -> bool:
+    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 + aiter)."""
+    try:
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
+            is_wo_a_fp8_mxscale_supported,
+        )
+
+        return is_wo_a_fp8_mxscale_supported()
+    except Exception:  # pragma: no cover - env-dependent
+        return False
+
+
 def handle_model_specific_adjustments(server_args: Any):
 
     cfg = resolving_view(server_args)
@@ -147,6 +183,9 @@ def handle_model_specific_adjustments(server_args: Any):
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
     ]:
@@ -169,19 +208,7 @@ def handle_model_specific_adjustments(server_args: Any):
             # The "dsa" attention fill moved to the override registry
             # (arg_groups/overrides.py: _deepseek_family_overrides).
 
-            index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
-            index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
-            if cfg.enable_two_batch_overlap and (
-                index_topk_freq > 1
-                or (index_topk_pattern is not None and "S" in index_topk_pattern)
-            ):
-                raise ValueError(
-                    "--enable-two-batch-overlap is not supported with DSA "
-                    "index-topk sharing (index_topk_freq > 1 or an "
-                    "index_topk_pattern containing shared layers): the TBO op "
-                    "path does not propagate topk indices across layers, so "
-                    "shared layers would run sparse attention without indices."
-                )
+            _validate_dsa_tbo_index_sharing(server_args, hf_config)
 
             if (
                 not get_platform().is_npu and not get_platform().is_xpu
@@ -218,9 +245,9 @@ def handle_model_specific_adjustments(server_args: Any):
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
 
             if cfg.enable_prefill_cp:
-                assert (
-                    cfg.disaggregation_mode != "decode"
-                ), "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
+                assert cfg.disaggregation_mode != "decode", (
+                    "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
+                )
             if (
                 cfg.enable_dsa_cache_layer_split
                 and cfg.disaggregation_mode != "prefill"
@@ -300,7 +327,7 @@ def handle_model_specific_adjustments(server_args: Any):
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
         if get_platform().is_hip:
             if is_deepseek_dsa(hf_config):
-                # The fused top-k v2 kernel (topk_transform_512_v2) is a
+                # The fused top-k v2 kernel (topk_transform_paged_v2) is a
                 # CUDA/Hopper-only path: its JIT source includes
                 # <cooperative_groups.h> and uses cg::this_cluster()
                 # (thread-block clusters), neither of which exists on ROCm,
@@ -345,16 +372,27 @@ def handle_model_specific_adjustments(server_args: Any):
             # DeepGEMM or require >99KB SMEM (topk_v2).
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
             if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
                 envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(True)
-            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
-            # Prefer TileLang over the Torch fallback.
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+            if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+            # Out of the box the indexer runs the TileLang kernel (works on
+            # stock DeepGEMM); both knobs stay env-overridable so a DeepGEMM
+            # build with SM120 attention support can opt into
+            # fp8_paged_mqa_logits by setting them to 0.
+            if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.is_set():
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+            if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
         elif get_platform().is_hip:
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # The fp8 wo_a GEMM is DeepGEMM-based on CUDA. ROCm has an aiter
+            # e8m0 block-scale equivalent, but only on gfx950 -- everywhere else
+            # keeps the bf16 absorb GEMM.
+            if not _rocm_fp8_wo_a_supported():
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
             envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
@@ -416,9 +454,9 @@ def handle_model_specific_adjustments(server_args: Any):
         # (arg_groups/overrides.py: _gpt_oss_overrides).
 
         if resolved_view(server_args).moe_runner_backend == "triton_kernel":
-            assert (
-                resolved_view(server_args).ep_size == 1
-            ), "Triton kernel MoE is only supported when ep_size == 1"
+            assert resolved_view(server_args).ep_size == 1, (
+                "Triton kernel MoE is only supported when ep_size == 1"
+            )
 
     elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
@@ -474,7 +512,9 @@ def handle_model_specific_adjustments(server_args: Any):
             "ascend",
             "trtllm_mha",
             "intel_xpu",
-        }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
+        }, (
+            f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
+        )
         # The moe_runner_backend selection moved to the override registry
         # (arg_groups/overrides.py: _llama4_overrides).
     # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the override registry
@@ -516,9 +556,9 @@ def handle_model_specific_adjustments(server_args: Any):
             # https://docs.sglang.ai/advanced_features/attention_backend.html
             accepted_backends = ["fa3", "triton", "trtllm_mha"]
             attention_backend = resolved_view(server_args).attention_backend
-            assert (
-                attention_backend in accepted_backends
-            ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
+            assert attention_backend in accepted_backends, (
+                f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
+            )
     elif model_arch in ["Olmo2ForCausalLM"]:
         # disable_hybrid_swa_memory + attention backend selection moved to
         # the override registry (arg_groups/overrides.py: _olmo2_overrides).
@@ -527,9 +567,9 @@ def handle_model_specific_adjustments(server_args: Any):
         # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
         # but Olmo3 does.
         attention_backend = resolved_view(server_args).attention_backend
-        assert (
-            attention_backend != "flashinfer"
-        ), "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+        assert attention_backend != "flashinfer", (
+            "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+        )
 
         logger.info(f"Using {attention_backend} as attention backend for {model_arch}.")
     elif model_arch in [

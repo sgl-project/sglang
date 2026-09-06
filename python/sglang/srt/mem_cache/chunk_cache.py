@@ -127,9 +127,9 @@ class SWAChunkCache(ChunkCache):
         self.chunked_prefill_size = params.chunked_prefill_size
 
     def supports_swa(self) -> bool:
-        assert (
-            self.sliding_window_size is not None
-        ), "sliding_window_size must be set for SWAChunkCache"
+        assert self.sliding_window_size is not None, (
+            "sliding_window_size must be set for SWAChunkCache"
+        )
         return True
 
     def evict(self, params: EvictParams) -> EvictResult:

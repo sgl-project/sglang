@@ -426,8 +426,10 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_token_non_padded=_make_num_token_non_padded(draft_num_tokens, device),
-            num_token_non_padded_cpu=draft_num_tokens,
+            global_num_token_non_padded=_make_num_token_non_padded(
+                draft_num_tokens, device
+            ),
+            global_num_token_non_padded_cpu=draft_num_tokens,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
@@ -487,8 +489,8 @@ class DraftBlockProposer:
         num_tokens = forward_batch.input_ids.numel()
         num_token_non_padded = _make_num_token_non_padded(num_tokens, device)
         if num_token_non_padded is not None:
-            forward_batch.num_token_non_padded = num_token_non_padded
-        forward_batch.num_token_non_padded_cpu = num_tokens
+            forward_batch.global_num_token_non_padded = num_token_non_padded
+        forward_batch.global_num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
         pin_memory = is_pin_memory_available(device)

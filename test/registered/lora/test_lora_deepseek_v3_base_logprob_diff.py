@@ -73,7 +73,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
 
 
 class TestLoRADeepSeekV3BaseLogprobDiff(CustomTestCase):
-
     def test_lora_deepseek_v3_base_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,

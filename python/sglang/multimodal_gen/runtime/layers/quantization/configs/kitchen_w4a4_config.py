@@ -64,8 +64,7 @@ class KitchenW4A4Config(QuantizationConfig):
                 continue
             if marker_format != "convrot_w4a4":
                 raise ValueError(
-                    f"Unsupported Comfy W4A4 format for {prefix!r}: "
-                    f"{marker_format!r}"
+                    f"Unsupported Comfy W4A4 format for {prefix!r}: {marker_format!r}"
                 )
             self._parse_marker(prefix, marker)
 

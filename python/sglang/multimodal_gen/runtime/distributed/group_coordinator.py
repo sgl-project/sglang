@@ -87,8 +87,7 @@ def _split_tensor_dict(
     tensor_list = []
     for key, value in tensor_dict.items():
         assert "%" not in key, (
-            "Avoid having '%' in key "
-            "as it is used as a separator for nested entries."
+            "Avoid having '%' in key as it is used as a separator for nested entries."
         )
         if isinstance(value, torch.Tensor):
             # Note: we cannot use `value.device` here,
@@ -425,9 +424,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -481,9 +480,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -599,9 +598,9 @@ class GroupCoordinator:
 
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        assert (
-            src != self.rank
-        ), "Invalid source rank. Source rank is the same as the current rank."
+        assert src != self.rank, (
+            "Invalid source rank. Source rank is the same as the current rank."
+        )
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
@@ -621,9 +620,9 @@ class GroupCoordinator:
             object_tensor, src=self.ranks[src], group=self.cpu_group
         )
 
-        assert (
-            rank_object == rank_size
-        ), "Received object sender rank does not match the size sender rank."
+        assert rank_object == rank_size, (
+            "Received object sender rank does not match the size sender rank."
+        )
 
         obj = pickle.loads(object_tensor.numpy().tobytes())
 
@@ -652,9 +651,9 @@ class GroupCoordinator:
         rank = self.rank
         if rank == src_global_rank:
             metadata_list: List[Tuple[Any, Any]] = []
-            assert isinstance(
-                tensor_dict, dict
-            ), f"Expecting a dictionary, got {type(tensor_dict)}"
+            assert isinstance(tensor_dict, dict), (
+                f"Expecting a dictionary, got {type(tensor_dict)}"
+            )
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
@@ -736,9 +735,9 @@ class GroupCoordinator:
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
         metadata_list: List[Tuple[Any, Any]] = []
-        assert isinstance(
-            tensor_dict, dict
-        ), f"Expecting a dictionary, got {type(tensor_dict)}"
+        assert isinstance(tensor_dict, dict), (
+            f"Expecting a dictionary, got {type(tensor_dict)}"
+        )
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         # `metadata_list` lives in CPU memory.
         # `send_object_list` has serialization & deserialization,
@@ -1193,14 +1192,14 @@ class PipelineGroupCoordinator(GroupCoordinator):
     def get_pipeline_recv_data(
         self, idx: int = -1, name: str = "latent"
     ) -> torch.Tensor:
-        assert (
-            len(self.receiving_tasks) > 0
-        ), "No tasks to receive, call add_pipeline_recv_task first"
+        assert len(self.receiving_tasks) > 0, (
+            "No tasks to receive, call add_pipeline_recv_task first"
+        )
         receiving_task = self.receiving_tasks.pop(0)
         receiving_task[0].wait()
-        assert (
-            receiving_task[1] == name and receiving_task[2] == idx
-        ), "Received tensor does not match the requested"
+        assert receiving_task[1] == name and receiving_task[2] == idx, (
+            "Received tensor does not match the requested"
+        )
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):
@@ -1255,14 +1254,14 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.recv_skip_tasks_queue.append(idx)
 
     def get_pipeline_recv_skip_data(self, idx: int = -1) -> torch.Tensor:
-        assert (
-            len(self.receiving_skip_tasks) > 0
-        ), "No tasks to receive, call add_pipeline_recv_skip_task first"
+        assert len(self.receiving_skip_tasks) > 0, (
+            "No tasks to receive, call add_pipeline_recv_skip_task first"
+        )
         receiving_skip_task = self.receiving_skip_tasks.pop(0)
         receiving_skip_task[0].wait()
-        assert (
-            receiving_skip_task[2] == idx
-        ), "Received tensor does not match the requested"
+        assert receiving_skip_task[2] == idx, (
+            "Received tensor does not match the requested"
+        )
         return self.skip_tensor_recv_buffer[idx]
 
     def recv_skip_next(self):
