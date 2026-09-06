@@ -27,6 +27,8 @@ const MAX_STOP_REGEX_LEN: usize = 256;
 /// Most `stop_regex` patterns accepted per request. Python's `re` cache holds 512
 /// (`re._MAXCACHE`), so past that every pattern recompiles on every decode step.
 const MAX_STOP_REGEX_COUNT: usize = 32;
+const REQUEST_REASONING_END_TOKEN_IDS_KEY: &str = "__sglang_reasoning_end_token_ids";
+const MAX_REQUEST_REASONING_END_TOKEN_IDS: usize = 32;
 
 /// JSON values accepted by Python's `CustomParamValue`: a scalar, a list of
 /// scalars, or a string-keyed object whose values are scalars.
@@ -584,6 +586,38 @@ impl SamplingParams {
                 }
             }
         }
+        if let Some(value) = self
+            .custom_params
+            .as_ref()
+            .and_then(|params| params.get(REQUEST_REASONING_END_TOKEN_IDS_KEY))
+        {
+            let CustomParamValue::List(token_ids) = value else {
+                return Err(bad(
+                    "request reasoning end token IDs must be a list of integers".into(),
+                ));
+            };
+            if token_ids.is_empty() || token_ids.len() > MAX_REQUEST_REASONING_END_TOKEN_IDS {
+                return Err(bad(format!(
+                    "request reasoning end token IDs must contain 1 to \
+                     {MAX_REQUEST_REASONING_END_TOKEN_IDS} integers"
+                )));
+            }
+            for token_id in token_ids {
+                let in_vocab = match token_id {
+                    JsonScalar::Signed(token_id) => {
+                        *token_id >= 0 && (*token_id as u64) < vocab_size
+                    }
+                    JsonScalar::Unsigned(token_id) => *token_id < vocab_size,
+                    _ => false,
+                };
+                if !in_vocab {
+                    return Err(bad(format!(
+                        "request reasoning end token IDs must be integers in [0, {})",
+                        vocab_size
+                    )));
+                }
+            }
+        }
         // Grammars are mutually exclusive.
         let grammars = [
             &self.json_schema,
@@ -1053,6 +1087,27 @@ mod tests {
             assert!(
                 serde_json::from_str::<SamplingParams>(json).is_err(),
                 "{json} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn request_reasoning_end_token_ids_are_bounded_integers() {
+        let valid = norm(r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[17,18]}}"#);
+        assert!(valid.custom_params.is_some());
+
+        for body in [
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[-1]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[true]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[32000]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":"17"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SamplingParams>(body)
+                    .unwrap()
+                    .normalize(false, 32_000)
+                    .is_err()
             );
         }
     }

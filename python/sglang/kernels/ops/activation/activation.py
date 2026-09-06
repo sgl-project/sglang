@@ -134,6 +134,11 @@ def run_activation(
     if expert_ids is None:
         _run_activation_inplace(op_name, input, out)
     else:
+        # The JIT kernel indexes expert ids as int32. Routing ids may arrive as
+        # int64 (e.g. from torch.topk) and torch.compile realizes them at their
+        # true dtype, so normalize here instead of asserting downstream.
+        if expert_ids.dtype != torch.int32:
+            expert_ids = expert_ids.to(torch.int32)
         _run_activation_filtered_inplace(op_name, input, out, expert_ids, expert_step)
     return out
 
