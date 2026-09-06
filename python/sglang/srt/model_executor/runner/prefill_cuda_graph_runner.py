@@ -361,8 +361,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
-        # storage; same physical tensors, stable data_ptr for capture vs
-        # replay. Replaces populate_from_forward_batch on capture/replay paths.
+        # storage; same physical tensors, stable data_ptr for capture vs replay.
         self.buffer_registry: CudaGraphBufferRegistry = build_prefill_registry(
             device=self.device,
             max_bs=self.max_bs,
