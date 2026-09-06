@@ -548,7 +548,9 @@ class DeepseekV4AttnBackend(
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
-        self.swa_page_size = 128
+        # Logical 128-token SWA attention window. The physical SWA cache page
+        # size lives on the KV pool (``swa_page_size``).
+        self.swa_window_size = SWA_WINDOW
         assert model_runner.page_size is not None
         assert model_runner.req_to_token_pool is not None
         self.page_size = model_runner.page_size
@@ -611,6 +613,32 @@ class DeepseekV4AttnBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
+        # Per-(batch, compress_ratio, index widths) FlashMLASchedMeta for the
+        # MXFP4 fused decode kernel. Created lazily outside graph capture (the
+        # op allocates its scheduler tensors on first use), then reused across
+        # steps. A separate dict is used during CUDA-graph capture so the
+        # scheduler generation runs inside the graph exactly once per key.
+        self._mxfp4_sched_meta: dict = {}
+        self._mxfp4_sched_meta_capture: dict = {}
+        # Tracks whether the last call was inside a CUDA-graph capture, to
+        # detect the start of a new capture session (see forward()).
+        self._mxfp4_capture_active = False
+        # Split-K accumulator workspace for the MXFP4 fused decode, owned by
+        # this runner (never the module-global scratch in the op): one
+        # prefix-sliced arena per query-head count, sized for the largest
+        # decode batch this runner can produce.  A capture sweep then pins
+        # one arena instead of one accumulator pair per captured batch size
+        # (~0.5 GiB at h_q=64 on a stock capture list), and two runners
+        # sharing a process never race on the same scratch tensors.
+        draft_factor = self.speculative_num_draft_tokens or 1
+        self._mxfp4_accum_bcap = (
+            max(1, model_runner.server_args.max_running_requests or 1) * draft_factor
+        )
+        # h_q -> (lse rows, s_q, h_q) / (rows, s_q, h_q, d_v) float32 arenas.
+        self._mxfp4_accum_arenas: dict = {}
+        # Superseded arenas stay referenced until shutdown: CUDA graphs
+        # captured against them keep recording their addresses.
+        self._mxfp4_accum_retired: list = []
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
@@ -1437,7 +1465,7 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert self.req_to_token_pool.req_to_token is self.req_to_token
 
-        assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
+        assert self.page_size % 128 == 0
         if max_seq_len_override is None:
             max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
         if max_seq_len_override is not None:
@@ -1704,11 +1732,45 @@ class DeepseekV4AttnBackend(
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
-            swa_window_size = token_to_kv_pool.swa_window_size
+            # --- MXFP4 path (before FP8-specific reshapes) ---
+            if token_to_kv_pool.dsv4_kv_cache_store_mxfp4:
+                # Use sparse prefill for true multi-token extend (prefill)
+                # batches. For decode (single-token, or decode CUDA graph
+                # capture with bs>1 but is_extend=False), use the fused
+                # MXFP4 decode kernel.
+                num_q_tokens = q.shape[0]
+                is_real_extend = (
+                    forward_batch.forward_mode.is_extend_without_speculative()
+                )
+                if is_real_extend and num_q_tokens > 1:
+                    return self._forward_prefill_sparse(
+                        q=q,
+                        layer_id=layer_id,
+                        compress_ratio=compress_ratio,
+                        forward_batch=forward_batch,
+                        token_to_kv_pool=token_to_kv_pool,
+                        core_attn_metadata=core_attn_metadata,
+                        attn_sink=attn_sink,
+                    )
+                # Decode (or small extend): fused MXFP4 FlashMLA-style kernel
+                return self._forward_mxfp4_decode_flashmla(
+                    q=q,
+                    forward_batch=forward_batch,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=core_attn_metadata.swa_page_indices,
+                    swa_topk_lengths=core_attn_metadata.swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    compress_ratio=compress_ratio,
+                    attn_sink=attn_sink,
+                )
+
+            swa_page_size = token_to_kv_pool.swa_page_size
             assert swa_k_cache.ndim == 2
             k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
-            swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
-                swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
+            swa_k_cache = swa_k_cache[:, : swa_page_size * k_cache_total_dim].view(
+                swa_k_cache.shape[0], swa_page_size, 1, k_cache_total_dim
             )
 
             if extra_k_cache is not None:
@@ -1844,6 +1906,140 @@ class DeepseekV4AttnBackend(
 
         raise NotImplementedError("ragged attention")
 
+    def _mxfp4_decode_accum_arena(self, h_q: int, b: int) -> tuple:
+        """(lse, o) split-K arena for the MXFP4 decode at ``h_q`` heads.
+
+        Rows are sized for ``max(batch capacity, current batch) + sm parts``;
+        every smaller batch prefix-slices the same allocation, so addresses
+        stay CUDA-graph stable without one accumulator pair per batch size.
+        An oversized batch (eager fallback beyond the configured capacity)
+        grows the arena; the previous one is retired but kept referenced, as
+        already-captured graphs still address it.
+        """
+        from sglang.kernels.ops.attention.dsv4.mxfp4_dsv4_decode_sm90 import (
+            _num_sm_parts,
+        )
+
+        arena = self._mxfp4_accum_arenas.get(h_q)
+        num_sm_parts = _num_sm_parts(b, 1, h_q, self.device)
+        rows_needed = max(b, self._mxfp4_accum_bcap) + num_sm_parts
+        if arena is None or arena[0].shape[0] < rows_needed:
+            if arena is not None:
+                logger.warning(
+                    "MXFP4 decode batch %d exceeds the accumulator arena "
+                    "(%d rows, capacity %d); reallocating",
+                    b,
+                    arena[0].shape[0],
+                    self._mxfp4_accum_bcap,
+                )
+                self._mxfp4_accum_retired.append(arena)
+            arena = (
+                torch.empty(
+                    (rows_needed, 1, h_q), dtype=torch.float32, device=self.device
+                ),
+                torch.empty(
+                    (rows_needed, 1, h_q, 512), dtype=torch.float32, device=self.device
+                ),
+            )
+            self._mxfp4_accum_arenas[h_q] = arena
+        return arena
+
+    def _forward_mxfp4_decode_flashmla(
+        self,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        compress_ratio: Literal[0, 4, 128],
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """MXFP4 decode via the fused FlashMLA-style kernel (per-request).
+
+        One call covers SWA + C4/C128 + attn_sink with a single online
+        softmax. Cache tensors are consumed in place: the SWA cache is a
+        tightly packed flat-slot pool (one 368-byte row per token, so
+        page_block_size=1), and the C4/C128 caches keep their physical
+        page layout.
+        """
+        from sglang.kernels.ops.attention.dsv4.mxfp4_dsv4_decode_sm90 import (
+            FlashMLASchedMeta,
+            flash_mla_with_kvcache_dsv4_mxfp4,
+        )
+        from sglang.kernels.ops.attention.dsv4.mxfp4_k_cache import (
+            MXFP4_BYTES_PER_TOKEN,
+        )
+
+        assert (
+            q.ndim == 3 and q.shape[2] == 512
+        ), f"expect [bs, heads, 512], got {q.shape}"
+        bs, h_q, _ = q.shape
+        assert h_q in (64, 128)
+
+        swa_cache_4d = swa_k_cache.view(-1, 1, 1, MXFP4_BYTES_PER_TOKEN)
+        swa_indices_3d = swa_page_indices.unsqueeze(1).contiguous()
+        swa_lengths = swa_topk_lengths.contiguous()
+
+        have_extra = compress_ratio > 0 and extra_k_cache is not None
+        extra_cache_4d = extra_indices_3d = extra_lengths = None
+        if have_extra:
+            page_size = self.token_to_kv_pool.page_size // compress_ratio
+            extra_cache_4d = extra_k_cache.view(
+                extra_k_cache.shape[0], page_size, 1, MXFP4_BYTES_PER_TOKEN
+            )
+            extra_indices_3d = extra_indices.unsqueeze(1).contiguous()
+            extra_lengths = extra_topk_lengths.contiguous()
+
+        # The scheduler config includes the padded index widths, which differ
+        # between decode (128) and small extends (seq-dependent multiple of 64).
+        key = (
+            bs,
+            compress_ratio,
+            swa_indices_3d.shape[-1],
+            extra_indices_3d.shape[-1] if have_extra else 0,
+        )
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and not self._mxfp4_capture_active:
+            # A new capture session: drop scheduler instances from previous
+            # sessions so each graph records its own scheduler generation —
+            # a later capture with the same geometry must not reuse another
+            # graph's (stale) metadata buffers.
+            self._mxfp4_sched_meta_capture.clear()
+        self._mxfp4_capture_active = capturing
+        if capturing:
+            # During capture the scheduler generation must run inside the
+            # graph (topk lengths are replayed device inputs) so it tracks
+            # replayed lengths; share one metadata per key so the generation
+            # kernel is captured once per (bs, ratio, widths) instead of once
+            # per layer (44x per decode step otherwise).
+            sched_meta = self._mxfp4_sched_meta_capture.get(key)
+            if sched_meta is None:
+                sched_meta = FlashMLASchedMeta()
+                self._mxfp4_sched_meta_capture[key] = sched_meta
+        else:
+            sched_meta = self._mxfp4_sched_meta.get(key)
+            if sched_meta is None:
+                sched_meta = FlashMLASchedMeta()
+                self._mxfp4_sched_meta[key] = sched_meta
+
+        o, _ = flash_mla_with_kvcache_dsv4_mxfp4(
+            q=q.unsqueeze(1),
+            k_cache=swa_cache_4d,
+            indices=swa_indices_3d,
+            topk_length=swa_lengths,
+            attn_sink=attn_sink,
+            tile_scheduler_metadata=sched_meta,
+            softmax_scale=self.softmax_scale,
+            extra_k_cache=extra_cache_4d,
+            extra_indices_in_kvcache=extra_indices_3d,
+            extra_topk_length=extra_lengths,
+            split_accum_buffers=self._mxfp4_decode_accum_arena(h_q, bs),
+        )
+        return o.squeeze(1)
+
     def _forward_prefill_sparse(
         self,
         q: torch.Tensor,
@@ -1916,19 +2112,40 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
-            dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
+        is_mxfp4 = token_to_kv_pool.dsv4_kv_cache_store_mxfp4
+        if is_mxfp4:
+            from sglang.kernels.ops.attention.dsv4.mxfp4_k_cache import (
+                dequantize_dsv4_mxfp4_k_cache_paged,
             )
-        dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
-            page_size=cache.swa_page_size,
-            out=swa_slice,
-        )
+
+            if compressed_slice is not None:
+                dequantize_dsv4_mxfp4_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            dequantize_dsv4_mxfp4_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+            )
+
+        else:
+            if compressed_slice is not None:
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            dequantize_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+            )
         kv = workspace
 
         o, _, _ = flash_mla_sparse_fwd(
@@ -2208,7 +2425,7 @@ class DeepseekV4AttnBackend(
         dspark_block_size: Optional[int] = None,
         num_tokens: Optional[int] = None,
     ) -> DSV4AttnMetadata:
-        assert self.swa_page_size == SWA_WINDOW
+        assert self.swa_window_size == SWA_WINDOW
 
         prep = BuildPageTablePositions.execute(
             req_to_token=req_to_token,

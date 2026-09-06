@@ -75,7 +75,9 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.utils.common import (
+    get_device_capability,
     get_quantization_config,
+    is_cuda,
     is_gfx95_supported,
     xpu_has_xmx_support,
 )
@@ -950,13 +952,42 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
 
     kv_cache_dtype = view.kv_cache_dtype
     if kv_cache_dtype == "auto":
-        kv_cache_dtype = "fp8_e4m3"
-        logger.warning(f"Setting KV cache dtype to {kv_cache_dtype} for {model_arch}.")
+        if envs.SGLANG_OPT_DSV4_MXFP4_KVCACHE.get():
+            # Legacy env-var alias for the MXFP4 KV cache recipe.
+            kv_cache_dtype = "fp4_e2m1"
+        else:
+            kv_cache_dtype = "fp8_e4m3"
+            logger.warning(
+                f"Setting KV cache dtype to {kv_cache_dtype} for {model_arch}."
+            )
     if view.device == "npu":
         kv_cache_dtype = "bfloat16"
+    if kv_cache_dtype == "fp4_e2m1":
+        if view.fp4_kv_cache_recipe != "mxfp4":
+            raise ValueError(
+                "DeepSeek V4 with fp4_e2m1 KV cache currently supports only "
+                "--fp4-kv-cache-recipe=mxfp4."
+            )
+        # get_device() reports "cuda" on ROCm as well, so gate on is_cuda()
+        # (true CUDA: torch.version.cuda is set), not the device string.
+        # Without this, ROCm/XPU/MUSA accept fp4_e2m1 at startup and die
+        # later at the JIT compile instead.
+        if not is_cuda():
+            raise ValueError(
+                "DeepSeek V4 MXFP4 KV cache (--kv-cache-dtype fp4_e2m1) "
+                "requires a CUDA SM90 (Hopper) GPU; this process is not "
+                "running on CUDA."
+            )
+        major, _ = get_device_capability()
+        if major != 9:
+            raise ValueError(
+                "DeepSeek V4 MXFP4 KV cache (--kv-cache-dtype fp4_e2m1) "
+                f"requires an SM90 (Hopper) GPU, got SM{major}."
+            )
     assert kv_cache_dtype in [
         "fp8_e4m3",
         "bfloat16",
+        "fp4_e2m1",
     ], f"{kv_cache_dtype} is not supported for {model_arch}"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}

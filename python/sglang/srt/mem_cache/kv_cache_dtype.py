@@ -62,12 +62,7 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
-    elif server_args_kv_cache_dtype == "fp4_e2m1":
-        raise ValueError(
-            "--kv-cache-dtype=fp4_e2m1 is deprecated. "
-            "Use --kv-cache-dtype=fp4_mx_block16."
-        )
-    elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+    elif server_args_kv_cache_dtype in ("fp4_e2m1", "nvfp4", "fp4_mx_block16"):
         if hasattr(torch, "float4_e2m1fn_x2"):
             kv_cache_dtype = torch.float4_e2m1fn_x2
             logger.warning(

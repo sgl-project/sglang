@@ -2167,6 +2167,53 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _deepseek_v4_kv_cache_dtype(_view(arch="LlamaForCausalLM")), {}
         )
 
+        # fp4_e2m1: only the mxfp4 recipe, only real CUDA (the device string
+        # is "cuda" on ROCm too), only SM90. Without the is_cuda() gate,
+        # non-CUDA platforms accepted fp4_e2m1 at startup and died at the
+        # JIT compile instead.
+        fp4 = dict(kv_cache_dtype="fp4_e2m1", fp4_kv_cache_recipe="mxfp4")
+        with self.assertRaisesRegex(ValueError, "mxfp4"):
+            _deepseek_v4_kv_cache_dtype(
+                _view(**{**fp4, "fp4_kv_cache_recipe": "nvfp4"})
+            )
+        with patch("sglang.srt.arg_groups.overrides.is_cuda", return_value=False):
+            with self.assertRaisesRegex(ValueError, "not running on CUDA"):
+                _deepseek_v4_kv_cache_dtype(_view(**fp4))
+        with patch("sglang.srt.arg_groups.overrides.is_cuda", return_value=True), patch(
+            "torch.cuda.get_device_capability", return_value=(10, 0)
+        ):
+            with self.assertRaisesRegex(ValueError, "SM90"):
+                _deepseek_v4_kv_cache_dtype(_view(**fp4))
+        with patch("sglang.srt.arg_groups.overrides.is_cuda", return_value=True), patch(
+            "torch.cuda.get_device_capability", return_value=(9, 0)
+        ):
+            self.assertEqual(_deepseek_v4_kv_cache_dtype(_view(**fp4)), {})
+
+    def test_kv4_compatibility_scopes_fp4_e2m1_to_dsv4(self):
+        """The fp4_e2m1 --kv-cache-dtype spelling means the DSV4 MXFP4 recipe.
+
+        Other models used to fall through to the KV-cache quant registry,
+        which rejected fp4_e2m1 as "deprecated" deep in pool construction;
+        the kv4 compatibility handler must reject it at startup instead.
+        """
+        from sglang.srt.server_args import ServerArgs
+
+        def _args(arch, kv_cache_dtype):
+            hf = SimpleNamespace(architectures=[arch])
+            return SimpleNamespace(
+                kv_cache_dtype=kv_cache_dtype,
+                get_model_config=lambda: SimpleNamespace(hf_config=hf),
+            )
+
+        handler = ServerArgs._handle_kv4_compatibility
+        with self.assertRaisesRegex(ValueError, "DeepSeek V4"):
+            handler(_args("LlamaForCausalLM", "fp4_e2m1"))
+        # DSV4 passes through the handler; recipe/SM90 are validated at the
+        # DSV4 resolution slot that runs earlier.
+        handler(_args("DeepseekV4ForCausalLM", "fp4_e2m1"))
+        # Unrelated dtypes are untouched.
+        handler(_args("LlamaForCausalLM", "fp8_e4m3"))
+
     def test_deepseek_spec_moe_resolution_pass(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
