@@ -1023,19 +1023,14 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         )
     }
 
-    /// Return the longest device-resident Full-KV prefix without touching LRU state,
-    /// incrementing hit counts, or splitting a partially matched edge.
+    /// Length of the longest device-resident Full-KV prefix of `key`, read-only:
+    /// no LRU refresh, no hit-count bump, no split of a partially matched edge.
     ///
-    /// This is intended for read-only LPM scoring. The mutable [`Self::match_prefix`]
-    /// remains the admission path when callers need component consensus and a node
-    /// handle to lock.
-    pub fn prefix_match_len(&self, params: &MatchPrefixParams<'_, K>) -> usize {
-        self.prefix_match_atoms_len(params.key.as_ref(), params.namespace)
-    }
-
-    /// Slice-based variant of [`Self::prefix_match_len`] for allocation-free
-    /// scheduling against a key already stored as radix atoms.
-    pub fn prefix_match_atoms_len(&self, key: &[K::Atom], namespace: KeyNamespaceRef<'_>) -> usize {
+    /// On a FULL-only tree this is the prefix [`Self::match_prefix`] would admit.
+    /// It ignores the SWA and Mamba validators, which can admit less, and it does
+    /// not count host-resident (evicted) Full nodes, so score SWA or Mamba trees
+    /// with `match_prefix`, and use `match_prefix` whenever a node handle is needed.
+    pub fn full_kv_prefix_len(&self, key: &[K::Atom], namespace: KeyNamespaceRef<'_>) -> usize {
         let aligned_key_len = key.len() / self.page_size * self.page_size;
         let mut node_id = self.arena.root();
         let mut offset = 0;

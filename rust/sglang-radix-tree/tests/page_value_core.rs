@@ -38,16 +38,15 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
 
     let partial_key = vec![10, 20, 50, 60];
     assert_eq!(
-        tree.prefix_match_len(&MatchPrefixParams {
-            key: &partial_key,
-            namespace: KeyNamespaceRef::default(),
-        }),
+        tree.full_kv_prefix_len(&partial_key, KeyNamespaceRef::default()),
         2
     );
-    assert_eq!(
-        tree.prefix_match_atoms_len(&partial_key, KeyNamespaceRef::default()),
-        2
-    );
+    // On a FULL-only tree the read-only length is the admitted prefix.
+    let admitted = tree.match_prefix(&MatchPrefixParams {
+        key: &partial_key,
+        namespace: KeyNamespaceRef::default(),
+    });
+    assert_eq!(admitted.device_indices.len(), 2);
 
     let prefix_key = vec![10, 20];
     let prefix = tree.match_prefix(&MatchPrefixParams {
@@ -153,6 +152,41 @@ fn continuation_insert_rejects_a_host_only_anchor() {
     ));
     tree.try_sanity_check(&[], &[])
         .expect("the rejected insert leaves the tree consistent");
+}
+
+#[test]
+fn full_kv_prefix_len_is_the_full_hit_not_the_admitted_prefix_on_mamba_trees() {
+    let mut tree = TestCore::new(
+        CacheInitParams {
+            mamba_cache_chunk_size: Some(1),
+            ..Default::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let key = vec![10, 20, 30, 40];
+    tree.insert(&InsertParams {
+        key: &key,
+        namespace: KeyNamespaceRef::default(),
+        value: PageValue::from_vec(vec![1, 2, 3, 4]),
+        prev_prefix_len: 0,
+        swa_evicted_seqlen: 0,
+        mamba_value: Some(PageValue::from_vec(vec![7])),
+        chunked: false,
+        priority: 0,
+        track_adopted_ranges: false,
+    });
+
+    // A partial hit splits the node, and the split parent holds no Mamba state,
+    // so the Mamba validator admits nothing even though Full KV matches two atoms.
+    let partial_key = vec![10, 20, 50, 60];
+    let read_only = tree.full_kv_prefix_len(&partial_key, KeyNamespaceRef::default());
+    let admitted = tree.match_prefix(&MatchPrefixParams {
+        key: &partial_key,
+        namespace: KeyNamespaceRef::default(),
+    });
+    assert_eq!(read_only, 2);
+    assert_eq!(admitted.full_kv_hit_length, read_only);
+    assert_eq!(admitted.device_indices.len(), 0);
 }
 
 #[test]

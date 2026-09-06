@@ -38,7 +38,7 @@ LIBTORCH_USE_PYTORCH=1 LIBTORCH_BYPASS_VERSION_CHECK=1 \
   cargo test --locked --no-default-features --features torch
 ```
 
-Native consumers instantiate `UnifiedTreeCore<K, PageValue<PageId>>` with `new`. `prefix_match_len` provides allocation-free, read-only LPM scoring, while `match_prefix` returns the retained `NodeId` used by `insert_suffix_from_node` for suffix-only decode or chunked-prefill growth. A continuation insert touches only the anchor: the retained prefix gets no LRU refresh, hit-count bump, or component overlap hooks, so use a root `insert` when those matter. Pool allocation, request leases, and event publication remain downstream responsibilities.
+Native consumers instantiate `UnifiedTreeCore<K, PageValue<PageId>>` with `new`. `full_kv_prefix_len` scores a key's device-resident Full-KV prefix without mutating the tree; that is the admitted prefix on FULL-only trees, while SWA and Mamba validators can admit less, so score those trees with `match_prefix`. `match_prefix` also returns the retained `NodeId` used by `insert_suffix_from_node` for suffix-only decode or chunked-prefill growth. A continuation insert touches only the anchor: the retained prefix gets no LRU refresh, hit-count bump, or component overlap hooks, so use a root `insert` when those matter. Pool allocation, request leases, and event publication remain downstream responsibilities.
 
 When a simulator keys the tree by one precomputed hash per KV page, each hash is already one radix atom: configure the core with `page_size = 1`, store one `PageId` per hash, and convert page counts to token counts at the simulator boundary.
 
