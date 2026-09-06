@@ -285,7 +285,6 @@ def _dsv4_batch_needs_visible_window(local_batch: ScheduleBatch, model_config) -
         local_batch.multimodal_inputs,
         local_batch.prefix_lens,
         local_batch.extend_lens,
-        getattr(model_config, "sliding_window_size", None) or 128,
     )
 
 

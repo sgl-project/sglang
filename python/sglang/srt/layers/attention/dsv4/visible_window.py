@@ -15,10 +15,15 @@ Image blocks are atomic across chunk boundaries and cache matches. This module
 is torch-free so scheduling can use the same boundaries as attention metadata.
 """
 
-from typing import List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Iterator, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import MultimodalInputs
 
 
-def iter_image_spans(mm_input):
+def iter_image_spans(
+    mm_input: Optional["MultimodalInputs"],
+) -> Iterator[Tuple[int, int]]:
     """Yield half-open DSV4 image blocks, including compression padding."""
     if mm_input is None:
         return
@@ -39,7 +44,7 @@ def _iter_visible_window_spans(
     mm_inputs,
     prefix_lens: Sequence[int],
     extend_lens: Sequence[int],
-):
+) -> Iterator[Tuple[int, int, int]]:
     for req_idx, mm_input in enumerate(mm_inputs or []):
         prefix = int(prefix_lens[req_idx])
         extend_end = prefix + int(extend_lens[req_idx])
@@ -59,7 +64,6 @@ def has_visible_window_span(
     mm_inputs,
     prefix_lens: Sequence[int],
     extend_lens: Sequence[int],
-    swa_window: int,
 ) -> bool:
     """True iff any request's extend chunk needs per-token visible-window
     overrides (and is therefore ineligible for fixed-shape prefill cuda
