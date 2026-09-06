@@ -14,12 +14,10 @@
 """Breakable CUDA Graph: capture a region as a sequence of
 torch.cuda.CUDAGraph segments separated by eager break points.
 
-Each segment is a real torch.cuda.CUDAGraph. Its destructor calls
-releasePool on the shared mempool, so the pool's use_count tracks how
-many segments are alive; the pool stays pinned as long as any segment graph
-is alive. This lets weak_ref_tensor views of intermediate pool-allocated
-tensors remain valid across replays — we don't need Python-managed bridge
-buffers to keep break-point tensors at stable addresses.
+Each segment is a real torch.cuda.CUDAGraph sharing one mempool. The pool's
+use_count only keeps the pool itself alive; a block freed inside it is still
+re-carved by later captures, so every break-point tensor read at replay time
+must be held by a strong Python reference.
 """
 
 import threading
@@ -153,27 +151,6 @@ def _uninstall_wait_stream_hook():
             _original_wait_stream = None
 
 
-def _weak_ref_if_tensor(x):
-    """Return a weak-ref tensor view (shared storage, no refcount) for tensors;
-    recurse into tuples/lists; pass-through for non-tensors. Weak-ref'ing
-    captured args lets the shared mempool reclaim per-layer intermediates
-    between segments — storage stays alive for each segment CUDAGraph's
-    lifetime via its pool use_count.
-
-    weak_ref_tensors is imported lazily because it hard-raises on
-    platforms without a CUDA/HIP/NPU backend; we only reach this code during
-    an active Breakable capture, which runs only on those backends."""
-    if torch.is_tensor(x):
-        from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
-
-        return weak_ref_tensors(x)
-    if isinstance(x, tuple):
-        return tuple(_weak_ref_if_tensor(e) for e in x)
-    if isinstance(x, list):
-        return [_weak_ref_if_tensor(e) for e in x]
-    return x
-
-
 def _copy_output(dst: Any, src: Any) -> Any:
     """Copy src output into dst in-place where possible.
 
@@ -243,16 +220,13 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             else:
                 output = inner(*args, **kwargs)
 
-            # Weak-ref captured inputs produced by graph segments. Their storage
-            # is pinned by the segment CUDAGraphs' mempool use-count, so Python
-            # refs do not need to keep every intermediate alive.
+            # Strong refs: the shared pool re-carves freed blocks into later
+            # captures, corrupting replay reads (use_count pins pool, not blocks).
             captured_inner = inner
-            captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
-            captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
-            # The eager break output is different: it is allocated between graph
-            # captures and is the static input address consumed by the next
-            # captured segment. Keep a strong reference so replay can safely
-            # copy fresh eager output into that bridge buffer.
+            captured_args = args
+            captured_kwargs = kwargs
+            # The eager break output is the static input address consumed by the
+            # next captured segment; replay copies fresh eager output into it.
             captured_output = output
 
             def replay_fn():
@@ -304,10 +278,9 @@ class BreakableCUDAGraphCapture:
     torch.cuda.CUDAGraph segments separated by eager break points.
 
     Each segment shares the supplied pool (MempoolId_t tuple) so
-    pool-allocated intermediates can be reused across segments. While any
-    segment is alive, its beginAllocateToPool call keeps the mempool's
-    use_count > 0, which makes weak_ref_tensor of segment-allocated
-    tensors safe across subsequent replays.
+    pool-allocated intermediates can be reused across segments. That reuse
+    also lets a later capture claim any freed block, so segment-allocated
+    tensors stay valid across replays only while strongly referenced.
     """
 
     def __init__(
