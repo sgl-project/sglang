@@ -64,6 +64,7 @@ def harness(monkeypatch):
     monkeypatch.setattr(test_server_common, "_PENDING_BASELINE_DUMPS", {})
     monkeypatch.setattr(test_server_common, "get_generate_fn", Mock())
     monkeypatch.setattr(runner, "_validate_consistency", Mock())
+    monkeypatch.setattr(runner, "_validate_audio_consistency", Mock())
     monkeypatch.setattr(runner, "_dump_baseline_for_testcase", Mock())
     case = DiffusionTestCase(
         "first",
@@ -183,6 +184,29 @@ def test_empty_content_is_not_a_consistency_pass(harness):
     runner, case = harness
     with pytest.raises(pytest.fail.Exception, match="Empty output"):
         test_server_common.DiffusionServerBase._validate_consistency(runner, case, b"")
+
+
+@pytest.mark.parametrize("bad_request", [0, 1])
+def test_audio_checked_even_when_video_consistency_fails(
+    harness, monkeypatch, bad_request
+):
+    runner, case = harness
+    case = replace(
+        case,
+        server_args=replace(case.server_args, modality="video"),
+        sampling_params=replace(case.sampling_params, expect_audio_output=True),
+    )
+    runner._validate_consistency.side_effect = AssertionError("wrong pixels")
+    audio_checks = [None, None]
+    audio_checks[bad_request] = AssertionError("wrong audio")
+    runner._validate_audio_consistency.side_effect = audio_checks
+    monkeypatch.setattr(
+        runner, "run_and_collect", Mock(return_value=(_perf_record(), b"output"))
+    )
+    with pytest.raises(pytest.fail.Exception, match="audio consistency.*wrong audio"):
+        runner.test_diffusion_generation(case, object())
+    assert runner._validate_consistency.call_count == 2
+    assert runner._validate_audio_consistency.call_count == 2
 
 
 @pytest.mark.parametrize("repeat", [0, -1])

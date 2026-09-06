@@ -900,9 +900,6 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
         )
 
-        if case.sampling_params.expect_audio_output:
-            self._validate_audio_consistency(case, content)
-
     def _validate_audio_consistency(
         self,
         case: DiffusionTestCase,
@@ -1673,11 +1670,19 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 lambda: self._test_t2v_rejects_input_reference(diffusion_server, case),
             )
 
-        if case.run_consistency_check:
+        if (
+            case.run_consistency_check
+            and os.environ.get("SGLANG_SKIP_CONSISTENCY", "0") != "1"
+        ):
             run_case_check(
                 "consistency",
                 lambda: self._validate_consistency(case, content),
             )
+            if case.sampling_params.expect_audio_output:
+                run_case_check(
+                    "audio consistency",
+                    lambda: self._validate_audio_consistency(case, content),
+                )
 
         if case.run_lora_basic_api_check:
             run_case_check(
