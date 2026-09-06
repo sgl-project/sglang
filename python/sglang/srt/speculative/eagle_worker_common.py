@@ -495,6 +495,10 @@ def run_eagle_verify(
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
     with plan_stream_ctx:
+        if plan_stream is not None:
+            # Verify prep copies draft-produced tree metadata on the plan stream,
+            # so it must not start before the draft frontier.
+            plan_stream.wait_stream(fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
