@@ -824,7 +824,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False
             )
-
+        # With decode hicache enabled, retract requests must not consume pending_restore_tokens;
+        # otherwise, insufficient memory will cause incomplete KV cache loading, lead
+        if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            reserved_restore_tokens = self._hicache_pending_restore_tokens()
+            full_allocatable_tokens = self._allocatable_token_budgets(
+                count_retracted=False,
+                hicache_reserved_tokens=reserved_restore_tokens,
+            )
+            
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
                 continue
@@ -2657,6 +2665,9 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
+                # Determine whether the current request is a 
+                # retract request when decode hicache is enabled.
+                is_retract_req = req.last_node is None
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
@@ -2665,6 +2676,19 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
+                # Only enter when decode hicache is enabled
+                #  and the current request is a retract request
+                if is_retract_req and get_disagg().disaggregation_decode_enable_radix_cache:
+                    # init_next_round_input() performs prefix matching and sets req.last_node without locking it.
+                    # Upon request completion, this memory is freed. Without prior locking, an extra unlock occurs,
+                    # ultimately causing a hiradix_tree memory leak.
+                    self.tree_cache.inc_lock_ref(req.last_node)
+                    # Even with decode hicache enabled, retract requests skip prefix matching during memory pre-allocation,
+                    # allocating memory for the entire sequence length instead. However, prefix matching is performed 
+                    # in init_next_round_input(), which assigns a value to cache_protected_len upon a hit.
+                    # When inserting the retract request's KV cache into the hiradix_tree, the memory for 
+                    # [:cache_protected_len] is not freed, causing a memory leak.
+                    req.cache_protected_len = 0
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
