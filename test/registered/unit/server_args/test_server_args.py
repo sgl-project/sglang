@@ -180,6 +180,25 @@ class TestPrepareServerArgs(CustomTestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
 
+    def test_aiter_dsa_topk_backend_cli_choices(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        target = parser.parse_args(
+            ["--model-path", "dummy-model", "--dsa-topk-backend", "aiter"]
+        )
+        self.assertEqual(target.dsa_topk_backend, "aiter")
+
+        draft = parser.parse_args(
+            [
+                "--model-path",
+                "dummy-model",
+                "--speculative-dsa-topk-backend",
+                "aiter",
+            ]
+        )
+        self.assertEqual(draft.speculative_dsa_topk_backend, "aiter")
+
     def test_return_hidden_states_mode_configuration(self):
         def _resolved(**kwargs):
             server_args = ServerArgs(**kwargs)
