@@ -33,6 +33,22 @@ def _try_cuda_backend() -> bool:
     return _cuda_backend_enabled
 
 
+def _maybe_pin(t):
+    """Pin a CPU tensor, returning it unpinned if pinning fails.
+
+    On unified-memory systems (e.g. Grace-Blackwell, sm_121) the pinned-memory
+    pool competes with the model's memory pool, so pin_memory() can fail
+    deterministically. Pinning is a host-to-device transfer optimization, not a
+    correctness requirement, so fall back rather than failing the request.
+    """
+    if t.device.type == "cpu":
+        try:
+            return t.pin_memory()
+        except RuntimeError:
+            return t
+    return t
+
+
 class VideoDecoderWrapper:
     """Unified video decoder that uses torchcodec when available, decord as fallback.
 
@@ -110,7 +126,7 @@ class VideoDecoderWrapper:
             return self._decoder.get_batch(indices).asnumpy()
 
     def get_frames_as_tensor(self, indices: list):
-        """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
+        """Return frames at given indices as a torch tensor (NHWC, uint8). pin_memory is best-effort."""
         import torch
 
         if (
@@ -127,10 +143,10 @@ class VideoDecoderWrapper:
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
-            return batch.data.pin_memory()
+            return _maybe_pin(batch.data)
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
-            return torch.from_numpy(arr).pin_memory()
+            return _maybe_pin(torch.from_numpy(arr))
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
@@ -156,7 +172,7 @@ class VideoDecoderWrapper:
                 idx = future_to_idx[future]
                 results[idx] = future.result()
 
-        return torch.cat(results, dim=0).pin_memory()
+        return _maybe_pin(torch.cat(results, dim=0))
 
     @property
     def source_bytes(self) -> bytes | None:
