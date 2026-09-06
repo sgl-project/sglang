@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -844,9 +845,11 @@ class SWAComponent(TreeComponent):
         swa_uuid_for_lock: Optional[int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        skip_lock_node_ids: Collection[NodeId] = (),
     ) -> None:
         """Early-release the SWA lock along [node, swa_uuid_for_lock] while
-        leaving Full and Mamba locks intact.
+        leaving the higher-priority Full lock intact. The tree core separately
+        releases any co-located lower-priority locks.
 
         Called when a request's decode position has advanced past the sliding
         window — the SWA portion of the tree lock is no longer needed but the
@@ -860,6 +863,10 @@ class SWAComponent(TreeComponent):
 
         cur = node
         while cur is not root:
+            if cur.id in skip_lock_node_ids:
+                cur = cur.parent
+                continue
+
             cd = cur.component_data[ct]
             # Acquire skips tombstoned nodes; release must skip them too. Same
             # for nodes with lock_ref == 0 — acquire never credited them.

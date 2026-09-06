@@ -167,6 +167,7 @@ class _RecordingComp:
         self.component_type = component_type
         self._priority = priority
         self.released = []
+        self.window_skip_lock_node_ids = None
 
     def eviction_priority(self, is_leaf):
         return self._priority
@@ -175,9 +176,14 @@ class _RecordingComp:
         self.released.append(params)
 
     def release_window_lock(  # SWA only
-        self, node, swa_uuid_for_lock, device_frees, host_frees
+        self,
+        node,
+        swa_uuid_for_lock,
+        device_frees,
+        host_frees,
+        skip_lock_node_ids=(),
     ):
-        pass
+        self.window_skip_lock_node_ids = skip_lock_node_ids
 
 
 class TestDecSwaLockSkip(unittest.TestCase):
@@ -203,9 +209,10 @@ class TestDecSwaLockSkip(unittest.TestCase):
             tree_core,
             node.id,
             swa_uuid_for_lock=None,
-            skip_lock_node_ids={ComponentType.MAMBA: {7}},
+            skip_lock_node_ids={ComponentType.SWA: {7}, ComponentType.MAMBA: {7}},
         )
 
+        self.assertEqual(swa.window_skip_lock_node_ids, {7})
         # mamba (below swa) is released, honoring the skip set
         self.assertEqual(len(mamba.released), 1)
         self.assertEqual(
