@@ -1623,6 +1623,8 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    # SM120 only: pad small-M in_proj_ba GEMMs past a cuBLAS heuristic cliff.
+    SGLANG_ENABLE_GDN_BA_PAD = EnvBool(True)
     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
     # One switch enables deferred MoE finalize and AR + residual + RMSNorm.
