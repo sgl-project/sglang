@@ -60,7 +60,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_model, get_parallel, get_spec
+from sglang.srt.runtime_context import get_lora, get_model, get_parallel, get_spec
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
 
@@ -96,6 +96,35 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+
+def _can_use_draft_local_argmax(
+    requested: bool,
+    cuda_backend: bool,
+    tp_size: int,
+    spec,
+    parallel,
+    num_added_embeddings: int,
+    lora_enabled: bool,
+    supported_lm_head: bool,
+    vocab_size: int,
+) -> bool:
+    return (
+        requested
+        and cuda_backend
+        and tp_size > 1
+        and (spec.speculative_algorithm or "").upper() in ("EAGLE", "NEXTN")
+        and spec.speculative_eagle_topk == 1
+        and not spec.speculative_use_rejection_sampling
+        and spec.speculative_token_map is None
+        and not parallel.enable_dp_attention
+        and not parallel.enable_dp_lm_head
+        and not parallel.enable_tp_lm_head_all_to_all
+        and num_added_embeddings == 0
+        and not lora_enabled
+        and supported_lm_head
+        and vocab_size < 2**24
+    )
 
 
 class DeepseekModelNextN(nn.Module):
@@ -391,7 +420,31 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             prefix=add_prefix("model.shared_head.head", prefix),
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
-        self.logits_processor = LogitsProcessor(config)
+        parallel = get_parallel()
+        spec = get_spec()
+        self._draft_local_argmax_enabled = _can_use_draft_local_argmax(
+            spec.speculative_draft_local_argmax,
+            _is_cuda,
+            self.tp_size,
+            spec,
+            parallel,
+            self.lm_head.num_added_embeddings,
+            get_lora().enable_lora,
+            isinstance(self.lm_head, ParallelLMHead),
+            config.vocab_size,
+        )
+        self.logits_processor = LogitsProcessor(
+            config, skip_all_gather=self._draft_local_argmax_enabled
+        )
+
+    @property
+    def _draft_vocab_parallel_argmax_fn(self):
+        if not self._draft_local_argmax_enabled:
+            return None
+        return self._draft_vocab_parallel_argmax
+
+    def _draft_vocab_parallel_argmax(self, local_logits: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor._vocab_parallel_argmax(local_logits, self.lm_head)
 
     @torch.no_grad()
     def forward(
