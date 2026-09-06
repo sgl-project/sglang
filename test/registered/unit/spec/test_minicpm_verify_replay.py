@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.minicpm.sparse_utils import (
     _plan_repeated_segments,
     _plan_sparse_verify,
 )
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -100,6 +101,43 @@ def _capture_seed_chain_rows(backend, num_draft_tokens):
 
 
 class TestVerifyGraphReplay(CustomTestCase):
+    def test_dspark_replay_uses_committed_compression_lengths(self):
+        """Expanded DSpark CPU lengths must not add another verify window on replay."""
+        width = 8
+        real_seq_lens = [240, 192]
+        padded_seq_lens = [*real_seq_lens, 1]
+        backend, base = make_replay_backend(padded_seq_lens, width, max_bs=3)
+        _capture_seed(backend, base, bs=3)
+        _, replay_base = make_verify_batch(padded_seq_lens, width)
+        base.cache_seqlens_int32.copy_(replay_base.cache_seqlens_int32)
+        base.cu_seqlens_k.copy_(replay_base.cu_seqlens_k)
+        spec_info = DFlashVerifyInput(
+            draft_token=torch.zeros(16, dtype=torch.int64),
+            positions=torch.zeros(16, dtype=torch.int64),
+            draft_token_num=width,
+            live_seq_lens_cpu=torch.tensor(real_seq_lens, dtype=torch.int32),
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=3,
+            num_padding=1,
+            seq_lens=torch.tensor(padded_seq_lens, dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([248, 200, 1], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 1, 0], dtype=torch.int32),
+            spec_info=spec_info,
+        )
+        metadata = MiniCPMSparseMetadata(base=base)
+        backend._bind_sparse_verify_graph_metadata(
+            forward_batch, metadata, in_capture=False
+        )
+        backend._replay_sparse_verify_graph_metadata(forward_batch, metadata)
+
+        eager = _eager_verify(backend, real_seq_lens, width)
+        self._assert_replay_rows(metadata, eager, 2, width, backend.head_group_num)
+        expected = self._assert_level_buffers_match_eager_builder(
+            backend, metadata, forward_batch, real_seq_lens, width
+        )
+        self._assert_repeat_layouts_match_eager(backend, metadata, expected, 2, width)
+
     def test_capture_seed_fits_minimum_context_capacity(self):
         """A context ending at the dense threshold must still fit the capture
         seed and repeated compression rows for the full draft width."""

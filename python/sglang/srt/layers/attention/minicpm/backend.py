@@ -43,11 +43,23 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _get_verify_seq_lens_cpu(forward_batch: ForwardBatch) -> torch.Tensor:
+    spec_info = forward_batch.spec_info
+    if (
+        isinstance(spec_info, DFlashVerifyInput)
+        and spec_info.live_seq_lens_cpu is not None
+    ):
+        # DSpark expands CPU attention lengths but retains committed history here.
+        return spec_info.live_seq_lens_cpu
+    return forward_batch.seq_lens_cpu
 
 
 def _transpose_head_group_layout(
@@ -407,6 +419,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         metadata: MiniCPMSparseMetadata,
     ):
+        seq_lens_cpu = _get_verify_seq_lens_cpu(forward_batch)
         # seq_lens + num_draft_tokens: compression must cover the draft keys
         # too, or block scoring never sees the proposed tokens.
         metadata.k1, metadata.k2 = _build_k1_k2_compression_metadata(
@@ -419,9 +432,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             k2_kernel_size=self.k2_kernel_size,
             k2_kernel_stride=self.k2_kernel_stride,
             cu_seqlens_q=metadata.base.cu_seqlens_q,
-            seq_lens_cpu=(
-                forward_batch.seq_lens_cpu + self.speculative_num_draft_tokens
-            ),
+            seq_lens_cpu=seq_lens_cpu + self.speculative_num_draft_tokens,
         )
         _plan_sparse_verify(
             forward_batch,
@@ -1655,7 +1666,8 @@ class MiniCPMSparseBackend(AttentionBackend):
             k2_kernel_size=self.k2_kernel_size,
             k2_kernel_stride=self.k2_kernel_stride,
             cu_seqlens_q=metadata.base.cu_seqlens_q,
-            seq_lens_cpu=forward_batch.seq_lens_cpu[:real_bs] + num_draft_tokens,
+            seq_lens_cpu=_get_verify_seq_lens_cpu(forward_batch)[:real_bs]
+            + num_draft_tokens,
         )
         # cu_total_compress_token_nums keeps the capture-time slab offsets the
         # compression kernel writes at; only the packed lengths are refreshed.

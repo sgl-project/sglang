@@ -582,6 +582,9 @@ class MiniCPMSALAForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self._lm_head_module().weight
 
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         self.capture_aux_hidden_states = True
         if layer_ids is None:
@@ -591,6 +594,10 @@ class MiniCPMSALAForCausalLM(nn.Module):
             # The draft checkpoint indexes target layers by their output hidden state;
             # capturing before layer i+1 reads layer i's output.
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]):
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

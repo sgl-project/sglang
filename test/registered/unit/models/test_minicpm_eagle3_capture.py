@@ -6,6 +6,9 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
+    configure_aux_hidden_state_capture,
+)
 from sglang.srt.models.minicpm import MiniCPMModel, MiniCPMSALAForCausalLM
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -72,6 +75,41 @@ class TestEagle3LayerMapping(CustomTestCase):
 
 
 class TestAuxCaptureForward(CustomTestCase):
+    def test_dspark_shares_target_input_embeddings(self):
+        """Draft embedding lookup must use the target's existing embedding module."""
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+
+        lm = _bare_causal_lm(capture=False)
+        torch.nn.Module.__init__(lm)
+        lm.model = _bare_model(layers_to_capture=[])
+        embedding = DSparkWorkerV2._resolve_target_embed_tokens(None, lm)
+        self.assertIs(embedding, lm.model.embed_tokens)
+
+    def test_dspark_setup_captures_requested_target_outputs(self):
+        """DSpark admission must capture full residual outputs at its requested layers."""
+        lm = _bare_causal_lm(capture=False)
+        torch.nn.Module.__init__(lm)
+        lm.model = _bare_model(layers_to_capture=[])
+        configure_aux_hidden_state_capture(
+            model=lm,
+            eagle_use_aux_hidden_state=False,
+            eagle_aux_hidden_state_layer_ids=None,
+            dflash_use_aux_hidden_state=True,
+            dflash_target_layer_ids=[0, 1, 2, 4, 6, 7],
+            is_dspark=True,
+        )
+        self.assertTrue(lm.capture_aux_hidden_states)
+        _, aux = lm.model.forward(
+            torch.zeros(3, dtype=torch.int64), positions=None, forward_batch=None
+        )
+        self.assertEqual(len(aux), 6)
+        for actual, expected in zip(
+            aux, (2.0, 6.0, 12.0, 30.0, 56.0, 72.0), strict=True
+        ):
+            self.assertTrue(torch.equal(actual, torch.full((3, _HIDDEN), expected)))
+
     def test_capture_records_complete_layer_outputs(self):
         model = _bare_model(layers_to_capture=[1, 2])
         input_ids = torch.zeros(3, dtype=torch.int64)
