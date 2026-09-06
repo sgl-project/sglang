@@ -3293,6 +3293,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             out["prompt_token_ids"] = state.prompt_token_ids
         del self.rid_to_state[recv_obj.rid]
 
+        # Release the LoRA adapter so aborted requests don't pin it forever.
+        if self.enable_lora and state.obj.lora_path:
+            asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+
         state.out_list.append(out)
         state.event.set()
 
