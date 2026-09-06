@@ -13,10 +13,6 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# ============================================================
-# Special Tokens
-# ============================================================
-
 bos_token: str = "<｜begin▁of▁sentence｜>"
 eos_token: str = "<｜end▁of▁sentence｜>"
 thinking_start_token: str = "<think>"
@@ -40,9 +36,6 @@ DS_TASK_SP_TOKENS = {
 }
 VALID_TASKS = set(DS_TASK_SP_TOKENS.keys())
 
-# ============================================================
-# Templates
-# ============================================================
 
 system_msg_template: str = "{content}"
 user_msg_template: str = "{content}"
@@ -82,12 +75,6 @@ REASONING_EFFORT_PROMPTS: Dict[str, str] = {
 }
 DEFAULT_REASONING_EFFORT = "low"
 
-# --- sglang compatibility shim -------------------------------------------
-# Previous sglang adapter exposed two reasoning-effort "profiles" keyed off
-# the checkpoint's bundled encoder: "preview" (original V4 text release) and
-# "official" (current upstream). The prompt texts are unchanged upstream, so
-# the profiles map onto the flat levels: preview/high == "", preview/max ==
-# upstream "high", official/* == upstream level of the same name.
 REASONING_EFFORT_PROFILES: Dict[str, Dict[str, str]] = {
     "preview": {"high": "", "max": REASONING_EFFORT_PROMPTS["high"]},
     "official": REASONING_EFFORT_PROMPTS,
@@ -104,8 +91,6 @@ def resolve_profile_reasoning_effort(
         return {"high": "low", "max": "high"}.get(reasoning_effort, reasoning_effort)
     return reasoning_effort
 
-
-# --- end sglang compatibility shim ---------------------------------------
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -133,10 +118,6 @@ Otherwise, output directly after {thinking_end_token} with tool calls or final r
 
 You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
 """
-
-# ============================================================
-# Utility Functions
-# ============================================================
 
 
 def to_json(value: Any) -> str:
@@ -177,23 +158,21 @@ def tool_calls_to_openai_format(tool_calls):
     ]
 
 
-def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
-    """
-    Encode tool call arguments into DSML parameter format.
-
-    Args:
-        tool_call: Dict with "name" and "arguments" (JSON string) keys.
-
-    Returns:
-        DSML-formatted parameter string.
-    """
+def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
+    """Encode tool call arguments into DSML parameter format."""
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    try:
-        arguments = json.loads(tool_call["arguments"])
-    except Exception as err:
-        arguments = {"arguments": tool_call["arguments"]}
+    raw_arguments = tool_call["arguments"]
+    if isinstance(raw_arguments, dict):
+        arguments = raw_arguments
+    else:
+        try:
+            arguments = json.loads(raw_arguments)
+        except (TypeError, ValueError):
+            arguments = {"arguments": raw_arguments}
+    if not isinstance(arguments, dict):
+        arguments = {"arguments": raw_arguments}
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(
@@ -210,16 +189,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
 def decode_dsml_to_arguments(
     tool_name: str, tool_args: Dict[str, Tuple[str, str]]
 ) -> Dict[str, str]:
-    """
-    Decode DSML parameters back to a tool call dict.
-
-    Args:
-        tool_name: Name of the tool.
-        tool_args: Dict mapping param_name -> (value, is_string_flag).
-
-    Returns:
-        Dict with "name" and "arguments" (JSON string) keys.
-    """
+    """Decode DSML parameters back to a tool call dict."""
 
     def _decode_value(key: str, value: str, string: str):
         if string == "true":
@@ -237,15 +207,7 @@ def decode_dsml_to_arguments(
 
 
 def render_tools(tools: List[Dict[str, Union[str, Dict[str, Any]]]]) -> str:
-    """
-    Render tool schemas into the system prompt format.
-
-    Args:
-        tools: List of tool schema dicts (each with name, description, parameters).
-
-    Returns:
-        Formatted tools section string.
-    """
+    """Render tool schemas into the system prompt format."""
     tools_json = [to_json(t) for t in tools]
 
     return TOOLS_TEMPLATE.format(
@@ -279,11 +241,6 @@ def attach_task_to_last_user_message(messages: List[Dict[str, Any]], task: str) 
     messages[idx]["task"] = task
 
 
-# ============================================================
-# Message Rendering
-# ============================================================
-
-
 def render_message(
     index: int,
     messages: List[Dict[str, Any]],
@@ -291,23 +248,7 @@ def render_message(
     drop_thinking: bool = True,
     reasoning_effort: Optional[str] = None,
 ) -> str:
-    """
-    Render a single message at the given index into its encoded string form.
-
-    This is the core function that converts each message in the conversation
-    into the DeepSeek-V4 format.
-
-    Args:
-        index: Index of the message to render.
-        messages: Full list of messages in the conversation.
-        thinking_mode: Either "chat" or "thinking".
-        drop_thinking: Whether to drop reasoning content from earlier turns.
-        reasoning_effort: Reasoning effort level, one of "low", "high", "max".
-            None is treated as "low".
-
-    Returns:
-        Encoded string for this message.
-    """
+    """Render a single message at the given index into its encoded string form."""
     assert 0 <= index < len(messages)
     assert thinking_mode in [
         "chat",
@@ -490,28 +431,8 @@ def render_message(
     return prompt
 
 
-# ============================================================
-# Preprocessing
-# ============================================================
-
-
 def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Merge tool messages into the preceding user message using content_blocks format.
-
-    DeepSeek-V4 does not have a standalone "tool" role; instead, tool results
-    are encoded as <tool_result> blocks within user messages.
-
-    This function converts a standard OpenAI-format conversation (with separate
-    "tool" role messages) into V4 format where tool results are merged into
-    user messages.
-
-    Args:
-        messages: List of message dicts in OpenAI format.
-
-    Returns:
-        Processed message list with tool messages merged into user messages.
-    """
+    """Merge tool messages into the preceding user message using content_blocks format."""
     merged: List[Dict[str, Any]] = []
 
     for msg in messages:
@@ -564,16 +485,7 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def sort_tool_results_by_call_order(
     messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    Sort tool_result blocks within user messages by the order of tool_calls
-    in the preceding assistant message.
-
-    Args:
-        messages: Preprocessed message list (after merge_tool_messages).
-
-    Returns:
-        Message list with sorted tool result blocks.
-    """
+    """Sort tool_result blocks within user messages by the order of tool_calls"""
     last_tool_call_order: Dict[str, int] = {}
 
     for msg in messages:
@@ -607,11 +519,6 @@ def sort_tool_results_by_call_order(
     return messages
 
 
-# ============================================================
-# Main Encoding Function
-# ============================================================
-
-
 def _encode_messages_text(
     messages: List[Dict[str, Any]],
     thinking_mode: str,
@@ -620,28 +527,7 @@ def _encode_messages_text(
     add_default_bos_token: bool = True,
     reasoning_effort: Optional[str] = None,
 ) -> str:
-    """
-    Encode a list of messages into the DeepSeek-V4 prompt format.
-
-    This is the main entry point for encoding conversations. It handles:
-    - BOS token insertion
-    - Thinking mode with optional reasoning content dropping
-    - Tool message merging into user messages
-    - Multi-turn conversation context
-
-    Args:
-        messages: List of message dicts to encode.
-        thinking_mode: Either "chat" or "thinking".
-        context: Optional preceding context messages (already encoded prefix).
-        drop_thinking: If True, drop reasoning_content from earlier assistant turns
-                      (only keep reasoning for messages after the last user message).
-        add_default_bos_token: Whether to prepend BOS token at conversation start.
-        reasoning_effort: Reasoning effort level, one of "low", "high", "max".
-            Only takes effect in thinking mode. None is treated as "low".
-
-    Returns:
-        The encoded prompt string.
-    """
+    """Encode a list of messages into the DeepSeek-V4 prompt format."""
     context = context if context else []
 
     # Preprocess: merge tool messages and sort tool results
@@ -707,11 +593,6 @@ def _drop_thinking_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
         # developer and other roles before last_user_idx are dropped
 
     return result
-
-
-# ============================================================
-# Vision Message Preprocessing
-# ============================================================
 
 
 def parse_tagged_text(text: str) -> Union[str, List[Dict[str, Any]]]:
@@ -854,12 +735,29 @@ def encode_messages(
     add_default_bos_token: bool = True,
     reasoning_effort: Optional[str] = None,
     return_multi_modal_data: bool = False,
+    reasoning_effort_profile: Optional[str] = None,
 ) -> Any:
     """Encode text or multimodal messages through one canonical public entrypoint.
 
     Text-only calls preserve the original string-returning API. When
     return_multi_modal_data is true, the result is ``(prompt, media_data)``.
     """
+    if reasoning_effort_profile is not None:
+        if reasoning_effort_profile not in REASONING_EFFORT_PROFILES:
+            raise ValueError(
+                f"Invalid reasoning effort profile: {reasoning_effort_profile!r}"
+            )
+        if (
+            reasoning_effort is not None
+            and reasoning_effort
+            not in REASONING_EFFORT_PROFILES[reasoning_effort_profile]
+        ):
+            raise ValueError(
+                f"Invalid reasoning effort {reasoning_effort!r} for profile {reasoning_effort_profile!r}"
+            )
+        reasoning_effort = resolve_profile_reasoning_effort(
+            reasoning_effort_profile, reasoning_effort
+        )
     context = context or []
     processed_context, _ = process_image_messages(context) if context else ([], [])
     processed_messages, images = process_image_messages(messages)
@@ -917,20 +815,10 @@ def encode_case(
     return prompt, media_data["images"]
 
 
-# ============================================================
-# Parsing (Decoding model output)
-# ============================================================
-
-
 def _read_until_stop(
     index: int, text: str, stop: List[str]
 ) -> Tuple[int, str, Optional[str]]:
-    """
-    Read text from index until one of the stop strings is found.
-
-    Returns:
-        Tuple of (new_index, content_before_stop, matched_stop_string_or_None).
-    """
+    """Read text from index until one of the stop strings is found."""
     min_pos = len(text)
     matched_stop = None
 
@@ -951,17 +839,7 @@ def _read_until_stop(
 def parse_tool_calls(
     index: int, text: str
 ) -> Tuple[int, Optional[str], List[Dict[str, str]]]:
-    """
-    Parse DSML tool calls from text starting at the given index.
-
-    Args:
-        index: Starting position in text.
-        text: The full text to parse.
-
-    Returns:
-        Tuple of (new_index, last_stop_token, list_of_tool_call_dicts).
-        Each tool call dict has "name" and "arguments" keys.
-    """
+    """Parse DSML tool calls from text starting at the given index."""
     tool_calls: List[Dict[str, Any]] = []
     stop_token = None
     tool_calls_end_token = f"</{dsml_token}{tool_calls_block_name}>"
@@ -1024,26 +902,7 @@ def parse_tool_calls(
 
 
 def parse_message_from_completion_text(text: str, thinking_mode: str) -> Dict[str, Any]:
-    """
-    Parse a model completion text into a structured assistant message.
-
-    This function takes the raw text output from the model (a single assistant turn)
-    and extracts:
-    - reasoning_content (thinking block)
-    - content (summary/response)
-    - tool_calls (if any)
-
-    NOTE: This function is designed to parse only correctly formatted strings and
-    will raise ValueError for malformed output.
-
-    Args:
-        text: The raw completion text (including EOS token).
-        thinking_mode: Either "chat" or "thinking".
-
-    Returns:
-        Dict with keys: "role", "content", "reasoning_content", "tool_calls".
-        tool_calls are in OpenAI format.
-    """
+    """Parse a model completion text into a structured assistant message."""
     summary_content, reasoning_content, tool_calls = "", "", []
     index, stop_token = 0, None
     tool_calls_start_token = f"\n\n<{dsml_token}{tool_calls_block_name}"
