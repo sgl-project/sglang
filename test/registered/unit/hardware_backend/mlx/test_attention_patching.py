@@ -1319,6 +1319,24 @@ if _HAS_MLX:
             self.o_proj = FakeProjection(4)
             self.rope = lambda x, offset=None: x
 
+        def __call__(self, x, mask=None, cache=None):
+            # Minimal mlx-lm attention contract so the delegate decode path can
+            # drive this stub.
+            B, L, _ = x.shape
+            hd = self.head_dim
+            q = self.q_proj(x).reshape(B, L, -1, hd).transpose(0, 2, 1, 3)
+            k = self.k_proj(x).reshape(B, L, -1, hd).transpose(0, 2, 1, 3)
+            v = self.v_proj(x).reshape(B, L, -1, hd).transpose(0, 2, 1, 3)
+            offset = cache.offset if cache is not None else 0
+            q = self.rope(q, offset=offset)
+            k = self.rope(k, offset=offset)
+            if cache is not None:
+                k, v = cache.update_and_fetch(k, v)
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=mask
+            )
+            return self.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
+
     class ProjectionOnlyMixer(nn.Module):
         def __init__(self):
             super().__init__()
