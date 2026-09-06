@@ -744,6 +744,16 @@ _B_DESC_CACHE_MAX = 64
 _B_DESC_CACHE: OrderedDict[tuple, TensorDescriptor] = OrderedDict()
 
 
+def clear_b_tma_desc_cache() -> None:
+    """Drop all cached B TensorDescriptors.
+
+    A descriptor holds its base tensor by strong reference, so callers that
+    allocate fresh weights per call must clear it or the dead weights stay
+    resident until the LRU evicts them.
+    """
+    _B_DESC_CACHE.clear()
+
+
 def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
     """
     Cache TensorDescriptor for constant weight B.
