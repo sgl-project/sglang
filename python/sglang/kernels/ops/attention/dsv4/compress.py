@@ -179,6 +179,12 @@ class CompressorDecodePlan(NamedTuple):
             int(swa_page_size),
             int(ring_size),
         )
+        # The XPU plan builder has no use_req_ring parameter, so the unified-KV
+        # request-ring addressing cannot be expressed there. Fail loudly rather
+        # than silently planning against the SWA-paged layout.
+        assert not (_is_xpu and use_req_ring), (
+            "use_req_ring is not supported by the XPU compress plan builder"
+        )
         plan_d = fn(*args) if _is_xpu else fn(*args, bool(use_req_ring))
         return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
 
@@ -288,6 +294,10 @@ class CompressorPrefillPlan(NamedTuple):
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
+        )
+        # See plan_decode: XPU cannot express the unified-KV request ring.
+        assert not (_is_xpu and use_req_ring), (
+            "use_req_ring is not supported by the XPU compress plan builder"
         )
         plan_c, plan_w = (
             fn(*args, bool(use_cuda_graph))

@@ -441,7 +441,7 @@ def create_paged_compressor_data(
 
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
-    use_req_ring = compress_ratio == 4 and token_to_kv_pool._unified_kv
+    use_req_ring = compress_ratio == 4 and token_to_kv_pool._unified_kv is True
     # NOTE: This is actually a proxy, which encounter some bug with tvm-ffi.
     # As a workaround, we use `.detach()` to get the real tensor.
     full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()

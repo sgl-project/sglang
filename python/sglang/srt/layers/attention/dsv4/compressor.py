@@ -264,7 +264,7 @@ def create_paged_compressor_data(
 ) -> FusedCompressMetadata:
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
-    use_req_ring = compress_ratio == 4 and token_to_kv_pool._unified_kv
+    use_req_ring = compress_ratio == 4 and token_to_kv_pool._unified_kv is True
     # assert ring_size % compress_ratio == 0
 
     def clip_down(positions: torch.Tensor) -> torch.Tensor:
