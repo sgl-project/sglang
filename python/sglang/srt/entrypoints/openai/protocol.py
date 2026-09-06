@@ -1008,6 +1008,15 @@ class ChatCompletionRequest(BaseModel):
         r = values.get("reasoning")
         thinking = None
 
+        # Honor the top-level enable_thinking field used by qwen3/glm-5.2
+        # chat templates. Without this, a bare "enable_thinking": false in the
+        # request body is silently dropped (it is not a declared field), so
+        # callers cannot disable thinking via the documented OpenAI-style knob.
+        # Map it onto chat_template_kwargs so the template sees it.
+        top_enable_thinking = values.get("enable_thinking")
+        if top_enable_thinking is not None:
+            thinking = bool(top_enable_thinking)
+
         if r is not None and isinstance(r, dict):
             effort = r.get("effort")
             if effort is None:
