@@ -587,5 +587,44 @@ class TestTraceServerAsync(TestTraceServer):
     test_parallel_sample = None
 
 
+class TestTraceServerMultiTokenizer(TestTraceServer):
+    """Regression: router processes must init OTel, otherwise the pickled
+    TraceReqContext is disabled in-flight and scheduler-side spans
+    (prefill_forward, decode_forward) never reach the collector."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.collector = LightweightOtlpCollector()
+        cls.collector.start()
+        time.sleep(0.2)
+
+        cls.process = popen_launch_server(
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-trace",
+                "--otlp-traces-endpoint",
+                "127.0.0.1:4317",
+                "--tokenizer-worker-num",
+                "4",
+                "--detokenizer-worker-num",
+                "2",
+            ],
+        )
+
+        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
+        assert response.status_code == 200
+
+        cls.collector.clear()
+
+    # Only run trace_level_3, the most comprehensive check.
+    test_trace_level_0 = None
+    test_trace_level_1 = None
+    test_trace_level_2 = None
+    test_batch_request = None
+    test_parallel_sample = None
+
+
 if __name__ == "__main__":
     unittest.main()
