@@ -43,6 +43,7 @@ import torch
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
 )
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     ShortConvHybridAttnBackend,
 )
@@ -501,16 +502,22 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
     ) -> None:
-        """Commit the TARGET_VERIFY conv windows at each request's last accepted step.
-
-        Slot ids come from ``req_pool_indices``, not the per-step
-        ``self._cache_indices``: this runs after the forward context exits, so that
-        buffer may already belong to a later forward.
-        """
+        """Commit the TARGET_VERIFY conv windows at each request's last accepted step."""
         pool = self.req_to_token_pool
+        bs = req_pool_indices.shape[0]
+        if self._slot_gather_recordable:
+            assert (
+                self._cache_indices_buf is not None
+                and self._cache_indices_buf.shape[0] >= bs
+            )
+            slot_ids = self._cache_indices_buf[:bs]
+        else:
+            slot_ids = self._translate_mamba_indices(
+                pool.get_mamba_indices(req_pool_indices)
+            )
         scatter_mamba_states_after_mtp_verify(
             pool.get_speculative_mamba2_params_all_layers(),
-            self._translate_mamba_indices(pool.get_mamba_indices(req_pool_indices)),
+            slot_ids,
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
@@ -547,6 +554,47 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
     capability surface stays visible through the wrapper; and the MTP-verify commit
     is Inkling's own, not the generic mamba scatter.
     """
+
+    @property
+    def supports_draft_extend_metadata_staging(self) -> bool:
+        full = self.full_attn_backend
+        return (
+            isinstance(full, FlashAttentionBackend)
+            and full.topk == 1
+            and not full._unified_dense
+            and full.draft_extend_metadata_captured_in_graph()
+            and self.short_conv_backend._slot_gather_recordable
+        )
+
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        if (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and self.supports_draft_extend_metadata_staging
+        ):
+            if in_capture:
+                self.full_attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=True
+                )
+            self.full_attn_backend.stage_draft_extend_metadata(forward_batch)
+            self.short_conv_backend._prepare_slot_indices(forward_batch)
+        else:
+            super().init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        if (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and self.supports_draft_extend_metadata_staging
+        ):
+            self.short_conv_backend._reset_step_state()
+            self.short_conv_backend._refresh_sconv_metadata(
+                forward_batch, on_graph_path=True
+            )
+        else:
+            super().init_forward_metadata_in_graph(forward_batch)
 
     def sconv_state(self, *, layer_id: int, stream: int) -> torch.Tensor:
         return self.short_conv_backend.sconv_state(layer_id=layer_id, stream=stream)
@@ -610,4 +658,7 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
         )
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:
-        return self.full_attn_backend.draft_extend_metadata_captured_in_graph()
+        return (
+            not self.supports_draft_extend_metadata_staging
+            and self.full_attn_backend.draft_extend_metadata_captured_in_graph()
+        )
