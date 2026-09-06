@@ -125,10 +125,12 @@ export const benchmarks = [
   // nvidia/Qwen3.8-Flash-Next-NVFP4 (ModelOpt MIXED_PRECISION) on the same
   // Spark pair, measured on the qwen4-main-squashed tip 9b2aee2283 (which
   // includes sgl-project/sglang#38121) — the shipped image cannot load this
-  // export yet. Same bench workload as above; accuracy pending.
+  // export yet. Same bench workload as above; GSM8K as in the RDXA rows (full
+  // set, dev-qwen38-next-local image, 2026-09-06).
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "multi-2" },
     sglang_version: "qwen4-main-squashed @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 96.8 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 447.13, tpot_ms: 18.70, tokens_per_sec_per_gpu: 119 },
