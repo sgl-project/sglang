@@ -204,6 +204,12 @@ def _create_unified_radix_cache(
             )
 
             linker_cls = MooncakeDirectLinker
+        elif backend == "mori":
+            from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
+                UMBPDirectLinker,
+            )
+
+            linker_cls = UMBPDirectLinker
         else:
             raise ValueError(
                 f"Unknown unified cache external linker backend: {backend!r}"
