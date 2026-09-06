@@ -462,7 +462,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         rid=request.request_id,
                         session_id=request.session_id,
                         extra_key=request.extra_key,
-                        cache_salt=request.cache_salt,
+                        # Preserve the standard Responses API cache key while
+                        # allowing SGLang callers to override it explicitly.
+                        cache_salt=request.cache_salt or request.prompt_cache_key,
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
