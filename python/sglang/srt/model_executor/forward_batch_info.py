@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
+    mamba_cache_chunk_size,
 )
 from sglang.srt.utils import (
     is_cpu,
@@ -1054,6 +1055,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens_per_dp=num_tokens_per_dp,
             sharded=sharded,
         )
+
+    def mamba_track_aligned_lens(self) -> Optional[torch.Tensor]:
+        """Tokens of this extend chunk covered by the tracked mamba state,
+        floored to the mamba_cache_chunk_size boundary the scheduler snapshots at;
+        the +1 that _force_track_h adds cancels under the floor.
+        Sole home of this math: every side state snapshotting alongside mamba calls it.
+        None means tracking is skipped for this forward:
+        no mask, or a prefill CUDA-graph replay without mamba_track_seqlens.
+        Masked-off rows hold garbage.
+        """
+        if (
+            self.mamba_track_mask is None
+            or self.mamba_track_seqlens is None
+            or self.extend_prefix_lens is None
+        ):
+            return None
+
+        chunk_size = mamba_cache_chunk_size()
+        lens_to_track = self.mamba_track_seqlens - self.extend_prefix_lens
+        return (lens_to_track // chunk_size) * chunk_size
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """

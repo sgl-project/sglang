@@ -126,7 +126,7 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
-class DecodeReqToTokenPool:
+class DecodeReqToTokenPool(ReqToTokenPool):
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
     DecodeReqToTokenPool subscribes memory for pre-allocated requests.
