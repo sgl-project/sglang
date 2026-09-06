@@ -183,6 +183,42 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
     return max(1, min(16, cpu_count // max(1, num_gpus)))
 
 
+def _format_calibration_timing(records) -> str:
+    """One line of what the planner's duration model was fed by the last probe."""
+    successful = [record for record in records if record.succeeded]
+    if not successful:
+        return "calibration timing: no successful probe"
+    record = max(successful, key=lambda r: (r.workload_units(), r.total_duration_ms))
+    stages = ", ".join(
+        f"{name.replace('MiniMaxH3', '').replace('Stage', '')}={ms / 1000:.1f}s"
+        for name, ms in record.stage_duration_ms.items()
+        if ms >= 100
+    )
+    steps = ", ".join(f"{ms / 1000:.2f}" for ms in record.step_duration_ms)
+    iterations = ", ".join(
+        f"{name.replace('MiniMaxH3', '').replace('Stage', '')}={measured}->{target}"
+        for name, (measured, target) in record.stage_iterations.items()
+    )
+    return (
+        f"calibration timing ({record.width}x{record.height}x{record.num_frames}f, "
+        f"{record.num_inference_steps} steps): total={record.total_duration_ms / 1000:.1f}s; "
+        f"stages: {stages}; steps: [{steps}]; iterations: {iterations}"
+    )
+
+
+def _probe_total_duration_ns(records, target_units) -> int:
+    """Wall time of the representative full-shape probe (0 without one)."""
+    successful = [record for record in records if record.succeeded]
+    if target_units is not None:
+        at_target = [r for r in successful if r.workload_units() >= target_units]
+        if at_target:
+            successful = at_target
+    if not successful:
+        return 0
+    record = max(successful, key=lambda r: (r.workload_units(), r.total_duration_ms))
+    return max(0, int(record.total_duration_ms * 1_000_000))
+
+
 PROBE_FIT_MIN_MARGIN_BYTES = 1 << 30
 
 
@@ -1537,6 +1573,27 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if pre_warmup and validate_only:
             raise ValueError("static placement cannot be validation-only")
         records = list(self._auto_residency_warmup_records)
+        if self.is_output_rank:
+            # The regression check compares request durations extrapolated from
+            # these few steps, so a rollback is only explainable with them.
+            for record in records:
+                logger.info(
+                    "Auto residency calibration record: %dx%dx%df steps=%d ok=%s "
+                    "total=%.1fs stages=%s steps_ms=%s iterations=%s",
+                    record.width,
+                    record.height,
+                    record.num_frames,
+                    record.num_inference_steps,
+                    record.succeeded,
+                    record.total_duration_ms / 1000.0,
+                    {
+                        name: round(ms / 1000.0, 2)
+                        for name, ms in record.stage_duration_ms.items()
+                        if ms >= 100.0
+                    },
+                    [round(ms) for ms in record.step_duration_ms],
+                    record.stage_iterations,
+                )
         # Each round must describe one placement. Intersecting phase ownership
         # across old and newly adjusted layouts would double-count weights that
         # are already resident in the new layout.
@@ -1601,8 +1658,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         ):
             regressions = []
             for report in reports:
-                reference_ns = report.estimated_request_duration_ns
-                measured_ns = report.measured_request_duration_ns
+                reference_ns = report.reference_probe_duration_ns
+                measured_ns = report.probe_duration_ns
                 tolerance_ns = max(
                     MIN_POST_ADJUSTMENT_REGRESSION_NS,
                     int(reference_ns * POST_ADJUSTMENT_REGRESSION_FRACTION),
@@ -1612,12 +1669,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if regressions:
                 _, regressed = max(regressions, key=lambda item: item[0])
                 cause = (
-                    "post-adjustment calibration regressed request duration "
-                    f"from {regressed.estimated_request_duration_ns / 1e9:.2f}s "
-                    f"to {regressed.measured_request_duration_ns / 1e9:.2f}s"
+                    "post-adjustment calibration regressed the probe's duration "
+                    f"from {regressed.reference_probe_duration_ns / 1e9:.2f}s "
+                    f"to {regressed.probe_duration_ns / 1e9:.2f}s"
                 )
                 if self.is_output_rank:
                     logger.warning("Auto residency: %s; rolling back", cause)
+                    logger.warning(
+                        "Auto residency: %s", _format_calibration_timing(records)
+                    )
                 return self._rollback_everywhere(
                     cause=cause,
                     already_failed=False,
@@ -1679,6 +1739,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         plan = plan_auto_residency(reports=reports)
         summary = format_plan_summary(plan=plan, workload=workload, records=records)
+        if self.is_output_rank and records:
+            logger.info("Auto residency: %s", _format_calibration_timing(records))
         if plan.skip_reason is not None or not plan.changes:
             if self.is_output_rank:
                 logger.info("%s", summary)
@@ -2120,6 +2182,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         if include_candidates:
             self._auto_residency_repeated_components = repeated_components
+        probe_duration_ns = _probe_total_duration_ns(records, target_units)
+        reference_probe_duration_ns = getattr(
+            self, "_auto_residency_reference_probe_duration_ns", None
+        )
+        if (
+            not warmup_oom
+            and reference_probe_duration_ns is None
+            and probe_duration_ns > 0
+        ):
+            reference_probe_duration_ns = probe_duration_ns
+            self._auto_residency_reference_probe_duration_ns = probe_duration_ns
         reference_request_duration_ns = (
             self._auto_residency_reference_request_duration_ns
         )
@@ -2293,6 +2366,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ),
             estimated_request_duration_ns=estimated_request_duration_ns,
             measured_request_duration_ns=measured_request_duration_ns,
+            probe_duration_ns=probe_duration_ns,
+            reference_probe_duration_ns=reference_probe_duration_ns or 0,
             candidate_latency_savings_ns=candidate_latency_savings_ns,
             candidates=candidates,
             warmup_oom=warmup_oom,

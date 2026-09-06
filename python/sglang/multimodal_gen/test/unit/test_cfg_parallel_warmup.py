@@ -479,6 +479,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.num_gpus = 1
 
         server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.pipeline_config.calibrate_auto_residency_with_explicit_warmup_resolutions = False
         server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
 
         sampling_defaults = SamplingParams(
@@ -505,6 +506,45 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(req.extra["cache_dit_num_inference_steps"], 50)
         self.assertEqual(req.negative_prompt, "model default negative")
         self.assertIs(req.do_classifier_free_guidance, True)
+
+    def test_explicit_warmup_only_calibrates_for_opted_in_pipeline(self):
+        def build(calibrate_explicit_resolution: bool) -> Req:
+            server_args = MagicMock()
+            server_args.warmup_steps = 1
+            server_args.enable_cfg_parallel = False
+            server_args.enable_torch_compile = False
+            server_args.num_gpus = 1
+            server_args.pipeline_config.task_type = ModelTaskType.T2V
+            server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: (
+                value
+            )
+            server_args.pipeline_config.calibrate_auto_residency_with_explicit_warmup_resolutions = calibrate_explicit_resolution
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+                    return_value=SamplingParams(
+                        num_frames=81,
+                        num_inference_steps=50,
+                    ),
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.warmup_request_builder.auto_residency_args_skip_reason",
+                    return_value=None,
+                ),
+            ):
+                return build_warmup_reqs(
+                    server_args,
+                    warmup_resolutions=["832x480"],
+                    server_based_warmup=True,
+                )[0]
+
+        ordinary = build(False)
+        opted_in = build(True)
+
+        self.assertEqual(ordinary.num_inference_steps, 2)
+        self.assertTrue(ordinary.metrics.suppress_stage_breakdown)
+        self.assertEqual(opted_in.num_inference_steps, 4)
+        self.assertFalse(opted_in.metrics.suppress_stage_breakdown)
 
     def test_server_based_image_warmup_uses_model_default_over_supported(self):
         """Server-based image warmup uses the model's default resolution so it

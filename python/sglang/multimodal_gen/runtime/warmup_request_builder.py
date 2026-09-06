@@ -588,9 +588,17 @@ def build_warmup_reqs(
         if warmup_resolutions is None
         else None
     )
+    # Most explicit warmup resolutions are deliberately lightweight and are
+    # not representative residency probes. Pipelines such as MiniMax H3 opt in
+    # because their explicit shape is the intended planner calibration shape.
+    calibrate_explicit_resolution = (
+        warmup_resolutions is not None
+        and server_args.pipeline_config.calibrate_auto_residency_with_explicit_warmup_resolutions
+        is True
+    )
     collect_auto_residency_metrics = (
-        warmup_resolutions is None
-        and server_based_warmup
+        server_based_warmup
+        and (warmup_resolutions is None or calibrate_explicit_resolution)
         and auto_residency_args_skip_reason(server_args) is None
     )
     if collect_auto_residency_metrics and sampling_defaults.num_inference_steps:
