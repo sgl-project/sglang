@@ -928,7 +928,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not self._enable_a2a_moe:
-            if self._can_dual_stream_graph(hidden_states):
+            if not skip_shared_experts and self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
@@ -937,7 +937,8 @@ class DeepseekV2MoE(nn.Module):
                     fwd.mlp_reduce_scatter,
                 )
             elif (
-                self.alt_stream is not None
+                not skip_shared_experts
+                and self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
