@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
     split_bitsandbytes_4bit_state,
 )
 from sglang.multimodal_gen.runtime.loader import rank_local_checkpoint
+from sglang.multimodal_gen.runtime.loader.host_spill import HostSpill
 from sglang.multimodal_gen.runtime.loader.utils import (
     finalize_loaded_model,
     get_param_names_mapping,
@@ -46,6 +47,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    host_copies_are_redundant,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -383,6 +387,18 @@ def maybe_load_fsdp_model(
         # layerwise offload replaces block parameters with placeholders after
         # load, so compatible checkpoint tensors stay file-backed on CPU
         model._keep_checkpoint_mapping = True
+    host_spill = None
+    if (
+        weight_dir_list
+        and weights_iterator is None
+        and weight_load_plan.checkpoint_load_device.type == "cpu"
+        and host_copies_are_redundant()
+    ):
+        # Compatible tensors stay on the checkpoint mapping; the fused and
+        # reordered ones are materialized. On a shared pool their anonymous
+        # copies are never reclaimable (10.4 GiB for the H3 DiT's fused
+        # q/k/v), so they are materialized into file mappings instead.
+        host_spill = HostSpill.for_checkpoint(weight_dir_list)
     defer_cpu_placement = bool(
         component_starts_on_cpu
         and weight_load_plan.defer_cpu_placement
@@ -505,7 +521,10 @@ def maybe_load_fsdp_model(
             weight_load_plan.load_full_state_dict_on_device
         ),
         preconverted_state_dict=preconverted_state_dict,
+        host_spill=host_spill,
     )
+    if host_spill is not None:
+        host_spill.log_summary(type(model).__name__)
     if bnb_quant_states:
         attach_bitsandbytes_4bit_quant_states(
             dict(model.named_parameters()), bnb_quant_states
@@ -625,6 +644,7 @@ def load_model_from_full_model_state_dict(
         | None
     ) = None,
     allow_device_tensor_assignment: bool = False,
+    host_spill: HostSpill | None = None,
 ) -> _IncompatibleKeys:
     """
     Converting full state dict into a sharded state dict
@@ -657,7 +677,12 @@ def load_model_from_full_model_state_dict(
             full_sd_iterator,
             param_names_mapping,
             valid_target_names=set(meta_sd.keys()),
+            fused_tensor_factory=(None if host_spill is None else host_spill.tensor),
         )  # type: ignore
+        if host_spill is not None:
+            for name, tensor in custom_param_sd.items():
+                if isinstance(tensor, torch.Tensor):
+                    host_spill.seal(name, tensor.shape, tensor.dtype)
     else:
         custom_param_sd, reverse_param_names_mapping = preconverted_state_dict
 
@@ -802,11 +827,21 @@ def load_model_from_full_model_state_dict(
                 ):
                     sharded_tensor = full_tensor
                 else:
-                    sharded_tensor = torch.empty_like(
-                        meta_sharded_param,
-                        device=checkpoint_load_device,
-                        dtype=target_dtype,
+                    spilled = (
+                        None
+                        if host_spill is None or checkpoint_load_device.type != "cpu"
+                        else host_spill.tensor(
+                            target_param_name, meta_sharded_param.shape, target_dtype
+                        )
                     )
+                    if spilled is not None:
+                        sharded_tensor = spilled[0]
+                    else:
+                        sharded_tensor = torch.empty_like(
+                            meta_sharded_param,
+                            device=checkpoint_load_device,
+                            dtype=target_dtype,
+                        )
                     # Preserve requires_grad flag to avoid errors with non-floating dtypes
                     requires_grad = meta_sharded_param.requires_grad
                     temp_param = _make_param_like(actual_param, sharded_tensor)
@@ -827,6 +862,10 @@ def load_model_from_full_model_state_dict(
                             f"param_cls={type(actual_param).__name__}"
                         ) from exc
                     sharded_tensor = temp_param.data
+                    if host_spill is not None and spilled is not None:
+                        host_spill.seal(
+                            target_param_name, meta_sharded_param.shape, target_dtype
+                        )
             else:
                 # In cases where parts of the model aren't sharded, some parameters will be plain tensors
                 sharded_tensor = full_tensor
