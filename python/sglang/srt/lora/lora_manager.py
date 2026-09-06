@@ -1028,6 +1028,15 @@ class LoRAManager:
                 self.lora_modules[layer_id][module_name] = lora_module
                 continue
 
+            # Suffix matching is ambiguous for multimodal models: encoder
+            # towers name their projections the same way the language model
+            # does, so a target such as qkv_proj also selects modules the
+            # adapter carries no weights for. Models narrow the scope by
+            # defining should_apply_lora; those that do not keep the plain
+            # suffix behavior.
+            should_apply_lora = getattr(self.base_model, "should_apply_lora", None)
+            if callable(should_apply_lora) and not should_apply_lora(module_name):
+                continue
             # The module should be converted if it is included in target_names
             parts = module_name.split(".")
             if (
