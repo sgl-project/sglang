@@ -17,7 +17,6 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Aliased for the same reason as the single-turn helpers above.
@@ -46,6 +45,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=2000, stage="extra-b", runner_config="4-gpu-b200")
@@ -118,7 +118,7 @@ class TestInklingSmallNvfp4(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         """Answer quality on the real checkpoint: guards the modelopt_fp4 weight
@@ -208,7 +208,7 @@ class TestInklingSmallNvfp4DsparkDeterministic(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def _run(self, helper, **kwargs):
         helper(
@@ -323,7 +323,7 @@ class TestInklingSmallNvfp4HiCacheDeterministic(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_multiturn_decode_cache_hit_over_hicache(self):
         """Nine interleaved branches, three turns, decode hits served through the

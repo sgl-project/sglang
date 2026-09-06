@@ -15,6 +15,12 @@ import { Wan22Deployment } from '/src/snippets/diffusion/wan22-deployment.jsx';
 
 Choose the A14B MoE checkpoints for maximum T2V or I2V capacity and the 5B TI2V model for a smaller unified 720p-at-24-fps path. MoE reduces active compute relative to total capacity but does not remove the memory cost of loading expert weights, so hardware selection still matters.
 
+<Warning>
+The Wan2.2 TI2V 5B checkpoint currently has known quality issues when it is used
+for image-to-video generation. Use `Wan-AI/Wan2.2-I2V-A14B-Diffusers` when I2V
+quality is the priority.
+</Warning>
+
 ## 2. SGLang-diffusion Installation
 
 SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
@@ -35,7 +41,7 @@ The Wan2.2 series offers models in various sizes, architectures and input types,
 
 ### 3.2 Configuration Tips
 
-Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
+See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use

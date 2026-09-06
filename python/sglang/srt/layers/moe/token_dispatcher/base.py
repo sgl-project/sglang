@@ -27,6 +27,8 @@ if TYPE_CHECKING:
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
+        DeepEPv2CombineInput,
+        DeepEPv2DispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
         StandardCombineInput,
@@ -39,7 +41,6 @@ if TYPE_CHECKING:
 
 
 class _RemovableDispatcherHandle:
-
     next_id = 0  # Global counter for unique IDs
 
     def __init__(self, hooks_dict: OrderedDict):
@@ -54,7 +55,6 @@ class _RemovableDispatcherHandle:
 
 
 class DispatcherBaseHooks:
-
     def __init__(self):
         self.hook_dict = OrderedDict[int, Callable]()
 
@@ -68,7 +68,6 @@ class DispatcherBaseHooks:
 
 
 class _PreDispatchHooks(DispatcherBaseHooks):
-
     def __call__(
         self,
         dispatcher: BaseDispatcher,
@@ -83,7 +82,6 @@ class _PreDispatchHooks(DispatcherBaseHooks):
 
 
 class _PostDispatchHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
     ) -> Optional[DispatchOutput]:
@@ -95,7 +93,6 @@ class _PostDispatchHooks(DispatcherBaseHooks):
 
 
 class _PreCombineHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, combine_input: CombineInput
     ) -> Optional[CombineInput]:
@@ -107,7 +104,6 @@ class _PreCombineHooks(DispatcherBaseHooks):
 
 
 class _PostCombineHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, hidden_states: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -122,7 +118,6 @@ class _PostCombineHooks(DispatcherBaseHooks):
 
 
 class DispatchOutputChecker:
-
     @staticmethod
     def format_is_standard(
         dispatch_output: DispatchOutput,
@@ -165,13 +160,19 @@ class DispatchOutputChecker:
     ) -> TypeGuard[FlashinferDispatchOutput]:
         return dispatch_output.format.is_flashinfer()
 
+    @staticmethod
+    def format_is_deepep_v2(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[DeepEPv2DispatchOutput]:
+        return dispatch_output.format.is_deepep_v2()
+
 
 class DispatchOutputFormat(Enum):
-
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
 
     def is_standard(self) -> bool:
@@ -194,6 +195,9 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_deepep_v2(self) -> bool:
+        return self == DispatchOutputFormat.DEEPEP_V2
 
 
 @runtime_checkable
@@ -249,12 +253,19 @@ class CombineInputChecker:
     ) -> TypeGuard[FlashinferCombineInput]:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
+    @staticmethod
+    def format_is_deepep_v2(
+        combine_input: CombineInput,
+    ) -> TypeGuard[DeepEPv2CombineInput]:
+        return combine_input.format == CombineInputFormat.DEEPEP_V2
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
 
 

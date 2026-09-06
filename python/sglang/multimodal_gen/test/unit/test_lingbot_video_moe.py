@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoGroupedExperts,
     LingBotVideoRouter,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+)
 from sglang.multimodal_gen.runtime.models.dits import (
     lingbot_video_moe as dits_lingbot_video_moe,
 )
@@ -260,6 +263,31 @@ def test_text_encoding_crops_template_then_trims_padding():
     torch.testing.assert_close(embeds, hidden[:, prefix_width:true_len])
     assert int(mask.sum()) == true_len - prefix_width
     assert stage._compute_crop_start() == prefix_width
+
+
+def test_text_encoding_sets_forward_context_for_native_encoder():
+    prompt_width, prefix_width, true_len, channels = 6, 2, 5, 4
+    hidden = torch.zeros(1, prompt_width, channels)
+
+    class NativeEncoder:
+        uses_sglang_forward_context = True
+
+        def __call__(self, **kwargs):
+            context = get_forward_context()
+            assert context.current_timestep == 0
+            assert context.attn_metadata is None
+            assert kwargs["output_hidden_states"] is True
+            return SimpleNamespace(hidden_states=[hidden])
+
+    stage = _text_encoding_stage(
+        _FakeQwenProcessor(prompt_width, prefix_width, true_len), NativeEncoder()
+    )
+    embeds, mask = stage._encode_prompt(
+        "a structured caption", torch.device("cpu"), torch.float32
+    )
+
+    assert tuple(embeds.shape) == (1, true_len - prefix_width, channels)
+    assert tuple(mask.shape) == (1, true_len - prefix_width)
 
 
 def test_check_inputs_enforces_frame_and_size_contract():

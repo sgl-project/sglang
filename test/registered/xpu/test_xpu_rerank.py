@@ -10,6 +10,7 @@ python3 -m unittest test_xpu_rerank.TestXPUDecoderRerank
 python3 -m unittest test_xpu_rerank.TestXpuCrossEncoderReank
 """
 
+import gc
 import math
 import multiprocessing as mp
 import unittest
@@ -20,9 +21,9 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-register_xpu_ci(est_time=180, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=180, suite="nightly-xpu-1-gpu", nightly=True)
 
 MODEL_PATH = "Qwen/Qwen3-Reranker-0.6B"
 TP_SIZE = 1
@@ -156,14 +157,12 @@ class TestXPUDecoderRerank(CustomTestCase):
             self._assert_close_scores(prompts)
 
 
-# This cross-encoder test is ported from `test/manual/prefill_only/test_cross_encoder_models.py`,
-# which uses float32 with the triton backend. The `intel_xpu` attention backend currently only
-# supports the bfloat16 dtype, so we keep the triton backend here to preserve float32 parity.
 CROSS_ENCODER_MODEL_PATH = "BAAI/bge-reranker-v2-m3"
 CROSS_ENCODER_TP_SIZE = 1
 CROSS_ENCODER_SCORE_TOLERANCE = 1e-2
-CROSS_ENCODER_ATTENTION_BACKEND = "triton"
 CROSS_ENCODER_TORCH_DTYPE = torch.float32
+CROSS_ENCODER_ATTENTION_BACKEND = "triton"
+CROSS_ENCODER_MEM_FRACTION_STATIC = 0.65
 
 
 class TestXPUCrossEncoderRerank(CustomTestCase):
@@ -179,6 +178,7 @@ class TestXPUCrossEncoderRerank(CustomTestCase):
         torch_dtype,
         score_tolerance,
         attention_backend,
+        mem_fraction_static,
     ) -> None:
         with HFRunner(
             model_path,
@@ -186,6 +186,9 @@ class TestXPUCrossEncoderRerank(CustomTestCase):
             model_type="cross_encoder",
         ) as hf_runner:
             hf_scores = hf_runner.forward(prompts).scores
+
+        gc.collect()
+        empty_gpu_cache()
 
         with SRTRunner(
             model_path,
@@ -195,6 +198,7 @@ class TestXPUCrossEncoderRerank(CustomTestCase):
             attention_backend=attention_backend,
             chunked_prefill_size=-1,
             disable_radix_cache=True,
+            mem_fraction_static=mem_fraction_static,
         ) as srt_runner:
             srt_scores = srt_runner.forward(prompts).scores
 
@@ -220,6 +224,7 @@ class TestXPUCrossEncoderRerank(CustomTestCase):
                 CROSS_ENCODER_TORCH_DTYPE,
                 CROSS_ENCODER_SCORE_TOLERANCE,
                 CROSS_ENCODER_ATTENTION_BACKEND,
+                CROSS_ENCODER_MEM_FRACTION_STATIC,
             )
 
 

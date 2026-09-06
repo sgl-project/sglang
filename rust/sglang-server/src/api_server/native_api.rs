@@ -99,8 +99,9 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 /// Python) decides whether `/health` shares it or is a plain 200 (routing the
 /// request already proves the frontend is up).
 fn health_routes() -> Router<Arc<AppState>> {
-    let timeout =
-        std::time::Duration::from_secs(environ::env_u64("SGLANG_HEALTH_CHECK_TIMEOUT", 20));
+    let timeout = std::time::Duration::from_secs(
+        environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
+    );
     let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout));
     let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
         probe.clone()
@@ -195,7 +196,7 @@ async fn generate(
     State(state): State<Arc<AppState>>,
     body: Result<Json<GenerateBody>, JsonRejection>,
 ) -> Response {
-    let body = match body {
+    let mut body = match body {
         Ok(Json(body)) => body,
         // A body that fails to parse has no readable `stream` flag, so this one
         // can only answer unary — as Python's does (FastAPI rejects before its
@@ -205,6 +206,15 @@ async fn generate(
         }
     };
     let stream = body.stream;
+    if let Some(preferred) = &state.server_args.preferred_sampling_params
+        && let Err(error) = body.apply_preferred_sampling(&preferred.0)
+    {
+        return native_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error.to_string(),
+            stream,
+        );
+    }
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
     let (mut payloads, is_batch) = match body.into_requests() {
@@ -222,7 +232,10 @@ async fn generate(
     let timing = RequestTiming::new();
     // Media I/O (URL downloads, file reads) happens here, on the API runtime
     // — never on the MM worker pool (see `prefetch`).
-    if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
+    if let Err(e) =
+        super::prefetch::prefetch_all(&mut payloads, &state.server_args.limit_mm_data_per_request)
+            .await
+    {
         return native_error(StatusCode::BAD_REQUEST, &e, stream);
     }
     if !is_batch {

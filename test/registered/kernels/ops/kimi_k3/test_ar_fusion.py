@@ -102,9 +102,9 @@ def _init_comm() -> CustomAllReduceV2:
     comm = CustomAllReduceV2(
         cpu_group, device, max_pull_size=1 * MB, max_push_size=2 * MB
     )
-    if comm.disabled or comm.mc_base_ptr == 0:
+    if comm.disabled or not comm.has_multicast:
         raise RuntimeError("ar_fusion requires CustomAllReduceV2 with multicast")
-    all_reduce.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
+    all_reduce.register_comm(comm.obj)
     register_comm_cleanup(comm)
     return comm
 
@@ -165,7 +165,7 @@ def test_ar_fusion_push(bs: int, use_residual: bool):
     x = _int_input(n, bs, per_rank=True)
     residual = _int_input(n, bs + 7, per_rank=False) if use_residual else None
     ref = _nccl_ref(x, residual)
-    all_reduce.all_reduce_push_res(world, x, residual, ws_mc_base=comm.mc_base_ptr)
+    all_reduce.all_reduce_push_res(world, x, residual)
     torch.cuda.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
@@ -240,9 +240,7 @@ def test_ar_fusion_push_norm(num_tokens: int, rows_per_token: int):
     x = _int_input(n, num_tokens + 41 + rows_per_token, per_rank=True)
     weight = _int_input(NORM_DIM, 43, per_rank=False) + 1
     ref = _norm_ref(_nccl_ref(x, None), num_tokens, weight, eps=1e-6)
-    all_reduce.all_reduce_push_norm(
-        world, x, weight, 1e-6, num_norm_rows=num_tokens, ws_mc_base=comm.mc_base_ptr
-    )
+    all_reduce.all_reduce_push_norm(world, x, weight, 1e-6, num_norm_rows=num_tokens)
     torch.cuda.synchronize()
     _assert_norm_close(x, ref, num_tokens)
 
@@ -310,7 +308,7 @@ def test_ar_fusion_finalize_push_norm(bs: int):
     ref = _finalize_norm_ref(gemm2, idx, weights, norm_w, eps)
     out = torch.empty(bs, NORM_DIM, dtype=torch.bfloat16, device=_device())
     all_reduce.finalize_all_reduce_push_norm(
-        world, out, gemm2, idx, weights, norm_w, eps, ws_mc_base=comm.mc_base_ptr
+        world, out, gemm2, idx, weights, norm_w, eps
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -331,12 +329,12 @@ def test_ar_fusion_finalize_push_norm_stress():
         ref = _finalize_norm_ref(gemm2, idx, weights, norm_w, eps)
         out = torch.empty(bs, NORM_DIM, dtype=torch.bfloat16, device=_device())
         all_reduce.finalize_all_reduce_push_norm(
-            world, out, gemm2, idx, weights, norm_w, eps, ws_mc_base=comm.mc_base_ptr
+            world, out, gemm2, idx, weights, norm_w, eps
         )
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         x = _int_input(bs * H, 8000 + it, per_rank=True)
         ref2 = _nccl_ref(x, None)
-        all_reduce.all_reduce_push_res(world, x, None, ws_mc_base=comm.mc_base_ptr)
+        all_reduce.all_reduce_push_res(world, x, None)
         torch.testing.assert_close(x, ref2, atol=0, rtol=0)
 
 
@@ -382,7 +380,7 @@ def test_ar_fusion_stress_mixed():
         num_blocks = (1, 2, 4, 8)[it % 4]
         x = _int_input(n, 3000 + it, per_rank=True)
         ref = _nccl_ref(x, None)
-        all_reduce.all_reduce_push_res(world, x, None, ws_mc_base=comm.mc_base_ptr)
+        all_reduce.all_reduce_push_res(world, x, None)
         torch.testing.assert_close(x, ref, atol=0, rtol=0)
         y = buf[:n]
         y.copy_(_int_input(n, 4000 + it, per_rank=True))
@@ -407,7 +405,7 @@ def test_ar_fusion_graph_capture():
     gz, mc_z = buf[n : 2 * n], mc + n * buf.element_size()
 
     def _run_all():
-        all_reduce.all_reduce_push_res(world, gx, gres, ws_mc_base=comm.mc_base_ptr)
+        all_reduce.all_reduce_push_res(world, gx, gres)
         all_reduce.all_reduce_pull_res(world, gy, gres, input_mc_ptr=mc_y)
         all_reduce.all_reduce_pull_res(world, gz, gres, input_mc_ptr=mc_z)
 

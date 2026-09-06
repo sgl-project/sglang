@@ -31,9 +31,14 @@ class TestGranianHTTP2Config(unittest.TestCase):
                 port=30000,
                 log_level="info",
                 http2_max_concurrent_streams=37,
+                http2_initial_connection_window_size=8 * 1024 * 1024,
             )
 
         self.assertEqual(configured["http2_settings"].max_concurrent_streams, 37)
+        self.assertEqual(
+            configured["http2_settings"].initial_connection_window_size,
+            8 * 1024 * 1024,
+        )
 
 
 if __name__ == "__main__":

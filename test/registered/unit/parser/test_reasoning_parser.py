@@ -14,6 +14,7 @@ from sglang.srt.parser.reasoning_parser import (
     InklingDetector,
     KimiDetector,
     KimiK2Detector,
+    Ling3Detector,
     Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
@@ -466,6 +467,69 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.normal_text, "<tool_call>tool call")
 
 
+class TestLing3Detector(CustomTestCase):
+    def setUp(self):
+        self.detector = Ling3Detector()
+
+    def test_init(self):
+        self.assertEqual(self.detector.tool_start_token, "<tool_call>")
+        self.assertEqual(self.detector.reasoning_default, "enable_thinking")
+        self.assertTrue(self.detector.thinks_internally)
+        self.assertTrue(self.detector._force_nonempty_content)
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_tool_interrupt(self):
+        text = "<think>I need a tool<tool_call>get_weather</tool_call>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "I need a tool")
+        self.assertEqual(result.normal_text, "<tool_call>get_weather</tool_call>")
+
+    def test_reasoning_only_swaps_to_normal_text(self):
+        text = "<think>Final answer without a closing think tag"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "Final answer without a closing think tag")
+
+    def test_reasoning_only_with_end_token_swaps_to_normal_text(self):
+        text = "<think>Final answer accidentally wrapped as reasoning</think>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(
+            result.normal_text, "Final answer accidentally wrapped as reasoning"
+        )
+
+    def test_force_nonempty_content_false_disables_swap(self):
+        detector = Ling3Detector(force_nonempty_content=False)
+        text = "<think>Reasoning only</think>"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Reasoning only")
+        self.assertEqual(result.normal_text, "")
+
+    def test_does_not_swap_when_normal_text_exists(self):
+        text = "<think>Reasoning here</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Reasoning here")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_empty_reasoning_with_normal_text(self):
+        text = "<think></think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_plain_text_without_thinking(self):
+        text = "The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, text)
+
+    def test_streaming_reasoning_only_currently_streams_reasoning(self):
+        self.detector.parse_streaming_increment("<think>")
+        result = self.detector.parse_streaming_increment("The answer is 42.")
+        self.assertEqual(result.reasoning_text, "The answer is 42.")
+        self.assertEqual(result.normal_text, "")
+
+
 class TestHunyuanDetector(CustomTestCase):
     """Test cases for Hunyuan detector with tool interruption support."""
 
@@ -677,6 +741,9 @@ class TestReasoningParser(CustomTestCase):
 
         parser = ReasoningParser("glm45")
         self.assertIsInstance(parser.detector, Glm45Detector)
+
+        parser = ReasoningParser("ling3")
+        self.assertIsInstance(parser.detector, Ling3Detector)
 
         parser = ReasoningParser("hunyuan")
         self.assertIsInstance(parser.detector, HunyuanDetector)

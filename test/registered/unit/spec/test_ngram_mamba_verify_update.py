@@ -194,12 +194,15 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             dtype=torch.int32,
         )
 
-        with patch(
-            "sglang.srt.speculative.spec_utils.mambaish_config",
-            return_value={"some": "config"},
-        ), patch(
-            "sglang.srt.speculative.spec_utils.mamba_track_grid",
-            return_value=256,
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.mambaish_config",
+                return_value={"some": "config"},
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.mamba_track_grid",
+                return_value=256,
+            ),
         ):
             commit_mamba_states_after_verify(
                 target_worker,

@@ -76,7 +76,7 @@ def make_processor(case, config, image_processor_cls=None):
         skip_tokenizer_init=False,
         mm_preprocess_cache_size_mb=0,
         trust_mm_content_hashes=False,
-        # Read by NativeMmHost._use_feature_shm (single-rank fixture → the
+        # Read by RustMmProcessor._use_feature_shm (single-rank fixture → the
         # inline zero-copy transport, like the 1-GPU e2e).
         tp_size=1,
         dist_init_addr=None,
@@ -89,14 +89,15 @@ def make_processor(case, config, image_processor_cls=None):
         allowed_media_domains=[],
         media_url_max_file_size_mb=64,
     )
-    # The processor reads its media policy, transport and per-modality limits
-    # from the mm bag, so the fixture publishes before building it.
+    # Left at the default backend, the fast image processor sends the tensor to
+    # `cuda:<base_gpu_id>`, which a CPU-only host cannot do.
     publish(
         ServerArgs(
             model_path="dummy",
             mm_feature_transport=server_args.mm_feature_transport,
             mm_process_config=server_args.mm_process_config,
             allowed_media_domains=server_args.allowed_media_domains,
+            disable_fast_image_processor=server_args.disable_fast_image_processor,
         ),
         role="tokenizer",
     )

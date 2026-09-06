@@ -21,19 +21,29 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
+    mount_flux2_nvfp4_swiglu_quant,
     mount_fused_gate_rmsnorm,
     mount_fused_linear_gelu,
     mount_fused_ln_modulate,
+    mount_helios_gated_residual,
     mount_hunyuan_qknorm,
+    mount_lingbot_video_gated_residual,
     mount_lingbot_video_rmsnorm,
     mount_ltx2_rms_norm_modulate,
+    mount_nvfp4_bias_gelu,
+    mount_qwen_image_added_qkv,
     mount_sana_video_linear_attention,
+    unmount_flux2_nvfp4_swiglu_quant,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
+    unmount_helios_gated_residual,
     unmount_hunyuan_qknorm,
+    unmount_lingbot_video_gated_residual,
     unmount_lingbot_video_rmsnorm,
     unmount_ltx2_rms_norm_modulate,
+    unmount_nvfp4_bias_gelu,
+    unmount_qwen_image_added_qkv,
     unmount_sana_video_linear_attention,
 )
 from sglang.multimodal_gen import envs
@@ -43,6 +53,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows_kernel_fusions,
+    resolve_skip_softmax_params,
+)
 from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
     prompt_padding as bcg_utils,
 )
@@ -83,12 +97,16 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     world_group_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
+    set_request_skip_softmax_params,
+)
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
     LocalAttention,
     UlyssesAttention,
     USPAttention,
     apply_attention_backend_override,
     prepare_attention_backend_override,
+    supports_skip_softmax,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
@@ -162,9 +180,24 @@ _QUALITY_FUSION_HANDLERS: tuple[
     tuple[str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
 ] = (
     (
+        "FLUX.2 NVFP4 FC1+SwiGLU+quant",
+        mount_flux2_nvfp4_swiglu_quant,
+        unmount_flux2_nvfp4_swiglu_quant,
+    ),
+    (
         "fused linear+GELU (cublasLt epilogue)",
         mount_fused_linear_gelu,
         unmount_fused_linear_gelu,
+    ),
+    (
+        "Wan NVFP4 fused bias+GELU",
+        mount_nvfp4_bias_gelu,
+        unmount_nvfp4_bias_gelu,
+    ),
+    (
+        "Qwen-Image fused added-QKV",
+        mount_qwen_image_added_qkv,
+        unmount_qwen_image_added_qkv,
     ),
     (
         "fused LN+modulate (affine folding)",
@@ -190,6 +223,16 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "LingBot Video fused RMSNorm",
         mount_lingbot_video_rmsnorm,
         unmount_lingbot_video_rmsnorm,
+    ),
+    (
+        "LingBot Video per-token gated residual",
+        mount_lingbot_video_gated_residual,
+        unmount_lingbot_video_gated_residual,
+    ),
+    (
+        "Helios per-token gated residual",
+        mount_helios_gated_residual,
+        unmount_helios_gated_residual,
     ),
     (
         "SANA-Video BF16-input linear attention",
@@ -291,6 +334,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def role_affinity(self):
         return RoleType.DENOISER
 
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
+
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
     ) -> None:
@@ -305,7 +353,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_request_overrides: dict[str, Any] = {}
         # Overrides key the mounted hooks were built from; None when unmounted.
         self._cache_dit_active_key: tuple | None = None
-        # Whether request-scoped quality="high" fusions are currently mounted.
+        # Whether request-scoped extra-high-or-higher fusions are mounted.
         self._quality_fusions_mounted = False
         self._torch_compile_registry = CompiledModuleRegistry()
         # Breakable CUDA graph runners, one per transformer module (lazy).
@@ -345,6 +393,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._attn_backend_default = self.attn_backend
         self._attn_metadata_head_size = attn_head_size
         self._attention_backend_active_override: AttentionBackendEnum | None = None
+        self._skip_softmax_forced_fa = False
 
         # cfg
         self.guidance = None
@@ -508,7 +557,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 config=dit_config,
                 default="max-autotune-no-cudagraphs",
             )
-            compile_kwargs = build_torch_compile_kwargs(mode=mode)
+            compile_kwargs = build_torch_compile_kwargs(mode=mode, module=module)
             logger.info(f"Compiling transformer with mode: {mode}")
 
         if getattr(self.server_args, "regional_compile", False):
@@ -532,13 +581,37 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
         """Apply request-dependent transformer acceleration in trace-safe order."""
-        self._maybe_override_attention_backend(batch)
+        skip_softmax_params = resolve_skip_softmax_params(
+            batch.sampling_params.skip_softmax_params
+        )
+        if skip_softmax_params is not None:
+            capability = current_platform.get_device_capability()
+            capability_tuple = (
+                (capability.major, capability.minor) if capability is not None else None
+            )
+            if capability_tuple not in ((9, 0), (10, 0), (10, 3), (10, 7)):
+                found = capability.as_version_str() if capability else "unknown"
+                raise ValueError(
+                    "skip_softmax_params requires Hopper SM90 or Blackwell "
+                    f"SM100/SM103/SM107; found {found}."
+                )
+            if (self.server_args.ring_degree or 1) > 1:
+                raise ValueError(
+                    "skip_softmax_params does not support Ring Attention because "
+                    "the ring merge requires dense per-hop softmax statistics."
+                )
+        set_request_skip_softmax_params(batch, skip_softmax_params)
+        self._maybe_override_attention_backend(
+            batch, force_fa_for_self_attention=skip_softmax_params is not None
+        )
         self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
 
-    def _maybe_override_attention_backend(self, batch: Req) -> None:
+    def _maybe_override_attention_backend(
+        self, batch: Req, *, force_fa_for_self_attention: bool = False
+    ) -> None:
         """Two-phase per-request backend switch: prepare all layers (may
         raise, mutates nothing), then flip all — a rejected request leaves the
         transformers untouched. Safe at this batch boundary because the field
@@ -546,21 +619,59 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         target = self._parse_attention_backend_override(
             batch.sampling_params.attention_backend_override
         )
-        if target == self._attention_backend_active_override:
+        if force_fa_for_self_attention and target not in (
+            None,
+            AttentionBackendEnum.FA,
+        ):
+            raise ValueError(
+                "skip_softmax_params requires the FA attention backend; "
+                f"attention_backend_override={target.name.lower()!r} is incompatible."
+            )
+        if (
+            target == self._attention_backend_active_override
+            and force_fa_for_self_attention == self._skip_softmax_forced_fa
+        ):
             return
         layers = self._request_switchable_attention_layers()
         stage_backend = self._attn_backend_default
+        layer_targets: list[tuple[nn.Module, AttentionBackendEnum | None]]
         if target is not None:
             stage_backend = self._validate_attention_backend_override(target, layers)
-            for layer in layers:
-                prepare_attention_backend_override(layer, target)
-        for layer in layers:
-            apply_attention_backend_override(layer, target)
+            layer_targets = [(layer, target) for layer in layers]
+        elif force_fa_for_self_attention:
+            self_attention_layers = [
+                layer for layer in layers if supports_skip_softmax(layer)
+            ]
+            if self_attention_layers:
+                stage_backend = self._validate_attention_backend_override(
+                    AttentionBackendEnum.FA, self_attention_layers
+                )
+            elif layers or self.attn_backend.get_enum() is not AttentionBackendEnum.FA:
+                self._validate_attention_backend_override(
+                    AttentionBackendEnum.FA, self_attention_layers
+                )
+            layer_targets = [
+                (
+                    layer,
+                    (AttentionBackendEnum.FA if supports_skip_softmax(layer) else None),
+                )
+                for layer in layers
+            ]
+        else:
+            layer_targets = [(layer, None) for layer in layers]
+
+        for layer, layer_target in layer_targets:
+            if layer_target is not None:
+                prepare_attention_backend_override(layer, layer_target)
+        for layer, layer_target in layer_targets:
+            apply_attention_backend_override(layer, layer_target)
         self.attn_backend = stage_backend
         self._attention_backend_active_override = target
+        self._skip_softmax_forced_fa = force_fa_for_self_attention
         logger.debug(
-            "Attention backend for this batch: %s (%d layers switched)",
+            "Attention backend for this batch: %s%s (%d layers considered)",
             target.name.lower() if target else "server default",
+            "; FA for self-attention" if force_fa_for_self_attention else "",
             len(layers),
         )
 
@@ -645,17 +756,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return stage_backend
 
     def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
-        """Mount/unmount the ``quality="high"`` fusions for this batch.
+        """Mount/unmount request-gated kernel fusions for this batch.
 
         These fusions are numerically equivalent only at half-precision
-        rounding level (not bit-exact), so they are mounted for
-        ``quality="high"`` requests and unmounted otherwise. The
-        ``"lossless"`` default runs the reference path bit-for-bit. ``quality``
-        participates in the dynamic-batch signature, making this transition
-        safe at the batch boundary. Mounting is all-or-nothing per transformer
-        and fusion family; models without marked sites are no-ops.
+        rounding level (not bit-exact), so they are mounted for both
+        ``quality="extra-high"`` and ``quality="high"``. The ``"lossless"``
+        default runs the reference path bit-for-bit. ``quality`` participates
+        in the dynamic-batch signature, making this transition safe at the
+        batch boundary. Mounting is all-or-nothing per transformer and fusion
+        family; models without marked sites are no-ops.
         """
-        want = getattr(batch.sampling_params, "quality", "lossless") == "high"
+        quality = getattr(batch.sampling_params, "quality", "lossless")
+        want = quality_allows_kernel_fusions(quality)
         if want == self._quality_fusions_mounted:
             return
         mounted_fusions: set[str] = set()
@@ -673,7 +785,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     unmount(transformer)
             descriptions = ", ".join(sorted(mounted_fusions))
             raise ValueError(
-                "quality='high' cannot be used with breakable CUDA graphs for "
+                f"quality={quality!r} cannot be used with breakable CUDA graphs for "
                 f"this model because its request-scoped DiT fusions "
                 f"({descriptions}) do not match the lossless warmup graphs. "
                 "Disable breakable CUDA graphs or use quality='lossless'."
@@ -681,7 +793,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         self._quality_fusions_mounted = want
         for description in sorted(mounted_fusions):
-            logger.info("Mounted %s for quality=high", description)
+            logger.debug("Mounted %s for quality=%s", description, quality)
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
@@ -1223,8 +1335,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         image_kwargs = self.prepare_extra_func_kwargs(
             getattr(self.transformer, "forward", self.transformer),
             {
+                # Pass None (not []) so T2V paths whose transformer has no
+                # image_embedder skip the branch; diffusers guards on
+                # `is not None` only.
                 # TODO: make sure on-device
-                "encoder_hidden_states_image": image_embeds,
+                "encoder_hidden_states_image": image_embeds if image_embeds else None,
             },
         )
 
@@ -1493,9 +1608,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
-            assert (
-                not server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            ), "image latents should not be provided for TI2V task"
+            assert not server_args.pipeline_config.task_type == ModelTaskType.TI2V, (
+                "image latents should not be provided for TI2V task"
+            )
             latent_model_input = torch.cat(
                 [latent_model_input, batch.image_latent], dim=1
             ).to(ctx.target_dtype)

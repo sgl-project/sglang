@@ -6,8 +6,10 @@ metatags:
 ---
 
 While the DiT denoises, the text and image encoders are idle — and while they
-encode, the whole DiT replica is idle. `--encoder-parallel` decides how to use
-those otherwise-unused GPUs for the encoding stage.
+encode, the whole DiT replica is idle. `--encoder-parallel` decides how native
+encoders use those otherwise-unused GPUs for the encoding stage. Folding applies
+to native text and image encoders; within-replica batch DP currently requires an
+explicitly supported native text encoder.
 
 ```bash
 --encoder-parallel {auto,fold,dp,replicate}
@@ -15,9 +17,9 @@ those otherwise-unused GPUs for the encoding stage.
 
 | Mode | What it does | Use when |
 | --- | --- | --- |
-| `auto` | Picks `fold`, `dp`, or the existing encoder layout from its width and the request's batch width | Default; you want the decision made per encoder |
+| `auto` | Picks folding or the existing layout for native text/image encoders, and batch DP for supported native text encoders | Default; you want the decision made per encoder |
 | `fold` | TP-shards the encoder weights across the idle DiT replica | One wide encoder dominates a single-request encode |
-| `dp` | Encoder copies split the prompt batch, then all-gather their outputs inside the replica | Throughput serving with `--batching-max-size > 1` |
+| `dp` | Supported native text encoder copies split the prompt batch, then all-gather their outputs inside the replica | Throughput serving with `--batching-max-size > 1` |
 | `replicate` | Keeps the encoder on its DiT TP group and encodes redundantly across the other replica ranks | You want to disable folding and batch DP |
 
 The two accelerated modes are mutually exclusive per encoder: folding shards the

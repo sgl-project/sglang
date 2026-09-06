@@ -40,7 +40,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_exec,
     get_flags,
     get_lora,
@@ -138,9 +137,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # Users can customize the batch sizes supported by cpu_graph, such as:
     # --cuda-graph-bs-decode 1 2 4 8 16
     capture_bs = get_exec().graph.cuda_graph_config.decode.bs
-    assert (
-        max(capture_bs) <= get_exec().graph.torch_compile_max_bs
-    ), f"{capture_bs=}, {get_exec().graph.torch_compile_max_bs=}"
+    assert max(capture_bs) <= get_exec().graph.torch_compile_max_bs, (
+        f"{capture_bs=}, {get_exec().graph.torch_compile_max_bs=}"
+    )
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -282,9 +281,9 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
-        # TODO: the kernel aliases query/key for 2D and 4D but allocates for 3D,
-        # which no schema expresses; an accurate fake needs it to pick one
-        return torch.empty_like(query), torch.empty_like(key)
+        if query.ndim == 3:
+            return torch.empty_like(query), torch.empty_like(key)
+        return query, key
 
     @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
     def _(query, key, cos, sin):
@@ -599,10 +598,10 @@ class CPUGraphRunner:
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.require_gathered_buffer = require_gathered_buffer()
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_mlp_sync = require_mlp_sync()
+        self.require_attn_tp_gather = require_attn_tp_gather()
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
@@ -610,9 +609,9 @@ class CPUGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        self.tp_size = model_runner.server_args.tp_size
+        self.tp_size = get_parallel().tp_size
         self.dp_size = get_parallel().dp_size
-        self.pp_size = configured_pp_size()
+        self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
@@ -620,21 +619,21 @@ class CPUGraphRunner:
         self.captured_req_width = 1
 
         assert not get_lora().enable_lora, "CPUGraphRunner does not support LoRA yet."
-        assert (
-            not self.enable_two_batch_overlap
-        ), "CPUGraphRunner does not support two batch overlap yet."
-        assert (
-            not self.require_mlp_tp_gather
-        ), "CPUGraphRunner does not support MLP TP gather yet."
-        assert (
-            not self.require_mlp_sync
-        ), "CPUGraphRunner does not support MLP sync yet."
-        assert (
-            not self.require_gathered_buffer
-        ), "CPUGraphRunner does not support gathered buffer yet."
-        assert (
-            model_runner.spec_algorithm.is_none()
-        ), "CPUGraphRunner does not support speculative inference yet."
+        assert not self.enable_two_batch_overlap, (
+            "CPUGraphRunner does not support two batch overlap yet."
+        )
+        assert not self.require_mlp_tp_gather, (
+            "CPUGraphRunner does not support MLP TP gather yet."
+        )
+        assert not self.require_mlp_sync, (
+            "CPUGraphRunner does not support MLP sync yet."
+        )
+        assert not self.require_gathered_buffer, (
+            "CPUGraphRunner does not support gathered buffer yet."
+        )
+        assert model_runner.spec_algorithm.is_none(), (
+            "CPUGraphRunner does not support speculative inference yet."
+        )
 
         assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
@@ -941,8 +940,10 @@ class CPUGraphRunner:
             )
             captured_forward_batch.encoder_out_cache_loc = None
         if enable_num_token_non_padded():
+            # CPUGraphRunner asserts not require_gathered_buffer, so this path is
+            # never attn-TP sharded: LOCAL == GLOBAL.
             captured_forward_batch.num_token_non_padded.copy_(
-                forward_batch.num_token_non_padded
+                forward_batch.global_num_token_non_padded
             )
 
         self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
@@ -953,9 +954,9 @@ class CPUGraphRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        assert (
-            pp_proxy_tensors is None
-        ), "PPProxyTensors is not supported in CPUGraphRunner yet."
+        assert pp_proxy_tensors is None, (
+            "PPProxyTensors is not supported in CPUGraphRunner yet."
+        )
 
         replay_context = (
             model_capture_mode if self.is_encoder_decoder else empty_context

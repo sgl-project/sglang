@@ -581,6 +581,11 @@ class TestAttachAdditionalStopTokenIds(unittest.TestCase):
         attach_additional_stop_token_ids(tok)
         self.assertEqual(tok.additional_stop_token_ids, {128008})
 
+    def test_k2_horizon_im_end_registers_as_stop(self):
+        tok = self._tokenizer({"<|ifm|im_end|>": 64019})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {64019})
+
     def test_no_known_marker_yields_none(self):
         tok = self._tokenizer({"<|other|>": 7})
         attach_additional_stop_token_ids(tok)

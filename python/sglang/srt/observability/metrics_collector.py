@@ -25,8 +25,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_CATEGORIES,
+)
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.runtime_context import (
+    exports_expert_balancedness_to_prometheus,
+    get_context,
     get_disagg,
     get_observability,
     get_schedule,
@@ -203,15 +208,16 @@ STAT_LOGGER_ROLE_RADIX_CACHE = "radix_cache"
 STAT_LOGGER_ROLE_EXPERT_DISPATCH = "expert_dispatch"
 
 
-def resolve_collector_class(
-    server_args: Optional[ServerArgs], role: str, default_cls: type
-) -> type:
-    """Return the subclass registered for `role` on `server_args.stat_loggers`,
-    or `default_cls` if none is registered. Tolerates `server_args=None` and
-    `stat_loggers=None`."""
-    if server_args is None:
+def resolve_collector_class(role: str, default_cls: type) -> type:
+    """Return the subclass registered for `role` in the published
+    ``observability`` bag, or `default_cls` if none is registered.
+
+    An unpublished ``observability`` namespace answers with the default.
+    """
+
+    if not get_context().is_config_namespace_published("observability"):
         return default_cls
-    stat_loggers = getattr(server_args, "stat_loggers", None)
+    stat_loggers = get_observability().stat_loggers
     if not stat_loggers:
         return default_cls
     return stat_loggers.get(role, default_cls)
@@ -241,7 +247,6 @@ class SchedulerMetricsCollectorContext:
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
-
     def __init__(
         self,
         labels: Dict[str, str],
@@ -877,10 +882,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # Execution
         # =================================================================
-        if (
-            labels["moe_ep_rank"] == 0
-            and server_args.should_export_expert_balancedness_to_prometheus()
-        ):
+        if labels["moe_ep_rank"] == 0 and exports_expert_balancedness_to_prometheus():
             self.eplb_balancedness = Summary(
                 name="sglang:eplb_balancedness",
                 documentation="Balancedness of MoE in expert parallelism.",
@@ -917,6 +919,31 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=list(labels.keys()) + ["category"],
         )
+        self.scheduler_idle_seconds_total = Counter(
+            name="sglang:scheduler_idle_seconds_total",
+            documentation=(
+                "Total wall time while the scheduler has no runnable or queued work."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.scheduler_process_cpu_seconds_total = Counter(
+            name="sglang:scheduler_process_cpu_seconds_total",
+            documentation=(
+                "Total CPU time consumed by the scheduler process across all threads."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.scheduler_stage_seconds_total = Counter(
+            name="sglang:scheduler_stage_seconds_total",
+            documentation=(
+                "Total scheduler-loop wall time exclusively attributed to each stage."
+            ),
+            labelnames=list(labels.keys()) + ["category"],
+        )
+        self.scheduler_idle_seconds_total.labels(**labels)
+        self.scheduler_process_cpu_seconds_total.labels(**labels)
+        for category in SCHEDULER_STAGE_CATEGORIES:
+            self.scheduler_stage_seconds_total.labels(**labels, category=category)
         self.estimated_flops_per_gpu_total = Counter(
             name="sglang:estimated_flops_per_gpu_total",
             documentation=(
@@ -1114,7 +1141,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
             scheduler_collector_cls = resolve_collector_class(
-                server_args, STAT_LOGGER_ROLE_SCHEDULER, cls
+                STAT_LOGGER_ROLE_SCHEDULER, cls
             )
             collector = scheduler_collector_cls(
                 labels=labels,
@@ -1302,6 +1329,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 category=category,
                 **dp_cooperation_info.to_labels(),
             ).inc(t)
+
+    def increment_scheduler_idle_seconds(self, t: float) -> None:
+        self.scheduler_idle_seconds_total.labels(**self.labels).inc(t)
+
+    def increment_scheduler_process_cpu_seconds(self, t: float) -> None:
+        self.scheduler_process_cpu_seconds_total.labels(**self.labels).inc(t)
+
+    def increment_scheduler_stage_seconds(self, stage: str, seconds: float) -> None:
+        self.scheduler_stage_seconds_total.labels(**self.labels, category=stage).inc(
+            seconds
+        )
 
     def increment_estimated_perf(
         self,
@@ -1781,10 +1819,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 if "storage" in cached_tokens_details:
                     storage_tokens = cached_tokens_details.get("storage", 0)
                     if storage_tokens > 0:
-                        backend = (
-                            cached_tokens_details.get("storage_backend") or "unknown"
-                        )
-                        report_cache_source(f"storage_{backend}", storage_tokens)
+                        report_cache_source("storage", storage_tokens)
             else:
                 # Fallback for backward compatibility
                 labels_total = {**labels, "cache_source": "total"}
@@ -1851,7 +1886,6 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
-    prefetch_stats: Dict[str, float] = field(default_factory=dict)
 
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
@@ -1879,7 +1913,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         )
         self.prefetched_tokens_total = Counter(
             name="sglang:prefetched_tokens_total",
-            documentation="Number of prefetched prompt tokens.",
+            documentation="Prompt tokens successfully transferred from L3 "
+            "storage into host memory, before admission-time reuse or discard.",
             labelnames=labels.keys(),
         )
 
@@ -1889,10 +1924,38 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.storage_prefetch_hit_tokens_total = Counter(
+            name="sglang:storage_prefetch_hit_tokens_total",
+            documentation="Storage-hit tokens returned by an L3 query before "
+            "host allocation, transfer, or cache insertion.",
+            labelnames=labels.keys(),
+        )
+
+        self.storage_prefetch_unfulfilled_tokens_total = Counter(
+            name="sglang:storage_prefetch_unfulfilled_tokens_total",
+            documentation="Storage-hit tokens that did not become a usable "
+            "prefetch result, by terminal reason.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        for reason in (
+            "below_threshold",
+            "host_capacity",
+            "device_capacity",
+            "storage_transfer",
+            "shrunk",
+            "dropped",
+        ):
+            self.storage_prefetch_unfulfilled_tokens_total.labels(
+                **self.labels, reason=reason
+            )
+
         self.backup_dropped_tokens_total = Counter(
             name="sglang:hicache_backup_dropped_tokens_total",
-            documentation="Buffer-mode backup tokens dropped by write-path rate "
-            "limiting (backlog cap or dropped-parent cascade).",
+            documentation="Buffer-mode backup tokens that never reached L3 "
+            "because admission rejected them or the source became stale "
+            "before the D2H staging launched; the write path lagging device "
+            "churn is the common cause, and the span rewrites only on a "
+            "later recompute.",
             labelnames=labels.keys(),
         )
 
@@ -1938,14 +2001,19 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
         self.histogram_prefetch_bandwidth = Histogram(
             name="sglang:prefetch_bandwidth",
-            documentation="Histogram of prefetch bandwidth in GB/s.",
+            documentation="Histogram of per-op L3 prefetch wire bandwidth in "
+            "GB/s: transferred bytes (compressed size when KV compression is "
+            "on) over the op's IO wall time.",
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
 
         self.histogram_backup_bandwidth = Histogram(
             name="sglang:backup_bandwidth",
-            documentation="Histogram of backup bandwidth in GB/s.",
+            documentation="Histogram of per-op L3 backup wire bandwidth in "
+            "GB/s: transferred bytes over the op's IO wall time, excluding "
+            "pages the backend already held (the log line's "
+            "processing_throughput includes them).",
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
@@ -1982,6 +2050,18 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
 
+    def log_storage_prefetch_hit_tokens(self, num_tokens: int) -> None:
+        if num_tokens > 0:
+            self.storage_prefetch_hit_tokens_total.labels(**self.labels).inc(num_tokens)
+
+    def log_storage_prefetch_unfulfilled_tokens(
+        self, num_tokens: int, reason: str
+    ) -> None:
+        if num_tokens > 0:
+            self.storage_prefetch_unfulfilled_tokens_total.labels(
+                **self.labels, reason=reason
+            ).inc(num_tokens)
+
     def log_backup_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:
             self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
@@ -2009,7 +2089,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
-        self.log_prefetch_outcomes(storage_metrics.prefetch_stats)
+        self.log_prefetch_outcomes(getattr(storage_metrics, "prefetch_stats", {}))
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):
@@ -2045,6 +2125,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             "SGLANG_BUCKET_EVICTION_DURATION"
         )
         if bucket_eviction_duration is None:
+            # Keep within a 1.0s ceiling: downstream metrics gateways with a
+            # fixed bucket preset silently drop the series when a boundary
+            # falls outside it. The >1s regime is covered by the
+            # backup-duration histogram, and the env override widens this
+            # where no such preset applies.
             bucket_eviction_duration = [
                 0.001,
                 0.002,
@@ -2064,11 +2149,6 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
                 0.2,
                 0.5,
                 1.0,
-                2.0,
-                5.0,
-                10.0,
-                30.0,
-                60.0,
             ]
         bucket_load_back_duration = get_histogram_conf_from_env(
             "SGLANG_BUCKET_LOAD_BACK_DURATION"
@@ -2097,12 +2177,13 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         # D->H backups include blocking merged ops issued during eviction under
         # --hicache-write-policy write_back, which can run for seconds -- hence
         # the wider default range than load-back.
+        # Keep the boundaries to a coarse, widely supported set: downstream
+        # metrics gateways with a fixed bucket preset drop the series when a
+        # boundary is not in it.
         bucket_backup_duration = [
             0.001,
-            0.002,
             0.005,
             0.01,
-            0.02,
             0.05,
             0.1,
             0.2,
@@ -2136,7 +2217,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
-            documentation="Time taken to load KV cache from CPU back to GPU in seconds.",
+            documentation="GPU-stream span of a merged host-to-device load-back "
+            "copy loop, including gaps between per-layer I/O submissions but "
+            "excluding pre-transfer queue and fence waits.",
             labelnames=labels.keys(),
             buckets=bucket_load_back_duration,
         )
@@ -2173,8 +2256,8 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             documentation="Bytes loaded back from local host DRAM (L2) to "
             "GPU, all pools combined, including draft/sidecar transfers that "
             "the token counter excludes. Divided by the rate of "
-            "load_back_duration_seconds_sum, gives the achieved H->D "
-            "bandwidth while transferring.",
+            "load_back_duration_seconds_sum, gives the achieved bandwidth "
+            "over each merged H2D load operation.",
             labelnames=labels.keys(),
         )
 
@@ -2189,9 +2272,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
         self.hicache_dropped_tokens = Counter(
             name="sglang:hicache_dropped_tokens_total",
-            documentation="The number of device KV tokens destroyed without a "
-            "host backup, by pool (kv, swa, ...) and reason (e.g. write-back "
-            "backup failure under host memory pressure).",
+            documentation="The number of logical device KV tokens destroyed "
+            "without a host backup. The pool label is always kv; reason is "
+            "host_pressure for write-back failure, or "
+            "write_through_unbacked_eviction when "
+            "eager write-through did not complete before eviction.",
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
 

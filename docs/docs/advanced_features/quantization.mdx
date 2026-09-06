@@ -47,7 +47,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes</td>
       <td>Yes</td>
       <td>Yes (A5)</td>
-      <td>On GPU: requires CDNA3/CDNA4 with MXFP support (uses Aiter). On Ascend NPU (A5): W4A4 MXFP4 for Qwen3 dense and MoE LLMs (MXFP4 weights + activations) — dense models support online dual-level MXFP4; offline <code>W4A4_MXFP4</code> dense and MoE checkpoints (single-level) are auto-detected via <code>modelslim</code></td>
+      <td>On GPU: requires CDNA3/CDNA4 with MXFP support (uses Aiter). On Ascend NPU (A5): W4A4 MXFP4 for Qwen3 dense and MoE LLMs (MXFP4 weights + activations) — dense models support online dual-level MXFP4; offline <code>W4A4_MXFP4</code> dense and MoE checkpoints (single-level) are auto-detected via <code>modelslim</code>. On Intel GPUs (XPU): W4A16 MoE experts on Xe2/BMG via <code>sgl-kernel-xpu</code>, enabled automatically with <code>--device xpu</code> (see <a href="../hardware-platforms/xpu">Intel GPUs (XPU)</a>)</td>
     </tr>
     <tr>
       <td><code>mxfp8</code></td>

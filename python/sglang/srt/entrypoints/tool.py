@@ -20,14 +20,12 @@ logger = logging.getLogger(__name__)
 
 
 class Tool(ABC):
-
     @abstractmethod
     async def get_result(self, context: "ConversationContext") -> Any:
         pass
 
 
 class HarmonyBrowserTool(Tool):
-
     def __init__(self, client: ExaClient | None = None):
         self.enabled = True
         if client is not None:
@@ -257,7 +255,6 @@ class HarmonyBrowserTool(Tool):
 
 
 class HarmonyPythonTool(Tool):
-
     def __init__(self):
         self.enabled = True
 

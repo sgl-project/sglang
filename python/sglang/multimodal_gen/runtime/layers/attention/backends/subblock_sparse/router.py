@@ -128,6 +128,22 @@ def load_bsa_attn_blk64_fwd():
     return mod.bsa_attn_blk64_fwd
 
 
+@functools.lru_cache(maxsize=1)
+def load_bsa_attn_sm120_blk64_fwd():
+    """FlashInfer's CuTe-DSL 64-block sparse attention entry point for SM120."""
+    try:
+        from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import (
+            bsa_attn_sm120_blk64_fwd,
+        )
+    except Exception as exc:
+        raise ImportError(
+            "SM120 SubBlock sparse attention requires FlashInfer's "
+            "flashinfer.cute_dsl.sparse.bsa_attn_sm120 module"
+        ) from exc
+
+    return bsa_attn_sm120_blk64_fwd
+
+
 LOG2E = 1.4426950408889634
 BLOCK = 64  # the kernel's block granularity (kSparseBlockSize=64)
 BUDGET_GRANULARITY = 8  # blocks per query row the kernel bills in, padding to fit
@@ -243,8 +259,9 @@ class SubBlockRouter:
         scores = self.scores(q, k, softmax_scale)  # [B, H, Gq, Gk]
         gq = scores.shape[2]
         topk = _snap_up_to_8(math.ceil((1.0 - sparsity) * gk), gk)
-        # One pass over the score matrix instead of torch.topk's several; the kernel
-        # accepts the blocks in any order, so nothing sorts them.
+        # One pass over the score matrix instead of torch.topk's several. The
+        # output order is unspecified: SM100 consumes it directly, while the
+        # SM90 backend sorts compact active prefixes before heterogeneous expansion.
         index = fused_topk(scores.reshape(-1, gk), topk).view(b, h, gq, topk)
         return RoutingPlan(index=index, topk=topk, num_blocks=gk)
 

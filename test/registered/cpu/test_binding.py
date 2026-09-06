@@ -11,7 +11,7 @@ from sglang.srt.utils.numa_utils import init_threads_binding
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-b-tp-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-a-tp-test-cpu-intel")
 
 
 class TestBinding(CustomTestCase):
