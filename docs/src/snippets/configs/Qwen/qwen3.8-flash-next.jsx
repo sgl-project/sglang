@@ -843,9 +843,10 @@ export const config = {
     // were driven through a 1024-in/256-out random benchmark and a ShareGPT
     // chat sweep at every concurrency up to the pin.
     // Verified 2026-09-06 on the dev-qwen38-next-local image (qwen4-main-squashed
-    // 9b2aee2283), the image the Docker tab uses for this card. Full GSM8K
-    // (sglang.test.run_eval --eval-name gsm8k --num-examples 1319, 5-shot,
-    // thinking on, 16k budget): 97.95% low latency, 97.79% high throughput.
+    // 9b2aee2283), the image the Docker tab uses for this card. Full GSM8K,
+    // 1,319 questions: 95.8% / 95.8% (low latency / high throughput) with
+    // the Spark rows' chat protocol (thinking off), 97.95% / 97.79% with
+    // sglang.test.run_eval --eval-name gsm8k (5-shot, thinking on, 16k budget).
     // 1024-in/256-out random prompts: 6.2 ms TPOT at 1 request and 613 output
     // tok/s at 16 with MTP, 885 output tok/s at 64 without; 2.8 GB / 4.0 GB
     // left at peak. The cells first passed on the qwen38flashnext image
@@ -1130,9 +1131,10 @@ export const config = {
     // Verified 2026-09-06 on the dev-qwen38-next-local image (9b2aee2283),
     // TP=1, 1024-in/256-out random prompts. With MTP: 5.9 ms TPOT at 1
     // request, 18.7 ms / 634 output tok/s at 16, accept length 3.4 of 4, full
-    // GSM8K (run_eval, 1319, thinking on) 97.72%, 2.7 GB left at peak.
-    // Without: 11.5 ms at 1, 25.1 ms at 16, 55.7 ms / 871 output tok/s at 64,
-    // GSM8K 97.72%, 4.0 GB left at peak. The smaller fp8 draft leaves a
+    // GSM8K 95.9% (chat, thinking off) / 97.72% (run_eval, thinking on),
+    // 2.7 GB left at peak. Without: 11.5 ms at 1, 25.1 ms at 16, 55.7 ms / 871
+    // output tok/s at 64, GSM8K 96.4% / 97.72%, 4.0 GB left at peak.
+    // The smaller fp8 draft leaves a
     // ~170k-token KV pool with MTP (vs ~78k for the RDXA cell).
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
