@@ -3,6 +3,7 @@ import unittest
 
 import torch
 
+from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
@@ -179,6 +180,85 @@ class TestTokenspeedMLAAttentionBackendCorrectness(CustomTestCase):
                     rtol=2e-1,
                     **MLA_SHAPE_KWARGS,
                 )
+
+
+class TestTokenspeedMLANoPEPrefillQuantize(CustomTestCase):
+    """NoPE MLA layers must still get packed FP8 prefill Q/K.
+
+    Layers built with ``skip_rope`` carry no rotary embedding, so the prefill
+    quantize runs with ``cos_sin_cache=None``. It must return the same packed
+    ``[nope | pe]`` FP8 layout as the RoPE path, and the head-0 pe slice it
+    writes to the KV cache must equal the plain FP8 cast of the unroped
+    ``k_pe`` that the decode path reads back.
+    """
+
+    T = 7
+    NUM_HEADS = 4
+    QK_NOPE_HEAD_DIM = 128
+    QK_ROPE_HEAD_DIM = 64
+    KV_LORA_RANK = 512
+
+    def test_nope_prefill_quantize_packs_without_rope(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        head_dim = self.QK_NOPE_HEAD_DIM + self.QK_ROPE_HEAD_DIM
+
+        q_nope = torch.randn(
+            self.T,
+            self.NUM_HEADS,
+            self.QK_NOPE_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        q_pe = torch.randn(
+            self.T,
+            self.NUM_HEADS,
+            self.QK_ROPE_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        k_nope = torch.randn(
+            self.T,
+            self.NUM_HEADS,
+            self.QK_NOPE_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        # k_pe reaches the backend as the strided tail of the latent cache.
+        latent_cache = torch.randn(
+            self.T,
+            1,
+            self.KV_LORA_RANK + self.QK_ROPE_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        k_pe = latent_cache[:, :, self.KV_LORA_RANK :]
+
+        q_fp8, k_fp8 = TokenspeedMLABackend._fused_rope_fp8_quantize(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            cos_sin_cache=None,
+            positions=torch.arange(self.T, device=device),
+            is_neox=True,
+            qk_nope_head_dim=self.QK_NOPE_HEAD_DIM,
+            qk_rope_head_dim=self.QK_ROPE_HEAD_DIM,
+        )
+
+        for name, out in (("q", q_fp8), ("k", k_fp8)):
+            with self.subTest(tensor=name):
+                self.assertEqual(out.shape, (self.T, self.NUM_HEADS, head_dim))
+                self.assertEqual(out.dtype, torch.float8_e4m3fn)
+                self.assertTrue(out.is_contiguous())
+
+        fp8 = torch.float8_e4m3fn
+        nope = self.QK_NOPE_HEAD_DIM
+        self.assertTrue(torch.equal(q_fp8[..., :nope], q_nope.to(fp8)))
+        self.assertTrue(torch.equal(q_fp8[..., nope:], q_pe.to(fp8)))
+        self.assertTrue(torch.equal(k_fp8[..., :nope], k_nope.to(fp8)))
+        # The slice prepare_prefill_qkv writes into the KV cache; the decode
+        # NoPE path reads it back as a plain cast of the unroped k_pe.
+        self.assertTrue(torch.equal(k_fp8[:, 0:1, nope:], k_pe.to(fp8)))
 
 
 if __name__ == "__main__":

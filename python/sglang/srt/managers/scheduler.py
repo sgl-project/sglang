@@ -292,6 +292,15 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_GET_NEXT_BATCH,
+    SCHEDULER_STAGE_IDLE,
+    SCHEDULER_STAGE_PROCESS_BATCH_RESULT,
+    SCHEDULER_STAGE_PROCESS_REQUESTS,
+    SCHEDULER_STAGE_RUN_BATCH,
+    SCHEDULER_STAGE_SANITY_CHECK_CACHE,
+    scheduler_stage_method,
+)
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -309,6 +318,8 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.uno_validation import validate_uno_request
+from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
+from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -337,7 +348,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
@@ -640,6 +650,7 @@ class Scheduler(
         self.init_diffusion_llm()
 
         self.init_metrics_reporter(tp_rank, pp_rank, dp_rank)
+        self.scheduler_stage_metrics = self.metrics_reporter.scheduler_stage_metrics
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -1540,6 +1551,7 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
+                scheduler_stage_metrics=self.scheduler_stage_metrics,
                 pp_rank=self.ps.pp_rank,
                 pp_size=self.ps.pp_size,
                 transfer_backend=self.transfer_backend,
@@ -1798,6 +1810,8 @@ class Scheduler(
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
+        destroy_global_experts_capturer()
+        destroy_global_indexer_capturer()
 
         rank_consensus_checker.shutdown()
 
@@ -1815,6 +1829,7 @@ class Scheduler(
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
+            self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
             return
 
@@ -1837,6 +1852,7 @@ class Scheduler(
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
+            self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
@@ -1861,8 +1877,11 @@ class Scheduler(
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            if recv_reqs:
+                self.metrics_reporter.record_scheduler_active()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run
@@ -1905,8 +1924,11 @@ class Scheduler(
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            if recv_reqs:
+                self.metrics_reporter.record_scheduler_active()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run
@@ -2010,7 +2032,7 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
-    @scheduler_nvtx_method("scheduler.process_input_requests")
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
@@ -2236,6 +2258,7 @@ class Scheduler(
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
+            scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -2294,6 +2317,7 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
+            scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
     def init_rank_consensus_checker(self) -> None:
@@ -3344,6 +3368,11 @@ class Scheduler(
             # it. Drop the marker once the request is actually gone.
             if req.finished() or not req.kv.holds_kv:
                 self._pending_chunked_abort_req = None
+                return
+            # The request moved to another scheduler queue after abort_request
+            # deferred it, so retry against its current location.
+            self._pending_chunked_abort_req = None
+            self.abort_request(AbortReq(rid=req.rid))
             return
 
         prepare_abort(req, "Aborted")
@@ -3407,7 +3436,7 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
-    @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
+    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
@@ -3756,10 +3785,17 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                # Pop the L3-loaded span. Unified cache exposes its absolute
+                # start so cache-mode L2/L3 attribution survives L3-tail eviction.
+                loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
+                    req.rid
+                )
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
+                    req.storage_hit_start = loaded_start
+                    # Cache-mode host memory is a resident L2 tier. Buffer mode
+                    # marks the staged span below once it is surfaced.
+                    req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
             if (
@@ -3781,6 +3817,13 @@ class Scheduler(
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
                     req.swa_host_hit_length = held_swa_tokens
+                    req.storage_hit_length = held_tokens
+                    req.storage_hit_start = len(req.prefix_indices)
+                    req.host_hit_is_storage = True
+                elif not (req.host_hit_is_storage and req.host_loaded_length > 0):
+                    req.storage_hit_length = 0
+                    req.storage_hit_start = None
+                    req.host_hit_is_storage = False
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -4091,13 +4134,14 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
-    @scheduler_nvtx_method("scheduler.run_batch")
+    @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
@@ -4435,7 +4479,7 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
-    @scheduler_nvtx_method("scheduler.process_batch_result")
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -4562,6 +4606,7 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         # Flush any health-check signal deferred while the engine was busy.
@@ -4574,7 +4619,9 @@ class Scheduler(
         # path spins without sleeping, so a wall-clock floor bounds the
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
-        if not self.is_fully_idle():
+        fully_idle = self.is_fully_idle()
+        if not fully_idle:
+            self.metrics_reporter.record_scheduler_active()
             now = time.monotonic()
             if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
                 self._last_stall_publish_ts = now
@@ -4583,6 +4630,7 @@ class Scheduler(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
             return
+        self.metrics_reporter.record_scheduler_idle()
 
         if self.enable_unified_memory:
             try:
@@ -4599,23 +4647,26 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
-        if not self.enable_hisparse and not deferred_pending:
-            has_leak, messages = self.invariant_checker._check_all_pools(
-                self.pool_stats_observer.get_pool_stats(),
-            )
-            if has_leak:
-                self.invariant_checker._report_leak("pool", "\n".join(messages))
-            self.invariant_checker._check_req_pool()
-            # Byte-conservation diagnostic (allocator-owned; static pools
-            # return [] — the token identity above can't see byte leaks).
-            byte_violations = self.token_to_kv_pool_allocator.verify_byte_accounting()
-            if byte_violations:
-                self.invariant_checker._report_leak(
-                    "pool-bytes", "\n".join(byte_violations)
+        with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
+            if not self.enable_hisparse and not deferred_pending:
+                has_leak, messages = self.invariant_checker._check_all_pools(
+                    self.pool_stats_observer.get_pool_stats(),
                 )
+                if has_leak:
+                    self.invariant_checker._report_leak("pool", "\n".join(messages))
+                self.invariant_checker._check_req_pool()
+                # Byte-conservation diagnostic (allocator-owned; static pools
+                # return [] — the token identity above can't see byte leaks).
+                byte_violations = (
+                    self.token_to_kv_pool_allocator.verify_byte_accounting()
+                )
+                if byte_violations:
+                    self.invariant_checker._report_leak(
+                        "pool-bytes", "\n".join(byte_violations)
+                    )
 
-        # tree cache sanity check
-        self.invariant_checker._check_tree_cache()
+            # tree cache sanity check
+            self.invariant_checker._check_tree_cache()
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
@@ -4635,6 +4686,13 @@ class Scheduler(
 
         # sleep until next event
         self.maybe_sleep_on_idle()
+        self.metrics_reporter.record_scheduler_idle()
+
+    def _record_scheduler_state_for_paused_engine(self) -> None:
+        if self.is_fully_idle():
+            self.metrics_reporter.record_scheduler_idle()
+        else:
+            self.metrics_reporter.record_scheduler_active()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.

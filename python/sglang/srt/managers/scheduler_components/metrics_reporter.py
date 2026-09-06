@@ -22,6 +22,9 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SchedulerStageMetricsRecorder,
+)
 from sglang.srt.runtime_context import (
     exports_expert_balancedness_to_prometheus,
     get_context,
@@ -48,6 +51,13 @@ RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
+# gen_throughput is computed only on decode-stats ticks; when decode is starved
+# (e.g. long chunked-prefill stretches) the last window's value would otherwise
+# be re-exported indefinitely. 30s is far above any healthy decode-stats gap,
+# so past it the true recent decode throughput is ~0.
+GEN_THROUGHPUT_STALENESS_SECONDS = 30.0
+# Update scheduler time counters every 1 second.
+_SCHEDULER_TIME_ACCOUNTING_INTERVAL_NS = 1_000_000_000
 
 
 class _CacheHitRateWindow:
@@ -119,6 +129,44 @@ class PrefillStats:
         )
 
 
+@dataclass(slots=True)
+class _SchedulerTimeAccountingSnapshot:
+    start_ns: int
+    last_sample_ns: int
+    start_process_cpu_ns: int
+    accumulate_idle_ns: int
+    # Whether the last sample was idle (for example, no work on the engine).
+    is_idle: bool
+
+    @classmethod
+    def init(
+        cls, now_ns: int, now_process_cpu_ns: int, is_idle: bool
+    ) -> _SchedulerTimeAccountingSnapshot:
+        return cls(
+            start_ns=now_ns,
+            last_sample_ns=now_ns,
+            start_process_cpu_ns=now_process_cpu_ns,
+            accumulate_idle_ns=0,
+            is_idle=is_idle,
+        )
+
+    def sample(self, now_ns: int, is_idle: bool) -> None:
+        if self.is_idle:
+            self.accumulate_idle_ns += now_ns - self.last_sample_ns
+        self.last_sample_ns = now_ns
+        self.is_idle = is_idle
+
+    def should_record(self, now_ns: int) -> bool:
+        return now_ns - self.start_ns >= _SCHEDULER_TIME_ACCOUNTING_INTERVAL_NS
+
+    def reset(self, now_ns: int, now_process_cpu_ns: int, is_idle: bool) -> None:
+        self.start_ns = now_ns
+        self.last_sample_ns = now_ns
+        self.start_process_cpu_ns = now_process_cpu_ns
+        self.accumulate_idle_ns = 0
+        self.is_idle = is_idle
+
+
 @dataclass(kw_only=True)
 class SchedulerMetricsReporter:
     scheduler: Scheduler
@@ -152,6 +200,16 @@ class SchedulerMetricsReporter:
         # Windowed rate for waiting-queue load estimation only; the exported
         # cache_hit_rate stats keep their per-report semantics.
         self.recent_cache_hit_rate = 0.0
+
+    def _current_gen_throughput(self, now: float) -> float:
+        """last_gen_throughput, decayed to 0 once decode-stats stop arriving.
+
+        Mirrors the pause-path zeroing in Scheduler.pause_generation: a stale
+        decode window must not keep exporting its throughput forever.
+        """
+        if now - self.last_decode_stats_tic > GEN_THROUGHPUT_STALENESS_SECONDS:
+            self.last_gen_throughput = 0.0
+        return self.last_gen_throughput
 
     def _init_metrics(
         self,
@@ -201,6 +259,12 @@ class SchedulerMetricsReporter:
                 self._mfu_log_write_bytes = 0.0
 
         self.fwd_occupancy = float("nan")
+        self._scheduler_time_accounting: Optional[_SchedulerTimeAccountingSnapshot] = (
+            None
+        )
+        self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
+            enabled=self.enable_metrics
+        )
 
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
 
@@ -717,6 +781,9 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            # Refresh here too: prefill-heavy stretches can run long between
+            # decode-stats ticks, and the gauge must decay rather than hold.
+            self.stats.gen_throughput = self._current_gen_throughput(now)
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
@@ -875,8 +942,6 @@ class SchedulerMetricsReporter:
                 spec_num_steps = spec_snapshot["num_steps"]
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
-        cache_hit_rate = 0.0
-
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
@@ -934,7 +999,9 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
-            self.stats.cache_hit_rate = cache_hit_rate
+            # cache_hit_rate is prefill-owned (per-report semantics); decode
+            # ticks must not reset it, or the exported gauge reads 0 whenever
+            # a decode report lands between prefill reports.
             self.stats.decode_sum_seq_lens = _decode_total_seq_lens(batch)
 
             # Memory pool usage ratios / Absolute token counts
@@ -1177,6 +1244,55 @@ class SchedulerMetricsReporter:
         self._device_timer_window_batch_count += 1
         if self._device_timer_window_batch_count >= self.decode_log_interval:
             self._device_timer_window_batch_count = 0
+
+    def start_scheduler_time_accounting(self) -> None:
+        if not self.enable_metrics:
+            return
+        now_wall_ns = time.monotonic_ns()
+        self._scheduler_time_accounting = _SchedulerTimeAccountingSnapshot.init(
+            now_wall_ns, time.process_time_ns(), True
+        )
+        self.scheduler_stage_metrics.start(now_wall_ns)
+
+    def record_scheduler_active(self) -> None:
+        self._record_scheduler_time(is_idle=False)
+
+    def record_scheduler_idle(self) -> None:
+        self._record_scheduler_time(is_idle=True)
+
+    def _record_scheduler_time(self, is_idle: bool) -> None:
+        if not self.enable_metrics:
+            return
+
+        now_wall_ns = time.monotonic_ns()
+        accounting = self._scheduler_time_accounting
+        if accounting is None:
+            self._scheduler_time_accounting = _SchedulerTimeAccountingSnapshot.init(
+                now_wall_ns, time.process_time_ns(), is_idle
+            )
+            self.scheduler_stage_metrics.start(now_wall_ns)
+            return
+
+        accounting.sample(now_wall_ns, is_idle)
+        if not accounting.should_record(now_wall_ns):
+            return
+
+        now_process_cpu_ns = time.process_time_ns()
+        elapsed_process_cpu_ns = now_process_cpu_ns - accounting.start_process_cpu_ns
+        if accounting.accumulate_idle_ns > 0:
+            self.metrics_collector.increment_scheduler_idle_seconds(
+                accounting.accumulate_idle_ns / 1e9
+            )
+        self.metrics_collector.increment_scheduler_process_cpu_seconds(
+            elapsed_process_cpu_ns / 1e9
+        )
+        for stage, elapsed_wall_ns in self.scheduler_stage_metrics.drain(
+            now_wall_ns
+        ).items():
+            self.metrics_collector.increment_scheduler_stage_seconds(
+                stage=stage, seconds=elapsed_wall_ns / 1e9
+            )
+        accounting.reset(now_wall_ns, now_process_cpu_ns, is_idle)
 
     def _reset_device_timer_window(self):
         """Exclude idle time and invalidate the last forward-occupancy sample."""

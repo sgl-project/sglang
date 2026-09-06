@@ -440,6 +440,7 @@ def _apply_qk_norm(
         and q.stride(-2) == k.stride(-2) == head_dim
         and q_norm.eps == k_norm.eps
         and not torch.compiler.is_compiling()
+        and current_platform.is_cuda()
     ):
         fused_inplace_qknorm(
             q,
@@ -845,6 +846,7 @@ class MiniMaxH3Attention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
+            packed_trailing_padding=True,
         )
         # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
         # the resolved enum alongside the impl instance instead of a second
