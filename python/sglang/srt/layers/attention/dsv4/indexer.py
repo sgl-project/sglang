@@ -29,6 +29,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     logits_rows_per_chunk,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
@@ -391,6 +392,7 @@ def topk_transform_flashinfer_unfused(
 
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
         _flashinfer_tie_break_value,
+        _flashinfer_topk_deterministic,
     )
 
     _topk_transform_vectorized(
@@ -403,7 +405,7 @@ def topk_transform_flashinfer_unfused(
         topk_op=flashinfer.top_k,
         topk_op_kwargs={
             "sorted": False,
-            "deterministic": envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+            "deterministic": _flashinfer_topk_deterministic(),
             "tie_break": _flashinfer_tie_break_value(),
             "dsa_graph_safe": True,
         },
@@ -423,6 +425,7 @@ def topk_transform_flashinfer_fused(
 
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
         _flashinfer_tie_break_value,
+        _flashinfer_topk_deterministic,
     )
 
     flashinfer.top_k_page_table_transform(
@@ -430,7 +433,7 @@ def topk_transform_flashinfer_fused(
         page_tables.contiguous(),
         seq_lens.contiguous(),
         out_page_indices.shape[1],
-        deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+        deterministic=_flashinfer_topk_deterministic(),
         tie_break=_flashinfer_tie_break_value(),
         dsa_graph_safe=True,
         page_size=page_size,
@@ -527,6 +530,11 @@ class C4IndexerBackendMixin:
         indexer_metadata: PagedIndexerMetadata,
     ) -> bool:
         if not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
+            return False
+        # This path is taken only for single-request extends above a token
+        # threshold, so leaving it on would make a prompt's indexer logits
+        # depend on the batch it arrived in.
+        if is_batch_invariant_mode_enabled():
             return False
         # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.

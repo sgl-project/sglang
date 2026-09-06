@@ -1072,6 +1072,23 @@ def _deterministic_sampling_backend(view: Any) -> dict:
     return {}
 
 
+def _deterministic_dsa_topk_backend(view: Any) -> dict:
+    """sgl-kernel's radix-select top-k admits tied candidates in the threshold
+    bin first-come-first-served, so once the indexer holds more than index_topk
+    candidates its index set is not repeatable; FlashInfer's ordered path is."""
+    if not view.enable_deterministic_inference:
+        return {}
+    resolved = {}
+    if view.dsa_topk_backend == "sgl-kernel":
+        logger.warning(
+            "DSA top-k backend is set to flashinfer for deterministic inference."
+        )
+        resolved["dsa_topk_backend"] = "flashinfer"
+    if view.speculative_dsa_topk_backend == "sgl-kernel":
+        resolved["speculative_dsa_topk_backend"] = "flashinfer"
+    return resolved
+
+
 def _deterministic_is_deepseek_model(view: Any) -> bool:
     """Faithful copy of the deterministic handler's arch probe (pure read;
     the handler keeps its own copy for the later deepseek validation)."""

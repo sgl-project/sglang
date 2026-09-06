@@ -195,14 +195,15 @@ def _extract_output_logprobs(result):
     return [x[0] for x in result["meta_info"]["output_token_logprobs"]]
 
 
-def test_input_output_logprobs_match_helper(
+def _collect_decode_and_prefill_logprobs(
     base_url,
-    ACC_THRESHOLDS,
     model_name,
     max_samples=None,
     max_new_tokens=16000,
     trust_remote_code=False,
 ):
+    """Decode the prompts, then prefill-replay prompt + output; returns the
+    (prefill, decode) logprobs of the same selected tokens."""
     num_samples = DEFAULT_NUM_SAMPLES
     if max_samples is not None and max_samples > num_samples:
         num_samples = max_samples
@@ -213,7 +214,7 @@ def test_input_output_logprobs_match_helper(
     )
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
-    print(f"Running test_input_output_logprobs_match with {len(input_ids)} prompts")
+    print(f"Running decode-vs-prefill replay with {len(input_ids)} prompts")
 
     print("Flush Cache and Running generation to get output logprobs ...")
     _flush_cache(base_url)
@@ -228,13 +229,63 @@ def test_input_output_logprobs_match_helper(
 
     print("Running prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
+    return input_logprobs, output_logprobs
 
+
+def test_input_output_logprobs_match_helper(
+    base_url,
+    ACC_THRESHOLDS,
+    model_name,
+    max_samples=None,
+    max_new_tokens=16000,
+    trust_remote_code=False,
+):
+    input_logprobs, output_logprobs = _collect_decode_and_prefill_logprobs(
+        base_url,
+        model_name,
+        max_samples=max_samples,
+        max_new_tokens=max_new_tokens,
+        trust_remote_code=trust_remote_code,
+    )
     compare_kl_divergence(
         input_logprobs,
         output_logprobs,
         ACC_THRESHOLDS,
         model_name,
         inspect.currentframe().f_code.co_name,
+    )
+
+
+def test_input_output_logprobs_bitexact_helper(
+    base_url,
+    model_name,
+    max_samples=None,
+    max_new_tokens=16000,
+    trust_remote_code=False,
+):
+    """Every selected-token logprob must match bit for bit between decode and
+    its prefill replay, so the KL is exactly 0 rather than under a floor."""
+    input_logprobs, output_logprobs = _collect_decode_and_prefill_logprobs(
+        base_url,
+        model_name,
+        max_samples=max_samples,
+        max_new_tokens=max_new_tokens,
+        trust_remote_code=trust_remote_code,
+    )
+    mismatches = []
+    total = 0
+    for sample, (prefill, decode) in enumerate(
+        zip(input_logprobs, output_logprobs, strict=True)
+    ):
+        assert len(prefill) == len(decode)
+        total += len(decode)
+        for pos, (p, d) in enumerate(zip(prefill, decode)):
+            if p != d:
+                mismatches.append((sample, pos, p, d))
+    print(f"bitexact: {total - len(mismatches)}/{total} logprobs match")
+    assert not mismatches, (
+        f"{len(mismatches)}/{total} logprobs differ between decode and prefill; "
+        f"first (sample, pos, prefill, decode): {mismatches[:5]}"
     )
 
 

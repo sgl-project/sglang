@@ -28,6 +28,10 @@ class TestDeterministicBase(CustomTestCase):
         return DEFAULT_MODEL
 
     @classmethod
+    def get_launch_timeout(cls):
+        return DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+
+    @classmethod
     def setUpClass(cls):
         cls.model = cls.get_model()
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -39,7 +43,7 @@ class TestDeterministicBase(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=cls.get_launch_timeout(),
             other_args=cls.get_server_args(),
         )
 

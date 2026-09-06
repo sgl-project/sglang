@@ -33,6 +33,7 @@ from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
@@ -273,9 +274,15 @@ def _cuda_sm_count() -> int:
 
 def _flashinfer_mhc_pre_num_splits(num_tokens: int, hc_hidden_size: int) -> int:
     block_m = block_k = 64
-    grid_m = (num_tokens + block_m - 1) // block_m
     num_block_k = (hc_hidden_size + block_k - 1) // block_k
-    raw = max(1, min(_cuda_sm_count() // max(grid_m, 1), num_block_k // 4))
+    max_splits = max(1, num_block_k // 4)
+    if is_batch_invariant_mode_enabled():
+        # The split count fixes the K summation order; see
+        # _compute_num_split_for_mhc_pre.
+        raw = max_splits
+    else:
+        grid_m = (num_tokens + block_m - 1) // block_m
+        raw = max(1, min(_cuda_sm_count() // max(grid_m, 1), max_splits))
     best = 1
     for split in _FLASHINFER_MHC_PRE_SPLITS:
         if split <= raw:

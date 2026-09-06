@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
 
@@ -83,7 +84,7 @@ class DSATopKBackend(Enum):
                 topk_op=flashinfer.top_k,
                 topk_op_kwargs={
                     "sorted": False,
-                    "deterministic": envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+                    "deterministic": _flashinfer_topk_deterministic(),
                     "tie_break": _flashinfer_tie_break_value(),
                     "dsa_graph_safe": True,
                 },
@@ -206,7 +207,7 @@ class DSATopKBackend(Enum):
                     lengths.contiguous(),
                     topk,
                     row_to_batch=row_to_batch,
-                    deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+                    deterministic=_flashinfer_topk_deterministic(),
                     tie_break=_flashinfer_tie_break_value(),
                     dsa_graph_safe=True,
                     row_starts=row_starts,
@@ -223,7 +224,7 @@ class DSATopKBackend(Enum):
                     topk_indices_offset.contiguous(),
                     lengths.contiguous(),
                     topk,
-                    deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+                    deterministic=_flashinfer_topk_deterministic(),
                     tie_break=_flashinfer_tie_break_value(),
                     dsa_graph_safe=True,
                     row_starts=row_starts,
@@ -426,6 +427,18 @@ def _build_flashinfer_paged_args(
         )
 
     return row_to_batch, page_table_row_starts
+
+
+def _flashinfer_topk_deterministic() -> bool:
+    """Whether FlashInfer's top-k must select a batch-independent index set.
+
+    Its fast path resolves ties by whichever candidate a race lands on, so
+    deterministic inference always takes the ordered path.
+    """
+    return (
+        envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get()
+        or is_batch_invariant_mode_enabled()
+    )
 
 
 def _flashinfer_tie_break_value() -> int:
