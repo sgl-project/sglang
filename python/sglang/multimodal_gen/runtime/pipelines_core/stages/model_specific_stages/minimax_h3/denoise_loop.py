@@ -139,10 +139,10 @@ def _build_local_embedding_layout(
     row_stop = row_start + local_seq_len
 
     def local_ids(pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        source_ids = torch.nonzero(
+        source_ids = 
             (pos >= row_start) & (pos < row_stop),
             as_tuple=False,
-        ).view(-1)
+        .nonzero().view(-1)
         return source_ids.to(device), pos.index_select(0, source_ids).to(device)
 
     text_source_start = min(row_start, int(text_pos.shape[0]))
@@ -222,8 +222,8 @@ class MiniMaxH3DenoiseBranch:
         self.img_target_seq_idx = self.img_pos_dev[self.update_mask_dev]
         self.audio_target_seq_idx = self.audio_pos_dev[self.audio_update_mask_dev]
         self.audio_ref_seq_idx = self.audio_pos_dev[~self.audio_update_mask_dev]
-        self.cond_row_idx = torch.nonzero(~self.update_mask_dev).view(-1)
-        self.audio_ref_row_idx = torch.nonzero(~self.audio_update_mask_dev).view(-1)
+        self.cond_row_idx = ~self.update_mask_dev.nonzero().view(-1)
+        self.audio_ref_row_idx = ~self.audio_update_mask_dev.nonzero().view(-1)
         # rows that keep the video timestep each step: text, padding, and
         # video target rows — everything the three overwrite sets do not cover
         self.n_video_timestep_rows = (
