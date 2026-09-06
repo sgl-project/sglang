@@ -106,12 +106,10 @@ def _evict_stale_model_page_cache(request):
     )
     print(f"[CONFTEST] cgroup memory.current before: {before}")
 
-    total_files, total_bytes = _evict_dir_page_cache(
-        MODELSCOPE_MODEL_WEIGHTS_DIR, keep
-    )
+    total_files, total_bytes = _evict_dir_page_cache(MODELSCOPE_MODEL_WEIGHTS_DIR, keep)
     print(
         f"[CONFTEST] Page cache eviction summary: {total_files} files, "
-        f"{total_bytes / 1024 ** 3:.2f} GiB evicted"
+        f"{total_bytes / 1024**3:.2f} GiB evicted"
     )
     print(f"[CONFTEST] cgroup memory.current after: {_read_cgroup_memory_current()}")
     yield
