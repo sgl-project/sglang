@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -54,6 +55,9 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class MambaComponent(TreeComponent):
@@ -490,14 +494,36 @@ class MambaComponent(TreeComponent):
                 self.tree_core.component_protected_size_[ct] -= vlen
             cd.lock_ref -= 1
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
-        """Allocate one mamba pool slot, evicting if necessary."""
+    def _try_alloc_mamba_slot(self) -> Optional[torch.Tensor]:
+        """One mamba slot, evicting if needed; None when every slot is pinned."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
         return slot
+
+    # Skipped donations recur at every chunk boundary while the pool stays
+    # pinned, so log the first one and then every 1000th.
+    _skipped_donations = 0
+
+    def _log_skipped_donation(self, req: Req) -> None:
+        self._skipped_donations += 1
+        if self._skipped_donations == 1 or self._skipped_donations % 1000 == 0:
+            ct = self.component_type
+            allocator = self.cache.req_to_token_pool.mamba_allocator
+            logger.warning(
+                "No free mamba slot to donate the checkpoint of request %s at "
+                "seqlen %s; skipping it (%d skipped so far). Pool: available=%d "
+                "evictable=%d protected=%d. Every slot is held by a running "
+                "request: raise --max-mamba-cache-size or "
+                "--mamba-full-memory-ratio to keep prefix reuse.",
+                req.rid,
+                req.kv.mamba_last_track_seqlen,
+                self._skipped_donations,
+                allocator.available_size(),
+                self.tree_core.component_evictable_size_[ct],
+                self.tree_core.component_protected_size_[ct],
+            )
 
     @property
     def int8_ckpt_pool(self):
@@ -571,10 +597,20 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
-            # Donate the mamba index to the radix cache instead of copying.
+            # Donate the mamba index to the radix cache instead of copying. All
+            # strategies but int8 no_buffer need a fresh slot before donating; a
+            # pinned pool skips this boundary's checkpoint and the next one retries.
+            needs_new_slot = (
+                self.cache.enable_mamba_extra_buffer or self.int8_ckpt_pool is None
+            )
+            new_slot = None
+            if needs_new_slot:
+                new_slot = self._try_alloc_mamba_slot()
+                if new_slot is None:
+                    self._log_skipped_donation(req)
+                    return 0
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:
-                    new_slot = self._alloc_mamba_slot()
                     src_active = (
                         self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                             req, new_slot
@@ -587,14 +623,13 @@ class MambaComponent(TreeComponent):
                         req.kv.mamba_pool_idx.view(-1)
                     )
             elif self.cache.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot()
                 mamba_value_donated = (
                     self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                         req, new_slot
                     )
                 )
             else:
-                mamba_value_donated = self._alloc_mamba_slot()
+                mamba_value_donated = new_slot
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices

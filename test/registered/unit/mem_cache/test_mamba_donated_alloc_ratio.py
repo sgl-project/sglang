@@ -4,10 +4,15 @@ Pins the sizing invariant behind MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO:
 at the first cache_unfinished_req, a request still holds its admission-locked
 matched-prefix mamba (protected) plus its own COW slot, and then allocates a
 donated slot. With N distinct-prefix requests that peak is N own + N locked +
-1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim and
-the donated alloc asserts; ratio 3 (pool = 3N) has headroom. Once decode's
+1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim, so
+the donated alloc comes back empty and that boundary's checkpoint is skipped;
+ratio 3 (pool = 3N) has headroom. Once decode's
 skip_mamba leaves the matched prefix evictable, even ratio 2 recovers via
 eviction -- which is why the peak, not the decode steady state, sets the floor.
+
+The lazy strategy has a real hole in that budget: under overlap the first
+decode step's pending ping-pong slot and the donate slot coexist for one step,
+so a pool sized exactly at the lazy ratio skips that boundary's checkpoint.
 """
 
 import unittest
@@ -18,6 +23,7 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     IncLockRefResult,
+    InsertParams,
 )
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
 from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
@@ -43,6 +49,9 @@ class _BoundedMambaAllocator:
 
     def free(self, value: torch.Tensor):
         self.free_ids.extend(int(v) for v in value.tolist())
+
+    def available_size(self) -> int:
+        return len(self.free_ids)
 
 
 class _RatioCache:
@@ -219,8 +228,30 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
     def test_prefill_peak_ratio2_exhausts_pool(self):
         # pool = 2N, all N prefixes admission-locked: no evictable victim.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
-        with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
-            component._alloc_mamba_slot()
+        self.assertIsNone(component._try_alloc_mamba_slot())
+        self.assertEqual(
+            cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
+        )
+
+    def test_exhausted_pool_skips_chunk_boundary_donation(self):
+        # Pinned pool through the chunked-prefill hook: the checkpoint is skipped
+        # (cache_len 0, nothing inserted) and the request keeps its ping-pong slots.
+        component, cache, owned = _build_peak(pool_size=2 * N, lock_prefixes=True)
+        cache.enable_mamba_extra_buffer = True
+        cache.req_to_token_pool.donate_mamba_ping_pong_slot = lambda *_: self.fail(
+            "donated without a replacement slot"
+        )
+        req = SimpleNamespace(
+            rid="r0",
+            kv=SimpleNamespace(mamba_pool_idx=owned[0], mamba_last_track_seqlen=64),
+        )
+        insert_params = InsertParams(prev_prefix_len=0)
+        cache_len = component.prepare_for_caching_req(
+            req, insert_params, token_ids_len=128, is_finished=False
+        )
+        self.assertEqual(cache_len, 0)
+        self.assertIsNone(insert_params.mamba_value)
+        self.assertEqual(cache.allocator.free_ids, [])
         self.assertEqual(
             cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
         )
@@ -228,7 +259,7 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
     def test_prefill_peak_ratio3_has_headroom(self):
         # pool = 3N: N free slots remain after own + locked prefix.
         component, cache, _ = _build_peak(pool_size=3 * N, lock_prefixes=True)
-        slot = component._alloc_mamba_slot()
+        slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(cache.component_protected_size_[ComponentType.MAMBA], N)
 
@@ -236,7 +267,7 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
         # pool = 2N but the matched prefixes are evictable (skip_mamba on decode):
         # eviction reclaims a victim, so even ratio 2 serves the donated alloc.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=False)
-        slot = component._alloc_mamba_slot()
+        slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(len(cache.prefix_nodes), N - 1)
         self.assertEqual(
