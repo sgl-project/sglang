@@ -1375,14 +1375,13 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 @register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
-    _, decode_backend = attention_backends_of(view)
-    if decode_backend == "intel_xpu":
+    prefill_backend, decode_backend = attention_backends_of(view)
+    if "intel_xpu" in (prefill_backend, decode_backend):
+        supported_page_sizes = [64, 128]
+        msg = "Intel XPU attention backend"
         if use_mla_backend(view):
-            supported_page_sizes = [16, 32, 64, 128]
-            msg = "Intel XPU attention backend for MLA Decode"
-        else:
-            supported_page_sizes = [64, 128]
-            msg = "Intel XPU attention backend"
+            supported_page_sizes.extend([16, 32])
+            msg = msg + " for MLA"
         if view.page_size not in supported_page_sizes:
             logger.warning(
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
