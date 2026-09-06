@@ -611,7 +611,35 @@ def detect_reasoning_pattern(
         if rule.predicate(ctx):
             return rule.value.always_on, rule.value
 
+    # Fallback: a template whose generation prompt unconditionally ends by
+    # opening the reasoning block (e.g. DeepSeek-style "<|Assistant|><think>")
+    # forces the model to start inside <think>, so reasoning must be treated
+    # as always-on for the parser to split replies into reasoning_content.
+    # Probe by rendering: source text is unreliable because Jinja control
+    # flow may sit between the role marker and the literal "<think>".
+    if (
+        "enable_thinking" not in template
+        and "thinking_mode" not in template
+        and _renders_forced_think_open(template)
+    ):
+        return True, ReasoningToggleConfig(special_case="always")
+
     return False, None
+
+
+def _renders_forced_think_open(template: str) -> bool:
+    """True if the rendered generation prompt ends with an open "<think>"."""
+    try:
+        env = jinja2.sandbox.ImmutableSandboxedEnvironment()
+        rendered = env.from_string(template).render(
+            messages=[{"role": "user", "content": "hi"}],
+            add_generation_prompt=True,
+            bos_token="",
+            eos_token="",
+        )
+    except Exception:
+        return False
+    return isinstance(rendered, str) and rendered.rstrip().endswith("<think>")
 
 
 def detect_reasoning_parser(

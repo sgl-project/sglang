@@ -415,6 +415,8 @@ class OpenAIServingChat(OpenAIServingBase):
             hf_config=self.tokenizer_manager.model_config.hf_config,
             tokenizer=self.tokenizer_manager.tokenizer,
             tool_call_parser=self.tool_call_parser,
+            explicit_chat_template=self.tokenizer_manager.server_args.chat_template
+            is not None,
         )
 
     def _request_id_prefix(self) -> str:
@@ -1308,7 +1310,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 result.stop.append(tool_call_stop)
 
         result.tool_call_constraint = tool_call_constraint
-        result.require_reasoning = thinking_mode
+        result.require_reasoning = thinking_mode or result.require_reasoning
         result.skip_special_tokens = request.skip_special_tokens
         if self.reasoning_parser == "k2_horizon" and thinking_mode:
             parser = ReasoningParser(
@@ -1353,6 +1355,7 @@ class OpenAIServingChat(OpenAIServingBase):
         modalities = []
 
         template_content_format = self.template_manager.jinja_template_content_format
+        template_forces_reasoning = False
 
         # Try custom encoding first (override in subclass for custom renderers)
         thinking_requested = (request.chat_template_kwargs or {}).get(
@@ -1558,6 +1561,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
 
+            # A template that unconditionally opens the reasoning block (the
+            # rendered prompt ends with "<think>") forces the model into
+            # reasoning regardless of chat_template_kwargs; keep
+            # require_reasoning in sync so the reasoning parser splits the
+            # reply into reasoning_content instead of leaking "</think>".
+            if isinstance(rendered_prompt, str) and rendered_prompt.rstrip().endswith(
+                "<think>"
+            ):
+                template_forces_reasoning = True
+
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
@@ -1580,6 +1593,7 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            require_reasoning=template_forces_reasoning,
         )
 
     def _apply_conversation_template(
