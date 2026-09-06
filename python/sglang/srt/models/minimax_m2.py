@@ -448,9 +448,9 @@ class MiniMaxM2QKRMSNorm:
             device=device,
             # push-only: no barrier plane and no staging buffer
             max_pull_size=0,
-            max_pull_blocks=0,
+            num_pull_blocks=0,
             max_push_size=max_size,
-            max_push_blocks=props.multi_processor_count * occupancy,
+            num_push_blocks=props.multi_processor_count * occupancy,
         )
         counter = MiniMaxM2QKRMSNorm.COUNTER
         MiniMaxM2QKRMSNorm.COUNTER += 1
