@@ -365,6 +365,17 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 self.window_kv_indptr = torch.zeros_like(kv_indptr_buf)
 
+        # Route the SWA decode metadata prep into the captured whole-decode
+        # graph (init_forward_metadata_in_graph) instead of running it eagerly
+        # per replay. The spec multi-step wrapper (skip_prefill=True backends
+        # that share a kv_indptr_buf) is not in the decode graph runner's
+        # in-graph hook, so it keeps the eager prep.
+        self.swa_metadata_in_graph = (
+            self.sliding_window_size is not None
+            and self.sliding_window_size > 0
+            and kv_indptr_buf is None
+        )
+
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int64, device=model_runner.device
@@ -528,6 +539,12 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indptr = self.window_kv_indptr
         window_kv_lens = None
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            if self.swa_metadata_in_graph:
+                # The padded SWA fill is recorded into the whole-decode graph by
+                # init_forward_metadata_in_graph (capture-time) / replay; it must
+                # not run eagerly per replay here (it would double-fill the same
+                # static buffers and re-add the host bubble this path removes).
+                return kv_indptr, window_kv_indptr, None, num_kv_splits_lens
             window_kv_indptr, _, window_kv_lens, _ = update_sliding_window_buffer(
                 self.window_kv_indptr,
                 self.kv_index_translator,
@@ -1138,6 +1155,19 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+            # Static padded lens for the in-graph SWA decode prep; refilled
+            # every replay by the captured torch.clamp (see
+            # _record_swa_decode_metadata_in_graph). Lives with the graph
+            # buffers so a later capture's clamp records against the same
+            # address the earlier recorded kernels write.
+            self.cuda_graph_window_kv_lens = torch.zeros(
+                (max_bs,),
+                # Match seq_lens (Long) so torch.clamp(seq_lens, out=...) is a
+                # same-dtype clamp with no cast under capture.
+                dtype=torch.int64,
+                device=self.device,
+            )
+
         if self.use_sliding_window_kv_pool:
             # SWA write-target buffer; refilled at replay from out_cache_loc.
             self.cuda_graph_swa_out_cache_loc = torch.zeros(
@@ -1298,6 +1328,63 @@ class TritonAttnBackend(AttentionBackend):
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """Record the SWA decode metadata prep into the whole-decode graph.
+
+        Runs inside ``graph.capture()`` right after the runner's eager
+        ``init_forward_metadata_out_graph(in_capture=True)``. Every op reads the
+        live-refilled ``forward_batch.seq_lens`` / ``req_pool_indices`` static
+        buffers and writes the same ``cuda_graph_*`` buffers the capture-time
+        ``_build_cuda_graph_forward_metadata`` references, so at replay the
+        recorded nodes recompute window indices / splits from the refilled
+        seq_lens with zero host work. No-op for non-SWA, non-decode, or spec
+        multi-step backends (``swa_metadata_in_graph`` is False there).
+        """
+        if not self.swa_metadata_in_graph:
+            return
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        if forward_batch.spec_info is not None:
+            return
+        self._record_swa_decode_metadata_in_graph(
+            forward_batch.batch_size,
+            forward_batch.seq_lens,
+            forward_batch.req_pool_indices,
+        )
+
+    def _record_swa_decode_metadata_in_graph(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        """Graph-recordable body of the SWA decode metadata prep.
+
+        Reads seq_lens / req_pool_indices (refilled out-of-graph each replay)
+        and recomputes the padded window_kv_indptr / window_kv_indices /
+        window_num_kv_splits the SWA decode layers consume. The gather and
+        full->swa translate run over the padded row count (``bs`` = capture
+        bucket, seq_lens already padded to that length), so no captured node
+        depends on a host-known packed length and the full->swa translate reads
+        live refilled state rather than frozen capture-time state.
+        """
+        seq_lens = seq_lens[:bs]
+        req_pool_indices = req_pool_indices[:bs]
+        _, _, window_kv_lens, _ = update_sliding_window_buffer(
+            self.window_kv_indptr,
+            self.kv_index_translator,
+            req_pool_indices,
+            self.sliding_window_size,
+            seq_lens,
+            bs,
+            token_to_kv_pool=self.token_to_kv_pool,
+            window_kv_indices=self.cuda_graph_window_kv_indices,
+            window_kv_lens_out=self.cuda_graph_window_kv_lens[:bs],
+        )
+        self.get_num_kv_splits(
+            self.cuda_graph_window_num_kv_splits[:bs], window_kv_lens
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -2509,6 +2596,7 @@ def update_sliding_window_buffer(
     device=None,
     token_to_kv_pool=None,
     window_kv_indices=None,
+    window_kv_lens_out=None,
 ):
     """Fill window KV buffers for sliding-window attention.
 
@@ -2516,16 +2604,28 @@ def update_sliding_window_buffer(
     path); omit it (or pass ``None``) to allocate a fresh tensor (eager path,
     requires ``device``).
 
+    Pass ``window_kv_lens_out`` to write the clamped lengths into a static
+    padded buffer in place (whole-decode-graph capture), keeping the gathered
+    row count at ``bs`` (real + padded lanes are already-clamped garbage that
+    the padded kernels absorb) so no captured node depends on the seq-dependent
+    packed length; omit it for the legacy exact packed fill (eager / spec
+    multi-step).
+
     Unified pool: the gather reads the swa sub-pool's own id space (built
     directly from virtual ids through the swa side's own v2p), so the window
     indices come out already swa-side ids -- no translate here, eager or
     captured. Static SWA pools gather full-token ids from req_to_token and keep
     the legacy full->swa translate below.
     """
-    window_kv_lens = torch.minimum(
-        seq_lens,
-        torch.tensor(sliding_window_size),
-    )
+    # Clamp the per-request length to the sliding window. ``tensor.item()``-free
+    # and H2D-free so this is safe under (nested) CUDA-graph capture: creating a
+    # scalar via ``torch.tensor(int)`` stages a host->device copy that capture
+    # forbids, so pass the Python scalar straight to ``torch.clamp`` instead.
+    if window_kv_lens_out is not None:
+        window_kv_lens = window_kv_lens_out
+        torch.clamp(seq_lens, max=sliding_window_size, out=window_kv_lens)
+    else:
+        window_kv_lens = torch.clamp(seq_lens, max=sliding_window_size)
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
     if window_kv_indices is None:
@@ -2543,10 +2643,18 @@ def update_sliding_window_buffer(
         sliding_window=translator.reads_are_translated,
     )
     if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
-        kv_last_index = window_kv_indptr[-1]
-        window_kv_indices[:kv_last_index] = (
-            token_to_kv_pool.translate_loc_from_full_to_swa(
-                window_kv_indices[:kv_last_index]
+        if window_kv_lens_out is not None:
+            # In-graph padded translate: the mapping has a slot-0/-1 sentinel,
+            # so gathering stale pad rows lands on a legal swa id. Avoids a
+            # seq-dependent packed slice that would bake capture-time state.
+            window_kv_indices.copy_(
+                token_to_kv_pool.translate_loc_from_full_to_swa(window_kv_indices)
             )
-        )
+        else:
+            kv_last_index = window_kv_indptr[-1]
+            window_kv_indices[:kv_last_index] = (
+                token_to_kv_pool.translate_loc_from_full_to_swa(
+                    window_kv_indices[:kv_last_index]
+                )
+            )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
