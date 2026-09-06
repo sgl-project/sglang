@@ -979,7 +979,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if (
             model_runner.ps.attn_dcp_size > 1
             and ret.out_cache_loc is not None
-            and is_hip()
+            and (is_hip() or _is_npu)
         ):
             ret.dcp_kv_mask = (
                 ret.positions % model_runner.ps.attn_dcp_size
