@@ -261,15 +261,46 @@ class RACERWorker(NGRAMWorker):
         local_values: torch.Tensor,
         local_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """All-gather only each vocabulary shard's local top-k candidates."""
+        """All-gather one packed local top-k candidate tensor per TP rank.
+
+        Scores are promoted to fp32. Token ids are bit-cast from int32 to fp32,
+        rather than numerically converted, so all 32 id bits survive exactly.
+        This lets one collective carry both fields while avoiding a second
+        latency-dominated small all-gather on PCIe-only TP systems.
+        """
 
         group = (
             get_attn_tp_group()
             if logits_processor.use_attn_tp_group
             else get_tp_group()
         )
-        gathered_values = group.all_gather(local_values, dim=-1)
-        gathered_ids = group.all_gather(local_ids, dim=-1)
+        rows, local_k = local_values.shape
+        packed = torch.cat(
+            (
+                local_values.float(),
+                local_ids.contiguous().view(torch.float32),
+            ),
+            dim=-1,
+        )
+        gathered = group.all_gather(packed, dim=-1)
+
+        # all_gather concatenates rank-local [values | ids] blocks along the
+        # last dimension. Restore [rows, TP, 2*k] before separating fields.
+        block_width = 2 * local_k
+        if gathered.shape[-1] % block_width != 0:
+            raise RuntimeError(
+                "RACER TP prompt warm-up packed gather width mismatch: "
+                f"gathered={gathered.shape[-1]} block={block_width}."
+            )
+        tp_size = gathered.shape[-1] // block_width
+        gathered = gathered.reshape(rows, tp_size, block_width)
+        gathered_values = gathered[..., :local_k].reshape(rows, tp_size * local_k)
+        gathered_ids = (
+            gathered[..., local_k:]
+            .contiguous()
+            .view(torch.int32)
+            .reshape(rows, tp_size * local_k)
+        )
         return gathered_values, gathered_ids
 
     def _warm_prompt_tokenbin(self, batch, hidden_states: torch.Tensor) -> None:
@@ -283,8 +314,8 @@ class RACERWorker(NGRAMWorker):
         SGLang adaptation: EXTEND already computed the prompt hidden states, so
         this path applies only the LM head in small chunks instead of rerunning
         the transformer. Under TP, each rank first computes top-k on its own
-        vocabulary shard, then all-gathers only ``(value, global_token_id)``
-        candidates and performs a final top-k over ``TP * k`` candidates:
+        vocabulary shard, then all-gathers one packed ``(value, global_token_id)``
+        candidate tensor and performs a final top-k over ``TP * k`` candidates:
 
             hidden_states      : [Tc, H]
             local logits       : [Tc, V / TP]
