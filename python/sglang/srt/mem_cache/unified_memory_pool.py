@@ -65,7 +65,11 @@ def _prod(iterable) -> int:
 
 
 def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
-    if kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+    if kv_cache_dtype in (
+        torch.float8_e5m2,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
         return torch.uint8
     return kv_cache_dtype
 
@@ -127,12 +131,21 @@ class MHASubPoolSpec(SubPoolSpec):
     head_num: int
     head_dim: int
     store_dtype: torch.dtype
+    kv_cache_dtype: Optional[torch.dtype] = None
     v_head_dim: Optional[int] = None
 
     def __post_init__(self):
         super().__post_init__()
         assert self.head_num > 0, f"head_num must be positive; got {self.head_num}"
         assert self.head_dim > 0, f"head_dim must be positive; got {self.head_dim}"
+        if self.kv_cache_dtype is None:
+            object.__setattr__(self, "kv_cache_dtype", self.store_dtype)
+        expected_store_dtype = _store_dtype_for(self.kv_cache_dtype)
+        assert self.store_dtype == expected_store_dtype, (
+            "MHASubPoolSpec.store_dtype must match the storage dtype required by "
+            f"kv_cache_dtype; got kv_cache_dtype={self.kv_cache_dtype}, "
+            f"store_dtype={self.store_dtype}, expected={expected_store_dtype}"
+        )
         if self.v_head_dim is None:
             object.__setattr__(self, "v_head_dim", self.head_dim)
         assert self.v_head_dim > 0, (
@@ -578,7 +591,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         super().__init__(
             size=view_rows - page_size,
             page_size=page_size,
-            dtype=spec.store_dtype,
+            dtype=spec.kv_cache_dtype,
             head_num=spec.head_num,
             head_dim=spec.head_dim,
             layer_num=spec.layer_num,
@@ -1226,6 +1239,7 @@ def init_unified_mamba_pools(
             head_num=head_num,
             head_dim=head_dim,
             store_dtype=store_dtype,
+            kv_cache_dtype=kv_cache_dtype,
             grow_direction="down",
         )
     cp = mamba2_cache_params
@@ -1445,7 +1459,11 @@ class UnifiedSWAKVPool(SWAKVPool):
             "UnifiedSWAKVPool: full and swa sub-pools must share store_dtype; got "
             f"full={full_spec.store_dtype}, swa={swa_spec.store_dtype}"
         )
-        self.dtype = full_spec.store_dtype
+        assert full_spec.kv_cache_dtype == swa_spec.kv_cache_dtype, (
+            "UnifiedSWAKVPool: full and swa sub-pools must share kv_cache_dtype; got "
+            f"full={full_spec.kv_cache_dtype}, swa={swa_spec.kv_cache_dtype}"
+        )
+        self.dtype = full_spec.kv_cache_dtype
         self.head_num = full_spec.head_num
         self.head_dim = full_spec.head_dim
         self.device = unified_buffer.device
@@ -1705,6 +1723,7 @@ def init_unified_swa_pools(
         head_dim=head_dim,
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
+        kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
     )
     swa_spec = MHASubPoolSpec(
@@ -1714,6 +1733,7 @@ def init_unified_swa_pools(
         head_dim=swa_head_dim,
         v_head_dim=swa_v_head_dim,
         store_dtype=store_dtype,
+        kv_cache_dtype=kv_cache_dtype,
         grow_direction="up",
     )
     if unified_total_bytes is not None:
@@ -1889,6 +1909,7 @@ def init_unified_mamba_swa_pools(
         head_dim=head_dim,
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
+        kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
     )
     swa_spec = MHASubPoolSpec(
@@ -1898,6 +1919,7 @@ def init_unified_mamba_swa_pools(
         head_dim=swa_head_dim,
         v_head_dim=swa_v_head_dim,
         store_dtype=store_dtype,
+        kv_cache_dtype=kv_cache_dtype,
         grow_direction="float",
     )
     cp = mamba2_cache_params
