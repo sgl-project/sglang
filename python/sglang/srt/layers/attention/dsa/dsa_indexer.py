@@ -107,6 +107,24 @@ if _is_cuda:
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
+    try:
+        from aiter.ops.cache import indexer_qk_rope_quant_and_cache
+    except ImportError:
+        indexer_qk_rope_quant_and_cache = None
+else:
+    indexer_qk_rope_quant_and_cache = None
+
+# Single-launch aiter kernel covering Q rope + fp8 quant, K LayerNorm + rope +
+# fp8 quant + index-K cache write, and the head-gate scale. aiter is pinned per
+# image, so probe rather than assume: an older one imports fine and would only
+# fail at the first layer's forward.
+_use_aiter_indexer_qk_fuse = indexer_qk_rope_quant_and_cache is not None
+if _use_aiter and not _use_aiter_indexer_qk_fuse:
+    logger.warning(
+        "ROCm DSA indexer: aiter has no indexer_qk_rope_quant_and_cache; "
+        "falling back to the unfused Q/K path."
+    )
+
 from sglang.srt.distributed import (
     get_attn_tp_group,
 )
@@ -186,6 +204,17 @@ def _broadcast_indexer_topk_from_rank0(
     return topk_indices
 
 
+def dsa_indexer_fusion_supported() -> bool:
+    """Whether this platform can run the fused indexer Q/K path.
+
+    Indexer.__init__ adds the per-layer conditions; lora_manager reads this to
+    reject an indexer-targeted adapter, whose modules fusion folds away.
+    """
+    return (
+        _is_cuda or _use_aiter_indexer_qk_fuse
+    ) and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
@@ -242,10 +271,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.is_neox_style = is_neox_style
+        self._k_norm_is_rms = (
+            config is not None
+            and getattr(config, "index_k_norm_type", "layer") == "rms"
+        )
+        # The aiter kernel takes a LayerNorm weight and bias; RMSNorm has no bias.
         self.use_dsa_indexer_fusion = (
-            _is_cuda
-            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+            dsa_indexer_fusion_supported()
             and not is_neox_style
+            and not (self._k_norm_is_rms and not _is_cuda)
         )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
@@ -292,14 +327,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 params_dtype=torch.bfloat16,
                 prefix=add_prefix("weights_proj", prefix),
             )
-        if (
-            config is not None
-            and getattr(config, "index_k_norm_type", "layer") == "rms"
-        ):
+        if self._k_norm_is_rms:
             self.k_norm = RMSNorm(self.head_dim)
         else:
+            # The fused kernels take fp32 norm params. Only the unfused ROCm path
+            # keeps bf16, where matching x.dtype is what selects aiter's CK
+            # layernorm over the native upcast.
             self.k_norm = LayerNorm(
-                self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+                self.head_dim,
+                dtype=(
+                    torch.bfloat16
+                    if _use_aiter and not self.use_dsa_indexer_fusion
+                    else torch.float32
+                ),
             )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
@@ -340,6 +380,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     @property
     def _indexer_cos_sin_cache(self) -> torch.Tensor:
         return self.rotary_emb.cos_sin_cache
+
+    def _aiter_indexer_cos_sin(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """cos and sin as the [max_position, rope_head_dim // 2] pair aiter wants.
+
+        aiter's rope module -- the one get_rope_wrapper builds under
+        SGLANG_USE_AITER -- keeps the two apart as [max_position, 1, 1, dim/2]
+        rather than in one cos_sin_cache, so this only drops the middle dims.
+        Both stay views; the kernel indexes them through cos_stride0 and needs
+        contiguity on the last dim alone. Read live rather than cached at
+        __init__, because the rope module's buffers can be replaced.
+        """
+        cos, sin = self.rotary_emb.cos_cache, self.rotary_emb.sin_cache
+        return cos.view(cos.shape[0], -1), sin.view(sin.shape[0], -1)
 
     def _weights_proj_bf16_in_fp32_out(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
@@ -576,11 +629,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ):
         # Non-fusion path only; self.wk does not exist when fusion is on.
         key, _ = self.wk(x)
-        key = self.k_norm(key)
+        return rotate_activation(self._k_norm_rope(key, positions))
+
+    def _k_norm_rope(
+        self, key_raw: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        key = self.k_norm(key_raw)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
-
         # Rotary may update both inputs in place, so the K-only path must not
         # alias its dummy query with the key.
         if _is_cuda or _is_hip or _is_xpu:
@@ -589,9 +646,27 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dummy_q_rope = k_rope
         _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        key = rotate_activation(key)
-
         return key
+
+    @staticmethod
+    def _acquire_index_k_pool(layer_id: int):
+        """The KV pool to write this layer's index-K into, or None if unowned."""
+        pool = get_token_to_kv_pool()
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return None
+        return pool
+
+    @staticmethod
+    def _aiter_index_k_cache_view(pool, layer_id: int) -> torch.Tensor:
+        """[num_blocks, page_size, 132] fp8: 128 quantized elems + a 4-byte scale.
+
+        The same view works for the legacy page_size=1 layout, where the middle
+        dim is 1.
+        """
+        buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        return buf.view(-1, pool.page_size, 132).view(fp8_dtype)
 
     def _fused_k_prepare_and_store(
         self,
@@ -604,14 +679,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ) -> None:
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
-        pool = get_token_to_kv_pool()
+        pool = self._acquire_index_k_pool(layer_id)
+        if pool is None:
+            return
         page_size = pool.page_size
-        if hasattr(pool, "invalidate_index_buffer_for_layer"):
-            pool.invalidate_index_buffer_for_layer(layer_id)
-        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+        if _use_aiter:
+            # No Hadamard, matching _maybe_rotate under fusion, so this writes the
+            # same K representation the fused Q/K kernel and decode read back.
+            self._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                key=self._k_norm_rope(key_raw, positions),
+                act_quant=act_quant,
+                out_cache_loc=out_cache_loc,
+            )
             return
         if (
-            not _is_fp8_fnuz
+            _is_cuda
+            and not _is_fp8_fnuz
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
@@ -659,6 +744,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # num_tokens (graph split-op contract) slices q/k/positions/out_cache_loc
         # to the unpadded count; the returned q_fp8/weights are sliced to match.
+        if _use_aiter_indexer_qk_fuse:
+            # One kernel covers Q and K, so there is nothing for the dual-stream
+            # split below to overlap.
+            return self._aiter_fused_qk_prepare_and_store(
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                act_quant=act_quant,
+                num_tokens=num_tokens,
+            )
         q_scale_gate = self.softmax_scale * self.n_heads**-0.5
         out_cache_loc = forward_batch.out_cache_loc
         if num_tokens is not None:
@@ -728,6 +825,82 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         current_stream.wait_stream(self.alt_stream)
         return q_fp8, weights
+
+    def _aiter_fused_qk_prepare_and_store(
+        self,
+        *,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        act_quant,
+        num_tokens: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        out_cache_loc = forward_batch.out_cache_loc
+        if num_tokens is not None:
+            positions = positions[:num_tokens]
+            out_cache_loc = out_cache_loc[:num_tokens]
+
+        key, weights_raw = self._fused_k_weights(x)
+        q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+        if num_tokens is not None:
+            key = key[:num_tokens]
+            weights_raw = weights_raw[:num_tokens]
+            q = q[:num_tokens]
+
+        pool = self._acquire_index_k_pool(layer_id)
+        if pool is None:
+            return self._q_rope_quant_and_gate(q, weights_raw, positions, act_quant)
+
+        if not out_cache_loc.is_contiguous():
+            out_cache_loc = out_cache_loc.contiguous()
+        cos, sin = self._aiter_indexer_cos_sin()
+        q_fp8 = torch.empty(q.shape, dtype=fp8_dtype, device=q.device)
+        weights = torch.empty(
+            (q.shape[0], self.n_heads), dtype=torch.float32, device=q.device
+        )
+        # key and weights_raw stay strided views of the wk_weights_proj output;
+        # the kernel indexes both through their strides.
+        indexer_qk_rope_quant_and_cache(
+            q,
+            q_fp8,
+            weights_raw,
+            weights,
+            key,
+            self._aiter_index_k_cache_view(pool, layer_id),
+            out_cache_loc,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            positions,
+            cos,
+            sin,
+            self.k_norm.variance_epsilon,
+            self.block_size,
+            self.scale_fmt,
+            self.softmax_scale * self.n_heads**-0.5,
+            preshuffle=_use_aiter_preshuffle,
+            is_neox=self.is_neox_style,
+        )
+        # [num_tokens, n_heads, 1] like the CUDA fused Q kernel; the top-k paths
+        # assert rank 3 and squeeze.
+        return q_fp8, weights.unsqueeze(-1)
+
+    def _q_rope_quant_and_gate(
+        self,
+        q: torch.Tensor,
+        weights_raw: torch.Tensor,
+        positions: torch.Tensor,
+        act_quant,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Q half of the fused kernel, for a layer whose index-K another rank owns."""
+        q_rope, _ = torch.split(
+            q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+        q_rope, _ = self.rotary_emb(positions, q_rope, q_rope)
+        self._update_rope_guarded(q[..., : self.rope_head_dim], q_rope)
+        q_fp8, q_scale = act_quant(q, self.block_size, self.scale_fmt)
+        return q_fp8, self._scale_head_gates(weights_raw, q_scale)
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -1545,10 +1718,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
 
-        pool = get_token_to_kv_pool()
-        if hasattr(pool, "invalidate_index_buffer_for_layer"):
-            pool.invalidate_index_buffer_for_layer(layer_id)
-        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+        pool = self._acquire_index_k_pool(layer_id)
+        if pool is None:
             return
 
         if (
@@ -1571,20 +1742,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return
 
         # Fast path: AITER fused quant + cache store
-        # When _use_aiter_preshuffle is True we use the new MFMA 16x16 preshuffle
-        # layout (page_size>=16). Otherwise we fall back to the legacy row-major
-        # layout with page_size=1; the same kv_cache.view works for both cases
-        # because page_size is 1 there.
         if _use_aiter:
-            page_size = pool.page_size
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
-            out_loc = forward_batch.out_cache_loc
+            out_loc = out_cache_loc
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
             indexer_k_quant_and_cache(
                 key,
-                kv_cache,
+                self._aiter_index_k_cache_view(pool, layer_id),
                 out_loc,
                 self.block_size,
                 self.scale_fmt,
