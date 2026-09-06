@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_group,
 )
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
@@ -74,6 +77,8 @@ if _is_xpu:
 
 if not _is_cpu:
     from sglang.kernels.ops.diffusion import norm_infer, rms_norm_fn
+
+_QK_NORM_ROPE_DICT: dict[tuple[int, bool], RotaryEmbedding] = {}
 
 
 # Copied and adapted from sglang
@@ -925,6 +930,7 @@ def apply_qk_norm_with_optional_rope(
     k_norm: "RMSNorm",
     head_dim: int,
     cos_sin_cache: Optional[torch.Tensor] = None,
+    freqs_complex: Optional[torch.Tensor] = None,
     *,
     is_neox: bool = False,
     positions: Optional[torch.Tensor] = None,
@@ -933,7 +939,7 @@ def apply_qk_norm_with_optional_rope(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK RMSNorm and optionally RoPE when a cos/sin cache is provided."""
 
-    if cos_sin_cache is None:
+    if cos_sin_cache is None and freqs_complex is None:
         return apply_qk_norm(
             q=q,
             k=k,
@@ -950,6 +956,7 @@ def apply_qk_norm_with_optional_rope(
         k_norm=k_norm,
         head_dim=head_dim,
         cos_sin_cache=cos_sin_cache,
+        freqs_complex=freqs_complex,
         is_neox=is_neox,
         positions=positions,
         position_offset=position_offset,
@@ -965,6 +972,7 @@ def apply_qk_norm_rope(
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     *,
+    freqs_complex: Optional[torch.Tensor] = None,
     is_neox: bool = False,
     positions: Optional[torch.Tensor] = None,
     position_offset: int = 0,
@@ -980,10 +988,6 @@ def apply_qk_norm_rope(
     ``cache_has_full_width`` describes ``[full cos, full sin]`` cache rows and
     requires the fused CUDA path; the ordinary cache stores half-width cos/sin.
     """
-
-    from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-        apply_flashinfer_rope_qk_inplace,
-    )
 
     if q.dim() != 4 or k.dim() != 4:
         raise ValueError(
@@ -1121,13 +1125,25 @@ def apply_qk_norm_rope(
         head_dim=head_dim,
         allow_inplace=allow_inplace,
     )
-    return apply_flashinfer_rope_qk_inplace(
-        q=q,
-        k=k,
-        cos_sin_cache=cos_sin_cache,
-        head_size=head_dim,
-        is_neox=is_neox,
+
+    rope_key = (head_dim, is_neox)
+    rotary_emb = _QK_NORM_ROPE_DICT.get(rope_key)
+    if rotary_emb is None:
+        rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=is_neox,
+        )
+        _QK_NORM_ROPE_DICT[rope_key] = rotary_emb
+    return rotary_emb(
+        query=q,
+        key=k,
         positions=positions,
+        complex_freqs=(
+            freqs_complex.unsqueeze(-2) if freqs_complex is not None else None
+        ),
+        cos_sin_cache=cos_sin_cache,
     )
 
 
