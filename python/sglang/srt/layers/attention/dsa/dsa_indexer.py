@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -88,6 +89,7 @@ else:
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
@@ -105,7 +107,10 @@ if _is_cuda:
         deep_gemm = e
 
 if _use_aiter:
-    from aiter.ops.cache import indexer_k_quant_and_cache
+    from aiter.ops.cache import (
+        indexer_k_quant_and_cache,
+        indexer_qk_rope_quant_and_cache,
+    )
 
 from sglang.srt.distributed import (
     get_attn_tp_group,
@@ -242,10 +247,41 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.block_size = block_size
+        # Built before the projections: the fusion switch below reads k_norm type.
+        if (
+            config is not None
+            and getattr(config, "index_k_norm_type", "layer") == "rms"
+        ):
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.k_norm = LayerNorm(
+                self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+            )
+        # One switch for the whole fused indexer q/k path: wk and weights_proj
+        # collapse into a single GEMM, the Hadamard rotation is dropped (indexer
+        # scores are invariant to it), and q/k preparation goes through the
+        # platform's fused kernels. is_neox_style changes the RoPE layout those
+        # kernels assume, so it opts out. Both platforms' fused k kernels take a
+        # (weight, bias) pair, so an RMSNorm k_norm rules the path out; only ROCm
+        # spells that out because no in-tree model reaches it on CUDA. The rest of
+        # the ROCm terms are aiter's kernel contract: head_dim=128, rope_dim=64,
+        # one quant group per head. Only gfx95 is validated there -- the kernel
+        # carries no arch-specific code, but the fp8 format differs (fnuz below
+        # gfx950) and nothing downstream of it has been exercised.
         self.use_dsa_indexer_fusion = (
-            _is_cuda
-            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+            not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
+            and (
+                _is_cuda
+                or (
+                    _use_aiter_gfx95
+                    and isinstance(self.k_norm, LayerNorm)
+                    and self.head_dim == 128
+                    and self.rope_head_dim == 64
+                    and self.block_size == self.head_dim
+                )
+            )
         )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
@@ -292,15 +328,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 params_dtype=torch.bfloat16,
                 prefix=add_prefix("weights_proj", prefix),
             )
-        if (
-            config is not None
-            and getattr(config, "index_k_norm_type", "layer") == "rms"
-        ):
-            self.k_norm = RMSNorm(self.head_dim)
-        else:
-            self.k_norm = LayerNorm(
-                self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
-            )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
@@ -310,7 +337,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             is_neox_style=is_neox_style,
             device=get_device().device,
         )
-        self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
         self.num_init_tokens = self.num_local_tokens = 0
@@ -394,6 +420,36 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Fusion drops the (logit-preserving) Hadamard rotation; without it the
         # index-K cache here matches the fused path that decode reads back.
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
+
+    @cached_property
+    def _aiter_k_norm_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        # aiter's fused kernel requires the LayerNorm params as contiguous fp32
+        # and rejects anything else at the host check. k_norm itself is bf16
+        # under aiter, so this widens. Cached on first use rather than built in
+        # __init__ because weights load after construction.
+        return (
+            self.k_norm.weight.detach().float().contiguous(),
+            self.k_norm.bias.detach().float().contiguous(),
+        )
+
+    def _aiter_cos_sin_halves(self, dtype: torch.dtype):
+        # aiter's fused kernel takes cos and sin as separate [max_pos, rope_dim/2]
+        # tensors. aiter's own rope module already stores them that way; the
+        # upstream one keeps a single cat(cos, sin) buffer that has to be split.
+        cached = getattr(self, "_aiter_cos_sin_halves_cache", None)
+        if cached is None or cached[0].dtype != dtype:
+            rope = self.rotary_emb
+            if hasattr(rope, "cos_cache") and hasattr(rope, "sin_cache"):
+                # aiter keeps them broadcast-shaped, [max_pos, 1, 1, rope_dim/2].
+                cos = rope.cos_cache.reshape(rope.cos_cache.shape[0], -1)
+                sin = rope.sin_cache.reshape(rope.sin_cache.shape[0], -1)
+            else:
+                cache = self._indexer_cos_sin_cache
+                half = cache.shape[-1] // 2
+                cos, sin = cache[..., :half], cache[..., half:]
+            cached = (cos.to(dtype).contiguous(), sin.to(dtype).contiguous())
+            self._aiter_cos_sin_halves_cache = cached
+        return cached
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         # When kv_len <= index_topk the top-k selects ALL valid positions, so the
@@ -574,8 +630,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         x: torch.Tensor,
         positions: torch.Tensor,
     ):
-        # Non-fusion path only; self.wk does not exist when fusion is on.
-        key, _ = self.wk(x)
+        if self.use_dsa_indexer_fusion:
+            key, _ = self._fused_k_weights(x)
+        else:
+            key, _ = self.wk(x)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -589,7 +647,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dummy_q_rope = k_rope
         _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        key = rotate_activation(key)
+        key = self._maybe_rotate(key)
 
         return key
 
@@ -728,6 +786,78 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         current_stream.wait_stream(self.alt_stream)
         return q_fp8, weights
+
+    @staticmethod
+    def _index_k_layer_owned(layer_id: int) -> bool:
+        # Under a layer-split DSA cache a rank only writes the layers it owns.
+        pool = get_token_to_kv_pool()
+        return not hasattr(pool, "_is_layer_owned") or pool._is_layer_owned(layer_id)
+
+    def _aiter_fused_qk_prepare_and_store(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        *,
+        num_tokens: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ROCm counterpart of _fused_q_prepare_and_store.
+
+        CUDA runs one kernel for q and a second one for k; aiter covers both in a
+        single kernel. It normalizes k, rotates it, and quantizes it into the
+        paged index-k cache, then rotates and quantizes q and scales the head
+        gates. num_tokens slices to the unpadded count.
+        """
+        pool = get_token_to_kv_pool()
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+
+        out_cache_loc = forward_batch.out_cache_loc
+        if num_tokens is not None:
+            positions = positions[:num_tokens]
+            out_cache_loc = out_cache_loc[:num_tokens]
+        if not out_cache_loc.is_contiguous():
+            out_cache_loc = out_cache_loc.contiguous()
+
+        kw, _ = self.wk_weights_proj(x)
+        key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
+        query = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+        if num_tokens is not None:
+            key = key[:num_tokens]
+            weights_raw = weights_raw[:num_tokens]
+            query = query[:num_tokens]
+
+        q_fp8 = torch.empty(query.shape, dtype=fp8_dtype, device=query.device)
+        weights = torch.empty(
+            weights_raw.shape, dtype=torch.float32, device=query.device
+        )
+        cos_cache, sin_cache = self._aiter_cos_sin_halves(query.dtype)
+        norm_weight, norm_bias = self._aiter_k_norm_params
+        page_size = pool.page_size
+        kv_cache = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        indexer_qk_rope_quant_and_cache(
+            query,
+            q_fp8,
+            weights_raw,
+            weights,
+            key,
+            kv_cache.view(-1, page_size, 132).view(fp8_dtype),
+            out_cache_loc,
+            norm_weight,
+            norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            self.k_norm.variance_epsilon,
+            self.block_size,
+            self.scale_fmt or "",
+            self.softmax_scale * self.n_heads**-0.5,
+            preshuffle=_use_aiter_preshuffle,
+            is_neox=False,
+        )
+        return q_fp8, weights.unsqueeze(-1)
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -1320,8 +1450,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
 
         # Write the same K representation the decode path reads back: fused
-        # (no-Hadamard) when fusion is on, else the legacy Hadamard path.
-        if self.use_dsa_indexer_fusion:
+        # (no-Hadamard) when fusion is on, else the legacy Hadamard path. ROCm
+        # has no k-only fused kernel, so it takes the branch below, which still
+        # skips the Hadamard and so agrees on basis.
+        if _is_cuda and self.use_dsa_indexer_fusion:
             key_raw, _ = self._fused_k_weights(x)
             if num_tokens is not None:
                 assert num_tokens <= key_raw.shape[0]
@@ -1701,10 +1833,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.use_dsa_indexer_fusion
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
+            # Under a layer-split DSA cache a rank has no index-k storage for
+            # the layers it does not own. CUDA stays fused there because its
+            # k store no-ops internally; aiter does q and k in one kernel, so
+            # it has to fall back instead.
+            and (_is_cuda or self._index_k_layer_owned(layer_id))
         ):
-            q_fp8, weights = self._fused_q_prepare_and_store(
-                x, q_lora, positions, forward_batch, layer_id, act_quant
-            )
+            if _is_cuda:
+                q_fp8, weights = self._fused_q_prepare_and_store(
+                    x, q_lora, positions, forward_batch, layer_id, act_quant
+                )
+            else:
+                q_fp8, weights = self._aiter_fused_qk_prepare_and_store(
+                    x, q_lora, positions, forward_batch, layer_id
+                )
         elif (
             is_graph_dsa_split_op_surface(forward_batch)
             and not self.dsa_enable_prefill_cp
@@ -1847,11 +1989,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             if in_piecewise_or_breakable_cuda_graph:
                 if self.use_dsa_indexer_fusion:
-                    weights = scale_head_gate_graph(
-                        weights_raw,
-                        self.n_heads**-0.5,
-                        self.softmax_scale,
-                        q_scale,
+                    weights = (
+                        scale_head_gate_graph(
+                            weights_raw,
+                            self.n_heads**-0.5,
+                            self.softmax_scale,
+                            q_scale,
+                        )
+                        if _is_cuda
+                        else self._scale_head_gates(weights_raw, q_scale)
                     )
                 else:
                     if weights_proj_lora:
@@ -1965,3 +2111,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             raise NotImplementedError("DSA indexer only supports CUDA, HIP, and NPU")
         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)
+
+
+def indexer_merges_weights_proj(model: torch.nn.Module) -> bool:
+    """Whether the model's DSA indexers folded wk and weights_proj into a single
+    wk_weights_proj param, which removes the modules indexer LoRA would wrap.
+
+    Asks the built indexers rather than re-deriving the condition, so this cannot
+    drift from what the model actually holds.
+    """
+    return any(
+        isinstance(module, Indexer) and module.use_dsa_indexer_fusion
+        for module in model.modules()
+    )

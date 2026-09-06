@@ -782,10 +782,10 @@ class LoRAManager:
         indexer_targets = self.target_modules & DSA_INDEXER_LORA_NAMES
         if indexer_targets:
             from sglang.srt.layers.attention.dsa.dsa_indexer import (
-                _use_dsa_indexer_fusion,
+                indexer_merges_weights_proj,
             )
 
-            if _use_dsa_indexer_fusion:
+            if indexer_merges_weights_proj(self.base_model):
                 raise ValueError(
                     f"LoRA targets the DSA indexer ({sorted(indexer_targets)}), which is "
                     "incompatible with DSA indexer Q/K fusion. Set "
