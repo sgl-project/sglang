@@ -171,9 +171,9 @@ class TestLifecycleBasic(ScriptedTestCase):
         assert "running" in seen, f"never observed running status; seen={seen}"
         assert seen[-1] == "finished", f"final status must be finished; seen={seen}"
         finished_idx = seen.index("finished")
-        assert all(
-            s in ("finished",) for s in seen[finished_idx:]
-        ), f"status regressed after finish; seen={seen}"
+        assert all(s in ("finished",) for s in seen[finished_idx:]), (
+            f"status regressed after finish; seen={seen}"
+        )
 
     def test_long_prompt_only_one_decode(self):
         self.server.execute_script(self._script_long_prompt_only_one_decode)
@@ -279,8 +279,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         assert r1.finished and r2.finished
         assert r2.chunks_done == 0
         assert r2.req.cached_tokens > 0, (
-            f"r2 must hit r1's radix prefix; got cached_tokens="
-            f"{r2.req.cached_tokens}"
+            f"r2 must hit r1's radix prefix; got cached_tokens={r2.req.cached_tokens}"
         )
         assert len(r2.req.output_ids) == 2
 
@@ -408,9 +407,9 @@ class TestLifecycleBasic(ScriptedTestCase):
         t.flush_cache()
         yield
         final = t.engine_stats()["kv_pool_free"]
-        assert (
-            final >= baseline - 1
-        ), f"KV pool drift: baseline={baseline}, final={final}"
+        assert final >= baseline - 1, (
+            f"KV pool drift: baseline={baseline}, final={final}"
+        )
 
     def test_abort_all_during_chunked(self):
         self.server.execute_script(self._script_abort_all_during_chunked)

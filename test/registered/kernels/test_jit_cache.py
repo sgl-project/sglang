@@ -187,9 +187,9 @@ def test_no_unordered_container_reaches_the_key(monkeypatch):
     _build_key()
 
     def walk(value, path="parts"):
-        assert not isinstance(
-            value, (set, frozenset, dict)
-        ), f"unordered container at {path}: {type(value).__name__}"
+        assert not isinstance(value, (set, frozenset, dict)), (
+            f"unordered container at {path}: {type(value).__name__}"
+        )
         if isinstance(value, (list, tuple)):
             for index, item in enumerate(value):
                 walk(item, f"{path}[{index}]")

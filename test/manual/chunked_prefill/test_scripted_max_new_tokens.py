@@ -143,14 +143,13 @@ class TestMaxNewTokensFirstDecodeAdjacent(ScriptedTestCase):
 
         decode_records = _decode_records(batch_log, r.rid)
         assert len(decode_records) == max_new_tokens, (
-            f"expected {max_new_tokens} decode forwards, got " f"{len(decode_records)}"
+            f"expected {max_new_tokens} decode forwards, got {len(decode_records)}"
         )
 
         rid_modes = [rec.mode for rec in rid_records]
         first_decode_pos = rid_modes.index("decode")
         assert first_decode_pos >= 1, (
-            f"first decode must be preceded by an extend chunk; rid_modes="
-            f"{rid_modes}"
+            f"first decode must be preceded by an extend chunk; rid_modes={rid_modes}"
         )
         assert rid_modes[first_decode_pos - 1] == "extend", (
             f"record immediately before the first decode (in this rid's "

@@ -139,7 +139,6 @@ QUANTIZATION_CHOICES = [
     "fp8",  # MOE + linear online quantization.
     "mxfp8",  # MOE + linear online quantization.
     "gptq",
-    "marlin",
     "gptq_marlin",
     "awq_marlin",
     "bitsandbytes",
@@ -847,12 +846,30 @@ class ServerArgs:
                 "The eviction policy of radix trees. 'lru' stands for Least "
                 "Recently Used, 'lfu' stands for Least Frequently Used, 'slru' "
                 "stands for Segmented Least Recently Used, and 'priority' evicts "
-                "lower-priority requests first."
+                "lower-priority requests first. See "
+                "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
+                "for what each policy optimizes for."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
         ),
         NS("memory"),
     ] = "lru"
+    radix_eviction_policy_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help=(
+                "Tuning parameters for --radix-eviction-policy, as a json object "
+                "passed to the policy as keyword arguments. Only 'slru' takes any "
+                "today: protected_threshold (int, default 2), e.g. "
+                "'{\"protected_threshold\": 4}'. An unrecognized key fails at "
+                "startup, naming the key and the policy. See "
+                "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "
+                "for the full parameter list."
+            ),
+            type_parser=json.loads,
+        ),
+        NS("memory"),
+    ] = None
     prefill_only_disable_kv_cache: A[
         bool,
         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
@@ -1131,6 +1148,15 @@ class ServerArgs:
         "Shard dense MLP weights across the attention TP group under DP attention.",
         NS("parallel"),
     ] = False
+    enable_layernorm_sp: A[
+        bool,
+        "Enable Megatron-style sequence parallelism (arXiv:2205.05198) for the "
+        "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
+        "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
+        "sequence-sharded activations with no extra communication volume. "
+        "Prefill only; Qwen3 dense; requires tp_size > 1 and NVLink/NVSwitch.",
+        NS("parallel"),
+    ] = False
     disable_attn_tp_gather: A[
         bool,
         "Disable scheduler-side attn_tp_gather (the upstream SP path "
@@ -1284,9 +1310,7 @@ class ServerArgs:
         "Initial connection-level HTTP/2 receive window in bytes (1024 to "
         "2^31 - 1). Only applies with --enable-http2.",
         NS("serving"),
-    ] = (
-        1024 * 1024
-    )
+    ] = 1024 * 1024
 
     # -------------------------------------------------------------------------
     # SSL/TLS
@@ -1351,6 +1375,16 @@ class ServerArgs:
     enable_cache_report: A[
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        NS("serving"),
+    ] = False
+    return_input_ids: A[
+        bool,
+        "Return prompt (input) token ids on the response-level sglext extension for every chat completion request, as if return_input_ids_in_sglext were set on the request.",
+        NS("serving"),
+    ] = False
+    return_output_ids: A[
+        bool,
+        "Return sampled output token ids on the response-level sglext extension for every chat completion request, as if return_output_ids_in_sglext were set on the request.",
         NS("serving"),
     ] = False
     reasoning_parser: A[Optional[str], NS("serving")] = None
@@ -2067,7 +2101,12 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
+        NS("spec"),
+    ] = None
+    uno_lora_path: A[
+        Optional[str],
+        "Path to the UNO draft LoRA checkpoint.",
         NS("spec"),
     ] = None
     speculative_draft_model_path: A[
@@ -2332,7 +2371,7 @@ class ServerArgs:
     ] = 18
     speculative_ngram_capacity: A[
         int, "The cache capacity for ngram speculative decoding.", NS("spec")
-    ] = (10 * 1000 * 1000)
+    ] = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: A[
         Optional[str],
         "Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
@@ -2396,8 +2435,8 @@ class ServerArgs:
     ] = "none"
     enable_w4a4_mxfp4_megamoe: A[
         bool,
-        "Enable the W4A4 MXFP4 MegaMoE path by setting DeepGEMM's "
-        "DG_USE_FP4_ACTS=1 and DG_USE_MXF4_KIND=1. Use with "
+        "Enable the W4A4 MXFP4 MegaMoE path with DeepGEMM's "
+        "mxf4xmxf4 MMA type. Use with "
         "--moe-a2a-backend megamoe.",
         NS("exec.moe"),
     ] = False
@@ -2420,8 +2459,10 @@ class ServerArgs:
         NS("exec.moe"),
     ] = "auto"
     flashinfer_mxfp4_moe_precision: A[
-        Literal["default", "bf16"],
-        "Choose the computation precision of flashinfer mxfp4 moe",
+        Literal["default", "bf16", "fp8"],
+        "Choose the computation precision of flashinfer mxfp4 moe. "
+        "On SM90, `fp8` selects the Humming-style MXFP4-weight x FP8-activation "
+        "path introduced by FlashInfer #3738 and requires FlashInfer >= 0.6.18.",
         NS("exec.moe"),
     ] = "default"
     deepep_mode: A[
@@ -2813,6 +2854,23 @@ class ServerArgs:
         "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
         NS("memory"),
     ] = 4
+
+    # -------------------------------------------------------------------------
+    # Unified Radix Cache
+    # -------------------------------------------------------------------------
+    enable_unified_cache_external_linker: A[
+        bool,
+        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
+        NS("memory"),
+    ] = False
+    unified_cache_external_linker_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-cache-external-linker.",
+            choices=["mooncake", "mori"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -3626,7 +3684,8 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Unix socket path for weight cache daemon (client mode)."
-            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+            "If not set, derives the path from SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE "
+            "using the caller's physical GPU UUID.",
         ),
         NS("model"),
     ] = None
@@ -3795,9 +3854,13 @@ class ServerArgs:
 
     # ===== END TO BE REFACTORED ====
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Cosmos3ForConditionalGeneration",
+        "Cosmos3EdgeForConditionalGeneration",
+    )
 
-    # The strided-layout Triton requirement is enforced via
+    # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
     # _handle_page_major_kv_layout); the model-family gate is enforced at pool
     # construction in model_runner_kv_cache_mixin._init_pools.
@@ -4024,13 +4087,6 @@ class ServerArgs:
             help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
-            "--enable-dsa-prefill-context-parallel",
-            dest="enable_dsa_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
             "--enable-nsa-prefill-context-parallel",
             dest="enable_dsa_prefill_context_parallel",
             action=DeprecatedStoreTrueAction,
@@ -4052,20 +4108,6 @@ class ServerArgs:
             help="[Deprecated] Use --enable-prefill-cp instead.",
         )
         parser.add_argument(
-            "--dsa-prefill-cp-mode",
-            dest="dsa_prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=ServerArgs.dsa_prefill_cp_mode,
-            choices=["in-seq-split", "round-robin-split"],
-            help=(
-                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
-                "'in-seq-split' maps to 'zigzag'; 'round-robin-split' maps to "
-                "'interleave'."
-            ),
-        )
-        parser.add_argument(
             "--nsa-prefill-cp-mode",
             dest="dsa_prefill_cp_mode",
             action=DeprecatedAliasStoreAction,
@@ -4074,19 +4116,6 @@ class ServerArgs:
             default=argparse.SUPPRESS,
             choices=["in-seq-split", "round-robin-split"],
             help="[Deprecated] Use --cp-strategy instead.",
-        )
-        parser.add_argument(
-            "--prefill-cp-mode",
-            dest="prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=ServerArgs.prefill_cp_mode,
-            choices=["in-seq-split"],
-            help=(
-                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
-                "'in-seq-split' maps to 'zigzag'."
-            ),
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",

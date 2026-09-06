@@ -93,8 +93,10 @@ def maybe_trigger_remote_instance_nccl_send_group(
     ``--speculative-draft-draft-load-format`` needs its own send group, and the
     target's format cannot answer for it."""
     if (
-        load_format or get_model().load_format
-    ) == LoadFormat.REMOTE_INSTANCE and get_model().remote_instance_weight_loader_backend == RemoteInstanceWeightLoaderBackend.NCCL:
+        (load_format or get_model().load_format) == LoadFormat.REMOTE_INSTANCE
+        and get_model().remote_instance_weight_loader_backend
+        == RemoteInstanceWeightLoaderBackend.NCCL
+    ):
         if tp_rank == 0:
             instance_ip = NetworkAddress.resolve_host(socket.gethostname())
             t = threading.Thread(
@@ -130,8 +132,7 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
         else:
             logger.warning(
                 "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0. "
-                "This may lead to less accurate results!"
+                "provided. Defaulting to scaling factors of 1.0."
             )
 
 
@@ -236,16 +237,13 @@ def build_load_config(
 def maybe_enable_ipc_weight_cache(
     *,
     load_config: LoadConfig,
-    tp_size: int,
-    pp_rank: int,
-    tp_rank: int,
 ) -> None:
     """Switch ``load_config`` onto the IPC weight-cache path, in place.
 
     Overrides the load format to ``IPC_CACHE`` (remembering the original as the
-    disk fallback) and derives the per-rank daemon socket if unset. Idempotent:
-    the format swap is guarded on ``!= IPC_CACHE`` so a second call (e.g. a
-    weight reload) can't overwrite the captured fallback format.
+    disk fallback). Idempotent: the format swap is guarded on ``!= IPC_CACHE``
+    so a second call (e.g. a weight reload) can't overwrite the captured
+    fallback format.
     """
     if get_model().weight_cache_mode == "off":
         return
@@ -253,17 +251,6 @@ def maybe_enable_ipc_weight_cache(
     if load_config.load_format != LoadFormat.IPC_CACHE:
         load_config.fallback_load_format = load_config.load_format
         load_config.load_format = LoadFormat.IPC_CACHE
-
-    # Compute socket path using global rank (tp_size * pp_rank + tp_rank) so
-    # each daemon has a unique socket even across PP stages and nodes.
-    if load_config.weight_cache_socket is None:
-        from sglang.srt.weight_cache.protocol import (
-            compute_global_rank,
-            get_socket_path,
-        )
-
-        global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-        load_config.weight_cache_socket = get_socket_path(global_rank=global_rank)
 
 
 def load_model_with_memory_saver(

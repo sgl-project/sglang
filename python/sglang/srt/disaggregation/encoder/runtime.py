@@ -892,8 +892,7 @@ class DPDispatcher:
                     )
                     self._listener_failed = True
                     self._fail_all_pending(
-                        "encoder DP result listener stopped after repeated "
-                        "recv errors",
+                        "encoder DP result listener stopped after repeated recv errors",
                         "ResultListenerStopped",
                     )
                     return
@@ -1029,9 +1028,7 @@ async def _push_embedding_to_prefill(
     if backend == "zmq_to_scheduler" and request.get("embedding_port") is None:
         send_coro = enc.send_with_url(req_id=req_id)
         if background_url_send:
-            task = asyncio.create_task(send_coro)
-            enc.background_tasks.add(task)
-            task.add_done_callback(enc.background_tasks.discard)
+            enc._create_background_task(send_coro)
         else:
             await send_coro
         return
@@ -1301,8 +1298,7 @@ async def _dp_worker_handle_request(
                 # Error envelope, not 200 + phantom count: the decoder must
                 # fail fast instead of waiting for a ZMQ ack that never comes.
                 raise MMError(
-                    f"no staged embedding for /send req_id={req_id} "
-                    f"(already released)"
+                    f"no staged embedding for /send req_id={req_id} (already released)"
                 )
             # Releasing on the first /send breaks decoder TP > 1. No count means
             # a pre-refcount decoder: stay eager rather than pin until the sweep.

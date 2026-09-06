@@ -52,7 +52,6 @@ _EXTEND_CASE = DenseAttentionCase(
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestExtendInitContract(CustomTestCase):
-
     def _make_case(self, backend: str) -> DenseAttentionCase:
         return DenseAttentionCase(
             name=f"extend_no_prefix_{backend}",

@@ -94,7 +94,6 @@ class Qwen2VLVideoInputs(TypedDict):
 
 
 class Qwen2VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -126,7 +125,6 @@ class Qwen2VisionMLP(nn.Module):
 
 
 class Qwen2VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -183,7 +181,6 @@ class Qwen2VisionBlock(nn.Module):
 
 
 class Qwen2VisionPatchEmbed(nn.Module):
-
     def __init__(
         self,
         patch_size: int = 14,
@@ -209,7 +206,6 @@ class Qwen2VisionPatchEmbed(nn.Module):
 
 
 class Qwen2VisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         d_model: int,
@@ -256,7 +252,6 @@ class Qwen2VisionPatchMerger(nn.Module):
 
 
 class Qwen2VisionRotaryEmbedding(nn.Module):
-
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
@@ -291,7 +286,6 @@ class Qwen2VisionRotaryEmbedding(nn.Module):
 
 
 class Qwen2VisionTransformer(nn.Module):
-
     def __init__(
         self,
         vision_config: Qwen2VLVisionConfig,
