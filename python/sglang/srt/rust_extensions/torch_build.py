@@ -74,7 +74,11 @@ def torch_build_configuration(
         cxx11_abi = bool(torch_module._C._GLIBCXX_USE_CXX11_ABI)
 
     environment = dict(os.environ if base_environment is None else base_environment)
-    environment["LIBTORCH_USE_PYTORCH"] = "1"
+    environment.pop("LIBTORCH_USE_PYTORCH", None)
+    environment["LIBTORCH"] = os.fspath(torch_root)
+    environment["LIBTORCH_INCLUDE"] = os.fspath(torch_root)
+    environment["LIBTORCH_LIB"] = os.fspath(torch_root)
+    environment["LIBTORCH_CXX11_ABI"] = "1" if cxx11_abi else "0"
     # tch 0.24 targets Torch 2.11. The compatibility header below covers the
     # API removals in the supported 2.12/2.13 builds, after this explicit gate.
     environment["LIBTORCH_BYPASS_VERSION_CHECK"] = "1"

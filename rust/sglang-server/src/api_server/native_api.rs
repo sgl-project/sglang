@@ -232,7 +232,10 @@ async fn generate(
     let timing = RequestTiming::new();
     // Media I/O (URL downloads, file reads) happens here, on the API runtime
     // — never on the MM worker pool (see `prefetch`).
-    if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
+    if let Err(e) =
+        super::prefetch::prefetch_all(&mut payloads, &state.server_args.limit_mm_data_per_request)
+            .await
+    {
         return native_error(StatusCode::BAD_REQUEST, &e, stream);
     }
     if !is_batch {

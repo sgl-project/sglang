@@ -596,7 +596,7 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         output.zero_()
