@@ -30,13 +30,14 @@ logger = logging.getLogger(__name__)
 
 
 class NvFp4OnlineConfig(ModelOptQuantConfig):
-    """Load-time NVFP4 with online per-token FP32 activation scales.
+    """Load-time NVFP4 expert weights with per-token W4A4 or CuTe DSL W4A16.
 
-    `--quantization nvfp4_online` exclusively means online per-token FP32
-    activation scaling. Use `modelopt_fp4` for per-tensor FP32 activation scales
-    or serialized NVFP4 checkpoints. This path converts BF16/FP16/FP8 MoE expert
-    weights as they load; dense layers retain their source precision or
-    quantization.
+    `--quantization nvfp4_online` defaults to online per-token FP32 activation
+    scaling. With `--moe-runner-backend flashinfer_cutedsl` and
+    `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1`, activations stay in BF16 instead.
+    Use `modelopt_fp4` for per-tensor FP32 activation scales or serialized NVFP4
+    checkpoints. This path converts BF16/FP16/FP8 MoE expert weights as they load;
+    dense layers retain their source precision or quantization.
     """
 
     # Marker consumed by the ModelOpt FP4 layout and the model loader. Serialized
@@ -85,8 +86,9 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping or {},
         )
         self.fp4_ignored_layers = fp4_ignored_layers
-        # NVFP4 weight scales are fixed at load time; FlashInfer computes one
-        # FP32 activation scale per token at runtime.
+        # W4A4 computes one FP32 activation scale per token at runtime. The CuTe
+        # DSL runner disables this activation quantization for W4A16; keep the
+        # config flag unchanged because it also controls source-layer exclusions.
         self.use_per_token_activation = self._use_per_token_activation
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.is_fp4_experts = False

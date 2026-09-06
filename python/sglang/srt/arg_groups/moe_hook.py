@@ -7,6 +7,8 @@ import logging
 import os
 from typing import Any
 
+import torch
+
 from sglang.srt.arg_groups.overrides import (
     _a2a_backend_overrides,
     _a2a_ep_size,
@@ -75,7 +77,25 @@ def handle_moe_kernel_config(server_args: Any):
             f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
             f"got '{view.moe_a2a_backend}'."
         )
-        if view.moe_a2a_backend == "deepep" and (
+        if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+            if not get_platform().is_sm100:
+                raise ValueError("CuTe DSL NVFP4 W4A16 requires SM100/SM103 GPUs.")
+            if model_config_of(server_args).dtype != torch.bfloat16:
+                raise ValueError(
+                    "CuTe DSL NVFP4 W4A16 requires BF16 activations; "
+                    "use --dtype bfloat16."
+                )
+            if view.moe_a2a_backend not in ("none", "flashinfer"):
+                raise ValueError(
+                    "CuTe DSL NVFP4 W4A16 requires "
+                    "moe_a2a_backend='none' or 'flashinfer'."
+                )
+            if envs.SGLANG_MOE_NVFP4_DISPATCH.get():
+                raise ValueError(
+                    "CuTe DSL NVFP4 W4A16 requires BF16 MoE dispatch; "
+                    "unset SGLANG_MOE_NVFP4_DISPATCH."
+                )
+        elif view.moe_a2a_backend == "deepep" and (
             view.quantization == "nvfp4_online"
             or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
         ):
