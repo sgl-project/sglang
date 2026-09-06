@@ -13,20 +13,8 @@ Image-embedding layout (see multimodal/processors/deepseek_v4_vl.py):
 each image placeholder expands into a sentinel block of learned vectors
 (image_start / image_pad / image_newline / image_end) with ViT+aligner
 embeddings scattered into the IMAGE slots in N-layout order (via `perm`).
-
-MoE gate ``bias_vl`` routing (phase 2, done): ``*.gate.bias_vl`` weights
-flow through the text model's load_weights onto ``MoEGate.bias_vl``. Hash
-layers select image tokens by ``(scores + bias_vl).topk`` instead of the
-tid2eid table; non-hash layers fall back to an eager per-token-bias top-k
-whenever a batch contains image tokens (see DeepseekV2MoE._forward_topk).
-
-NOT YET IMPLEMENTED (phase 2, required for correct outputs):
-- bidirectional / visible-window attention inside image spans during prefill
-  (reference: get_image_visible + get_window_topk_idxs_visible); needs
-  image-span-aware topk construction in layers/attention/deepseek_v4_backend.py.
 """
 
-import logging
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -50,8 +38,6 @@ from sglang.srt.models.deepseek_v4_vit import (
 )
 from sglang.srt.utils import add_prefix
 
-logger = logging.getLogger(__name__)
-
 # Sentinel type ids, matching the reference image_processor.py and
 # multimodal/processors/deepseek_v4_vl.py.
 IMAGE_START, IMAGE_PAD, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(5)
@@ -68,6 +54,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self._vision_weights_loaded = False
         self.is_multimodal = getattr(config, "vision_n_layers", 0) > 0
 
         self.language_model = _DeepseekV4TextLM(
@@ -86,9 +73,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
             self.image_pad = nn.Parameter(torch.empty(config.hidden_size))
 
-    # ------------------------------------------------------------------
-    # multimodal interface
-    # ------------------------------------------------------------------
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -162,46 +146,41 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
         return hidden_states
 
-    # ------------------------------------------------------------------
-    # weight loading
-    # ------------------------------------------------------------------
     _SENTINEL_NAMES = ("image_start", "image_end", "image_newline", "image_pad")
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-        llm_weights = []
         loaded_vision_names = set()
-        for name, loaded_weight in weights:
-            if name.startswith(("vision.", "aligner.")):
-                param = params_dict[name]
-                default_weight_loader(param, loaded_weight)
-                loaded_vision_names.add(name)
-            elif name in self._SENTINEL_NAMES:
-                param = params_dict[name]
-                default_weight_loader(param, loaded_weight)
-                loaded_vision_names.add(name)
-            else:
-                llm_weights.append((name, loaded_weight))
-        self.language_model.load_weights(llm_weights)
-        if self.is_multimodal:
-            # The vision params are created with torch.empty; a checkpoint
-            # missing them would silently serve garbage, so audit loudly.
+
+        def llm_weights():
+            for name, loaded_weight in weights:
+                if (
+                    name.startswith(("vision.", "aligner."))
+                    or name in self._SENTINEL_NAMES
+                ):
+                    default_weight_loader(params_dict[name], loaded_weight)
+                    loaded_vision_names.add(name)
+                else:
+                    yield name, loaded_weight
+
+        self.language_model.load_weights(llm_weights())
+        if self.is_multimodal and not self._vision_weights_loaded:
+            # Check the complete checkpoint iterator, which can span many shards.
+            # Later updates may contain only language-model weights.
             expected_vision = {
-                n for n in params_dict if n.startswith(("vision.", "aligner."))
+                name
+                for name in params_dict
+                if name.startswith(("vision.", "aligner."))
+                or name in self._SENTINEL_NAMES
             }
             missing = sorted(expected_vision - loaded_vision_names)
-            missing += sorted(set(self._SENTINEL_NAMES) - loaded_vision_names)
             if missing:
-                logger.warning(
-                    "DeepSeek-V4-Vision checkpoint did not provide %d vision "
-                    "weights (e.g. %s); they hold uninitialized values.",
-                    len(missing),
-                    missing[:4],
+                raise ValueError(
+                    f"DeepSeek-V4-Vision checkpoint is missing {len(missing)} "
+                    f"required vision weights: {missing}"
                 )
+            self._vision_weights_loaded = True
 
-    # ------------------------------------------------------------------
-    # delegations expected by the framework / engine
-    # ------------------------------------------------------------------
     def get_input_embeddings(self) -> nn.Module:
         return self.language_model.get_input_embeddings()
 
