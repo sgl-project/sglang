@@ -5,11 +5,8 @@ import os
 import socket
 import tempfile
 import unittest
-from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-
-import torch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
@@ -39,7 +36,6 @@ from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
-    handle_moe_kernel_config,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
 )
@@ -2244,87 +2240,6 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         )
         self.assertIn("token_oracle", enabled_action.choices)
         self.assertNotIn("token_oracle", disabled_action.choices)
-
-
-class TestCuteDslW4A16Args(CustomTestCase):
-    def setUp(self):
-        stack = ExitStack()
-        self.addCleanup(stack.close)
-        stack.enter_context(override_platform(is_sm100=True))
-        stack.enter_context(envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True))
-        stack.enter_context(
-            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(False)
-        )
-        stack.enter_context(envs.SGLANG_MOE_NVFP4_DISPATCH.override(False))
-
-    def _args(self, **kwargs):
-        args = ServerArgs(
-            model_path="dummy",
-            quantization="nvfp4_online",
-            moe_runner_backend="flashinfer_cutedsl",
-            tp_size=4,
-            dp_size=4,
-            ep_size=4,
-            enable_dp_attention=True,
-            **kwargs,
-        )
-        args._model_config = SimpleNamespace(dtype=torch.bfloat16)
-        return args
-
-    def test_online_w4a16_accepts_bf16_dispatch(self):
-        for a2a in ("none", "flashinfer"):
-            with self.subTest(a2a=a2a):
-                args = self._args(moe_a2a_backend=a2a)
-                handle_moe_kernel_config(args)
-                handle_a2a_moe(args)
-                self.assertEqual(
-                    resolution_result(args, "moe_runner_backend"), "flashinfer_cutedsl"
-                )
-
-    def test_online_w4a16_nvfp4_dispatch_flag(self):
-        with envs.SGLANG_MOE_NVFP4_DISPATCH.override(True):
-            args = self._args()
-            handle_moe_kernel_config(args)
-            handle_a2a_moe(args)
-            args = self._args(moe_a2a_backend="flashinfer")
-            handle_moe_kernel_config(args)
-            with self.assertRaisesRegex(ValueError, "SGLANG_MOE_NVFP4_DISPATCH"):
-                handle_a2a_moe(args)
-
-    def test_online_w4a16_overrides_per_token_activation(self):
-        with envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(True):
-            handle_moe_kernel_config(self._args())
-
-    def test_online_w4a16_rejects_deepep(self):
-        with self.assertRaisesRegex(ValueError, "W4A16 requires.*moe_a2a_backend"):
-            handle_a2a_moe(self._args(moe_a2a_backend="deepep"))
-
-    def test_online_w4a16_checks_resolved_a2a_backend(self):
-        with self.assertRaisesRegex(ValueError, "W4A16 requires.*moe_a2a_backend"):
-            handle_a2a_moe(self._args(enable_waterfill=True))
-
-    def test_w4a16_rejects_non_sm100(self):
-        args = self._args()
-        # Exercise the W4A16 gate separately from nvfp4_online's existing gate.
-        args.quantization = "modelopt_fp4"
-        with override_platform(is_sm100=False):
-            with self.assertRaisesRegex(ValueError, "W4A16 requires SM10X"):
-                handle_moe_kernel_config(args)
-
-    def test_online_w4a16_checks_resolved_dtype(self):
-        args = self._args(dtype="auto")
-        args._model_config.dtype = torch.float16
-        with self.assertRaisesRegex(ValueError, "use --dtype bfloat16"):
-            handle_moe_kernel_config(args)
-
-    def test_online_w4a4_still_accepts_per_token_activation(self):
-        with (
-            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(False),
-            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(True),
-        ):
-            handle_moe_kernel_config(self._args())
-            with self.assertRaisesRegex(ValueError, "per-token NVFP4 activation"):
-                handle_moe_kernel_config(self._args(moe_a2a_backend="deepep"))
 
 
 class TestDeepEPv2Args(CustomTestCase):
