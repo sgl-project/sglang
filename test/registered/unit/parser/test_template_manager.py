@@ -44,6 +44,22 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         )
         return force, config, parser
 
+    def test_gigachat35_gcml_template_wins_over_generic_think_tags(self):
+        """The GCML marker must map both parsers to gigachat35; the template also
+        carries <think>, so the rule has to outrank the generic deepseek-r1
+        think-tags fallback."""
+        template = """
+        {{- 'assistant<|role_sep|>\\n<think>' -}}
+        <｜GCML｜tool_calls>
+        """
+        vocab = ["<think>", "</think>", "<|role_sep|>\n"]
+        force, config, parser = self._detect(template, vocab)
+        self.assertEqual(parser, "gigachat35")
+        self.assertEqual(
+            detect_tool_call_parser(template, _DummyTokenizer(vocab), config, force),
+            "gigachat35",
+        )
+
     def test_qwen3_template_not_misclassified_as_glm45(self):
         template = """
         {% set enable_thinking = enable_thinking if enable_thinking is defined else true %}

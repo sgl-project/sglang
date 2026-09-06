@@ -472,6 +472,10 @@ def _is_deepseek_r1_think_tags(ctx):
     return not _is_lfm2(ctx) and (ctx.has_text("<think>") or ctx.has_text("</think>"))
 
 
+def _is_gigachat35(ctx):
+    return ctx.has_text("<｜GCML｜tool_calls>")
+
+
 # ---------------------------------------------------------------------------
 # Reasoning parser rules
 # ---------------------------------------------------------------------------
@@ -497,6 +501,7 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="qwen3", value="qwen3", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v4", value="deepseek-v4", predicate=_is_deepseek_v4),
     DetectionRule(name="deepseek_v3", value="deepseek-v3", predicate=_is_deepseek_v3),
+    DetectionRule(name="gigachat35", value="gigachat35", predicate=_is_gigachat35),
     DetectionRule(
         name="deepseek_r1_force", value="deepseek-r1", predicate=_is_deepseek_r1
     ),
@@ -512,6 +517,7 @@ REASONING_PARSER_RULES = (
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PARSER_RULES = (
+    DetectionRule(name="gigachat35", value="gigachat35", predicate=_is_gigachat35),
     DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),

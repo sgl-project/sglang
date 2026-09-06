@@ -187,6 +187,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.chain_mtp_hidden_states = draft_arch in [
             "Step3p5MTP",
             "InklingForConditionalGenerationMTP",
+            "GigaChat35ForCausalLMNextN",
         ]
         self.draft_tp_context = (
             draft_tp_context if get_parallel().enable_dp_attention else empty_context
@@ -262,7 +263,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             return
         if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
             conv_state = self.req_to_token_pool.mamba_pool.mamba_cache.conv
-            self.draft_extend_num_warmup_tokens = conv_state[0].shape[2]
+            self.draft_extend_num_warmup_tokens = min(conv_state[0].shape[2:])
         self.draft_extend_num_front_tokens = (
             self.speculative_num_steps - 1 + self.draft_extend_num_warmup_tokens
         )
@@ -982,7 +983,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors=None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -992,7 +997,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 else CaptureHiddenMode.FULL
             )
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=target_capture_mode,
             )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.

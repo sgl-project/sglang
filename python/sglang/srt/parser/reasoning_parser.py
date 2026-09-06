@@ -2049,6 +2049,7 @@ class ReasoningParser:
         "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
+        "gigachat35": DeepSeekR1Detector,
         "inkling": InklingDetector,
         "cohere_command4": CohereCommand4Detector,
     }

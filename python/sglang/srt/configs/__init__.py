@@ -16,6 +16,7 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.hy_v4 import HYV4Config
 from sglang.srt.configs.inkling import (
@@ -119,6 +120,7 @@ __all__ = [
     "DotsOCRConfig",
     "Dots3Config",
     "FalconH1Config",
+    "GigaChat35Config",
     "GraniteMoeHybridConfig",
     "HYV4Config",
     "Lfm2Config",
