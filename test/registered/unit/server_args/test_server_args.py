@@ -163,6 +163,19 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+    def test_min_free_slots_max_delay_passes(self):
+        args = ServerArgs(model_path="dummy", min_free_slots_max_delay_passes=1)
+        args.resolve_once()
+        self.assertEqual(resolution_result(args, "min_free_slots_max_delay_passes"), 1)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--min-free-slots-max-delay-passes must be non-negative",
+        ):
+            ServerArgs(
+                model_path="dummy", min_free_slots_max_delay_passes=-1
+            ).resolve_once()
+
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
