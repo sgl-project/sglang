@@ -78,7 +78,7 @@ export const InternS2PreviewDeployment = () => {
     if (toolcall === 'enabled') flags.push('  --tool-call-parser qwen3_coder');
     if (mtp === 'enabled') {
       flags.push('  --mamba-radix-cache-strategy extra_buffer');
-      flags.push("  --speculative-algo 'NEXTN'");
+      flags.push("  --speculative-algorithm NEXTN");
       flags.push('  --speculative-eagle-topk 1');
       flags.push('  --speculative-num-steps 3');
       flags.push('  --speculative-num-draft-tokens 4');
