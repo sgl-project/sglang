@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary._dispatch import use_torch_reference
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -305,11 +306,27 @@ def launch_canary_verify_kernel(
     """
     canary_buf = context.canary_buf
     real_kv_sources = context.real_kv_sources
+    # Enforce the source-count cap before dispatching: the torch reference is
+    # pinned to match the CUDA ABI byte-for-byte, so the limit is a cross-backend
+    # contract, not a CUDA-only guard. Checking after the reference early-return
+    # (XPU / CPU path) would silently skip it.
     if len(real_kv_sources) > consts.MAX_REAL_KV_SOURCES:
         raise ValueError(
             f"kv-canary: at most {consts.MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
             f"got {len(real_kv_sources)}"
         )
+
+    if use_torch_reference(canary_buf.device):
+        from sglang.kernels.ops.kv_canary.verify_ref import (
+            launch_canary_verify_kernel_torch_reference,
+        )
+
+        launch_canary_verify_kernel_torch_reference(
+            context=context,
+            plan=plan,
+            check_verify_expected_token=check_verify_expected_token,
+        )
+        return
 
     _assert_contiguous(canary_buf, "canary_buf")
     _assert_contiguous(plan.verify_slot_indices, "plan.verify_slot_indices")
