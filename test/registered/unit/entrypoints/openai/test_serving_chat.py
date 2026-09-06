@@ -709,6 +709,30 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertTrue(processed.require_reasoning)
 
+    def test_gpt_oss_reasoning_parser_preserves_special_tokens(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello"}],
+        )
+        self.chat.reasoning_parser = "gpt-oss"
+
+        self.chat._patch_reasoning_skip_special_tokens(request)
+
+        self.assertFalse(request.skip_special_tokens)
+
+    def test_non_gpt_oss_reasoning_parser_keeps_default_special_token_handling(self):
+        for reasoning_parser in (None, "qwen3"):
+            with self.subTest(reasoning_parser=reasoning_parser):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+                self.chat.reasoning_parser = reasoning_parser
+
+                self.chat._patch_reasoning_skip_special_tokens(request)
+
+                self.assertTrue(request.skip_special_tokens)
+
     def test_kimi_tool_call_respects_explicit_reasoning_disable(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True
