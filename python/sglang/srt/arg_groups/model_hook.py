@@ -183,6 +183,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
