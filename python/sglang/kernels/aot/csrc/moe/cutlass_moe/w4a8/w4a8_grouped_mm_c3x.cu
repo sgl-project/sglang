@@ -177,16 +177,20 @@ void dispatch_w4a8_moe_mm_sm90(
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     }
   } else if (n == 4096 && k == 6144) {
-    // GLM-5.2 group gemm 1
+    // GLM-5.2 group gemm 1 at EP-8 (no DeepEP)
     if (m <= 256) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+    } else if (m <= 1024) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     }
   } else if (n == 6144 && k == 2048) {
-    // GLM-5.2 group gemm 2
+    // GLM-5.2 group gemm 2 at EP-8 (no DeepEP)
     if (m <= 256) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+    } else if (m <= 1024) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     }
