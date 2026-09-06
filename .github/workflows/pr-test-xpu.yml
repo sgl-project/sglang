@@ -56,10 +56,13 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              # Exclude kernels/ (no XPU per-commit coverage) and narrow test/**
+              # so CPU/AMD/NPU-only test edits don't queue the XPU serving suite.
+              - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
               - "python/pyproject_xpu.toml"
-              - "test/**/!(*.md)"
-              - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+              - "test/registered/xpu/**/!(*.md)"
+              - "test/run_suite.py"
+              - "test/pytest.ini"
               - ".github/workflows/pr-test-xpu.yml"
               - "docker/xpu.Dockerfile"
             multimodal_gen:
@@ -75,7 +78,7 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
-  # ==================== Stage A ==================== #
+  # Runs the entire per-commit XPU test suite in one job (single install, single queue).
   stage-a-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
@@ -120,102 +123,10 @@ jobs:
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
-      - name: Run stage-a tests
-        timeout-minutes: 30
+      - name: Run tests
+        timeout-minutes: 150
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu --enable-retry"
-
-      - name: Cleanup container
-        if: always()
-        run: |
-          # pip install ran as root inside the container against the
-          # bind-mounted workspace, so build artifacts are root-owned on
-          # the host. Chown them back before rm to avoid Permission denied.
-          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
-            chown -R "$(id -u):$(id -g)" /w || true
-          # Wipe everything the run wrote into the workspace so the next
-          # job starts from a clean tree.
-          rm -rf \
-            python/build \
-            python/dist \
-            python/sglang.egg-info \
-            python/sglang/*.egg-info \
-            test/result.jsonl \
-            test/results \
-            test/.pytest_cache \
-            .pytest_cache || true
-          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
-          find . -type f -name "*.pyc" -delete || true
-          # SIGTERM sglang and drain GPU context before `docker rm -f`;
-          # SIGKILL leaves the xe/GuC exec queue registered and triggers a
-          # GT reset (+ devcoredump) on B580.
-          if docker ps --format '{{.Names}}' | grep -qx ci_sglang_xpu; then
-            docker exec ci_sglang_xpu bash -c '
-              pkill -TERM -f "sglang|run_suite|python3.*test_" 2>/dev/null || true
-              for _ in $(seq 1 30); do
-                pgrep -f "sglang::|sglang.launch_server" >/dev/null || break
-                sleep 1
-              done
-              pkill -KILL -f "sglang|run_suite" 2>/dev/null || true
-            ' || true
-          fi
-          docker rm -f ci_sglang_xpu || true
-          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
-            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
-          fi
-
-  # ==================== Wait for Stage A ==================== #
-  wait-for-stage-a:
-    needs: [stage-a-test-1-gpu-xpu]
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "stage-a passed"
-
-  # ==================== Stage B ==================== #
-  stage-b-test-1-gpu-xpu:
-    needs: [check-changes, pr-gate, wait-for-stage-a]
-    if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: intel-bmg
-    env:
-      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
-      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
-    steps:
-      - name: Reset workspace ownership
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
-            chown -R "$(id -u):$(id -g)" /w || true
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Start CI container
-        run: |
-          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install Dependency
-        timeout-minutes: 60
-        run: |
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
-          docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
-          # Fetch tags so setuptools_scm resolves a real version instead of
-          # falling back to 0.0.0 on a shallow/tag-less checkout.
-          docker exec -w /sglang-checkout ci_sglang_xpu git fetch origin '+refs/tags/*:refs/tags/*' --force
-          docker exec -w /sglang-checkout/python ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
-
-      - name: Run stage-b tests
-        timeout-minutes: 120
-        run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu --enable-retry"
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --enable-retry"
 
       - name: Cleanup container
         if: always()
@@ -338,20 +249,15 @@ jobs:
 
   finish:
     if: always()
-    needs: [stage-a-test-1-gpu-xpu, stage-b-test-1-gpu-xpu, multimodal-gen-test-1-gpu-xpu, pr-gate]
+    needs: [stage-a-test-1-gpu-xpu, multimodal-gen-test-1-gpu-xpu, pr-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Check job status
         run: |
           stage_a="${{ needs.stage-a-test-1-gpu-xpu.result }}"
-          stage_b="${{ needs.stage-b-test-1-gpu-xpu.result }}"
           multimodal_gen="${{ needs.multimodal-gen-test-1-gpu-xpu.result }}"
           if [ "$stage_a" != "success" ] && [ "$stage_a" != "skipped" ]; then
             echo "stage-a failed with result: $stage_a"
-            exit 1
-          fi
-          if [ "$stage_b" != "success" ] && [ "$stage_b" != "skipped" ]; then
-            echo "stage-b failed with result: $stage_b"
             exit 1
           fi
           if [ "$multimodal_gen" != "success" ] && [ "$multimodal_gen" != "skipped" ]; then
