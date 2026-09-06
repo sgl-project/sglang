@@ -36,6 +36,8 @@ from sglang.srt.utils.common import is_xpu
 
 logger = logging.getLogger(__name__)
 
+_PP_LOCAL_RELEASE = envs.SGLANG_PP_PD_LOCAL_RELEASE.get()
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -242,9 +244,13 @@ class SchedulerPPMixin:
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
 
-                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                release_polls = self._pp_pd_poll_transfers()
+                transferred_rids = self._pp_pd_get_prefill_transferred_ids(
+                    release_polls
+                )
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+                self._pp_pd_release_local_transfers(release_polls)
 
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
@@ -322,7 +328,11 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(next_release_rids)
+                    self.process_disagg_prefill_inflight_queue(
+                        next_release_rids,
+                        polls=self._pp_pd_aligned_polls(release_polls),
+                    )
+                    self._pp_pd_confirm_release(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -350,7 +360,11 @@ class SchedulerPPMixin:
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
-            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
+            if (
+                server_is_idle
+                and len(self.disagg_prefill_inflight_queue) == 0
+                and len(self.pp_release_held) == 0
+            ):
                 self.on_idle()
 
     @DynamicGradMode()
@@ -553,6 +567,7 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
+        self.pp_release_held = {}
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not get_parallel().enable_dsa_prefill_context_parallel
@@ -637,30 +652,68 @@ class SchedulerPPMixin:
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
-    def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
+    def _pp_pd_poll_transfers(self: Scheduler) -> Dict[int, int]:
+        queue = self.disagg_prefill_inflight_queue
+        if not queue:
+            return {}
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in queue],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        return {id(req): poll for req, poll in zip(queue, polls)}
+
+    def _pp_pd_local_terminal_rids(self: Scheduler, polls: Dict[int, int]) -> List[str]:
+        terminal: Dict[str, bool] = {}
+        for req in self.disagg_prefill_inflight_queue:
+            is_terminal = polls.get(id(req)) in (KVPoll.Success, KVPoll.Failed)
+            terminal[req.rid] = terminal.get(req.rid, True) and is_terminal
+        return [rid for rid, done in terminal.items() if done]
+
+    def _pp_pd_get_prefill_transferred_ids(
+        self: Scheduler, polls: Dict[int, int]
+    ) -> List[str]:
+        local_rids = list(
+            dict.fromkeys(
+                [
+                    *self._pp_pd_local_terminal_rids(polls),
+                    *self.pp_release_held,
+                ]
+            )
+        )
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-        # if other ranks, do intersection with the previous rank's transferred rids
-        else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
-            )
-        return transferred_rids
+            return local_rids
+
+        previous_rids = set(self._pp_recv_pyobj_from_prev_stage())
+        return [rid for rid in local_rids if rid in previous_rids]
+
+    def _pp_pd_aligned_polls(
+        self: Scheduler, polls: Dict[int, int]
+    ) -> List[Optional[int]]:
+        return [polls.get(id(req)) for req in self.disagg_prefill_inflight_queue]
+
+    def _pp_pd_release_local_transfers(self: Scheduler, polls: Dict[int, int]) -> None:
+        if not _PP_LOCAL_RELEASE:
+            return
+        rids = self._pp_pd_local_terminal_rids(polls)
+        if not rids:
+            return
+        done = self.process_disagg_prefill_inflight_queue(
+            rids,
+            polls=self._pp_pd_aligned_polls(polls),
+            release_pools=False,
+        )
+        for req in done:
+            self.pp_release_held.setdefault(req.rid, []).append(req)
+
+    def _pp_pd_confirm_release(
+        self: Scheduler, release_rids: Optional[List[str]]
+    ) -> None:
+        if not release_rids:
+            return
+        for rid in release_rids:
+            for req in self.pp_release_held.pop(rid, []):
+                self.release_prefill_transfer_pools(req)
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
