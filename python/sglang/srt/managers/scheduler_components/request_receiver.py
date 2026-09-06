@@ -167,8 +167,15 @@ class SchedulerRequestReceiver:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
-                work_reqs = None
-                control_reqs = None
+                # The requests reach every rank in two hops: along attn_tp from
+                # the leader, then along attn_cp from each attn_tp_rank 0. In
+                # the first hop the source of every attn_cp_rank != 0 slice is
+                # a rank that has nothing yet, and broadcast_pyobj reads
+                # len(data) on the source, so it must hold a list rather than
+                # None. It broadcasts an empty payload, and the second hop
+                # replaces it with the real requests (#37590).
+                work_reqs = []
+                control_reqs = []
 
             work_reqs = attn_cp_tp_broadcast_pyobj(work_reqs)
 
