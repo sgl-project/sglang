@@ -485,6 +485,33 @@ class ModelConfig:
         self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+        # Online FP8 -> MXFP4 expert requant presents a block-FP8 checkpoint to
+        # the quant method as if its routed experts were stored MXFP4.
+        self.requant_fp8_experts_to_mxfp4: bool = False
+        if envs.SGLANG_FP8_MOE_EXPERTS_REQUANT_MXFP4.get():
+            if not get_platform().is_sm100:
+                # The MXFP4 expert kernels (fp8xfp4 / mxf4xmxf4) are SM100-only;
+                # SM90 MegaMoE keeps block-FP8 weights.
+                raise ValueError(
+                    "SGLANG_FP8_MOE_EXPERTS_REQUANT_MXFP4 requires an SM100-class "
+                    "GPU (B200 / B300); unset it on this platform."
+                )
+            is_block_fp8 = (
+                quantization_config.get("quant_method") == "fp8"
+                and quantization_config.get("weight_block_size") is not None
+            )
+            if is_block_fp8 and not self.is_fp4_experts:
+                self.requant_fp8_experts_to_mxfp4 = True
+                self.is_fp4_experts = True
+                logger.info(
+                    "SGLANG_FP8_MOE_EXPERTS_REQUANT_MXFP4=1: block-FP8 routed "
+                    "experts will be requantized to MXFP4 at load time."
+                )
+            else:
+                logger.warning(
+                    "SGLANG_FP8_MOE_EXPERTS_REQUANT_MXFP4 ignored: it needs a "
+                    "block-FP8 checkpoint whose routed experts are not already MXFP4."
+                )
 
         # DSV4 mxfp4 layout applies only when the ckpt does not opt in above.
         if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:

@@ -250,6 +250,9 @@ class Fp8Config(QuantizationConfig):
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
+        # FP8 routed experts in the checkpoint, MXFP4 params in memory; the
+        # FusedMoE loader requantizes each expert as it streams in.
+        self.requant_fp8_experts_to_mxfp4 = False
         self.dequant_fp4_to_fp8 = False
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
