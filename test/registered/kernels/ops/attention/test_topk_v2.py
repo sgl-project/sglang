@@ -2,8 +2,8 @@
 
 The v2 kernel selects the per-row top-k of ``scores`` (ragged ``seq_lens``) and
 writes the page-table transform of the selected raw indices into the output. We
-validate against ``torch.topk`` with a small tolerance for boundary ties (the
-fp16 coarse histogram can swap elements of equal score).
+validate the selected value multiset exactly against ``torch.topk``; swapping
+indices whose FP32 scores are equal is valid, selecting a lower score is not.
 
 Coverage is organized around the kernel's dispatch so every template and its
 boundaries are exercised:
@@ -14,12 +14,13 @@ boundaries are exercised:
   Register2     k < seq <= 8192        max_seq <= 8192          (level 0)
   Register4     8192 < seq <= 16384    max_seq <= 16384         (level 1)
   Streaming     16384 < seq <= floor   max_seq > 16384, non-cluster (level 2)
-  Cluster       seq > floor(=65536)    max_seq > floor and batch <= 128
+  Cluster       seq > floor            max_seq > batch-aware floor, batch <= 512
 
 and two cluster dispatch shapes: the fused small-batch kernel (batch <= 30) and
-the persistent-pool + main kernel (30 < batch <= 128). Boundary seq lengths
-(8192/8193, 16384/16385, 65535/65536/65537) and batch sizes (30/31, 128/129) are
-included explicitly, across k in {512,1024,2048} and identity/perm page tables.
+the persistent-pool + main kernel (30 < batch <= 512). Boundary seq lengths
+(8192/8193, 16384/16385, 32768/32769, 65535/65536/65537) and batch sizes
+(30/31, 512/513) are included explicitly, across k in {512,1024,2048} and
+identity/perm page tables.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
+    topk_transform_paged,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
@@ -42,8 +44,6 @@ register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
 PAGE_MASK = PAGE_SIZE - 1
-MAX_PERMIT_ERROR = 5
-FLOOR = 65536  # kClusterFloor
 
 # (batch, seq) chosen to land on each template and each dispatch boundary.
 FIXED_CONFIGS = [
@@ -61,23 +61,22 @@ FIXED_CONFIGS = [
     (256, 16384),  # batch > 128
     # --- Streaming (level 2: max_seq > 16384, non-cluster) ---
     (8, 16385),  # just over reg4 (small batch, seq < floor => non-cluster)
-    (4, 32768),
+    (4, 32768),  # at the reduced small-batch floor => non-cluster
     (16, 65535),  # just under floor
-    (4, 65536),  # at floor (seq == floor => non-cluster)
+    (4, 32769),  # just over the reduced small-batch floor => fused cluster
     (100, 65536),
     # --- Cluster, fused small-batch kernel (batch <= 30, max_seq > floor) ---
     (1, 65537),  # single row just over floor
     (2, 131072),
     (8, 98304),
     (30, 131072),  # batch == pool boundary
-    # --- Cluster, persistent pool + main kernel (30 < batch <= 128) ---
+    # --- Cluster, persistent pool + main kernel (30 < batch <= 512) ---
     (31, 131072),  # just over small-batch
     (40, 262144),  # N > pool of 30 => round-robin
     (64, 196608),
-    (128, 131072),  # cluster batch upper boundary
-    # --- batch > 128 => non-cluster streaming even at long ctx ---
-    (129, 131072),
-    (200, 262144),
+    (512, 65537),  # cluster batch upper boundary
+    # --- batch > 512 => non-cluster streaming even at long ctx ---
+    (513, 65537),
 ]
 
 
@@ -86,20 +85,42 @@ def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
     bad = 0
     for i in range(bs):
         L = int(seq_lens[i])
-        ref, our = set(ref_raw[i]), set(our_raw[i])
+        ref, our_list = set(ref_raw[i]), our_raw[i]
+        our = set(our_list)
+        assert len(our_list) == min(k, L), (
+            f"b={i} L={L} k={k}: {len(our_list)} outputs != {min(k, L)}"
+        )
+        assert len(our) == len(our_list), f"b={i} L={L} k={k}: duplicate indices"
+        assert all(0 <= index < L for index in our), (
+            f"b={i} L={L} k={k}: output index outside [0, {L})"
+        )
         more, less = our - ref, ref - our
         if more or less:
             mv = sorted(scores_cpu[i, list(more)].tolist())
             lv = sorted(scores_cpu[i, list(less)].tolist())
             if mv != lv:  # not merely a tie swap -> genuine error
-                bad += len(more)
+                bad += max(len(more), len(less))
                 print(
                     f"b={i} L={L} k={k}: more={list(more)[:4]} less={list(less)[:4]} mv={mv[:3]} lv={lv[:3]}"
                 )
-        assert len(our) == min(k, L), (
-            f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
-        )
-    assert bad <= MAX_PERMIT_ERROR, f"{bad=} > {MAX_PERMIT_ERROR}"
+    assert bad == 0, f"{bad=}"
+
+
+def _oversized_coarse_bin(batch: int, seq: int) -> torch.Tensor:
+    """Increasing FP32 scores contained in one 12-bit fp16 coarse bin.
+
+    Keeping the largest values at the end makes a clipped arrival-order prefix
+    deterministically wrong while retaining exact-value ties as the row grows.
+    """
+    values = 1.0 + torch.arange(seq, dtype=torch.float32, device="cuda") * (1e-3 / seq)
+    return values.expand(batch, -1).contiguous()
+
+
+def _coarse_keys_12(values: torch.Tensor) -> torch.Tensor:
+    """Mirror extract_coarse_bin<12> for test-shape assertions."""
+    bits = values.to(torch.float16).view(torch.int16).to(torch.int32) & 0xFFFF
+    ordered = torch.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits | 0x8000)
+    return ordered >> 4
 
 
 def _make_page_table(batch, num_pages, mode, device, per_row=False):
@@ -209,7 +230,7 @@ def test_topk_v2(batch: int, seq: int, k: int, page_mode: str) -> None:
     [
         (20, "small_batch"),  # fused small-batch kernel (<= pool of 30)
         (64, "persistent"),  # persistent pool + main kernel
-        (128, "persistent"),  # cluster batch boundary
+        (128, "persistent"),  # persistent cluster with a larger batch
     ],
 )
 @pytest.mark.parametrize("per_row_pt", [False, True])
@@ -256,8 +277,8 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     Runs the no-page-table mode, so the output is the selected positions
     themselves. Unlike ``test_topk_v2`` -- which checks the page-transformed
     output and inverts it through the page table -- this isolates the top-k
-    selection from the transform, and it is the only coverage of that mode.
-    Covers every dispatch template/boundary.
+    selection from the transform, and it is the only dispatch-matrix-wide
+    coverage of that mode. Covers every dispatch template/boundary.
     """
     torch.manual_seed(batch * 100003 + seq * 7 + k + 1)
     device = "cuda"
@@ -268,6 +289,154 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     our_raw = _run_raw(scores, seq_lens, k)
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+
+
+@pytest.mark.parametrize(
+    "batch,seq,k",
+    [
+        pytest.param(1, 6000, 512, id="register2"),
+        pytest.param(1, 12000, 1024, id="register4"),
+        pytest.param(4, 32768, 2048, id="streaming"),
+        pytest.param(1, 131072, 2048, id="cluster-fused"),
+        pytest.param(31, 131072, 2048, id="cluster-persistent"),
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_oversized_coarse_bin(batch: int, seq: int, k: int) -> None:
+    """Every v2 dispatch path must rescan, not clip, an oversized tie bin."""
+    scores = _oversized_coarse_bin(batch, seq)
+    if batch == 31:
+        # Put the strictly-higher values in the final cluster rank. This makes
+        # non-primary cluster emissions fill [0, above_count) while rank 0's exact
+        # fallback fills the disjoint tail [above_count, topk).
+        scores[:, -137:] += 1.0
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+
+    our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+
+    if seq == 131072:
+        # PAGE_TABLE mode stages cluster output through the elected block's
+        # shared memory before applying the transform. Exercise that distinct
+        # path with the oversized-bin fallback active.
+        num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+        page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", "cuda")
+        our_paged_raw = _run(scores, seq_lens, page_table, inv_cpu, k)
+        _assert_topk_close(
+            scores.cpu(), ref_raw, our_paged_raw, batch, seq_lens.cpu(), k
+        )
+
+
+@pytest.mark.parametrize("depth", [16, 8, 0])
+@torch.inference_mode()
+def test_topk_v2_oversized_bin_separates_at_each_variable_byte(depth: int) -> None:
+    """The fallback must retain strict winners found at every variable byte."""
+    torch.manual_seed(20260904 + depth)
+    per_side, k = 4097, 2048
+    base = 0x3F000000
+    noise = torch.randint(
+        0, 1 << depth, (2 * per_side,), dtype=torch.int32, device="cuda"
+    )
+    bits = torch.full((2 * per_side,), base, dtype=torch.int32, device="cuda") + noise
+    bits[:per_side] += 1 << depth
+    values = bits[torch.randperm(2 * per_side, device="cuda")].view(torch.float32)
+    cutoff = torch.topk(values, k).values.min()
+    cutoff_bin = _coarse_keys_12(cutoff.view(1))[0]
+    assert int((_coarse_keys_12(values) == cutoff_bin).sum()) > 2048
+    logical_length = 2 * per_side
+    # The entry point requires a 16-byte-aligned physical row stride. Keep the
+    # 8194-element logical row (and its scalar tail), backed by a padded stride.
+    padded = torch.empty((1, (logical_length + 3) & ~3), device="cuda")
+    padded[0, :logical_length] = values
+    scores = padded[:, :logical_length]
+    seq_lens = torch.tensor([logical_length], dtype=torch.int32, device="cuda")
+
+    our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, 1, seq_lens.cpu(), k)
+
+
+@torch.inference_mode()
+def test_topk_v2_cluster_all_equal_overflow() -> None:
+    """Full-key ties larger than the cap use captured candidates exactly."""
+    seq, k = 131072, 2048
+    scores = torch.full((1, seq), 0.75, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor([seq], dtype=torch.int32, device="cuda")
+
+    our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, 1, seq_lens.cpu(), k)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.0])
+@torch.inference_mode()
+def test_topk_v2_signed_zero_rows(value: float) -> None:
+    """The boundary classifier handles positive and negative zero rows."""
+    seq, k = 6000, 512
+    scores = torch.full((1, seq), value, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor([seq], dtype=torch.int32, device="cuda")
+
+    our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, 1, seq_lens.cpu(), k)
+
+
+@torch.inference_mode()
+def test_topk_v2_oversized_exact_tie_fills_one_tail_slot() -> None:
+    """Captured exact ties start after topk-1 strictly higher values."""
+    k, high_count, tie_count = 2048, 2047, 3000
+    high = 2.0 + torch.arange(high_count, dtype=torch.float32, device="cuda") * 1e-3
+    tie = torch.full((tie_count,), 0.75, dtype=torch.float32, device="cuda")
+    values = torch.cat([tie, high])
+    assert (
+        int((_coarse_keys_12(values) == _coarse_keys_12(tie[:1])[0]).sum()) == tie_count
+    )
+    logical_length = values.numel()
+    padded = torch.empty((1, (logical_length + 3) & ~3), device="cuda")
+    padded[0, :logical_length] = values
+    scores = padded[:, :logical_length]
+    seq_lens = torch.tensor([logical_length], dtype=torch.int32, device="cuda")
+
+    our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, 1, seq_lens.cpu(), k)
+
+
+@pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="topk_transform_paged v1 uses the CUDA JIT path on NVIDIA",
+)
+@pytest.mark.parametrize("k", [512, 1024])
+@torch.inference_mode()
+def test_topk_v1_oversized_coarse_bin(k: int) -> None:
+    """The legacy DSV4 CUDA JIT caller shares the overflow-safe selector."""
+    batch, seq, page_size = 2, 20000, 64
+    scores = _oversized_coarse_bin(batch, seq)
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    num_pages = (seq + page_size - 1) // page_size
+    page_table = (
+        torch.arange(num_pages, dtype=torch.int32, device="cuda")
+        .expand(batch, -1)
+        .contiguous()
+    )
+    page_indices = torch.full((batch, k), -1, dtype=torch.int32, device="cuda")
+    raw_indices = torch.full_like(page_indices, -1)
+
+    topk_transform_paged(
+        scores,
+        seq_lens,
+        page_table,
+        page_indices,
+        page_size,
+        raw_indices,
+    )
+    torch.cuda.synchronize()
+
+    ref_raw = _reference(scores, seq_lens, k)
+    our_raw = raw_indices.cpu().tolist()
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+    assert torch.equal(torch.sort(page_indices).values, torch.sort(raw_indices).values)
 
 
 # --- ragged entry point ------------------------------------------------------
@@ -361,6 +530,33 @@ def test_topk_v2_ragged_window(name: str, rows, k: int, offset_shift: int) -> No
             allowed[start - start % 4 : start] = True
         stray = (changed[i] & ~allowed).nonzero().flatten().tolist()
         assert not stray, f"row {i} ({name}) wrote outside its masked head: {stray[:8]}"
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@torch.inference_mode()
+def test_topk_v2_ragged_oversized_coarse_bin(k: int) -> None:
+    """Ragged register and streaming paths rescan their exact score windows."""
+    rows = [(3, 6000), (7007, 12000), (20011, 40000)]
+    width = ((max(start + length for start, length in rows)) + 3) & ~3
+    scores = torch.full(
+        (len(rows), width), OUTSIDE_SCORE, dtype=torch.float32, device="cuda"
+    )
+    for i, (start, length) in enumerate(rows):
+        scores[i, start : start + length] = _oversized_coarse_bin(1, length)[0]
+    starts = torch.tensor(
+        [start for start, _ in rows], dtype=torch.int32, device="cuda"
+    )
+    lengths = torch.tensor(
+        [length for _, length in rows], dtype=torch.int32, device="cuda"
+    )
+    offsets = starts + 4321
+
+    our_raw = _run_ragged(scores, lengths, starts, offsets, k)
+    windows = torch.zeros(len(rows), int(lengths.max().item()), dtype=torch.float32)
+    for i, (start, length) in enumerate(rows):
+        windows[i, :length] = scores[i, start : start + length].cpu()
+    ref_raw = _reference(windows, lengths.cpu(), k)
+    _assert_topk_close(windows, ref_raw, our_raw, len(rows), lengths.cpu(), k)
 
 
 @pytest.mark.parametrize("k", [512, 2048])
