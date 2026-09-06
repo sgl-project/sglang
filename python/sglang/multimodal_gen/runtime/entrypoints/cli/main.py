@@ -3,13 +3,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/entrypoints/cli/main.py
 
+from sglang.multimodal_gen.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
-from sglang.multimodal_gen.runtime.entrypoints.cli.generate import GenerateSubcommand
-from sglang.multimodal_gen.runtime.entrypoints.cli.serve import ServeSubcommand
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
 def generate_cmd_init() -> list[CLISubcommand]:
+    # Command modules import the runtime graph. Activate plugins first so OOT
+    # platforms can prepare that graph before its modules are evaluated.
+    apply_plugin_hooks()
+
+    from sglang.multimodal_gen.runtime.entrypoints.cli.generate import (
+        GenerateSubcommand,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.cli.serve import ServeSubcommand
+
     return [GenerateSubcommand(), ServeSubcommand()]
 
 
@@ -21,6 +29,8 @@ def cmd_init() -> list[CLISubcommand]:
 
 
 def main() -> None:
+    apply_plugin_hooks()
+
     parser = FlexibleArgumentParser(description="sglang-diffusion CLI")
     parser.add_argument("-v", "--version", action="version", version="0.1.0")
 

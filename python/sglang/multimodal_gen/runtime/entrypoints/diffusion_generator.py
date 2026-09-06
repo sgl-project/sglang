@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GenerationResult,
     ListLorasReq,
@@ -31,7 +32,6 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
@@ -54,15 +54,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 )
 
 logger = init_logger(__name__)
-
-try:
-    # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
-    # This must be done at the top level of the module, before any CUDA context
-    # or other processes are initialized.
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    # The start method can only be set once per program execution.
-    pass
 
 
 def _replace_sampling_params_for_prompt(
@@ -134,6 +125,8 @@ class DiffGenerator:
 
         Priority level: Default pipeline config < User's pipeline config < User's kwargs
         """
+        apply_plugin_hooks()
+
         # If users also provide some kwargs, it will override the ServerArgs and PipelineConfig.
 
         if (server_args := kwargs.get("server_args", None)) is not None:
@@ -159,6 +152,7 @@ class DiffGenerator:
         Returns:
             The created DiffGenerator
         """
+        apply_plugin_hooks()
         globally_suppress_loggers()
         instance = cls(
             server_args=server_args,
@@ -181,6 +175,9 @@ class DiffGenerator:
         self,
     ) -> list[mp.Process]:
         """Check if a local server is running; if not, start it and return the process handles."""
+        # Not module scope: launch_server pulls in the whole worker graph.
+        from sglang.multimodal_gen.runtime.launch_server import launch_server
+
         # First, we need a client to test the server. Initialize it temporarily.
         sync_scheduler_client.initialize(self.server_args)
 
