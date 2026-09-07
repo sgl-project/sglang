@@ -36,7 +36,7 @@ class CPUWorker(GPUWorker):
 
     def init_cpu_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
-        cpu_ids_by_node = get_cpu_ids_by_node()
+        (mode, cpu_ids_by_node) = get_cpu_ids_by_node()
         n_numa_node = len(cpu_ids_by_node)
         if omp_cpuids == "all":
             assert self.server_args.tp_size <= n_numa_node, (
