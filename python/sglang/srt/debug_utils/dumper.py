@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 import zmq
 
+from sglang.srt.debug_utils.cuda_graph import cuda_graph_dump
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -166,6 +167,17 @@ class DumperConfig(_BaseConfig):
     # When True, append parallel-rank tags (pp_rank/tp_rank/...) to dump filenames so
     # tensors from different ranks do not collide when dumped into a shared directory.
     include_parallel_rank_in_filename: bool = False
+    # CUDA-graph-compatible dumping. Off by default: it costs one device buffer
+    # per dumped tensor, held for the process lifetime, because a graph-recorded
+    # copy_ bakes in the buffer's address. See sglang.srt.debug_utils.cuda_graph.
+    cuda_graph_enable: bool = False
+    # Comma-separated dump-name prefixes to keep. None/empty means every name,
+    # which is rarely what you want: the buffers are allocated up front.
+    cuda_graph_filter: Optional[str] = None
+    # Device-memory ceiling for those buffers. Negative means unlimited.
+    cuda_graph_budget_mb: int = 4096
+    # Raise instead of warning when the budget is exhausted or no tap fired.
+    cuda_graph_strict: bool = False
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -744,15 +756,27 @@ class _NonIntrusiveDumper:
     def _dump_value(
         self, module_name: str, value: Any, sub_name: str, *, is_root: bool
     ) -> None:
+        # `cuda_graph_dump.tap` returns True when it has taken the tensor
+        # through a graph-aware channel -- a recorded `copy_` into a
+        # graph-resident buffer, whose contents are written out after the
+        # replay that produced them. False means "nothing captured this", and
+        # the eager path below is exactly right. Inside a captured region a
+        # `self._dumper.dump(...)` here would either be traced away or write
+        # capture-time dummy values, which is the silent hole this guards.
         for key, item in self._convert_value(
             value, skip_forward_batch=(not is_root)
         ).items():
             effective_key = key or sub_name.rsplit(".", 1)[-1]
             if effective_key in self._core_fields:
+                if cuda_graph_dump.tap(effective_key, item):
+                    continue
                 self._dumper.dump(effective_key, item)
             elif self._mode == "all":
                 parts = [p for p in (module_name, sub_name, key) if p]
-                self._dumper.dump(self._NAME_PREFIX + ".".join(parts), item)
+                name = self._NAME_PREFIX + ".".join(parts)
+                if cuda_graph_dump.tap(name, item):
+                    continue
+                self._dumper.dump(name, item)
 
     @staticmethod
     def _convert_value(value, *, skip_forward_batch: bool = False) -> dict[str, Any]:
