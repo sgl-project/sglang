@@ -129,8 +129,8 @@ class PureSWARadixCache(RadixCache):
                 self.token_to_kv_pool_allocator.free(
                     kv_indices[old_prefix_len:free_end]
                 )
-            alive_start = max(swa_evicted_seqlen, old_prefix_len)
-            if swa_evicted_seqlen > 0 and alive_start < keys_len:
+            alive_start = max(swa_evicted_seqlen, free_end)
+            if alive_start < keys_len:
                 self.token_to_kv_pool_allocator.free(kv_indices[alive_start:keys_len])
 
         self.token_to_kv_pool_allocator.free(kv_indices[keys_len:])
