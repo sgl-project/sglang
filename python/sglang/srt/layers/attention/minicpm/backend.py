@@ -442,10 +442,12 @@ class MiniCPMSparseBackend(AttentionBackend):
         layer,
         forward_batch,
         is_prefill=True,
+        selector_query=None,
     ):
         if is_prefill:
             metadata = self.forward_metadata
             sparse_bs = metadata.sparse_bs_list
+            selection_query = query_states if selector_query is None else selector_query
             full_compressed_k1, full_compressed_k2 = allocate_and_compress_keys(
                 layer=layer,
                 forward_batch=forward_batch,
@@ -468,8 +470,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                     (full_compressed_k2, metadata.k2.cu_seqlens),
                 ]
             else:
-                query_states = batched_gather(
-                    query_states.reshape(-1, layer.tp_q_head_num, layer.head_dim),
+                selection_query = batched_gather(
+                    selection_query,
                     forward_batch.extend_seq_lens_cpu,
                     sparse_bs,
                 )
@@ -490,7 +492,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             ) = compressed
 
             ret = self.sparse_get_topk_impl(
-                query_states,
+                selection_query,
                 metadata.topk_cu_seqlens_q,
                 metadata.topk_cu_seqlens_k,
                 metadata.topk_max_seqlen_q,
@@ -499,9 +501,13 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens=compressed_cu_seqlens,
                 compressed_k2=compressed_k2,
                 compressed_cu_seqlens2=compressed_cu_seqlens2,
-                fused_kernel=self._get_fused_topk_kernel(
-                    len(sparse_bs),
-                    is_prefill=True,
+                fused_kernel=(
+                    self._get_fused_topk_kernel(
+                        len(sparse_bs),
+                        is_prefill=True,
+                    )
+                    if selector_query is None
+                    else None
                 ),
             )
             return ret
@@ -517,11 +523,13 @@ class MiniCPMSparseBackend(AttentionBackend):
             if not sparse_bs:
                 return None
 
+            selection_query = query_states if selector_query is None else selector_query
             cu_seqlens_q = metadata.base.cu_seqlens_q
             compressed_cu_seqlens = metadata.k1.cu_seqlens
             compressed_cu_seqlens2 = metadata.k2.cu_seqlens
             if len(sparse_bs) < forward_batch.batch_size:
                 query_states = query_states[sparse_bs]
+                selection_query = selection_query[sparse_bs]
                 compressed_k, compressed_cu_seqlens = _gather_compressed_keys(
                     compressed_k, metadata.k1, sparse_bs
                 )
@@ -531,7 +539,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 cu_seqlens_q = metadata.topk_cu_seqlens_q
 
             ret = self.sparse_get_topk_impl(
-                query_states,
+                selection_query,
                 cu_seqlens_q,
                 metadata.base.cu_seqlens_k,
                 1,
@@ -540,9 +548,13 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens=compressed_cu_seqlens,
                 compressed_k2=compressed_k2,
                 compressed_cu_seqlens2=compressed_cu_seqlens2,
-                fused_kernel=self._get_fused_topk_kernel(
-                    len(sparse_bs),
-                    is_prefill=False,
+                fused_kernel=(
+                    self._get_fused_topk_kernel(
+                        len(sparse_bs),
+                        is_prefill=False,
+                    )
+                    if selector_query is None
+                    else None
                 ),
             )
 
@@ -575,7 +587,11 @@ class MiniCPMSparseBackend(AttentionBackend):
                 batch_size, dtype=torch.int32, device=cu_seqlens_q.device
             )
 
-        if not self.minicpm_fuse_topk:
+        # Forecast selectors have KV-head layout rather than the normal
+        # grouped-query layout expected by the fused kernel.  Keep this path
+        # on the reference implementation until the fused kernel grows an
+        # explicit selector-query interface.
+        if not self.minicpm_fuse_topk or fused_kernel is None:
             topk_idx = compressed_attention(
                 query_layer,
                 compressed_k,
@@ -622,6 +638,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        forecast_query: Optional[torch.Tensor] = None,
     ):
         if layer.is_cross_attention:
             raise NotImplementedError(
@@ -669,6 +686,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 key_states=k,
                 layer=layer,
                 forward_batch=forward_batch,
+                selector_query=forecast_query,
             )
 
             sparse_page_table_sparse_bs = get_block_table(
@@ -758,6 +776,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        forecast_query: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if layer.is_cross_attention:
             raise NotImplementedError(
@@ -808,6 +827,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             layer=layer,
             forward_batch=forward_batch,
             is_prefill=False,
+            selector_query=forecast_query,
         )
         if topk_idx is not None:
             topk_page_table = page_table

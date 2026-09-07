@@ -15,6 +15,23 @@ _MIXER_TYPE_ALIASES = {
 }
 
 
+# MiniCPM4.1's base config does not contain sparse-attention settings.  These
+# are the deployment defaults used by the official SparDA training code; the
+# model hook applies them only when ``--enable-sparda`` is requested.
+MINICPM_SPARSE_CONFIG_DEFAULTS = {
+    "kernel_size": 32,
+    "kernel_stride": 16,
+    "init_blocks": 1,
+    "block_size": 64,
+    "window_size": 2048,
+    "topk": 64,
+    "dense_len": 8192,
+    "use_nope": False,
+    "use_q_future_for_topk": True,
+    "use_q_future_decode_only": False,
+}
+
+
 class MiniCPMHybridConfig(PretrainedConfig):
     """
     Configuration class for hybrid MiniCPM models.
@@ -192,3 +209,15 @@ class MiniCPMHybridConfig(PretrainedConfig):
     def lightning_layer_ids(self) -> list:
         """Get the indices of layers with lightning attention."""
         return [i for i, mt in enumerate(self.mixer_types) if mt == "lightning-attn"]
+
+
+class MiniCPMConfig(MiniCPMHybridConfig):
+    """Configuration for the non-SALA MiniCPM family."""
+
+    model_type = "minicpm"
+
+    def __init__(self, *args, **kwargs):
+        # Transformers 5 wraps inherited PretrainedConfig constructors when a
+        # new config subclass is registered.  An explicit delegating
+        # constructor keeps MiniCPMHybridConfig's fields intact.
+        MiniCPMHybridConfig.__init__(self, *args, **kwargs)
