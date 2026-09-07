@@ -515,6 +515,7 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
             and self.hash is not None
             and self.pad_value is not None
             and isinstance(self.feature, CudaIpcTensorTransportProxy)
+            and self.feature.supports_deferred_reconstruction
             and not isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
             and not any(
                 isinstance(value, CudaIpcTensorTransportProxy)

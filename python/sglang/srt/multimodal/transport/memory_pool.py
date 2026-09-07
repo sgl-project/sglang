@@ -331,35 +331,60 @@ class StreamOrderedMmFeaturePool:
     def copy_tensor(
         self, tensor: torch.Tensor
     ) -> tuple[Optional[PoolLease], Optional[torch.Tensor]]:
-        if not tensor.is_cuda:
-            raise ValueError(f"{self.transport_name} requires a CUDA tensor")
-        source = tensor.contiguous()
-        nbytes = source.numel() * source.element_size()
-        if nbytes == 0:
-            raise ValueError(f"{self.transport_name} cannot transport an empty tensor")
+        lease, destinations = self.copy_tensors([tensor])
+        return lease, destinations[0] if lease is not None else None
+
+    def copy_tensors(
+        self, tensors: list[torch.Tensor]
+    ) -> tuple[Optional[PoolLease], list[torch.Tensor]]:
+        """publish one request's tensors under a single ready/ack lease"""
+        sources = []
+        offsets = []
+        nbytes = 0
+        for tensor in tensors:
+            if not tensor.is_cuda:
+                raise ValueError(f"{self.transport_name} requires a CUDA tensor")
+            if tensor.numel() == 0:
+                raise ValueError(
+                    f"{self.transport_name} cannot transport an empty tensor"
+                )
+            source = tensor.contiguous().reshape(-1).view(torch.uint8)
+            # typed views must start at an address aligned for their dtype
+            nbytes = align_up(nbytes, tensor.element_size())
+            offsets.append(nbytes)
+            sources.append(source)
+            nbytes += source.numel()
+        if not sources:
+            return None, []
         with self._lock:
             lease = self._allocate_locked(nbytes)
         if lease is None:
-            return None, None
+            return None, []
 
         try:
             with torch.cuda.device(self.device_id):
-                destination = self.byte_tensor[lease.start : lease.start + lease.nbytes]
-                destination.copy_(
-                    source.view(torch.uint8).reshape(-1), non_blocking=True
-                )
+                destinations = [
+                    self.byte_tensor[
+                        lease.start + offset : lease.start + offset + source.numel()
+                    ]
+                    for source, offset in zip(sources, offsets, strict=True)
+                ]
+                for destination, source in zip(destinations, sources, strict=True):
+                    destination.copy_(source, non_blocking=True)
                 stream_write_value32(
                     self.device_id,
                     self.base_address + lease.ready_byte_offset,
                     lease.generation,
                     self.transport_name,
                 )
-        except Exception:
+        except BaseException:
+            # earlier copies may already be queued when a later tensor fails
+            torch.cuda.current_stream(self.device_id).synchronize()
             with self._lock:
                 self._release_locked(lease)
                 self._merge_ranges_locked()
             raise
-        return lease, destination
+        return lease, destinations
 
     def cancel_lease(
         self,

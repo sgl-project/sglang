@@ -933,6 +933,8 @@ class _CudaVmmPackedTransportOwner(CudaVmmTensorTransportProxy):
 class CudaVmmPackedTensorTransportProxy(CudaVmmTensorTransportProxy):
     """One typed view within a packed CUDA VMM transfer."""
 
+    supports_deferred_reconstruction = False
+
     def __init__(
         self,
         *,
