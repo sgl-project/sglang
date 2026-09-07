@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_kpool_write_plan,
     update_pooled_paged_mqa_metadata,
 )
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -21,6 +22,17 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
     from sglang.srt.layers.attention.dsa_backend import _DSA_IMPL_T, DSAMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+
+def _is_kpool_metadata_fusion_supported(
+    index_kpool: int, page_size: int, index_topk: int
+) -> bool:
+    return (
+        index_kpool > 1
+        and page_size == 64
+        and page_size % index_kpool == 0
+        and index_topk % index_kpool == 0
+    )
 
 
 @dataclass
@@ -302,3 +314,38 @@ class DeepseekSparseAttnBackendKPoolMixin:
             forward_mode=forward_mode,
             slots_per_page=slots_per_page,
         )
+
+    def _copy_kpool_metadata_from_sibling(
+        self, metadata: DSAMetadata, src_metadata: DSAMetadata
+    ) -> None:
+        """Copy KPool metadata derived from identical inputs from a sibling."""
+        if self.dsa_index_kpool <= 1 or not is_cuda():
+            return
+
+        if metadata.pooled_cache_seqlens_int32 is not None:
+            metadata.pooled_cache_seqlens_int32.copy_(
+                src_metadata.pooled_cache_seqlens_int32
+            )
+        if metadata.pooled_real_page_table is not None:
+            metadata.pooled_real_page_table.copy_(src_metadata.pooled_real_page_table)
+        if metadata.pooled_paged_mqa_schedule_metadata is not None:
+            metadata.pooled_paged_mqa_schedule_metadata.copy_(
+                src_metadata.pooled_paged_mqa_schedule_metadata
+            )
+
+        dst_plan = metadata.kpool_write_plan
+        src_plan = src_metadata.kpool_write_plan
+        if dst_plan is None:
+            return
+        dst_plan.req.copy_(src_plan.req)
+        dst_plan.write_start.copy_(src_plan.write_start)
+        dst_plan.tail_logical_start.copy_(src_plan.tail_logical_start)
+        dst_plan.write_loc.copy_(src_plan.write_loc)
+        if dst_plan.pool_seqlens_per_q is not None:
+            dst_plan.pool_seqlens_per_q.copy_(src_plan.pool_seqlens_per_q)
+        if dst_plan.seqlens_per_q is not None:
+            dst_plan.seqlens_per_q.copy_(src_plan.seqlens_per_q)
+        if dst_plan.pool_schedule_metadata is not None:
+            dst_plan.pool_schedule_metadata.copy_(src_plan.pool_schedule_metadata)
+        if dst_plan.effective_n_per_batch is not None:
+            dst_plan.effective_n_per_batch.copy_(src_plan.effective_n_per_batch)
