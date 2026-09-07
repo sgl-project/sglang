@@ -280,9 +280,9 @@ class CutlassMxfp4A8FusedMoeRunner:
         device = a.device
 
         if apply_router_weight_on_input:
-            assert (
-                topk == 1
-            ), "apply_router_weight_on_input is only implemented for topk=1"
+            assert topk == 1, (
+                "apply_router_weight_on_input is only implemented for topk=1"
+            )
 
         # The AOT prepare/apply path does not materialize valid c_map entries for
         # the EP sentinel (-1 -> num_local_experts). Keep the legacy Triton path

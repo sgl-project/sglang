@@ -807,9 +807,9 @@ def _build_grouped_act_block_scale_capture_safe(
     issue for odd per-expert token counts and makes the whole builder
     CUDA-graph-recordable.
     """
-    assert torch.is_tensor(
-        expert_offsets
-    ), "capture-safe path requires tensor expert_offsets"
+    assert torch.is_tensor(expert_offsets), (
+        "capture-safe path requires tensor expert_offsets"
+    )
     device = scale.device
     nblk = scale.shape[1]
     A = MXFP4_PACKED_SCALES
