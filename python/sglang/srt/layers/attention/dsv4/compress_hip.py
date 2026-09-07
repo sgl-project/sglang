@@ -118,6 +118,11 @@ class CompressorHip(_CompressorBase):
             assert isinstance(backend, DeepseekV4HipRadixBackend)
         token_to_kv_pool = backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        # C128 state is always request-addressed; C4 state is too under the
+        # unified-KV request ring.
+        req_ring_state = self.ratio == 128 or (
+            self.ratio == 4 and token_to_kv_pool._unified_kv
+        )
 
         state_pool = self._get_state_pool(backend)
         prefix_lens = forward_batch.extend_prefix_lens_cpu
@@ -144,9 +149,7 @@ class CompressorHip(_CompressorBase):
             pre_state_indices = self.compute_state_len_indices(
                 seq_len=prefix_lens[i], ratio=self.ratio
             ).to(device)
-            if self.ratio == 128 or (
-                self.ratio == 4 and token_to_kv_pool._unified_kv is True
-            ):
+            if req_ring_state:
                 state_loc = state_pool.translate_from_req_position_to_state_loc(
                     req_pool_indices[i], pre_state_indices
                 )
@@ -168,9 +171,7 @@ class CompressorHip(_CompressorBase):
             post_state_len = post_state_indices.size(0)
 
             assert post_state_len <= valid_kv_len
-            if self.ratio == 128 or (
-                self.ratio == 4 and token_to_kv_pool._unified_kv is True
-            ):
+            if req_ring_state:
                 post_state_loc = state_pool.translate_from_req_position_to_state_loc(
                     req_pool_indices[i], post_state_indices
                 )
@@ -264,6 +265,11 @@ class CompressorHip(_CompressorBase):
         state_pool = self._get_state_pool(attn_backend)
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        # C128 state is always request-addressed; C4 state is too under the
+        # unified-KV request ring.
+        req_ring_state = self.ratio == 128 or (
+            self.ratio == 4 and token_to_kv_pool._unified_kv
+        )
         req_pool_indices = forward_batch.req_pool_indices
         req_to_token = attn_backend.req_to_token_pool.req_to_token
         seq_lens = forward_batch.seq_lens
@@ -275,9 +281,7 @@ class CompressorHip(_CompressorBase):
             seq_lens = seq_lens_2d.view(-1)
             req_pool_indices = req_pool_indices.repeat_interleave(draft_tokens)
 
-        if self.ratio == 128 or (
-            self.ratio == 4 and token_to_kv_pool._unified_kv is True
-        ):
+        if req_ring_state:
             state_locs = state_pool.translate_from_req_position_to_state_loc(
                 req_pool_indices, seq_lens - 1
             )
@@ -292,9 +296,7 @@ class CompressorHip(_CompressorBase):
             -compress_bulk_len, 0, device=seq_lens.device
         )
         compress_indices.clamp_(min=-1)
-        if self.ratio == 128 or (
-            self.ratio == 4 and token_to_kv_pool._unified_kv is True
-        ):
+        if req_ring_state:
             compress_indices_state = (
                 state_pool.translate_from_req_position_to_state_loc(
                     req_pool_indices[:, None], compress_indices
