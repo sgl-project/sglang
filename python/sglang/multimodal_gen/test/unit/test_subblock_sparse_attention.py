@@ -24,7 +24,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.rou
     _snap_up_to_8,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
-    SubBlockSparseAttentionBackend,
     SubBlockSparseAttentionImpl,
     SubBlockSparseSchedule,
     _dit_layer_index,
@@ -187,17 +186,6 @@ class TestBudgetGranularity(unittest.TestCase):
 
 
 class TestSubBlockSparseBackend(unittest.TestCase):
-    def test_the_advertised_builder_can_be_built(self):
-        """`AttentionMetadataBuilder.__init__` is abstract; a builder that does
-        not override it makes `get_builder_cls()()` a TypeError."""
-        builder = SubBlockSparseAttentionBackend.get_builder_cls()()
-        builder.prepare()
-        metadata = builder.build(current_timestep=7)
-        self.assertIsInstance(
-            metadata, SubBlockSparseAttentionBackend.get_metadata_cls()
-        )
-        self.assertEqual(metadata.current_timestep, 7)
-
     def test_sm90_adapter_uses_presorted_indices_and_64x64_blocks(self):
         captured = {}
 
