@@ -83,6 +83,10 @@ class Schedule:
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    enable_hicache_loadback_reorder: A[
+        bool,
+        "Prefer prefill requests that do not need HiCache host load-back before requests that do, and delay load-back-only prefill while decode work is runnable. This can isolate fast TTFT when L2 H2D load-back is slow. Currently applies only to unified, non-LoRA, non-priority, non-storage HiCache scheduling.",
+    ] = False
     schedule_policy: A[
         str,
         Arg(

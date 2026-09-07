@@ -51,6 +51,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_dynamic_chunking",
     "max_prefill_tokens",
     "prefill_max_requests",
+    "enable_hicache_loadback_reorder",
     "schedule_policy",
     "enable_priority_scheduling",
     "disable_priority_preemption",
