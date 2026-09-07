@@ -27,8 +27,9 @@ GITHUB_API = "https://api.github.com"
 UTILIZATION_WORKFLOW = "runner-utilization.yml"
 
 # Primary pool labels only; aliases (1-gpu-runner, 8-gpu-h200-deepep, ...) are
-# excluded so every runner is counted under exactly one label.
-CUDA_LABEL_RE = re.compile(r"^\d+-gpu-(h100|h200|h20|5090|b200|b300|gb200|gb300|a10)$")
+# excluded so every runner is counted under exactly one label. a10 is left out
+# as well: it serves no per-commit test, so its transitions are noise.
+CUDA_LABEL_RE = re.compile(r"^\d+-gpu-(h100|h200|h20|5090|b200|b300|gb200|gb300)$")
 
 # Workflows whose jobs run on the CUDA pools; used for queue-digest.
 CUDA_WORKFLOW_FILES = [
@@ -40,7 +41,11 @@ CUDA_WORKFLOW_FILES = [
 
 FAILED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
 # Aggregator jobs fail whenever any other job fails; listing them is noise.
-AGGREGATOR_JOB_RE = re.compile(r"^(check-all-jobs|pr-test-finish)$")
+# Jobs from a called workflow arrive prefixed ("call-pr-test-extra / <name>"),
+# so the aggregator name is matched on the last segment.
+AGGREGATOR_JOB_RE = re.compile(
+    r"^(?:.+ / )?(check-all-jobs|pr-test-finish|pr-test-extra-finish)$"
+)
 MAX_LISTED_JOBS = 15
 
 

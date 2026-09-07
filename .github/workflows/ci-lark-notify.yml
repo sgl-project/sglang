@@ -9,7 +9,7 @@ on:
     branches: [main]
   schedule:
     - cron: '*/15 * * * *'   # runner-health
-    - cron: '30 */8 * * *'   # queue-digest
+    - cron: '30 16 * * *'    # queue-digest
   workflow_dispatch:
     inputs:
       task:
@@ -94,7 +94,8 @@ jobs:
           LARK_WEBHOOK: ${{ secrets.LARK_WEBHOOK }}
         run: |
           python scripts/ci_monitor/lark_notify.py $DRY_RUN_FLAG runner-health \
-            --state-file runner-health-state.json
+            --state-file runner-health-state.json \
+            --remind-hours 6
       - name: Save runner-health state
         if: ${{ !inputs.dry_run }}
         uses: actions/cache/save@v4
@@ -105,7 +106,7 @@ jobs:
   queue-digest:
     if: >-
       github.repository == 'sgl-project/sglang' && (
-        (github.event_name == 'schedule' && github.event.schedule == '30 */8 * * *') ||
+        (github.event_name == 'schedule' && github.event.schedule == '30 16 * * *') ||
         (github.event_name == 'workflow_dispatch' && inputs.task == 'queue-digest')
       )
     runs-on: ubuntu-latest
@@ -119,8 +120,10 @@ jobs:
           python-version: '3.12'
       - name: Post queue digest
         env:
-          # PAT: an 8h window is ~400-500 API calls, too close to GITHUB_TOKEN's 1000/h
+          # PAT: an 8h window is ~400-500 API calls, too close to GITHUB_TOKEN's 1000/h.
+          # Do not widen the window: 24h exhausts even a PAT's 5000/h.
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           LARK_WEBHOOK: ${{ secrets.LARK_WEBHOOK }}
         run: |
-          python scripts/ci_monitor/lark_notify.py $DRY_RUN_FLAG queue-digest --hours 8 --only-if-slow
+          python scripts/ci_monitor/lark_notify.py $DRY_RUN_FLAG queue-digest \
+            --hours 8 --slow-minutes 120 --only-if-slow
