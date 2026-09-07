@@ -34,7 +34,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=96, stage="extra-b", runner_config="4-gpu-b200")
 
 BASE_MODEL = "lmsys/gpt-oss-20b-bf16"
 LORA_HF_REPO = "yushengsu/lora-diff-gpt-oss-20b"
@@ -67,7 +67,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
 
 
 class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
-
     def test_lora_gpt_oss_20b_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,

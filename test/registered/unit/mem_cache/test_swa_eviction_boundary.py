@@ -28,7 +28,7 @@ from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,6 @@ def _make_batch(tree, allocator, pool):
 
 
 class TestSWAEvictionBoundary(unittest.TestCase):
-
     # -- Eviction formula: page_size > window --
 
     def test_formula_page_gt_window_sweep(self):

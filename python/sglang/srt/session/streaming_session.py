@@ -53,14 +53,6 @@ class SessionSlot:
     # releases only what it took (may share the node with another req).
     skip_lock_node_ids: dict = field(default_factory=dict)
 
-    # Mamba states
-    mamba_pool_idx: Any = None
-    mamba_ping_pong_track_buffer: Any = None
-    mamba_next_track_idx: Any = None
-    mamba_last_track_idx: Any = None
-    mamba_last_track_seqlen: Any = None
-    mamba_branching_seqlen: Any = None
-
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
         kv = req.detach_kv()
@@ -74,21 +66,7 @@ class SessionSlot:
             # Later turns run on the slot's record (see restore_to_req).
             assert kv is self.kv
 
-        self.mamba_pool_idx = req.mamba_pool_idx
-        self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
-        self.mamba_next_track_idx = req.mamba_next_track_idx
-        self.mamba_last_track_idx = req.mamba_last_track_idx
-        self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
-        self.mamba_branching_seqlen = req.mamba_branching_seqlen
-
-        # The mamba state moved to the slot too; clear the req's references so a
-        # later alloc/retract path cannot mistake slot-owned state for its own.
-        req.mamba_pool_idx = None
-        req.mamba_ping_pong_track_buffer = None
-        req.mamba_next_track_idx = None
-        req.mamba_last_track_idx = None
-        req.mamba_last_track_seqlen = None
-        req.mamba_branching_seqlen = None
+        req.swa_branching_seqlen = None
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
@@ -96,15 +74,8 @@ class SessionSlot:
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
         req.skip_lock_node_ids = self.skip_lock_node_ids
 
-        req.mamba_pool_idx = self.mamba_pool_idx
-        req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
-        req.mamba_next_track_idx = self.mamba_next_track_idx
-        req.mamba_last_track_idx = self.mamba_last_track_idx
-        req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
-        req.mamba_branching_seqlen = self.mamba_branching_seqlen
-
-        # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
-        # from the slot. During chunked prefill, a request may be rejected by
+        # NOTE: the slot keeps sharing the record it just handed out. During
+        # chunked prefill, a request may be rejected by
         # the scheduler (e.g. budget exhausted) and retried in the next cycle.
         # Each retry calls match_prefix -> restore_to_req again, so the slot
         # must remain intact for idempotent restoration.
@@ -176,7 +147,7 @@ class StreamingSession(BasePrefixCache):
         return session_id in self.slots
 
     def any_holding_kv(self) -> bool:
-        return any(s.kv.is_held for s in self.slots.values())
+        return any(s.kv.holds_kv for s in self.slots.values())
 
     # -- Try-handle entries for composition (see class docstring) --
 
@@ -204,7 +175,7 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return None
         slot = self.slots.get(req.session.session_id)
-        if slot is None or not slot.kv.is_held:
+        if slot is None or not slot.kv.holds_kv:
             return None
         if req.to_finish is not None:
             req.session.abort_req()
@@ -263,8 +234,10 @@ class StreamingSession(BasePrefixCache):
             f"{slot.kv.cache_protected_len=}"
         )
 
-        # Floor-align prefix_len to page boundary (NPU workaround).
-        if is_npu() and self.page_size > 1:
+        # NPU requires page-aligned KV reuse; a rewind below the SWA eviction
+        # cursor must also land on a page boundary -- free_kv_row_segments
+        # splits dead/alive at the cursor, and a mid-page cut frees a page twice.
+        if self.page_size > 1 and (is_npu() or req.kv.swa_evicted_seqlen > prefix_len):
             prefix_len = (prefix_len // self.page_size) * self.page_size
             req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
 
@@ -310,25 +283,17 @@ class StreamingSession(BasePrefixCache):
             kv = req.detach_kv()
             if slot is None:
                 # First-request mid-processing abort: create ephemeral
-                # slot from req state so release_session handles cleanup.
-                # Include last_node from the req so
-                # release_session calls dec_lock_ref on the tree lock.
-                # Also carry the mamba refs over so _free_slot_mamba can
-                # return the (possibly extra_buffer ping-pong) slots to
-                # the mamba pool; otherwise the abort orphans them.
+                # slot from req state so release_session handles cleanup;
+                # the detached record carries the mamba refs for
+                # _free_slot_mamba, and last_node lets release_session
+                # dec_lock_ref the tree lock.
                 slot = SessionSlot(
                     kv=kv,
                     last_node=req.last_node,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
                     skip_lock_node_ids=req.skip_lock_node_ids,
-                    mamba_pool_idx=req.mamba_pool_idx,
-                    mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
                 )
                 self.slots[session_id] = slot
-                # Slot now owns the mamba state — drop the req's refs so
-                # the abort fall-through doesn't double-free.
-                req.mamba_pool_idx = None
-                req.mamba_ping_pong_track_buffer = None
             else:
                 assert kv is slot.kv
             self.release_session(session_id)
@@ -424,7 +389,7 @@ class StreamingSession(BasePrefixCache):
         protected_len = slot.kv.cache_protected_len
         lock_node = slot.last_node
         tokens_freed = (
-            max(0, slot.kv.kv_allocated_len - protected_len) if slot.kv.is_held else 0
+            max(0, slot.kv.kv_allocated_len - protected_len) if slot.kv.holds_kv else 0
         )
         logger.info(
             "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
@@ -439,14 +404,8 @@ class StreamingSession(BasePrefixCache):
                 ),
             )
 
-        if slot.kv.is_held:
-            start = protected_len
-            end = slot.kv.kv_allocated_len
-            if start < end:
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    slot.kv.req_pool_idx, start:end
-                ]
-                self.token_to_kv_pool_allocator.free(kv_indices)
+        if slot.kv.holds_kv:
+            self.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
             self.req_to_token_pool.free(slot)
 
         self._free_slot_mamba(slot)
@@ -467,7 +426,7 @@ class StreamingSession(BasePrefixCache):
                 active_pool_idxs is not None
                 and slot.kv.req_pool_idx in active_pool_idxs
             )
-            if slot.kv.is_held and not in_batch:
+            if slot.kv.holds_kv and not in_batch:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
                 total += allocated - slot.kv.cache_protected_len
         return total
@@ -484,7 +443,7 @@ class StreamingSession(BasePrefixCache):
                 active_pool_idxs is not None
                 and slot.kv.req_pool_idx in active_pool_idxs
             )
-            if slot.kv.is_held and not in_batch:
+            if slot.kv.holds_kv and not in_batch:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
                 total += allocated - max(
                     slot.kv.cache_protected_len, slot.kv.swa_evicted_seqlen
@@ -498,7 +457,7 @@ class StreamingSession(BasePrefixCache):
             in_batch = (
                 active_pool_idxs is not None and s.kv.req_pool_idx in active_pool_idxs
             )
-            return s.kv.is_held and not in_batch
+            return s.kv.holds_kv and not in_batch
 
         return sum(_owned(s) for s in self.slots.values())
 
@@ -517,10 +476,10 @@ class StreamingSession(BasePrefixCache):
             )
             if in_batch:
                 continue
-            if slot.mamba_pool_idx is not None:
-                total += slot.mamba_pool_idx.numel()
-            if slot.mamba_ping_pong_track_buffer is not None:
-                total += slot.mamba_ping_pong_track_buffer.numel()
+            if slot.kv.holds_mamba:
+                total += slot.kv.mamba_pool_idx.numel()
+            if slot.kv.mamba_ping_pong_track_buffer is not None:
+                total += slot.kv.mamba_ping_pong_track_buffer.numel()
         return total
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
@@ -528,12 +487,12 @@ class StreamingSession(BasePrefixCache):
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is None:
             return
-        if slot.mamba_pool_idx is not None:
-            mamba_allocator.free(slot.mamba_pool_idx.unsqueeze(0))
-            slot.mamba_pool_idx = None
-        if slot.mamba_ping_pong_track_buffer is not None:
-            mamba_allocator.free(slot.mamba_ping_pong_track_buffer)
-            slot.mamba_ping_pong_track_buffer = None
+        if slot.kv.holds_mamba:
+            mamba_allocator.free(slot.kv.mamba_pool_idx.unsqueeze(0))
+            slot.kv.mamba_pool_idx = None
+        if slot.kv.mamba_ping_pong_track_buffer is not None:
+            mamba_allocator.free(slot.kv.mamba_ping_pong_track_buffer)
+            slot.kv.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --
 
@@ -543,7 +502,7 @@ class StreamingSession(BasePrefixCache):
         decoding pushes allocated above committed, or when retract retry's
         logit-reserve pulls prefix_len below committed.
         """
-        self._free_kv_aligned(kv.req_pool_idx, prefix_len, kv.kv_allocated_len)
+        self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)
         kv.kv_allocated_len = prefix_len
         kv.kv_committed_len = min(kv.kv_committed_len, prefix_len)
         kv.swa_evicted_seqlen = min(kv.swa_evicted_seqlen, prefix_len)
@@ -555,14 +514,18 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.kv.req_pool_idx, target, req.kv.kv_allocated_len)
+        if self.page_size > 1 and req.kv.swa_evicted_seqlen > target:
+            # Same hazard as the match-path rewind: the cursor must stay
+            # page-aligned; the partial page is re-prefilled next turn.
+            target = (target // self.page_size) * self.page_size
+        self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
 
-    def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
-        """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
+    def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
+        """Free the record's kv row over [ceil_align(target), end). Page-aligned
         because PagedTokenToKVPoolAllocator.free returns whole pages
         (free_index // page_size), so partial-page free would corrupt pages
         still holding committed tokens. The range [target, ceil_align(target))
@@ -573,9 +536,7 @@ class StreamingSession(BasePrefixCache):
         start = target
         if self.page_size > 1:
             start = ceil_align(start, self.page_size)
-        if start < end:
-            tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
-            self.token_to_kv_pool_allocator.free(tail)
+        self.free_kv_row(kv, [(start, end)])
 
     # -- Pass-through methods --
 
@@ -605,6 +566,17 @@ class StreamingSession(BasePrefixCache):
 
     def init_load_back(self, params: InitLoadBackParams):
         return self.inner.init_load_back(params)
+
+    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
+        return self.inner.pop_prefetch_loaded_span(req_id)
+
+    def finish_storage_prefetch_admission(
+        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+    ) -> None:
+        self.inner.finish_storage_prefetch_admission(req_id, fulfilled_tokens, reason)
+
+    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
+        self.inner.discard_storage_prefetch_accounting(req_id)
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()

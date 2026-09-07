@@ -38,6 +38,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
@@ -169,7 +170,7 @@ class _FakeReq:
         self.rid = rid
         self.prefix_indices = torch.empty(0, dtype=torch.long)
         self.fill_ids = [0]
-        self.kv = SimpleNamespace(req_pool_idx=req_pool_idx)
+        self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         # Mirrors Req's chunk-finality contract read by
         # MlxTpModelWorker._chunk_needs_logits: extend_range=None means
         # "not truncated" (final chunk / plain prefill).
@@ -225,14 +226,18 @@ class TestMlxExtendRouting(CustomTestCase):
             MlxModelRunnerStub,
         )
         from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+        from sglang.srt.runtime_context import get_context
 
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
-        worker.server_args = SimpleNamespace(is_startup_weight_load_overlap=True)
 
-        with self.assertRaisesRegex(ValueError, "CUDA only"):
-            MlxModelRunnerStub.validate_startup_weight_load_mode(worker.server_args)
-        with self.assertRaisesRegex(ValueError, "CUDA only"):
-            worker._init_model_runner()
+        # The guard reads `get_model().is_startup_weight_load_overlap`, which is
+        # derived from `startup_weight_load_mode`. Stating it on a `server_args`
+        # of the worker's own no longer reaches it.
+        with get_context().override_server_args(startup_weight_load_mode="overlap"):
+            with self.assertRaisesRegex(ValueError, "CUDA only"):
+                MlxModelRunnerStub.validate_startup_weight_load_mode()
+            with self.assertRaisesRegex(ValueError, "CUDA only"):
+                worker._init_model_runner()
 
     # ---------- the shared decision helper ----------
     # The helper takes no seq_len: length cannot distinguish a 1-token

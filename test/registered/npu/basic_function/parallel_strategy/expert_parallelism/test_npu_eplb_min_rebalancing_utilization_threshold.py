@@ -113,7 +113,7 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["score"],
             self.accuracy,
-            f'Accuracy of {self.model} is {str(metrics["score"])}, is lower than {self.accuracy}',
+            f"Accuracy of {self.model} is {str(metrics['score'])}, is lower than {self.accuracy}",
         )
 
         """

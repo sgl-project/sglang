@@ -20,7 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _mm_rust_utils import load_core  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 CORE = load_core()
 FETCH = CORE and CORE.common.fetch_bytes
@@ -28,7 +28,7 @@ FETCH = CORE and CORE.common.fetch_bytes
 
 @unittest.skipUnless(FETCH, "sglang-mm fetch binding not built")
 class TestRustMediaSourceLoading(CustomTestCase):
-    DATA = b"native-mm-source"
+    DATA = b"rust-mm-source"
 
     def test_inline_sources(self):
         encoded = base64.b64encode(self.DATA).decode()

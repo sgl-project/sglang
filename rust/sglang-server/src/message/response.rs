@@ -118,8 +118,18 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Columnar scalar header for a whole decode batch. All numeric fields are
-/// `#[serde(default)]`; the hot path (no extras) emits just the first four.
+/// Columnar scalar header for a whole decode batch. The first four fields are
+/// required; every field after `tok_lens` defaults empty, so the hot path emits
+/// a four-element header. Field order is the wire ABI and must match
+/// `RustTokenizerManager.push_generation`'s `header_cols` in
+/// `python/sglang/srt/rust_server/server.py`.
+///
+/// Field names follow `direction_family_shape`:
+/// - direction: `out` = decode output, `in` = prefill input;
+/// - family: `lp` = token logprobs, `top` = top-k logprobs, `tokids_lp` =
+///   requested-token logprobs, and `hidden` = hidden states;
+/// - shape: `lens` counts elements per request, `reqlens` counts positions or
+///   rows per request, and `poslens` counts elements per position or row.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BatchHeader {
     /// Request ids, as the same strings Python holds (`Req.rid`, uuid hex) —
@@ -143,13 +153,13 @@ pub struct BatchHeader {
     #[serde(default)]
     pub in_top_poslens: Vec<u32>,
     #[serde(default)]
-    pub out_tid_reqlens: Vec<u32>,
+    pub out_tokids_lp_reqlens: Vec<u32>,
     #[serde(default)]
-    pub out_tid_poslens: Vec<u32>,
+    pub out_tokids_lp_poslens: Vec<u32>,
     #[serde(default)]
-    pub in_tid_reqlens: Vec<u32>,
+    pub in_tokids_lp_reqlens: Vec<u32>,
     #[serde(default)]
-    pub in_tid_poslens: Vec<u32>,
+    pub in_tokids_lp_poslens: Vec<u32>,
     #[serde(default)]
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
@@ -262,8 +272,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || !per_req_ok(&h.in_lp_lens)
         || !per_req_ok(&h.out_top_reqlens)
         || !per_req_ok(&h.in_top_reqlens)
-        || !per_req_ok(&h.out_tid_reqlens)
-        || !per_req_ok(&h.in_tid_reqlens)
+        || !per_req_ok(&h.out_tokids_lp_reqlens)
+        || !per_req_ok(&h.in_tokids_lp_reqlens)
         || !per_req_ok(&h.hidden_reqlens)
     {
         reject!()
@@ -274,8 +284,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // surplus left positions unread and delivered a truncated row with a 200.
     if sum(&h.out_top_reqlens) != h.out_top_poslens.len()
         || sum(&h.in_top_reqlens) != h.in_top_poslens.len()
-        || sum(&h.out_tid_reqlens) != h.out_tid_poslens.len()
-        || sum(&h.in_tid_reqlens) != h.in_tid_poslens.len()
+        || sum(&h.out_tokids_lp_reqlens) != h.out_tokids_lp_poslens.len()
+        || sum(&h.in_tokids_lp_reqlens) != h.in_tokids_lp_poslens.len()
         || sum(&h.hidden_reqlens) != h.hidden_poslens.len()
     {
         reject!()
@@ -295,8 +305,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     let n_ilp = sum(&h.in_lp_lens);
     let n_ot = sum(&h.out_top_poslens);
     let n_it = sum(&h.in_top_poslens);
-    let n_od = sum(&h.out_tid_poslens);
-    let n_id = sum(&h.in_tid_poslens);
+    let n_od = sum(&h.out_tokids_lp_poslens);
+    let n_id = sum(&h.in_tokids_lp_poslens);
     let n_h = sum(&h.hidden_poslens);
     let mut c_ids = col(n_ids);
     let mut c_olp_v = col(n_olp);
@@ -331,8 +341,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         && h.in_lp_lens.is_empty()
         && h.out_top_reqlens.is_empty()
         && h.in_top_reqlens.is_empty()
-        && h.out_tid_reqlens.is_empty()
-        && h.in_tid_reqlens.is_empty()
+        && h.out_tokids_lp_reqlens.is_empty()
+        && h.in_tokids_lp_reqlens.is_empty()
         && h.hidden_reqlens.is_empty());
 
     // Position cursors into the header's per-request `poslens` (ragged + hidden).
@@ -378,17 +388,17 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 data,
                 &mut c_od_v,
                 &mut c_od_i,
-                &h.out_tid_poslens,
+                &h.out_tokids_lp_poslens,
                 &mut p_od,
-                lens_i(&h.out_tid_reqlens, i),
+                lens_i(&h.out_tokids_lp_reqlens, i),
             )?;
             let (in_tid_val, in_tid_idx, in_tid_lens) = take_ragged(
                 data,
                 &mut c_id_v,
                 &mut c_id_i,
-                &h.in_tid_poslens,
+                &h.in_tokids_lp_poslens,
                 &mut p_id,
-                lens_i(&h.in_tid_reqlens, i),
+                lens_i(&h.in_tokids_lp_reqlens, i),
             )?;
             let (hidden_val, hidden_lens) = take_hidden(
                 data,
@@ -778,10 +788,10 @@ mod tests {
             arr_u(&[]),     // out_top_poslens
             arr_u(&[0, 0]), // in_top_reqlens
             arr_u(&[]),     // in_top_poslens
-            arr_u(&[0, 0]), // out_tid_reqlens
-            arr_u(&[]),     // out_tid_poslens
-            arr_u(&[0, 0]), // in_tid_reqlens
-            arr_u(&[]),     // in_tid_poslens
+            arr_u(&[0, 0]), // out_tokids_lp_reqlens
+            arr_u(&[]),     // out_tokids_lp_poslens
+            arr_u(&[0, 0]), // in_tokids_lp_reqlens
+            arr_u(&[]),     // in_tokids_lp_poslens
             arr_u(&[2, 0]), // hidden_reqlens — 2 rows claimed
             arr_u(&[3]),    // hidden_poslens — only 1 supplied
         ]);
@@ -901,7 +911,8 @@ mod tests {
         let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
         // header: rids, finish, prompt, tok_lens, out_lp_lens, in_lp_lens,
-        //   out_top_reqlens, out_top_poslens, in_top_*, out_tid_*, in_tid_*,
+        //   out_top_reqlens, out_top_poslens, in_top_*, out_tokids_lp_*,
+        //   in_tokids_lp_*,
         //   hidden_reqlens, hidden_poslens
         let header_arr = Value::Array(vec![
             Value::Array(vec![Value::from("1"), Value::from("2")]), // rids
@@ -914,10 +925,10 @@ mod tests {
             arr_u(&[2]),    // out_top_poslens (that pos: k=2)
             arr_u(&[0, 0]), // in_top_reqlens
             arr_u(&[]),     // in_top_poslens
-            arr_u(&[0, 0]), // out_tid_reqlens
-            arr_u(&[]),     // out_tid_poslens
-            arr_u(&[0, 0]), // in_tid_reqlens
-            arr_u(&[]),     // in_tid_poslens
+            arr_u(&[0, 0]), // out_tokids_lp_reqlens
+            arr_u(&[]),     // out_tokids_lp_poslens
+            arr_u(&[0, 0]), // in_tokids_lp_reqlens
+            arr_u(&[]),     // in_tokids_lp_poslens
             arr_u(&[1, 0]), // hidden_reqlens (req0: 1 row)
             arr_u(&[3]),    // hidden_poslens (dim 3)
         ]);
@@ -986,10 +997,10 @@ mod tests {
                 arr_u(&[]),                                             // out_top_poslens
                 reqlens.clone(),                                        // in_top_reqlens
                 arr_u(&[]),                                             // in_top_poslens
-                reqlens.clone(),                                        // out_tid_reqlens
-                arr_u(&[]),                                             // out_tid_poslens
-                reqlens.clone(),                                        // in_tid_reqlens
-                arr_u(&[]),                                             // in_tid_poslens
+                reqlens.clone(),                                        // out_tokids_lp_reqlens
+                arr_u(&[]),                                             // out_tokids_lp_poslens
+                reqlens.clone(),                                        // in_tokids_lp_reqlens
+                arr_u(&[]),                                             // in_tokids_lp_poslens
                 reqlens,                                                // hidden_reqlens
                 arr_u(&[]),                                             // hidden_poslens
             ]);
@@ -1045,9 +1056,9 @@ mod tests {
     /// All SEVEN extras families in one frame, each with a distinct length AND
     /// distinct values. The existing extras test exercises only `out_lp` /
     /// `out_top` / `hidden`, so transposing a header pair — `in_top_*` with
-    /// `out_tid_*`, say — leaves every assertion passing while the client receives
-    /// another request's logprobs under the wrong key. Lengths differ per family
-    /// (2/1/2/1/2/1/3 elements) so a swap misaligns the cursors too.
+    /// `out_tokids_lp_*`, say, leaves every assertion passing while the client
+    /// receives another request's logprobs under the wrong key. Lengths differ per
+    /// family (2/1/2/1/2/1/3 elements) so a swap misaligns the cursors too.
     #[test]
     fn decodes_all_extras_families_without_transposition() {
         use rmpv::Value;
@@ -1066,10 +1077,10 @@ mod tests {
             arr_u(&[2]),                          // out_top_poslens  …k=2)
             arr_u(&[1]),                          // in_top_reqlens   (1 position…
             arr_u(&[1]),                          // in_top_poslens   …k=1)
-            arr_u(&[1]),                          // out_tid_reqlens  (1 position…
-            arr_u(&[2]),                          // out_tid_poslens  …2 ids)
-            arr_u(&[1]),                          // in_tid_reqlens   (1 position…
-            arr_u(&[1]),                          // in_tid_poslens   …1 id)
+            arr_u(&[1]),                          // out_tokids_lp_reqlens (1 position...
+            arr_u(&[2]),                          // out_tokids_lp_poslens ...2 ids)
+            arr_u(&[1]),                          // in_tokids_lp_reqlens  (1 position...
+            arr_u(&[1]),                          // in_tokids_lp_poslens  ...1 id)
             arr_u(&[1]),                          // hidden_reqlens   (1 row…
             arr_u(&[3]),                          // hidden_poslens   …dim 3)
         ]);

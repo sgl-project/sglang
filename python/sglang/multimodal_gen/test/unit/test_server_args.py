@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.helios import (
+    HeliosDistilledConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
@@ -188,7 +191,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             },
         )
 
-    def test_supplemental_weight_file_remains_a_component_path(self):
+    def test_any_explicit_component_weight_file_keeps_base_config(self):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
@@ -198,11 +201,11 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             }
         )
 
+        self.assertEqual(args.component_paths, {})
         self.assertEqual(
-            args.component_paths,
+            args.component_weights_paths,
             {"conditioning_projection": "owner/repo/projection.safetensors"},
         )
-        self.assertEqual(args.component_weights_paths, {})
 
     def test_component_attention_backends_are_normalized(self):
         args = self._from_dict_without_model_resolution(
@@ -216,6 +219,21 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args.component_attention_backends,
             {"text_encoder": "torch_sdpa", "transformer": "fa"},
         )
+        self.assertEqual(
+            args._requested_component_attention_backends,
+            args.component_attention_backends,
+        )
+
+    def test_pipeline_attention_default_is_not_an_explicit_override(self):
+        args = _from_dict_without_model_resolution(
+            {"model_path": "/data/my-model"},
+            pipeline_config=LTX2PipelineConfig(),
+        )
+
+        self.assertEqual(
+            args.component_attention_backends, {"text_encoder": "torch_sdpa"}
+        )
+        self.assertFalse(args.has_requested_component_attention_backends())
 
     def test_component_attention_backend_lookup(self):
         args = self._from_dict_without_model_resolution(
@@ -855,7 +873,6 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
-
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
@@ -1581,6 +1598,13 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
+        self.assertEqual(sana_wm_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(sana_wm_deployment.keep_resident_components, ("dit", "vae"))
+
+        helios_deployment = HeliosDistilledConfig().get_model_deployment_config()
+        self.assertEqual(helios_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(helios_deployment.keep_resident_components, ("dit", "vae"))
+        self.assertEqual(helios_deployment.dit_layerwise_offload_modes, ("memory",))
 
         fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
         self.assertEqual(fast_hunyuan_deployment.keep_resident_min_available_gb, 60)

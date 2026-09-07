@@ -34,9 +34,9 @@ class PureSWARadixCache(RadixCache):
         self.sliding_window_size = params.sliding_window_size
 
     def supports_swa(self) -> bool:
-        assert (
-            self.sliding_window_size is not None
-        ), "sliding_window_size must be set for PureSWARadixCache"
+        assert self.sliding_window_size is not None, (
+            "sliding_window_size must be set for PureSWARadixCache"
+        )
         return True
 
     def swa_evictable_size(self):

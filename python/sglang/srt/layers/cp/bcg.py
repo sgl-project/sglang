@@ -53,6 +53,7 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
     return (
         cfg.enable_prefill_cp
+        and cfg.pp_size == 1
         and resolved.attn_cp_size == cfg.tp_size
         and cfg.cp_strategy == "zigzag"
         and prefill_attention_backend == "trtllm_mha"

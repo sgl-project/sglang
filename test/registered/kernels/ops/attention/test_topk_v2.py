@@ -31,7 +31,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
-    topk_transform_512_v2,
+    topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -96,9 +96,9 @@ def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
                 print(
                     f"b={i} L={L} k={k}: more={list(more)[:4]} less={list(less)[:4]} mv={mv[:3]} lv={lv[:3]}"
                 )
-        assert len(our) == min(
-            k, L
-        ), f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
+        assert len(our) == min(k, L), (
+            f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
+        )
     assert bad <= MAX_PERMIT_ERROR, f"{bad=} > {MAX_PERMIT_ERROR}"
 
 
@@ -165,7 +165,7 @@ def _run(scores, seq_lens, page_table, inv_cpu, k):
     batch = scores.shape[0]
     metadata = _plan(seq_lens)
     out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
-    topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata)
+    topk_transform_paged_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata)
     torch.cuda.synchronize()
     out_cpu = out.cpu().tolist()
     return [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
@@ -177,7 +177,7 @@ def _run_raw(scores, seq_lens, k):
     batch = scores.shape[0]
     metadata = _plan(seq_lens)
     out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
-    topk_transform_512_v2(scores, seq_lens, None, out, PAGE_SIZE, metadata)
+    topk_transform_paged_v2(scores, seq_lens, None, out, PAGE_SIZE, metadata)
     torch.cuda.synchronize()
     out_cpu = out.cpu().tolist()
     return [[v for v in out_cpu[i] if v != -1] for i in range(batch)]
