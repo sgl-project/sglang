@@ -304,8 +304,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     ) -> None:
         # Some unit-test and backend harnesses intentionally construct a
         # minimal worker with object.__new__. Keep that default-off path valid.
+        selected = getattr(
+            self, "_eagle_cuda_sync_debug_checkpoints", frozenset()
+        )
+        if checkpoint not in selected:
+            return
         _maybe_sync_eagle_cuda_debug(
-            getattr(self, "_eagle_cuda_sync_debug_checkpoints", frozenset()),
+            selected,
             checkpoint,
             self.device,
             detail=detail,
