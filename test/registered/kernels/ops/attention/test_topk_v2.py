@@ -20,6 +20,10 @@ and two cluster dispatch shapes: the fused small-batch kernel (batch <= 30) and
 the persistent-pool + main kernel (30 < batch <= 128). Boundary seq lengths
 (8192/8193, 16384/16385, 65535/65536/65537) and batch sizes (30/31, 128/129) are
 included explicitly, across k in {512,1024,2048} and identity/perm page tables.
+
+The row layout is covered on top of that: rows normally start at column 0 and
+own one page-table row each, while DSA extend packs all requests into one score
+buffer and shares a table row per request (``test_topk_v2_packed_rows``).
 """
 
 from __future__ import annotations
@@ -375,6 +379,87 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
     implicit = _run_ragged(scores.clone(), lengths, None, offsets, k)
     for i in range(len(rows)):
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize(
+    "extend_lens",
+    [
+        [7],  # one request
+        [4, 4],  # equal row counts
+        [1, 13, 2],  # ragged, including a single-row request
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
+    """DSA extend layout: batch-global packed scores + shared page-table rows.
+
+    Every request's scores live side by side in one buffer, so a row's window
+    starts at ``row_starts[row]`` instead of column 0, and all rows of a request
+    map through that request's single page-table row (``row_to_batch``). Rows are
+    causal, so lengths grow by one within a request. This is the shape
+    ``dsa_topk_backend`` routes to v2 for PAGED extend; a distinct page-table
+    permutation per request catches any row/request index mix-up.
+
+    The ragged case below also leaves most window starts off the 16-byte load
+    boundary, which is the general case in production -- a window start is a
+    running KV length, aligned only by luck.
+    """
+    torch.manual_seed(4242 + k + len(extend_lens))
+    device = "cuda"
+
+    # Keep every row longer than k so no row takes the trivial path, which would
+    # pass regardless of the offsets.
+    prefix = k + 1024
+    kv_lens = [prefix + e for e in extend_lens]
+    k_offsets = [0]
+    for kv in kv_lens[:-1]:
+        k_offsets.append(k_offsets[-1] + kv)
+    total_kv = sum(kv_lens)
+
+    row_starts, lengths, row_to_batch = [], [], []
+    for i, e in enumerate(extend_lens):
+        for local in range(e):
+            row_starts.append(k_offsets[i])
+            lengths.append(kv_lens[i] - e + local + 1)
+            row_to_batch.append(i)
+    rows = len(lengths)
+
+    width = (total_kv + 3) & ~3
+    scores = torch.randn(rows, width, dtype=torch.float32, device=device)[:, :total_kv]
+    lengths_t = torch.tensor(lengths, dtype=torch.int32, device=device)
+    row_starts_t = torch.tensor(row_starts, dtype=torch.int32, device=device)
+    row_to_batch_t = torch.tensor(row_to_batch, dtype=torch.int32, device=device)
+
+    num_pages = (max(kv_lens) + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(
+        len(extend_lens), num_pages, "perm", device, per_row=True
+    )
+
+    out = torch.full((rows, k), -1, dtype=torch.int32, device=device)
+    metadata = plan_topk_v2(lengths_t)
+    # The kernel masks the <= 3 columns its aligned read base pulls in ahead of
+    # each window, so reference values have to be read before the call.
+    scores_cpu = scores.cpu()
+    topk_transform_paged_v2(
+        scores,
+        lengths_t,
+        page_table,
+        out,
+        PAGE_SIZE,
+        metadata,
+        row_starts=row_starts_t,
+        row_to_batch=row_to_batch_t,
+    )
+    torch.cuda.synchronize()
+
+    out_cpu = out.cpu().tolist()
+    for r in range(rows):
+        L, start, req = lengths[r], row_starts[r], row_to_batch[r]
+        window = scores_cpu[r, start : start + L]
+        ref = torch.topk(window, k, sorted=False).indices.tolist()
+        our = _invert(out_cpu[r], inv_cpu[req])
+        _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
 
 
 if __name__ == "__main__":
