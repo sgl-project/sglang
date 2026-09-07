@@ -94,9 +94,11 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         from sglang.srt.layers.linear import RowParallelLinear
 
         original_dtype = x.dtype
+        original_shape = x.shape
+        x_2d = x.reshape(-1, original_shape[-1]) if x.ndim > 2 else x
         if original_dtype != torch.int8:
-            x = torch.ops.npu.npu_quantize(
-                x,
+            x_2d = torch.ops.npu.npu_quantize(
+                x_2d,
                 layer.aclnn_input_scale_reciprocal,
                 layer.aclnn_input_offset,
                 torch.qint8,
@@ -109,13 +111,16 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
             quant_bias = None
         else:
             quant_bias = layer.quant_bias
-        return torch.ops.npu.npu_quant_matmul(
-            x,
+        out = torch.ops.npu.npu_quant_matmul(
+            x_2d,
             layer.weight,
             layer.deq_scale,
             bias=quant_bias,
             output_dtype=original_dtype,
         )
+        if x.ndim > 2:
+            out = out.reshape(*original_shape[:-1], -1)
+        return out
 
 
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
@@ -139,10 +144,23 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             """dynamic_scale is calculated in malprolog kernel"""
             original_dtype = torch.bfloat16
             quant_out, dynamic_scale = x
-        else:
-            original_dtype = x.dtype
-            quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
-        return torch.ops.npu.npu_quant_matmul(
+            return torch.ops.npu.npu_quant_matmul(
+                quant_out,
+                layer.weight,
+                layer.weight_scale,
+                pertoken_scale=dynamic_scale.flatten(),
+                bias=bias,
+                output_dtype=original_dtype,
+            )
+
+        # The vision encoder feeds linears a 3-D (seq, 1, hidden) layout that
+        # the NPU quant ops only accept flattened to 2-D.  Fold the leading
+        # batch dims into m for the quantized GEMM, then restore the layout.
+        original_dtype = x.dtype
+        original_shape = x.shape
+        x_2d = x.reshape(-1, original_shape[-1]) if x.ndim > 2 else x
+        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x_2d)
+        out = torch.ops.npu.npu_quant_matmul(
             quant_out,
             layer.weight,
             layer.weight_scale,
@@ -150,6 +168,9 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             bias=bias,
             output_dtype=original_dtype,
         )
+        if x.ndim > 2:
+            out = out.reshape(*original_shape[:-1], -1)
+        return out
 
 
 class NPUMXFP8LinearMethod(_NPULinearMethodBase):
