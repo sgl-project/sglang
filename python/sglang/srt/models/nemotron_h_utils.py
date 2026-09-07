@@ -27,9 +27,10 @@ def get_real_num_tokens(
 ) -> int:
     """Number of real (non DP-padding) rows in ``hidden_states``."""
     real_tokens = hidden_states.shape[0]
-    num_token_non_padded_cpu = getattr(forward_batch, "num_token_non_padded_cpu", None)
-    if num_token_non_padded_cpu is not None:
-        real_tokens = min(real_tokens, int(num_token_non_padded_cpu))
+    if forward_batch.global_num_token_non_padded_cpu is not None:
+        real_tokens = min(
+            real_tokens, int(forward_batch.global_num_token_non_padded_cpu)
+        )
     if (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_mixed()

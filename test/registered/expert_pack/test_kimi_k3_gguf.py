@@ -20,7 +20,7 @@ from sglang.srt.model_loader.kimi_k3_gguf import (
 from sglang.srt.models.kimi_k3 import _uses_split_gguf_kv_b
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestKimiK3GGUFMapping(unittest.TestCase):

@@ -13,7 +13,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_ps(**overrides) -> ParallelState:
@@ -103,8 +103,8 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 side_effect=fake_point_to_point_pyobj,
             ),
             patch(
-                "sglang.srt.managers.scheduler_pp_mixin.broadcast_pyobj",
-                side_effect=lambda data, *args, **kwargs: data,
+                "sglang.srt.managers.scheduler_pp_mixin.attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda data: data,
             ),
         ):
             self.assertEqual(

@@ -14,7 +14,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestMmProcessConfigValidation(CustomTestCase):
@@ -493,6 +493,38 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
         pool.shutdown()
 
         self.assertFalse(pool._recycle_thread.is_alive())
+
+
+class TestCudaIpcProcessorRollback(CustomTestCase):
+    def test_partial_wrap_failure_restores_items_and_cancels_proxy(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.multimodal.transport.cuda_ipc import (
+            CudaIpcTensorTransportProxy,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+        processor.use_cuda_ipc = True
+        processor.cudaipc_mmfeature_pool = MagicMock()
+        proxy = object.__new__(CudaIpcTensorTransportProxy)
+        processor._wrap_tensor_for_cuda_ipc = MagicMock(
+            side_effect=[proxy, RuntimeError("wrap failed")]
+        )
+        features = [torch.ones(2), torch.ones(3)]
+        items = [
+            MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
+            for feature in features
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "wrap failed"):
+            processor._prepare_mm_items_for_transport(items)
+
+        processor.cudaipc_mmfeature_pool.cancel_proxy.assert_called_once_with(proxy)
+        self.assertIs(items[0].feature, features[0])
+        self.assertIs(items[1].feature, features[1])
 
 
 class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
