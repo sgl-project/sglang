@@ -23,7 +23,10 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_resources,
+)
 
 try:
     from nixl_ep import Buffer
@@ -52,8 +55,6 @@ class NixlEPBuffer:
     @classmethod
     def _state(cls):
         from types import SimpleNamespace
-
-        from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
         state = buffers.get("nixl_ep_state")
@@ -135,7 +136,7 @@ class NixlEPBuffer:
         offset = ElasticEPStateManager.get_ep_join_rank_offset()
         global_rank = rank + offset
 
-        max_ep_size = get_parallel().config.max_ep_size or world_size
+        max_ep_size = get_parallel().max_ep_size or world_size
         nixl_max_ranks = max_ep_size
 
         num_rdma_bytes = 0
@@ -233,7 +234,7 @@ class _NixlEPDispatcherImplBase:
         )
         self._active_world_size = dist.get_world_size(group)
 
-        _max_ep = get_parallel().config.max_ep_size or self._active_world_size
+        _max_ep = get_parallel().max_ep_size or self._active_world_size
         self._mask_buffer = (
             torch.zeros(_max_ep, dtype=torch.int32, device="cuda")
             if self.active_ranks is not None

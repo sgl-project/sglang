@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_model_inputs,
+    get_cp_strategy,
     is_cp_v2_active,
     prepare_cp_forward,
 )
@@ -37,7 +38,11 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
@@ -53,13 +58,13 @@ from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_spec,
-    mamba_extra_buffer_enabled,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import (
     ceil_align,
     get_eager_max_batch_size,
@@ -133,7 +138,8 @@ class EagerRunner(BaseRunner):
             max_num_token=max_num_token,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=(
-                mamba_extra_buffer_enabled() and mr.spec_algorithm.is_none()
+                get_exec().mamba.enable_mamba_extra_buffer
+                and mr.spec_algorithm.is_none()
             ),
             is_encoder_decoder=is_encoder_decoder,
             encoder_len_fill_value=(
@@ -144,7 +150,7 @@ class EagerRunner(BaseRunner):
             encoder_lens_dtype=(
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
-            dp_size=get_parallel().config.dp_size,
+            dp_size=get_parallel().dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         self.warmup()
@@ -208,6 +214,12 @@ class EagerRunner(BaseRunner):
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
     ) -> Any:
         mode = forward_batch.forward_mode
+        if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
+            # A mixed batch is extend-shaped (decode tails are 1-token
+            # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
+            # kernel; CP keeps it to skip the zigzag split.
+            forward_batch.forward_mode = ForwardMode.EXTEND
+            mode = ForwardMode.EXTEND
         if mode.is_decode():
             return self._execute_decode(forward_batch, pp_proxy_tensors)
         if mode.is_idle():
@@ -368,7 +380,7 @@ class EagerRunner(BaseRunner):
     def _execute_extend_cp_v2(
         self, forward_batch: ForwardBatch, kwargs: dict
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        """CP-v2 extend: shard inputs at the model boundary, run the body on the
+        """CP extend: shard inputs at the model boundary, run the body on the
         rank-local slice, then gather hidden states before the logits step.
         """
         model = self.model_runner.model
@@ -377,13 +389,16 @@ class EagerRunner(BaseRunner):
         if input_embeds is None:
             input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
         with cp_shard_model_inputs(
-            input_embeds, forward_batch.positions, forward_batch
-        ) as (sharded_input_embeds, sharded_positions):
+            input_embeds,
+            forward_batch.positions,
+            forward_batch,
+            forward_batch.input_ids,
+        ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
             hidden_states = model.model(
-                forward_batch.input_ids,
+                model_input_ids,
                 sharded_positions,
                 forward_batch,
                 **model_kwargs,

@@ -2,32 +2,58 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.layers.moe.moe_runner.base import (
+    DispatchMoeRunnerCore,
     FusedOpPool,
     MoeRunnerConfig,
     PermuteMethodPool,
 )
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
-from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
+from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore, TritonRunnerInput
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackendLike,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+    register_moe_runner_backend_name,
+    resolve_moe_runner_backend,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput, DispatchOutput
-    from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.lora.lora_moe_runners import LoRAHooks
 
 logger = logging.getLogger(__name__)
+
+_CUSTOM_RUNNER_CORE_FACTORIES: dict[
+    str, Callable[[MoeRunnerConfig], DispatchMoeRunnerCore]
+] = {}
+
+
+def register_moe_runner_core(
+    backend_name: str,
+    factory: Callable[[MoeRunnerConfig], DispatchMoeRunnerCore],
+) -> None:
+    """Register a runner-core factory for a new or built-in backend name."""
+
+    if backend_name in _CUSTOM_RUNNER_CORE_FACTORIES:
+        raise ValueError(f"Runner core for {backend_name!r} is already registered")
+    try:
+        resolve_moe_runner_backend(backend_name)
+    except ValueError:
+        register_moe_runner_backend_name(backend_name)
+    _CUSTOM_RUNNER_CORE_FACTORIES[backend_name] = factory
 
 
 class MoeRunner:
     def __init__(
         self,
-        runner_backend: MoeRunnerBackend,
+        runner_backend: MoeRunnerBackendLike,
         config: MoeRunnerConfig,
         lora_enabled: bool = False,
     ):
@@ -61,7 +87,9 @@ class MoeRunner:
 
         self.fused_func = None
 
-        if runner_backend.is_triton():
+        if custom_factory := _CUSTOM_RUNNER_CORE_FACTORIES.get(runner_backend.value):
+            self.runner_core = custom_factory(config)
+        elif runner_backend.is_triton():
             self.runner_core = TritonRunnerCore(config)
         elif runner_backend.is_ascend():
             from sglang.srt.layers.moe.moe_runner.ascend import AscendRunnerCore
@@ -157,7 +185,16 @@ class MoeRunner:
 
         assert self.runner_core is not None
 
-        def _maybe_build_lora_hooks(_runner_input: Any) -> LoRAHooks:
+        def _maybe_build_lora_hooks(
+            _runner_input: DispatchOutput | TritonRunnerInput,
+        ) -> Optional[LoRAHooks]:
+            # Bail out before touching the runner input: LoRA is only wired up
+            # for the Triton runner, so every other backend (deep_gemm,
+            # triton_kernels, aiter, ascend, ...) gets here with LoRA disabled
+            # and its runner input carries no topk_ids to read.
+            if not self.lora_enabled or lora_info is None:
+                return None
+
             from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutput
             from sglang.srt.lora.lora_moe_runners import build_lora_hooks
 
@@ -167,19 +204,18 @@ class MoeRunner:
                     _runner_input.topk_output.topk_ids,
                 )
             else:
+                assert isinstance(_runner_input, TritonRunnerInput), type(_runner_input)
                 hidden_states = _runner_input.hidden_states
-                topk_ids = getattr(_runner_input, "topk_ids", None)
-            if self.lora_enabled and lora_info is not None:
-                return build_lora_hooks(
-                    hidden_states,
-                    lora_info,
-                    topk_ids,
-                )
-            return None
+                topk_ids = _runner_input.topk_ids
+            return build_lora_hooks(
+                hidden_states,
+                lora_info,
+                topk_ids,
+            )
 
         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
         # bypass the pre-permute step and do their own alignment internally.
-        if hasattr(self.runner_core, "run_from_dispatch"):
+        if isinstance(self.runner_core, DispatchMoeRunnerCore):
             hooks = _maybe_build_lora_hooks(dispatch_output)
             return self.runner_core.run_from_dispatch(
                 dispatch_output, quant_info, self.config, hooks=hooks

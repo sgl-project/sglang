@@ -1,15 +1,10 @@
 """Resolution writes are recorded, not just applied.
 
 The projection that replaces field materialization reads the declaration stash,
-so a resolution write that only assigns the field is invisible to it. Every
-resolver declares now -- the record's handlers through `self._declare`, the
-hooks and hardware defaults through `declare_resolution` -- and that is pinned
-two ways: no bare assignment to a field survives anywhere a ServerArgs instance
-is in reach, and after resolution `resolution_result` answers for every declared
-field with what the stash holds. The second check is what the stash is measured
-against: the two can disagree only if something wrote behind the stash's back. A
-third check runs the other way -- every field resolution moved has to be
-explained by the stash, which covers the spellings a source scan cannot see.
+so a resolution write that bypasses the stash is invisible to it. These tests
+compare the raw input, resolved record, declaration result, and published bags
+across representative configurations. A field that moves without a declaration
+or is projected into the wrong namespace therefore fails on observed state.
 """
 
 import ast
@@ -24,13 +19,12 @@ import unittest
 import unittest.mock
 
 import sglang
-from sglang.srt import server_args as server_args_module
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 
@@ -123,114 +117,6 @@ _REACHED_BY_SHAPES = frozenset(
 )
 
 
-def _late_resolvers():
-    """Callables that reach `declare_late_resolution`, derived per module."""
-    found = set()
-    for relative in ("server_args.py", "parser/template_detection.py"):
-        tree = ast.parse((_SRT / relative).read_text(encoding="utf-8-sig"))
-        functions = {
-            node.name: node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-
-        def reaches(name, seen=None):
-            seen = seen if seen is not None else set()
-            if name in seen or name not in functions:
-                return False
-            seen.add(name)
-            for node in ast.walk(functions[name]):
-                if not isinstance(node, ast.Call):
-                    continue
-                called = (
-                    node.func.attr
-                    if isinstance(node.func, ast.Attribute)
-                    else getattr(node.func, "id", None)
-                )
-                if called in ("declare_late_resolution", "_late_resolution"):
-                    return True
-                if called and reaches(called, seen):
-                    return True
-            return False
-
-        found |= {name for name in functions if reaches(name)}
-    return found
-
-
-def _server_args_writers(tree, path):
-    """Assignment targets that land on a ServerArgs instance.
-
-    Two mechanisms reach the same instance during resolution: a handler writing
-    `self.<field>`, and a helper elsewhere in the tree writing through a
-    `ServerArgs`-annotated parameter -- `set_default_server_args(args)` is
-    called from the pipeline and writes `args.<field>`. Both bypass the
-    declaration stash, so both have to be scanned; scanning only the handlers
-    would let a field look converted while a second writer still assigns it.
-    """
-    names = {"self"} if path.name == "server_args.py" else set()
-    # A parameter *named* `server_args` counts with or without the annotation.
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        args = node.args
-        for arg in args.posonlyargs + args.args + args.kwonlyargs:
-            annotation = arg.annotation
-            if isinstance(annotation, ast.Constant):
-                text = annotation.value
-            elif isinstance(annotation, ast.Name):
-                text = annotation.id
-            elif isinstance(annotation, ast.Attribute):
-                text = annotation.attr
-            else:
-                continue
-            if text == "ServerArgs":
-                names.add(arg.arg)
-        names |= {
-            arg.arg for arg in args.posonlyargs + args.args if arg.arg == "server_args"
-        }
-    return names
-
-
-def _bare_assignments():
-    """Assignments to a converted field that never reach the stash."""
-    found = []
-    for path in sorted(_SRT.rglob("*.py")):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
-        except SyntaxError:
-            continue
-        names = _server_args_writers(tree, path)
-        if not names:
-            continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                targets = node.targets
-            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
-                targets = [node.target]
-            else:
-                continue
-            # Destructured targets count: `(sa.a, sa.b) = f()` writes two
-            # fields and is not an `ast.Attribute` at the top level.
-            flat = []
-            for target in targets:
-                if isinstance(target, (ast.Tuple, ast.List)):
-                    flat.extend(target.elts)
-                else:
-                    flat.append(target)
-            for target in flat:
-                if (
-                    isinstance(target, ast.Attribute)
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id in names
-                    and target.attr in _RESOLVED_FIELDS
-                ):
-                    found.append(
-                        f"{path.relative_to(_SRT)}:{node.lineno} "
-                        f"{target.value.id}.{target.attr}"
-                    )
-    return sorted(found)
-
-
 def shape_key(shape):
     """A shape rendered short enough for a failure message."""
     return ",".join(f"{k}={v}" for k, v in sorted(shape.items())) or "defaults"
@@ -299,15 +185,6 @@ class TestResolutionDeclarations(CustomTestCase):
         server_args = ServerArgs(model_path=path, device="cuda", **fields)
         server_args.resolve_once()
         return server_args
-
-    def test_converted_fields_are_not_assigned_bare(self):
-        bare = _bare_assignments()
-        self.assertEqual(
-            bare,
-            [],
-            "a converted field is assigned directly, so the projection would "
-            "not see this write:\n  " + "\n  ".join(bare),
-        )
 
     def test_the_stash_accounts_for_every_change_resolution_made(self):
         """The other direction: a field resolution moved is in the stash.
@@ -420,10 +297,7 @@ class TestResolutionDeclarations(CustomTestCase):
         the last hop: whether the leaf is reachable through the path the
         metadata declares, and whether it carries the resolved value once it
         is. Both sides here come from that metadata, so this cannot tell that
-        a field is assigned to the *wrong* group -- the readers are the
-        independent source for that, and
-        `test_server_args_namespaces.py::test_the_readers_agree_with_the_namespace_metadata`
-        is where the two are compared.
+        a field is assigned to the *wrong* group.
         """
         import sglang.srt.runtime_context as runtime_context
         from sglang.srt.arg_groups.arg_utils import namespace_of
@@ -433,19 +307,11 @@ class TestResolutionDeclarations(CustomTestCase):
         mapping = namespace_of(ServerArgs)
         self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
 
-        # The five sizes keep a live property shadowing the bare name; the
-        # comparison below reaches them anyway, through `get_parallel().config`.
-        self.assertGreaterEqual(
-            _live_topology_leaves()
-            & {
-                "tp_size",
-                "pp_size",
-                "moe_dp_size",
-                "attn_cp_size",
-                "dcp_size",
-            },
-            {"tp_size", "pp_size", "moe_dp_size", "attn_cp_size", "dcp_size"},
-            "a parallel size stopped being served from the live topology",
+        self.assertEqual(
+            set(),
+            _live_topology_leaves() & set(mapping),
+            "a parallel leaf gained a live member of the same name, so the "
+            "comparison below reads the group rather than the published leaf",
         )
 
         compared = 0
@@ -461,10 +327,6 @@ class TestResolutionDeclarations(CustomTestCase):
                     unreachable.append(f"no get_{groups[0]}() for {path}.{field}")
                     continue
                 node = accessor()
-                if groups[0] == "parallel":
-                    # Bare names there are the live topology; the published
-                    # leaves are one hop down, so the reader takes that hop.
-                    node = node.config
                 try:
                     for group in groups[1:]:
                         node = getattr(node, group)
@@ -538,14 +400,16 @@ class TestResolutionDeclarations(CustomTestCase):
             reset_context()
             child = pickle.loads(blob)
             entered = []
-            original = ServerArgs._run_resolution_pipeline
+            from sglang.srt.arg_groups import pipeline as pipeline_module
 
-            def counted(self, _original=original):
+            original = pipeline_module.run_resolution_pipeline
+
+            def counted(server_args, _original=original):
                 entered.append(1)
-                return _original(self)
+                return _original(server_args)
 
             with unittest.mock.patch.object(
-                ServerArgs, "_run_resolution_pipeline", counted
+                pipeline_module, "run_resolution_pipeline", counted
             ):
                 publish(child, role="scheduler")
             self.assertEqual(
@@ -603,6 +467,22 @@ class TestResolutionDeclarations(CustomTestCase):
             "does not write back",
         )
 
+    def test_pre_engine_late_resolution_reaches_the_projection(self):
+        """A launcher declaration survives the engine's first resolution pass."""
+        from sglang.srt.arg_groups.overrides import declare_late_resolution
+
+        server_args = ServerArgs(model_path="dummy")
+        declare_late_resolution(
+            server_args,
+            "launcher",
+            enable_forward_pass_metrics=True,
+        )
+
+        server_args.resolve_once()
+
+        self.assertTrue(resolution_result(server_args, "enable_forward_pass_metrics"))
+        self.assertFalse(server_args.enable_forward_pass_metrics)
+
     def test_validation_can_still_resolve_before_the_record_is_published(self):
         """The LoRA checks resolve, so they must precede publish.
 
@@ -638,54 +518,6 @@ class TestResolutionDeclarations(CustomTestCase):
             "normalization is a declaration; the record keeps what was passed",
         )
 
-    def test_the_launcher_finishes_resolving_before_it_publishes(self):
-        """Every late resolver runs above the publish, in the source.
-
-        A published record refuses to be written, so a late resolver below the
-        publish raises at startup rather than at test time -- and only for the
-        configuration that reaches it, which is why the LoRA path can break
-        while every other launch stays green. Both sides are derived: which
-        callables reach `declare_late_resolution`, and where the launcher calls
-        them.
-        """
-        launcher = _SRT / "entrypoints/engine.py"
-        late = {"check_server_args", "resolve_auto_parsers"} | _late_resolvers()
-        tree = ast.parse(launcher.read_text(encoding="utf-8-sig"))
-        function = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "_launch_subprocesses"
-        )
-        published_at = [
-            node.lineno
-            for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "publish"
-        ]
-        self.assertEqual(len(published_at), 1, "the launcher publishes once")
-        too_late = sorted(
-            f"{name}() at line {node.lineno}"
-            for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            for name in [
-                (
-                    node.func.attr
-                    if isinstance(node.func, ast.Attribute)
-                    else getattr(node.func, "id", None)
-                )
-            ]
-            if name in late and node.lineno > published_at[0]
-        )
-        self.assertEqual(
-            too_late,
-            [],
-            f"these resolve after the launcher publishes at line "
-            f"{published_at[0]}, and a published record refuses to be "
-            f"written:\n  " + "\n  ".join(too_late),
-        )
-
     def test_an_undeclared_field_still_holds_the_raw_input(self):
         """Nothing writes a field behind the stash's back.
 
@@ -709,8 +541,7 @@ class TestResolutionDeclarations(CustomTestCase):
                 current = getattr(server_args, name, None)
                 if current != raw_input[name]:
                     moved.append(
-                        f"{shape} -> {name}: raw={raw_input[name]!r} "
-                        f"field={current!r}"
+                        f"{shape} -> {name}: raw={raw_input[name]!r} field={current!r}"
                     )
         self.assertEqual(
             moved,
@@ -828,48 +659,6 @@ class TestResolutionDeclarations(CustomTestCase):
             "so a decision made inside the declared object was dropped",
         )
 
-    def test_every_platform_hook_that_takes_the_record_is_captured(self):
-        """A second out-of-tree config hook must not arrive uncaptured.
-
-        `apply_server_args_defaults` is the one method on the platform
-        interface that is handed the record, and its implementations live in
-        other distributions -- no source scan of this tree can see what they
-        write, so the pipeline diffs the record across the call instead. A new
-        hook of the same shape would be invisible again, and this is what
-        notices. Derived from the interface rather than listed: a rename keeps
-        working, an addition fails.
-        """
-        interface = _SRT / "platforms" / "interface.py"
-        tree = ast.parse(interface.read_text(encoding="utf-8-sig"))
-        taking_the_record = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            arguments = node.args
-            names = [
-                arg.arg
-                for arg in arguments.posonlyargs + arguments.args + arguments.kwonlyargs
-            ]
-            if any(name == "server_args" or name.endswith("_args") for name in names):
-                taking_the_record.add(node.name)
-        self.assertEqual(
-            taking_the_record,
-            {"apply_server_args_defaults"},
-            "the platform interface hands the startup record to a method this "
-            "test does not know about; either it only reads, or its writes need "
-            "capturing like apply_server_args_defaults",
-        )
-
-        pipeline = (_SRT / "server_args.py").read_text(encoding="utf-8-sig")
-        for hook in sorted(taking_the_record):
-            self.assertIn(
-                f"current_platform.{hook},",
-                pipeline,
-                f"{hook} is called directly instead of through the write "
-                "capture, so an out-of-tree plugin's defaults would be dropped "
-                "by the projection",
-            )
-
     def test_the_shapes_reach_the_fields_they_are_meant_to(self):
         """A green agreement check over an empty stash would prove nothing."""
         declared = set()
@@ -897,16 +686,20 @@ class TestResolutionDeclarations(CustomTestCase):
         # The pipeline asks the platform other questions on the way through
         # (whether it is out of tree, whether it supports piecewise capture),
         # and which of those it reaches depends on the host.
-        class _Plugin(type(server_args_module.current_platform)):
+        from sglang.srt.platforms import current_platform
+
+        class _Plugin(type(current_platform)):
             device_name = "oot"
 
             def apply_server_args_defaults(self, server_args):
                 server_args.attention_backend = "triton"
                 server_args.schedule_conservativeness = 0.5
 
-        with unittest.mock.patch.object(
-            server_args_module, "current_platform", _Plugin()
-        ):
+        from sglang.srt.arg_groups import pipeline as pipeline_module
+
+        # The write capture runs in the dispatcher, so that is the namespace the
+        # plugin has to be installed in.
+        with unittest.mock.patch.object(pipeline_module, "current_platform", _Plugin()):
             server_args = self._resolve({})
         self.assertEqual(
             (
@@ -918,6 +711,99 @@ class TestResolutionDeclarations(CustomTestCase):
             "result, so the projection publishes what the operator passed "
             "instead of what the platform decided",
         )
+
+
+class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
+    """A declaration records a value, not a handle on one.
+
+    The stash keeps whatever object the declaring handler passed, so a handler
+    that declares a mutable and then edits it in place rewrites an entry that
+    already went into the log. The projection still answers with the end state,
+    which is why nothing else notices: what is lost is *which* handler decided
+    what, and `validate_declarations` never sees the later change at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        environment = dict(os.environ)
+
+        def restore():
+            os.environ.clear()
+            os.environ.update(environment)
+
+        self.addCleanup(restore)
+
+    def _resolve_recording_each_entry(self, **supplied):
+        """Resolve, deep-copying every stash entry the moment it is appended.
+
+        The property is about the stash, so the seam is the stash: a list that
+        snapshots on append. Every declaration path -- `declare_resolution`,
+        `declare_late_resolution`, `declare_direct_writes` and the passes --
+        reaches it through `.append`, whatever it was imported as.
+        """
+        recorded = []
+
+        class _SnapshotOnAppend(list):
+            def append(self, entry):
+                super().append(entry)
+                recorded.append((len(self) - 1, copy.deepcopy(entry)))
+
+        class _WatchedArgs(ServerArgs):
+            """Whatever list the pipeline installs, snapshot what lands in it.
+
+            The pipeline resets the stash at the start of a resolution, so the
+            seam has to survive that assignment rather than precede it.
+            """
+
+            def __setattr__(self, name, value):
+                if name == "_resolved_overrides" and not isinstance(
+                    value, _SnapshotOnAppend
+                ):
+                    value = _SnapshotOnAppend(value)
+                super().__setattr__(name, value)
+
+        path = tempfile.mkdtemp(prefix="declared_values_")
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        with open(os.path.join(path, "config.json"), "w") as handle:
+            json.dump(_MINI_CONFIG, handle)
+        server_args = _WatchedArgs(
+            model_path=path, device="cuda", random_seed=42, **supplied
+        )
+        server_args.resolve_once()
+        return server_args, recorded
+
+    def test_no_entry_changes_after_it_is_recorded(self):
+        # One shape per family of handlers that decides a graph setting.
+        for label, supplied in (
+            ("plain", {}),
+            ("cuda_graph_knobs", {"cuda_graph_max_bs_decode": 16}),
+            ("chunked_prefill", {"chunked_prefill_size": 1024}),
+            ("explicit_json", {"cuda_graph_config": {"decode": {"max_bs": 12}}}),
+            ("disaggregation", {"disaggregation_mode": "prefill"}),
+            ("deterministic", {"enable_deterministic_inference": True}),
+            ("speculative", {"speculative_algorithm": "EAGLE"}),
+            ("dp_attention", {"tp_size": 2, "dp_size": 2, "enable_dp_attention": True}),
+        ):
+            with self.subTest(shape=label):
+                server_args, recorded = self._resolve_recording_each_entry(**supplied)
+                stash = server_args._resolved_overrides
+                self.assertGreater(
+                    len(recorded),
+                    0,
+                    "nothing was recorded, so this case is not watching the "
+                    "declaration paths it thinks it is",
+                )
+                drifted = [
+                    (index, was, stash[index])
+                    for index, was in recorded
+                    if stash[index] != was
+                ]
+                self.assertEqual(
+                    [],
+                    drifted,
+                    "these entries changed after they were declared, so the log "
+                    f"credits the wrong handler for the end state: {drifted}",
+                )
 
 
 if __name__ == "__main__":

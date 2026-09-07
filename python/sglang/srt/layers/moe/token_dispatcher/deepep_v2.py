@@ -21,6 +21,10 @@ from sglang.srt.layers.moe.utils import (
     DeepEPv2Fp8ScaleFormat,
     get_deepep_v2_fp8_scale_format,
 )
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_resources,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +116,6 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-    from sglang.srt.runtime_context import get_exec
 
     return get_exec().moe.deepep_v2_mode == "hybrid"
 
@@ -138,8 +141,6 @@ class DeepEPv2Buffer:
     @classmethod
     def _state(cls):
         from types import SimpleNamespace
-
-        from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
         state = buffers.get(cls._STATE_KEY)

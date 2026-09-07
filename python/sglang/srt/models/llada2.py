@@ -256,7 +256,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 self.score_function == "softmax" and self.correction_bias is None
             ) or (
                 self.score_function == "sigmoid" and self.correction_bias is not None
-            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            ), (
+                "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            )
 
         self.topk = TopK(
             top_k=self.top_k,
@@ -707,7 +709,6 @@ class LLaDA2MoeBlock(nn.Module):
 
 
 class LLaDA2MoeModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -824,7 +825,7 @@ class LLaDA2MoeModelLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config, return_full_logits=True)
 

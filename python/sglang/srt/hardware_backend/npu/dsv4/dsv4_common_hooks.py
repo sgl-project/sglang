@@ -10,8 +10,9 @@ these hooks then:
   2. Write newly allocated C128 page ids into the per-request sidecar.
 
 Compressor state is fixed ring storage and does not participate in this
-allocation/write path. PD reuses the public SWA/C128-state payloads and only
-builds an NPU-specific payload for the independently addressed C128 KV pool.
+allocation/write path. PD reuses the public SWA/C128-state payloads and builds
+NPU-specific payloads for the independently addressed C128 KV pool and A5 C4
+compress-state rows.
 
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
@@ -71,11 +72,24 @@ def dsv4_state_payloads(
     *,
     prefix_len: int = 0,
 ):
-    """Build the only NPU-specific DSV4 PD payload: C128 KV pages."""
+    """Build NPU-specific DSV4 PD payloads.
+
+    Returns payloads for components that are addressed differently from the
+    cross-hardware ``StateType.SWA`` / ``StateType.C128_STATE`` defaults:
+
+    * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
+    * ``DSV4_C4_STATE`` (A5 only) — live C4 compress-state rows.  Prefill
+      and decode derive physical rows using their own local ring sizes, so
+      decode-only MTP can safely transfer from an 8-row ring to a 16-row ring.
+      Pre-A5 uses EXPLICIT cache_mode and the C4 state is handled by the
+      shared ``StateType.SWA`` payload.
+    """
 
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
+    from sglang.srt.disaggregation.utils import get_dsv4_c4_state_indices
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
@@ -94,7 +108,20 @@ def dsv4_state_payloads(
         )
         return pages[pages > 0]
 
-    return {AscendStateType.DSV4_C128: c128_kv_pages}
+    payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
+
+    if is_npu_arch35():
+
+        def c4_state_indices():
+            return get_dsv4_c4_state_indices(
+                req_pool_idx,
+                seq_len,
+                ring_size=req_to_token_pool.get_dsv4_c4_state_ring_size(),
+            )
+
+        payloads[AscendStateType.DSV4_C4_STATE] = c4_state_indices
+
+    return payloads
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
@@ -104,7 +131,7 @@ def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device)
         return {}
     return dict(
         req_pool_indices=torch.tensor(
-            [req.req_pool_idx], dtype=torch.int64, device=device
+            [req.kv.req_pool_idx], dtype=torch.int64, device=device
         ),
         req_to_token_pool=req_to_token_pool,
     )
@@ -130,7 +157,7 @@ def write_dsv4_prealloc_tables(
     prealloc path (no ScheduleBatch); no-op without bundle / DSV4 tables."""
     if bundle is None or not hasattr(req_to_token_pool, "write_c128"):
         return
-    rp = torch.tensor([req.req_pool_idx])
+    rp = torch.tensor([req.kv.req_pool_idx])
     pl = torch.tensor([prefix_len])
     sl = torch.tensor([fill_len])
 

@@ -709,9 +709,9 @@ class SGLangFailuresAnalyzer:
                     runner_instance_key = f"{runner_labels_str}_{runner_id}"
                     runner_instance_stats[runner_instance_key]["total_jobs"] += 1
                     # Store runner name for reference
-                    runner_instance_stats[runner_instance_key][
-                        "runner_name"
-                    ] = runner_name
+                    runner_instance_stats[runner_instance_key]["runner_name"] = (
+                        runner_name
+                    )
 
                     # Calculate queue time (time from created to started) per instance
                     created_at = job.get("created_at")

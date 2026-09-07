@@ -5,7 +5,7 @@ python3 -m unittest test_pp_with_hicache.TestPPWithHiCache.test_eval_accuracy
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=138, stage="base-c", runner_config="4-gpu-h100")
 
 import os
 import subprocess
@@ -16,13 +16,13 @@ from urllib.parse import urlparse
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     find_available_port,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 
@@ -74,7 +74,7 @@ class TestPPWithHiCache(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process"):
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
         cls._stop_mooncake_services()
 
     @classmethod

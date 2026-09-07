@@ -3,10 +3,12 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
+    resolved_view,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
+
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
@@ -89,7 +92,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with speculative decoding "
                     f"(--speculative-algorithm {cfg.speculative_algorithm})"
                 )
-            from sglang.srt.arg_groups.overrides import resolved_view
 
             if resolved_view(server_args).enable_dp_attention:
                 logger.warning(
@@ -127,9 +129,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     elif cfg.disaggregation_mode == "prefill":
-        assert (
-            cfg.disaggregation_transfer_backend != "fake"
-        ), "Prefill server does not support 'fake' as the transfer backend"
+        assert cfg.disaggregation_transfer_backend != "fake", (
+            "Prefill server does not support 'fake' as the transfer backend"
+        )
 
         if envs.SGLANG_RUST_SERVER.get():
             _alias_bootstrap_port_to_api_port(server_args)
@@ -181,4 +183,83 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
             server_args,
             "_alias_bootstrap_port_to_api_port",
             disaggregation_bootstrap_port=cfg.port,
+        )
+
+
+def handle_encoder_disaggregation(server_args: Any):
+    from sglang.srt.arg_groups.model_hook import handle_language_model_only
+    from sglang.srt.arg_groups.validation_hook import validate_ib_devices
+    from sglang.srt.server_args import resolve_encoder_transfer_backend
+
+    cfg = resolving_view(server_args)
+    handle_language_model_only(server_args)
+    if cfg.enable_prefix_mm_cache and not cfg.encoder_only:
+        raise ValueError(
+            "--enable-prefix-mm-cache requires --encoder-only to be enabled"
+        )
+    if cfg.encoder_only and cfg.language_only:
+        raise ValueError("Cannot set --encoder-only and --language-only together")
+    if cfg.encoder_only and not cfg.disaggregation_mode == "null":
+        raise ValueError(
+            "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
+        )
+
+    if cfg.language_only and len(cfg.encoder_urls) == 0:
+        logger.info(
+            "--language-only is set without --encoder-urls. Encoders are "
+            "expected to register dynamically via the "
+            "EncoderBootstrapServer."
+        )
+
+    # Validate IB devices when mooncake backend is used
+    if (
+        cfg.disaggregation_transfer_backend == "mooncake"
+        and cfg.disaggregation_mode in ("prefill", "decode")
+    ) or cfg.encoder_transfer_backend == "mooncake":
+        declare_resolution(
+            server_args,
+            "_handle_encoder_disaggregation",
+            disaggregation_ib_device=validate_ib_devices(cfg.disaggregation_ib_device),
+        )
+
+    # Validate model type for encoder disaggregation
+    hf_config = model_config_of(server_args).hf_config
+    model_arch = hf_config.architectures[0]
+    if cfg.encoder_transfer_backend == "auto":
+        declare_resolution(
+            server_args,
+            "_handle_encoder_disaggregation",
+            encoder_transfer_backend=resolve_encoder_transfer_backend(
+                cfg.encoder_transfer_backend, model_arch, cfg.tp_size
+            ),
+        )
+        if cfg.encoder_only or cfg.language_only:
+            logger.info(
+                "Encoder transfer backend auto-resolved to %s for %s at TP%d.",
+                cfg.encoder_transfer_backend,
+                model_arch,
+                cfg.tp_size,
+            )
+    if (cfg.encoder_only or cfg.language_only) and model_arch not in [
+        "Qwen2VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "InternS2PreviewForConditionalGeneration",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen2AudioForConditionalGeneration",
+        "Qwen2_5OmniForConditionalGeneration",
+        "Dots3NoteForCausalLM",
+        "KimiVLForConditionalGeneration",
+        "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "MiMoV2ForCausalLM",
+        "Glm5NextForConditionalGeneration",
+    ]:
+        raise ValueError(
+            f"Model type {model_arch} is not supported for encoder disaggregation. "
+            f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next."
         )

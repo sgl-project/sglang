@@ -17,7 +17,7 @@ from sglang.srt.layers.attention import vision
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 EMBED_DIM = 32
 NUM_HEADS = 4
@@ -67,9 +67,10 @@ def single_rank(monkeypatch, gloo_world):
         "_determine_attention_backend",
         lambda self, passed_backend: passed_backend,
     )
-    with get_parallel().override(
-        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-    ), get_context().override_server_args():
+    with (
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
+        get_context().override_server_args(),
+    ):
         yield
 
 
