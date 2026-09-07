@@ -4035,6 +4035,8 @@ class HybridLinearKVPool(KVCache):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
+        # Wait for HiCache load-back here; the inner pool's counter is disabled.
+        self._wait_for_layer(layer.layer_id)
         # Read door -- same kernel-facing contract as the write door: `loc` is
         # a read-index tensor already translated at its production site
         # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices); the
