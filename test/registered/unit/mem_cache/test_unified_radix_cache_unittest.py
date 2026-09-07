@@ -1341,7 +1341,10 @@ class TestUnifiedRadixCacheComponentPlacementEvents(
             sampling_params=sp,
         )
         req_to_token_pool.alloc([req])
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
+        # Set the two lengths in place: alloc already populated req.kv (mamba
+        # slot included), so rebinding it would drop the mamba registration.
+        req.kv.kv_allocated_len = 0
+        req.kv.swa_evicted_seqlen = 0
         return req
 
     def _stored(self, cache, medium=None):
@@ -1525,7 +1528,7 @@ class TestUnifiedRadixCacheComponentPlacementEvents(
             InsertParams(
                 key=RadixKey(array("q", tokens)),
                 value=value[: len(tokens)],
-                mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         stored = self._stored(cache, StorageMedium.GPU)
