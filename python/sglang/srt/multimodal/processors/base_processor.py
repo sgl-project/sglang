@@ -48,6 +48,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    VideoData,
     configure_media_url_security,
     envs,
     is_cpu,
@@ -63,6 +65,60 @@ from sglang.srt.utils import (
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
+_DATA_URI_PATTERN = re.compile(r"data:[^,\s]*,[^\s'\"<>]+", re.IGNORECASE)
+_MEDIA_URL_PATTERN = re.compile(r"(?:https?|file)://[^\s'\"<>]+", re.IGNORECASE)
+_MIME_TYPE_PATTERN = re.compile(r"[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*")
+
+
+def _describe_media_input(data) -> str:
+    if isinstance(data, (ImageData, VideoData)):
+        data = data.url
+    if isinstance(data, str):
+        if data.startswith("data:"):
+            metadata, separator, payload = data.partition(",")
+            mime_type = metadata[5:].split(";", 1)[0].lower()
+            if not _MIME_TYPE_PATTERN.fullmatch(mime_type):
+                mime_type = "unknown"
+            encoded_length = len(payload) if separator else 0
+            return f"<data-uri mime={mime_type} encoded_length={encoded_length}>"
+        if data.startswith(("http://", "https://")):
+            scheme = data.partition(":")[0].lower()
+            return f"<url scheme={scheme}>"
+        if data.startswith("file://"):
+            return "<file-uri>"
+        return f"<string length={len(data)}>"
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return f"<bytes length={len(data)}>"
+    if isinstance(data, Image.Image):
+        return f"<image mode={data.mode} size={data.width}x{data.height}>"
+    return f"<{type(data).__name__}>"
+
+
+def _redact_media_text(text: str, data) -> str:
+    descriptor = _describe_media_input(data)
+    raw_values = {str(data), repr(data)}
+    if isinstance(data, (ImageData, VideoData)):
+        raw_values.update((data.url, repr(data.url)))
+    for raw_value in sorted(raw_values, key=len, reverse=True):
+        if raw_value:
+            text = text.replace(raw_value, descriptor)
+    text = _DATA_URI_PATTERN.sub("<data-uri>", text)
+    return _MEDIA_URL_PATTERN.sub("<url>", text)
+
+
+def _sanitize_media_exception(error: Exception, data) -> Exception:
+    message = _redact_media_text(str(error), data)
+    try:
+        sanitized = type(error)(message)
+    except Exception:
+        sanitized = RuntimeError(f"{type(error).__name__}: {message}")
+    if error.__cause__ is not None:
+        sanitized.__cause__ = _sanitize_media_exception(error.__cause__, data)
+    elif error.__context__ is not None:
+        sanitized.__context__ = _sanitize_media_exception(error.__context__, data)
+    sanitized.__suppress_context__ = error.__suppress_context__
+    return sanitized
 
 
 @dataclasses.dataclass
@@ -960,6 +1016,8 @@ class BaseMultimodalProcessor(ABC):
         """
         if cls._is_preprocessed_input(data):
             return data
+        load_error = None
+        is_client_error = False
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
@@ -980,15 +1038,20 @@ class BaseMultimodalProcessor(ABC):
                 return load_audio(data, audio_sample_rate)
 
         except CLIENT_MEDIA_EXCEPTIONS as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise ValueError(f"Error while loading data {data_str}: {e}") from e
+            load_error = e
+            is_client_error = True
         except Exception as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
+            load_error = e
+
+        if load_error is not None:
+            sanitized_cause = _sanitize_media_exception(load_error, data)
+            message = (
+                f"Error while loading {modality.name.lower()} data "
+                f"{_describe_media_input(data)}: "
+                f"{type(load_error).__name__}: {sanitized_cause}"
+            )
+            exception_type = ValueError if is_client_error else RuntimeError
+            raise exception_type(message) from sanitized_cause
 
     @staticmethod
     def _get_preprocessed_input_format(data):
