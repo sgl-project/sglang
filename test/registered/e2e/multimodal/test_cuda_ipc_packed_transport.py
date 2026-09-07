@@ -86,6 +86,22 @@ def _publish_batch(commands, results, consumer_count, use_handle_cache):
             pool.shutdown()
 
 
+def _consume_second_rank(wire, device, results):
+    # Real TP ranks use separate processes, each with its own CUDA context.
+    torch.cuda.set_device(device)
+    proxies = pickle.loads(wire)
+    try:
+        for proxy, expected in zip(proxies, _features("cpu"), strict=True):
+            actual = proxy.reconstruct_on_target_device(device, consumer_rank=1)
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        results.put(("ok", None))
+    except BaseException as error:
+        results.put(("error", repr(error)))
+    finally:
+        proxies[0].owner._pool_storage = None
+        _pool_handle_cache_clear()
+
+
 @contextmanager
 def _published_batch(consumer_count=1, use_handle_cache=True):
     context = mp.get_context("spawn")
@@ -166,15 +182,22 @@ class TestPackedCudaIpcTransport(CustomTestCase):
             torch.cuda.synchronize()
             commands.put("inspect")
             self.assertEqual(results.get(timeout=10), ("leases", 1))
-            # Use a second physical GPU when available; one-GPU CI still checks
-            # independently deserialized TP consumers and distinct ack slots.
+            # One-GPU CI still checks independent processes and TP ack slots.
             device = min(1, torch.cuda.device_count() - 1)
-            second = pickle.loads(wire)
-            for proxy, expected in zip(second, _features("cpu"), strict=True):
-                actual = proxy.reconstruct_on_target_device(device, consumer_rank=1)
-                torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
-            torch.cuda.synchronize(device)
-            second[0].owner._pool_storage = None
+            context = mp.get_context("spawn")
+            consumer_results = context.Queue()
+            consumer = context.Process(
+                target=_consume_second_rank, args=(wire, device, consumer_results)
+            )
+            consumer.start()
+            try:
+                self.assertEqual(consumer_results.get(timeout=60), ("ok", None))
+            finally:
+                consumer.join(timeout=60)
+                if consumer.is_alive():
+                    consumer.terminate()
+                    consumer.join(timeout=10)
+            self.assertEqual(consumer.exitcode, 0)
             commands.put("reuse")
             self.assertEqual(results.get(timeout=10), ("reused", True))
 
