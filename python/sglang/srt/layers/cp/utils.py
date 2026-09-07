@@ -40,18 +40,6 @@ from sglang.srt.runtime_context import get_parallel
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
-    {
-        "DeepseekV32ForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        "GptOssForCausalLM",
-        "MiMoV2FlashForCausalLM",
-        "MiMoV2ForCausalLM",
-        "Qwen3MoeForCausalLM",
-        "DeepseekV3ForCausalLM",
-    }
-)
-
 
 def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
     """Whether DSA GPU KV/indexer cache layers are sharded across CP ranks.
@@ -130,10 +118,10 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
 
 
 def enable_cp_v2() -> bool:
-    """Return whether the CP-v2 path is enabled for this process."""
-    from sglang.srt.environ import envs
+    """Return whether the strategy-based generic prefill CP path is available."""
+    from sglang.srt.utils import is_hip, is_npu
 
-    return bool(envs.SGLANG_ENABLE_CP_V2.get())
+    return not (is_hip() or is_npu())
 
 
 def is_cp_v2_active(forward_batch) -> bool:
@@ -322,7 +310,6 @@ __all__ = [
     "InterleaveContextParallelMetadata",
     "ZigzagCPStrategy",
     "ZigzagContextParallelMetadata",
-    "CP_V2_DEFAULT_MODEL_CLASSES",
     "enable_cp_v2",
     "get_cp_strategy",
     "is_cp_v2_active",

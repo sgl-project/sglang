@@ -3,8 +3,8 @@ import torch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
-    topk_transform_512,
-    topk_transform_512_v2,
+    topk_transform_paged,
+    topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -42,10 +42,10 @@ def _build_paged_fn(
 
     def fn(scores, seq_lens, page_table):
         if provider == "jit_v1":
-            topk_transform_512(scores, seq_lens, page_table, out, N)
+            topk_transform_paged(scores, seq_lens, page_table, out, N)
             return out
         elif provider == "jit_v2":
-            topk_transform_512_v2(scores, seq_lens, page_table, out, N, metadata)
+            topk_transform_paged_v2(scores, seq_lens, page_table, out, N, metadata)
             return out
         elif provider == "flashinfer":
             from flashinfer import top_k_page_table_transform

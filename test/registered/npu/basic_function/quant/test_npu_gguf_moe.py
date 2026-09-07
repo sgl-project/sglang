@@ -28,7 +28,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendGGUFMoE(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()

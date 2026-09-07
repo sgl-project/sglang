@@ -222,7 +222,7 @@ class _LongCatFFN(nn.Module):
             ]
         )
         self.act = nn.GELU(approximate="tanh")
-        # quality="high" site: up-proj GEMM + tanh-GELU cublasLt epilogue. Off by
+        # extra-high/high site: up-proj GEMM + tanh-GELU epilogue. Off by
         # default; the denoising stage mounts it per batch. The ModuleDict holds
         # `proj` in _modules, so getattr resolves it for the fusion helper.
         mark_fused_gelu_site(self.net[0], "proj")
@@ -268,9 +268,9 @@ class _LongCatJointAttention(nn.Module):
         super().__init__()
         tp_size = get_tp_world_size()
         self.num_local_heads = num_attention_heads // tp_size
-        assert (
-            num_attention_heads % tp_size == 0
-        ), f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        assert num_attention_heads % tp_size == 0, (
+            f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -429,9 +429,9 @@ class _LongCatSingleAttention(nn.Module):
         super().__init__()
         tp_size = get_tp_world_size()
         self.num_local_heads = num_attention_heads // tp_size
-        assert (
-            num_attention_heads % tp_size == 0
-        ), f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        assert num_attention_heads % tp_size == 0, (
+            f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -511,7 +511,7 @@ class _SingleTransformerBlock(nn.Module):
             prefix=f"{prefix}.proj_mlp",
         )
         self.act_mlp = nn.GELU(approximate="tanh")
-        # quality="high" site: proj_mlp GEMM + tanh-GELU cublasLt epilogue,
+        # extra-high/high site: proj_mlp GEMM + tanh-GELU epilogue,
         # mounted per batch by the denoising stage; off (bit-exact) by default.
         mark_fused_gelu_site(self, "proj_mlp")
         # proj_out: RowParallelLinear reduces sharded [attn | mlp] concat via

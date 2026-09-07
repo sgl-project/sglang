@@ -20,7 +20,7 @@ from sglang.kernels.ops.attention.dsv4.gemm import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 
 # (hidden_size, n_routed_experts + zero experts) for LongCat-Flash Chat / Lite.
 _ROUTER_SHAPES = ((6144, 768), (3072, 384))
@@ -31,7 +31,6 @@ _ROUTER_SHAPES = ((6144, 768), (3072, 384))
     "requires HPC-Ops (https://github.com/Tencent/hpc-ops) and a Hopper GPU",
 )
 class TestLinearBf16Fp32Hpc(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mark_hpc_bf16xfp32_gemm_enabled()

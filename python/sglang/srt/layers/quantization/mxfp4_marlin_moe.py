@@ -159,7 +159,7 @@ class Mxfp4MarlinMoEMethod:
 
         log_info_on_rank0(
             logger,
-            f"Preparing MXFP4 experts for Marlin backend " f"(layer: {self.prefix})...",
+            f"Preparing MXFP4 experts for Marlin backend (layer: {self.prefix})...",
         )
         if self.runner.config.gemm1_alpha is not None:
             deinterleave_moe_mxfp4_w13_for_marlin(layer)
