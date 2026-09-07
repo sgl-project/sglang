@@ -39,6 +39,10 @@ from sglang.kernels.ops.attention.linear.gdn_blackwell import (  # noqa: E402
 @pytest.mark.parametrize("num_seqs", [1, 5, 257])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 def test_gdn_chunk_cutedsl_correctness(num_seqs: int, state_dtype: torch.dtype):
+    # Fixed per-case seed: the mean-error assertions sit close to the observed
+    # error distribution (state_error.mean() threshold 6e-4 vs ~6.3e-4 seen on
+    # unlucky draws in CI), so unseeded inputs make the test flaky.
+    torch.manual_seed(num_seqs)
     seq_lens = torch.randint(1, 130, (num_seqs,), dtype=torch.int32)
     cu_seqlens = torch.zeros(num_seqs + 1, device="cuda", dtype=torch.int32)
     cu_seqlens[1:] = seq_lens.to(device="cuda").cumsum(0)

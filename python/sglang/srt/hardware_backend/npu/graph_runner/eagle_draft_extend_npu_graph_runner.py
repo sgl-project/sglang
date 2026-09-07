@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
@@ -35,7 +35,8 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
         return torch.int32
 
     def _replay_graph(self, shape_key, forward_batch):
-        if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
+        hf_config = self.model_runner.model_config.hf_config
+        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
                 self.bs - self.raw_bs
             )

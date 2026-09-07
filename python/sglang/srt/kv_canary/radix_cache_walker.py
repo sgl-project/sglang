@@ -1,29 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.mem_cache.unified_cache_components import (
-    BASE_COMPONENT_TYPE,
-    ComponentType,
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    RadixCacheWalkResult,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.radix_cache import TreeNode
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class RadixCacheWalkResult:
-    slot_indices: torch.Tensor
-    positions: torch.Tensor
-    prev_slot_indices: torch.Tensor
 
 
 def walk_radix_cache_for_canary(
@@ -40,11 +30,11 @@ def walk_radix_cache_for_canary(
     req. ``swa_resident_only=True`` skips SWA-tombstoned nodes (slots evicted from the SWA
     window)."""
     cache_type = type(radix_cache)
-    if (
-        cache_type is not RadixCache
-        and cache_type is not SWARadixCache
-        and cache_type is not UnifiedRadixCache
-    ):
+    if cache_type is UnifiedRadixCache:
+        return radix_cache.tree_core.walk_for_kv_canary(
+            unlocked_only=unlocked_only, swa_resident_only=swa_resident_only
+        )
+    if cache_type is not RadixCache and cache_type is not SWARadixCache:
         raise NotImplementedError(
             f"walk_radix_cache_for_canary does not support {cache_type.__name__}"
         )
@@ -78,7 +68,7 @@ def walk_radix_cache_for_canary(
 
 def _walk_radix_subtree(
     *,
-    node: TreeNode | UnifiedTreeNode,
+    node: TreeNode,
     radix_cache: BasePrefixCache,
     depth: int,
     parent_last_slot: int,
@@ -89,13 +79,11 @@ def _walk_radix_subtree(
     unlocked_only: bool,
     swa_resident_only: bool,
 ) -> None:
-    node_slots = _node_slots_for_canary(node=node, radix_cache=radix_cache)
+    node_slots = _node_slots_for_canary(node=node)
 
     if unlocked_only:
         emit_slots = not is_root and _node_is_unlocked_for_canary(
-            node=node,
-            radix_cache=radix_cache,
-            swa_resident_only=swa_resident_only,
+            node=node, radix_cache=radix_cache
         )
     else:
         emit_slots = not is_root
@@ -114,12 +102,7 @@ def _walk_radix_subtree(
             prev_slot_buf.append(prev)
         chain_last_slot = slot
 
-    child_depth = depth + _node_len_for_canary(
-        node=node,
-        radix_cache=radix_cache,
-        node_slots=node_slots,
-        is_root=is_root,
-    )
+    child_depth = depth + len(node_slots)
     for child in node.children.values():
         _walk_radix_subtree(
             node=child,
@@ -135,55 +118,23 @@ def _walk_radix_subtree(
         )
 
 
-def _node_slots_for_canary(
-    *,
-    node: TreeNode | UnifiedTreeNode,
-    radix_cache: BasePrefixCache,
-) -> list[int]:
-    value: Any
-    if type(radix_cache) is UnifiedRadixCache:
-        value = node.component_data[BASE_COMPONENT_TYPE].value
-    else:
-        value = node.value
-
+def _node_slots_for_canary(*, node: TreeNode) -> list[int]:
+    value: Any = node.value
     if isinstance(value, torch.Tensor):
         return [int(s) for s in value.tolist()]
     return []
 
 
-def _node_len_for_canary(
-    *,
-    node: TreeNode | UnifiedTreeNode,
-    radix_cache: BasePrefixCache,
-    node_slots: list[int],
-    is_root: bool,
-) -> int:
-    if type(radix_cache) is not UnifiedRadixCache:
-        return len(node_slots)
-
-    if is_root or node.key is None:
-        return len(node_slots)
-    return len(node.key)
-
-
 def _node_is_unlocked_for_canary(
     *,
-    node: TreeNode | UnifiedTreeNode,
+    node: TreeNode,
     radix_cache: BasePrefixCache,
-    swa_resident_only: bool,
 ) -> bool:
     if type(radix_cache) is RadixCache:
         return node.lock_ref == 0
 
     if type(radix_cache) is SWARadixCache:
         return node.full_lock_ref == 0
-
-    if type(radix_cache) is UnifiedRadixCache:
-        if swa_resident_only and radix_cache.supports_swa():
-            # Unified SWA owns an independent component lock. A node can still
-            # hold Full KV for a running request while its SWA slots are unused.
-            return node.component_data[ComponentType.SWA].lock_ref == 0
-        return node.component_data[BASE_COMPONENT_TYPE].lock_ref == 0
 
     raise NotImplementedError(
         f"walk_radix_cache_for_canary does not support {type(radix_cache).__name__}"
@@ -192,15 +143,10 @@ def _node_is_unlocked_for_canary(
 
 def _node_is_swa_resident_for_canary(
     *,
-    node: TreeNode | UnifiedTreeNode,
+    node: TreeNode,
     radix_cache: BasePrefixCache,
 ) -> bool:
     if type(radix_cache) is SWARadixCache:
         return not node.swa_tombstone
-
-    if type(radix_cache) is UnifiedRadixCache:
-        if not radix_cache.supports_swa():
-            return True
-        return node.component_data[ComponentType.SWA].value is not None
 
     return True

@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.mem_cache.unified_cache_components import ComponentType
-    from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
         TreeComponent,
     )
 
@@ -27,6 +27,9 @@ class CacheInitParams:
     attn_tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     pp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
+    # Keyword arguments for the eviction policy's constructor; see the strategy
+    # classes in evict_policy.py for what each policy accepts.
+    eviction_policy_config: Optional[dict[str, Any]] = None
     disable_finished_insert: bool = False
 
     enable_metrics: bool = False
@@ -53,3 +56,5 @@ class CacheInitParams:
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
         None
     )
+
+    mtp_draft_device_pools: tuple[object, ...] = ()

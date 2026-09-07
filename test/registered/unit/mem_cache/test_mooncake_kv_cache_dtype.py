@@ -1,14 +1,11 @@
 """Unit tests for Mooncake KV-cache dtype isolation via tenant_id."""
 
-import json
-import tempfile
 import types
 import unittest
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     format_kv_cache_dtype,
@@ -171,7 +168,7 @@ def _make_config(
         is_mla_model=False,
         enable_storage_metrics=False,
         is_page_first_layout=True,
-        model_name="test",
+        model_name=None,
         extra_config=extra_config,
         kv_cache_dtype=kv_cache_dtype,
     )
@@ -277,93 +274,6 @@ class TestMooncakeKvCacheDtypeIsolation(CustomTestCase):
 
     def test_dtype_isolation_requires_mooncake_tenant_id(self):
         _assert_old_mooncake_rejects_tenant(self, kv_cache_dtype="bfloat16")
-
-
-class TestMooncakeTenantConfig(CustomTestCase):
-    def test_load_from_extra_config_normalizes_tenant(self):
-        with patch.dict("sys.modules", _import_stubs(_fake_store_class())):
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                DEFAULT_TENANT_ID,
-                MooncakeStoreConfig,
-            )
-
-            cfg = MooncakeStoreConfig.load_from_extra_config(
-                {
-                    "master_server_address": "127.0.0.1:50051",
-                    "tenant_id": " tenant-extra ",
-                }
-            )
-            self.assertEqual(cfg.tenant_id, "tenant-extra")
-
-            cfg = MooncakeStoreConfig.load_from_extra_config(
-                {
-                    "master_server_address": "127.0.0.1:50051",
-                    "tenant_id": " ",
-                }
-            )
-            self.assertEqual(cfg.tenant_id, DEFAULT_TENANT_ID)
-
-    def test_load_from_env_reads_mooncake_tenant_id(self):
-        with patch.dict("sys.modules", _import_stubs(_fake_store_class())):
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStoreConfig,
-            )
-
-            with (
-                envs.MOONCAKE_MASTER.override("127.0.0.1:50051"),
-                envs.MOONCAKE_TENANT_ID.override("tenant-env"),
-            ):
-                cfg = MooncakeStoreConfig.load_from_env()
-        self.assertEqual(cfg.tenant_id, "tenant-env")
-
-    def test_load_from_file_reads_tenant_id(self):
-        with patch.dict("sys.modules", _import_stubs(_fake_store_class())):
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStoreConfig,
-            )
-
-            with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
-                json.dump(
-                    {
-                        "master_server_address": "127.0.0.1:50051",
-                        "tenant_id": "tenant-file",
-                    },
-                    config_file,
-                )
-                config_file.flush()
-                with envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.override(
-                    config_file.name
-                ):
-                    cfg = MooncakeStoreConfig.from_file()
-        self.assertEqual(cfg.tenant_id, "tenant-file")
-
-    def test_forwards_non_default_tenant_id(self):
-        store, fake_store = _make_store(tenant_id="tenant-a")
-        self.assertEqual(fake_store.setup_calls[0][1]["tenant_id"], "tenant-a")
-
-    def test_default_tenant_is_not_passed_to_setup(self):
-        store, fake_store = _make_store()
-        self.assertNotIn("tenant_id", fake_store.setup_calls[0][1])
-
-    def test_non_default_tenant_requires_new_mooncake(self):
-        _assert_old_mooncake_rejects_tenant(self, tenant_id="tenant-a")
-
-    def test_embedding_store_forwards_tenant_id(self):
-        fake_store_cls = _fake_store_class()
-        storage_config = types.SimpleNamespace(
-            extra_config={
-                "master_server_address": "127.0.0.1:50051",
-                "tenant_id": "tenant-embedding",
-            }
-        )
-        with patch.dict("sys.modules", _import_stubs(fake_store_cls)):
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
-                MooncakeEmbeddingStore,
-            )
-
-            MooncakeEmbeddingStore(storage_config)
-        fake_store = fake_store_cls.instances[-1]
-        self.assertEqual(fake_store.setup_calls[0][1]["tenant_id"], "tenant-embedding")
 
 
 if __name__ == "__main__":

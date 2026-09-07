@@ -236,18 +236,17 @@ def qkv_lora_b_fwd(
         and batch_info.max_len >= _CUBLAS_MIN_MAX_LEN
         and qkv_lora_b.shape[0]
         == 1  # single-adapter fast path: only valid with one resident slot
+        and x.dtype == qkv_lora_b.dtype
     ):
         return _qkv_lora_b_cublas(
             x, qkv_lora_b, batch_info, output_offset_cpu, base_output, n_slices
         )
 
     BLOCK_S = 16
-    BLOCK_R = triton.next_power_of_2(r)
-    # BLOCK_OUT stays 64: with the 1-adapter cuBLAS dispatch the Triton path
-    # only runs for decode-sized batches, where 128 halves the grid (96->48
-    # programs on Kimi r16 bs64) and slows the kernel ~60% (11.4->18.5us, B200).
-    # Re-swept for the store path on GB200: 32 vs 64 is within noise (one preset
-    # marginally each way), so the single value is kept for both writebacks.
+    # Pad to >=16 for Triton MMA K>=16 (rank<16 adapters); k_offset < K=r masks the
+    # padded contraction rows to 0, so the result is unchanged.
+    BLOCK_R = max(16, triton.next_power_of_2(r))
+    # Keep one output tile size for both writeback paths.
     BLOCK_OUT = 64
 
     grid_b = (

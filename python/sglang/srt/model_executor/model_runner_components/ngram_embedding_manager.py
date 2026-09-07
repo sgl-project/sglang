@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.kernels.ops.speculative.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -32,7 +32,6 @@ class NgramEmbeddingManager:
         model: torch.nn.Module,
         model_config: ModelConfig,
         req_to_token_pool: ReqToTokenPool,
-        server_args: ServerArgs,
         max_running_requests: int,
         device: str,
     ):
@@ -50,10 +49,10 @@ class NgramEmbeddingManager:
                 dtype=torch.int32,
                 device=device,
             )
-            chunked_prefill_size = server_args.chunked_prefill_size
-            assert (
-                chunked_prefill_size is not None and chunked_prefill_size > 0
-            ), "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
+            chunked_prefill_size = get_schedule().chunked_prefill_size
+            assert chunked_prefill_size is not None and chunked_prefill_size > 0, (
+                "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
+            )
             for module in model.modules():
                 if isinstance(module, NgramEmbedding):
                     module.init_buffers(
@@ -177,14 +176,17 @@ def update_ngram_token_table_after_sampling(
         )
         return True
 
-    ngram_embedding_info.out_column_starts[:batch_size] = seq_lens
+    # NGRAM_BS_FIX: seq_lens / next_token_ids / req_pool_indices may be padded to the
+    # cuda-graph batch size while batch_size is the real request count. Slice to
+    # batch_size so padded rows don't pollute the token table (and shapes match).
+    ngram_embedding_info.out_column_starts[:batch_size] = seq_lens[:batch_size]
     ngram_embedding_info.out_req_lens[:batch_size] = 1
     update_token_table(
         ne_token_table=ngram_embedding_info.token_table,
-        tokens=next_token_ids.to(torch.int32),
-        row_indices=req_pool_indices,
-        column_starts=ngram_embedding_info.out_column_starts,
-        req_lens=ngram_embedding_info.out_req_lens,
+        tokens=next_token_ids[:batch_size].to(torch.int32),
+        row_indices=req_pool_indices[:batch_size],
+        column_starts=ngram_embedding_info.out_column_starts[:batch_size],
+        req_lens=ngram_embedding_info.out_req_lens[:batch_size],
         ignore_tokens=None,
     )
     return True

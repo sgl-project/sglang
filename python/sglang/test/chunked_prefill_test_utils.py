@@ -4,7 +4,6 @@ import time
 from types import SimpleNamespace
 from typing import ClassVar, List, Optional
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -14,6 +13,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     try_cached_model,
 )
 
@@ -106,7 +106,7 @@ class ChunkedTestBase(ChunkedGsm8kMixin, CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if cls.process is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
 
 class ChunkedTestPDBase(ChunkedGsm8kMixin, PDDisaggregationServerBase):

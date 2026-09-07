@@ -33,7 +33,7 @@ from sglang.test.test_utils import (
     is_in_ci,
 )
 
-register_cuda_ci(est_time=280, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=130, stage="extra-a", runner_config="2-gpu-large")
 
 LOGPROB_THRESHOLD = 5e-04
 # Chunked vs non-chunked runs differ only in lm_head matmul shape (16-row
@@ -161,7 +161,7 @@ class TestMoELoRATP2Logprobs(CustomTestCase):
         prompts = MOE_LORA_TEST_PROMPTS[:3]
         baseline = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
         torch.cuda.empty_cache()
-        with envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.override(16):
+        with envs.SGLANG_LOGPROB_CHUNK_SIZE.override(16):
             chunked = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
 
         for i in range(len(prompts)):

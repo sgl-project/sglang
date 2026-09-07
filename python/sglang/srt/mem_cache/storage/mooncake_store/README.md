@@ -205,7 +205,7 @@ python -m sglang.launch_server \
     --enable-hierarchical-cache \
     --hicache-storage-backend mooncake \
     --model-path [model_path] \
-    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "local_hostname": "localhost", "metadata_server": "http://127.0.0.1:8080/metadata", "global_segment_size": "4gb", "protocol": "rdma", "device_name": ""}'
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "local_hostname": "localhost", "metadata_server": "http://127.0.0.1:8080/metadata", "global_segment_size": "4gb", "protocol": "rdma", "device_name": "", "tenant_id": "tenant-a"}'
 ```
 
 **Using JSON file to configure Mooncake**
@@ -221,7 +221,8 @@ echo '{
     "master_server_address": "127.0.0.1:50051",
     "protocol": "rdma",
     "device_name": "",
-    "global_segment_size": "4gb"
+    "global_segment_size": "4gb",
+    "tenant_id": "tenant-a"
 }' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
 
 python -m sglang.launch_server \
@@ -238,6 +239,7 @@ MOONCAKE_MASTER="127.0.0.1:50051" \
 MOONCAKE_PROTOCOL="rdma" \
 MOONCAKE_DEVICE="" \
 MOONCAKE_GLOBAL_SEGMENT_SIZE="4gb" \
+MOONCAKE_TENANT_ID="tenant-a" \
 python -m sglang.launch_server \
     --enable-hierarchical-cache \
     --hicache-storage-backend mooncake\
@@ -251,6 +253,14 @@ The Mooncake parameters used here are essentially the same as those configured f
 In particular, for the `global segment size`, if at least one `store service` instance is running, this value can be set to `0`. In this case, the SGLang server will not contribute any memory to the system. Note that KV tensors stored in this contributed memory will be lost when the process exits; however, this will **not** cause any system errors.
 
 **Important:** when `tp > 1`, each Tensor Parallel (TP) rank launches its own Mooncake backend instance and contributes `1/global_segment_size` memory. Therefore, the total memory consumption equals `global segment size`.
+
+**Tenant Isolation (`tenant_id`):**
+
+When `tenant_id` is set, SGLang forwards it to `MooncakeDistributedStore.setup(..., tenant_id=...)`. Producers and consumers that should share HiCache data must use the same `tenant_id`.
+
+You can configure it through `tenant_id` in `--hicache-storage-backend-extra-config`, `tenant_id` in the JSON config file, or `MOONCAKE_TENANT_ID`.
+
+> **Note:** strict isolation between tenants requires a Mooncake master started with `--enable_multi_tenants=true` and a tenant quota policy that explicitly registers each tenant. When strict multi-tenant mode is disabled, Mooncake ignores request tenant IDs for object placement and all objects use the `default` namespace. Non-default `tenant_id` requires **mooncake-transfer-engine >= 0.3.12**, which added `tenant_id` to `MooncakeDistributedStore.setup()`. In `standalone_storage` mode, start the external `mooncake_client` with the matching `--tenant_id` because that process owns the real Mooncake client. If you use `--enable_multi_tenants=true`, register the composed tenant name produced by KV-cache dtype isolation (for example `dtype_bfloat16` or `tenant-a_dtype_fp8_e4m3`).
 
 **SSD Offload (`enable_ssd_offload`):**
 
@@ -314,7 +324,7 @@ HiCache keys do not include `--kv-cache-dtype`. Sharing one Mooncake store betwe
 - Default tenant + `bfloat16` → `dtype_bfloat16`
 - Explicit tenant `tenant-a` + `fp8_e4m3` → `tenant-a_dtype_fp8_e4m3`
 
-This requires **mooncake-transfer-engine >= 0.3.12**. Older packages fail at `setup()` with an upgrade hint. `extra_backend_tag` still prefixes object keys and is independent of dtype isolation.
+This requires **mooncake-transfer-engine >= 0.3.12**. Older packages fail at `setup()` with an upgrade hint. `extra_backend_tag` and `model_name` still prefix object keys via `config_prefix` and are independent of dtype isolation.
 
 ```bash
 python -m sglang.launch_server \
@@ -323,12 +333,6 @@ python -m sglang.launch_server \
     --kv-cache-dtype fp8_e4m3 \
     --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "tenant_id": "tenant-a"}'
 ```
-
-**Mooncake Tenant ID (`tenant_id`):**
-
-SGLang forwards a non-default `tenant_id` to `MooncakeDistributedStore.setup(..., tenant_id=...)`. Set it in `--hicache-storage-backend-extra-config`, in the JSON file selected by `SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`, or with `MOONCAKE_TENANT_ID`. The default `"default"` is not passed to `setup()` unless dtype isolation composes a tenant such as `dtype_bfloat16`.
-
-When the master is started with `--enable_multi_tenants=true`, register the composed tenant name (including the dtype suffix). Instances that should share KV entries must use the same tenant and compatible model / dtype / release namespaces.
 
 **HiCache Related Parameters for SGLang Server**
 

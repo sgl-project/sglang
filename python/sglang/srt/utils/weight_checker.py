@@ -55,7 +55,7 @@ _NON_PERSISTENT_BUFFER_PATTERNS = (
     "cos_sin_cache",
     "inv_freq",
     "freqs_cis",
-    "_weight_fp32",
+    "expert_mask_gpu",
 )
 
 
@@ -89,9 +89,9 @@ class WeightChecker:
             (name, param.data.detach().cpu()) for name, param in self._model_state()
         ]
         self._snapshot_tensors = dict(named_tensors)
-        assert len(self._snapshot_tensors) == len(
-            named_tensors
-        ), f"should not have duplicated tensor name"
+        assert len(self._snapshot_tensors) == len(named_tensors), (
+            f"should not have duplicated tensor name"
+        )
 
     def _reset_tensors(self):
         for name, param in self._model_state():
@@ -194,10 +194,13 @@ def _check_tensors(
         actual_should_compare,
         actual_comparable,
     ) in zip(expect_tensors, actual_tensors, strict=True):
+        if ".cos_sin_cache" in expect_name:
+            # skip cos/sin cache which is deterministic from shape and dtype and may have different shapes due to different implementations.
+            continue
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
-        assert (
-            should_compare == actual_should_compare
-        ), f"{should_compare=} {actual_should_compare=}"
+        assert should_compare == actual_should_compare, (
+            f"{should_compare=} {actual_should_compare=}"
+        )
         name = expect_name
 
         try:

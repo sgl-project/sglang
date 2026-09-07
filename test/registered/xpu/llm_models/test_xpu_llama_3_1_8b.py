@@ -3,8 +3,7 @@
 TP=4 wedges the Level Zero driver during the first prefill batch on Arc/BMG;
 TP=2 runs cleanly with the same model and serves at ~18 tok/s.
 
-Scored by ``simple_eval_gsm8k.GSM8KEval`` (the same evaluator AMD and
-NVIDIA nightlies use); threshold mirrors theirs.
+Scored by ``simple_eval_gsm8k.GSM8KEval``.
 """
 
 import unittest

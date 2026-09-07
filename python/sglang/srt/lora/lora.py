@@ -203,6 +203,8 @@ class LoRAAdapter(nn.Module):
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
+            self.normalize_inkling_qkvr_proj(weight_names, layer.weights)
+            self._normalize_shared_expert_moe(layer.weights)
             self._rename_expert_w_to_proj(layer.weights)
             # Stack gate_proj + x_proj → in_proj for Mamba layers (before gate_up normalization)
             self._normalize_in_proj(layer.weights)
@@ -212,6 +214,52 @@ class LoRAAdapter(nn.Module):
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
+
+    def normalize_inkling_qkvr_proj(
+        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+    ):
+        """Normalize Inkling split attention LoRA keys into the runtime qkvr layer.
+
+        Inkling checkpoints expose separate attention projections
+        (wq_du/wk_dv/wv_dv/wr_du), while the serving model uses a single
+        MergedColumnParallelLinear named qkvr with those slices in that order.
+        """
+        for weight_name in weight_names:
+            if "wq_du" not in weight_name:
+                continue
+
+            q_name = weight_name
+            k_name = weight_name.replace("wq_du", "wk_dv")
+            v_name = weight_name.replace("wq_du", "wv_dv")
+            r_name = weight_name.replace("wq_du", "wr_du")
+            qkvr_name = weight_name.replace("wq_du", "qkvr")
+
+            if any(name not in weights for name in (k_name, v_name, r_name)):
+                continue
+
+            cat_dim = weights[q_name].dim() - 2
+            weights[qkvr_name] = torch.cat(
+                (
+                    weights[q_name],
+                    weights[k_name],
+                    weights[v_name],
+                    weights[r_name],
+                ),
+                cat_dim,
+            )
+            weights.pop(q_name)
+            weights.pop(k_name)
+            weights.pop(v_name)
+            weights.pop(r_name)
+
+        for weight_name in list(weights.keys()):
+            if "qkvr" not in weight_name or "lora_A" not in weight_name:
+                continue
+            if weights[weight_name].shape[-2] != self.config.r:
+                continue
+            repeat_dims = [1] * weights[weight_name].dim()
+            repeat_dims[-2] = 4
+            weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
@@ -265,6 +313,61 @@ class LoRAAdapter(nn.Module):
                 if "lora_A" in weight_name:
                     weights[qkv_name] = weights[qkv_name].repeat(3, 1)
                 # else: no-op as LoRA B weight is already stacked.
+
+    def _normalize_shared_expert_moe(self, weights: Dict[str, torch.Tensor]):
+        """Reshape flat Inkling shared-sink factors to shared-outer 3D form."""
+        # Gate on the architecture so other models with 2D shared experts keep
+        # the stock path.
+        cfg = self.base_hf_config
+        if hasattr(cfg, "get_text_config"):
+            cfg = cfg.get_text_config()
+        archs = list(getattr(self.base_hf_config, "architectures", None) or [])
+        archs += list(getattr(cfg, "architectures", None) or [])
+        is_inkling = (
+            any("Inkling" in arch for arch in archs)
+            or "inkling" in str(getattr(cfg, "model_type", "")).lower()
+        )
+        if not is_inkling:
+            return
+        num_shared = getattr(cfg, "n_shared_experts", 0) or 0
+        if num_shared <= 0:
+            return
+        for name in list(weights.keys()):
+            if "shared_experts." not in name:
+                continue
+            if re.search(r"shared_experts\.\d+\.", name):
+                # Preserve named per-expert factors so adapter validation can
+                # reject outer factors that are not actually shared.
+                continue
+            is_down = any(k in name for k in (".w2.", ".down_proj."))
+            is_gate_up = any(
+                k in name
+                for k in (
+                    ".w1.",
+                    ".w3.",
+                    ".gate_proj.",
+                    ".up_proj.",
+                    ".gate_up_proj.",
+                )
+            )
+            if not (is_down or is_gate_up):
+                continue
+            w = weights[name]
+            if w.dim() != 2:
+                continue
+            if "lora_A" in name:
+                if is_down:
+                    r, flat = w.shape
+                    weights[name] = w.reshape(r, num_shared, flat // num_shared)
+                    weights[name] = weights[name].transpose(0, 1).contiguous()
+                else:
+                    weights[name] = w.unsqueeze(0)
+            else:
+                if is_down:
+                    weights[name] = w.unsqueeze(0)
+                else:
+                    flat, r = w.shape
+                    weights[name] = w.reshape(num_shared, flat // num_shared, r)
 
     def _rename_expert_w_to_proj(self, weights: Dict[str, torch.Tensor]):
         """Rename w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj so that

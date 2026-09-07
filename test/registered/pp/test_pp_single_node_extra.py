@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=350, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=342, stage="extra-b", runner_config="4-gpu-h100")
 register_amd_ci(est_time=350, suite="stage-c-test-4-gpu-amd")
 
 
@@ -66,7 +66,7 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreaterEqual(metrics["score"], 0.60)
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
 

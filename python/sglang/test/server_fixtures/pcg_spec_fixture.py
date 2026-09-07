@@ -16,12 +16,12 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 
@@ -40,9 +40,9 @@ class PCGSpecBase:
 
     @classmethod
     def setUpClass(cls):
-        assert (
-            cls.model and cls.server_args
-        ), f"{cls.__name__} must set `model` and `server_args`"
+        assert cls.model and cls.server_args, (
+            f"{cls.__name__} must set `model` and `server_args`"
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
         kwargs = dict(
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * cls.timeout_mult,
@@ -54,7 +54,7 @@ class PCGSpecBase:
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_gsm8k(self):
         eval_kwargs = dict(

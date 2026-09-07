@@ -1,0 +1,101 @@
+name: PR Test Mori (AMD)
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        type: string
+        default: ""
+      amd_ci_image:
+        description: "Override AMD CI Docker image"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+concurrency:
+  group: pr-test-amd-mori-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.action != 'labeled' }}
+
+jobs:
+  mori-pd:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-mori-pd') ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-mori-pd'))
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Detect RDMA device
+        run: |
+          if compgen -G "/sys/class/infiniband/*" > /dev/null; then
+            echo "SGLANG_TEST_RDMA_DEVICE=rdma0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Start disaggregation container
+        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm724
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run Mori PD tests
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -w /sglang-checkout/test \
+            python3 registered/amd/disaggregation/test_mori_transfer_engine_e2e.py
+
+  mori-hicache:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-mori-hicache') ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-mori-hicache'))
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm724
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+
+      - name: Run Mori HiCache tests
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -w /sglang-checkout/test \
+            python3 registered/hicache/test_hicache_storage_umbp_backend.py

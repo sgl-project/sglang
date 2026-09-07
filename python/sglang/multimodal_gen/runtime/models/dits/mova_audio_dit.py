@@ -1,8 +1,8 @@
 # Copied and adapted from: mossVG/mova/diffusion/models/wan_audio_dit.py
 # SPDX-License-Identifier: Apache-2.0
 #
-# NOTE: This module reuses common functions from mova_video_dit.py to reduce code duplication.
-# Audio-specific functions (precompute_freqs_cis_1d, legacy_precompute_freqs_cis_1d) are kept here.
+# NOTE: This module reuses common functions from mova_video_dit.py to reduce
+# code duplication. Audio-specific precompute_freqs_cis_1d is kept here.
 
 import math
 from typing import Any, Optional, Tuple
@@ -13,6 +13,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -25,23 +26,6 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 # Reuse common functions and classes from mova_video_dit
 from .mova_video_dit import DiTBlock, precompute_freqs_cis, sinusoidal_embedding_1d
-
-
-# Audio-specific positional encoding functions
-def legacy_precompute_freqs_cis_1d(
-    dim: int,
-    end: int = 16384,
-    theta: float = 10000.0,
-    base_tps=4.0,
-    target_tps=44100 / 2048,
-):
-    s = float(base_tps) / float(target_tps)
-    # 1d rope precompute
-    f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta, s)
-    # No positional encoding is applied to the remaining dimensions
-    no_freqs_cis = precompute_freqs_cis(dim // 3, end, theta, s)
-    no_freqs_cis = torch.ones_like(no_freqs_cis)
-    return f_freqs_cis, no_freqs_cis, no_freqs_cis
 
 
 def precompute_freqs_cis_1d(dim: int, end: int = 16384, theta: float = 10000.0):
@@ -104,9 +88,8 @@ class Conv1dLocalIsland(nn.Conv1d):
 
 
 class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = MOVAAudioConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVAAudioConfig()._compile_conditions
-    _supported_attention_backends = MOVAAudioConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = MOVAAudioConfig().param_names_mapping
     reverse_param_names_mapping = MOVAAudioConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVAAudioConfig().lora_param_names_mapping

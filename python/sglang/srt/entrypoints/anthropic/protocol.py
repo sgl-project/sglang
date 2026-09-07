@@ -284,13 +284,13 @@ class AnthropicThinkingParam(BaseModel):
         if self.type == "enabled":
             if self.budget_tokens is None:
                 raise ValueError(
-                    "thinking.budget_tokens is required when "
-                    "thinking.type is 'enabled'"
+                    "thinking.budget_tokens is required when thinking.type is 'enabled'"
                 )
             if self.budget_tokens < 1024:
                 raise ValueError(
-                    "thinking.budget_tokens must be >= 1024 "
-                    "(got {})".format(self.budget_tokens)
+                    "thinking.budget_tokens must be >= 1024 (got {})".format(
+                        self.budget_tokens
+                    )
                 )
         elif self.type == "disabled":
             if self.budget_tokens is not None:
@@ -300,8 +300,7 @@ class AnthropicThinkingParam(BaseModel):
                 )
             if self.display is not None:
                 raise ValueError(
-                    "thinking.display is not allowed when "
-                    "thinking.type is 'disabled'"
+                    "thinking.display is not allowed when thinking.type is 'disabled'"
                 )
         elif self.type == "adaptive":
             if self.budget_tokens is not None:
@@ -334,7 +333,7 @@ class AnthropicOutputConfig(BaseModel):
     ``task_budget`` is propagated as a custom-param hint.
     """
 
-    effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = None
+    effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "max"]] = None
     task_budget: Optional[AnthropicTaskBudget] = None
 
 

@@ -1,14 +1,8 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.kits.attention_unittest.attention_methods.dual_chunk_attention import (
     DualChunkAttentionCase,
     make_dual_chunk_cases,
@@ -23,11 +17,12 @@ from sglang.test.kits.attention_unittest.attention_methods.dual_chunk_attention 
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dual_chunk_cuda_graph_decode_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 # Container gate (KNOWN_FAILURES.md §1): `DualChunkFlashAttentionBackend` calls
 # `flash_attn_varlen_func` on every forward via
-# `sglang.jit_kernel.flash_attention`. On SM8x/SM9x, that resolves to sgl-kernel's
+# `sglang.kernels.ops.attention.flash_attention`. On SM8x/SM9x, that resolves to sgl-kernel's
 # FA3 build (which works). On SM != {8, 9} (notably SM10.3 / GB300), the JIT
 # kernel falls back to the upstream `flash_attn` (FA2) wheel — but the
 # `lmsysorg/sglang:nightly-dev-cu13` container's `flash_attn` package ships
@@ -40,7 +35,7 @@ def _dual_chunk_fa_supported() -> tuple[bool, str]:
         return False, "CUDA is required"
     major, _minor = torch.cuda.get_device_capability()
     # FA3 path is taken when sm major is 8 or 9 (see
-    # `sglang.jit_kernel.flash_attention_v3._is_fa3_supported`). On that path
+    # `sglang.kernels.ops.attention.flash_attention_v3._is_fa3_supported`). On that path
     # the upstream `flash_attn` fallback is never invoked.
     if major in (8, 9):
         return True, ""
@@ -65,8 +60,8 @@ _DUAL_CHUNK_FLASH_ATTN_AVAILABLE, _DUAL_CHUNK_SKIP_REASON = _dual_chunk_fa_suppo
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

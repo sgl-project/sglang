@@ -19,7 +19,7 @@ on:
         default: ''
         type: string
       publish_target_dir:
-        description: 'Remote target directory in sgl-project/ci-data. Leave empty to use diffusion-ci/consistency_gt/sglang_generated/ascend.'
+        description: 'Remote target directory in sgl-project/ci-data-diffusion. Leave empty to use diffusion-ci/consistency_gt/sglang_generated/ascend.'
         required: false
         default: ''
         type: string
@@ -61,6 +61,16 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Verify write access to sgl-project/ci-data-diffusion
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          if [ "$(gh api repos/sgl-project/ci-data-diffusion --jq .permissions.push)" != "true" ]; then
+            echo "::error::GH_PAT_FOR_NIGHTLY_CI_DATA lacks write (push) access to sgl-project/ci-data-diffusion. Grant it before running GT generation."
+            exit 1
+          fi
+          echo "OK: write access to sgl-project/ci-data-diffusion confirmed"
+
       - name: Compute partitions
         env:
           USE_NPU_CONFIGS: true
@@ -78,7 +88,7 @@ jobs:
     if: |
       needs.compute-diffusion-partitions.result == 'success' &&
       needs.compute-diffusion-partitions.outputs.matrix-1npu != '{"include":[]}'
-    runs-on: linux-aarch64-a3-2
+    runs-on: linux-aarch64-a3-800t-2
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-1npu) }}
@@ -88,6 +98,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Mark repository safe
         run: |
@@ -135,7 +147,7 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Publish GT images to sgl-project/ci-data-diffusion
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -148,7 +160,7 @@ jobs:
     if: |
       needs.compute-diffusion-partitions.result == 'success' &&
       needs.compute-diffusion-partitions.outputs.matrix-2npu != '{"include":[]}'
-    runs-on: linux-aarch64-a3-16
+    runs-on: linux-aarch64-a3-800t-16
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2npu) }}
@@ -158,6 +170,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Mark repository safe
         run: |
@@ -205,7 +219,7 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Publish GT images to sgl-project/ci-data-diffusion
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
