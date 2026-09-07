@@ -377,6 +377,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager = object.__new__(TokenizerManager)
         manager.rid_to_state = {}
+        manager.encoder_dispatch_ready = {}
         transport = MagicMock()
         transport.prepare_for_dispatch_async = AsyncMock(return_value=[])
         manager.cuda_vmm_feature_transport = transport
@@ -405,6 +406,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         manager.rid_to_state = {}
+        manager.encoder_dispatch_ready = {}
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock(
             side_effect=RuntimeError("send failed")
@@ -440,6 +442,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         manager.rid_to_state = {}
+        manager.encoder_dispatch_ready = {}
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock()
         time_stats = MagicMock()
@@ -767,6 +770,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
 
     @staticmethod
     def _prepare_scheduler(scheduler):
+        scheduler.scheduler_stage_metrics = None
         scheduler.session_controller = SimpleNamespace(maybe_reap=MagicMock())
         scheduler._request_dispatcher = MagicMock(return_value=None)
         scheduler.flush_wrapper = SimpleNamespace(check_pending=MagicMock())

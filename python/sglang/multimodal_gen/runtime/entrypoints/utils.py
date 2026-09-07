@@ -165,49 +165,6 @@ def _close_cached_cuda_video_buffer() -> None:
 atexit.register(_close_cached_cuda_video_buffer)
 
 
-@dataclass
-class SetLoraReq:
-    lora_nickname: Union[str, List[str]]
-    lora_path: Optional[Union[str, List[Optional[str]]]] = None
-    target: Union[str, List[str]] = "all"
-    strength: Union[float, List[float]] = 1.0
-    merge_mode: Optional[str] = None
-    lora_alpha: Optional[Union[int, List[Optional[int]]]] = None
-
-
-@dataclass
-class MergeLoraWeightsReq:
-    target: str = "all"
-    strength: float = 1.0
-
-
-@dataclass
-class UnmergeLoraWeightsReq:
-    target: str = "all"
-
-
-@dataclass
-class ListLorasReq:
-    pass
-
-
-@dataclass
-class ShutdownReq:
-    pass
-
-
-@dataclass
-class ReleaseRealtimeSessionReq:
-    session_id: str
-
-
-@dataclass
-class GetDisaggStatsReq:
-    """Request to get disagg pipeline metrics from the scheduler."""
-
-    pass
-
-
 def format_lora_message(
     lora_nickname: Union[str, List[str]],
     target: Union[str, List[str]],
