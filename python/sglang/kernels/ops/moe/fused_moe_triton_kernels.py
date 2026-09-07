@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -384,6 +385,8 @@ def fused_moe_kernel(
     LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
     FUSE_SWIGLU: tl.constexpr = False,
+    USE_GDC: tl.constexpr = False,
+    GDC_EARLY: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -412,6 +415,11 @@ def fused_moe_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        if GDC_EARLY:
+            tl.extra.cuda.gdc_launch_dependents()
+
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
@@ -706,6 +714,9 @@ def fused_moe_kernel(
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
+    if USE_GDC and not GDC_EARLY:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 # -----------------------------------------------------------------------------
 # TMA allocator: set once per process (avoid per-call triton.set_allocator)
@@ -855,9 +866,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
-            assert (
-                per_channel_quant
-            ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
+            assert per_channel_quant, (
+                "int8 quantization only supports channel-wise quantization except for block-wise quantization"
+            )
             A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
@@ -891,23 +902,23 @@ def invoke_fused_moe_kernel(
     if fuse_sum_all_reduce:
         assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
     if fuse_add_to_output:
-        assert (
-            not fuse_sum_all_reduce
-        ), "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
-        assert (
-            add_output_mask is not None
-        ), "add_output_mask required when fuse_add_to_output=True"
+        assert not fuse_sum_all_reduce, (
+            "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
+        )
+        assert add_output_mask is not None, (
+            "add_output_mask required when fuse_add_to_output=True"
+        )
     # ===== TO BE REFACTORED ====
     if mask_output:
-        assert (
-            not fuse_add_to_output
-        ), "mask_output and fuse_add_to_output are mutually exclusive"
-        assert (
-            not fuse_sum_all_reduce
-        ), "mask_output and fuse_sum_all_reduce are mutually exclusive"
-        assert (
-            add_output_mask is not None
-        ), "add_output_mask required when mask_output=True"
+        assert not fuse_add_to_output, (
+            "mask_output and fuse_add_to_output are mutually exclusive"
+        )
+        assert not fuse_sum_all_reduce, (
+            "mask_output and fuse_sum_all_reduce are mutually exclusive"
+        )
+        assert add_output_mask is not None, (
+            "add_output_mask required when mask_output=True"
+        )
     # ===== END TO BE REFACTORED ====
 
     if (
@@ -915,9 +926,9 @@ def invoke_fused_moe_kernel(
         and block_shape is not None
         and block_shape[1] > 0
     ):
-        assert (
-            not fuse_sum_all_reduce
-        ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
+        assert not fuse_sum_all_reduce, (
+            "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
+        )
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
@@ -980,6 +991,11 @@ def invoke_fused_moe_kernel(
         else:
             b_desc = None
 
+        pdl_kwargs = (
+            {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
+            if is_arch_support_pdl()
+            else {}
+        )
         fused_moe_kernel[grid](
             A,
             a_desc,
@@ -1028,9 +1044,10 @@ def invoke_fused_moe_kernel(
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             MASK_OUTPUT=mask_output,
             LORA_PRESERVE_BASE=lora_preserve_base,
-            FUSE_SWIGLU=fuse_swiglu,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
+            FUSE_SWIGLU=fuse_swiglu,
+            **pdl_kwargs,
             **config,
         )
 
@@ -1160,6 +1177,102 @@ def act_and_mul_triton(
     )
 
 
+# ============================================================
+# Fused silu_and_mul + per_token_group_quant_fp8 kernel
+# ============================================================
+
+_fp8_type = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
+_FP8_MAX = torch.finfo(_fp8_type).max
+
+
+@triton.jit
+def _fused_silu_mul_quant_fp8_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    num_tokens,
+    hidden_dim,
+    FP8_MAX: tl.constexpr,
+    EPS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
+    HAS_SWIGLU_LIMIT: tl.constexpr = False,
+):
+    """Fused kernel: silu(gate) * up -> fp8 quantize with block-wise scales."""
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    mask_m = offs_m < num_tokens
+    mask_k = offs_k < hidden_dim
+    mask = mask_m[:, None] & mask_k[None, :]
+    two_d = hidden_dim * 2
+    base_ptrs = input_ptr + offs_m[:, None] * two_d + offs_k[None, :]
+    gate = tl.load(base_ptrs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(base_ptrs + hidden_dim, mask=mask, other=0.0).to(tl.float32)
+    # DeepSeek-V4 SwiGLU clamp: gate clamped to [-inf, L], up clamped to [-L, L]
+    if HAS_SWIGLU_LIMIT:
+        gate = tl.minimum(gate, SWIGLU_LIMIT)
+        up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+    result = (gate * tl.sigmoid(gate)) * up
+    group_max = tl.max(tl.abs(result), axis=1)
+    scale = group_max / FP8_MAX
+    scale = tl.where(scale > EPS, scale, EPS)
+    result_scaled = result / scale[:, None]
+    result_fp8 = tl.clamp(result_scaled, -FP8_MAX, FP8_MAX).to(
+        output_ptr.dtype.element_ty
+    )
+    out_ptrs = output_ptr + offs_m[:, None] * hidden_dim + offs_k[None, :]
+    tl.store(out_ptrs, result_fp8, mask=mask)
+    num_groups = hidden_dim // GROUP_SIZE
+    scale_mask = mask_m & (pid_g < num_groups)
+    scale_ptrs = scale_ptr + offs_m * num_groups + pid_g
+    tl.store(scale_ptrs, scale, mask=scale_mask)
+
+
+def fused_silu_mul_quant_fp8(x, group_size, swiglu_limit=0.0):
+    """Fused Triton kernel: silu_and_mul + per_token_group_quant_fp8 in one launch.
+
+    Args:
+        x: [num_tokens, 2 * hidden_dim], bf16/fp16, contiguous row-major
+        group_size: quantization group size (e.g. 128 for DeepSeek-V4 block-wise FP8)
+        swiglu_limit: SwiGLU clamp limit (0 = no clamp, 10.0 for DeepSeek-V4).
+            When > 0, gate is clamped to [-inf, L] and up to [-L, L] before
+            silu(gate) * up, matching the DeepSeek-V4 activation contract.
+
+    Returns:
+        (x_fp8, x_scale):
+            x_fp8: [num_tokens, hidden_dim], fp8
+            x_scale: [num_tokens, hidden_dim // group_size], float32, row-major
+    """
+    assert x.is_contiguous(), "Input must be contiguous"
+    num_tokens = x.shape[0]
+    hidden_dim = x.shape[1] // 2
+    num_groups = hidden_dim // group_size
+    assert hidden_dim % group_size == 0
+    x_fp8 = torch.empty(num_tokens, hidden_dim, device=x.device, dtype=_fp8_type)
+    x_scale = torch.empty(num_tokens, num_groups, device=x.device, dtype=torch.float32)
+    BLOCK_M = 128
+    grid = (triton.cdiv(num_tokens, BLOCK_M), num_groups)
+    has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0
+    _fused_silu_mul_quant_fp8_kernel[grid](
+        x,
+        x_fp8,
+        x_scale,
+        num_tokens,
+        hidden_dim,
+        FP8_MAX=_FP8_MAX,
+        EPS=1e-10,
+        GROUP_SIZE=group_size,
+        BLOCK_M=BLOCK_M,
+        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
+        num_warps=4,
+    )
+    return x_fp8, x_scale
+
+
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit
 def _moe_sum_reduce_kernel(
@@ -1177,6 +1290,7 @@ def _moe_sum_reduce_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
     NUM_STAGE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
     input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
@@ -1194,6 +1308,10 @@ def _moe_sum_reduce_kernel(
     base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
         tile = tl.load(
@@ -1232,6 +1350,7 @@ def moe_sum_reduce_triton(
         triton.cdiv(hidden_dim, BLOCK_DIM),
     )
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _moe_sum_reduce_kernel[grid](
         input,
         *input.stride(),
@@ -1245,6 +1364,7 @@ def moe_sum_reduce_triton(
         BLOCK_DIM=BLOCK_DIM,
         NUM_STAGE=NUM_STAGE,
         num_warps=num_warps,
+        **pdl_kwargs,
     )
     return
 
@@ -1535,9 +1655,9 @@ def fused_append_shared_experts_with_weights(
       ``apply_sigmoid`` (the sigmoid is intrinsic), so the two are mutually
       exclusive.
     """
-    assert not (
-        fuse_gate and apply_sigmoid
-    ), "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
+    assert not (fuse_gate and apply_sigmoid), (
+        "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
+    )
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1545,9 +1665,9 @@ def fused_append_shared_experts_with_weights(
         return topk_ids, topk_weights
 
     if fuse_gate:
-        assert (
-            hidden_states is not None and gate_weight is not None
-        ), "fuse_gate=True requires hidden_states and gate_weight"
+        assert hidden_states is not None and gate_weight is not None, (
+            "fuse_gate=True requires hidden_states and gate_weight"
+        )
         hidden_arg = hidden_states.contiguous()
         wgate_arg = gate_weight.reshape(-1).contiguous()
         hidden_dim = hidden_arg.shape[1]

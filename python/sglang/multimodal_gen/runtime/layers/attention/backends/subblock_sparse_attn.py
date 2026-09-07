@@ -2,8 +2,9 @@
 """SubBlock block-sparse attention backend.
 
 Routes the same 64-token SubBlock plan to SGLang's CuTe-DSL block-sparse
-FlashAttention kernel on SM90 or FlashInfer's kernel on SM100. A log-sum-exp
-over query/key sub-block pairs selects the blocks (see ``backends/subblock_sparse/``).
+FlashAttention kernel on SM90 or FlashInfer's architecture-specific kernels on
+SM100 and SM120. A log-sum-exp over query/key sub-block pairs selects the blocks
+(see ``backends/subblock_sparse/``).
 Everything is training-free: the router runs before attention and produces
 the ``q2k_block_index`` the selected kernel consumes.
 
@@ -18,15 +19,16 @@ individual keys of the defaults below::
     --attention-backend-config '{"sparsity": 0.85}'
 
 Requirements inherited from the kernels: compute capability 9.0 (Hopper) or
-10.0 (B200 / GB200), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
-block-sparse FlashAttention kernel; B200 uses FlashInfer's ``sm_100a`` blk64
-kernel. Inside the DiT, any call the kernels cannot serve -- cross/refiner
-attention, short sequences, non-bf16 -- runs dense instead. On any other GPU
-the resolver refuses the backend at startup rather than falling back.
+10.0/12.0 (Blackwell), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
+block-sparse FlashAttention kernel; B200 and SM120 devices use FlashInfer's
+architecture-specific blk64 kernels. Inside the DiT, any call the kernels cannot
+serve -- cross/refiner attention, short sequences, non-bf16 -- runs dense instead.
+On any other GPU the resolver refuses the backend at startup rather than falling back.
 
 ``--attention-backend`` reaches every component, and the text encoder admits
-only fa / torch_sdpa / sage_attn_3, so pair it with
-``--component-attention-backends text_encoder=fa``; see the README.
+only fa / torch_sdpa / sage_attn_3. Pair it with
+``--component-attention-backends text_encoder=fa`` on SM90/SM100, or
+``text_encoder=torch_sdpa`` on SM120; see the README.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
     SubBlockRouter,
     load_bsa_attn_blk64_fwd,
+    load_bsa_attn_sm120_blk64_fwd,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -137,22 +140,21 @@ def _sm90_sparse_attention(
     q2k_block_index: torch.Tensor,
     topk: int,
     softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a SubBlock routing plan through the existing SM90 CuTe kernel."""
     BlockSparseTensorsTorch, flash_attn_func = _load_sm90_block_sparse_attention()
 
-    # The router contract permits indices in any order, while the SM90 sparse
-    # pipeline consumes each list from high slot to low slot and applies
-    # sequence-tail masking to the first block. Sort explicitly so the largest
-    # block id -- the possible ragged tail -- occupies the highest slot without
-    # depending on the fused top-k kernel's current ascending output order.
-    ordered_index = q2k_block_index.sort(dim=-1).values
-    block_counts = torch.full(
-        ordered_index.shape[:-1],
-        topk,
-        dtype=torch.int32,
-        device=ordered_index.device,
-    )
+    # The caller sorts each active sparse prefix for SM90. Dense rows are the
+    # already-sorted complete range; entries beyond each row's count are ignored.
+    ordered_index = q2k_block_index
+    if block_counts is None:
+        block_counts = torch.full(
+            ordered_index.shape[:-1],
+            topk,
+            dtype=torch.int32,
+            device=ordered_index.device,
+        )
     sparse_tensors = BlockSparseTensorsTorch(
         mask_block_cnt=block_counts,
         mask_block_idx=ordered_index,
@@ -183,6 +185,7 @@ def _sm100_sparse_attention(
     q2k_block_index: torch.Tensor,
     topk: int,
     softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a SubBlock routing plan through FlashInfer's SM100 kernel."""
     out = load_bsa_attn_blk64_fwd()(
@@ -192,7 +195,31 @@ def _sm100_sparse_attention(
         q2k_block_index,
         topk,
         block_sizes=_cached_block_sizes(k.shape[1], k.device),
-        q2k_block_nums=None,  # the budget is uniform across rows
+        q2k_block_nums=block_counts,
+        softmax_scale=softmax_scale,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _sm120_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run a SubBlock routing plan through FlashInfer's SM120 kernel."""
+    logger.info_once("SubBlock sparse attention kernel active: FlashInfer SM120 blk64")
+    out = load_bsa_attn_sm120_blk64_fwd()(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        topk,
+        block_sizes=_cached_block_sizes(k.shape[1], k.device),
+        q2k_block_nums=block_counts,
         softmax_scale=softmax_scale,
     )
     return out[0] if isinstance(out, tuple) else out
@@ -206,8 +233,10 @@ def _get_subblock_sparse_attention_runner(device: torch.device):
         return _sm90_sparse_attention
     if capability == (10, 0):
         return _sm100_sparse_attention
+    if capability == (12, 0):
+        return _sm120_sparse_attention
     raise RuntimeError(
-        "SubBlock sparse attention supports compute capability 9.0 or 10.0; "
+        "SubBlock sparse attention supports compute capability 9.0, 10.0, or 12.0; "
         f"this tensor is on a {capability[0]}.{capability[1]} device."
     )
 
@@ -219,8 +248,15 @@ def _run_subblock_sparse_attention(
     q2k_block_index: torch.Tensor,
     topk: int,
     softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Dispatch the same 64x64 routing plan to Hopper or Blackwell."""
+    """Dispatch a prepared 64x64 routing plan to Hopper or Blackwell.
+
+    SM90 requires every active index prefix to be sorted in ascending order;
+    SM100 and SM120 accept the router's original order. Heterogeneous callers
+    must sort compact sparse prefixes before expanding them to full-width dense
+    rows.
+    """
     runner = _get_subblock_sparse_attention_runner(q.device)
     return runner(
         q,
@@ -229,6 +265,7 @@ def _run_subblock_sparse_attention(
         q2k_block_index,
         topk,
         softmax_scale,
+        block_counts,
     )
 
 
@@ -401,26 +438,90 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         )
 
     def _sparse_attention(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        sparse_query_block_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """q, k, v: ``[1, S, H, 128]`` bf16 -> same shape."""
+        """Q ``[1, Sq, H, 128]`` against K/V ``[1, Sk, H, 128]``."""
         plan = self.router.route(
-            q, k, sparsity=self.schedule.sparsity, softmax_scale=self.softmax_scale
+            q,
+            k,
+            sparsity=self.schedule.sparsity,
+            softmax_scale=self.softmax_scale,
         )
-        # Proof that the sparse path actually ran, with the shape it ran on --
-        # the construction-time log above only says the layer was eligible.
-        logger.info_once(
-            f"SubBlock sparse attention active: S={k.shape[1]} heads={q.shape[2]} "
-            f"keeping {plan.topk}/{plan.num_blocks} key blocks per query block "
-            f"(sparsity {1 - plan.density:.4f})"
+        expected_q_blocks = -(-q.shape[1] // SUBBLOCK_SPARSE_BLOCK_SIZE)
+        if plan.index.shape[2] != expected_q_blocks:
+            raise ValueError(
+                "SubBlock routing/kernel query-block mismatch: "
+                f"plan has {plan.index.shape[2]}, kernel needs {expected_q_blocks}"
+            )
+        # Proof that the sparse path actually ran -- the construction-time log
+        # above only says the layer was eligible.
+        if sparse_query_block_mask is None:
+            logger.info_once(
+                f"SubBlock sparse attention active: Sq={q.shape[1]} "
+                f"Sk={k.shape[1]} heads={q.shape[2]} "
+                f"keeping {plan.topk}/{plan.num_blocks} key blocks per query "
+                f"block (sparsity {1 - plan.density:.4f})"
+            )
+        else:
+            logger.info_once(
+                f"SubBlock heterogeneous BSA active: Sq={q.shape[1]} "
+                f"Sk={k.shape[1]} heads={q.shape[2]}; selected query blocks "
+                f"keep {plan.topk}/{plan.num_blocks} key blocks and unselected "
+                "query blocks are dense"
+            )
+        block_counts = None
+        runner = _get_subblock_sparse_attention_runner(q.device)
+        block_index = (
+            plan.index.sort(dim=-1).values
+            if runner is _sm90_sparse_attention
+            else plan.index
         )
+        kernel_topk = plan.topk
+        if sparse_query_block_mask is not None:
+            sparse_query_block_mask = sparse_query_block_mask.to(
+                device=q.device, dtype=torch.bool
+            ).view(-1)
+            if sparse_query_block_mask.numel() != expected_q_blocks:
+                raise ValueError(
+                    "SubBlock sparse query-block mask length does not match Q"
+                )
+            num_k_blocks = plan.num_blocks
+            full_index = torch.arange(
+                num_k_blocks, device=q.device, dtype=block_index.dtype
+            ).view(1, 1, 1, num_k_blocks)
+            heterogeneous_index = full_index.expand(
+                *block_index.shape[:-1], num_k_blocks
+            ).clone()
+            sparse_rows = sparse_query_block_mask.view(1, 1, -1, 1)
+            heterogeneous_index[..., : plan.topk] = torch.where(
+                sparse_rows,
+                block_index,
+                heterogeneous_index[..., : plan.topk],
+            )
+            block_counts = (
+                torch.where(
+                    sparse_query_block_mask.view(1, 1, -1),
+                    plan.topk,
+                    num_k_blocks,
+                )
+                .expand(*block_index.shape[:-1])
+                .to(torch.int32)
+            )
+            block_index = heterogeneous_index
+            kernel_topk = num_k_blocks
         return _run_subblock_sparse_attention(
             q,
             k,
             v,
-            plan.index,
-            plan.topk,
+            block_index,
+            kernel_topk,
             self.softmax_scale,
+            block_counts,
         )
 
     def forward(
@@ -444,12 +545,15 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        first_segment_sparse_query_block_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Packed ``[T, H, D]`` rows split into documents by ``cu_seqlens``.
 
-        The block-sparse kernel takes one contiguous sequence, so each packed
-        document is routed on its own. Documents shorter than ``min_seq_len``
-        -- in MiniMax H3 the padding tail -- go through the dense kernel.
+        Each packed document keeps its own full K/V context. The optional
+        first-segment mask selects sparse Q blocks; unselected blocks stay
+        dense within the same heterogeneous BSA call.
+        Documents shorter than ``min_seq_len`` -- in H3, the padding tail --
+        stay on the existing dense segment path.
         """
 
         def all_dense() -> torch.Tensor:
@@ -487,14 +591,24 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         for start, stop in segments:
             # Deliberately not `.contiguous()`. After the Ulysses all-to-all,
             # q/k/v are last-dim slices of one packed buffer, so they are
-            # strided; both the block-sparse kernel and SDPA permute them
-            # anyway, and forcing contiguity here measured as a wasted
+            # strided; the attention kernels handle those views directly, and
+            # forcing contiguity here measured as a wasted
             # full-tensor copy (0.46 ms per call at S=37.7k on B200).
             q_seg = query[start:stop].unsqueeze(0)
             k_seg = key[start:stop].unsqueeze(0)
             v_seg = value[start:stop].unsqueeze(0)
             if (start, stop) in sparse_segments:
-                seg_out = self._sparse_attention(q_seg, k_seg, v_seg)
+                sparse_query_block_mask = (
+                    first_segment_sparse_query_block_mask
+                    if (start, stop) == segments[0]
+                    else None
+                )
+                seg_out = self._sparse_attention(
+                    q_seg,
+                    k_seg,
+                    v_seg,
+                    sparse_query_block_mask=sparse_query_block_mask,
+                )
             else:
                 seg_out = self._dense_segment(q_seg, k_seg, v_seg)
             out[start:stop] = seg_out[0]

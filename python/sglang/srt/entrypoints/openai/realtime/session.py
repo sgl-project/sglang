@@ -72,6 +72,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import random_uuid
 
@@ -186,7 +187,7 @@ class RealtimeConnection:
 
         self.model_sample_rate = adapter.model_sample_rate
         self.bytes_per_second = self.model_sample_rate * _SAMPLE_WIDTH
-        self.max_buffer_seconds = server_args.asr_max_buffer_seconds
+        self.max_buffer_seconds = get_serving().asr_max_buffer_seconds
 
         self.config = _SessionConfig()
 

@@ -338,10 +338,13 @@ fn router(state: Arc<Registry>) -> Router {
 
 /// Drop room entries
 async fn cleanup_sweeper(state: Arc<Registry>) {
-    let cleanup_interval = Duration::from_secs(environ::env_u64(
-        ENTRY_CLEANUP_INTERVAL_ENV,
-        ENTRY_CLEANUP_INTERVAL_DEFAULT_SECS,
-    ));
+    let cleanup_interval = Duration::from_secs(
+        environ::env_i64(
+            ENTRY_CLEANUP_INTERVAL_ENV,
+            ENTRY_CLEANUP_INTERVAL_DEFAULT_SECS as i64,
+        )
+        .max(0) as u64,
+    );
     loop {
         tokio::time::sleep(cleanup_interval).await;
         state.rooms.sweep(cleanup_interval);

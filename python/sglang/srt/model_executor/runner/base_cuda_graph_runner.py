@@ -70,11 +70,10 @@ def get_batch_sizes_to_capture(
     constraints and clamps to req_to_token_pool.size.
     """
 
-    server_args = model_runner.server_args
     capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
 
-    mul_base = get_cuda_graph_batch_size_alignment(server_args)
+    mul_base = get_cuda_graph_batch_size_alignment()
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
@@ -82,7 +81,7 @@ def get_batch_sizes_to_capture(
         alignment_width = 1
 
     # pad `num_max_requests` to avoid being filtered out
-    num_max_requests = get_cuda_graph_max_batch_size(server_args, num_max_requests)
+    num_max_requests = get_cuda_graph_max_batch_size(num_max_requests)
     if max(capture_bs) > num_max_requests:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.

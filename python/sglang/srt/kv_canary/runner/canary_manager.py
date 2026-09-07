@@ -169,9 +169,9 @@ class CanaryManager:
 
     @contextlib.contextmanager
     def with_active_single_forward_manager(self, index: int) -> Iterator[None]:
-        assert (
-            self._active_single_forward_manager_index is None
-        ), "kv-canary: nested with_active_single_forward_manager is forbidden"
+        assert self._active_single_forward_manager_index is None, (
+            "kv-canary: nested with_active_single_forward_manager is forbidden"
+        )
         self._active_single_forward_manager_index = index
         try:
             yield
