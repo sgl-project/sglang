@@ -17,7 +17,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestServerArgsAnnotatedCli(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.parser = argparse.ArgumentParser()

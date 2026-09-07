@@ -369,8 +369,9 @@ class TestChatCompletionRequest(unittest.TestCase):
             {"reasoning": {"effort": 1.1}},
             {"reasoning": {"effort": "1.5"}},
         ):
-            with self.subTest(request_kwargs=request_kwargs), self.assertRaises(
-                ValidationError
+            with (
+                self.subTest(request_kwargs=request_kwargs),
+                self.assertRaises(ValidationError),
             ):
                 ChatCompletionRequest(
                     model="test-model", messages=messages, **request_kwargs

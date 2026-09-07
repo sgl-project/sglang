@@ -85,8 +85,7 @@ def multiprocess_test(file: str, nproc: int, timeout: int = 120) -> None:
         ) from e
 
     assert result.returncode == 0, (
-        f"torchrun (nproc={nproc}) failed with rc={result.returncode}\n"
-        f"{result.stdout}"
+        f"torchrun (nproc={nproc}) failed with rc={result.returncode}\n{result.stdout}"
     )
 
 

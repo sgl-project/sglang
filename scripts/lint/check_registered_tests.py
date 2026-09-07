@@ -156,11 +156,7 @@ def main() -> int:
             "test silently never runs. Switch to the modern form:\n"
         )
         for f, suite in non_dispatchable:
-            print(
-                f"  {f}\n"
-                f'    suite="{suite}"'
-                f'  ->  stage="...", runner_config="..."'
-            )
+            print(f'  {f}\n    suite="{suite}"  ->  stage="...", runner_config="..."')
         print()
         exit_code = 1
     if dead_tests:

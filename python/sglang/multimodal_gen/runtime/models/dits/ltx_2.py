@@ -198,7 +198,7 @@ def _ltx2_rms_norm_modulate(
     """``rms_norm(x) * (1 + scale) + shift`` for the LTX-2 adaLN sites.
 
     Folds the weightless RMSNorm and the modulate into one kernel when the
-    ``quality="high"`` fusion is mounted on ``block`` and the per-call guard
+    request-gated fusion is mounted on ``block`` and the per-call guard
     passes; otherwise the verbatim eager reference chain (the ``lossless``
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
@@ -735,6 +735,7 @@ class LTX2Attention(nn.Module):
         apply_gated_attention: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        required_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ) -> None:
@@ -837,6 +838,7 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
+                required_attention_backend=required_attention_backend,
                 is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
@@ -852,6 +854,7 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
+                required_attention_backend=required_attention_backend,
                 is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
@@ -1196,10 +1199,11 @@ class LTX2TransformerBlock(nn.Module):
             use_local_attention=use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
             enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
-            supported_attention_backends=(
-                {AttentionBackendEnum.TORCH_SDPA}
+            supported_attention_backends=supported_attention_backends,
+            required_attention_backend=(
+                AttentionBackendEnum.TORCH_SDPA
                 if force_sdpa_v2a_cross_attention
-                else supported_attention_backends
+                else None
             ),
             prefix=f"{prefix}.video_to_audio_attn",
             quant_config=quant_config,

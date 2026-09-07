@@ -46,7 +46,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
@@ -445,12 +445,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             # positions are passed through unremapped.
             ("other", False, False, False, unremapped),
         ):
-            with self.subTest(platform=platform), envs.SGLANG_DSA_FUSE_TOPK.override(
-                True
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip
+            with (
+                self.subTest(platform=platform),
+                envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
+                ),
+                patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip),
             ):
                 self.assertEqual(
                     should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True),

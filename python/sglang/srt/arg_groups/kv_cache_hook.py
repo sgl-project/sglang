@@ -305,12 +305,10 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
         "transfer, where translate_kv_indices_for_transfer would abort a "
         "server that had already booted."
     )
-    # trtllm_mla (and its cutedsl_mla / tokenspeed_mla subclasses) build the
-    # MLA block table straight from req_to_token with
-    # create_flashmla_kv_indices_triton, whose v2p gather assumes UNWIDENED
-    # page ids; the DCP variant (create_mla_kv_page_table_for_dcp) has no v2p
-    # gather at all. Wire one of them through the other to add those here.
-    dcp_allowed = {"flashinfer"}
+    # The trtllm_mla family builds its DCP block table through the pool's v2p
+    # gather (create_mla_kv_page_table_for_dcp), so it speaks the same
+    # two-stage contract as flashinfer.
+    dcp_allowed = {"flashinfer", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= dcp_allowed, (

@@ -99,6 +99,7 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 "lingbot-world",
                 "lingbot-world-v2",
                 "fastwan21-t2v-1.3b",
+                "fasth3-t2va-vsa",
                 "wan22-t2v-nvfp4",
                 "krea2-turbo",
                 "krea2-raw",
@@ -256,6 +257,12 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             high_cmd = module.build_sglang_cmd("longcat-image", quality="high")
             self.assertIn("--quality=high", high_cmd)
             self.assertNotIn("--enable-breakable-cuda-graph", high_cmd)
+
+            extra_high_cmd = module.build_sglang_cmd(
+                "longcat-image", quality="extra-high"
+            )
+            self.assertIn("--quality=extra-high", extra_high_cmd)
+            self.assertNotIn("--enable-breakable-cuda-graph", extra_high_cmd)
 
             bcg_cmd = module.build_sglang_cmd(
                 "longcat-image",
@@ -538,6 +545,37 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 [module.BCG_LATE_QUALITY_FUSION_SIGNAL],
             )
 
+    def test_extra_high_bcg_rejects_quality_fusion_mounted_after_capture(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_root = Path(tmpdir)
+            module = _load_benchmark_module(temp_root)
+            output_dir = temp_root / "outputs"
+            output_dir.mkdir()
+
+            with patch.object(module.subprocess, "Popen") as popen:
+                popen.return_value.stdout = iter(
+                    (
+                        "[Diffusion BCG] captured 3 segment(s)\n",
+                        "Mounted Qwen fused added-QKV for quality=extra-high\n",
+                    )
+                )
+                popen.return_value.wait.return_value = 0
+                result = module._run_benchmark_once_impl(
+                    "longcat-image",
+                    "bcg-extra-high",
+                    output_dir,
+                    warmup=False,
+                    quality="extra-high",
+                    breakable_cuda_graph=True,
+                    cuda_visible_devices="0",
+                )
+
+            self.assertTrue(result["error"])
+            self.assertEqual(
+                result["bcg_invalid_signals"],
+                [module.BCG_LATE_QUALITY_FUSION_SIGNAL],
+            )
+
     def test_quality_bcg_matrix_reuses_one_gpu_set_and_cleans_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_root = Path(tmpdir)
@@ -564,7 +602,7 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                     cleanup_model_cache=True,
                 )
 
-            self.assertEqual(len(results), 8)
+            self.assertEqual(len(results), 12)
             self.assertEqual(
                 [
                     (call[2]["quality"], call[2]["breakable_cuda_graph"])

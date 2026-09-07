@@ -427,9 +427,9 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        )
 
         results = await self.init_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
@@ -440,9 +440,9 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
+        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
+        )
 
         results = await self.destroy_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
@@ -453,9 +453,9 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        )
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
@@ -486,9 +486,9 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         # TODO: support DP
-        assert (
-            get_parallel().dp_size == 1
-        ), "dp_size must be 1 for init_weights_send_group_for_remote_instance"
+        assert get_parallel().dp_size == 1, (
+            "dp_size must be 1 for init_weights_send_group_for_remote_instance"
+        )
         result = (
             await self.init_weights_send_group_for_remote_instance_communicator(obj)
         )[0]
@@ -501,9 +501,9 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         # TODO: support DP
-        assert (
-            get_parallel().dp_size == 1
-        ), "dp_size must be 1 for send_weights_to_remote_instance"
+        assert get_parallel().dp_size == 1, (
+            "dp_size must be 1 for send_weights_to_remote_instance"
+        )
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
 
@@ -513,9 +513,9 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+        )
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
@@ -551,9 +551,9 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         try:
             # For now, we only support single data parallel instance
-            assert (
-                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
-            ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+                "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+            )
             logger.info("Starting IPC weight update")
 
             async with self.is_pause_cond:
@@ -583,9 +583,9 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
     ) -> UnloadLoRAAdapterReqOutput:
-        assert (
-            self.lora_update_lock.locked()
-        ), "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
+        assert self.lora_update_lock.locked(), (
+            "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
+        )
 
         # Unregister the LoRA adapter from the registry to stop new requests for this adapter
         # from being started.
@@ -614,9 +614,9 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert (
-                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
-            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            )
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
                 obj.lora_name,
@@ -692,9 +692,9 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert (
-                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
-            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            )
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
                 obj.lora_name,
@@ -768,13 +768,13 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert (
-                obj.lora_name is not None
-            ), "lora_name must be provided to unload LoRA adapter"
+            assert obj.lora_name is not None, (
+                "lora_name must be provided to unload LoRA adapter"
+            )
 
-            assert (
-                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
-            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            )
             logger.info(
                 "Start unload Lora adapter. Lora name=%s",
                 obj.lora_name,
@@ -847,9 +847,9 @@ class TokenizerControlMixin:
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()
         req = GetInternalStateReq()
-        responses: List[GetInternalStateReqOutput] = (
-            await self.get_internal_state_communicator(req)
-        )
+        responses: List[
+            GetInternalStateReqOutput
+        ] = await self.get_internal_state_communicator(req)
         # Many DP ranks
         return [res.internal_state for res in responses]
 
@@ -857,9 +857,9 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: SetInternalStateReq
     ) -> List[bool]:
         self.auto_create_handle_loop()
-        responses: List[SetInternalStateReqOutput] = (
-            await self.set_internal_state_communicator(obj)
-        )
+        responses: List[
+            SetInternalStateReqOutput
+        ] = await self.set_internal_state_communicator(obj)
         return [res.updated for res in responses]
 
     async def dumper_control(

@@ -49,8 +49,7 @@ class ContextParallelStrategyKind(IntEnum):
         if value == "interleave":
             return cls.INTERLEAVE
         raise ValueError(
-            f"Unknown cp_strategy={value!r}; expected one of "
-            "{'zigzag', 'interleave'}"
+            f"Unknown cp_strategy={value!r}; expected one of {{'zigzag', 'interleave'}}"
         )
 
     @property

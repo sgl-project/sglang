@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from unittest.mock import MagicMock, patch
@@ -52,6 +52,7 @@ def _make_ctx(
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
         enable_flexkv=False,
+        enable_unified_cache_external_linker=False,
     )
     return TreeCacheBuildContext(
         server_args=server_args,
@@ -334,6 +335,57 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             )
             ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
+
+    def test_unified_radix_cache_with_mori_external_linker(self):
+        from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
+
+        ctx = _make_ctx(self)
+        object.__setattr__(
+            ctx.server_args, "enable_unified_cache_external_linker", True
+        )
+        object.__setattr__(
+            ctx.server_args, "unified_cache_external_linker_backend", "mori"
+        )
+        self.assertTrue(ctx.server_args.enable_unified_cache_external_linker)
+        self.assertEqual(ctx.server_args.unified_cache_external_linker_backend, "mori")
+        fake_components = MagicMock()
+        fake_components.ComponentType.FULL = "full"
+        fake_radix = MagicMock()
+        cache = fake_radix.UnifiedRadixCache.return_value
+        cache.components = ("full",)
+        counter = MagicMock(name="layer_done_counter")
+        cache.linker.layer_done_counter = counter
+        linker = MagicMock(name="linker")
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                    "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+                },
+            ),
+            patch.object(
+                umbp_direct_linker,
+                "UMBPDirectLinker",
+                return_value=linker,
+            ) as linker_cls,
+        ):
+            result = default_radix_cache_factory(ctx)
+
+        linker_cls.assert_called_once_with(
+            ctx.server_args,
+            ctx.params,
+            components={"full"},
+        )
+        cache.init_cache_linker.assert_called_once_with(linker)
+        ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value.register_layer_transfer_counter.assert_called_once_with(
+            counter
+        )
+        ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once_with(
+            counter
+        )
+        self.assertIs(result, cache)
 
     def test_swa_radix_cache_when_hybrid_swa(self):
         ctx = _make_ctx(self, is_hybrid_swa=True)

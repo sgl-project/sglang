@@ -45,6 +45,7 @@ from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
+    get_dsa_index_kpool,
     get_dsa_index_n_heads,
     get_dsa_index_topk,
     is_deepseek_dsa,
@@ -62,6 +63,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -303,8 +305,7 @@ class DeepseekV2MLP(nn.Module):
             self.down_proj.weight = self.down_proj.weight_packed
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
         self.use_fused_clamp_act_mul = _is_hip
@@ -479,7 +480,14 @@ class MoEGate(nn.Module):
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size),
+                dtype=(
+                    torch.float32
+                    if getattr(config, "router_fp32", False)
+                    else torch.get_default_dtype()
+                ),
+            )
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
@@ -516,6 +524,9 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if self.weight.dtype == torch.float32:
+            return F.linear(hidden_states.float(), self.weight)
+
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
@@ -563,7 +574,6 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -779,19 +789,22 @@ class DeepseekV2MoE(nn.Module):
                     ModelOptFp4LinearMethod,
                 )
                 and fc1_n % 128 == 0
+                and self.shared_experts.swiglu_limit is None
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 self.shared_experts.gate_up_proj._interleave_for_swiglu_fusion = True
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
                 self.shared_experts.down_proj._accepts_prequantized_fp4 = True
             self._shared_expert_tp1 = _shared_expert_use_tp1
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
+            is_packed_weight = (
+                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
+                and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
+                in {
+                    "awq",
+                    "awq_marlin",
+                    "moe_wna16",
+                }
+            )
             shared_gate_up_weight = getattr(
                 self.shared_experts.gate_up_proj, "weight", None
             )
@@ -823,9 +836,7 @@ class DeepseekV2MoE(nn.Module):
                         self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
                         == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
                     )
-                    self.shared_experts_weight_block_size = (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    )
+                    self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
 
         self.top_k = config.num_experts_per_tok
 
@@ -1740,7 +1751,6 @@ class DeepseekV2AttentionMLA(
     DeepseekMLAFusedRopeRocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1852,7 +1862,10 @@ class DeepseekV2AttentionMLA(
 
             if not self.skip_topk or is_nextn:
                 is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-                self.indexer = Indexer(
+                indexer_cls = (
+                    IndexerKPool if get_dsa_index_kpool(config) > 1 else Indexer
+                )
+                indexer_kwargs = dict(
                     hidden_size=hidden_size,
                     index_n_heads=get_dsa_index_n_heads(config),
                     index_head_dim=get_dsa_index_head_dim(config),
@@ -1871,6 +1884,9 @@ class DeepseekV2AttentionMLA(
                     alt_stream=alt_stream,
                     config=config,
                 )
+                if indexer_cls is IndexerKPool:
+                    indexer_kwargs["skip_rope"] = skip_rope
+                self.indexer = indexer_cls(**indexer_kwargs)
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1894,7 +1910,7 @@ class DeepseekV2AttentionMLA(
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
-        if not skip_rope:
+        if not skip_rope and qk_rope_head_dim > 0:
             is_neox_style = not getattr(config, "rope_interleave", True)
             self.rotary_emb = get_rope_wrapper(
                 qk_rope_head_dim,
@@ -2106,18 +2122,18 @@ class DeepseekV2AttentionMLA(
                 not get_attn_tp_context().input_scattered
                 and hidden_states[0].shape[0] == 0
             ):
-                assert (
-                    not self.o_proj.reduce_results
-                ), "short-circuiting allreduce will lead to hangs"
+                assert not self.o_proj.reduce_results, (
+                    "short-circuiting allreduce will lead to hangs"
+                )
                 return hidden_states[0]
         else:
             if (
                 not get_attn_tp_context().input_scattered
                 and hidden_states.shape[0] == 0
             ):
-                assert (
-                    not self.o_proj.reduce_results
-                ), "short-circuiting allreduce will lead to hangs"
+                assert not self.o_proj.reduce_results, (
+                    "short-circuiting allreduce will lead to hangs"
+                )
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
@@ -2301,7 +2317,6 @@ class DeepseekV2AttentionMLA(
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2311,6 +2326,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        skip_rope: bool = False,
         dsa_enable_prefill_cp: bool = False,
         mla_enable_prefill_cp: bool = False,
     ) -> None:
@@ -2333,6 +2349,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
         self.layer_id = layer_id
         self.is_nextn = is_nextn
+        if is_nextn and getattr(config, "mla_nope", False):
+            # The NextN draft must match the NoPE target layers, or its Q/K
+            # and the KV it verifies against live in different spaces.
+            skip_rope = True
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -2352,6 +2372,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            skip_rope=skip_rope,
             is_nextn=is_nextn,
             dsa_enable_prefill_cp=dsa_enable_prefill_cp,
             mla_enable_prefill_cp=mla_enable_prefill_cp,
@@ -2682,6 +2703,7 @@ class DeepseekV2Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=self.alt_stream,
+                skip_rope=config.qk_rope_head_dim == 0,
                 dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
                 mla_enable_prefill_cp=self.mla_enable_prefill_cp,
             ),
