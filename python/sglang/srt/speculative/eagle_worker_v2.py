@@ -299,6 +299,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+    def _maybe_sync_cuda_debug(
+        self, checkpoint: str, *, detail: Optional[str] = None
+    ) -> None:
+        # Some unit-test and backend harnesses intentionally construct a
+        # minimal worker with object.__new__. Keep that default-off path valid.
+        _maybe_sync_eagle_cuda_debug(
+            getattr(self, "_eagle_cuda_sync_debug_checkpoints", frozenset()),
+            checkpoint,
+            self.device,
+            detail=detail,
+        )
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -640,11 +652,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
-        _maybe_sync_eagle_cuda_debug(
-            self._eagle_cuda_sync_debug_checkpoints,
-            "after_draft_prepare",
-            self.device,
-        )
+        self._maybe_sync_cuda_debug("after_draft_prepare")
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
@@ -669,12 +677,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
-                _maybe_sync_eagle_cuda_debug(
-                    self._eagle_cuda_sync_debug_checkpoints,
-                    "after_draft_forward",
-                    self.device,
-                    detail="graph",
-                )
+                self._maybe_sync_cuda_debug("after_draft_forward", detail="graph")
             else:
                 if (
                     not forward_batch.forward_mode.is_idle()
@@ -684,11 +687,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
-                    _maybe_sync_eagle_cuda_debug(
-                        self._eagle_cuda_sync_debug_checkpoints,
-                        "after_draft_metadata",
-                        self.device,
-                    )
+                    self._maybe_sync_cuda_debug("after_draft_metadata")
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
@@ -716,11 +715,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_tokens = torch.cat(
                 (draft_input.bonus_tokens.unsqueeze(1), draft_tokens), dim=1
             ).flatten()
-            _maybe_sync_eagle_cuda_debug(
-                self._eagle_cuda_sync_debug_checkpoints,
-                "after_draft_pp_tree",
-                self.device,
-            )
+            self._maybe_sync_cuda_debug("after_draft_pp_tree")
             return draft_tokens, parent_list, top_scores_index
 
         return build_eagle_verify_input(
@@ -844,12 +839,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output = self.draft_runner.forward(
                         forward_batch
                     ).logits_output
-                _maybe_sync_eagle_cuda_debug(
-                    self._eagle_cuda_sync_debug_checkpoints,
-                    "after_draft_forward",
-                    self.device,
-                    detail=f"step={i}",
-                )
+                self._maybe_sync_cuda_debug("after_draft_forward", detail=f"step={i}")
                 next_token_logits, next_hidden_states, local_positions = (
                     _slice_draft_output_to_local_tokens(
                         logits_output.next_token_logits,
@@ -889,12 +879,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     local_positions.add_(1)
-                _maybe_sync_eagle_cuda_debug(
-                    self._eagle_cuda_sync_debug_checkpoints,
-                    "after_draft_topk",
-                    self.device,
-                    detail=f"step={i}",
-                )
+                self._maybe_sync_cuda_debug("after_draft_topk", detail=f"step={i}")
                 maybe_detect_oob(
                     topk_index,
                     0,
@@ -960,12 +945,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 canary_index_ctx,
             ):
                 self.draft_runner.forward(forward_batch)
-            _maybe_sync_eagle_cuda_debug(
-                self._eagle_cuda_sync_debug_checkpoints,
-                "after_draft_forward",
-                self.device,
-                detail=f"idle_step={i}",
-            )
+            self._maybe_sync_cuda_debug("after_draft_forward", detail=f"idle_step={i}")
 
         return None, None, None, None
 

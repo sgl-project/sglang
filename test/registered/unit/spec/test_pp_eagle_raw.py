@@ -189,6 +189,15 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
             "after_draft_forward", "cuda:1", detail="step=0"
         )
 
+    @patch("sglang.srt.speculative.eagle_worker_v2._sync_eagle_cuda_debug")
+    def test_minimal_draft_worker_defaults_cuda_sync_off(self, sync_debug):
+        worker = object.__new__(EagleDraftWorker)
+        worker.device = "cuda:1"
+
+        worker._maybe_sync_cuda_debug("after_draft_forward", detail="idle_step=0")
+
+        sync_debug.assert_not_called()
+
     def test_unknown_checkpoint_fails_closed(self):
         from sglang.srt.environ import envs
 
