@@ -8,6 +8,8 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress
 
 try:
@@ -75,8 +77,12 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 output_tensor_list, tmp_tensor, group=get_world_group().device_group
             )
         """Initialize the ascend transfer instance."""
-        ret_value = self.engine.initialize(
-            self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+        ret_value = run_with_deadline(
+            lambda: self.engine.initialize(
+                self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+            ),
+            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
+            what=f"Ascend TransferEngine.initialize({self.store_url!r}, {self.session_id!r})",
         )
         if ret_value != 0:
             logger.error("Ascend Transfer Engine initialization failed.")

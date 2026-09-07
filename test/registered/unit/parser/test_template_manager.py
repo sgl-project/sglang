@@ -269,6 +269,42 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         _, _, parser = self._detect(template, ["<minimax:tool_call>"])
         self.assertEqual(parser, "minimax")
 
+    HYV4_TEMPLATE = (
+        "{%- set reasoning_mode_token = '<｜reasoning_mode:opensource｜>' %}\n"
+        "{%- if not reasoning_effort is defined %}\n"
+        "    {%- set reasoning_effort = 'high' %}\n"
+        "{%- elif reasoning_effort not in ['high', 'low', 'no_think'] %}\n"
+        "{%- endif %}\n"
+        "<tool_call:opensource>{{ name }}<arg_key:opensource>{{ k }}</arg_key:opensource>"
+    )
+
+    HYV4_VOCAB = [
+        "<tool_calls:opensource>",
+        "<tool_call:opensource>",
+        "<arg_key:opensource>",
+        "<arg_value:opensource>",
+    ]
+
+    def test_hyv4_effort_template_detected_with_special_case(self):
+        # Hy4 drops <tool_sep>; detection must key on the effort-mode template
+        # signature plus the suffixed arg tokens instead.
+        force, config, parser = self._detect(self.HYV4_TEMPLATE, self.HYV4_VOCAB)
+
+        self.assertEqual(config, ReasoningToggleConfig(special_case="hunyuan_effort"))
+        self.assertEqual(parser, "hunyuan")
+        self.assertEqual(
+            detect_tool_call_parser(
+                self.HYV4_TEMPLATE, _DummyTokenizer(self.HYV4_VOCAB), config, force
+            ),
+            "hunyuan",
+        )
+
+    def test_hyv4_template_without_arg_tokens_not_hunyuan(self):
+        _, config, parser = self._detect(self.HYV4_TEMPLATE, ["<tool_call:opensource>"])
+
+        self.assertEqual(config, ReasoningToggleConfig(special_case="hunyuan_effort"))
+        self.assertNotEqual(parser, "hunyuan")
+
 
 class TestTemplateDetectionRuleMatrix(unittest.TestCase):
     """Table-driven tests for REASONING_PARSER_RULES and REASONING_MODE_RULES."""
@@ -482,6 +518,28 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
         self.assertEqual(parser, "qwen3")
         self.assertEqual(config.toggle_param, "enable_thinking")
         self.assertTrue(config.default_enabled)
+
+    def test_k2_horizon_detects_always_on_reasoning_and_tool_parsers(self):
+        template = """
+        {% set tool_call_fmt = tool_call_format | default('xml') %}
+        {% set effort = reasoning_effort | default('high') %}
+        <ifm|think><ifm|think_fast><ifm|think_faster>
+        <ifm|tool_calls><ifm|tool_call>
+        """
+        force, config = detect_reasoning_pattern(template)
+        tokenizer = _DummyTokenizer([])
+
+        self.assertTrue(force)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.special_case, "always")
+        self.assertEqual(
+            detect_reasoning_parser(template, tokenizer, config, force),
+            "k2_horizon",
+        )
+        self.assertEqual(
+            detect_tool_call_parser(template, tokenizer, config, force),
+            "k2_horizon",
+        )
 
 
 class TestToolCallParserDetection(unittest.TestCase):

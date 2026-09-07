@@ -3,19 +3,19 @@
 use crate::message::config::ServerArgs;
 use crate::message::request::MmRequest;
 
-/// The intake side of the MM path.
+/// Dispatches multimodal requests onto the MM worker channel.
 #[derive(Clone)]
-pub struct Mm {
+pub struct MmDispatch {
     /// Whether the model is multimodal. When false, mm fields are silently
     /// ignored, as the Python `TokenizerManager` does with `mm_processor is
     /// None`.
     pub enabled: bool,
     /// → MM worker pool (spawned via `Server.start_mm_workers`).
     pub tx: flume::Sender<MmRequest>,
-    /// Results sidecar. Purged here when a late result arrives for a request
+    /// Parked results. Purged here when a late result arrives for a request
     /// that is no longer parked; otherwise it would leak, since only the
     /// scheduler drain pops entries.
-    pub sidecar: crate::multi_modality::sidecar::Sidecar,
+    pub results: crate::multi_modality::result_store::MmResultStore,
 }
 
 /// Resolved once at boot from the scheduler's `server_args`.

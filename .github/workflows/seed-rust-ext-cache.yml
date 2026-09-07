@@ -15,6 +15,10 @@ on:
       # The key's prefix lives in this file, so a bump there also moves the key.
       - '.github/workflows/_pr-test-rust-ext-build.yml'
       - 'scripts/ci/utils/stage_rust_ext_modules.sh'
+      # Not hashed into the key, but they carry the prefix each side uses: the one
+      # seeded per arch here, and the one consumers restore with there.
+      - '.github/workflows/seed-rust-ext-cache.yml'
+      - '.github/actions/download-rust-ext/action.yml'
   workflow_dispatch:
 
 # Only the newest merge needs to seed; earlier ones are already stale.
@@ -34,4 +38,14 @@ jobs:
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: ubuntu-22.04
+    secrets: inherit
+
+  # One entry per arch, since the arch is part of the key.
+  seed-aarch64:
+    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
+    with:
+      runs_on: ubuntu-22.04-arm
+      collect_runs_on: ubuntu-22.04-arm
+      artifact_name: rust-ext-aarch64
+      cache_key_prefix: rust-ext-aarch64-cp310-cp312
     secrets: inherit

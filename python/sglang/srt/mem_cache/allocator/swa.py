@@ -84,9 +84,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_kv_pool,
                 need_sort,
             )
-        # Note: append one more item of value -1 in the end so -1 maps to -1.
-        # It is needed for the last_loc in alloc_extend, where the first full_last_loc
-        # is -1, and we need to map it to swa_last_loc -1 as well.
+        # Trailing -1: a last_loc of -1 (no prefix) indexes it, so alloc_extend and
+        # alloc_decode see -1 on the SWA side as well.
         self.full_to_swa_index_mapping = torch.cat(
             [
                 torch.zeros(
@@ -103,7 +102,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.free_group = None
         self.swa_free_group = []
-        self.full_free_group = []
 
         self._kvcache = kvcache
         self.clear()
@@ -234,12 +232,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         swa_tail_len: int,
     ):
-        """Allocate full KV for the whole extend and SWA KV only for the tail.
-
-        This is used by disaggregated decode preallocation: decode receives full
-        prompt KV for full-attention layers, but only the sliding-window state is
-        transferred for SWA layers.
-        """
+        """Allocate full KV for the whole extend and SWA KV only for the tail."""
         assert self.page_size > 1
         assert len(seq_lens_cpu) == 1, "SWA tail allocation currently supports bs=1"
         assert len(prefix_lens_cpu) == 1
@@ -335,10 +328,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        """Write full_to_swa_index_mapping[full_indices[i]] = swa_indices[i].
-
-        Used by HiCache load-back path to rebuild the mapping after FULL and SWA device alloc.
-        """
         if full_indices.numel() == 0:
             return
         assert full_indices.numel() == swa_indices.numel()
@@ -402,18 +391,34 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_index_mapping[free_index] == 0,
             msg="caller wants free",
         )
-        if self.free_group is None:
-            self.full_attn_allocator.free(free_index)
-        else:
-            self.full_free_group.append(self._copy_for_free_group(free_index))
+        self.full_attn_allocator.free(free_index)
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
 
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        if free_index.numel() == 0:
+            return
+        # SWA first, as in free(): it reads the mapping that a later cache
+        # action in this group may re-point.
+        self.free_swa(free_index)
+        self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
+
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        if free_index.numel() == 0:
+            return
+        expect(
+            _SWA_PEER_RELEASED,
+            self.full_to_swa_index_mapping[free_index] == 0,
+            msg="caller wants free_segment",
+        )
+        self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
+
     def free_group_begin(self):
         super().free_group_begin()
         self.swa_free_group = []
-        self.full_free_group = []
+        # No full-side pile here: the full allocator's own group defers those.
+        self.full_attn_allocator.free_group_begin()
 
     def free_group_end(self):
         super().free_group_end()
@@ -421,10 +426,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
             self._release_swa(torch.cat(swa_free_group))
-        if self.full_free_group:
-            full_free_group = self.full_free_group
-            self.full_free_group = []
-            self.full_attn_allocator.free(torch.cat(full_free_group))
+        self.full_attn_allocator.free_group_end()
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
@@ -468,14 +470,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[:-1].fill_(0)
         self.free_group = None
         self.swa_free_group = []
-        self.full_free_group = []
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        return self._kvcache.get_cpu_copy(
+            indices,
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
+        )
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         return self._kvcache.load_cpu_copy(
-            kv_cache_cpu, indices, mamba_indices=mamba_indices
+            kv_cache_cpu,
+            indices,
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
         )
 
 
@@ -594,8 +604,16 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # release once the SWA side is gone.
         return
 
-    # Not inherited: the SWA parent's hooks drive swa_free_group and
-    # full_free_group, which this pure-SWA variant does not have.
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        # Single pool: the parent's split into an SWA and a full half would
+        # release the same slots twice.
+        self.free(free_index)
+
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        return
+
+    # Not inherited: the SWA parent's hooks drive swa_free_group and the full
+    # allocator's group, which this pure-SWA variant does not have.
     def free_group_begin(self):
         BaseTokenToKVPoolAllocator.free_group_begin(self)
 

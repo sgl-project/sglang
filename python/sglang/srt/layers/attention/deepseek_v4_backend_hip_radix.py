@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_spec,
 )
@@ -474,16 +475,16 @@ class DeepseekV4HipRadixBackend(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
         self.enable_deepseek_v4_fp4_indexer: bool = (
-            model_runner.server_args.enable_deepseek_v4_fp4_indexer
+            get_exec().kernel.enable_deepseek_v4_fp4_indexer
         )
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
+        self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
         self.is_dspark_draft = (
-            getattr(model_runner, "is_draft_worker", False)
-            and model_runner.spec_algorithm.is_dspark()
+            self.is_draft_worker and model_runner.spec_algorithm.is_dspark()
         )
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
@@ -1149,7 +1150,9 @@ class DeepseekV4HipRadixBackend(
                 and extend_seq_lens is not None
                 and extend_seq_lens_cpu is not None
             )
-            is_draft = forward_batch.forward_mode.is_draft_extend_v2()
+            is_draft = (
+                forward_batch.forward_mode.is_draft_extend_v2() or self.is_draft_worker
+            )
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,

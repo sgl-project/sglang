@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 
 # Two classes run from this file: the default server plus the Rust-frontend
 # variant (when the embedded extension is built), each launches a server + eval.
-register_cuda_ci(est_time=124, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=149, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestModeloptFP8(CustomTestCase):
