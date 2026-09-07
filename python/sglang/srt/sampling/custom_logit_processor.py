@@ -58,6 +58,17 @@ class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
         return logits
 
 
+def supports_sampling_mask(serialized_processor: str) -> bool:
+    """Hard exclusion preserves the relative logits needed for mask-based replay."""
+    try:
+        return isinstance(
+            CustomLogitProcessor.from_str(serialized_processor),
+            DisallowedTokensLogitsProcessor,
+        )
+    except Exception:
+        return False
+
+
 def _open_thinking_start(ids: list[int], start_id: int, end_id: int) -> int:
     """Return the index of the start token of the currently open thinking block, or -1."""
     for idx in reversed(range(len(ids))):
