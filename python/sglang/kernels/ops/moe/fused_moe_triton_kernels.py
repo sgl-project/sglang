@@ -1410,9 +1410,16 @@ def _fused_append_remap_shared_experts_deepep_kernel(
         # slot. Matches the old fill(topk_ids=0) -> remap(0)=0 when pad_fill_id==0.
         # ids is a BLOCK_K-wide register tile (K need not be pow2), so fill the
         # whole tile and let the masked store below drop the tail.
+        #
+        # The weights are zeroed here too, on both the routed and the shared
+        # slots, so a padded row leaves this kernel fully inert. The caller
+        # otherwise has to follow up with a separate pass to zero them, because
+        # the gate's routed weights survive the id fill and the shared slots are
+        # written unconditionally at scale_factor.
         n_valid = tl.load(num_token_non_padded_ptr)
-        if pid >= n_valid:
-            ids = tl.full((BLOCK_K,), pad_fill_id, dtype=ids.dtype)
+        keep = pid < n_valid
+        ids = tl.where(keep, ids, tl.full((BLOCK_K,), pad_fill_id, dtype=ids.dtype))
+        ws = tl.where(keep, ws, tl.zeros((BLOCK_K,), dtype=ws.dtype))
 
     tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
     tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws, mask=mask_k)
@@ -1421,6 +1428,8 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     mask_s = offs_s < S
     shared_ids = tl.cast(shared_id_base + offs_s, ids.dtype)
     shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
+    if HAS_PADDING:
+        shared_ws = tl.where(keep, shared_ws, tl.zeros([BLOCK_S], dtype=ws.dtype))
 
     tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
     tl.store(out_weights_ptr + out_ids_row_ptr + K + offs_s, shared_ws, mask=mask_s)
