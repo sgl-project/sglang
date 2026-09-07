@@ -19,7 +19,6 @@ from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearSche
 
 
 class ModelSlimW8A8Int8(ModelSlimLinearScheme):
-
     def __init__(
         self,
         quant_config: Dict[str, any],

@@ -9,7 +9,7 @@ from sglang.srt.entrypoints.http_server import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
@@ -57,7 +57,6 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
 
         with patch("sglang.srt.entrypoints.http_server.aiohttp.ClientSession", Session):
             status_codes = await _send_disaggregation_warmup_requests(
-                server_args=server_args,
                 url="http://localhost:30000",
                 headers={"Authorization": "Bearer token"},
                 ssl_verify=False,

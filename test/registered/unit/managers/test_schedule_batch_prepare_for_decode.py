@@ -12,14 +12,14 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_req():
     return types.SimpleNamespace(
         decode_batch_idx=0,
-        kv_committed_len=3,
-        kv_allocated_len=3,
+        kv=types.SimpleNamespace(kv_committed_len=3, kv_allocated_len=3),
+        beam_group=None,
     )
 
 

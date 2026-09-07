@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
+from sglang.kernels.ops.attention.fla.kda import chunk_kda as triton_chunk_kda
 
 CHUNK_SIZE = 64
 # Rounded identically to flash-linear-attention/SGLang before FP32 multiply.
@@ -1313,6 +1314,7 @@ def chunk_kda(
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
     output_intermediate_states: bool = False,
+    beta_is_raw: bool = False,
     **kwargs: object,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Match the public forward contract of SGLang's Triton ``chunk_kda``."""
@@ -1320,6 +1322,34 @@ def chunk_kda(
         scale = k.shape[-1] ** -0.5
     if initial_state is None or initial_state_indices is None:
         raise ValueError("KDA prefill requires an indexed initial-state pool")
+
+    num_tokens = q.shape[1]
+    if g.shape[1] < num_tokens or beta.shape[1] < num_tokens:
+        raise ValueError("g and beta must cover every q token")
+    g = g[:, :num_tokens]
+    beta = beta[:, :num_tokens]
+    if beta_is_raw:
+        beta = beta.float().sigmoid()
+    if num_tokens == 1:
+        # Tracing constant-folds size-one dimensions, but the resulting kernel
+        # can share a cache entry with longer inputs. Keep T=1 on Triton so a
+        # short first request cannot specialize later Helion calls incorrectly.
+        return triton_chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            output_intermediate_states=output_intermediate_states,
+        )
 
     q = q.contiguous()
     k = k.contiguous()

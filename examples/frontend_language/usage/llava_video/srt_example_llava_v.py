@@ -124,7 +124,6 @@ def batch(video_dir, save_dir, cur_chunk, num_chunks, num_frames=16, batch_size=
 
 
 if __name__ == "__main__":
-
     url = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
     cache_dir = os.path.expanduser("~/.cache")

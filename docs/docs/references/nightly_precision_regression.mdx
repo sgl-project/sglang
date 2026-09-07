@@ -72,7 +72,7 @@ The layer count is resolved automatically from the model's HuggingFace `config.j
 The dumper filter is built dynamically as a regex matching only the selected layer indices, e.g.:
 
 ```
-match(r'^non_intrusive__model\.layers\.(0|7|15|23)\.inputs\.1$', name)
+match(r'^non_intrusive__model\.layers\.(0|7|15|23)\.(inputs\.1|self_attn\.inputs\.hidden_states)$', name)
 ```
 
 ### Decode-path verification
@@ -81,19 +81,29 @@ The test generates **2 tokens** with `ignore_eos=True` to ensure the model's dec
 
 ### Comparator
 
-The comparator computes **relative differences** (`rel_diff`) for each tensor and checks them against a configurable threshold (default `1e-3`). For tensor-parallel models, the `--override-dims` flag tells the comparator how to reduce across TP ranks before comparing:
+The comparator computes **relative differences** (`rel_diff`) for each tensor and checks them against a configurable threshold (default `1e-3`). The comparison is restricted to the post-fusion attention input, which `--override-dims` declares replicated across TP ranks:
 
 ```
---override-dims ^non_intrusive__model\.layers\.\d+\.inputs\.1$:bs h[tp:partial]
+--filter self_attn\.inputs\.hidden_states
+--override-dims ^non_intrusive__model\.layers\.\d+\.self_attn\.inputs\.hidden_states$:bs h # tp:replicated
 ```
 
-This sums partial TP contributions along the hidden dimension before computing the diff, so the comparison is semantically correct even with TP > 1.
+Declaring the axis replicated makes the comparator check that every rank holds the same value, rather than summing partial contributions across ranks. Layer-entry `inputs.1` tensors are still captured, but they are excluded from the comparison by `--filter` (see below).
 
 If the comparator returns exit code 0 but compared **zero layers** (baseline/target name mismatch), the test fails with a diagnostic message rather than silently passing.
 
 ### Capture signature
 
-A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP size, and dumper filter) is computed per run. The HF store uses this signature during fetch to ensure only baselines with an identical capture shape are considered. If the signature changes (e.g. you add layers to the capture set or change TP), the framework establishes a fresh baseline instead of erroring on incompatible tensors.
+A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP size, dumper filter, comparator filter, and fusion backend) is computed per run. The HF store uses this signature during fetch to ensure only baselines with an identical capture and comparison contract are considered. If the signature changes (e.g. you add layers to the capture set or change TP), the framework establishes a fresh baseline instead of erroring on incompatible tensors.
+
+### Fusion and what gets compared
+
+The harness pins FlashInfer all-reduce fusion **on** (`--flashinfer-allreduce-fusion-backend trtllm`; the SM90 auto-enable was dropped in #23402). Two names are captured per layer:
+
+- `inputs.1` — hidden states entering the layer. `LayerCommunicator` defers the cross-layer all-reduce, so with fusion active these are rank-local TP-partial sums. CPU-side reduction of them is not the kernel's semantic output and drifts across self-hosted runners, so they are **not** compared. `_assert_fused_tp_layout()` keeps them only as a guard: if they come back replicated, fusion silently fell back and the test fails.
+- `self_attn.inputs.hidden_states` — the value attention consumes after `prepare_attn()`, i.e. post fused all-reduce and residual RMSNorm. This is replicated across ranks and is what the comparator actually diffs.
+
+This is why a stale baseline captured with fusion *not* initialized is incompatible: it holds replicated layer-entry tensors where the target holds TP-partial ones, which reads as an approximately `tp_size`x mismatch. Fusion initialization failures are tracked in [FlashInfer #3676](https://github.com/flashinfer-ai/flashinfer/issues/3676) and [SGLang #30875](https://github.com/sgl-project/sglang/issues/30875).
 
 ---
 
@@ -109,6 +119,7 @@ A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP 
 | `SGLANG_PRECISION_HF_REPO` | _(required)_ | HuggingFace dataset repo for cross-runner baseline storage |
 | `SGLANG_PRECISION_HF_REVISION` | `main` | Branch/revision of the HF dataset |
 | `SGLANG_PRECISION_HF_TOKEN` | _(required in CI)_ | HuggingFace token with write access to the dataset. Kept off `HF_TOKEN`, which already carries the runner's gated-model read token |
+| `SGLANG_PRECISION_HF_READ_ONLY` | `0` | Set to `1` to fetch and compare without updating the shared baseline store |
 
 ---
 
@@ -136,6 +147,8 @@ Key CI configuration:
 ```
 
 `SGLANG_PRECISION_HF_TOKEN` rather than `HF_TOKEN`: the latter already carries the runner's gated-model read token, and overwriting it would turn every gated model on the job into a 401.
+
+Standalone `/rerun-test` runs fetch the nightly baseline without changing it. Maintainers can refresh it from an in-repo PR with `/rerun-test --refresh-precision-baseline test/registered/debug_utils/test_nightly_precision_regression.py`.
 
 ### Required GitHub secrets/variables
 

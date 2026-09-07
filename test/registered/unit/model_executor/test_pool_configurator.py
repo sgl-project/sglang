@@ -10,12 +10,18 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.runtime_context import get_memory, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_server_args,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 @contextlib.contextmanager
@@ -79,6 +85,8 @@ def _make_model_runner(
     disaggregation_decode_extra_slots=0,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
+    swa_kv_lora_rank=128,
+    swa_qk_rope_head_dim=32,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -99,6 +107,9 @@ def _make_model_runner(
     mc.v_head_dim = v_head_dim
     mc.kv_lora_rank = kv_lora_rank
     mc.qk_rope_head_dim = qk_rope_head_dim
+    mc.swa_kv_lora_rank = swa_kv_lora_rank
+    mc.swa_qk_rope_head_dim = swa_qk_rope_head_dim
+    mc.attention_arch = AttentionArch.MLA if use_mla_backend else AttentionArch.MHA
     mc.is_hybrid_swa = is_hybrid_swa
     mc.full_attention_layer_ids = (
         full_attention_layer_ids
@@ -113,9 +124,11 @@ def _make_model_runner(
     mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    mc.hf_config.model_type = "llama"
     mc.hf_config.get_text_config = lambda: mc.hf_config
     mc.linear_attn_registry_result = None
     mc.context_len = 8192
+    mc.is_draft_model = False
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
 
@@ -158,7 +171,9 @@ def _make_model_runner(
     mr.ps = ParallelState.trivial()
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
-        eagle_draft_num_layers=None, dflash_draft_num_layers=None
+        eagle_draft_num_layers=None,
+        eagle_draft_swa_num_layers=None,
+        dflash_draft_num_layers=None,
     )
 
     return mr
@@ -303,7 +318,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             )
 
             cfg = create_memory_pool_configurator(mr)
-            config = cfg.calculate_pool_sizes(available_bytes, mr.server_args.page_size)
+            config = cfg.calculate_pool_sizes(available_bytes, get_schedule().page_size)
         return mr, cfg, config
 
     def test_memory_utilization(self):
@@ -311,6 +326,58 @@ class TestHybridSWAConfigurator(CustomTestCase):
         available = 10_000_000
         mr, _, config = self._run(available)
         used = _actual_memory_used(mr, config)
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_mla_uses_full_and_swa_latent_geometry(
+        self,
+        mock_calculate_mla_kv_cache_dim,
+    ):
+        """Hybrid MLA pools must not be sized from MHA head geometry."""
+        available = 10_000_000
+        full_layers = 2
+        swa_layers = 3
+        swa_kv_lora_rank = 128
+        swa_qk_rope_head_dim = 32
+        mr = _make_model_runner(
+            self,
+            num_kv_heads=32,
+            head_dim=256,
+            v_head_dim=256,
+            use_mla_backend=True,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(full_layers)),
+            swa_attention_layer_ids=list(range(full_layers, full_layers + swa_layers)),
+            swa_num_kv_heads=16,
+            swa_head_dim=128,
+            swa_v_head_dim=128,
+            swa_kv_lora_rank=swa_kv_lora_rank,
+            swa_qk_rope_head_dim=swa_qk_rope_head_dim,
+            swa_full_tokens_ratio=0.5,
+        )
+
+        with mock_cpu_env(kv_size=2):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        expected_full_per_token = 576 * 2
+        expected_swa_per_token = (swa_kv_lora_rank + swa_qk_rope_head_dim) * 2
+        self.assertEqual(cfg._full_per_token, expected_full_per_token)
+        self.assertEqual(cfg._swa_per_token, expected_swa_per_token)
+        mock_calculate_mla_kv_cache_dim.assert_called_once()
+
+        used = (
+            config.full_max_total_num_tokens * expected_full_per_token * full_layers
+            + config.swa_max_total_num_tokens * expected_swa_per_token * swa_layers
+        )
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 
@@ -353,7 +420,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         user_limit = original.full_max_total_num_tokens // 2
         with mock_cpu_env():
             config = cfg.calculate_pool_sizes_from_max_tokens(
-                user_limit, mr.server_args.page_size
+                user_limit, get_schedule().page_size
             )
         used = _actual_memory_used(mr, config)
         self.assertLessEqual(used, available)
@@ -442,6 +509,40 @@ class TestHybridSWAConfigurator(CustomTestCase):
 
         self.assertEqual(config.swa_max_total_num_tokens, 91)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
+
+    def test_chunk_cache_cap_accounts_for_draft_swa_layers(self):
+        """Draft SWA tensors consume the same fixed-capacity pool as target SWA."""
+        available = 1_000_000
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            disable_radix_cache=True,
+            chunked_prefill_size=4,
+            sliding_window_size=8,
+            page_size=1,
+            max_running_requests=2,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 1
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        full_tokens = config.full_max_total_num_tokens
+        swa_tokens = config.swa_max_total_num_tokens
+        used = full_tokens * _full_per_token(mr) + swa_tokens * _swa_per_token(mr) * 2
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
 
     def test_chunk_cache_cap_drops_prefill_for_disagg_decode(self):
         available = 1_000_000
@@ -658,6 +759,45 @@ class TestEagleConfigurator(CustomTestCase):
             available,
         )
 
+    def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
+        """SWA draft layers use SWA KV geometry and capacity."""
+        available = 10_000_000
+        ratio = 0.25
+        mr = _make_model_runner(
+            self,
+            num_kv_heads=8,
+            head_dim=64,
+            v_head_dim=64,
+            num_layers=4,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0, 1],
+            swa_attention_layer_ids=[2, 3],
+            swa_num_kv_heads=2,
+            swa_head_dim=32,
+            swa_v_head_dim=32,
+            swa_full_tokens_ratio=ratio,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 1
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        full_tokens = config.full_max_total_num_tokens
+        swa_tokens = config.swa_max_total_num_tokens
+        full_pt = _full_per_token(mr)
+        swa_pt = _swa_per_token(mr)
+        used = full_tokens * full_pt * 2 + swa_tokens * swa_pt * 3
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
 
 class TestDSAIndexerAllocationPolicy(CustomTestCase):
     @patch(
@@ -675,8 +815,9 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         mr.model_config.hf_config.index_topk_freq = 4
         mr.model_config.hf_config.index_skip_topk_offset = 3
 
-        with get_memory().override(enable_hierarchical_cache=True), mock_cpu_env(
-            kv_size=1
+        with (
+            get_memory().override(enable_hierarchical_cache=True),
+            mock_cpu_env(kv_size=1),
         ):
             from sglang.srt.model_executor.pool_configurator import (
                 DefaultPoolConfigurator,
@@ -862,10 +1003,71 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 )
 
                 cfg = create_memory_pool_configurator(mr)
-                config = cfg.calculate_pool_sizes(available, mr.server_args.page_size)
+                config = cfg.calculate_pool_sizes(available, get_schedule().page_size)
             return config.full_max_total_num_tokens
 
         self.assertLess(_tokens(10240), _tokens(None))
+
+
+class TestSWAPoolFloor(CustomTestCase):
+    """An SWA pool below the prefill admission floor must fail here, not livelock
+    the scheduler at warmup."""
+
+    def _hybrid_swa_from_max_tokens(self, max_tokens, ratio, page_size, window):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(16)),
+            swa_attention_layer_ids=list(range(16, 32)),
+            swa_num_kv_heads=4,
+            page_size=page_size,
+            swa_full_tokens_ratio=ratio,
+            sliding_window_size=window,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            return cfg.calculate_pool_sizes_from_max_tokens(max_tokens, page_size)
+
+    def test_hybrid_swa_rejects_single_page_pool(self):
+        with self.assertRaisesRegex(ValueError, "cannot hold even one request"):
+            self._hybrid_swa_from_max_tokens(
+                max_tokens=4096, ratio=0.1, page_size=256, window=128
+            )
+
+    def test_hybrid_swa_accepts_pool_above_floor(self):
+        config = self._hybrid_swa_from_max_tokens(
+            max_tokens=32768, ratio=0.1, page_size=256, window=128
+        )
+        self.assertEqual(config.swa_max_total_num_tokens, 3072)
+
+    def _dsv4_sizes(self, max_tokens, page_size):
+        """Exercise the DSV4 size arithmetic without a full V4 model fixture:
+        _compute_dsv4_sizes reads only these five attributes."""
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.swa_ratio = 0.1
+        cfg.sliding_window_size = 128
+        cfg.swa_page_size = 128
+        cfg.c4_ring_size = 8
+        cfg.c4_shrink_factor = 1
+        return cfg._compute_dsv4_sizes(max_tokens, page_size)
+
+    def test_dsv4_rejects_single_page_pool(self):
+        # DeepSeek-V4-Flash defaults: page_size=256, swa_full_tokens_ratio=0.1.
+        # int(4096 * 0.1) page-aligns down to 256 -- exactly one page, below the
+        # 128 + 256 floor.
+        with self.assertRaisesRegex(ValueError, "cannot hold even one request"):
+            self._dsv4_sizes(max_tokens=4096, page_size=256)
+
+    def test_dsv4_accepts_pool_above_floor(self):
+        sizes = self._dsv4_sizes(max_tokens=32768, page_size=256)
+        self.assertEqual(sizes.full_max_total_num_tokens, 32768)
+        self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
 
 
 if __name__ == "__main__":

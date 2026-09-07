@@ -7,13 +7,22 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["video", "text-to-video", "mixture-of-experts"]} />
+<DiffusionModelTags tags={["video", "text-to-video", "mixture-of-experts", "30B-A3B"]} />
 
-## 1. Model introduction
+## 1. Model Introduction
 
 [LingBot Video MoE 30B-A3B](https://huggingface.co/robbyant/lingbot-video-moe-30b-a3b)
-is a text-to-video mixture-of-experts model. SGLang Diffusion provides a native
-pipeline for the public checkpoint:
+is a text-to-video mixture-of-experts model served through a native SGLang
+Diffusion pipeline. Its main advantage is the MoE economics: 30B total
+parameters with 3B active per token, so a plain `sglang serve` invocation
+covers the released 480×480, 81-frame profile without parallelism flags.
+
+Prompting is the distinctive part of this checkpoint: it expects a structured
+JSON caption rather than an unexpanded natural-language prompt, passed as the
+request's `prompt` string. A compact 17-frame, 12-step smoke-test profile is
+available for quick validation next to the released 40-step profile.
+
+The public checkpoint served by the pipeline:
 
 | Model ID | Task | Default output |
 | --- | --- | --- |
