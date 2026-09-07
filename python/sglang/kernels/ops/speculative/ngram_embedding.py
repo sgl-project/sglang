@@ -48,24 +48,32 @@ def _torch_update_token_table(
     req_lens: torch.Tensor,
     ignore_tokens: torch.Tensor | None = None,
 ) -> None:
-    max_context_len = ne_token_table.shape[1]
     batch_size = req_lens.shape[0]
-    starts = torch.zeros(batch_size + 1, dtype=torch.int32, device=tokens.device)
-    starts[1:] = torch.cumsum(req_lens, dim=0)
-    has_ignore = ignore_tokens is not None and ignore_tokens.numel() > 0
-    for req_id in range(batch_size):
-        s = starts[req_id].item()
-        e = starts[req_id + 1].item()
-        if e <= s:
-            continue
-        token_slice = tokens[s:e]
-        row = row_indices[req_id].item()
-        col = column_starts[req_id].item()
-        ne_token_table[row, col : col + (e - s)] = token_slice
-        if has_ignore:
-            mask = torch.isin(token_slice, ignore_tokens)
-            if mask.any():
-                ne_token_table[row, col : col + (e - s)][mask] = -token_slice[mask]
+    if batch_size <= 0:
+        return
+    device = tokens.device
+    req_lens = req_lens.long()
+    # Map every token to its request id; repeat_interleave's output length is
+    # the total token count, known here as a Python int without a sync.
+    req_id = torch.repeat_interleave(
+        torch.arange(batch_size, device=device), req_lens
+    )
+    total_tokens = req_id.shape[0]
+    if total_tokens == 0:
+        return
+    max_context_len = ne_token_table.shape[1]
+    starts = torch.cumsum(req_lens, dim=0) - req_lens
+    pos_in_req = torch.arange(total_tokens, device=device) - starts[req_id]
+    flat = (
+        row_indices[req_id].long() * max_context_len
+        + column_starts[req_id].long()
+        + pos_in_req
+    )
+    values = tokens[:total_tokens]
+    if ignore_tokens is not None and ignore_tokens.numel() > 0:
+        # Ignored tokens are stored negated, mirroring UpdateTokenTableKernel.
+        values = torch.where(torch.isin(values, ignore_tokens), -values, values)
+    ne_token_table.reshape(-1)[flat] = values
 
 
 def _torch_update_token_table_decode(
@@ -96,39 +104,50 @@ def _torch_compute_n_gram_ids(
     eos_token_id: int,
 ) -> None:
     batch_size = exclusive_req_len_sums.shape[0] - 1
+    if batch_size <= 0:
+        return
+    device = ne_token_table.device
+    max_context_len = ne_token_table.shape[1]
+    req_lens = (exclusive_req_len_sums[1:] - exclusive_req_len_sums[:-1]).long()
+    # Per-token mapping into the token table, built once for all configs.
+    req_id = torch.repeat_interleave(
+        torch.arange(batch_size, device=device), req_lens
+    )
+    total_tokens = req_id.shape[0]
+    if total_tokens == 0:
+        return
+    pos_in_req = (
+        torch.arange(total_tokens, device=device)
+        - exclusive_req_len_sums[:-1][req_id].long()
+    )
+    row_base = row_indices[req_id].long() * max_context_len
+    col = column_starts[req_id].long()
+    table_flat = ne_token_table.reshape(-1)
+    zero_i64 = torch.zeros((), dtype=torch.int64, device=device)
+    # The (n, k, j) loops stay in Python: they are tiny (config counts), while
+    # everything token-parallel below is a single tensor op with no host sync.
     for n in range(ne_n - 1):
         for k in range(ne_k):
-            mod_val = ne_mods[n, k].item()
+            config = n * ne_k + k
+            mod = ne_mods[n, k].long()
             w_row = ne_weights[n, k]
-            emb_offset = exclusive_ne_embedder_size_sums[n * ne_k + k].item()
-            for req_id in range(batch_size):
-                req_start = exclusive_req_len_sums[req_id].item()
-                req_end = exclusive_req_len_sums[req_id + 1].item()
-                num_tokens = req_end - req_start
-                if num_tokens <= 0:
-                    continue
-                row = row_indices[req_id].item()
-                col = column_starts[req_id].item()
-                table_row = ne_token_table[row]
-                ng = torch.zeros(num_tokens, dtype=torch.int64, device=tokens.device)
-                active = torch.ones(num_tokens, dtype=torch.bool, device=tokens.device)
-                for j in range(n + 2):
-                    valid_start = max(0, j - col)
-                    shifted = torch.full(
-                        (num_tokens,), -1, dtype=torch.int32, device=tokens.device
-                    )
-                    if num_tokens > valid_start:
-                        src_start = max(0, col - j)
-                        cnt = num_tokens - valid_start
-                        shifted[valid_start:] = table_row[src_start : src_start + cnt]
-                    active = active & (shifted >= 0)
-                    if j > 0:
-                        active = active & (shifted != eos_token_id)
-                    w = w_row[j].item()
-                    contrib = (shifted.to(torch.int64) * w) % mod_val
-                    ng[active] += contrib[active]
-                ng = (ng % mod_val + emb_offset).to(torch.int32)
-                n_gram_ids[req_start:req_end, n * ne_k + k] = ng
+            emb_offset = exclusive_ne_embedder_size_sums[config].long()
+            ng = torch.zeros(total_tokens, dtype=torch.int64, device=device)
+            active = torch.ones(total_tokens, dtype=torch.bool, device=device)
+            for j in range(n + 2):
+                table_col = col + pos_in_req - j
+                valid = table_col >= 0
+                # Clamp for the gather; invalid positions are already masked
+                # out of `active` by `valid`, so the fetched value is unused.
+                shifted = table_flat[(row_base + table_col.clamp_min(0)).long()]
+                active = active & valid & (shifted >= 0)
+                if j > 0:
+                    # Don't let the n-gram context cross an eos boundary.
+                    active = active & (shifted != eos_token_id)
+                contrib = shifted.long() * w_row[j].long() % mod
+                ng += torch.where(active, contrib, zero_i64)
+            ng = (ng % mod + emb_offset).to(torch.int32)
+            n_gram_ids[:total_tokens, config] = ng
 
 
 def _torch_compute_n_gram_ids_decode(
