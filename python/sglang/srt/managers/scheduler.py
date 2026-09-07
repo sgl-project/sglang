@@ -2856,6 +2856,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        req.pp_prefetch_ticketed = recv_req.pp_prefetch_ticketed
         self._maybe_namespace_elastic_radix_cache(req)
 
         if mm_input_error is not None:
@@ -3052,6 +3053,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.ps.pp_rank == 0 and getattr(
+            self.tree_cache.cache_controller, "pp_prefetch_command_group", None
+        ):
+            self._prefetch_kvcache(req)
+            recv_req.pp_prefetch_ticketed = req.pp_prefetch_ticketed
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -3068,7 +3075,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage and not req.finished():
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
@@ -3104,7 +3111,7 @@ class Scheduler(
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                tree_cache.prefetch_from_storage(
+                ticketed = tree_cache.prefetch_from_storage(
                     req.rid,
                     last_host_node,
                     new_input_tokens,
@@ -3114,6 +3121,8 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                 )
+                if ticketed is not None:
+                    req.pp_prefetch_ticketed = ticketed
 
     def _retry_missed_storage_prefetches(self):
         """Re-issue the availability check for queued requests whose prefetch
@@ -3815,10 +3824,16 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if req.pp_prefetch_ticketed:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(
+                        req.rid, True
+                    )
+                else:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
+                req.pp_prefetch_ticketed = False
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
                 loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(

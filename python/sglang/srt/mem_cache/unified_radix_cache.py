@@ -4,6 +4,7 @@ import atexit
 import logging
 import threading
 import time
+from array import array
 from dataclasses import replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -1722,9 +1723,13 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
-    ) -> None:
+    ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
-            return
+            return None
+
+        submission = self.cache_controller.get_prefetch_submission(req_id)
+        if submission is not None:
+            return submission.decision
 
         buffer_mode = self.host_memory_mode == "buffer_only"
         # Key the span by the request's namespace, not the anchor's (a root
@@ -1755,17 +1760,17 @@ class UnifiedRadixCache(BasePrefixCache):
             # A too-short/fully-matched suffix can become a full recompute if
             # the device match evicts while queued; arm the paced retry.
             self._storage_prefetch_missed_rids.add(req_id)
-            return
+            return None
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
             self._storage_prefetch_missed_rids.add(req_id)
-            return
+            return None
         if req_id in self.ongoing_prefetch or (
             buffer_mode and self.buffer_pipeline.has_staged(req_id)
         ):
             # A fetch (or an unconsumed hold) already exists for this rid;
             # overwriting would leak its staging slots.
-            return
+            return None
 
         # Buffer mode holds no tree state during the fetch: buffers are
         # operation-owned, so the anchor needs no pin.
@@ -1821,22 +1826,31 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
             # Forfeited over transient staging pressure; retryable.
             self._storage_prefetch_missed_rids.add(req_id)
-            return
+            return None
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        operation = self.cache_controller.prefetch(
+        submission = self.cache_controller.submit_prefetch(
             req_id,
             prefetch_key,
             last_hash,
             prefix_keys,
-            extra_pools=aux_xfers or None,
+            matched_prefix_tokens,
+            aux_xfers or None,
         )
-        stats["issued"] += 1
-        # Snapshot the requested span for L3 miss-token accounting at the
-        # rank-synchronized query outcome.
-        operation.stats_requested_tokens = prefetch_length
-        operation.storage_start = len(matched_prefix_tokens or [])
+        operation = submission.operation
+        if operation is not None:
+            stats["issued"] += 1
+            operation.stats_requested_tokens = prefetch_length
+            operation.storage_start = len(matched_prefix_tokens or [])
+        if submission.decision is not None:
+            if operation is None:
+                self.cache_controller.append_host_mem_release(
+                    extra_pools=aux_xfers or None
+                )
+            return submission.decision
+
+        assert operation is not None
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node_id,
             prefetch_key,
@@ -1860,6 +1874,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # Cache mode reserves the requested span up front; buffer mode
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+        return None
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
@@ -1893,7 +1908,57 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
     @rank_consensus(same_params=True, same_results=True)
-    def check_prefetch_progress(self, req_id: str) -> bool:
+    def check_prefetch_progress(
+        self, req_id: str, pp_prefetch_ticketed: bool = False
+    ) -> bool:
+        if pp_prefetch_ticketed:
+            ready = self.pp_rank == 0 and self.cache_controller.is_pp_prefetch_ready(
+                req_id
+            )
+            ready_tensor = torch.tensor(int(ready), dtype=torch.int, device="cpu")
+            self._all_reduce(ready_tensor, torch.distributed.ReduceOp.MAX)
+            if ready_tensor.item() == 0:
+                return False
+
+            state = self.cache_controller.take_ready_pp_prefetch(req_id)
+            if state is None:
+                raise RuntimeError(
+                    f"PP prefetch became ready before local state existed: {req_id}"
+                )
+
+            operation = state.operation
+            if operation.host_indices is None or operation.completed_tokens == 0:
+                self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+                return True
+
+            ticket = state.ticket
+            prefetch_key = RadixKey(
+                array("q", ticket.token_ids),
+                extra_key=ticket.extra_key,
+                is_bigram=ticket.is_bigram,
+                cache_salt=ticket.cache_salt,
+            )
+            self.buffer_pipeline.set_prefix_ctx(
+                req_id,
+                ticket.matched_prefix_tokens,
+                extra_key=ticket.extra_key,
+                cache_salt=ticket.cache_salt,
+            )
+            self.buffer_pipeline.try_lock_anchor(req_id)
+            self.ongoing_prefetch[req_id] = _OngoingPrefetch(
+                self.root_node_handle(ticket.extra_key),
+                prefetch_key,
+                operation.host_indices,
+                operation,
+                None,
+                {BASE_COMPONENT_TYPE: list(operation.pool_transfers or [])},
+            )
+            self.cache_controller.append_host_mem_release(
+                operation.host_indices[operation.completed_tokens :]
+            )
+            self._handle_prefetch_result(operation)
+            return True
+
         if req_id not in self.ongoing_prefetch:
             return True
 
@@ -2265,6 +2330,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
         self._storage_prefetch_missed_rids.discard(rid)
+        if (
+            self.buffer_pipeline is not None
+            and self.cache_controller.pp_prefetch_command_group is not None
+            and self.cache_controller.release_pp_prefetch(rid)
+        ):
+            return
         if (
             self.buffer_pipeline is not None
             and self.buffer_pipeline.release_staged_hold(rid)
@@ -2780,7 +2851,10 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
-        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+            self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
+        else:
+            self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
         assert count_values[-2] == -count_values[-1], (
@@ -2978,7 +3052,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
-        if self.pp_size != 1:
+        if self.pp_size != 1 and self.host_memory_mode != "buffer_only":
             finish_counts = torch.zeros(2, dtype=torch.int, device="cpu")
             if self.pp_rank == 0 and self.cache_controller is not None:
                 finish_counts[0] = self._count_ready_acks(

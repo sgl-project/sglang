@@ -330,6 +330,20 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+    supports_pp_rank_query = True
+
+    def _rank_suffixes(self, pp_rank: Optional[int]):
+        if pp_rank is None:
+            return self.mla_suffix, self.mha_suffix
+        if self.should_split_heads:
+            base_rank = self.local_rank * self.split_factor
+            mha_suffix = [
+                f"{base_rank + i}_{pp_rank}" for i in range(self.split_factor)
+            ]
+        else:
+            mha_suffix = f"{self.local_rank}_{pp_rank}"
+        return str(pp_rank), mha_suffix
+
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -455,7 +469,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     )
                     device_name = ""
             if self.config.standalone_storage:
-                if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
+                if getattr(mem_pool, "kv_buffer", None) is not None and not isinstance(
+                    mem_pool.allocator, MooncakeHostTensorAllocator
+                ):
                     raise RuntimeError(
                         "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
                         "Please set standalone_storage=False "
@@ -742,7 +758,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return [group_ids[i] for i in indices]
 
     def _get_hybrid_page_component_keys(
-        self, page_keys: List[str], transfer: PoolTransfer
+        self,
+        page_keys: List[str],
+        transfer: PoolTransfer,
+        pp_rank: Optional[int] = None,
     ) -> Tuple[List[str], int]:
         host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
         if host_pool is None:
@@ -751,18 +770,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Suffix order must match get_page_buffer_meta() for one page, because
         # Mooncake zips object keys with registered buffer pointers.
         pool_name = transfer.name
+        mla_suffix, mha_suffix = self._rank_suffixes(pp_rank)
         suffixes = []
         if pool_name == PoolName.KV:
-            suffixes = [f"_{self.mla_suffix}_k"]
+            suffixes = [f"_{mla_suffix}_k"]
         elif pool_name == PoolName.MAMBA:
             # Mamba stores one temporal object plus one object per conv state.
             # conv-only models have no ssm state; drop the 0-element temporal
             # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
             # its temporal pointer under the same condition to stay aligned.
             conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+            suffixes = [f"_{mha_suffix}_conv_{i}" for i in range(conv_num)]
             if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+                suffixes = [f"_{mha_suffix}_temporal"] + suffixes
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the
@@ -771,11 +791,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # `{rank}_k` / `{rank}_k` + `{rank}_v` keys.
             draft_pool = self.registered_pools.get(PoolName.DRAFT)
             if isinstance(draft_pool, MLATokenToKVPoolHost):
-                suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}_k"]
+                suffixes = [f"_{mla_suffix}_{PoolName.DRAFT}_k"]
             else:
                 suffixes = [
-                    f"_{self.mha_suffix}_{PoolName.DRAFT}_k",
-                    f"_{self.mha_suffix}_{PoolName.DRAFT}_v",
+                    f"_{mha_suffix}_{PoolName.DRAFT}_k",
+                    f"_{mha_suffix}_{PoolName.DRAFT}_v",
                 ]
         elif pool_name == PoolName.DRAFT_SWA:
             from sglang.srt.mem_cache.memory_pool_host import (
@@ -787,11 +807,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 host_pool,
                 (DeepSeekV4PagedHostPool, MLATokenToKVPoolHost),
             ):
-                suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+                suffixes = [f"_{mla_suffix}_{pool_name}"]
             elif isinstance(host_pool, MHATokenToKVPoolHost):
                 suffixes = [
-                    f"_{self.mha_suffix}_{pool_name}_k",
-                    f"_{self.mha_suffix}_{pool_name}_v",
+                    f"_{mha_suffix}_{pool_name}_k",
+                    f"_{mha_suffix}_{pool_name}_v",
                 ]
         elif pool_name in (
             PoolName.INDEXER,
@@ -806,16 +826,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ):
             # DSA indexer and DeepSeek V4 side pools are page-packed
             # single-object pools.
-            suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+            suffixes = [f"_{mla_suffix}_{pool_name}"]
         elif pool_name == PoolName.SWA:
             if not self.is_mla_backend and hasattr(host_pool, "v_buffer"):
                 # Ordinary MHA SWA mirrors a K/V pool.
                 suffixes = [
-                    f"_{self.mha_suffix}_{pool_name}_k",
-                    f"_{self.mha_suffix}_{pool_name}_v",
+                    f"_{mha_suffix}_{pool_name}_k",
+                    f"_{mha_suffix}_{pool_name}_v",
                 ]
             elif self.is_mla_backend:
-                suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+                suffixes = [f"_{mla_suffix}_{pool_name}"]
 
         if not suffixes:
             raise ValueError(
@@ -842,6 +862,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        pp_rank = (
+            (extra_info.extra_info or {}).get("pp_rank")
+            if extra_info is not None
+            else None
+        )
         # Start from every KV prefix and let each pool remove the stop points it
         # cannot serve. Collect the whole set, not just its maximum: a
         # TRAILING_PAGES pool leaves holes (see PoolTransferResult), and the
@@ -852,7 +877,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if not restorable:
                 break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+                keys, transfer, pp_rank=pp_rank
             )
             component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
@@ -1278,22 +1303,28 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ) -> int:
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
+        pp_rank = (
+            (extra_info.extra_info or {}).get("pp_rank")
+            if extra_info is not None
+            else None
+        )
+        mla_suffix, mha_suffix = self._rank_suffixes(pp_rank)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+            query_keys = [f"{key}_{mla_suffix}_k" for key in keys]
             key_multiplier = 1
         else:
             query_keys = []
             if self.should_split_heads:
                 for key in keys:
-                    for suffix in self.mha_suffix:
+                    for suffix in mha_suffix:
                         query_keys.append(f"{key}_{suffix}_k")
                         query_keys.append(f"{key}_{suffix}_v")
                 key_multiplier = 2 * self.split_factor
             else:
                 for key in keys:
-                    query_keys.append(f"{key}_{self.mha_suffix}_k")
-                    query_keys.append(f"{key}_{self.mha_suffix}_v")
+                    query_keys.append(f"{key}_{mha_suffix}_k")
+                    query_keys.append(f"{key}_{mha_suffix}_v")
                 key_multiplier = 2
 
         exist_result = self._batch_exist(query_keys)
