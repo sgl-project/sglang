@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -23,6 +24,7 @@ from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+_DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "kda"})
 
 logger = logging.getLogger(__name__)
 
@@ -522,6 +524,146 @@ def _parse_optional_int(
         comparator = "positive" if int(min_value) == 1 else f">= {int(min_value)}"
         raise ValueError(f"{field_name} must be {comparator}, got {parsed}.")
     return parsed
+
+
+@dataclass(frozen=True)
+class DFlashKDAConfig:
+    head_dim: int
+    num_heads: int
+    short_conv_kernel_size: int
+    use_full_rank_gate: bool
+    gate_lower_bound: Optional[float]
+    #: Where a proposal block's recurrent state starts (SpecForge
+    #: ``linear_attn_config.context_state``): ``reset`` = zero state per block
+    #: (block-local KDA), ``scan`` = the state after the target context strictly
+    #: before the block, kept per request and advanced with every verified slice.
+    context_state: str = "reset"
+
+    @property
+    def projection_size(self) -> int:
+        return self.head_dim * self.num_heads
+
+    @property
+    def scans_context(self) -> bool:
+        return self.context_state == "scan"
+
+
+_DFLASH_KDA_CONTEXT_STATES = ("reset", "scan")
+
+
+def get_dflash_attention_modes(draft_hf_config: Any) -> Tuple[str, ...]:
+    """Return one normalized attention mode for every DFlash draft layer."""
+    dflash_cfg = _get_dflash_config(draft_hf_config)
+    draft_text_config = _get_text_config(draft_hf_config)
+    num_hidden_layers = _parse_optional_int(
+        _cfg_get(draft_text_config, "num_hidden_layers", None),
+        field_name="DFLASH draft num_hidden_layers",
+        min_value=1,
+    )
+    if num_hidden_layers is None:
+        raise ValueError("DFLASH attention modes require num_hidden_layers in config.")
+
+    has_uniform_mode = "attention_mode" in dflash_cfg
+    has_layer_modes = "attention_modes" in dflash_cfg
+    if has_uniform_mode and has_layer_modes:
+        raise ValueError(
+            "DFLASH dflash_config must set only one of attention_mode or "
+            "attention_modes."
+        )
+
+    if has_layer_modes:
+        raw_modes = dflash_cfg["attention_modes"]
+        if not isinstance(raw_modes, (list, tuple)):
+            raise ValueError(
+                "DFLASH dflash_config.attention_modes must be a list with one "
+                f"entry per draft layer, got {raw_modes!r}."
+            )
+        if len(raw_modes) != num_hidden_layers:
+            raise ValueError(
+                "DFLASH dflash_config.attention_modes must contain exactly "
+                f"num_hidden_layers={num_hidden_layers} entries, got "
+                f"{len(raw_modes)}."
+            )
+    else:
+        raw_modes = [dflash_cfg.get("attention_mode", "gqa")] * num_hidden_layers
+
+    modes = tuple(str(mode).lower() for mode in raw_modes)
+    invalid_modes = set(modes) - _DFLASH_ATTENTION_MODES
+    if invalid_modes:
+        raise ValueError(
+            "DFLASH dflash_config attention mode(s) must be selected from "
+            f"{sorted(_DFLASH_ATTENTION_MODES)}, got {sorted(invalid_modes)}."
+        )
+    return modes
+
+
+def parse_dflash_kda_config(draft_hf_config: Any) -> Optional[DFlashKDAConfig]:
+    """Validate KDA dimensions when a DFlash draft contains recurrent layers."""
+    if "kda" not in get_dflash_attention_modes(draft_hf_config):
+        return None
+
+    raw_config = _cfg_get(draft_hf_config, "linear_attn_config", None)
+    if raw_config is None:
+        raise ValueError("DFLASH KDA layers require config.linear_attn_config.")
+    if not isinstance(raw_config, dict):
+        try:
+            raw_config = dict(raw_config)
+        except Exception as exc:
+            raise ValueError(
+                "DFLASH config.linear_attn_config must be a mapping."
+            ) from exc
+
+    required_fields = ("head_dim", "num_heads", "short_conv_kernel_size")
+    missing_fields = [name for name in required_fields if raw_config.get(name) is None]
+    if missing_fields:
+        raise ValueError(
+            "DFLASH KDA linear_attn_config is missing required fields: "
+            f"{missing_fields}."
+        )
+
+    head_dim = _parse_optional_int(
+        raw_config["head_dim"], field_name="DFLASH KDA head_dim", min_value=1
+    )
+    num_heads = _parse_optional_int(
+        raw_config["num_heads"], field_name="DFLASH KDA num_heads", min_value=1
+    )
+    short_conv_kernel_size = _parse_optional_int(
+        raw_config["short_conv_kernel_size"],
+        field_name="DFLASH KDA short_conv_kernel_size",
+        min_value=1,
+    )
+
+    use_full_rank_gate = raw_config.get("use_full_rank_gate", False)
+    if not isinstance(use_full_rank_gate, bool):
+        raise ValueError(
+            "DFLASH KDA linear_attn_config.use_full_rank_gate must be a boolean, "
+            f"got {use_full_rank_gate!r}."
+        )
+
+    gate_lower_bound = raw_config.get("gate_lower_bound")
+    if gate_lower_bound is not None:
+        gate_lower_bound = float(gate_lower_bound)
+        if not math.isfinite(gate_lower_bound) or gate_lower_bound >= 0:
+            raise ValueError(
+                "DFLASH KDA linear_attn_config.gate_lower_bound must be a finite "
+                f"negative number or null, got {gate_lower_bound!r}."
+            )
+
+    context_state = str(raw_config.get("context_state", "reset")).lower()
+    if context_state not in _DFLASH_KDA_CONTEXT_STATES:
+        raise ValueError(
+            "DFLASH KDA linear_attn_config.context_state must be one of "
+            f"{list(_DFLASH_KDA_CONTEXT_STATES)}, got {context_state!r}."
+        )
+
+    return DFlashKDAConfig(
+        head_dim=int(head_dim),
+        num_heads=int(num_heads),
+        short_conv_kernel_size=int(short_conv_kernel_size),
+        use_full_rank_gate=use_full_rank_gate,
+        gate_lower_bound=gate_lower_bound,
+        context_state=context_state,
+    )
 
 
 @dataclass(frozen=True)
