@@ -443,6 +443,10 @@ class Platform:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
         return resolve_obj_by_qualname(attention_cls_str)
 
+    def tensor_on_device(self, t: torch.Tensor) -> bool:
+        """Check if a tensor is on the current platform's device."""
+        return t.is_cuda
+
 
 class UnspecifiedPlatform(Platform):
     _enum = PlatformEnum.UNSPECIFIED
