@@ -12,18 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
-# Define a enum class for FP4 formats, including MXFP4, NVFP4 and future formats
-from enum import Enum
-
 import torch
 
 from sglang.srt.runtime_context import get_platform
-
-
-class FP4KVCacheRecipe(Enum):
-    MXFP4 = 1  # KVFP4: block-wise scaling
-    NVFP4 = 2  # two-level scaling: global FP32 + block FP8 E4M3
-
 
 E2M1_MAX = 6.0
 MAX_BLOCK_SCALE_FP8 = 448.0  # Maximum FP8 E4M3 value

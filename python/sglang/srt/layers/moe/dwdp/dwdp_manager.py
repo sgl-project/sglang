@@ -39,7 +39,7 @@ class DwdpManager:
                 "DWDP requires NVIDIA CUDA (cuda.bindings VMM and MNNVL handles); "
                 "--dwdp-size > 1 is unsupported on this platform."
             )
-        self.dwdp_size = server_args.dwdp_size
+        self.dwdp_size = get_parallel().dwdp_size
         self.dwdp_rank = get_parallel().tp_rank
         self.device_id = torch.cuda.current_device()
         self.layout: Optional[DwdpExpertLayout] = None
