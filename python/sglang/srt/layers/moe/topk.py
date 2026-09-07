@@ -631,7 +631,14 @@ class TopK(BaseFusedOp):
         )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
-    def _get_output_format(self) -> TopKOutputFormat:
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
@@ -654,17 +661,7 @@ class TopK(BaseFusedOp):
             output_format = TopKOutputFormat.BYPASSED
         else:
             output_format = TopKOutputFormat.STANDARD
-        return output_format
 
-    def forward_cuda(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        *,
-        num_token_non_padded: Optional[torch.Tensor] = None,
-        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    ) -> TopKOutput:
-        output_format = self._get_output_format()
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
             (
@@ -770,9 +767,12 @@ class TopK(BaseFusedOp):
                         device=device,
                     )
                 )
-        if (
-            should_use_flashinfer_moe_fp4_allgather()
-            and self._get_output_format() == TopKOutputFormat.BYPASSED
+        if should_use_flashinfer_moe_fp4_allgather() and (
+            self.topk_config.output_format == TopKOutputFormat.BYPASSED
+            or (
+                self.topk_config.output_format is None
+                and get_moe_runner_backend().is_flashinfer_trtllm()
+            )
         ):
             # Empty DP ranks must gather the same routing fields as nonempty
             # ranks. The standard dispatcher fills in the logits' expert width.

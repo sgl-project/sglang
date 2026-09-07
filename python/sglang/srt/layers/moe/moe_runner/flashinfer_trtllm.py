@@ -1358,7 +1358,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
-        # the native FP4 MoE kernel requires bf16 output.
+        # the MoE output is bf16 rather than the input dtype.
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )

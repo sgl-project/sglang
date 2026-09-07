@@ -138,7 +138,67 @@ class StandardDispatcher(BaseDispatcher):
     ) -> StandardDispatchOutput:
 
         if should_use_flashinfer_moe_fp4_allgather():
-            return self._dispatch_allgather(hidden_states, topk_output)
+            x, x_sf, per_token_scale = hidden_states, None, None
+            global_scale = self.quant_config.get("input_global_scale")
+            if global_scale is not None:
+                x, x_sf, per_token_scale = self._quantize_fp4(
+                    hidden_states, global_scale
+                )
+            # Layers excluded from NVFP4 (e.g. SGLANG_FP4_IGNORED_LAYERS) retain
+            # their input precision, with the same token gather/combine geometry.
+            payloads = [x]
+            if x_sf is not None:
+                payloads.append(x_sf)
+            if per_token_scale is not None:
+                payloads.append(per_token_scale)
+            routing_offset = len(payloads)
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                # An empty DP rank has no router invocation to supply the logits
+                # width or dtype. Use logical routed experts and FP32 on every
+                # rank; converting BF16/FP16 logits to FP32 preserves their values.
+                if hidden_states.shape[0] == 0:
+                    num_routed_experts = (
+                        self.num_experts
+                        - self.num_local_shared_experts
+                        - get_exec().moe.ep_num_redundant_experts
+                    )
+                    router_logits = hidden_states.new_empty(
+                        (0, num_routed_experts), dtype=torch.float32
+                    )
+                else:
+                    router_logits = topk_output.router_logits.float()
+                topk_output = topk_output._replace(router_logits=router_logits)
+                routing_fields = ["router_logits"]
+            else:
+                assert TopKOutputChecker.format_is_standard(topk_output)
+                routing_fields = ["topk_weights", "topk_ids"]
+            payloads.extend(getattr(topk_output, name) for name in routing_fields)
+            gathered = get_tp_group().all_gatherv(
+                payloads, sizes=get_dp_global_num_tokens()
+            )
+            x = gathered[0]
+            if x_sf is not None:
+                x_sf = gathered[1]
+            if per_token_scale is not None:
+                per_token_scale = gathered[2]
+            routing = dict(zip(routing_fields, gathered[routing_offset:]))
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                # Keep routing inside the non-routed TRT-LLM kernel. Its logits
+                # must have the same global token order as the packed activations.
+                topk_output = topk_output._replace(
+                    **routing, hidden_states=x, num_token_non_padded=None
+                )
+            else:
+                topk_output = StandardTopKOutput(**routing, router_logits=None)
+            # Communicate linear block scales; only CUTLASS needs a swizzle.
+            if x_sf is not None:
+                if self.enable_flashinfer_cutlass_moe:
+                    x_sf = nvfp4_block_scale_interleave_flashinfer(x_sf)
+                else:
+                    x_sf = x_sf.view(torch.float8_e4m3fn)
+            return StandardDispatchOutput(
+                x, x_sf, topk_output, hidden_states_per_token_scale=per_token_scale
+            )
 
         if (
             self.moe_ep_size > 1
@@ -241,69 +301,6 @@ class StandardDispatcher(BaseDispatcher):
             x.reshape(num_tokens, hidden_size // 2),
             x_sf.view(torch.uint8).reshape(num_tokens, hidden_size // 16),
             per_token_scale,
-        )
-
-    def _dispatch_allgather(
-        self, hidden_states: torch.Tensor, topk_output: TopKOutput
-    ) -> StandardDispatchOutput:
-        x, x_sf, per_token_scale = hidden_states, None, None
-        global_scale = self.quant_config.get("input_global_scale")
-        if global_scale is not None:
-            x, x_sf, per_token_scale = self._quantize_fp4(hidden_states, global_scale)
-        # Layers excluded from NVFP4 (e.g. SGLANG_FP4_IGNORED_LAYERS) retain
-        # their input precision, with the same token gather/combine geometry.
-        payloads = [x]
-        if x_sf is not None:
-            payloads.append(x_sf)
-        if per_token_scale is not None:
-            payloads.append(per_token_scale)
-        routing_offset = len(payloads)
-        if TopKOutputChecker.format_is_bypassed(topk_output):
-            # An empty DP rank has no router invocation to supply the logits
-            # width or dtype. Use logical routed experts and FP32 on every
-            # rank; converting BF16/FP16 logits to FP32 preserves their values.
-            if hidden_states.shape[0] == 0:
-                num_routed_experts = (
-                    self.num_experts
-                    - self.num_local_shared_experts
-                    - get_exec().moe.ep_num_redundant_experts
-                )
-                router_logits = hidden_states.new_empty(
-                    (0, num_routed_experts), dtype=torch.float32
-                )
-            else:
-                router_logits = topk_output.router_logits.float()
-            topk_output = topk_output._replace(router_logits=router_logits)
-            routing_fields = ["router_logits"]
-        else:
-            assert TopKOutputChecker.format_is_standard(topk_output)
-            routing_fields = ["topk_weights", "topk_ids"]
-        payloads.extend(getattr(topk_output, name) for name in routing_fields)
-        gathered = get_tp_group().all_gatherv(
-            payloads, sizes=get_dp_global_num_tokens()
-        )
-        x = gathered[0]
-        if x_sf is not None:
-            x_sf = gathered[1]
-        if per_token_scale is not None:
-            per_token_scale = gathered[2]
-        routing = dict(zip(routing_fields, gathered[routing_offset:]))
-        if TopKOutputChecker.format_is_bypassed(topk_output):
-            # Keep routing inside the non-routed TRT-LLM kernel. Its logits
-            # must have the same global token order as the packed activations.
-            topk_output = topk_output._replace(
-                **routing, hidden_states=x, num_token_non_padded=None
-            )
-        else:
-            topk_output = StandardTopKOutput(**routing, router_logits=None)
-        # Communicate linear block scales; only CUTLASS needs a swizzle.
-        if x_sf is not None:
-            if self.enable_flashinfer_cutlass_moe:
-                x_sf = nvfp4_block_scale_interleave_flashinfer(x_sf)
-            else:
-                x_sf = x_sf.view(torch.float8_e4m3fn)
-        return StandardDispatchOutput(
-            x, x_sf, topk_output, hidden_states_per_token_scale=per_token_scale
         )
 
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
