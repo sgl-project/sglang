@@ -64,7 +64,9 @@ def launch_or_reuse_server(launch_server_func: Callable, server_args: ServerArgs
         )
         return None, base_url
 
-    proc = multiprocessing.Process(
+    # Spawn: the parent already initialized the accelerator, and a forked child
+    # cannot re-initialize it.
+    proc = multiprocessing.get_context("spawn").Process(
         target=_launch_server_target,
         args=(
             launch_server_func,
