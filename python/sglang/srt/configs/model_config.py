@@ -1909,6 +1909,7 @@ def _get_and_verify_dtype(
     else:
         config_dtype = getattr(config, "dtype", None)
         model_type = getattr(config, "model_type", "")
+    config_dtype_is_missing = config_dtype is None
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_TORCH_DTYPE.get(config_dtype, None)
     if config_dtype is None:
@@ -1933,6 +1934,15 @@ def _get_and_verify_dtype(
                     # Following the common practice, we use float16 for float32
                     # models.
                     torch_dtype = torch.float16
+                    if config_dtype_is_missing:
+                        logger.warning(
+                            "The model config declares no dtype/torch_dtype, so "
+                            "`--dtype auto` assumes float32 and downcasts to "
+                            "float16. If the checkpoint was trained in bfloat16, "
+                            "pass `--dtype bfloat16` explicitly to avoid a silent "
+                            "precision change (float16's narrow exponent range "
+                            "can overflow activations that bfloat16 handles)."
+                        )
             else:
                 torch_dtype = config_dtype
         else:
