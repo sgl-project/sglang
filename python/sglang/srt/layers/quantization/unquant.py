@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -255,28 +256,41 @@ def _flashinfer_pr4266_bf16_gemm(
 
 
 def _bf16_gemm_dispatch_impl(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
     if _enable_bf16_splitk_gemm and use_flashinfer_pr4266_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
-        return _flashinfer_pr4266_bf16_gemm(x, weight, bias)
-    if (
+        output = _flashinfer_pr4266_bf16_gemm(x, weight, bias)
+    elif (
         _use_hopper_bf16_gemv is not None
         and bias is None
         and _use_hopper_bf16_gemv(m, weight.shape[0], weight.shape[1])
     ):
-        return _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
+        output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
-    if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
+    elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
-        return _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
+        output = _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
             *x.shape[:-1], -1
         )
-    return F.linear(x, weight, bias)
+    elif addend is not None:
+        # cuBLAS folds the addend in through the GEMM beta input;
+        # a bias would need a third operand, so callers must exclude it.
+        assert bias is None
+        return torch.addmm(addend, x, weight.t(), out=addend)
+    else:
+        return F.linear(x, weight, bias)
+
+    if addend is not None:
+        output.add_(addend)
+    return output
 
 
 @register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
@@ -284,6 +298,32 @@ def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     return _bf16_gemm_dispatch_impl(x, weight, bias)
+
+
+def _can_accumulate_into_addend(
+    *,
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    addend: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> bool:
+    if not _is_cuda or torch.compiler.is_compiling():
+        return False
+    # Batch-invariant mode overrides aten::mm and aten::addmm,
+    # but not aten::addmm.out, so deterministic inference keeps a separate add.
+    if is_batch_invariant_mode_enabled():
+        return False
+    # x.is_cuda also keeps the CPU AMX route in apply().
+    if bias is not None or x.ndim != 2 or not x.is_cuda:
+        return False
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return False
+    return (
+        addend.dtype == torch.bfloat16
+        and addend.is_contiguous()
+        and addend.shape == (x.shape[0], weight.shape[0])
+        and not (x.requires_grad or addend.requires_grad or weight.requires_grad)
+    )
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -401,6 +441,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
+
+    def apply_with_addend(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        addend: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run an inference-only BF16 linear and add ``addend`` to the result.
+
+        Only the cuBLAS route accumulates through the GEMM beta input,
+        returning ``addend`` itself; the other routes add separately,
+        leaving it untouched. Callers must treat it as consumed either way.
+        """
+        if _can_accumulate_into_addend(
+            weight=layer.weight, x=x, addend=addend, bias=bias
+        ):
+            return _bf16_gemm_dispatch_impl(x, layer.weight, bias, addend=addend)
+        return self.apply(layer, x, bias).add_(addend)
 
     def apply_into(
         self,
