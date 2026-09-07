@@ -109,7 +109,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       // Verified with online dynamic FP8 (--quantization fp8 on the BF16
-      // checkpoint); when serving the FP8 repo directly, drop --quantization.
+      // checkpoint), the same serving path the FP8 repo uses natively.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
@@ -118,7 +118,6 @@ sgl-eval run mmmu_pro \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--mem-fraction-static 0.85",
-        "--quantization fp8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
