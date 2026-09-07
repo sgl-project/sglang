@@ -1064,6 +1064,11 @@ class Scheduler(
 
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
+        if self.draft_worker is not None:
+            # Before the target pool is sized: the draft's duplicate,
+            # vocab-sized embed/lm_head are released here, so the profiler
+            # counts those bytes as free and gives them to the KV cache.
+            self.draft_worker.share_target_embed_and_head()
         self.init_target_memory_pool()
         # Lands the retraction backend on the disagg bag before the draft
         # worker's HiCache plan reads it.
