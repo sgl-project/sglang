@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sgl_kernel/runtime.cuh>
+
 #include "hicache.cuh"
 #include <algorithm>
 #include <cstdint>
@@ -111,12 +113,13 @@ struct TransferMambaKernel {
     if (num_items == 0) return;
 
     const auto device = device_.unwrap();
+    runtime::DeviceGuard device_guard(device.device_id);
     const int grid_x = static_cast<int>(std::min(static_cast<int64_t>(kBlockQuotaLoad), num_items));
     dim3 grid(grid_x);
 
     const auto params = MambaTransferParams{
-        .src_base = static_cast<const char*>(src.data_ptr()),
-        .dst_base = static_cast<char*>(dst.data_ptr()),
+        .src_base = static_cast<const char*>(runtime::device_accessible_ptr(src)),
+        .dst_base = static_cast<char*>(runtime::device_accessible_ptr(dst)),
         .layer_ptrs = nullptr,
         .src_indices = static_cast<const int64_t*>(src_indices.data_ptr()),
         .dst_indices = static_cast<const int64_t*>(dst_indices.data_ptr()),
@@ -163,13 +166,14 @@ struct TransferMambaKernel {
     if (num_items == 0) return;
 
     const auto device = device_.unwrap();
+    runtime::DeviceGuard device_guard(device.device_id);
     const int64_t total_work = num_items * num_layers;
     const int grid_x = static_cast<int>(std::min(static_cast<int64_t>(kBlockQuotaBackup), total_work));
     dim3 grid(grid_x);
 
     const auto params = MambaTransferParams{
         .src_base = nullptr,
-        .dst_base = static_cast<char*>(dst.data_ptr()),
+        .dst_base = static_cast<char*>(runtime::device_accessible_ptr(dst)),
         .layer_ptrs = static_cast<const uintptr_t*>(src_ptrs.data_ptr()),
         .src_indices = static_cast<const int64_t*>(src_indices.data_ptr()),
         .dst_indices = static_cast<const int64_t*>(dst_indices.data_ptr()),
