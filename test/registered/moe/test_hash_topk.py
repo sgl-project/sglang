@@ -140,6 +140,13 @@ def test_hash_topk_capture_masks_padded_tokens(monkeypatch):
         topk_module, "get_global_experts_capturer", lambda: FakeCapturer()
     )
 
+    def mask_padded_rows(topk_ids, num_token_non_padded, fill_value=-1):
+        topk_ids[int(num_token_non_padded.item()) :].fill_(fill_value)
+
+    monkeypatch.setattr(
+        topk_module, "_mask_topk_ids_padded_region", mask_padded_rows
+    )
+
     topk = HashTopK(
         topk=2,
         num_experts=8,
