@@ -300,6 +300,16 @@ class _MoriTransferSubmissionError(RuntimeError):
         self.statuses = statuses
 
 
+class _SubmissionLocal(threading.local):
+    """Per-thread sink for statuses issued by a submission still in progress.
+
+    `statuses` is None outside a tracked submission, so a leaf that records
+    into it is a no-op on threads that are not submitting.
+    """
+
+    statuses: Optional[List[TransferStatus]] = None
+
+
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
@@ -317,7 +327,7 @@ class MoriKVManager(CommonKVManager):
         self.aux_mem_descs: List[MemoryDesc] = []
         self.state_mem_descs: List[List[MemoryDesc]] = []
         self.transfer_lock = threading.Lock()
-        self._submission_local = threading.local()
+        self._submission_local = _SubmissionLocal()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
@@ -607,7 +617,7 @@ class MoriKVManager(CommonKVManager):
                 list(self._submission_local.statuses),
             ) from exc
         finally:
-            del self._submission_local.statuses
+            self._submission_local.statuses = None
 
     def _enqueue_transfer_drain(
         self,
@@ -1150,7 +1160,7 @@ class MoriKVManager(CommonKVManager):
         return statuses
 
     def _record_submitted_statuses(self, statuses: List[TransferStatus]) -> None:
-        active_statuses = getattr(self._submission_local, "statuses", None)
+        active_statuses = self._submission_local.statuses
         if active_statuses is not None:
             active_statuses.extend(statuses)
 

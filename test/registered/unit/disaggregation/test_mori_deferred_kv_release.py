@@ -69,6 +69,7 @@ from sglang.srt.disaggregation.mori.conn import (
     MoriKVManager,
     StatusCode,
     _MoriTransferSubmissionError,
+    _SubmissionLocal,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -87,7 +88,7 @@ def _manager(enabled: bool = True) -> MoriKVManager:
     manager._deferred_abort_ack_tracker = {}
     manager._staging_outstanding = defaultdict(int)
     manager._drain_queue = Queue(maxsize=1)
-    manager._submission_local = threading.local()
+    manager._submission_local = _SubmissionLocal()
     manager.req_to_decode_prefix_len = {}
     manager.transfer_infos = {}
     manager._room_notify_lock = threading.Lock()

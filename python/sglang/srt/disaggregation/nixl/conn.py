@@ -498,8 +498,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 FastQueue() for _ in range(transfer_queue_size)
             ]
             self.exceptions: Dict[int, Exception] = {}
-            # Per-room count of chunks not yet transferred; teardown waits for
-            # zero so a deferred chunk is not dropped by an early conclude.
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
