@@ -7,6 +7,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     get_global_dp_buffer_len,
@@ -23,7 +24,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
+from sglang.srt.models.deepseek_v4 import (
+    DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
+    _is_npu,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -154,6 +159,11 @@ class DeepseekV4ModelNextN(nn.Module):
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
+
+        if _is_npu:
+            # Same per-forward rope prime as DeepseekV4Model.forward: the
+            # decoder layer reads the memoized gather instead of re-gathering.
+            prime_rope_cos_sin([self.decoder.self_attn], forward_batch, positions)
 
         hidden_states, residual, post, comb = self.decoder(
             positions=positions,

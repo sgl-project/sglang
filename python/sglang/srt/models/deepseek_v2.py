@@ -433,12 +433,13 @@ class DeepseekV2MLP(nn.Module):
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
             if _is_npu:
-                _g, _u = gate_up.chunk(2, dim=-1)
-                _lim = float(self.swiglu_limit)
-                gate_up = torch.cat(
-                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                x = torch.ops.npu.npu_clipped_swiglu(
+                    gate_up,
+                    alpha=1,
+                    limit=self.swiglu_limit,
+                    bias=0,
+                    interleaved=False,
                 )
-                x = self.act_fn(gate_up)
             else:
                 M, N = gate_up.shape
                 x = gate_up.new_empty((M, N // 2))
@@ -470,7 +471,6 @@ class MoEGate(nn.Module):
                 ),
             )
         )
-
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
             if quant_config is not None:
@@ -2113,6 +2113,10 @@ class DeepseekV2AttentionMLA(
             inner_state = self.forward_normal_one_shot_rocm_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV_ROCM:
+            inner_state = self.forward_normal_chunked_kv_rocm_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         elif attn_forward_method == AttnForwardMethod.MLA_ROCM:
             inner_state = self.forward_absorb_rocm_prepare(
                 positions,
@@ -2181,6 +2185,8 @@ class DeepseekV2AttentionMLA(
             return self.forward_normal_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT_ROCM:
             return self.forward_normal_one_shot_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV_ROCM:
+            return self.forward_normal_chunked_kv_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_ROCM:
             return self.forward_absorb_rocm_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_ROCM:
