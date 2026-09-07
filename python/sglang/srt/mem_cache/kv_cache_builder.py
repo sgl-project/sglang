@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.runtime_context import get_exec
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -312,8 +314,8 @@ def build_kv_cache(
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
-        enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-        enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
+        enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         attn_cp_rank=ps.attn_cp_rank,
