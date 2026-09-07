@@ -41,6 +41,8 @@ on:
           - nightly-test-1-gpu-unit-rocm720
           - nightly-test-1-gpu-kernel-rocm720
           - nightly-test-1-gpu-mi35x-rocm720
+          - nightly-2-gpu-mi30x-qwen38-flash-next-fp8-rocm720
+          - nightly-1-gpu-mi35x-qwen38-flash-next-fp8-rocm720
           # 2-GPU and 4-GPU Tests (MI30x + MI35x)
           - nightly-accuracy-2-gpu-rocm720
           - nightly-accuracy-2-gpu-vlm-rocm720
@@ -264,6 +266,101 @@ jobs:
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-1-gpu-mi35x --nightly --timeout-per-file 900 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
+  # Qwen3.8-Flash-Next-FP8 (MI30x TP2+EP2, MI35x TP1)
+  # ==============================================================================
+
+  nightly-2-gpu-mi30x-qwen38-flash-next-fp8-rocm720:
+    name: ${{ format('nightly-2-gpu-mi30x-qwen38-flash-next-fp8 ({0}, linux-mi300-2gpu-sglang)', matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi30x-qwen38-flash-next-fp8-rocm720,'))
+    runs-on: linux-mi300-2gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Check model cache space
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            bash scripts/ci/amd/check_hf_cache_space.sh \
+            Qwen/Qwen3.8-Flash-Next-FP8 250
+
+      - name: Qwen3.8-Flash-Next-FP8 Accuracy MI30x ROCm 7.2
+        timeout-minutes: 60
+        run: |
+          : > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e QWEN38_FLASH_NEXT_FP8_TP_SIZE=2 \
+            -e QWEN38_FLASH_NEXT_FP8_EP_SIZE=2 \
+            -e QWEN38_FLASH_NEXT_FP8_MEM_FRACTION_STATIC=0.75 \
+            python3 run_suite.py --hw amd --suite nightly-amd-2-gpu-mi30x-qwen38-flash-next-fp8 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md)" >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  nightly-1-gpu-mi35x-qwen38-flash-next-fp8-rocm720:
+    name: ${{ format('nightly-1-gpu-mi35x-qwen38-flash-next-fp8 ({0}, linux-mi35x-gpu-1)', matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-1-gpu-mi35x-qwen38-flash-next-fp8-rocm720,'))
+    runs-on: linux-mi35x-gpu-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Check model cache space
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            bash scripts/ci/amd/check_hf_cache_space.sh \
+            Qwen/Qwen3.8-Flash-Next-FP8 250
+
+      - name: Qwen3.8-Flash-Next-FP8 Accuracy MI35x ROCm 7.2
+        timeout-minutes: 60
+        run: |
+          : > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu-mi35x-qwen38-flash-next-fp8 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md)" >> "$GITHUB_STEP_SUMMARY" || true
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
@@ -2281,6 +2378,8 @@ jobs:
       # 1-GPU Unit Tests (MI30x + MI35x)
       - nightly-test-1-gpu-unit-rocm720
       - nightly-test-1-gpu-mi35x-rocm720
+      - nightly-2-gpu-mi30x-qwen38-flash-next-fp8-rocm720
+      - nightly-1-gpu-mi35x-qwen38-flash-next-fp8-rocm720
       # 2-GPU and 4-GPU Tests (MI30x + MI35x)
       - nightly-accuracy-2-gpu-rocm720
       - nightly-accuracy-2-gpu-vlm-rocm720
