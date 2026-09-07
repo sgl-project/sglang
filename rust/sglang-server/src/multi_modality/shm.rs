@@ -86,7 +86,7 @@ pub(super) fn shm_name(item: usize) -> String {
     format!("sglmm-{}-{n}-{item}", std::process::id())
 }
 
-/// Test helper shared with the sidecar's parking tests.
+/// Test helper shared with the result store's parking tests.
 #[cfg(test)]
 pub(super) fn shm_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new("/dev/shm").join(name)
