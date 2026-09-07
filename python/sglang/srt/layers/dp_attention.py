@@ -996,15 +996,33 @@ def dp_reduce_scatterv_async(
     sizes: List[int],
     event_key=("combine", 0),
 ) -> torch.cuda.Event:
-    """Launch the variable-length reduce_scatterv (combine) on the shared DP TBO
-    comm stream; re-record + return a PERSISTENT event (keyed by `event_key`).
-    Matches the gatherv (SUM_LEN) path."""
+    """Launch the TBO variable-length combine on the shared comm stream.
+
+    ``sizes`` describes one shard per full-TP rank. For attention TP > 1,
+    reduce-scatter first returns that rank's shard, then an attention-TP
+    all-gather reconstructs the replicated DP-local output.
+    """
     comm = get_dp_tbo_comm_stream()
     compute = torch.cuda.current_stream()
     ev = _tbo_event(event_key)
+    attn_tp_size = get_attn_tensor_model_parallel_world_size()
+    if attn_tp_size == 1:
+        output_shard = output_local
+    else:
+        shard_rows = sizes[get_tp_group().rank_in_group]
+        assert output_local.shape[0] == shard_rows * attn_tp_size
+        output_shard = get_tbo_persistent_buffer(
+            ("combine_shard", event_key),
+            shard_rows,
+            output_local.shape[1],
+            output_local.dtype,
+            output_local.device,
+        )
     with torch.cuda.stream(comm):
         comm.wait_stream(compute)
-        get_tp_group().reduce_scatterv(global_tokens, output=output_local, sizes=sizes)
+        get_tp_group().reduce_scatterv(global_tokens, output=output_shard, sizes=sizes)
+        if attn_tp_size > 1:
+            get_attn_tp_group().all_gather_into_tensor(output_local, output_shard)
         ev.record(comm)
     return ev
 
