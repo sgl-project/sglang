@@ -5,12 +5,16 @@ export const config = {
   groupHardware: false,
 
   variants: [{ id: "default", label: "Ling-3.0-flash-VL" }],
-  quantizations: [{ id: "bf16", label: "BF16" }],
+  quantizations: [
+    { id: "bf16", label: "BF16" },
+    { id: "fp8", label: "FP8 (online)" },
+  ],
   strategies: [{ id: "balanced", label: "Balanced" }],
   nodesOptions: [{ id: "single", label: "Single Node" }],
 
   modelNames: {
     "default|bf16": "inclusionAI/Ling-3.0-flash-VL",
+    "default|fp8": "inclusionAI/Ling-3.0-flash-VL",
   },
 
   placeholders: {
@@ -99,6 +103,20 @@ sgl-eval run mmmu_pro \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--mem-fraction-static 0.85",
+        "--quantization fp8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
