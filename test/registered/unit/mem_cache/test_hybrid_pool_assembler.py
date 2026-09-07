@@ -203,9 +203,12 @@ class TestHybridMambaStackHostRowWidth(_PackedRowGeometryFixtures, CustomTestCas
         """
         params = MagicMock()
         params.page_size = self.PAGE_SIZE
-        params.mtp_draft_device_pools = tuple(
-            SimpleNamespace(full_kv_pool=pool) for pool in draft_pools
-        )
+        wrapped_draft_pools = []
+        for pool in draft_pools:
+            wrapper = object.__new__(HybridLinearKVPool)
+            wrapper.full_kv_pool = pool
+            wrapped_draft_pools.append(wrapper)
+        params.mtp_draft_device_pools = tuple(wrapped_draft_pools)
         memory = SimpleNamespace(
             hicache_size=0,
             hicache_ratio=2.0,
