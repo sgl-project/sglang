@@ -591,6 +591,57 @@ class SchedulerMetricsReporter:
         end_evt.synchronize()
         return f", step time (ms): {start_evt.elapsed_time(end_evt):.3f}"
 
+    def log_unreported_step_time(self, batch: Optional[ScheduleBatch]) -> None:
+        """Emit a step-time line for a forward that no per-mode reporter claimed.
+
+        Two batch kinds reach the result path without ever calling
+        report_prefill_stats / report_decode_stats:
+
+        * IDLE -- dp-attention lockstep filler (DPAttnAdapter.get_idle_batch).
+          process_batch_result_idle streams output and returns. This is the
+          common one at dp>1: a rank with no local work still runs the model to
+          drive the mlp-sync collectives, burning GPU time that belongs in the
+          denominator when you ask what share of a GPU went to prefill.
+        * EXTEND with prefill_stats None -- a decode batch converted by
+          maybe_convert_decode_to_extend so a heterogeneous dp step stays
+          mode-homogeneous. convert_decode_to_extend clears prefill_stats
+          precisely so the prefill path does not re-report stale stats, which
+          also means nothing reports it at all. (Unreachable while speculative
+          decoding is on: _local_prefill_cuda_graph_vote requires
+          spec_algorithm.is_none(). Handled anyway so a spec-off dp arm does not
+          silently lose steps.)
+
+        Without this the events for those forwards are recorded and then evicted
+        by the _step_events cap, so the time vanishes from the logs.
+        """
+        if not self.scheduler.server_args.enable_step_time_logging:
+            return
+        if batch is None or batch.forward_iter is None:
+            return
+        if not self.is_stats_logging_rank:
+            # Drop the events regardless so they cannot pile up on ranks that
+            # never log; _step_time_suffix would otherwise be the only consumer.
+            self.scheduler._step_events.pop(batch.forward_iter, None)
+            return
+
+        suffix = self._step_time_suffix(batch.forward_iter)
+        if not suffix:
+            # Already consumed by the prefill/decode reporter -- the normal case.
+            return
+
+        if batch.forward_mode.is_idle():
+            label = "Idle batch"
+        elif batch.forward_mode.is_extend() and batch.prefill_stats is None:
+            # Decode work wearing the extend costume; account it as decode.
+            label = "Decode batch [dp-extend]"
+        else:
+            label = f"{batch.forward_mode.name.capitalize()} batch"
+
+        logger.info(
+            f"{label}, step_idx: {batch.forward_iter}, "
+            f"#running-req: {len(batch.reqs)}{suffix}"
+        )
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],

@@ -4062,10 +4062,19 @@ class Scheduler(
 
         # Time every decode/prefill forward with CUDA events for accurate
         # per-step GPU time. Gated on the enable_step_time_logging engine flag.
+        # is_idle() is included on purpose: under dp-attention a rank with no
+        # local work still runs a filler forward to stay in lockstep for the
+        # mlp sync, and that forward costs real GPU time on that rank. Dropping
+        # it would silently shrink the denominator of any
+        # prefill-vs-decode-share calculation and hide dp load imbalance.
         step_timing = (
             self.server_args.enable_step_time_logging
             and self.is_generation
-            and (batch.forward_mode.is_decode() or batch.forward_mode.is_extend())
+            and (
+                batch.forward_mode.is_decode()
+                or batch.forward_mode.is_extend()
+                or batch.forward_mode.is_idle()
+            )
             and not use_mlx()
         )
         _sstep_start = None
@@ -4448,6 +4457,10 @@ class Scheduler(
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
+
+        # Runs after the per-mode dispatch above, so it only fires for forwards
+        # that no report_{prefill,decode}_stats call claimed.
+        self.metrics_reporter.log_unreported_step_time(batch)
 
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:
