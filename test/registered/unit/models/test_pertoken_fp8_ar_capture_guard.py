@@ -63,11 +63,12 @@ def _call(ca_comm):
     # The wrapper only touches self.ca_comm; call it unbound with a fake self.
     fake_self = types.SimpleNamespace(ca_comm=ca_comm, world_size=2)
     x = torch.zeros(4, 16)
-    with patch(
-        "sglang.srt.distributed.parallel_state.is_hip", return_value=True
-    ), patch(
-        "sglang.srt.distributed.parallel_state.is_gfx95_supported",
-        return_value=True,
+    with (
+        patch("sglang.srt.distributed.parallel_state.is_hip", return_value=True),
+        patch(
+            "sglang.srt.distributed.parallel_state.is_gfx95_supported",
+            return_value=True,
+        ),
     ):
         return GroupCoordinator.fused_allreduce_rmsnorm_quant_per_token(
             fake_self, x, x.clone(), torch.ones(16), 1e-6

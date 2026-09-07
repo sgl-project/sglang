@@ -67,7 +67,12 @@ if _use_aiter_gfx95:
             out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
             yscale = torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device)
             rmsnorm2d_fwd_with_dynamicquant(
-                out, x, yscale, weight, eps, group_size=0  # group_size=0 -> per-token
+                out,
+                x,
+                yscale,
+                weight,
+                eps,
+                group_size=0,  # group_size=0 -> per-token
             )
             return out, yscale, x.dtype
 
