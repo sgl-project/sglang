@@ -52,6 +52,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
+    MMFeatureStreamSink,
     _get_image_dimensions,
     _gpu_preprocess_images,
     _grid_thw_from_resize_config,
@@ -59,6 +60,7 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+    PRECOMPUTED_FEATURE_HASHES_KEY,
 )
 from sglang.srt.utils import is_cuda
 
@@ -201,11 +203,12 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
     def __call__(self, text=None, images=None, **kwargs):
         images = images or kwargs.pop("images", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
+        feature_sink = kwargs.pop("sglang_feature_sink", None)
         if images and torch.cuda.is_available():
-            return self._gpu_call(text, images, original_input_ids)
+            return self._gpu_call(text, images, original_input_ids, feature_sink)
         return self._cpu_call(text, images, original_input_ids, **kwargs)
 
-    def _gpu_call(self, text, images, original_input_ids=None):
+    def _gpu_call(self, text, images, original_input_ids=None, feature_sink=None):
         input_text = text[0] if isinstance(text, list) else text
 
         resize_configs = []
@@ -242,13 +245,17 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             self._patch_size,
             to_chw=_k3_to_cuda_chw,
             post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
+            per_image_sink=feature_sink,
         )
 
-        return {
+        ret = {
             "input_ids": input_ids,
             "pixel_values": pixel_values,
             "image_grid_thw": grid_thws,
         }
+        if feature_sink is not None:
+            ret[PRECOMPUTED_FEATURE_HASHES_KEY] = feature_sink.hash_list(len(images))
+        return ret
 
     def _cpu_call(self, text, images, original_input_ids=None, **kwargs):
         """HF fallback with the same K3 media framing as the GPU path."""
@@ -340,6 +347,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                     x, self._transparent_bg_config
                 ),
             )
+            pixel_values = torch.cat(pixel_values) if pixel_values else pixel_values
         else:
             # The checkpoint CPU processor couples prompt composition with media
             # preprocessing. A synthetic prompt keeps that API but is discarded;
@@ -691,6 +699,7 @@ class KimiK3ImageProcessor(
             base_output,
             self.mm_tokens,
             sglang_original_input_ids=base_output.input_ids,
+            sglang_feature_sink=MMFeatureStreamSink(self),
         )
         if self.keep_mm_features_on_device:
             for item in mm_items:
