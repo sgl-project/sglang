@@ -1626,7 +1626,16 @@ class HiRadixCache(RadixCache):
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
-            # there is no ongoing prefetch for this request or it has been revoked
+            # This rank has no ongoing prefetch for req_id, but other TP/PP
+            # ranks may. We must still participate in the same all_reduce
+            # below to avoid a gloo same-group deadlock: ranks with ongoing
+            # block in all_reduce while ranks without ongoing skip it,
+            # causing a permanent hang on the shared ProcessGroup.
+            #
+            # Contribute 0 (should_terminate=False) so the MAX result is
+            # unaffected — we only maintain collective symmetry.
+            dummy = torch.tensor(0, dtype=torch.int, device="cpu")
+            self._all_reduce(dummy, torch.distributed.ReduceOp.MAX)
             return True
 
         _, _, operation = self.ongoing_prefetch[req_id]
