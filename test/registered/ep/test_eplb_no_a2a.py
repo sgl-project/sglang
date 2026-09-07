@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=420, suite="nightly-eval-text-2-gpu", nightly=True)
+register_cuda_ci(est_time=200, stage="nightly", runner_config="2-gpu-large")
 
 # 72 routed experts + 48 replicas = 120 physical, 60 per rank, so two thirds of
 # the routed (token, expert) pairs get double-counted when ranks disagree. At 24

@@ -13,6 +13,57 @@
 
 export const popularModels = [
   {
+    name: "Qwen3.8-Flash-Next",
+    vendor: "Qwen",
+    href: "/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next",
+    logo: "/cards/logos/qwen.png",
+    badge: "New",
+    tags: ["6 platforms", "GDN + QSA hybrid", "BF16 / FP8 / NVFP4"],
+    hero: {
+      eyebrow: "Featured model \u00b7 New",
+      headline: "Meet Qwen3.8-Flash-Next on SGLang",
+      blurb:
+        "Qwen's early preview of the Qwen4 architecture \u2014 176B total parameters with 6B active, three of every four layers Gated DeltaNet and the fourth global attention running Qwen Sparse Attention, over an ultra-sparse MoE with an in-checkpoint MTP head. The cookbook covers single-node TP4 serving on H200 / B200 / B300 / GB300 and TP8 on MI350X / MI355X.",
+      tags: ["176B / 6B active", "262K context", "Single-node"],
+      cta: "Open the Qwen3.8-Flash-Next cookbook",
+      caption: "Qwen3.8-Flash-Next deployment guide",
+    },
+  },
+  {
+    name: "GLM-5.3-Flash",
+    vendor: "Z.ai",
+    href: "/cookbook/autoregressive/GLM/GLM-5.3-Flash",
+    logo: "/cards/logos/glm.png",
+    badge: "New",
+    tags: ["9 platforms", "MLA + DSA + KDA hybrid", "Multimodal"],
+    hero: {
+      eyebrow: "Featured model · New",
+      headline: "Meet GLM-5.3-Flash on SGLang",
+      blurb:
+        "Z.ai's natively multimodal Mixture-of-Experts model — 320B total parameters with 18B active, 45 text layers combining MLA, DSA sparse, and KDA linear attention, a 24-layer vision encoder for image and video input, and a native MTP draft layer for speculative decoding. Recipes cover H100 / H200 / B200 / B300 / GB200 / GB300 and AMD MI300X / MI325X / MI355X.",
+      tags: ["320B / 18B active", "1M context", "Text + image + video"],
+      cta: "Open the GLM-5.3-Flash cookbook",
+      caption: "GLM-5.3-Flash deployment guide",
+    },
+  },
+  {
+    name: "MiniMax-H3",
+    vendor: "MiniMax",
+    href: "/cookbook/diffusion/MiniMax/MiniMax-H3",
+    logo: "/cards/logos/minimax.png",
+    badge: "New",
+    tags: ["7 platforms", "Video + audio", "BF16 / FP8"],
+    hero: {
+      eyebrow: "Featured model · New",
+      headline: "Meet MiniMax-H3 on SGLang",
+      blurb:
+        "MiniMax's video-and-audio diffusion model — one request returns an MP4 carrying 24 fps video and a synchronized stereo audio track. SGLang Diffusion serves all three task profiles — text, first/last frame, and image / video / audio reference conditioning — with Ulysses × Ring sequence parallelism and recipes across B200, B300, H200, H100, AMD MI300X / MI355X, and 2× RTX 5090.",
+      tags: ["Video + synced audio", "4–15 s at 24 fps", "8× B200 → 2× RTX 5090"],
+      cta: "Open the MiniMax-H3 cookbook",
+      caption: "MiniMax-H3 deployment guide",
+    },
+  },
+  {
     name: "Kimi-K3",
     vendor: "Moonshot AI",
     href: "/cookbook/autoregressive/Moonshotai/Kimi-K3",
@@ -27,40 +78,6 @@ export const popularModels = [
       tags: ["2.8T parameters", "Fused KDA decode", "NVIDIA + AMD"],
       cta: "Open the Kimi-K3 cookbook",
       caption: "Kimi-K3 deployment guide",
-    },
-  },
-  {
-    name: "Inkling",
-    vendor: "Thinking Machines",
-    href: "/cookbook/autoregressive/ThinkingMachines/Inkling",
-    logo: "/cards/logos/thinkingmachines.png",
-    badge: "New",
-    tags: ["7 platforms", "NVFP4 / BF16", "MTP + DSpark"],
-    hero: {
-      eyebrow: "Featured model · New",
-      headline: "Meet Inkling on SGLang",
-      blurb:
-        "Thinking Machines' open-weights Mixture-of-Experts model — 975B parameters, 41B active per token, a 1M-token context window, and native text, image, and audio input. The cookbook covers its MTP speculative-decoding path and long-context prefix caching on NVIDIA and AMD.",
-      tags: ["975B · 41B active", "1M context", "Text + image + audio"],
-      cta: "Open the Inkling cookbook",
-      caption: "Inkling deployment guide",
-    },
-  },
-  {
-    name: "GLM-5.2",
-    vendor: "Z.ai",
-    href: "/cookbook/autoregressive/GLM/GLM-5.2",
-    logo: "/cards/logos/glm.png",
-    badge: "New",
-    tags: ["7 platforms", "DSA attention", "FP8 / NVFP4"],
-    hero: {
-      eyebrow: "Featured model · New",
-      headline: "Meet GLM-5.2 on SGLang",
-      blurb:
-        "Z.ai's DeepSeek-Sparse-Attention Mixture-of-Experts model, with MTP speculative decoding and a 1M-token context window. Recipes cover FP8, BF16, and NVFP4 across H200, B200, B300, GB300, and AMD MI300X / MI325X / MI355X.",
-      tags: ["DSA attention", "1M context", "FP8 / BF16 / NVFP4"],
-      cta: "Open the GLM-5.2 cookbook",
-      caption: "GLM-5.2 deployment guide",
     },
   },
 ];

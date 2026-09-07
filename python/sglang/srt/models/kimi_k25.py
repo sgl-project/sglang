@@ -49,7 +49,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
     get_parallel,
-    get_server_args,
 )
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
@@ -88,7 +87,6 @@ def apply_rope(
 
 
 class MoonViTEncoderLayer(nn.Module):
-
     def __init__(
         self,
         num_heads: int,
@@ -227,7 +225,6 @@ def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
 
 
 class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
-
     def __init__(
         self,
         height: int,
@@ -371,7 +368,6 @@ class Rope2DPosEmbRepeated(nn.Module):
 
 
 class MoonVision3dPatchEmbed(nn.Module):
-
     def __init__(
         self,
         out_dim: int,
@@ -383,14 +379,14 @@ class MoonVision3dPatchEmbed(nn.Module):
         pos_emb_type: str = "divided_fixed",
     ):
         super().__init__()
-        assert isinstance(
-            patch_size, int | Sequence
-        ), f"Invalid patch_size type: {type(patch_size)}"
+        assert isinstance(patch_size, int | Sequence), (
+            f"Invalid patch_size type: {type(patch_size)}"
+        )
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
-        assert (
-            len(patch_size) == 2
-        ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        assert len(patch_size) == 2, (
+            f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        )
         self.patch_size = patch_size
 
         self.proj = Conv2dLayer(
@@ -437,9 +433,9 @@ class MoonViT3dEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        assert (
-            video_attn_type == "spatial_temporal"
-        ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        assert video_attn_type == "spatial_temporal", (
+            f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        )
         self.video_attn_type = video_attn_type
         self.rope_2d = Rope2DPosEmbRepeated(
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
@@ -637,6 +633,8 @@ def mm_projection_auto(
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
+    supports_cuda_vmm_feature_transport = True
+
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
     # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json
@@ -645,6 +643,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
             "language_model.layers.": "language_model.model.layers.",
         }
     )
+
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if hf_config.encoder_only:
+            return None
+        return DeepseekV3ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config.text_config, quant_config
+        )
 
     def __init__(
         self,
@@ -721,13 +727,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
             acknowledges the entire TP group so the bounded IPC pool remains
             recyclable.
             """
-            parallel = get_parallel()
-            server_args = get_server_args()
-            # Match MmItemMemoryPool.try_to_recycle(), which waits for the
-            # server TP size rather than the attention subgroup size.
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
+            # Match the configured TP consumer count captured when the
+            # tokenizer creates MmItemMemoryPool. A live attention subgroup
+            # size could leave acknowledgements missing and strand the lease.
+            ipc_consumer_count = max(get_parallel().tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()

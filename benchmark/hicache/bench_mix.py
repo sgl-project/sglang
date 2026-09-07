@@ -457,7 +457,7 @@ class WorkloadGenerator:
             try:
                 user_data, response = self.response_queue.get(timeout=10)
                 logger.info(
-                    f"{((time.perf_counter()-self.start_time)/self.duration*100):.2f}%"
+                    f"{((time.perf_counter() - self.start_time) / self.duration * 100):.2f}%"
                 )
                 if not response.success:
                     raise ValueError(f"Request failed with error: {response.error}")
@@ -540,10 +540,10 @@ class WorkloadGenerator:
         output_stats = self.user_generator.output_stats
         print(f"round_ratios: {user_stats}")
         print(
-            f"mean_new_tokens_per_round: {[int(a/b) if b > 0 else 0 for a, b in input_stats]}"
+            f"mean_new_tokens_per_round: {[int(a / b) if b > 0 else 0 for a, b in input_stats]}"
         )
         print(
-            f"mean_return_tokens_per_round: {[int(a/b) if b > 0 else 0 for a, b in output_stats]}"
+            f"mean_return_tokens_per_round: {[int(a / b) if b > 0 else 0 for a, b in output_stats]}"
         )
         return performance_data
 

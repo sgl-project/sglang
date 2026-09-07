@@ -12,7 +12,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=5, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=5, suite="base-a-test-1-npu-a2")
 
 # Mock NPU-only modules before importing the source module.
 for _ in (
@@ -153,6 +153,7 @@ class TestForwardMetadata(unittest.TestCase):
             "seq_lens",
             "actual_seq_lengths_q",
             "actual_seq_lengths_q_pa",
+            "actual_seq_lengths_q_pa_cpu",
             "actual_seq_lengths_kv",
             "swa_mask",
             "prefix_lens",

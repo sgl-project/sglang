@@ -19,7 +19,7 @@ Each section should be as comprehensive as possible to create a rich and immersi
 The story should span multiple events, challenges, and character developments over time. Aim to make the story at least 3,000 words long.
 """
 
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
 
 class TestMatchedStop(CustomTestCase):

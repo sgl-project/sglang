@@ -19,6 +19,7 @@ from sglang.srt.function_call.kimik3_format import (
     TOOLS_CLOSE,
     TOOLS_OPEN,
     partial_suffix_len,
+    strip_partial_marker_suffix,
     strip_response_wrappers,
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
@@ -216,6 +217,20 @@ class KimiK3Detector(BaseFormatDetector):
             self._buffer = ""
             self._sent_normal_idx = 0
             return StreamingParseResult()
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        open_idx = self._buffer.find(self.bot_token)
+        if open_idx != -1:
+            section = self._buffer[open_idx + len(self.bot_token) :]
+            if not self._parse_calls(section):
+                logger.warning(
+                    "Kimi K3 tools section ended with no complete tool call; "
+                    "dropping %d buffered chars",
+                    len(section),
+                )
+            return StreamingParseResult()
+        pending = self._emit_normal_text(limit=len(self._buffer))
+        return StreamingParseResult(normal_text=strip_partial_marker_suffix(pending))
 
     def _emit_normal_text(self, limit: int | None = None) -> str:
         if limit is None:

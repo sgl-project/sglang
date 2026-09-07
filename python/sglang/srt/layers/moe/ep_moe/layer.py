@@ -103,7 +103,9 @@ class DeepEPMoE(FusedMoE):
             and quant_config is not None
             and quant_config.get_name() == "humming"
         )
-        if is_humming:
+        if get_moe_a2a_backend().is_deepep_v2():
+            self.deprecate_flag = True
+        elif is_humming:
             self.deprecate_flag = True
         elif _use_aiter:
             self.deprecate_flag = True
@@ -121,8 +123,7 @@ class DeepEPMoE(FusedMoE):
         elif (
             get_moe_runner_backend().is_flashinfer_cutedsl()
             and quant_config is not None
-            and quant_config.get_name()
-            in ("modelopt_fp4", "modelopt_mixed", "nvfp4_online")
+            and quant_config.get_name() in ("modelopt_fp4", "modelopt_mixed")
         ):
             self.deprecate_flag = True
         elif (
@@ -142,9 +143,9 @@ class DeepEPMoE(FusedMoE):
             and not _is_npu
             and not _is_hip
         ):
-            assert (
-                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            ), "Unquantized DeepEP MoE requires DeepGEMM BF16"
+            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
+                "Unquantized DeepEP MoE requires DeepGEMM BF16"
+            )
             self.deprecate_flag = True
         else:
             self.deprecate_flag = False
@@ -174,9 +175,9 @@ class DeepEPMoE(FusedMoE):
             and quant_config is not None
         ):
             # AMD HIP and NPU support low_latency DeepEP without DeepGEMM.
-            assert (
-                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
+                f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+            )
 
     def _a2a_forward_with_output_impl(
         self,
@@ -222,9 +223,9 @@ class DeepEPMoE(FusedMoE):
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for breakable cuda graph"
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "Only standard topk output is supported for breakable cuda graph"
+            )
             output = torch.empty_like(hidden_states)
             self.a2a_forward_with_output(
                 hidden_states,
@@ -235,9 +236,9 @@ class DeepEPMoE(FusedMoE):
             )
             return output
         if is_in_tc_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "Only standard topk output is supported for piecewise cuda graph"
+            )
             return moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
@@ -355,6 +356,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if (
         get_moe_a2a_backend().is_mori()
         or get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_deepep_v2()
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
         or get_moe_a2a_backend().is_pplx()

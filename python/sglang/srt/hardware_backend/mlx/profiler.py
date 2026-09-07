@@ -12,8 +12,8 @@ from typing import Any, Callable, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.io_struct import ProfileReqOutput
-from sglang.srt.utils.tensor_bridge import use_mlx
 
 logger = logging.getLogger(__name__)
 

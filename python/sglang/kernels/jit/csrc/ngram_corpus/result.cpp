@@ -5,6 +5,8 @@
 #include <queue>
 #include <tuple>
 
+namespace sglang {
+
 namespace ngram {
 
 Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root) {
@@ -135,3 +137,5 @@ void Result::truncate(size_t n) {
 }
 
 }  // namespace ngram
+
+}  // namespace sglang

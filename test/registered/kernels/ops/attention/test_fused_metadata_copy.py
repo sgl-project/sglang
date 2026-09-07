@@ -396,29 +396,29 @@ def test_fused_metadata_copy(bs, forward_mode, has_real_page_table, has_flashmla
     )
 
     # Compare results
-    assert torch.equal(
-        dst_ref["cache_seqlens"], dst_fused["cache_seqlens"]
-    ), "cache_seqlens mismatch"
-    assert torch.equal(
-        dst_ref["cu_seqlens_k"], dst_fused["cu_seqlens_k"]
-    ), "cu_seqlens_k mismatch"
-    assert torch.equal(
-        dst_ref["page_table_1"], dst_fused["page_table_1"]
-    ), "page_table_1 mismatch"
-    assert torch.equal(
-        dst_ref["dsa_cache_seqlens"], dst_fused["dsa_cache_seqlens"]
-    ), "dsa_cache_seqlens mismatch"
+    assert torch.equal(dst_ref["cache_seqlens"], dst_fused["cache_seqlens"]), (
+        "cache_seqlens mismatch"
+    )
+    assert torch.equal(dst_ref["cu_seqlens_k"], dst_fused["cu_seqlens_k"]), (
+        "cu_seqlens_k mismatch"
+    )
+    assert torch.equal(dst_ref["page_table_1"], dst_fused["page_table_1"]), (
+        "page_table_1 mismatch"
+    )
+    assert torch.equal(dst_ref["dsa_cache_seqlens"], dst_fused["dsa_cache_seqlens"]), (
+        "dsa_cache_seqlens mismatch"
+    )
     assert torch.equal(
         dst_ref["dsa_seqlens_expanded"], dst_fused["dsa_seqlens_expanded"]
     ), "dsa_seqlens_expanded mismatch"
-    assert torch.equal(
-        dst_ref["dsa_cu_seqlens_k"], dst_fused["dsa_cu_seqlens_k"]
-    ), "dsa_cu_seqlens_k mismatch"
+    assert torch.equal(dst_ref["dsa_cu_seqlens_k"], dst_fused["dsa_cu_seqlens_k"]), (
+        "dsa_cu_seqlens_k mismatch"
+    )
 
     if has_real_page_table:
-        assert torch.equal(
-            dst_ref["real_page_table"], dst_fused["real_page_table"]
-        ), "real_page_table mismatch"
+        assert torch.equal(dst_ref["real_page_table"], dst_fused["real_page_table"]), (
+            "real_page_table mismatch"
+        )
 
     if has_flashmla:
         assert torch.equal(
@@ -643,7 +643,11 @@ def test_fused_metadata_copy_multi_dtype_validation():
 
     # Create source tensors - one with WRONG dtype
     cache_seqlens_src_wrong = torch.randint(
-        1, max_len, (bs,), dtype=torch.int64, device=device  # Wrong dtype!
+        1,
+        max_len,
+        (bs,),
+        dtype=torch.int64,
+        device=device,  # Wrong dtype!
     )
     cu_seqlens_k_src = torch.zeros(bs + 1, dtype=torch.int32, device=device)
     page_indices_src = torch.randint(
@@ -829,7 +833,7 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
         f"\n[VERIFY] bs={bs}, real_page_table={has_real_page_table}, flashmla={has_flashmla}"
     )
     print(
-        f"[VERIFY] Fused time: {fused_time*1000:.3f}ms, Loop time: {loop_time*1000:.3f}ms, Speedup: {speedup:.2f}x"
+        f"[VERIFY] Fused time: {fused_time * 1000:.3f}ms, Loop time: {loop_time * 1000:.3f}ms, Speedup: {speedup:.2f}x"
     )
 
     max_diff = 0.0
@@ -1063,7 +1067,7 @@ def test_fused_metadata_copy_multi_large_batch(bs):
 
     speedup = loop_time / fused_time if fused_time > 0 else 0
     print(
-        f"\n[PERF] Large batch (bs={bs}): Fused={fused_time*1000:.3f}ms, Loop={loop_time*1000:.3f}ms, Speedup={speedup:.2f}x"
+        f"\n[PERF] Large batch (bs={bs}): Fused={fused_time * 1000:.3f}ms, Loop={loop_time * 1000:.3f}ms, Speedup={speedup:.2f}x"
     )
 
     # Verify correctness
@@ -1076,9 +1080,9 @@ def test_fused_metadata_copy_multi_large_batch(bs):
     ):
         for key in dst_ref:
             if dst_ref[key] is not None and dst_fused[key] is not None:
-                assert torch.equal(
-                    dst_ref[key], dst_fused[key]
-                ), f"Backend {backend_idx} {key} mismatch"
+                assert torch.equal(dst_ref[key], dst_fused[key]), (
+                    f"Backend {backend_idx} {key} mismatch"
+                )
 
 
 if __name__ == "__main__":

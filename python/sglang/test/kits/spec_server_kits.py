@@ -386,8 +386,8 @@ class SpecLogprobKit:
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(func, args))
 
-    def test_logprob_spec_v2_match(self):
-        """Verify spec v2 decode logprobs match prefill scoring logprobs."""
+    def test_logprob_decode_match_prefill(self):
+        """Decode logprobs from the spec path must match prefill scoring."""
         top_k = 5
         probe_token_ids = [1, 2, 10, 100, 1000]
         prompts = [

@@ -72,7 +72,6 @@ class AttentionMetadata:
 
 
 class T5DenseActDense(nn.Module):
-
     def __init__(
         self, config: T5Config, quant_config: QuantizationConfig | None = None
     ):
@@ -98,7 +97,6 @@ class T5DenseActDense(nn.Module):
 
 
 class T5DenseGatedActDense(nn.Module):
-
     def __init__(
         self, config: T5Config, quant_config: QuantizationConfig | None = None
     ):
@@ -138,7 +136,6 @@ class T5DenseGatedActDense(nn.Module):
 
 
 class T5LayerFF(nn.Module):
-
     def __init__(
         self, config: T5Config, quant_config: QuantizationConfig | None = None
     ):
@@ -161,7 +158,6 @@ class T5LayerFF(nn.Module):
 
 # T5 has attn_bias and does not use softmax scaling
 class T5MultiHeadAttention(nn.Module):
-
     def __init__(self) -> None:
         super().__init__()
 
@@ -178,7 +174,6 @@ class T5MultiHeadAttention(nn.Module):
 
 
 class T5Attention(nn.Module):
-
     def __init__(
         self,
         config: T5Config,
@@ -378,7 +373,6 @@ class T5Attention(nn.Module):
 
 
 class T5LayerSelfAttention(nn.Module):
-
     def __init__(
         self,
         config,
@@ -416,7 +410,6 @@ class T5LayerSelfAttention(nn.Module):
 
 
 class T5LayerCrossAttention(nn.Module):
-
     def __init__(
         self, config, quant_config: QuantizationConfig | None = None, prefix: str = ""
     ):
@@ -445,7 +438,6 @@ class T5LayerCrossAttention(nn.Module):
 
 
 class T5Block(nn.Module):
-
     def __init__(
         self,
         config: T5Config,
@@ -505,7 +497,6 @@ class T5Block(nn.Module):
 
 
 class T5Stack(nn.Module):
-
     def __init__(
         self,
         config: T5Config,
@@ -568,6 +559,8 @@ class T5Stack(nn.Module):
 
 
 class T5EncoderModel(TextEncoder):
+    # encoder-only: no tied lm_head, the table is reached only by its gather
+    host_resident_table_names = ["shared"]
     # dp measured here: 1.9x on the encode stage at batch 2/4/8
     # (2xH100, T5-XXL width), max_abs_diff=0 vs replicated
     supports_dp_encode = True
@@ -660,6 +653,8 @@ class T5EncoderModel(TextEncoder):
 
 
 class UMT5EncoderModel(TextEncoder):
+    # encoder-only: no tied lm_head, the table is reached only by its gather
+    host_resident_table_names = ["shared"]
     # dp measured here: 1.9x on the encode stage at batch 2/4/8
     # (2xH100, T5-XXL width), max_abs_diff=0 vs replicated
     supports_dp_encode = True
