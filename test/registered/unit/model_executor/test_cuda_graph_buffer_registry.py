@@ -674,8 +674,7 @@ class TestPoolBackedAlloc(unittest.TestCase):
 
 class TestBuildDecodeRegistry(unittest.TestCase):
     """``build_decode_registry`` registers the always-on FB-shared decode
-    slots with padding policies matching
-    ``DecodeInputBuffers.populate_from_forward_batch``."""
+    slots with their required padding policies."""
 
     def setUp(self):
         from sglang.srt.model_executor import input_buffers
