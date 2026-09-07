@@ -972,6 +972,9 @@ class Envs:
     # nondeterministic (bf16 unordered sum) -- keep off for bit-reproducibility.
     # No effect on the DeepGEMM (block-FP8) mega path, which lacks the knob.
     SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE = EnvBool(False)
+    # Optional JSON object of CuTeDSL MegaMOE tuner knobs. Lists are accepted
+    # for tuple-valued knobs so this can be supplied directly as JSON.
+    SGLANG_FLASHINFER_MEGAMOE_KNOBS = EnvJSON(None)
     # Cross-rank combine wire format for the FlashInfer NVFP4 cutedsl MegaMOE
     # kernel. "bf16" is exact/default; "mxfp8" and "nvfp4" reduce combine
     # traffic with a small accuracy tradeoff and require FC2 reduce outside the

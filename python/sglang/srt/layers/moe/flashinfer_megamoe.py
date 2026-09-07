@@ -65,6 +65,18 @@ def _format_megakernel_config(config: Any) -> str:
     return f"{type(config).__name__}({', '.join(parts)})"
 
 
+def _resolve_megamoe_knobs() -> dict | None:
+    knobs = envs.SGLANG_FLASHINFER_MEGAMOE_KNOBS.get()
+    if knobs is None:
+        return None
+    if not isinstance(knobs, dict):
+        raise ValueError("SGLANG_FLASHINFER_MEGAMOE_KNOBS must be a JSON object.")
+    return {
+        key: tuple(value) if isinstance(value, list) else value
+        for key, value in knobs.items()
+    }
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -375,12 +387,15 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             apply_topk_in_fc1=True,
-            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            enable_in_kernel_fc2_reduce=(
+                envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+            ),
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
             fc1_alpha=layer.g1_alphas,
             fc2_alpha=layer.g2_alphas,
             fc1_norm_const=layer.w2_input_scale_quant,
+            knobs=_resolve_megamoe_knobs(),
         ),
         w13_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
@@ -401,7 +416,10 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             kind="mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
-            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            enable_in_kernel_fc2_reduce=(
+                envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+            ),
+            knobs=_resolve_megamoe_knobs(),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -422,7 +440,10 @@ def ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             kind="bf16_mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
-            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            enable_in_kernel_fc2_reduce=(
+                envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+            ),
+            knobs=_resolve_megamoe_knobs(),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -442,7 +463,10 @@ def ensure_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
-            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            enable_in_kernel_fc2_reduce=(
+                envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+            ),
+            knobs=_resolve_megamoe_knobs(),
         ),
         w13_scale=None,
         w2_scale=None,
