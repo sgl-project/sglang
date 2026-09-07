@@ -69,7 +69,7 @@ class LRUFileEvictor:
         config_suffix: str,
         *,
         tp_rank: int,
-        is_mla_model: bool,
+        is_storage_owner: bool,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -78,9 +78,7 @@ class LRUFileEvictor:
         self._tp_rank = tp_rank
         self._on_evict = on_evict
 
-        # MLA ranks share the same physical files, so centralize LRU bookkeeping
-        # on rank 0; non-MLA ranks each own their own files via the suffix.
-        self._is_storage_owner = (not is_mla_model) or (tp_rank == 0)
+        self._is_storage_owner = is_storage_owner
 
         # suffixed_key -> file size in bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -94,7 +92,8 @@ class LRUFileEvictor:
         self._eviction_enabled = self._eviction_configured and self._is_storage_owner
         if self._eviction_configured and not self._is_storage_owner:
             logger.info(
-                f"HiCacheFile rank {self._tp_rank} (MLA): eviction handled by rank 0; "
+                f"HiCacheFile rank {self._tp_rank}: eviction handled by the "
+                "storage owner; "
                 f"this rank skips LRU bookkeeping and will not create new files."
             )
 

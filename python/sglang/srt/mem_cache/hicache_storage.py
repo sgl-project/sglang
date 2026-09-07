@@ -38,6 +38,16 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    use_shared_cp_storage: bool = False
+
+    @property
+    def is_storage_owner(self) -> bool:
+        """Whether this rank owns writes and eviction for its storage namespace."""
+        if not self.is_mla_model:
+            return True
+        if self.tp_rank != 0:
+            return False
+        return not self.use_shared_cp_storage or self.attn_cp_rank == 0
 
 
 @dataclass
@@ -393,10 +403,13 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix += f"_{tp_rank}_{tp_size}"
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
-        # Under NSA context parallel each CP rank holds a disjoint slice of every
-        # page, so give each rank its own file key to avoid a cross-rank write race.
+        # Most CP caches are rank-sharded and need distinct file keys. DeepSeek V4
+        # materializes its full cache before storage, so all CP ranks share one copy.
         if attn_cp_size > 1:
-            self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+            if storage_config.use_shared_cp_storage:
+                self.config_suffix += f"_cpfull_{attn_cp_size}"
+            else:
+                self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -436,7 +449,7 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             self.config_suffix,
             tp_rank=tp_rank,
-            is_mla_model=is_mla_model,
+            is_storage_owner=storage_config.is_storage_owner,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
