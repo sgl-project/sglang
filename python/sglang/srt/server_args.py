@@ -40,6 +40,7 @@ import functools
 import logging
 import tempfile
 import uuid
+import warnings
 from contextlib import contextmanager
 from typing import Any
 
@@ -63,11 +64,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.runtime_context import (
-    get_context,
-    get_platform,
-    publish,
-)
+from sglang.srt.runtime_context import get_platform, publish
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 
@@ -807,10 +804,34 @@ def set_global_server_args_for_tokenizer(server_args: ServerArgs):
 
 
 def get_global_server_args() -> ServerArgs:
-    """Legacy accessor shim — prefer ``get_server_args()`` from
-    ``sglang.srt.runtime_context`` in new code."""
+    """Retired. Read the configuration from its namespace bag.
 
-    return get_context().server_args
+    This was the last spelling of "reach for the whole record and pick a field
+    off it". Runtime code reads `get_<namespace>()[.sub].field` now -- the value
+    that is in effect, which is what a reader almost always means, and a plain
+    attribute load that survives `override` and dynamo tracing. The 15 record
+    reads that legitimately remain each hold a record they were handed.
+
+    It raises rather than warning-and-returning because a returned record is
+    exactly the thing that has to stop: it answers with the operator's *input*,
+    so a caller reading a field resolution decided gets a stale value and no
+    error. The name is kept so an out-of-tree caller lands here instead of on
+    an ImportError.
+    """
+    warnings.warn(
+        "get_global_server_args() is retired; read the config bag instead "
+        "(sglang.srt.runtime_context.get_<namespace>()). If you genuinely need "
+        "the operator's raw input, use get_server_args().",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    raise RuntimeError(
+        "get_global_server_args() is retired. Read the value that is in effect "
+        "from its namespace bag -- `get_exec().kernel.attention_backend`, "
+        "`get_schedule().max_running_requests`, and so on "
+        "(sglang.srt.runtime_context). For the operator's raw input, which is a "
+        "different question, `get_server_args()` still answers it."
+    )
 
 
 @contextmanager

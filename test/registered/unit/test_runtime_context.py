@@ -11,6 +11,7 @@ import pathlib as _pathlib
 import shutil
 import tempfile
 import unittest
+import warnings
 from unittest.mock import patch
 
 import sglang as _sglang
@@ -246,9 +247,18 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         # Identity, not equality: the slot holds the very object published.
         sentinel = ServerArgs(model_path="dummy")
         server_args_module.set_global_server_args_for_scheduler(sentinel)
-        self.assertIs(server_args_module.get_global_server_args(), sentinel)
         self.assertIs(get_server_args(), sentinel)
         self.assertIs(get_context().server_args, sentinel)
+
+    def test_the_retired_accessor_warns_before_it_raises(self):
+        """`get_global_server_args` is retired: it answered with the record,
+        so a caller reading a field resolution had decided got a stale value
+        and no error at all."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.assertRaises(RuntimeError):
+                server_args_module.get_global_server_args()
+        self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
 
     def test_tokenizer_alias_is_distinct_role_shim(self):
         # Deliberately NOT an alias: the two legacy setters publish with
@@ -260,10 +270,9 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
 
     def test_pre_publish_error_verbatim(self):
         reset_context()
-        for accessor in (get_server_args, server_args_module.get_global_server_args):
-            with self.assertRaises(ValueError) as cm:
-                accessor()
-            self.assertEqual(str(cm.exception), "Global server args is not set yet!")
+        with self.assertRaises(ValueError) as cm:
+            get_server_args()
+        self.assertEqual(str(cm.exception), "Global server args is not set yet!")
 
     def test_republish_overwrite_allowed(self):
         first = ServerArgs(model_path="dummy")
