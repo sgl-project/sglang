@@ -108,6 +108,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_round_robin_input_ids,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    dsa_prefill_cp_fused_symm_mem_eligible,
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -2450,7 +2451,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+                # use_cp_fused_symm_mem is set only when the fused path
+                # really runs, so the skip sees what the kernels saw.
+                _comm = get_tp_group().torch_symm_mem_comm
+                if _comm is None or not _comm.use_cp_fused_symm_mem:
+                    hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -2489,7 +2494,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                 skip_shared_experts=_do_shared_local,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            _comm = get_tp_group().torch_symm_mem_comm
+            if _comm is None or not _comm.use_cp_fused_symm_mem:
+                hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            else:
+                # Experts emitted unreduced [M, topk, H]; a 3D tensor here
+                # means fused RS fell back after that, which nothing repairs.
+                assert hidden_states.dim() == 2, (
+                    "fused CP RS fell back after no_topk_reduce expert output; "
+                    "add the missing condition to "
+                    "dsa_prefill_cp_fused_symm_mem_eligible"
+                )
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
@@ -3273,55 +3288,69 @@ class DeepseekV4Model(nn.Module):
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
                 input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
+            # Set LAST in prep: anything that can raise stays before set, so
+            # the try below covers the whole use_cp_fused_symm_mem window.
+            _comm = get_tp_group().torch_symm_mem_comm
+            if dsa_prefill_cp_fused_symm_mem_eligible(
+                self.layers[self.start_layer].mlp,
+                forward_batch,
+                hidden_states,
+                _comm,
+            ):
+                _comm.set_use_cp_fused_symm_mem(True)
 
-        # Reset Compressor's per-step freqs_cis cache from any previous step.
-        for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
-            if hasattr(forward_batch, _attr):
-                delattr(forward_batch, _attr)
-        if run_tbo:
-            # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
-            # disabled here (each layer self-contained), so no trailing hc_post.
-            hidden_states = self._forward_layers_tbo(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
-        else:
-            use_fused = self.use_fused_mhc_post_pre
-            prev_residual, prev_post, prev_comb = None, None, None
-            last_layer = None
-            for i in range(self.start_layer, self.end_layer):
-                layer = self.layers[i]
-                last_layer = layer
-                ctx = (
-                    nullcontext()
-                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                    else get_global_expert_distribution_recorder().with_current_layer(i)
+        try:
+            # Reset Compressor's per-step freqs_cis cache from any previous step.
+            for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
+                if hasattr(forward_batch, _attr):
+                    delattr(forward_batch, _attr)
+            if run_tbo:
+                # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
+                # disabled here (each layer self-contained), so no trailing hc_post.
+                hidden_states = self._forward_layers_tbo(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
                 )
-                with ctx:
-                    hidden_states, prev_residual, prev_post, prev_comb = layer(
-                        positions=positions,
-                        hidden_states=hidden_states,
-                        forward_batch=forward_batch,
-                        input_ids=input_ids,
-                        input_ids_global=input_ids_global,
-                        prev_residual=prev_residual,
-                        prev_post=prev_post,
-                        prev_comb=prev_comb,
+            else:
+                use_fused = self.use_fused_mhc_post_pre
+                prev_residual, prev_post, prev_comb = None, None, None
+                last_layer = None
+                for i in range(self.start_layer, self.end_layer):
+                    layer = self.layers[i]
+                    last_layer = layer
+                    ctx = (
+                        nullcontext()
+                        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                        else get_global_expert_distribution_recorder().with_current_layer(i)
                     )
-                if capture_dspark and i in self.dspark_layers_to_capture:
-                    if use_fused:
-                        completed = layer.hc_post(
-                            hidden_states, prev_residual, prev_post, prev_comb
+                    with ctx:
+                        hidden_states, prev_residual, prev_post, prev_comb = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            prev_residual=prev_residual,
+                            prev_post=prev_post,
+                            prev_comb=prev_comb,
                         )
-                    else:
-                        completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
-            if use_fused and last_layer is not None:
-                hidden_states = last_layer.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
-                )
-
+                    if capture_dspark and i in self.dspark_layers_to_capture:
+                        if use_fused:
+                            completed = layer.hc_post(
+                                hidden_states, prev_residual, prev_post, prev_comb
+                            )
+                        else:
+                            completed = hidden_states
+                        dspark_aux_hidden_states.append(completed.mean(dim=1))
+                if use_fused and last_layer is not None:
+                    hidden_states = last_layer.hc_post(
+                        hidden_states, prev_residual, prev_post, prev_comb
+                    )
+        finally:
+            _comm = get_tp_group().torch_symm_mem_comm
+            if _comm is not None:
+                _comm.set_use_cp_fused_symm_mem(False)
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if (
             self.pp_group.is_last_rank

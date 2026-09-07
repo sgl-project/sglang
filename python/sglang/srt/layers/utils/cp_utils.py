@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Callable, List
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -19,8 +19,14 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import (
     get_parallel,
+    max_prefill_buffer_tokens,
     uses_mla_backend,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+        TorchSymmMemCommunicator,
+    )
 
 
 @dataclass
@@ -197,6 +203,57 @@ def cp_round_robin_input_ids(input_ids):
     else:
         input_ids = input_ids[cp_rank::cp_size].contiguous()
     return input_ids
+
+
+def dsa_prefill_cp_fused_symm_mem_eligible(
+    mlp: Any,
+    forward_batch: Any,
+    hidden_states: torch.Tensor,
+    comm: Optional["TorchSymmMemCommunicator"],
+) -> bool:
+    """Eligibility gate for the fused CP AG/RS prefill path: when True the
+    caller skips the standalone dsa_cp gather / reduce-scatter, so this must
+    be rank-consistent and run before any collective."""
+    from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
+        MOE_RS_CHUNK_WIDTH,
+    )
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
+    )
+    from sglang.srt.layers.cp.utils import is_cp_v2_active
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    if comm is None or comm.disabled:
+        return False
+    if not envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get():
+        return False
+    if get_is_capture_mode():
+        return False
+    if not get_moe_a2a_backend().is_none():
+        return False
+    if is_cp_v2_active(forward_batch):
+        return False
+    if not is_dsa_prefill_cp_round_robin_split():
+        # AG places rank r at offset r * M_local; only equal round-robin
+        # shards keep that arithmetic exact.
+        return False
+    parallel = get_parallel()
+    if parallel.attn_dp_size != 1 or parallel.attn_tp_size != 1:
+        # Same layout the dsa_cp_* collectives assert.
+        return False
+    if not mlp.cp_fused_symm_mem_eligible:
+        return False
+    if hidden_states.shape[-1] % MOE_RS_CHUNK_WIDTH != 0:
+        return False
+    # AG kernel and its symm buffer are bf16-only.
+    if hidden_states.dtype != torch.bfloat16:
+        return False
+    # hidden_states is the CP shard here; symm buffers size global tokens.
+    m_global = hidden_states.shape[0] * parallel.attn_cp_size
+    if not (0 < m_global <= max_prefill_buffer_tokens()):
+        return False
+    return True
 
 
 def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, stream):
