@@ -7,6 +7,10 @@ on:
         description: Immutable task image tag
         required: true
         type: string
+      source_commit:
+        description: Exact SGLang source commit embedded in the image
+        required: true
+        type: string
 
 concurrency:
   group: glm53-w4a8-community-${{ github.ref }}
@@ -20,7 +24,13 @@ jobs:
     env:
       IMAGE_REPO: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang
       REGISTRY_HOST: iaas-gpu-cn-beijing.cr.volces.com
-      BASE_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:glm52-w4a8-integrated-1e105705-pp-eagle-v1@sha256:692d9f218caa76270736a0ed3529c7ad467bfb816c8677b17615d52a0d5df74b
+      # This image already contains the exact SM90-only wheel built from the
+      # AOT tree below. Reuse is allowed only while the requested source has
+      # the same tree; the workflow and Dockerfile both fail closed otherwise.
+      KERNEL_BASE_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:glm53-w4a8-community-704c7a96f6-legacy-seed-eager-v2@sha256:426d84c888e8988f5e2e1fad0126a689aa4e941cfdbd8def56710b1c75349b49
+      KERNEL_SOURCE_COMMIT: 704c7a96f6c133a3e92cf67883b0f9d4a334b024
+      KERNEL_SOURCE_TREE: c1fb7595d0e43d523ad853fefa62d9fd402755a3
+      KERNEL_AOT_TREE: 6471f67908ae0c8d5324d628f695123ba59e2f78
       SGL_DEEP_GEMM_COMMIT: aee79a715951a3d47dbbbdbd5387d8be8a131d53
       SGLANG_KERNEL_VERSION: 0.4.6.post1
       SGLANG_KERNEL_BUILD_TORCH: 2.11.0+cu130
@@ -41,10 +51,36 @@ jobs:
           docker system prune -af --filter "until=72h"
           df -h /
 
-      - name: Checkout exact task branch
+      - name: Checkout build recipe
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: Pin low-disk build recipe
+        id: recipe
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow_commit="$(git rev-parse HEAD)"
+          install -m 0644 docker/glm53-w4a8-community-kernel-reuse.Dockerfile \
+            /tmp/glm53-w4a8-community-kernel-reuse.Dockerfile
+          echo "workflow_commit=${workflow_commit}" >> "$GITHUB_OUTPUT"
+          printf 'BUILD_WORKFLOW_COMMIT=%s\n' "$workflow_commit"
+
+      - name: Checkout exact source commit
+        shell: bash
+        env:
+          REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "source_commit must be a full lowercase commit SHA" >&2
+            exit 1
+          }
+          git fetch --no-tags --depth=1 origin "$REQUESTED_SOURCE_COMMIT"
+          git checkout --detach "$REQUESTED_SOURCE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$REQUESTED_SOURCE_COMMIT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
       - name: Compute source provenance
         id: source
@@ -54,6 +90,9 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=no)"
           source_commit="$(git rev-parse HEAD)"
           source_tree="$(git write-tree)"
+          test "$source_commit" = "${{ inputs.source_commit }}"
+          kernel_aot_tree="$(git rev-parse HEAD:python/sglang/kernels/aot)"
+          test "$kernel_aot_tree" = "$KERNEL_AOT_TREE"
           expected_tag_prefix="glm53-w4a8-community-${source_commit:0:10}-"
           case "${{ inputs.image_tag }}" in
             "${expected_tag_prefix}"*) ;;
@@ -64,7 +103,9 @@ jobs:
           esac
           echo "source_commit=${source_commit}" >> "$GITHUB_OUTPUT"
           echo "source_tree=${source_tree}" >> "$GITHUB_OUTPUT"
-          printf 'SOURCE_COMMIT=%s\nSOURCE_TREE=%s\n' "$source_commit" "$source_tree"
+          echo "kernel_aot_tree=${kernel_aot_tree}" >> "$GITHUB_OUTPUT"
+          printf 'SOURCE_COMMIT=%s\nSOURCE_TREE=%s\nKERNEL_AOT_TREE=%s\n' \
+            "$source_commit" "$source_tree" "$kernel_aot_tree"
 
       - name: Stage exact shallow source tree
         id: archive
@@ -74,16 +115,16 @@ jobs:
           SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
         run: |
           set -euo pipefail
-          rm -rf .glm53-build
-          mkdir -p .glm53-build
+          rm -rf /tmp/glm53-source /tmp/glm53-build-context
+          mkdir -p /tmp/glm53-build-context
           git clone --depth 1 --no-local \
-            "file://${GITHUB_WORKSPACE}" .glm53-build/source
-          test "$(git -C .glm53-build/source rev-parse HEAD)" = "$SOURCE_COMMIT"
-          test "$(git -C .glm53-build/source write-tree)" = "$SOURCE_TREE"
-          test -z "$(git -C .glm53-build/source status --porcelain=v1 --untracked-files=all)"
+            "file://${GITHUB_WORKSPACE}" /tmp/glm53-source
+          test "$(git -C /tmp/glm53-source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git -C /tmp/glm53-source write-tree)" = "$SOURCE_TREE"
+          test -z "$(git -C /tmp/glm53-source status --porcelain=v1 --untracked-files=all)"
           tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
-            -cf .glm53-build/source.tar -C .glm53-build/source .
-          source_archive_sha256="$(sha256sum .glm53-build/source.tar | awk '{print $1}')"
+            -cf /tmp/glm53-build-context/source.tar -C /tmp/glm53-source .
+          source_archive_sha256="$(sha256sum /tmp/glm53-build-context/source.tar | awk '{print $1}')"
           echo "source_archive_sha256=${source_archive_sha256}" >> "$GITHUB_OUTPUT"
           printf 'SOURCE_ARCHIVE_SHA256=%s\n' "$source_archive_sha256"
 
@@ -120,20 +161,24 @@ jobs:
           build_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           docker buildx build \
             --platform linux/amd64 \
-            --file docker/glm53-w4a8-community-source-overlay.Dockerfile \
-            --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --file /tmp/glm53-w4a8-community-kernel-reuse.Dockerfile \
+            --build-arg BASE_IMAGE="$KERNEL_BASE_IMAGE" \
+            --build-arg KERNEL_SOURCE_COMMIT="$KERNEL_SOURCE_COMMIT" \
+            --build-arg KERNEL_SOURCE_TREE="$KERNEL_SOURCE_TREE" \
+            --build-arg KERNEL_AOT_TREE="$KERNEL_AOT_TREE" \
             --build-arg SGL_DEEP_GEMM_COMMIT="$SGL_DEEP_GEMM_COMMIT" \
             --build-arg SGLANG_KERNEL_VERSION="$SGLANG_KERNEL_VERSION" \
             --build-arg SGLANG_KERNEL_BUILD_TORCH="$SGLANG_KERNEL_BUILD_TORCH" \
             --build-arg SGLANG_BUILD_COMMIT="$SOURCE_COMMIT" \
             --build-arg SGLANG_SOURCE_TREE="$SOURCE_TREE" \
             --build-arg SGLANG_SOURCE_ARCHIVE_SHA256="$SOURCE_ARCHIVE_SHA256" \
+            --build-arg SGLANG_BUILD_WORKFLOW_COMMIT="${{ steps.recipe.outputs.workflow_commit }}" \
             --build-arg SGLANG_BUILD_URL="$build_url" \
             --build-arg SGLANG_IMAGE_TAG="$image_ref" \
             --metadata-file /tmp/glm53-w4a8-image-metadata.json \
             --push \
             --tag "$image_ref" \
-            .
+            /tmp/glm53-build-context
           digest="$(python3 -c 'import json; print(json.load(open("/tmp/glm53-w4a8-image-metadata.json"))["containerimage.digest"])')"
           test -n "$digest"
           echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
@@ -148,6 +193,7 @@ jobs:
           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
           SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
           SOURCE_ARCHIVE_SHA256: ${{ steps.archive.outputs.source_archive_sha256 }}
+          BUILD_WORKFLOW_COMMIT: ${{ steps.recipe.outputs.workflow_commit }}
         run: |
           set -euo pipefail
           docker buildx imagetools inspect "${IMAGE_REF}@${IMAGE_DIGEST}"
@@ -155,6 +201,9 @@ jobs:
           test "$(docker image inspect "${IMAGE_REF}@${IMAGE_DIGEST}" \
             --format '{{ index .Config.Labels "ai.sglang.build.source-archive-sha256" }}')" \
             = "$SOURCE_ARCHIVE_SHA256"
+          test "$(docker image inspect "${IMAGE_REF}@${IMAGE_DIGEST}" \
+            --format '{{ index .Config.Labels "ai.sglang.build.workflow-commit" }}')" \
+            = "$BUILD_WORKFLOW_COMMIT"
           docker run --rm "${IMAGE_REF}@${IMAGE_DIGEST}" bash -ceu '
             test "$(git -C /glm53-community/sglang rev-parse HEAD)" = "$1"
             test "$(git -C /glm53-community/sglang write-tree)" = "$2"
@@ -165,6 +214,7 @@ jobs:
             test "$(cat /opt/sgl-deep-gemm/source-commit)" = "$3"
             test "$(cat /opt/sglang-source-archive-sha256)" = "$4"
             test "$(python3 -c '"'"'from importlib.metadata import version; print(version("sglang-kernel"))'"'"')" = "$5"
+            test "$(git -C /glm53-community/sglang rev-parse HEAD:python/sglang/kernels/aot)" = "$6"
             test "$(python3 -c '"'"'import torch; print(torch.__version__)'"'"')" = "2.11.0+cu130"
             test "$(python3 -c '"'"'from importlib.metadata import requires; print(next(x.split("==", 1)[1] for x in requires("sglang-kernel") if x.startswith("torch==")))'"'"')" = "2.11.0+cu130"
             python3 -c '"'"'from importlib.metadata import distribution; files = tuple(map(str, distribution("sglang-kernel").files or ())); assert any(path.startswith("sgl_kernel/sm90/common_ops.") and path.endswith(".so") for path in files), files; assert not any(path.startswith("sgl_kernel/sm100/common_ops.") for path in files), files; assert any(path.startswith("sgl_kernel/flash_ops.") and path.endswith(".so") for path in files), files; assert any(path.startswith("sgl_kernel/flashmla_ops.") and path.endswith(".so") for path in files), files'"'"'
@@ -192,4 +242,4 @@ jobs:
               /glm53-community/sglang/test/registered/unit/spec/test_eagle_draft_dp_padding.py \
               /glm53-community/sglang/test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py \
               /glm53-community/sglang/test/registered/unit/spec/test_eagle_draft_cuda_graph_runner.py
-          ' -- "$SOURCE_COMMIT" "$SOURCE_TREE" "$SGL_DEEP_GEMM_COMMIT" "$SOURCE_ARCHIVE_SHA256" "$SGLANG_KERNEL_VERSION"
+          ' -- "$SOURCE_COMMIT" "$SOURCE_TREE" "$SGL_DEEP_GEMM_COMMIT" "$SOURCE_ARCHIVE_SHA256" "$SGLANG_KERNEL_VERSION" "$KERNEL_AOT_TREE"

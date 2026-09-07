@@ -11,6 +11,10 @@ on:
         description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
         required: false
         default: ""
+      source_commit:
+        description: "Exact source commit for the GLM53 W4A8 immutable image. Defaults to the dispatched ref."
+        required: false
+        default: ""
       image_repo:
         description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
@@ -45,6 +49,7 @@ jobs:
     uses: ./.github/workflows/release-docker-glm53-w4a8-community.yml
     with:
       image_tag: ${{ inputs.tag }}
+      source_commit: ${{ inputs.source_commit || github.sha }}
     secrets: inherit
 
   prepare:
