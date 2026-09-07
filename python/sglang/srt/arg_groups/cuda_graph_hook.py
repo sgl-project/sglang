@@ -244,10 +244,6 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             lambda: resolved_view(server_args).attn_cp_size > 1,
         ),
         ("CUDA graph debug mode", lambda: cfg.debug_cuda_graph),
-        (
-            "DSA prefill context parallelism",
-            lambda: cfg.enable_dsa_prefill_context_parallel,
-        ),
         # Capture builds a dummy extend forward with attn_dcp_metadata=None.
         (
             "decode context parallel (dcp_size > 1)",

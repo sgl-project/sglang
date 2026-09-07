@@ -100,10 +100,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.
+    from sglang.srt.arg_groups.parallel_hook import validate_prefill_cp_platform
     from sglang.srt.arg_groups.platform_hook import (
         handle_hardware_runtime_validation,
     )
 
+    validate_prefill_cp_platform(server_args)
     handle_hardware_runtime_validation()
     if cfg.model_path.lower() in ["none", "dummy"]:
         return
@@ -146,21 +148,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_pd_disaggregation(server_args)
 
-    # Normalize protected-platform CP aliases before validations or
-    # model-specific defaults inspect enable_prefill_cp/cp_strategy.
-    from sglang.srt.arg_groups.parallel_hook import (
-        handle_context_parallelism,
-        handle_data_parallelism,
-        handle_dcp_validation,
-        handle_dwdp,
-        handle_elastic_ep,
-        handle_eplb_and_dispatch,
-        handle_expert_distribution_metrics,
-        handle_legacy_cp_runtime_compatibility,
-        handle_platform_cp_compatibility,
-    )
-
-    handle_platform_cp_compatibility(server_args)
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
         handle_kv4_compatibility,
@@ -169,6 +156,15 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_prefill_only_disable_kv_cache,
         handle_unified_memory_pool,
         validate_prefill_only_disable_kv_cache_args,
+    )
+    from sglang.srt.arg_groups.parallel_hook import (
+        handle_context_parallelism,
+        handle_data_parallelism,
+        handle_dcp_validation,
+        handle_dwdp,
+        handle_elastic_ep,
+        handle_eplb_and_dispatch,
+        handle_expert_distribution_metrics,
     )
 
     validate_prefill_only_disable_kv_cache_args(server_args)
@@ -286,9 +282,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Normalize load balancing defaults.
     handle_load_balance_method(server_args)
-
-    # Protected runtimes still consume platform CP fields after backend selection.
-    handle_legacy_cp_runtime_compatibility(server_args)
 
     # Handle context parallelism.
     handle_context_parallelism(server_args)
