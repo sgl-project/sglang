@@ -1,20 +1,12 @@
 """Triton kernels for the LiLiCorr candidate-lattice reranker.
 
-Two kernels, both serving the same head:
-
-``lilicorr_topk_lse``
-    Exact per-row top-k over the candidate vocab logits **and** the full-vocab
-    log-partition, from one pass over ``[n, V]``. The head scores normalized
-    candidate log-probs, so it needs the partition as well as the top-k; a
-    separate ``topk`` plus an ``logsumexp`` epilogue reads the vocabulary three
-    times and materializes two more ``[n, V]`` temporaries, and that read is the
-    single largest cost in the block.
-
-``lilicorr_greedy_path``
-    The whole left-to-right commit through the lattice, emitting the selected
-    token ids. The torch form issues roughly three kernels per slot over ``[bs,
-    k]`` tensors, so at 15 slots the decode is dozens of few-microsecond launches
-    and is pure launch overhead rather than arithmetic.
+``lilicorr_topk_lse`` returns an exact per-row top-k over the candidate vocab
+logits and the full-vocab log-partition from one pass over ``[n, V]``; a separate
+``topk`` plus a ``logsumexp`` epilogue reads the vocabulary three times and
+materializes two more ``[n, V]`` temporaries, and that read is the single largest
+cost in the block. ``lilicorr_greedy_path`` folds the whole left-to-right commit
+into one launch, where the torch form issues roughly three kernels per slot over
+``[bs, k]`` tensors and is pure launch overhead rather than arithmetic.
 
 Both dispatch to a value-identical torch implementation off CUDA, which is also
 what makes the head exercisable in a CPU unit test.
@@ -36,9 +28,11 @@ _TILE = 1024
 _TILES_PER_PROGRAM = 8
 _NUM_WARPS = 4
 
-# Widest candidate pool the fused greedy commit holds in one lane group. k is
-# free -- a wider pool simply takes the torch path.
-_GREEDY_MAX_K = 16
+# Widest candidate pool the fused greedy commit holds in one lane group. Exported
+# because the config refuses a head wider than this rather than serving it on the
+# torch path; the two must not drift.
+MAX_FUSED_CANDIDATE_TOPK = 16
+_GREEDY_MAX_K = MAX_FUSED_CANDIDATE_TOPK
 
 _NEG = -3.0e38
 
@@ -140,15 +134,12 @@ def _greedy_path_kernel(
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """The whole greedy path for one batch row, token ids included.
+    """The whole greedy path for one batch row, tokens included.
 
-    Same recurrence as the torch reference: ``c_0 = argmax(log_start)``, then
-    ``c_s = argmax_c pair[s-1, c_{s-1}, c]``. Factors are fp32 and ``tl.argmax``
-    breaks ties toward the lower index, as ``Tensor.argmax`` does, so the
-    committed path is identical.
-
-    ``pair`` layout: dim -2 ("from") has stride ``lp_sp``, dim -1 ("to") is
-    unit-stride.
+    ``c_0 = argmax(log_start)``, then ``c_s = argmax_c pair[s-1, c_{s-1}, c]``.
+    ``tl.argmax`` breaks ties toward the lower index as ``Tensor.argmax`` does, so
+    the committed path matches the torch reference. ``pair`` layout: dim -2
+    ("from") has stride ``lp_sp``, dim -1 ("to") is unit-stride.
     """
     b = tl.program_id(0)
     offs = tl.arange(0, BLOCK_K)
@@ -181,8 +172,7 @@ def _combine_lse(pm: torch.Tensor, ps: torch.Tensor) -> torch.Tensor:
 def _topk_lse_torch(
     logits: torch.Tensor, k: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference form: ``torch.topk`` plus an fp32-accumulated shifted-exp
-    partition. Value-identical to the tiled path, and the fallback off CUDA."""
+    # Value-identical reference for the tiled path, and the fallback off CUDA.
     vals, ids = torch.topk(logits, k, dim=-1)
     rowmax = vals[:, 0:1]  # topk is sorted descending
     sumexp = (logits - rowmax).exp().sum(dim=-1, dtype=torch.float32)
@@ -195,24 +185,23 @@ def lilicorr_topk_lse(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Exact per-row top-k and full-vocab logsumexp from one ``[N, V]`` read.
 
-    Returns ``(vals [N, k] fp32 descending, ids [N, k] int64, lse [N] fp32)``.
+    Returns ``(vals [N, k] fp32 descending, tokens [N, k] int64, lse [N] fp32)``.
     The candidate log-prob the head consumes is ``val - lse``.
 
-    The tile pre-selection is exact, not approximate. Let ``e`` be a member of
-    the row's true top-k, lying in tile ``T``; then ``max(T) >= e``. If ``T``
-    were not among the k tiles with the largest max, then k other tiles each hold
-    an element ``>= max(T) >= e``, so ``e`` has rank > k -- a contradiction. So
-    every top-k element lives in one of the k selected tiles. Ties in the tile
-    maxima can only reorder elements of equal value, and the tile ids are sorted
-    ascending before the second pass, so the surviving tie-break is by ascending
-    token id, matching ``torch.topk``.
+    The tile pre-selection is exact, not approximate. Let ``e`` be a member of the
+    row's true top-k, lying in tile ``T``; then ``max(T) >= e``. If ``T`` were not
+    among the k tiles with the largest max, k other tiles would each hold an
+    element ``>= max(T) >= e``, so ``e`` has rank > k -- a contradiction.
 
-    ``k`` must be a power of two to take the tiled path: the second pass holds the
-    selected tiles in one Triton lane group and ``tl.arange`` requires a
-    power-of-two extent. That is a property of the head, not of this call, so it is
-    enforced where the head is configured -- ``lilicorr_candidate_topk`` is checked
-    at config parse -- and this function only has to stay correct for the residual
-    case below.
+    Exactness is about the returned *values*. Which of an exactly-tied set of
+    values is returned is unspecified here and in CUDA ``torch.topk`` alike, so
+    the two can select different token ids for the same row -- reachable on bf16
+    logits, where a wide vocabulary rounds several entries together. The tied
+    candidates carry equal log-probs, so the head scores an equally-ranked
+    alternative rather than a wrong one.
+
+    ``k`` must be a power of two to take the tiled path, which is enforced at
+    config parse on ``lilicorr_candidate_topk``.
     """
     if not logits.is_cuda:
         return _topk_lse_torch(logits, k)
@@ -222,10 +211,8 @@ def lilicorr_topk_lse(
     K = int(k)
     T = (V + _TILE - 1) // _TILE
     if min(K, T) & (min(K, T) - 1):
-        # Not a power of two, so the lane group cannot be expressed. With ``k``
-        # validated at config parse this can only mean the vocabulary spans fewer
-        # than k tiles, where the pre-selection is vacuous -- every tile is chosen
-        # -- so the reference path is exact and the tiles bought nothing anyway.
+        # With k validated at config parse, this can only mean the vocabulary spans
+        # fewer than k tiles, where the pre-selection is vacuous anyway.
         return _topk_lse_torch(logits, k)
     P = (T + _TILES_PER_PROGRAM - 1) // _TILES_PER_PROGRAM
     device = logits.device
@@ -276,9 +263,9 @@ def lilicorr_topk_lse(
 def _greedy_path_torch(
     log_start: torch.Tensor,
     log_pair: torch.Tensor,
-    candidate_token_ids: torch.Tensor,
+    candidate_tokens: torch.Tensor,
 ) -> torch.Tensor:
-    num_slots = int(candidate_token_ids.shape[1])
+    num_slots = int(candidate_tokens.shape[1])
     topk = int(log_start.shape[-1])
     cur = log_start.argmax(dim=-1)
     cols = [cur]
@@ -291,16 +278,12 @@ def _greedy_path_torch(
         cur = trans.argmax(dim=-1)
         cols.append(cur)
     path = torch.stack(cols, dim=-1)
-    return torch.gather(candidate_token_ids, 2, path.unsqueeze(-1)).squeeze(-1)
+    return torch.gather(candidate_tokens, 2, path.unsqueeze(-1)).squeeze(-1)
 
 
 def _as_fp32_unit_last(t: torch.Tensor) -> torch.Tensor:
-    """``t`` as fp32 with a unit-stride last dim, copying only if needed.
-
-    The kernel reads the candidate (last) dim contiguously and every other dim
-    through a passed stride, so this is sufficient, and it skips the copy on the
-    common path where the factors already arrive fp32.
-    """
+    # The kernel reads the candidate (last) dim contiguously and every other dim
+    # through a passed stride, so a unit-stride last dim is all it needs.
     if t.dtype != torch.float32:
         t = t.float()
     if t.stride(-1) != 1:
@@ -311,27 +294,27 @@ def _as_fp32_unit_last(t: torch.Tensor) -> torch.Tensor:
 def lilicorr_greedy_path(
     log_start: torch.Tensor,
     log_pair: torch.Tensor,
-    candidate_token_ids: torch.Tensor,
+    candidate_tokens: torch.Tensor,
 ) -> torch.Tensor:
     """Locally-optimal left-to-right decode of the candidate lattice.
 
     Shapes (single block): ``log_start [bs, k]``, ``log_pair [bs, slots-1, k,
-    k]``, ``candidate_token_ids [bs, slots, k]``. Returns the selected token ids
-    ``[bs, slots]``.
+    k]``, ``candidate_tokens [bs, slots, k]``. Returns the selected tokens ``[bs,
+    slots]``.
 
     Commits the argmax candidate at each slot conditioned on the previously
-    committed pick. This matches the locally-normalized training objective: under
-    prefix acceptance, once a slot is wrong nothing after it is accepted, so the
-    global MAP's freedom to trade an early slot for a richer tail has no value.
-    Fixed trip count and no host syncs, so it is CUDA-graph safe either way.
+    committed pick, which matches the locally-normalized training objective:
+    under prefix acceptance, once a slot is wrong nothing after it is accepted,
+    so the global MAP's freedom to trade an early slot for a richer tail has no
+    value. Fixed trip count and no host syncs, so it is CUDA-graph safe.
     """
     if not (log_start.is_cuda and log_start.shape[-1] <= _GREEDY_MAX_K):
-        return _greedy_path_torch(log_start, log_pair, candidate_token_ids)
+        return _greedy_path_torch(log_start, log_pair, candidate_tokens)
 
-    bsz, num_slots, k = candidate_token_ids.shape
+    bsz, num_slots, k = candidate_tokens.shape
     ls = _as_fp32_unit_last(log_start)
     lp = _as_fp32_unit_last(log_pair)
-    ids = candidate_token_ids
+    ids = candidate_tokens
     if ids.stride(-1) != 1:
         ids = ids.contiguous()
     out = torch.empty(bsz, num_slots, dtype=ids.dtype, device=ls.device)

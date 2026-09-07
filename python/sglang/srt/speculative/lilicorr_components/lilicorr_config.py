@@ -1,31 +1,22 @@
 """Geometry of the LiLiCorr candidate-lattice reranker head.
 
-Parsed here rather than as a field on ``DFlashDraftConfig`` so that the shared
-DFLASH config carries no knowledge of this head. This follows
-``dspark_components/dspark_config.py``, which extends the base draft config from
-its own package instead of adding fields to it. The cost is one extra read of
-``dflash_config``, which happens once, at model build.
+Parsed here rather than as a field on ``DFlashDraftConfig``, following
+``dspark_components/dspark_config.py``, so the shared DFLASH config carries no
+knowledge of this head. The cost is one extra read of ``dflash_config``, at
+model build.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
+import msgspec
+
+from sglang.kernels.ops.speculative.lilicorr import MAX_FUSED_CANDIDATE_TOPK
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
 
 
-@dataclass(frozen=True)
-class LiLiCorrConfig:
-    """Geometry of the LiLiCorr candidate-lattice reranker head.
-
-    Every field is read from the checkpoint with no default. Most of them change a
-    tensor shape and would be caught at weight load, but ``logit_scale`` and
-    ``vector_eps`` do not: a guessed value there builds a head that loads cleanly
-    and scores a different function of the same weights, which surfaces as a small
-    believable acceptance delta rather than as an error.
-    """
-
+class LiLiCorrConfig(msgspec.Struct, frozen=True):
     candidate_topk: int
     hidden_size: int
     num_layers: int
@@ -36,16 +27,14 @@ class LiLiCorrConfig:
     logit_scale: float
 
     def resolve_hidden_size(self, *, model_hidden_size: int) -> int:
-        """Head width, where 0 means "as wide as the draft"."""
+        # hidden_size 0 means "as wide as the draft"; the exporter records it for
+        # a head that carries no token_proj.
         return int(self.hidden_size) if self.hidden_size else int(model_hidden_size)
 
 
 def _parse_lilicorr_config(dflash_cfg: dict) -> Optional[LiLiCorrConfig]:
-    """Parse the LiLiCorr head geometry, or None when this is a plain DFLASH config.
-
-    Absence and an explicit ``lilicorr_enabled: false`` both mean "no head", so a
-    DFLASH checkpoint that merely mentions the flag still parses.
-    """
+    # Absence and an explicit lilicorr_enabled: false both mean "no head", so a
+    # DFLASH checkpoint that merely mentions the flag still parses.
     if not any(key.startswith("lilicorr_") for key in dflash_cfg):
         return None
     enabled = dflash_cfg.get("lilicorr_enabled")
@@ -53,6 +42,10 @@ def _parse_lilicorr_config(dflash_cfg: dict) -> Optional[LiLiCorrConfig]:
         return None
 
     def required(key: str, cast, *, positive: bool = True):
+        # No field may be defaulted. Most change a tensor shape and would be
+        # caught at weight load, but logit_scale and vector_eps would not: a
+        # guessed value builds a head that loads cleanly and scores a different
+        # function of the same weights.
         full_key = f"lilicorr_{key}"
         if full_key not in dflash_cfg:
             raise ValueError(
@@ -77,14 +70,22 @@ def _parse_lilicorr_config(dflash_cfg: dict) -> Optional[LiLiCorrConfig]:
             f"{candidate_topk}. The tiled candidate top-k selects its tiles inside a "
             "single Triton lane group, and tl.arange requires a power-of-two extent, "
             "so a head trained at another width could only be served on the slow "
-            "reference path. Refused here, at load, rather than either failing inside "
-            "a kernel on the first decode or silently serving deoptimized."
+            "reference path."
+        )
+    if candidate_topk > MAX_FUSED_CANDIDATE_TOPK:
+        # A wider pool loads and serves correctly but falls off the fused greedy
+        # commit onto the torch path, which is roughly three kernel launches per
+        # slot. Refuse it here for the same reason the power-of-two case is
+        # refused: silently deoptimized is worse than not served.
+        raise ValueError(
+            f"dflash_config.lilicorr_candidate_topk={candidate_topk} exceeds the "
+            f"fused greedy commit's width of {MAX_FUSED_CANDIDATE_TOPK}, which is "
+            "one Triton lane group. A wider head would serve on the reference path "
+            "at a large throughput cost."
         )
 
     return LiLiCorrConfig(
         candidate_topk=candidate_topk,
-        # The one field allowed to be zero: it means "as wide as the draft", which
-        # is what the exporter records for a head that carries no token_proj.
         hidden_size=required("hidden_size", int, positive=False),
         num_layers=required("num_layers", int),
         num_heads=required("num_heads", int),
@@ -96,12 +97,6 @@ def _parse_lilicorr_config(dflash_cfg: dict) -> Optional[LiLiCorrConfig]:
 
 
 def parse_lilicorr_draft_config(*, draft_hf_config: Any) -> LiLiCorrConfig:
-    """The head geometry a LiLiCorr checkpoint must carry.
-
-    Called from ``LiLiCorrDraftModel``, so the architecture string is what a
-    missing geometry contradicts: the checkpoint asked for this head and did not
-    say which one.
-    """
     config = _parse_lilicorr_config(_get_dflash_config(draft_hf_config))
     if config is None:
         raise ValueError(
