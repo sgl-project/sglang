@@ -176,9 +176,46 @@ try:
 
     class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4"
+        hc_pre_from_prev_sublayer = False
+        # V4 normalizes each attention query head (weightless rmsnorm) before RoPE.
+        q_head_norm = True
+        kv_source_layers = ()
+        index_source_layers = ()
+        candidate_source_layer = -1
+        candidate_topk_blocks = 0
+        candidate_block_size = 0
+        engram_layer_ids = ()
+        engram_num_embeddings = ()
+        engram_max_ngram_size = 1
+        engram_vocab_size = 0
+        engram_n_heads = 0
+        engram_head_dim = 0
+        engram_pad_id = 2
+        engram_compressed_vocab_size = 0
+
+    # Not transformers' native deepseek_v4 config: its __post_init__ maps
+    # compress_ratios over a fixed {0, 4, 128} set and KeyErrors on V4.1's 1/2.
+    # Drop the alias once transformers ships a deepseek_v4.1 config.
+    class _DeepseekV41ConfigAlias(_HFDeepseekV3Config):
+        model_type = "deepseek_v4.1"
+        vision_n_layers: int = 0
+        # Each sublayer collapses the hc stream with the pre-mix its predecessor
+        # produced (one-hot copy 0 at layer 0); the head collapses with the last
+        # FFN's pre-mix instead of hc_head_* parameters.
+        hc_pre_from_prev_sublayer = True
+        q_head_norm = False
+        engram_layer_ids = ()
+        engram_num_embeddings = ()
+        engram_max_ngram_size = 1
+        engram_vocab_size = 0
+        engram_n_heads = 0
+        engram_head_dim = 0
+        engram_pad_id = 2
+        engram_compressed_vocab_size = 0
 
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
+    _CONFIG_REGISTRY["deepseek_v4.1"] = _DeepseekV41ConfigAlias
 
     # For kimi_k25_eagle3
     class _KimiK2ConfigAlias(_HFDeepseekV3Config):

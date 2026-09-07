@@ -119,6 +119,12 @@ class PagedIndexerMetadata:
     use_topk_v2: bool
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
+    # Compression ratio of the indexer source: 4 for c4, 1/2 for the dsv41
+    # low-ratio sources. Drives the compressed-domain page size and seq lens.
+    compress_ratio: int = 4
+    # Compressed-domain page size; 0 derives page_size // compress_ratio (the c4
+    # rule). The low-ratio indexer-K pool pages at 64 and passes it explicitly.
+    index_page_size: int = 0
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -176,10 +182,13 @@ class PagedIndexerMetadata:
             self.topk_metadata = torch.empty((0,))
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
+        assert self.page_size % self.compress_ratio == 0, (
+            f"{self.page_size = } must divide {self.compress_ratio = }"
+        )
 
     @property
     def c4_page_size(self) -> int:
-        return self.page_size // 4
+        return self.index_page_size or self.page_size // self.compress_ratio
 
     @property
     def max_seq_len(self) -> int:
@@ -202,6 +211,8 @@ class PagedIndexerMetadata:
             dst=self,
             check_eq_fields=[
                 "page_size",
+                "compress_ratio",
+                "index_page_size",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",

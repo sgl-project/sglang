@@ -126,6 +126,47 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             extend_lens=(16,),
             compress_ratio=128,
         ),
+        # DeepSeek V4.1 ratio 1 / 2: latents in the c1 / c2 FlashMLA-layout pools,
+        # attended through the same extra-cache path as C4.
+        DSV4AttentionCase(
+            name="dsv4_c1_extend",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64,),
+            extend_lens=(16,),
+            compress_ratio=1,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c1_decode",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64, 200),
+            compress_ratio=1,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c2_extend",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            # Odd lengths: the ratio-2 causal count (pos + 1) // 2 rounds down.
+            prefix_lens=(33,),
+            extend_lens=(7,),
+            compress_ratio=2,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c2_decode",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(65,),
+            compress_ratio=2,
+        ),
         DSV4AttentionCase(
             name="dsv4_c128_decode",
             backend="dsv4",
@@ -340,7 +381,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 [[base + 11, base + 12], [base + 13, base + 14]], dtype=torch.int32
             ),
             swa_topk_lengths=torch.tensor([base + 15, base + 16], dtype=torch.int32),
-            c4_sparse_topk=128,
+            index_topk=128,
         )
         metadata.c4_out_loc = torch.tensor([base + 17, base + 18], dtype=torch.int32)
         metadata.c128_out_loc = torch.tensor([base + 19, base + 20], dtype=torch.int32)
@@ -365,7 +406,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         metadata.c128_topk_lengths_clamp1 = torch.tensor(
             [base + 39, base + 40], dtype=torch.int32
         )
-        metadata.c1_flashmla_metadata = object()
+        metadata.c0_flashmla_metadata = object()
         metadata.c4_flashmla_metadata = object()
         metadata.c128_flashmla_metadata = object()
         return metadata
@@ -519,7 +560,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "swa_topk_lengths",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
-            "c1_flashmla_metadata",
+            "c0_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
         ]
@@ -625,12 +666,10 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         for max_seq_len in (3, 4, 255, 256, 259, 260):
             with self.subTest(max_seq_len=max_seq_len):
                 cache = self._make_sparse_prefill_cache(max_seq_len)
-                cache.ensure_c4(page_table, c4_page_size=64)
+                gather = cache.ensure_compressed(4, page_table, c_page_size=64)
                 expected_extent = max(max_seq_len // 4, 1)
-                self.assertEqual(cache.c4_flat_token_ids.numel(), 2 * expected_extent)
-                self.assertEqual(
-                    cache.c4_compressed_base.tolist(), [0, expected_extent]
-                )
+                self.assertEqual(gather.flat_token_ids.numel(), 2 * expected_extent)
+                self.assertEqual(gather.compressed_base.tolist(), [0, expected_extent])
 
     def test_sparse_prefill_c128_uses_live_extent(self):
         from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils

@@ -1182,6 +1182,7 @@ class KVCacheConfigurator:
         if is_dsv4_model:
             token_to_kv_pool = self._build_dsv4_kv_pool(
                 max_running_requests=sizes.max_running_requests,
+                full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                 swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 c4_max_total_num_tokens=sizes.c4_max_total_num_tokens,
                 c128_max_total_num_tokens=sizes.c128_max_total_num_tokens,
@@ -1285,6 +1286,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_running_requests: int,
+        full_max_total_num_tokens: int,
         swa_max_total_num_tokens: Optional[int],
         c4_max_total_num_tokens: int,
         c128_max_total_num_tokens: int,
@@ -1306,8 +1308,10 @@ class KVCacheConfigurator:
             compression_ratios = [
                 COMPRESS_RATIO_NEXTN_LAYER
             ] * self.layer_info.num_effective_layers
+            kv_source_layers = []
         else:
             compression_ratios = self.model_config.compress_ratios
+            kv_source_layers = list(self.model_config.hf_config.kv_source_layers)
 
         # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
         # follows the same fixed ring ownership as GPU. Do not replace the
@@ -1349,6 +1353,8 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            kv_source_layers=kv_source_layers,
+            full_size=full_max_total_num_tokens,
         )
         return token_to_kv_pool
 

@@ -922,6 +922,21 @@ def can_use_flashinfer_allreduce(
     # Dynamo, so statically-off configs must short-circuit before reaching them
     # (same ordering rule as apply_flashinfer_allreduce_fusion).
     token_num, hidden_dim = input_.shape
+
+    # MNNVL vectorizes the hidden dim by float4 and its host-side check
+    # (flashinfer csrc/trtllm_mnnvl_allreduce.cu) hard-fails, rather than
+    # falling back, when the hidden dim is not a whole number of float4s.
+    # Reductions whose width is data-dependent hit this: the dsv4.1 indexer
+    # reduces scores over a variable number of compressed positions, which
+    # crashes the whole server on an NVLink-domain box while Hopper never
+    # selects MNNVL and so never sees it. Rank-invariant: hidden_dim and the
+    # dtype are identical on every rank of the group.
+    if (
+        workspace_manager.backend == "mnnvl"
+        and hidden_dim % (16 // input_.element_size()) != 0
+    ):
+        return False
+
     if torch.compiler.is_compiling():
         # Don't call into the flashinfer workspace object while tracing. The
         # workspace was allocated for (max_token_num, hidden_dim, dtype) and

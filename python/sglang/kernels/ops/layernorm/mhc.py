@@ -2027,6 +2027,352 @@ def _hc_combine_kernel(
     tl.store(y_ptr + pid_m * y_stride_m + offs_h, acc, mask=mask)
 
 
+@triton.jit
+def _hc_mix_stats_partial_kernel(
+    x_ptr,
+    w_ptr,
+    part_mix_ptr,
+    part_sq_ptr,
+    M,
+    K,
+    x_stride_m,
+    w_stride_n,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    """Mixing dot products and row sum of squares over one K slice; the slicing
+    and tiles are compile-time constants, so a row's fp32 operation sequence
+    does not depend on the batch size."""
+    pid_m = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, MIX_PAD)
+    mask_m = offs_m < M
+    mask_n = offs_n < MIX
+    k_per_slice = K // NUM_SLICES
+    k_start = pid_s * k_per_slice
+    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
+    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for kb in range(0, k_per_slice, BLOCK_K):
+        offs_k = k_start + kb + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < k_start + k_per_slice
+        x_tile = tl.load(
+            x_ptr + offs_m[:, None] * x_stride_m + offs_k[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        w_tile = tl.load(
+            w_ptr + offs_n[None, :] * w_stride_n + offs_k[:, None],
+            mask=mask_n[None, :] & mask_k[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.dot(x_tile, w_tile, input_precision=DOT_PRECISION)
+        sq += tl.sum(x_tile * x_tile, axis=1)
+    tl.store(
+        part_mix_ptr + (pid_s * M + offs_m[:, None]) * MIX + offs_n[None, :],
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+    tl.store(part_sq_ptr + pid_s * M + offs_m, sq, mask=mask_m)
+
+
+@triton.jit
+def _hc_mix_stats_reduce_kernel(
+    part_mix_ptr,
+    part_sq_ptr,
+    mixes_ptr,
+    M,
+    inv_k,
+    eps,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Sum the NUM_SLICES partials in slice order and apply the rms scaling."""
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, MIX_PAD)
+    mask_m = offs_m < M
+    mask_n = offs_n < MIX
+    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
+    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for s in tl.static_range(NUM_SLICES):
+        acc += tl.load(
+            part_mix_ptr + (s * M + offs_m[:, None]) * MIX + offs_n[None, :],
+            mask=mask_m[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+        sq += tl.load(part_sq_ptr + s * M + offs_m, mask=mask_m, other=0.0)
+    rsqrt = 1.0 / tl.sqrt(sq * inv_k + eps)
+    tl.store(
+        mixes_ptr + offs_m[:, None] * MIX + offs_n[None, :],
+        acc * rsqrt[:, None],
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+# Interim kernel, kept for its batch invariance, not its speed: a few percent of
+# tensor-core peak at large M; a hand-written replacement is expected. The row tile
+# is now picked from M (see _block_m_for), which is worth 1.6x at decode widths and
+# 1.1-1.2x in the hundreds, but it does not change the large-M picture.
+# The decomposition is fixed (slice count from K, BLOCK_M x BLOCK_K tiles,
+# tf32x3) because each choice changes the rounding; none may depend on M.
+# "ieee" is not an option: Triton lowers it to plain TF32 once BLOCK_M >= 64.
+# BLOCK_M 32 over 64: measured on GB300 (K=20480, MIX=24, CUDA graph replay)
+# the 32-row tile costs 12.8 us per call at M=1 against 64 us for a 64-row tile,
+# and loses at large M; decode won the trade. The contract to keep is
+# test_hc_mix_stats.py: a row alone is bitwise equal to that row in any batch.
+_HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
+_HC_MIX_BLOCK_M = 32
+_HC_MIX_BLOCK_K = 64
+_HC_MIX_NUM_WARPS = 4
+_HC_MIX_DOT_PRECISION = "tf32x3"
+# num_stages only reorders memory issue, not arithmetic; 2 is enough to cover the
+# short k_per_slice loop (K=20480 gives 80 slices, i.e. 4 BLOCK_K tiles per CTA).
+_HC_MIX_NUM_STAGES = 2
+
+# Unlike the slice count, BLOCK_M may be chosen from M. The dot reduces along K in
+# BLOCK_K tiles, so the M tile size does not enter a row's fp32 operation sequence:
+# BLOCK_M 8 / 16 / 32 are bitwise identical to each other at every M from 1 to 1024
+# (verified against the shipped BLOCK_M=32 in the sweep this table came from). 64 is
+# excluded -- that is where Triton drops tf32x3 for plain TF32 and the result moves.
+# GB300, K=20480, MIX=24, CUDA-graph replay, GPU us per call (partial + reduce):
+#   M          1     6     8    16    32    64   256   1024   4096
+#   BLOCK_M=8  8.8   8.4   8.2   9.6  10.7  16.0  37.2  125.5  582.9
+#   BLOCK_M=16 21.7  9.0   8.8   9.0  10.7  14.3  30.0   89.2  437.2
+#   BLOCK_M=32 13.9  13.9  13.6  13.9  14.8  17.6  34.4   92.8  388.9  <- was always this
+_HC_MIX_BLOCK_M_SMALL = 8
+_HC_MIX_BLOCK_M_MID = 16
+_HC_MIX_MID_MAX_M = 2048
+
+
+def _block_m_for(m: int) -> int:
+    """Row-tile height for M rows. Every choice here is bitwise interchangeable,
+    so this is free to depend on M; see the table above for why it should."""
+    if m <= _HC_MIX_BLOCK_M_SMALL:
+        return _HC_MIX_BLOCK_M_SMALL
+    if m <= _HC_MIX_MID_MAX_M:
+        return _HC_MIX_BLOCK_M_MID
+    return _HC_MIX_BLOCK_M
+
+
+def _num_slices_for(k: int) -> int:
+    """Slice count for a hidden width: the largest preferred count that divides
+    k into whole BLOCK_K tiles. A function of the model width only, never of M."""
+    blocks = k // _HC_MIX_BLOCK_K
+    assert k % _HC_MIX_BLOCK_K == 0, k
+    for n in _HC_MIX_SLICE_CHOICES:
+        if blocks % n == 0:
+            return n
+    return 1
+
+
+def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
+    """Batch-invariant ``F.linear(x_flat.float(), hc_fn) * rsqrt(mean(x_flat^2) + eps)``.
+
+    x_flat is [M, K] in any float dtype (upcast to fp32 in the kernel, so it
+    equals ``x_flat.float()``), hc_fn is [MIX, K] fp32; returns [M, MIX] fp32.
+    The K slicing, tile shapes and reduction order are fixed constants, so a
+    row's result is bitwise identical whether it is computed alone or inside a
+    batch of any size; the fp32 cuBLAS GEMM and the torch row reduction it
+    replaces both pick their reduction order from M.
+    """
+    assert x_flat.dim() == 2 and hc_fn.dim() == 2
+    assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
+    assert hc_fn.dtype == torch.float32
+    m, k = x_flat.shape
+    mix = hc_fn.shape[0]
+    assert hc_fn.shape[1] == k
+    num_slices = _num_slices_for(k)
+    mix_pad = max(16, triton.next_power_of_2(mix))
+    part_mix = torch.empty(
+        (num_slices, m, mix), dtype=torch.float32, device=x_flat.device
+    )
+    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=x_flat.device)
+    mixes = torch.empty((m, mix), dtype=torch.float32, device=x_flat.device)
+    if m == 0:
+        return mixes
+    block_m = _block_m_for(m)
+    grid_m = triton.cdiv(m, block_m)
+    _hc_mix_stats_partial_kernel[(grid_m, num_slices)](
+        x_flat,
+        hc_fn,
+        part_mix,
+        part_sq,
+        m,
+        k,
+        x_flat.stride(0),
+        hc_fn.stride(0),
+        MIX=mix,
+        MIX_PAD=mix_pad,
+        NUM_SLICES=num_slices,
+        BLOCK_M=block_m,
+        BLOCK_K=_HC_MIX_BLOCK_K,
+        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
+        num_warps=_HC_MIX_NUM_WARPS,
+        num_stages=_HC_MIX_NUM_STAGES,
+    )
+    _hc_mix_stats_reduce_kernel[(grid_m,)](
+        part_mix,
+        part_sq,
+        mixes,
+        m,
+        1.0 / k,
+        eps,
+        MIX=mix,
+        MIX_PAD=mix_pad,
+        NUM_SLICES=num_slices,
+        BLOCK_M=block_m,
+        num_warps=4,
+    )
+    return mixes
+
+
+@triton.jit
+def _hc_mix_reduce_sinkhorn_kernel(
+    part_mix_ptr,
+    part_sq_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    m,
+    inv_k,
+    rms_eps,
+    MIX: tl.constexpr,
+    HC: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Slice reduction + rms scaling + split/sinkhorn for one token row.
+
+    One CTA per row rather than one per BLOCK_M rows: that keeps the 4x4 sinkhorn
+    reductions two-dimensional (a [BLOCK_M, HC, HC] tile makes the cross-row
+    ``tl.sum(axis=1)`` cost more than the launch the fusion saves) and makes the
+    slice reduction *more* parallel than the standalone reduce, which puts every
+    row in a single CTA. The per-row arithmetic is the reduce kernel's followed by
+    the in-tree Triton sinkhorn port's, in that order.
+    """
+    row = tl.program_id(0)
+    if row >= m:
+        return
+    j = tl.arange(0, HC)
+    jj = j[:, None]
+    kk = j[None, :]
+
+    a_pre = tl.zeros([HC], dtype=tl.float32)
+    a_post = tl.zeros([HC], dtype=tl.float32)
+    a_comb = tl.zeros([HC, HC], dtype=tl.float32)
+    sq = tl.zeros([], dtype=tl.float32)
+    for s in tl.static_range(NUM_SLICES):
+        off = (s * m + row) * MIX
+        a_pre += tl.load(part_mix_ptr + off + j)
+        a_post += tl.load(part_mix_ptr + off + HC + j)
+        a_comb += tl.load(part_mix_ptr + off + 2 * HC + jj * HC + kk)
+        sq += tl.load(part_sq_ptr + s * m + row)
+    rsqrt = 1.0 / tl.sqrt(sq * inv_k + rms_eps)
+
+    s0 = tl.load(scale_ptr + 0)
+    s1 = tl.load(scale_ptr + 1)
+    s2 = tl.load(scale_ptr + 2)
+
+    pre = tl.sigmoid(a_pre * rsqrt * s0 + tl.load(base_ptr + j)) + EPS
+    tl.store(pre_ptr + row * HC + j, pre)
+    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + tl.load(base_ptr + HC + j))
+    tl.store(post_ptr + row * HC + j, post)
+
+    comb = a_comb * rsqrt * s2 + tl.load(base_ptr + 2 * HC + jj * HC + kk)
+    comb = tl.exp(comb - tl.max(comb, axis=1)[:, None])
+    comb = comb / tl.sum(comb, axis=1)[:, None] + EPS
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    for _ in tl.static_range(ITERS - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
+
+
+def hc_mix_stats_sinkhorn(
+    x_flat: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+):
+    """``hc_split_sinkhorn(hc_mix_stats(x_flat, hc_fn, rms_eps), ...)`` with the
+    reduce and the sinkhorn in one kernel.
+
+    The partial (split-K) kernel is unchanged and still sets the reduction order,
+    so the batch-invariance contract of ``hc_mix_stats`` carries over unchanged.
+    The sinkhorn half is the in-tree Triton port rather than the TileLang kernel,
+    which differs only in transcendental lowering (measured max rel 1.2e-06).
+    """
+    assert x_flat.dim() == 2 and hc_fn.dim() == 2
+    assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
+    assert hc_fn.dtype == torch.float32
+    m, k = x_flat.shape
+    mix = hc_fn.shape[0]
+    assert mix == (2 + hc_mult) * hc_mult and hc_fn.shape[1] == k
+    dev = x_flat.device
+    pre = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
+    post = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
+    comb = torch.empty(m, hc_mult, hc_mult, dtype=torch.float32, device=dev)
+    if m == 0:
+        return pre, post, comb
+
+    num_slices = _num_slices_for(k)
+    mix_pad = max(16, triton.next_power_of_2(mix))
+    part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
+    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
+    block_m = _block_m_for(m)
+    _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
+        x_flat,
+        hc_fn,
+        part_mix,
+        part_sq,
+        m,
+        k,
+        x_flat.stride(0),
+        hc_fn.stride(0),
+        MIX=mix,
+        MIX_PAD=mix_pad,
+        NUM_SLICES=num_slices,
+        BLOCK_M=block_m,
+        BLOCK_K=_HC_MIX_BLOCK_K,
+        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
+        num_warps=_HC_MIX_NUM_WARPS,
+        num_stages=_HC_MIX_NUM_STAGES,
+    )
+    _hc_mix_reduce_sinkhorn_kernel[(m,)](
+        part_mix,
+        part_sq,
+        hc_scale.float().contiguous(),
+        hc_base.float().contiguous(),
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        rms_eps,
+        MIX=mix,
+        HC=hc_mult,
+        NUM_SLICES=num_slices,
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        num_warps=1,
+    )
+    return pre, post, comb
+
+
 def hc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:

@@ -9,6 +9,8 @@ repos:
       - id: destroyed-symlinks
       - id: trailing-whitespace
       - id: end-of-file-fixer
+        # Byte-exact chat-encoding goldens end without a newline.
+        exclude: ^test/registered/unit/entrypoints/openai/fixtures/dsv41/.*\.txt$
       - id: check-yaml
         args: [--allow-multiple-documents]
         # Helm chart templates embed Go template syntax ({{- ... -}})

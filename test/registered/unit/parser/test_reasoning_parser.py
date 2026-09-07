@@ -255,6 +255,17 @@ class TestDeepSeekV4Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "pick a tool")
         self.assertTrue(result.normal_text.startswith("<｜DSML｜tool_calls>"))
 
+    def test_deepseek_v41_alias_routes_spaced_dsml_out_of_reasoning(self):
+        """V4.1 spaces its DSML tag names; the marker-based split must not care."""
+        detector = ReasoningParser(model_type="deepseek-v41").detector
+        self.assertIsInstance(detector, DeepSeekV4Detector)
+
+        result = detector.parse_streaming_increment(
+            '<think>pick a tool<｜DSML｜ calls><｜DSML｜ invoke name="s">'
+        )
+        self.assertEqual(result.reasoning_text, "pick a tool")
+        self.assertTrue(result.normal_text.startswith("<｜DSML｜ calls>"))
+
 
 class TestInklingDetector(CustomTestCase):
     def test_streaming_routes_blocks_across_all_string_boundaries(self):
@@ -1169,6 +1180,18 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
         )
         self._assert_invariant(
             DeepSeekV4Detector,
+            f"<think>my reasoning</think>{tool_call}",
+            ("my reasoning", tool_call),
+        )
+
+    def test_dsv41_spaced_tool_block_after_think_end(self):
+        tool_call = (
+            f"<{self.DSML} calls>"
+            f'<{self.DSML} invoke name="s"></{self.DSML} invoke>'
+            f"</{self.DSML} calls>"
+        )
+        self._assert_invariant(
+            lambda: ReasoningParser(model_type="deepseek-v41").detector,
             f"<think>my reasoning</think>{tool_call}",
             ("my reasoning", tool_call),
         )

@@ -52,7 +52,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 # Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
-_ALL_CHAT_ENCODING_SPECS = ("dsv4", "dsv32", "inkling", "kimi_k3")
+_ALL_CHAT_ENCODING_SPECS = ("dsv41", "dsv4", "dsv32", "inkling", "kimi_k3")
 
 
 def _spec_result(index):
@@ -2252,6 +2252,225 @@ class ServingChatTestCase(unittest.TestCase):
             )
         )
         self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
+
+    # ------------- dsv41 -------------
+    def test_dsv41_encoding_spec_resolution(self):
+        """model_type picks V4.1 ahead of the V4 architecture substring, with
+        or without a checkpoint chat template."""
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        hf_config = tm.model_config.hf_config
+        hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        hf_config.model_type = "deepseek_v4.1"
+        for chat_template in (None, "some jinja"):
+            tm.tokenizer.chat_template = chat_template
+            self.assertEqual(
+                OpenAIServingChat(tm, TemplateManager()).chat_encoding_spec, "dsv41"
+            )
+
+        hf_config.architectures = ["DeepseekV41ForConditionalGeneration"]
+        hf_config.model_type = "deepseek_v41"
+        self.assertEqual(
+            OpenAIServingChat(tm, TemplateManager()).chat_encoding_spec, "dsv41"
+        )
+
+        hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        hf_config.model_type = "deepseek_v4"
+        hf_config.to_dict.return_value = {"dsv4_reasoning_effort_profile": "preview"}
+        self.assertEqual(
+            OpenAIServingChat(tm, TemplateManager()).chat_encoding_spec, "dsv4"
+        )
+
+        hf_config.architectures = ["LlamaForCausalLM"]
+        tm.server_args.tool_call_parser = "deepseekv41"
+        self.assertEqual(
+            OpenAIServingChat(tm, TemplateManager()).chat_encoding_spec, "dsv41"
+        )
+
+    def test_dsv41_default_reasoning_effort_resolved_from_env_at_boot(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.model_type = "deepseek_v4.1"
+        for raw, expected in (("max", "max"), ("42", 42)):
+            with envs.SGLANG_DSV41_REASONING_EFFORT.override(raw):
+                serving_chat = OpenAIServingChat(tm, TemplateManager())
+            self.assertEqual(serving_chat._dsv41_default_reasoning_effort, expected)
+        for raw in ("0", "101", "medium"):
+            with (
+                self.subTest(raw=raw),
+                envs.SGLANG_DSV41_REASONING_EFFORT.override(raw),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "SGLANG_DSV41_REASONING_EFFORT"
+                ):
+                    OpenAIServingChat(tm, TemplateManager())
+
+    def _render_dsv41(self, *, raw_effort=None, **request_kwargs) -> str:
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv41"
+        self.chat._dsv41_default_reasoning_effort = "high"
+        req = ChatCompletionRequest(model="x", **request_kwargs)
+        if raw_effort is not None:
+            # A chat_template_kwargs.reasoning_effort lands here unvalidated
+            # (_convert_to_internal_request pops it onto the request).
+            req.reasoning_effort = raw_effort
+        self.chat._process_messages(req, is_multimodal=False)
+        return self.tm.tokenizer.encode.call_args[0][0]
+
+    def test_dsv41_system_host_only_inserted_for_tools(self):
+        """V4.1 renders a token for an empty system message, so a bare chat must
+        not get the implicit system that dsv4/dsv32 insert."""
+        bos = "<｜begin▁of▁sentence｜>"
+        user = [{"role": "user", "content": "hi"}]
+        self.assertTrue(
+            self._render_dsv41(messages=user).startswith(bos + "<｜User｜>")
+        )
+
+        tool = {
+            "type": "function",
+            "function": {"name": "weather", "parameters": {"type": "object"}},
+        }
+        with_tools = self._render_dsv41(messages=user, tools=[tool])
+        self.assertTrue(with_tools.startswith(bos + "<｜System｜>\n\n## Tools"))
+        self.assertIn('"name": "weather"', with_tools)
+
+    def test_dsv41_tool_json_carries_only_client_fields(self):
+        """The tool JSON goes into the prompt verbatim, so pydantic defaults
+        (strict, defer_loading, an unset description) must not leak in."""
+        from sglang.srt.entrypoints.openai import encoding_dsv41
+
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Get the weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+        user = [{"role": "user", "content": "hi"}]
+        rendered = self._render_dsv41(messages=user, tools=[tool])
+        expected = encoding_dsv41.encode_messages(
+            [{"role": "system", "content": "", "tools": [tool]}] + user,
+            thinking_mode="chat",
+        )
+        self.assertEqual(rendered, expected)
+        self.assertNotIn('"strict"', rendered)
+        self.assertNotIn('"defer_loading"', rendered)
+
+    def test_dsv41_reasoning_effort_mapping(self):
+        user = [{"role": "user", "content": "hi"}]
+        thinking = {"thinking": True}
+
+        def budget(**kwargs):
+            prompt = self._render_dsv41(messages=user, **kwargs)
+            marker = "Reasoning Effort: "
+            self.assertIn(marker, prompt)
+            return int(prompt.split(marker, 1)[1].split(" ", 1)[0])
+
+        self.assertEqual(budget(chat_template_kwargs=thinking), 50)
+        self.assertEqual(
+            budget(chat_template_kwargs=thinking, reasoning_effort="xhigh"), 75
+        )
+        self.assertEqual(
+            budget(chat_template_kwargs=thinking, reasoning_effort=0.42), 42
+        )
+        self.assertEqual(budget(chat_template_kwargs=thinking, reasoning_effort=0.0), 1)
+        self.assertEqual(budget(chat_template_kwargs=thinking, raw_effort=7), 7)
+        self.assertEqual(budget(chat_template_kwargs=thinking, raw_effort=101), 50)
+
+        # Unsupported tiers fall back to the default and warn once per value.
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+        ) as logs:
+            self.assertEqual(
+                budget(chat_template_kwargs=thinking, reasoning_effort="medium"), 50
+            )
+        self.assertEqual(len(logs.records), 1)
+        with self.assertNoLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+        ):
+            self.assertEqual(
+                budget(chat_template_kwargs=thinking, reasoning_effort="medium"), 50
+            )
+
+        # Chat mode never renders the effort prompt.
+        self.assertNotIn(
+            "Reasoning Effort:",
+            self._render_dsv41(
+                messages=user,
+                chat_template_kwargs={"thinking": False},
+                reasoning_effort="max",
+            ),
+        )
+
+    def test_dsv41_content_parts_reach_the_encoder(self):
+        """Text parts join with a blank line; image parts are refused without a
+        vision tower instead of being silently dropped."""
+        prompt = self._render_dsv41(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first"},
+                        {"type": "text", "text": "second"},
+                    ],
+                }
+            ]
+        )
+        self.assertIn("<｜User｜>first\n\nsecond<｜Assistant｜>", prompt)
+
+        with self.assertRaisesRegex(ValueError, "image input is not supported"):
+            self._render_dsv41(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "look"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "http://x/a.png"},
+                            },
+                        ],
+                    }
+                ]
+            )
+
+    def test_dsv41_vision_preserves_image_order_and_reasoning_effort(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv41"
+        self.chat._dsv41_default_reasoning_effort = "high"
+        self.tm.model_config.hf_config.image_token_id = 129264
+        self.tm.tokenizer.convert_ids_to_tokens.return_value = "<image>"
+        request = ChatCompletionRequest(
+            model="x",
+            chat_template_kwargs={"thinking": True},
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "second.png"}},
+                        {"type": "text", "text": "Compare"},
+                        {"type": "image_url", "image_url": {"url": "first.png"}},
+                    ],
+                }
+            ],
+        )
+        # Request conversion promotes numeric chat_template_kwargs to this field.
+        request.reasoning_effort = 42
+        result = self.chat._process_messages(request, is_multimodal=True)
+        prompt = self.tm.tokenizer.encode.call_args[0][0]
+        self.assertEqual(result.image_data, ["second.png", "first.png"])
+        self.assertEqual(prompt.count("<image>"), 2)
+        self.assertNotIn("<｜deepseek_image｜>", prompt)
+        self.assertIn("Reasoning Effort: 42", prompt)
 
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):

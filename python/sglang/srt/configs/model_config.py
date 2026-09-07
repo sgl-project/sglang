@@ -558,12 +558,17 @@ class ModelConfig:
                 or hasattr(self.hf_config, "audio_config")
             )
         )
+        has_dsv41_vision = (
+            self.hf_config.model_type == "deepseek_v4.1"
+            and self.hf_config.vision_n_layers > 0
+        )
         self.is_multimodal = (
             enable_multimodal
             and not self.is_lm_only
             and (
                 is_multimodal_model(self.hf_config.architectures)
                 or has_multimodal_subconfig
+                or has_dsv41_vision
             )
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
@@ -582,6 +587,8 @@ class ModelConfig:
             self.is_multimodal
             and getattr(self.hf_config, "vision_config", None) is not None
         )
+        if self.is_multimodal and has_dsv41_vision:
+            self.is_image_understandable_model = True
 
         # Models expose audio_config at different nesting levels:
         #   - top-level audio_config: e.g. Qwen2Audio
@@ -610,7 +617,10 @@ class ModelConfig:
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
         )
-        self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        # Tokens (the token itself plus its predecessors) each position reads from the
+        # per-request n-gram token table; 0 disables the table.
+        self.ngram_context_size = ngram_context_size(self.hf_config)
+        self.use_ngram_embedding = self.ngram_context_size > 0
         # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
@@ -2397,3 +2407,11 @@ def get_hybrid_layer_ids(
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
+
+
+def ngram_context_size(hf_config) -> int:
+    if getattr(hf_config, "use_ngram_embedding", False):
+        return hf_config.ngram_embedding_n
+    if getattr(hf_config, "engram_layer_ids", ()):
+        return hf_config.engram_max_ngram_size
+    return 0

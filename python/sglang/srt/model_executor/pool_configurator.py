@@ -930,6 +930,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
+        # Ratio 1/2 kv_source layers keep one FlashMLA-layout latent and one bf16
+        # index key per compressed position.
+        low_ratio_kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        self.low_ratio_bytes_per_full_token = sum(
+            (low_ratio_kv_bytes + 2 * self.indexer_head_dim) / cfg.compress_ratios[l]
+            for l in cfg.hf_config.kv_source_layers
+            if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+            and cfg.compress_ratios[l] in (1, 2)
+        )
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
@@ -1023,6 +1032,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
             self.swa_ratio * kv_bytes * self.num_layers_total
+            + self.low_ratio_bytes_per_full_token
             + c4_frac * kv_bytes * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4

@@ -23,7 +23,6 @@ class NgramEmbeddingManager:
     enabled: bool
     table: Optional[torch.Tensor]
     n: int
-    k: int
 
     @classmethod
     def from_model(
@@ -36,8 +35,6 @@ class NgramEmbeddingManager:
         device: str,
     ):
         token_table = None
-        ngram_embedding_n = 0
-        ngram_embedding_k = 0
         use_ngram_embedding = model_config.use_ngram_embedding
         if use_ngram_embedding:
             from sglang.srt.layers.n_gram_embedding import NgramEmbedding
@@ -58,14 +55,10 @@ class NgramEmbeddingManager:
                     module.init_buffers(
                         max_running_requests, chunked_prefill_size, device
                     )
-            hf_config = model_config.hf_config
-            ngram_embedding_n = hf_config.ngram_embedding_n
-            ngram_embedding_k = hf_config.ngram_embedding_k
         return cls(
             enabled=use_ngram_embedding,
             table=token_table,
-            n=ngram_embedding_n,
-            k=ngram_embedding_k,
+            n=model_config.ngram_context_size,
         )
 
     def update_after_decode(

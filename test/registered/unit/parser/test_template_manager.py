@@ -351,6 +351,14 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             "thinking",
         ),
         (
+            "deepseek_v41_spaced_dsml_calls",
+            "{% if not thinking is defined %}{% set thinking = false %}{% endif %}\n"
+            '<｜DSML｜ calls><｜DSML｜ invoke name="tool"></｜DSML｜ invoke>',
+            [],
+            "deepseek-v41",
+            "thinking",
+        ),
+        (
             "hunyuan_interleaved_thinking",
             "{% set reasoning_effort = reasoning_effort | default('no_think', true) %}\n"
             "{% set interleaved_thinking = interleaved_thinking | default(false, true) %}\n"
@@ -622,6 +630,12 @@ class TestToolCallParserDetection(unittest.TestCase):
                 "deepseekv4",
             ),
             (
+                "deepseekv41",
+                '<｜DSML｜ calls><｜DSML｜ invoke name="tool"></｜DSML｜ invoke></｜DSML｜ calls>',
+                [],
+                "deepseekv41",
+            ),
+            (
                 "kimi_k2",
                 "{% set thinking = thinking if thinking is defined else true %}\n<think>",
                 ["<|tool_calls_section_begin|>"],
@@ -757,6 +771,7 @@ class TestToolCallParserDetection(unittest.TestCase):
         reasoning_index = {
             rule.name: i for i, rule in enumerate(REASONING_PARSER_RULES)
         }
+        self.assertLess(reasoning_index["deepseek_v41"], reasoning_index["deepseek_v4"])
         self.assertLess(reasoning_index["deepseek_v4"], reasoning_index["deepseek_v3"])
         self.assertLess(
             reasoning_index["hunyuan"], reasoning_index["deepseek_r1_think_tags"]
@@ -770,6 +785,7 @@ class TestToolCallParserDetection(unittest.TestCase):
         )
 
         tool_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
+        self.assertLess(tool_index["deepseek_v41"], tool_index["deepseek_v4"])
         self.assertLess(tool_index["deepseek_v31"], tool_index["deepseek_v3"])
         self.assertLess(tool_index["hunyuan"], tool_index["xml_kv_tool_call"])
         self.assertLess(tool_index["poolside_v1"], tool_index["xml_kv_tool_call"])
@@ -932,6 +948,44 @@ class TestResolveAutoParsers(unittest.TestCase):
 
         with _patch_hf_transformers_utils(
             Mock(return_value=tokenizer), Mock(return_value=config)
+        ):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(_declared(args, "reasoning_parser"), "deepseek-v4")
+        self.assertEqual(_declared(args, "tool_call_parser"), "deepseekv4")
+
+    def test_deepseek_v41_model_type_selects_v41_parsers(self):
+        """The first V4.1 checkpoints keep the V4 architecture name and differ
+        only in model_type, so the V4 substring branch must not win."""
+        for config in (
+            SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v4.1"
+            ),
+            SimpleNamespace(
+                architectures=["DeepseekV41ForConditionalGeneration"],
+                model_type="deepseek_v4.1",
+            ),
+        ):
+            with self.subTest(config=config):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                with _patch_hf_transformers_utils(
+                    Mock(return_value=_DummyTokenizer([])), Mock(return_value=config)
+                ):
+                    resolve_auto_parsers(args)
+
+                self.assertEqual(_declared(args, "reasoning_parser"), "deepseek-v41")
+                self.assertEqual(_declared(args, "tool_call_parser"), "deepseekv41")
+
+    def test_deepseek_v4_model_type_keeps_v4_parsers(self):
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
+        config = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v4"
+        )
+
+        with _patch_hf_transformers_utils(
+            Mock(return_value=_DummyTokenizer([])), Mock(return_value=config)
         ):
             resolve_auto_parsers(args)
 
