@@ -197,6 +197,7 @@ def fit_auto_residency_probe(
     free_bytes: int,
     total_bytes: int,
     server_args: ServerArgs,
+    constant_weight_bytes: int = 0,
 ) -> tuple[Req, int | None, int]:
     """Shrink a full-shape probe until its extrapolated peak fits the memory left.
 
@@ -205,6 +206,9 @@ def fit_auto_residency_probe(
     memory. The bounded warmup that runs before it gives one measurement to
     extrapolate from; while that extrapolation exceeds free memory minus the
     reserve, frames go first and then area, the ladder the OOM retry walks.
+    ``constant_weight_bytes`` is the weight floor the planner also uses: a
+    component-offloaded DiT sits fully on the device during its phase, and
+    scaling it with the workload turned a 27 GiB probe into a 77 GiB estimate.
     Returns the fitted request, its estimate and the number of shrink steps.
     """
     # Only the probe has to fit, so the margin is allocator slack, not the
@@ -222,7 +226,9 @@ def fit_auto_residency_probe(
             * max(1, int(fitted.num_frames or 1))
         )
         estimate = estimate_default_workload_peak_bytes(
-            records=records, target_units=units
+            records=records,
+            target_units=units,
+            constant_weight_bytes=constant_weight_bytes,
         )
         if estimate is None or estimate <= budget or units <= floor_units:
             return fitted, estimate, steps
@@ -1072,12 +1078,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             current_platform.get_available_gpu_memory(empty_cache=True) * (1 << 30)
         )
         total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
+        weight_floor_bytes = self._probe_weight_floor_bytes()
         _, _, steps = fit_auto_residency_probe(
             req,
             records=records,
             free_bytes=free_bytes,
             total_bytes=total_bytes,
             server_args=self.server_args,
+            constant_weight_bytes=weight_floor_bytes,
         )
         requested_units = (
             max(1, int(req.width or 1))
@@ -1085,7 +1093,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             * max(1, int(req.num_frames or 1))
         )
         estimate = estimate_default_workload_peak_bytes(
-            records=records, target_units=requested_units
+            records=records,
+            target_units=requested_units,
+            constant_weight_bytes=weight_floor_bytes,
         )
         # Ranks see different free memory and hold different records; the
         # forward must run one shape everywhere, so the most cautious rank wins.
@@ -1112,6 +1122,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 _shape_label(fitted),
             )
         req.sampling_params = fitted.sampling_params
+
+    def _probe_weight_floor_bytes(self) -> int:
+        """Weight bytes on the device during a probe, kept out of extrapolation.
+
+        Resident components sit on the device for the whole request and
+        offloaded ones stream through it one component at a time, so the floor
+        is the resident sum plus the largest streamed component.
+        """
+        runtime_bytes = component_runtime_weight_bytes(self._auto_residency_modules())
+        resident = 0
+        streamed = 0
+        for name, weight_bytes in runtime_bytes.items():
+            if self.server_args.residency_mode(name) == RESIDENT:
+                resident += weight_bytes
+            else:
+                streamed = max(streamed, weight_bytes)
+        return resident + streamed
 
     def _release_warmup_pool(self, req: Req) -> None:
         """Drop what the full-shape probe left behind before the next request.
