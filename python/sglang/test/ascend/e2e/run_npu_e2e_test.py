@@ -501,6 +501,13 @@ def monitor_pod_logs(
 
 
 def generate_metrics_json(metrics_data_file, test_case, status):
+    """Collect [METRIC] lines from the log and write metrics.json.
+
+    This writes ${metrics_data_file}/metrics.json only, which feeds the
+    persistence-directory output (e.g. /root/.cache/tests/output/...).
+    It is NOT consumed by CI artifacts (the former /tmp/metrics.json +
+    'Upload metrics' path was removed).
+    """
     log_file = os.path.join(metrics_data_file, "test_output.log")
 
     metrics = {}
@@ -552,10 +559,6 @@ def generate_metrics_json(metrics_data_file, test_case, status):
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
     logger.info(f"Metrics JSON written to {output_path}")
-
-    with open("/tmp/metrics.json", "w") as f:
-        json.dump(output, f, indent=2)
-    logger.info("Metrics JSON written to /tmp/metrics.json")
 
 
 def run_npu_e2e_test_case(

@@ -49,6 +49,7 @@
 /python/sglang/srt/managers/tokenizer_manager_score_mixin.py @sundar24295s @chanh @fortunecookiee
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hanming-lu @yizhang2077 @hzh0425 @ispobock @alphabetc1 @huangtingwei9988
 /python/sglang/srt/mem_cache/allocator @hnyls2002 @ispobock @alphabetc1
+/python/sglang/srt/mem_cache/rust_tree_core @Jialin @ispobock @alphabetc1
 /python/sglang/srt/mem_cache/storage/mooncake_store @huangtingwei9988
 /python/sglang/srt/mem_cache/embedding_*.py @liusy58
 /python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_embedding_store.py @liusy58
@@ -67,6 +68,7 @@
 /python/sglang/srt/weight_cache @liusy58 @QiuMike @alexnails
 /python/sglang/kernels/aot @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /python/sglang/kernels/aot/csrc/musa @yeahdongcn
+/rust/sglang-radix-tree @Jialin @ispobock @alphabetc1
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
 /sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237

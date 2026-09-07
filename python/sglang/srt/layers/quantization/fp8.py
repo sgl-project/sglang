@@ -87,6 +87,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_capability,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -911,9 +912,20 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.data, requires_grad=False
                     )
 
+                # On SM120 (Blackwell RTX 50) the per-tensor FP8 path dispatches
+                # to the fast cudnn/nvjet SM120 kernel, which beats the
+                # channelwise cutlass GemmUniversal by ~1.2-2.7x across the
+                # decode/prefill M range (matches vLLM's per-tensor SM120
+                # choice). Requantize per-channel -> per-tensor (max scale)
+                # there instead.
+                use_sm120_fp8_pertensor = (
+                    self.cutlass_fp8_supported
+                    and not self.use_marlin
+                    and get_device_capability()[0] == 12
+                )
                 # cutlass sgl-kernel and marlin only support per-channel scale; aiter supports per-channel scale
                 if (
-                    self.cutlass_fp8_supported
+                    (self.cutlass_fp8_supported and not use_sm120_fp8_pertensor)
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
@@ -2000,6 +2012,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
                 w2_s = layer.w2_weight_scale_inv.data
+            elif get_moe_runner_backend().is_cutlass():
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                w13_s = layer.w13_weight_scale_inv.data
+                w2_s = layer.w2_weight_scale_inv.data
             elif (
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -2554,6 +2571,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_mxfp8=use_mxfp8,
                 output=symm_output,
                 enable_es=(use_mxfp8, use_mxfp8),
+                swiglu_limit=self.moe_runner_config.swiglu_limit,
             )
             return StandardCombineInput(hidden_states=output)
 

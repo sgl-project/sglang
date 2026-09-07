@@ -327,6 +327,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise ValueError(
                 "Rust TreeCore does not support component_registry_override"
             )
+        # The Rust core builds its own eviction strategy from the policy name
+        # alone, so a config would be dropped rather than applied.
+        if params.eviction_policy_config:
+            raise ValueError(
+                "Rust TreeCore does not support --radix-eviction-policy-config"
+            )
 
         self._page_size = params.page_size
         self.is_eagle = (
@@ -928,8 +934,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DropSubtreeNoHostResult(is_dropped=binding_result.dropped)
         return _fill_evict_result(binding_result, result)
 
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
-        self._binding.mark_write_through_pending(node_id)
+    def mark_write_through_pending(
+        self, node_ids: list[NodeId], ack_id: NodeId
+    ) -> list[NodeId]:
+        return self._binding.mark_write_through_pending(list(node_ids), ack_id)
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         self._binding.finish_write_through(list(node_ids), ack_id)
