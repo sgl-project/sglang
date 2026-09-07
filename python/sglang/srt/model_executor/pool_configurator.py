@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     get_schedule,
@@ -112,6 +113,23 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * get_parallel().attn_dcp_size
+
+
+def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
+    """Global layer ids represented by the local DSA pool's dense layer slots."""
+    if kvc.mambaish_config and not kvc.is_draft_worker:
+        layer_ids = [
+            layer_id
+            for layer_id in kvc.mambaish_config.full_attention_layer_ids
+            if kvc.layer_info.start_layer <= layer_id < kvc.layer_info.end_layer
+        ]
+    else:
+        layer_ids = list(range(kvc.layer_info.start_layer, kvc.layer_info.end_layer))
+    # Draft pools and a few platform-specific pools may expose a synthetic layer
+    # count. They do not use indexShare, so only the length matters for sizing.
+    if len(layer_ids) != num_layers:
+        return list(range(num_layers))
+    return layer_ids
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -280,8 +298,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             get_glm_dsa_layer_split_effective_num_layers,
         )
 
-        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-            kvc, num_layers
+        effective_num_layers = (
+            num_layers
+            if kvc.server_args.enable_hisparse
+            else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -444,18 +464,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             _should_elide_dsa_index_k,
         )
 
-        if allocate_all_layers or not _should_elide_dsa_index_k(
-            is_draft_worker=kvc.is_draft_worker
+        if (
+            allocate_all_layers
+            or kvc.server_args.enable_hisparse
+            or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
         ):
             num_indexer_layers = num_layers
         else:
-            active_indexer_layers = [
-                layer_id
-                for layer_id in range(
-                    kvc.layer_info.start_layer, kvc.layer_info.end_layer
-                )
-                if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
-            ]
             from sglang.srt.layers.cp.utils import (
                 get_glm_dsa_cp_layer_shard_info,
                 get_layer_shard_range,
@@ -463,6 +478,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             _, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
             if shard_size > 1:
+                # Preserve the existing LayerSplit sizing semantics. GLM-5.3
+                # hybrid-layer support is intentionally limited to the normal
+                # (non-LayerSplit) pool below.
+                active_indexer_layers = [
+                    layer_id
+                    for layer_id in range(
+                        kvc.layer_info.start_layer, kvc.layer_info.end_layer
+                    )
+                    if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                ]
                 active_set = set(active_indexer_layers)
                 max_owned = 0
                 for rank in range(shard_size):
@@ -476,7 +501,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                 num_indexer_layers = max_owned + 1
             else:
-                num_indexer_layers = len(active_indexer_layers)
+                num_indexer_layers = sum(
+                    not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                    for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
+                )
 
         return int(
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
@@ -893,7 +921,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # keeps the FP8 estimate.
         self.indexer_bytes_per_token = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim,
-            _is_hip and kvc.server_args.enable_deepseek_v4_fp4_indexer,
+            _is_hip and get_exec().kernel.enable_deepseek_v4_fp4_indexer,
         )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.

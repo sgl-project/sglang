@@ -454,6 +454,10 @@ class ServerArgs(DisaggServerArgsMixin):
     warmup_resolutions: list[str] = None
     warmup_num_frames: int | None = None
     warmup_steps: int = 1
+    # JSON overrides for the representative request shape used by synthetic
+    # warmup and automatic residency planning. Execution remains bounded by
+    # warmup_steps and the server warmup frame/area caps.
+    warmup_sampling_params: dict[str, Any] | str | None = None
 
     disable_autocast: bool | None = None
 
@@ -2383,6 +2387,18 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=ServerArgs.warmup_steps,
             help="The number of warmup steps to perform for each resolution.",
+        )
+        parser.add_argument(
+            "--warmup-sampling-params",
+            type=str,
+            default=ServerArgs.warmup_sampling_params,
+            help=(
+                "JSON object overriding model sampling defaults for synthetic "
+                "warmup and auto residency planning, for example "
+                '\'{"width":832,"height":480,"num_frames":9,'
+                '"num_inference_steps":4}\'. Warmup still applies its '
+                "bounded execution caps."
+            ),
         )
         # component residency and legacy offload controls
         parser.add_argument(
