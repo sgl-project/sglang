@@ -693,6 +693,11 @@ class TboForwardBatchPreparer:
             )
             output_dict[key] = old_value[start_token_index:end_token_index]
 
+        if batch.out_cache_loc_virtual is not None:
+            output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
+                start_token_index:end_token_index
+            ]
+
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
@@ -756,6 +761,7 @@ class TboForwardBatchPreparer:
             "return_logprob",
             "can_run_decode_cuda_graph",
             "can_run_dp_prefill_cuda_graph",
+            "dp_prefill_cuda_graph_max_prefix_len",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",

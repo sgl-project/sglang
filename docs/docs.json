@@ -925,6 +925,7 @@
               "docs/advanced_features/overview",
               "docs/advanced_features/server_arguments",
               "docs/advanced_features/session_radix_cache",
+              "docs/advanced_features/radix_eviction_policy",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
