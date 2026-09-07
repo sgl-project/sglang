@@ -403,6 +403,33 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(CustomTestCase):
         result = self.processor(logits, params)
         self.assertTrue(torch.equal(result, original))
 
+    def test_invalid_window_size_type_skips(self):
+        """Non-numeric window_size should be handled gracefully."""
+        req = _make_req(origin_input_ids=[1, 2, 1, 2])
+        params = [{"__req__": req, "ngram_size": 2, "window_size": "invalid"}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_negative_ngram_size_skips(self):
+        """Negative ngram_size should disable ngram checking."""
+        req = _make_req(origin_input_ids=[1, 2, 1, 2])
+        params = [{"__req__": req, "ngram_size": -1, "window_size": 100}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_negative_window_size_skips(self):
+        """Negative window_size should disable ngram checking."""
+        req = _make_req(origin_input_ids=[1, 2, 1, 2])
+        params = [{"__req__": req, "ngram_size": 2, "window_size": -1}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
     def test_falsy_params_in_list_skipped(self):
         """A falsy entry (None, {}, 0) in param list should be skipped."""
         req = _make_req(origin_input_ids=[1, 2, 1, 2])
