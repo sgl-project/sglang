@@ -231,7 +231,7 @@ def is_musa() -> bool:
 
 @lru_cache(maxsize=1)
 def is_mps() -> bool:
-    return torch.backends.mps.is_available()
+    return hasattr(torch, "mps") and torch.mps.is_available()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -525,7 +525,23 @@ def get_available_gpu_memory(
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
-        free_gpu_memory = psutil.virtual_memory().available
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+        num_gpus = torch.mps.device_count()
+        assert gpu_id < num_gpus
+
+        if use_mlx():
+            # Torch's allocator does not track MLX Metal allocations.
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            if empty_cache:
+                empty_device_cache(torch.mps)
+            # Bound free memory by host RAM and Metal's working-set limit.
+            total_gpu_memory = torch.mps.recommended_max_memory()
+            metal_headroom = max(
+                0, total_gpu_memory - torch.mps.driver_allocated_memory()
+            )
+            free_gpu_memory = min(psutil.virtual_memory().available, metal_headroom)
     else:
         if not current_platform.is_out_of_tree():
             raise ValueError(
@@ -774,6 +790,16 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mps_memory_capacity():
+    # Metal's working-set limit is smaller than unified system RAM.
+    try:
+        if torch.mps.is_available():
+            return torch.mps.recommended_max_memory() // 1024 // 1024  # unit: MB
+        raise ValueError("No GPU memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.mps is not available.")
+
+
 def get_mtgpu_memory_capacity():
     try:
         # Run mthreads-gmi and capture the output
@@ -826,6 +852,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "mps":
+        gpu_mem = get_mps_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
@@ -844,6 +872,9 @@ def get_device_memory_capacity(device: str = None):
 
 
 def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        return torch.backends.mps.get_name()
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
@@ -933,6 +964,12 @@ def get_device(device_id: Optional[int] = None) -> str:
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        try:
+            return torch.mps.device_count()
+        except RuntimeError:
+            return 0
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
             return torch.cuda.device_count()
@@ -996,6 +1033,10 @@ def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
+
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        # MPS has no SGLang graph runner.
+        return "eager"
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"

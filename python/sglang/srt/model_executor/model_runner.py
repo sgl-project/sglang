@@ -414,10 +414,21 @@ class ModelRunner:
         if get_exec().features.enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
-        # Set device early so that TransferEngine init (e.g. Ascend NPU)
-        # can access the device context.
+        # Set the device before TransferEngine init. MPS has one implicit device.
+        is_mps_device = str(self.device).split(":", 1)[0] == "mps"
+        if is_mps_device:
+            from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+            if not use_mlx():
+                # Direct ModelRunner construction bypasses the ServerArgs gate.
+                from sglang.srt.hardware_backend.mps.runtime import (
+                    validate_mps_runtime,
+                )
+
+                validate_mps_runtime()
         try:
-            torch.get_device_module(self.device).set_device(ps.gpu_id)
+            if not is_mps_device:
+                torch.get_device_module(self.device).set_device(ps.gpu_id)
         except Exception:
             import os
 
@@ -436,7 +447,12 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        if is_mps_device:
+            from sglang._platform_stubs import Stream
+
+            self.forward_stream = Stream(device=torch.device("mps"))
+        else:
+            self.forward_stream = torch.get_device_module(self.device).Stream()
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.

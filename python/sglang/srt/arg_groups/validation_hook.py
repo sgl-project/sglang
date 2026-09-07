@@ -413,6 +413,47 @@ def validate_experimental_sgl_marlin(server_args: Any):
     validate_experimental_sgl_marlin_server_args(server_args, view)
 
 
+def validate_standard_mps_server_args(server_args: Any):
+    """Validate execution modes supported by the Torch MPS path."""
+
+    cfg = resolving_view(server_args)
+    supported_attention_backends = {None, "torch_native"}
+    for field in (
+        "attention_backend",
+        "prefill_attention_backend",
+        "decode_attention_backend",
+    ):
+        value = getattr(cfg, field, None)
+        normalized = getattr(value, "value", value)
+        normalized = None if normalized is None else str(normalized).lower()
+        if normalized not in supported_attention_backends:
+            raise ValueError(
+                "The standard Torch MPS path currently supports only the "
+                f"torch_native attention backend; got {field}={value!r}"
+            )
+
+    sampling_backend = getattr(cfg, "sampling_backend", None)
+    normalized_sampling = getattr(sampling_backend, "value", sampling_backend)
+    normalized_sampling = (
+        None if normalized_sampling is None else str(normalized_sampling).lower()
+    )
+    if normalized_sampling not in {None, "pytorch"}:
+        raise ValueError(
+            "The standard Torch MPS path currently supports only the "
+            f"pytorch sampling backend; got sampling_backend={sampling_backend!r}"
+        )
+
+    if (
+        getattr(cfg, "tp_size", 1) != 1
+        or getattr(cfg, "pp_size", 1) != 1
+        or getattr(cfg, "dp_size", 1) != 1
+    ):
+        raise ValueError(
+            "The standard Torch MPS path requires tp_size=1, pp_size=1, "
+            "and dp_size=1"
+        )
+
+
 def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.prefill_decode_interval < 0:

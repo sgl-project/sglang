@@ -55,12 +55,19 @@ from sglang.srt.arg_groups.argparse_actions import (
 from sglang.srt.arg_groups.overrides import (
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
+    model_config_of,
     remote_instance_transfer_engine_of,
     resolution_projection,
     resolving_view,
 )
+from sglang.srt.arg_groups.validation_hook import validate_standard_mps_server_args
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hardware_backend.mps.runtime import (
+    validate_mps_model_config,
+    validate_mps_runtime,
+)
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -3740,11 +3747,39 @@ class ServerArgs:
             )
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
+        # Validate Torch MPS before model resolution; MLX has its own gate.
+        # Platform detection covers the usual omitted --device on macOS.
+        if not use_mlx():
+            requested_device = getattr(self, "device", None)
+            explicitly_mps = (
+                requested_device is not None
+                and str(requested_device).split(":", 1)[0] == "mps"
+            )
+            if explicitly_mps or (requested_device is None and get_platform().is_mps):
+                validate_mps_runtime()
+
         try:
             run_resolution_pipeline(self)
+
+            # Validate resolved arguments and checkpoint-derived constraints.
+            cfg = resolving_view(self)
+            if (
+                cfg.device == "mps"
+                and not use_mlx()
+                and str(cfg.model_path).lower() not in ("none", "dummy")
+            ):
+                validate_standard_mps_server_args(self)
+                lora_enabled = bool(cfg.enable_lora) or (
+                    cfg.enable_lora is None and bool(cfg.lora_paths)
+                )
+                validate_mps_model_config(
+                    model_config_of(self),
+                    lora_enabled=lora_enabled,
+                )
         except BaseException:
             # The handlers that ran already declared, and they are not
             # idempotent over their own output.
+            self._resolution_finished = False
             self._resolution_failed = True
             raise
         # Set here too, because the dummy/absent-model path returns before the
