@@ -89,6 +89,10 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.hunyuan_reasoning import (
+    normalize_hunyuan_reasoning_effort,
+    uses_hunyuan_reasoning_effort,
+)
 from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
@@ -706,6 +710,20 @@ class OpenAIServingChat(OpenAIServingBase):
         """Post-process reasoning and tool_calls before building response."""
         return reasoning_text, tool_calls
 
+    def _should_return_input_ids(self, request: ChatCompletionRequest) -> bool:
+        """Whether prompt (input) token ids should be returned via sglext."""
+        return (
+            request.return_input_ids_in_sglext
+            or self.tokenizer_manager.server_args.return_input_ids
+        )
+
+    def _should_return_output_ids(self, request: ChatCompletionRequest) -> bool:
+        """Whether sampled output token ids should be returned via sglext."""
+        return (
+            request.return_output_ids_in_sglext
+            or self.tokenizer_manager.server_args.return_output_ids
+        )
+
     def _continuous_usage_cached_details(
         self, content: Dict[str, Any]
     ) -> Optional[PromptTokensDetails]:
@@ -1034,11 +1052,26 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
-        reasoning_effort = (
-            request.chat_template_kwargs.pop("reasoning_effort", None)
-            if request.chat_template_kwargs
-            else None
-        )
+
+        # Header-based opt-in (same rationale as request_headers.py).
+        if raw_request is not None and not request.return_input_ids_in_sglext:
+            if raw_request.headers.get("x-sglext-return-input-ids") == "1":
+                request.return_input_ids_in_sglext = True
+
+        if raw_request is not None and not request.return_output_ids_in_sglext:
+            if raw_request.headers.get("x-sglext-return-output-ids") == "1":
+                request.return_output_ids_in_sglext = True
+
+        reasoning_effort = None
+        if not uses_hunyuan_reasoning_effort(
+            self.reasoning_parser, self.template_manager.reasoning_config
+        ):
+            reasoning_effort = (
+                request.chat_template_kwargs.pop("reasoning_effort", None)
+                if request.chat_template_kwargs
+                else None
+            )
+
         if self.is_gpt_oss and reasoning_effort == "none":
             raise ValueError(
                 f"Harmony does not support reasoning effort {reasoning_effort}"
@@ -1155,8 +1188,11 @@ class OpenAIServingChat(OpenAIServingBase):
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
-            return_prompt_token_ids=request.return_prompt_token_ids
-            or request.return_token_ids,
+            return_prompt_token_ids=(
+                request.return_prompt_token_ids
+                or request.return_token_ids
+                or self._should_return_input_ids(request)
+            ),
         )
         if (
             raw_request is not None
@@ -1178,6 +1214,10 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
+
+        normalize_hunyuan_reasoning_effort(
+            request, self.reasoning_parser, self.template_manager.reasoning_config
+        )
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -1666,12 +1706,23 @@ class OpenAIServingChat(OpenAIServingBase):
         image_tokens = {}
         audio_tokens = {}
         video_tokens = {}
+        input_ids: Optional[List[int]] = None
+        output_ids: Dict[int, List[int]] = {}
 
         stream_started = False
+        error_aborted = False
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
+            )
+
+            return_input_ids = self._should_return_input_ids(request)
+            return_output_ids = self._should_return_output_ids(request)
+
+            ids_framed = (
+                raw_request is not None
+                and raw_request.headers.get("x-sglext-ids-framed") == "1"
             )
 
             async for content in self.tokenizer_manager.generate_request(
@@ -1702,6 +1753,32 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
 
+                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+
+                if return_input_ids and input_ids is None:
+                    # The prompt is the full, shared prompt (same across choices
+                    # and constant across chunks), so capture it once.
+                    chunk_input_ids = content.get("prompt_token_ids")
+                    if chunk_input_ids is not None:
+                        input_ids = list(chunk_input_ids)
+
+                if return_output_ids:
+                    chunk_output_ids = content.get("output_ids")
+                    if chunk_output_ids is not None:
+                        if self.tokenizer_manager.server_args.incremental_streaming_output:
+                            accumulated = output_ids.setdefault(index, [])
+                            if finish_reason_type == "abort":
+                                # The abort chunk re-sends the last token plus any coalesced deltas;
+                                # keep only what brings the total up to completion_tokens.
+                                keep = completion_tokens[index] - len(accumulated)
+                                chunk_output_ids = chunk_output_ids[: max(keep, 0)]
+                            accumulated.extend(chunk_output_ids)
+                        else:
+                            # Intermediate chunks share the live state.output_ids
+                            # list; the final chunk is a stable copy.
+                            output_ids[index] = chunk_output_ids
+
                 # Handle logprobs
                 choice_logprobs = None
                 if request.logprobs:
@@ -1714,9 +1791,6 @@ class OpenAIServingChat(OpenAIServingBase):
                             content, n_prev_token, total_output_logprobs
                         ).model_dump()
                     n_prev_tokens[index] = total_output_logprobs
-
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
                 if finish_reason_type:
@@ -1736,6 +1810,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             code.value,
                         )
                         yield f"data: {error}\n\n"
+                        error_aborted = True
                         break
                     finish_reasons[index] = finish_reason
 
@@ -1840,24 +1915,54 @@ class OpenAIServingChat(OpenAIServingBase):
                         spec_details if request.n > 1 else spec_details[0]
                     )
 
-            if any(
-                obj is not None
-                for obj in [
-                    sglext_routed,
-                    sglext_cached_tokens_details,
-                    sglext_spec_tokens_details,
+            # Omit token ids after an error abort.
+            sglext_input_ids = None
+            if return_input_ids and input_ids and not error_aborted:
+                sglext_input_ids = list(input_ids)
+
+            sglext_output_ids = None
+            if return_output_ids and output_ids and not error_aborted:
+                sglext_output_ids = [
+                    list(output_ids.get(i, [])) for i in range(request.n)
                 ]
-            ):
+
+            sglext_full = SglExt(
+                routed_experts=sglext_routed,
+                cached_tokens_details=sglext_cached_tokens_details,
+                spec_tokens_details=sglext_spec_tokens_details,
+                input_ids=sglext_input_ids,
+                output_ids=sglext_output_ids,
+            )
+            sglext_non_ids, sglext_ids = sglext_full.split_ids()
+
+            if ids_framed:
+                # A named SSE event lets transit hops pick the ids out without parsing JSON;
+                # the other sglext fields keep the plain data-chunk shape.
+                if sglext_non_ids is not None:
+                    sglext_chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[],
+                        model=request.model,
+                        sglext=sglext_non_ids,
+                    )
+                    yield f"data: {sglext_chunk.model_dump_json()}\n\n"
+                if sglext_ids is not None:
+                    sglext_ids_chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[],
+                        model=request.model,
+                        sglext=sglext_ids,
+                    )
+                    yield f"event: sglext_ids\ndata: {sglext_ids_chunk.model_dump_json()}\n\n"
+            elif sglext_non_ids is not None or sglext_ids is not None:
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
                     choices=[],  # sglext is at response level
                     model=request.model,
-                    sglext=SglExt(
-                        routed_experts=sglext_routed,
-                        cached_tokens_details=sglext_cached_tokens_details,
-                        spec_tokens_details=sglext_spec_tokens_details,
-                    ),
+                    sglext=sglext_full,
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
 
@@ -1972,12 +2077,26 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.n > 1
             else (spec_details[0] if spec_details else None)
         )
+        input_ids = None
+        if self._should_return_input_ids(request) and "prompt_token_ids" in ret[0]:
+            input_ids = list(ret[0]["prompt_token_ids"])
+        output_ids = None
+        if self._should_return_output_ids(request):
+            output_ids = [list(ret_item["output_ids"]) for ret_item in ret]
         response_sglext = None
-        if routed_experts or cached_tokens_details or spec_tokens_details:
+        if (
+            routed_experts
+            or cached_tokens_details
+            or spec_tokens_details
+            or input_ids is not None
+            or output_ids is not None
+        ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
                 spec_tokens_details=spec_tokens_details,
+                input_ids=input_ids,
+                output_ids=output_ids,
             )
 
         for idx, ret_item in enumerate(ret):
@@ -2470,7 +2589,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return
 
         if self.reasoning_parser == "hunyuan":
-            request.reasoning_effort = "medium" if enabled else "no_think"
+            config = self.template_manager.reasoning_config
+            if config is not None and config.special_case == "hunyuan_effort":
+                request.reasoning_effort = "high" if enabled else "no_think"
+            else:
+                request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
         if self.reasoning_parser == "inkling":
@@ -2539,6 +2662,9 @@ class OpenAIServingChat(OpenAIServingBase):
             ) == "enabled"
 
         if self.reasoning_parser == "hunyuan":
+            config = self.template_manager.reasoning_config
+            if config is not None and config.special_case == "hunyuan_effort":
+                return request.reasoning_effort not in ("none", "no_think")
             # Hy3-preview template emits no <think> when reasoning_effort is
             # "no_think" / "none" / unset; forcing reasoning would route all
             # output into reasoning_content.

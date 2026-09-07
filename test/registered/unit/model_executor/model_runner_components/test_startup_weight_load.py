@@ -31,7 +31,7 @@ from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 _STARTUP_MODULE = (
