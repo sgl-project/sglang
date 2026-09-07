@@ -88,7 +88,7 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
             && mb.workers.contains(&key);
         if converged {
             // Both trees agree on count AND on the worker that holds the
-            // prefix. This is what the cache-aware-zmq policy reads to
+            // prefix. This is what the Radix Tree provider reads to
             // pick a worker; both routers picking the same key here
             // means they would route the same prompt to the same worker.
             assert_eq!(
