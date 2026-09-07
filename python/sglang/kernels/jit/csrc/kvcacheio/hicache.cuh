@@ -50,12 +50,24 @@ inline constexpr bool group_fits(int64_t bytes, uint32_t num_threads, uint32_t g
   return package == 4 || package == 8 || package == 16;
 }
 
+// kvcache/hicache.py pre-screens element sizes with a Python copy of this rule
+// and derives its lane count from a literal 32. Pin the constant that mirrors,
+// so a wavefront-size change fails here, at the rule, rather than silently
+// disagreeing with that screen.
+static_assert(device::kWarpThreads == 32, "kvcache/hicache.py mirrors this lane count");
+
 inline constexpr uint32_t pick_group_bytes(int64_t bytes, uint32_t num_threads) {
+  // The narrow rounds only pay off against the raised ROCm block quota, so CUDA
+  // keeps the original 128 B requirement and generates the same code as before.
+#ifdef USE_ROCM
   return group_fits(bytes, num_threads, 128)  ? 128u
          : group_fits(bytes, num_threads, 64) ? 64u
          : group_fits(bytes, num_threads, 32) ? 32u
          : group_fits(bytes, num_threads, 16) ? 16u
                                               : 0u;
+#else
+  return group_fits(bytes, num_threads, 128) ? 128u : 0u;
+#endif
 }
 
 // NVIDIA exposes an explicit "do not allocate in L1" cache hint via PTX. ROCm
