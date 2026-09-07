@@ -150,6 +150,30 @@ class HfModelConfigParser(ModelConfigParserBase):
             else:
                 config._name_or_path = model
 
+        # After potential registry reload, the fresh config may carry
+        # parent-class defaults (e.g. DeepseekV3Config.hidden_size=7168)
+        # that conflict with the checkpoint's nested text_config values
+        # (e.g. V4.1 hidden_size=5120).  When text_config is still a plain
+        # dict it means the registry reload just replaced the config and
+        # the earlier flattening was lost — overwrite the outer config's
+        # text-level attributes from the dict so the model sees correct values.
+        if isinstance(model, str):
+            _tc_raw = getattr(config, "text_config", None)
+            if isinstance(_tc_raw, dict):
+                _skip_keys = {
+                    "text_config",
+                    "vision_config",
+                    "model_type",
+                    "architectures",
+                    "torch_dtype",
+                    "transformers_version",
+                    "auto_map",
+                    "custom_pipelines",
+                }
+                for _key, _val in _tc_raw.items():
+                    if _key not in _skip_keys and _val is not None:
+                        setattr(config, _key, _val)
+
         if isinstance(model, str) and config.model_type == "internvl_chat":
             for key, val in config.llm_config.__dict__.items():
                 if not hasattr(config, key):
