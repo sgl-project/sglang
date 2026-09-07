@@ -66,6 +66,8 @@ def _make_cache(page_size=4):
     cache._inflight_store_nodes = {}
     cache._pending_store_launches = {}
     cache._pending_store_copies = {}
+    cache._restore_leases = {}
+    cache._restore_generation = 0
     cache._async_store_slot_mapping = False
     cache._profile_store_stages = False
     cache.flexkv_connector.is_store_sync_leader = True
@@ -109,6 +111,152 @@ def test_duplicate_restore_reuses_live_node_without_creating_stale_leaf():
     assert result.num_tokens_evicted == 4
     assert allocator.free.call_count + allocator.free_segment.call_count == 1
     assert cache.evictable_size() == 0
+
+
+def test_evict_never_enters_a_cross_rank_store_protocol():
+    """evict() fires on local allocator pressure, so it is not rank-symmetric.
+
+    Both store-completion polls scatter across ranks, so a rank that evicted
+    would block in a collective its peers never entered. Draining belongs to
+    check_hicache_events, which every rank runs each scheduler tick.
+    """
+    cache, _allocator = _make_cache()
+    # The async path is what used to drain stores from inside evict().
+    cache._async_store_slot_mapping = True
+    key = RadixKey(array("q", range(4)))
+    _load(cache, key, 0, 4, "first")
+
+    cache.evict(EvictParams(num_tokens=4))
+
+    cache.flexkv_connector.sync_ready_store_rids.assert_not_called()
+    cache.flexkv_connector.check_completed_stores.assert_not_called()
+    # The store stream must still be synchronized: eviction frees the source
+    # slots a queued D2H copy may still be reading.
+    cache.store_stream.synchronize.assert_called_once()
+
+    # The rank-symmetric hook is what actually drains.
+    cache.flexkv_connector.check_completed_stores.return_value = []
+    cache.check_hicache_events()
+    cache.flexkv_connector.check_completed_stores.assert_called_once()
+    cache.flexkv_connector.sync_ready_store_rids.assert_called_once()
+
+
+def _ip_restore(cache, rid="ip-request", uncached_len=4, value_numel=0, key=None):
+    """Run an IP-mode (request-owned) restore and return the fake Req."""
+    req = SimpleNamespace(
+        rid=rid,
+        origin_input_ids=[],
+        output_ids=[],
+        kv=SimpleNamespace(kv_committed_len=0, cache_protected_len=0),
+        _flexkv_uncached_restore=False,
+        pending_restore_generation=None,
+        pending_restore_slots=None,
+    )
+    result = cache._allocate_and_load(
+        key=key if key is not None else RadixKey(array("q", range(uncached_len))),
+        value_numel=value_numel,
+        uncached_len=uncached_len,
+        last_node=cache.root_node,
+        tracking_rid=rid,
+        sglang_req_id=rid,
+        load_fn=MagicMock(side_effect=lambda slots: int(slots.numel())),
+        request_owned_req=req,
+    )
+    assert result is not None
+    return req, result
+
+
+def test_ip_restore_is_reported_uncommitted_until_the_cache_commits_it():
+    """The scheduler skips the waiting-queue rematch while this is True.
+
+    Without it, init_next_round_input reassigns req.prefix_indices, which is
+    the only handle on request-owned restored slots, and they leak.
+    """
+    cache, _allocator = _make_cache()
+    req, _ = _ip_restore(cache)
+
+    assert cache.has_uncommitted_restore(req) is True
+
+    with (
+        patch.object(RadixCache, "cache_finished_req", lambda *a, **k: None),
+        patch.dict(
+            FlexKVRadixCache.cache_finished_req.__globals__,
+            {"get_spec": lambda: SimpleNamespace(speculative_eagle_topk=None)},
+        ),
+    ):
+        cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=0)
+
+    assert cache.has_uncommitted_restore(req) is False
+    assert req._flexkv_uncached_restore is False
+    assert req.pending_restore_slots is None
+
+
+def test_mp_restore_never_takes_a_lease():
+    """MP restores are attached to the tree, so leasing them would make the
+    scheduler skip every MP request forever."""
+    cache, _allocator = _make_cache()
+    key = RadixKey(array("q", range(4)))
+    _load(cache, key, 0, 4, "mp-request")
+
+    assert cache._restore_leases == {}
+
+    # Positive control: leasing does happen on the IP path, so the assertion
+    # above is about MP declining a lease, not about leases never being taken.
+    # Use a disjoint key so this restore actually allocates instead of being
+    # deduplicated against the prefix the MP restore just put in the tree.
+    ip_req, _ = _ip_restore(
+        cache, rid="ip-request", key=RadixKey(array("q", range(100, 104)))
+    )
+    assert cache.has_uncommitted_restore(ip_req) is True
+
+
+def test_aborted_ip_restore_does_not_stay_uncommitted_forever():
+    """An abort must clear the lease. Otherwise a requeued rid would be
+    skipped on every scheduling pass and never run again."""
+    cache, _allocator = _make_cache()
+    req, _ = _ip_restore(cache, rid="aborted")
+    assert cache.has_uncommitted_restore(req) is True
+
+    cache.release_aborted_request("aborted")
+
+    assert cache.has_uncommitted_restore(req) is False
+    assert req._flexkv_uncached_restore is False
+
+
+def test_lease_covers_only_freshly_allocated_slots_not_the_reused_prefix():
+    """Freeing a lease must never free tree-owned slots."""
+    cache, _allocator = _make_cache()
+    first_page = RadixKey(array("q", range(4)))
+    full_key = RadixKey(array("q", range(8)))
+
+    (reused, _node), _ = _load(cache, first_page, 0, 4, "first")
+    cache.flexkv_connector.lookup_kv.return_value = (17, 4)
+    req, (restored, _last) = _ip_restore(
+        cache, rid="ip-second", uncached_len=8, key=full_key
+    )
+
+    # The request sees the whole prefix, but the lease owns only the new tail.
+    assert restored.numel() == 8
+    lease = cache._restore_leases["ip-second"]
+    assert lease.device_indices.numel() == 4
+    # No leased slot may appear anywhere in the tree-owned reused prefix.
+    assert not bool((lease.device_indices == reused.unsqueeze(1)).any())
+
+
+def test_reset_drains_flexkv_before_freeing_leased_restore_slots():
+    """FlexKV still holds these slot addresses: a layerwise H2D may be writing
+    into them. Draining must happen before the free."""
+    cache, allocator = _make_cache()
+    _ip_restore(cache, rid="in-flight")
+    order = []
+    cache.flexkv_connector.reset.side_effect = lambda: order.append("connector_reset")
+    allocator.free.side_effect = lambda *_a, **_k: order.append("free_slots")
+
+    with patch.object(RadixCache, "reset", lambda _self: order.append("base_reset")):
+        cache.reset()
+
+    assert order == ["connector_reset", "free_slots", "base_reset"]
+    assert cache._restore_leases == {}
 
 
 def test_partial_duplicate_restore_relooks_up_only_missing_suffix():
