@@ -43,6 +43,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_mm,
     get_serving,
 )
@@ -647,6 +648,69 @@ class BaseMultimodalProcessor(ABC):
             video_token_id=getattr(self, "VIDEO_TOKEN_ID", None),
         )
 
+    def get_validated_mm_data(
+        self,
+        prompt,
+        embeddings: Dict[Modality, torch.Tensor],
+        **kwargs,
+    ) -> MultimodalProcessorOutput:
+        """Build EPD multimodal inputs and validate the embedding layout.
+
+        Model processors may override ``get_mm_data`` to rebuild their prompt
+        layout. This shared wrapper ensures every override consumes exactly the
+        encoder rows it received before the result reaches the scheduler.
+        """
+        output = self.get_mm_data(prompt, embeddings, **kwargs)
+        self._validate_precomputed_embedding_layout(output, embeddings)
+        return output
+
+    @staticmethod
+    def _validate_precomputed_embedding_layout(
+        output: MultimodalProcessorOutput,
+        embeddings: Dict[Modality, torch.Tensor],
+    ) -> None:
+        consumed_per_modality = {modality: 0 for modality in embeddings}
+
+        for item in output.mm_items:
+            embedding = item.precomputed_embeddings
+            if not isinstance(embedding, torch.Tensor):
+                raise RuntimeError(
+                    "EPD multimodal items must contain tensor embeddings; "
+                    f"got {type(embedding).__name__} for "
+                    f"{item.modality.name.lower()}"
+                )
+
+            num_rows = embedding.shape[0]
+            if item.offsets is not None:
+                expected_rows = sum(end - start + 1 for start, end in item.offsets)
+                if num_rows != expected_rows:
+                    raise RuntimeError(
+                        "Precomputed multimodal embedding length mismatch for "
+                        f"{item.modality.name.lower()}: expected {expected_rows} "
+                        f"rows from prompt offsets, got {num_rows}"
+                    )
+
+            if item.modality not in consumed_per_modality:
+                raise RuntimeError(
+                    "EPD processor returned an unexpected embedding modality: "
+                    f"{item.modality.name.lower()}"
+                )
+            consumed_per_modality[item.modality] += num_rows
+
+        for modality, embedding in embeddings.items():
+            if not isinstance(embedding, torch.Tensor):
+                raise RuntimeError(
+                    "EPD encoder output must contain tensor embeddings; "
+                    f"got {type(embedding).__name__} for {modality.name.lower()}"
+                )
+            consumed_rows = consumed_per_modality[modality]
+            if consumed_rows != embedding.shape[0]:
+                raise RuntimeError(
+                    "Precomputed multimodal embedding consumption mismatch for "
+                    f"{modality.name.lower()}: received {embedding.shape[0]} rows, "
+                    f"consumed {consumed_rows}"
+                )
+
     def _resolve_processor(self, processor=None):
         if processor is None:
             return self._processor, self._tokenizer
@@ -660,7 +724,7 @@ class BaseMultimodalProcessor(ABC):
         preprocessing worker there is one more competitor for that device rather
         than added parallelism.
         """
-        if _is_cpu or self.server_args.rl_on_policy_target is not None:
+        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return False
         if self.disable_fast_image_processor:
             return False
@@ -696,7 +760,7 @@ class BaseMultimodalProcessor(ABC):
         tokenizer process each carry their own ``base_gpu_id``.
         """
         server_args = self.server_args
-        if _is_cpu or server_args.rl_on_policy_target is not None:
+        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return "cpu"
         if _is_xpu:
             return "xpu"
@@ -902,11 +966,14 @@ class BaseMultimodalProcessor(ABC):
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
+                # PIL decodes lazily; do it here in the io worker so the decode
+                # doesn't run later on the event-loop thread.
                 if discard_alpha_channel:
                     if cls.smart_rgb_conversion:
                         return smart_to_rgb(img)
                     if img.mode != "RGB":
                         return img.convert("RGB")
+                img.load()
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
