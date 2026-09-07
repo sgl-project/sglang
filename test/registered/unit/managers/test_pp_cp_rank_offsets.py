@@ -128,9 +128,10 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
                 return_value=parallel,
             ),
             patch(
-                "sglang.srt.managers.scheduler_components.request_receiver."
-                "is_ep_scale_joiner",
-                return_value=False,
+                "sglang.srt.managers.scheduler_components.request_receiver.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver."
