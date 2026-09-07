@@ -3,6 +3,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,13 +28,13 @@ class _FakeGraph:
 
 
 def _load_npu_graph_runner():
+    # Load shared modules before stubbing torch_npu so platform detection stays on CPU.
+    importlib.import_module("sglang.srt.multimodal.vit_cuda_graph_runner")
     torch_npu = SimpleNamespace()
-    allocator = SimpleNamespace(set_graph_pool_id=lambda pool: None)
     with patch.dict(
         sys.modules,
         {
             "torch_npu": torch_npu,
-            "sglang.srt.distributed.device_communicators.pynccl_allocator": allocator,
         },
     ):
         module = importlib.import_module(
@@ -69,18 +70,22 @@ def test_npu_vit_graph_keys_include_attention_boundaries():
     first_layout = torch.tensor([0, 4, 8], dtype=torch.int32)
     second_layout = torch.tensor([0, 2, 8], dtype=torch.int32)
 
-    runner.run(
-        x,
-        first_layout,
-        rotary_pos_emb_cos=rotary,
-        rotary_pos_emb_sin=rotary,
-    )
-    runner.run(
-        x,
-        second_layout,
-        rotary_pos_emb_cos=rotary,
-        rotary_pos_emb_sin=rotary,
-    )
+    with patch(
+        "sglang.srt.hardware_backend.npu.graph_runner."
+        "vit_npu_graph_runner.set_graph_pool_id"
+    ):
+        runner.run(
+            x,
+            first_layout,
+            rotary_pos_emb_cos=rotary,
+            rotary_pos_emb_sin=rotary,
+        )
+        runner.run(
+            x,
+            second_layout,
+            rotary_pos_emb_cos=rotary,
+            rotary_pos_emb_sin=rotary,
+        )
 
     assert len(runner.block_graphs) == 2
     assert {key[1][0] for key in runner.block_graphs} == {
@@ -90,3 +95,7 @@ def test_npu_vit_graph_keys_include_attention_boundaries():
     assert all(
         workspace.shape[0] == x.shape[0] for workspace in runner.block_ws.values()
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
