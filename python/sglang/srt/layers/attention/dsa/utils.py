@@ -71,8 +71,18 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
-    return original_seq_lens.clamp(max=dsa_index_topk)
+def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int, index_kpool: int = 1):
+    if index_kpool <= 1:
+        return original_seq_lens.clamp(max=dsa_index_topk)
+
+    # Clamp only complete pools; the unfinished tail must remain selectable
+    # outside the pooled top-k budget.
+    full_pool_tokens = (
+        torch.div(original_seq_lens, index_kpool, rounding_mode="floor") * index_kpool
+    )
+    selected_history_tokens = full_pool_tokens.clamp(max=dsa_index_topk)
+    tail_tokens = original_seq_lens - full_pool_tokens
+    return selected_history_tokens + tail_tokens
 
 
 def should_remap_pd_dsa_seed_to_local_slots() -> bool:
@@ -186,7 +196,18 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
         return input_[indices]
 
     # for torch device tensor
-    return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
+    shard = input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank]
+    # .contiguous() is not sufficient here. When tokens == cp_size every rank's
+    # shard has a single row, and a size-1 outer dimension imposes no contiguity
+    # constraint, so is_contiguous() is True whatever stride(0) is and
+    # .contiguous() becomes a no-op. The shard then keeps the cp_size-inflated
+    # row pitch (cp_size * row_numel instead of row_numel), which any kernel that
+    # takes its row pitch from stride(0) will read as an oversized tensor.
+    # Compare the pitch against the parent's explicitly, so the copy happens
+    # exactly when the shard really is strided -- and not at all for cp_size == 1.
+    if shard.stride(0) != input_.stride(0):
+        shard = shard.clone(memory_format=torch.contiguous_format)
+    return shard
 
 
 def cal_padded_tokens(forward_batch: "ForwardBatch"):

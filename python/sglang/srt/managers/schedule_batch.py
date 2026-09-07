@@ -1004,6 +1004,10 @@ class Req(ReqDllmMixin):
         # For req-level memory management
         self.kv = ReqKvInfo()
 
+        # Full-KV-derived boundary whose SWA window should be inserted after
+        # the current prefill pass.
+        self.swa_branching_seqlen: Optional[int] = None
+
         # for cross-encoder model
         self.token_type_ids = token_type_ids
 
@@ -1515,6 +1519,7 @@ class Req(ReqDllmMixin):
                 self.best_match_node,
                 self.host_hit_length,
                 self.swa_host_hit_length,
+                self.swa_branching_seqlen,
                 self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
@@ -1524,6 +1529,7 @@ class Req(ReqDllmMixin):
                 match_result.best_match_node,
                 match_result.host_hit_length,
                 match_result.swa_host_hit_length,
+                match_result.swa_branching_seqlen,
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
@@ -1817,6 +1823,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        self.swa_branching_seqlen = None
         self.skip_lock_node_ids = {}
         self.extend_range = None
         self.dllm_initialized = False
@@ -1870,7 +1877,9 @@ class Req(ReqDllmMixin):
         )
         self.kv.retraction_backup = RetractionBackup(
             cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
-                token_indices, mamba_indices=self.kv.mamba_pool_idx
+                token_indices,
+                mamba_indices=self.kv.mamba_pool_idx,
+                req_pool_index=self.kv.req_pool_idx,
             ),
             mamba_cpu=(
                 mamba_pool.get_cpu_copy(self.kv.mamba_pool_idx.unsqueeze(0))
@@ -1894,6 +1903,7 @@ class Req(ReqDllmMixin):
             self.kv.retraction_backup.cpu_tensors,
             token_indices,
             mamba_indices=self.kv.mamba_pool_idx,
+            req_pool_index=self.kv.req_pool_idx,
         )
         self.kv.retraction_backup = None
 
@@ -2301,6 +2311,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
+    dp_prefill_cuda_graph_max_prefix_len: int = 0
     tbo_split_seq_index: Optional[int] = None
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
@@ -3600,6 +3611,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
+            dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
