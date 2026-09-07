@@ -298,8 +298,7 @@ def _canonicalize(value: Any) -> Any:
             "items": items,
         }
     raise ValueError(
-        "Unsupported value in multimodal cache identity: "
-        f"{_qualified_type_name(value)}"
+        f"Unsupported value in multimodal cache identity: {_qualified_type_name(value)}"
     )
 
 

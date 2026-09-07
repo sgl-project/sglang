@@ -342,9 +342,7 @@ class LatentPreparationStage(PipelineStage):
             server_args.pipeline_config.vae_config.use_temporal_scaling_frames
         )
         if use_temporal_scaling_frames:
-            temporal_scale_factor = (
-                server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
-            )
+            temporal_scale_factor = server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
             latent_num_frames = (video_length - 1) // temporal_scale_factor + 1
         return int(latent_num_frames)
 
@@ -354,8 +352,10 @@ class LatentPreparationStage(PipelineStage):
         result.add_check(
             "prompt_or_embeds",
             None,
-            lambda _: V.string_or_list_strings(batch.prompt)
-            or V.list_not_empty(batch.prompt_embeds),
+            lambda _: (
+                V.string_or_list_strings(batch.prompt)
+                or V.list_not_empty(batch.prompt_embeds)
+            ),
         )
         result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
         result.add_check(

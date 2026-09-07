@@ -109,6 +109,34 @@ class BaseDiT(nn.Module, ABC):
         """Apply model-specific LoRA transforms after names are normalized."""
         return adapter
 
+    def validate_weight_update_source(self, *, weights_path: str | None) -> None:
+        """Reject a weight update this model cannot stay coherent under.
+
+        Called before any weight is written, so a rejection leaves the served
+        model untouched. ``weights_path`` is the new on-disk source, or None
+        for in-memory (tensor RPC) updates. Default no-op; models that derive
+        served values from their weights override this.
+        """
+        return None
+
+    def validate_lora_layers(self, layer_names: list[str]) -> None:
+        """Reject LoRA layers this model cannot apply.
+
+        Called before any LoRA weight is written. Default no-op; models that
+        prune or replace layers a LoRA may target override this so the update
+        fails instead of silently skipping those layers.
+        """
+        return None
+
+    def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
+        """Invalidate caches derived from weights after a weight update.
+
+        ``weights_path`` is the new on-disk source, or None for in-memory
+        (tensor RPC) updates. Default no-op; models that precompute values
+        from their weights override this.
+        """
+        return None
+
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:
         return self._supported_attention_backends

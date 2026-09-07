@@ -31,7 +31,6 @@ if _use_aiter:
 
 
 class QuarkW8A8Fp8(QuarkLinearScheme):
-
     def __init__(
         self, weight_config: dict[str, Any], input_config: Optional[dict[str, Any]]
     ):

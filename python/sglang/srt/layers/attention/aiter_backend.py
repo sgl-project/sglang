@@ -211,7 +211,6 @@ def _asm_context_prefill_gather_indices(
 
 
 class AiterAttnBackend(AttentionBackend):
-
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
@@ -1019,32 +1018,25 @@ class AiterAttnBackend(AttentionBackend):
         k_descale,
     ):
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        q_mla = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         max_q_len = self.forward_metadata.max_q_len or 1
 
-        if (
-            prefer_mla_gluon_decode(
-                head_pad_mode=getattr(self, "head_pad_mode", "none"),
-                num_head=getattr(self, "num_head", layer.tp_q_head_num),
-                kv_cache_dtype=self.kv_cache_dtype,
-            )
-            and max_q_len == 1
+        if prefer_mla_gluon_decode(
+            head_pad_mode=getattr(self, "head_pad_mode", "none"),
+            num_head=getattr(self, "num_head", layer.tp_q_head_num),
+            kv_cache_dtype=self.kv_cache_dtype,
         ):
-            kv_scale = self._resolve_fp8_kv_scale_float(layer, k_descale)
-            min_kv_seq_len = self._resolve_mla_gluon_min_kv_seq_len(forward_batch)
-            gluon_out = mla_gluon_decode(
-                q=q_mla,
+            return mla_gluon_decode(
+                q=q,
                 k_buffer=k_buffer,
                 layer=layer,
                 kv_indices=self.forward_metadata.kv_indices,
                 kv_indptr=self.forward_metadata.kv_indptr,
-                seq_lens=forward_batch.seq_lens,
                 sm_scale=layer.scaling,
-                kv_scale=kv_scale,
-                min_kv_seq_len=min_kv_seq_len,
+                kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
+                min_kv_seq_len=self._resolve_mla_gluon_min_kv_seq_len(forward_batch),
+                qlen=max_q_len,
             )
-            if gluon_out is not None:
-                return gluon_out
 
         work_metadata = self.forward_metadata.work_metadata
         work_indptr = self.forward_metadata.work_indptr
@@ -1055,7 +1047,7 @@ class AiterAttnBackend(AttentionBackend):
         num_kv_splits = self.forward_metadata.num_kv_splits
 
         return self._mla_decode_fwd_with_head_pad(
-            q_mla,
+            q,
             k_buffer.view(-1, 1, 1, layer.qk_head_dim),
             layer,
             qo_indptr=self.forward_metadata.qo_indptr,
@@ -1192,11 +1184,14 @@ class AiterAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+            if in_capture:
+                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+            else:
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
                 )
-            )
             self.forward_metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
                 :n
             ]
@@ -2214,6 +2209,57 @@ class AiterAttnBackend(AttentionBackend):
             and layer.qk_head_dim == layer.v_head_dim
         )
 
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ) -> None:
+        pass
+
+    def _forward_extend_prefix_chunk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        idx = forward_batch.prefix_chunk_idx
+        output, lse = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            self.forward_metadata.qo_indptr,
+            forward_batch.prefix_chunk_cu_seq_lens[idx],
+            self.forward_metadata.max_q_len,
+            forward_batch.prefix_chunk_max_seq_lens[idx],
+            softmax_scale=layer.scaling,
+            causal=False,
+            return_lse=True,
+        )[:2]
+        return output, lse.transpose(0, 1).contiguous()
+
+    def _forward_extend_skip_prefix(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+    ):
+        qo_indptr = self.forward_metadata.qo_indptr
+        max_q_len = self.forward_metadata.max_q_len
+        output, lse = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            qo_indptr,
+            qo_indptr,
+            max_q_len,
+            max_q_len,
+            softmax_scale=layer.scaling,
+            causal=True,
+            return_lse=True,
+        )[:2]
+        return output, lse.transpose(0, 1).contiguous()
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2225,6 +2271,9 @@ class AiterAttnBackend(AttentionBackend):
         sinks=None,
     ):
         self.logits_soft_cap = layer.logit_cap
+
+        if forward_batch.attn_attend_prefix_cache:
+            return self._forward_extend_prefix_chunk(q, k, v, layer, forward_batch)
 
         cache_loc = (
             forward_batch.out_cache_loc
@@ -2337,6 +2386,8 @@ class AiterAttnBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.mha_return_lse:
+                    return self._forward_extend_skip_prefix(q, k, v, layer)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
                         output = self.mla_fp8_prefill_attn(
@@ -2469,6 +2520,25 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                if prefer_mla_gluon_decode(
+                    head_pad_mode=getattr(self, "head_pad_mode", "none"),
+                    num_head=getattr(self, "num_head", layer.tp_q_head_num),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                ):
+                    return mla_gluon_decode(
+                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k_buffer=K_Buffer,
+                        layer=layer,
+                        kv_indices=self.forward_metadata.kv_indices,
+                        kv_indptr=self.forward_metadata.kv_indptr,
+                        sm_scale=layer.scaling,
+                        kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
+                        min_kv_seq_len=self._resolve_mla_gluon_min_kv_seq_len(
+                            forward_batch
+                        ),
+                        qlen=self.forward_metadata.max_q_len or 1,
+                    )
+
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
                 work_info_set = self.forward_metadata.work_info_set
