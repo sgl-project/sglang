@@ -1,6 +1,6 @@
 ---
 title: MiniCPM5-2B
-description: "Deploy OpenBMB MiniCPM5-2B with SGLang — a 2.5B dense Llama-architecture on-device model with 131K context, thinking mode, XML tool calling and DSpark speculative decoding on H200, RTX PRO 6000 and RTX 5090."
+description: "Deploy OpenBMB MiniCPM5-2B with SGLang — a 2.5B dense Llama-architecture on-device model with 131K context, thinking mode, XML tool calling and DSpark speculative decoding on H200, RTX PRO 6000, RTX 5090 and DGX Spark."
 tag: NEW
 ---
 
@@ -49,9 +49,10 @@ import { benchmarks } from "/src/snippets/configs/openbmb/minicpm5-2b-benchmarks
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
-  Speed numbers exist for the RTX 5090 cell only — a single card at random
-  1024/1024, recorded as Mean. The H200 and RTX PRO 6000 cells are pending
-  measurement, and no accuracy numbers have been taken on any platform yet.
+  Speed numbers exist for the RTX 5090 and DGX Spark cells — a single card at
+  random 1024/1024, recorded as Mean. The H200 and RTX PRO 6000 cells are
+  pending measurement, and no accuracy numbers have been taken on any platform
+  yet. The DSpark overlay carries no speed numbers on any card.
 </Note>
 
 ## Playground

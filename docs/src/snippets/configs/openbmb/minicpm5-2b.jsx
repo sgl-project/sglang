@@ -21,14 +21,14 @@
 //
 // DSpark is the separately published draft checkpoint
 // (openbmb/MiniCPM5-2B-DSpark). It is orthogonal to the card grid, so it is an
-// overlay row rather than a match dim. It has not been through a verification
-// round on any card yet, so every cell reports "in-progress" while it is the
-// active overlay pick -- see the per-cell `verificationStatus` predicates.
+// overlay row rather than a match dim. No DSpark speed numbers are published:
+// the speedup tracks acceptance length, which moves with the prompt
+// distribution, and a random-token dataset inflates it above real traffic.
 
 export const config = {
   modelName: "MiniCPM5-2B",
 
-  supportedHardware: ["h200", "rtx6000", "rtx5090"],
+  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark"],
 
   // RTX PRO 6000 and RTX 5090 (SM120 / Blackwell workstation + desktop) are not
   // datacenter parts, so the shared HARDWARE_CATALOG in _deployment.jsx does not
@@ -111,6 +111,7 @@ export const config = {
     h200:    "lmsysorg/sglang:dev",
     rtx6000: "lmsysorg/sglang:dev",
     rtx5090: "lmsysorg/sglang:dev",
+    "dgx-spark": "lmsysorg/sglang:dev",
   },
 
   // Pre-selects the issue template's `model` field on "Submit verified cell".
@@ -161,10 +162,6 @@ export const config = {
     {
       match: { hw: "h200", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
-      // DSPARK has not been through a verification round on this card; every
-      // other overlay pick keeps this cell's own validation.
-      verificationStatus: (sel) =>
-        sel.spec === "dspark" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -203,16 +200,31 @@ export const config = {
       // just lets SGLang clamp capture back down.
       match: { hw: "rtx5090", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
-      // DSPARK has not been through a verification round on this card; every
-      // other overlay pick keeps this cell's own validation.
-      verificationStatus: (sel) =>
-        sel.spec === "dspark" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser qwen3",
         "--tool-call-parser minicpm5",
         "--mem-fraction-static 0.75",
+        "--cuda-graph-max-bs 128",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // GB10 has no discrete VRAM, so `mem_get_info()` reports all 128GB of
+      // unified system memory and the default fraction claims ~89GB for KV --
+      // leaving ~5GB for the OS, which kills the node during warmup with no
+      // traceback and no OOMKilled event. 0.30 is required, not tuning; it
+      // still leaves a 658k-token pool.
+      match: { hw: "dgx-spark", variant: "default", quant: "bf16", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser minicpm5",
+        "--mem-fraction-static 0.30",
         "--cuda-graph-max-bs 128",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
