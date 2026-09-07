@@ -298,6 +298,25 @@ class TestPackedCudaIpcTransport(CustomTestCase):
         finally:
             pool.shutdown()
 
+    def test_noncontiguous_inputs_do_not_accumulate_staging_buffers(self):
+        pool = MmItemMemoryPool(16 << 20, 0.01, 0, 1)
+        features = [
+            torch.arange(512 * 512, device="cuda").reshape(512, 512).T for _ in range(4)
+        ]
+        try:
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            proxies = pool.wrap_tensors(features, use_pool_handle_cache=True)
+            self.assertIsNotNone(proxies)
+            staging_peak = torch.cuda.max_memory_allocated() - allocated
+            image_bytes = features[0].numel() * features[0].element_size()
+            self.assertLess(staging_peak, 2 * image_bytes)
+            pool.cancel_proxy(proxies[0])
+            _wait_for_recycle(pool)
+        finally:
+            pool.shutdown()
+
     def test_full_pool_falls_back_to_individual_transport(self):
         pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
         with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):

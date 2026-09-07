@@ -338,8 +338,7 @@ class StreamOrderedMmFeaturePool:
         self, tensors: list[torch.Tensor]
     ) -> tuple[Optional[PoolLease], list[torch.Tensor]]:
         """publish one request's tensors under a single ready/ack lease"""
-        sources = []
-        offsets = []
+        ranges = []
         nbytes = 0
         for tensor in tensors:
             if not tensor.is_cuda:
@@ -348,13 +347,12 @@ class StreamOrderedMmFeaturePool:
                 raise ValueError(
                     f"{self.transport_name} cannot transport an empty tensor"
                 )
-            source = tensor.contiguous().reshape(-1).view(torch.uint8)
             # typed views must start at an address aligned for their dtype
             nbytes = align_up(nbytes, tensor.element_size())
-            offsets.append(nbytes)
-            sources.append(source)
-            nbytes += source.numel()
-        if not sources:
+            size = tensor.numel() * tensor.element_size()
+            ranges.append((nbytes, size))
+            nbytes += size
+        if not tensors:
             return None, []
         with self._lock:
             lease = self._allocate_locked(nbytes)
@@ -364,13 +362,15 @@ class StreamOrderedMmFeaturePool:
         try:
             with torch.cuda.device(self.device_id):
                 destinations = [
-                    self.byte_tensor[
-                        lease.start + offset : lease.start + offset + source.numel()
-                    ]
-                    for source, offset in zip(sources, offsets, strict=True)
+                    self.byte_tensor[lease.start + offset : lease.start + offset + size]
+                    for offset, size in ranges
                 ]
-                for destination, source in zip(destinations, sources, strict=True):
-                    destination.copy_(source, non_blocking=True)
+                # keep at most one noncontiguous input's staging copy live
+                for destination, tensor in zip(destinations, tensors, strict=True):
+                    destination.copy_(
+                        tensor.contiguous().reshape(-1).view(torch.uint8),
+                        non_blocking=True,
+                    )
                 stream_write_value32(
                     self.device_id,
                     self.base_address + lease.ready_byte_offset,
