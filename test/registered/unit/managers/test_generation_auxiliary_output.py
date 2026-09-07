@@ -15,10 +15,12 @@ from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 
 @dataclass
@@ -69,11 +71,25 @@ def _model_runner_for_sampling_path(
     spec_algorithm=SpeculativeAlgorithm.NONE,
     dllm_algorithm=None,
 ):
+    # `supports_sampling_observer` reads the dLLM algorithm from the bags, so
+    # the path is stated by publishing it rather than by standing one in.
+    reset_context()
+    publish(ServerArgs(model_path="dummy", dllm_algorithm=dllm_algorithm), role="test")
     runner = object.__new__(ModelRunner)
-    runner.server_args = SimpleNamespace(dllm_algorithm=dllm_algorithm)
+    runner.server_args = SimpleNamespace()
     runner.spec_algorithm = spec_algorithm
     runner._sampling_observer = None
     return runner
+
+
+def setup_function(_):
+    # The code under test reads its config from the bags.
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+
+def teardown_function(_):
+    reset_context()
 
 
 def test_auxiliary_output_releases_device_holder_after_copy():
@@ -388,6 +404,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     )
     copy_done = CopyDone()
     scheduler = object.__new__(Scheduler)
+    scheduler.scheduler_stage_metrics = None
     scheduler.metrics_reporter = Mock()
     scheduler.forward_ct = 0
     scheduler._sched_idled = False
@@ -442,6 +459,8 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     req = SimpleNamespace(
         output_ids=[],
         finished_len=None,
+        to_finish=None,
+        finished_reason=None,
         inflight_middle_chunks=0,
         pending_bootstrap=False,
         return_logprob=False,
@@ -473,6 +492,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         disagg_prefill_inflight_queue=[],
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
+        maybe_send_health_check_signal=Mock(),
     )
 
     with patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"):
@@ -489,6 +509,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         host_output,
         [0],
     )
+    scheduler.maybe_send_health_check_signal.assert_called_once_with()
 
 
 def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():

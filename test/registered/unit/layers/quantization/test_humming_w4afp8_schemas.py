@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.humming import (  # noqa: E402
     _W4AFp8CheckpointWeightSchema,
 )
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestW4AFp8CheckpointSchema(CustomTestCase):

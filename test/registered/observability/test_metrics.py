@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=74, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=144, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -195,6 +195,7 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:startup_cuda_graph_time_seconds",
             "sglang:scheduler_idle_seconds_total",
             "sglang:scheduler_process_cpu_seconds_total",
+            "sglang:scheduler_stage_seconds_total",
         ]
         mfu_metrics = [
             "sglang:estimated_flops_per_gpu_total",
@@ -232,6 +233,7 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:forward_execution_seconds_total", {"category": "extend"}),
             ("sglang:forward_execution_seconds_total", {"category": "decode"}),
             ("sglang:scheduler_process_cpu_seconds_total", {}),
+            ("sglang:scheduler_stage_seconds_total", {"category": "other"}),
             ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
             ("sglang:weight_memory_usage_gb", {"model_name": _MODEL_NAME}),
             ("sglang:kv_cache_memory_usage_gb", {"model_name": _MODEL_NAME}),
