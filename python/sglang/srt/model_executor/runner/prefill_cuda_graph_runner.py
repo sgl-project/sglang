@@ -135,6 +135,7 @@ from sglang.srt.utils import (
     is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
+    require_mlp_sync,
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
@@ -732,10 +733,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.dp_padding_mode.is_max_len(),
             forward_batch.global_num_tokens_cpu,
         )
-        # Prefill graphs only serve EXTEND batches. Capturing under False makes the
-        # flag disagree with what prepare_mlp_sync_batch sets at serving time, which
-        # invalidates every captured shape on first replay under DP.
-        set_is_extend_in_batch(True)
+        # Prefill graphs only serve EXTEND batches, so True is the semantically
+        # correct value -- but only prepare_mlp_sync_batch actually writes this
+        # flag at serving time, and it runs only when require_mlp_sync(). Without
+        # it the global keeps the False default, so capturing under an
+        # unconditional True makes Dynamo's guard disagree with every real prefill
+        # under plain TP and invalidates all captured shapes on first replay.
+        # Mirror what serving will do instead of asserting what it ought to be.
+        set_is_extend_in_batch(require_mlp_sync())
 
         with self._prefill_forward_context(forward_batch):
             pp_proxy_tensors = self._capture_pp_proxy_tensors(num_tokens)
@@ -820,7 +825,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             fb.global_num_tokens_cpu,
         )
         # See _run_forward.
-        set_is_extend_in_batch(True)
+        set_is_extend_in_batch(require_mlp_sync())
 
         with (
             forward_context(
