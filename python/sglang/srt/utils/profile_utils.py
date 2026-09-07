@@ -31,6 +31,41 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def get_torch_profiler_activity_map() -> dict[str, torch.profiler.ProfilerActivity]:
+    activity_map = {
+        "CPU": torch.profiler.ProfilerActivity.CPU,
+        "GPU": torch.profiler.ProfilerActivity.CUDA,
+    }
+    if current_platform.is_xpu():
+        xpu_activity = torch.profiler.ProfilerActivity.XPU
+        activity_map["GPU"] = xpu_activity
+        activity_map["XPU"] = xpu_activity
+    elif hasattr(torch.profiler.ProfilerActivity, "XPU"):
+        activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
+
+    if current_platform.is_out_of_tree():
+        activity_name = current_platform.get_torch_profiler_activity_str()
+        if hasattr(torch.profiler.ProfilerActivity, activity_name):
+            activity_map[activity_name] = current_platform.get_torch_profiler_activity()
+    return activity_map
+
+
+def resolve_torch_profiler_activities(
+    activities: List[str],
+) -> List[torch.profiler.ProfilerActivity]:
+    """Translate requested activity names into torch activities, in request order.
+
+    Two names can resolve to the same activity: on XPU the generic ``GPU`` and
+    the explicit ``XPU`` both mean XPU. ``torch.profiler.profile`` deduplicated
+    a repeated activity silently up to torch 2.11 (``set(activities)``) and
+    raises ``ValueError`` on it by 2.13, so collapse duplicates here rather than
+    depending on which version is installed.
+    """
+    activity_map = get_torch_profiler_activity_map()
+    resolved = [activity_map[a] for a in activities if a in activity_map]
+    return list(dict.fromkeys(resolved))
+
+
 def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: int):
     """Persist a CUDA-graph capture profiler trace (chrome trace) to disk.
 
@@ -298,19 +333,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
         self.activities = activities
 
     def start(self):
-        activity_map = {
-            "CPU": torch.profiler.ProfilerActivity.CPU,
-            "GPU": torch.profiler.ProfilerActivity.CUDA,
-        }
-
-        if current_platform.is_out_of_tree():
-            activity_map[current_platform.get_torch_profiler_activity_str()] = (
-                current_platform.get_torch_profiler_activity()
-            )
-
-        torchprof_activities = [
-            activity_map[a] for a in self.activities if a in activity_map
-        ]
+        torchprof_activities = resolve_torch_profiler_activities(self.activities)
 
         self.torch_profiler = torch.profiler.profile(
             activities=torchprof_activities,
