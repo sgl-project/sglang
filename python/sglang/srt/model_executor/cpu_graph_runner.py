@@ -472,7 +472,7 @@ def register_fake_ops(tp_size: int):
     def _(
         mat1,
         mat2,
-        scale,
+        scale2,
         bias,
         out_dtype,
         is_vnni,
