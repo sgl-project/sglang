@@ -620,6 +620,37 @@ class MultimodalRequestTestCase(CustomTestCase):
         )
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
+    def test_multimodal_kimi_k3_routes_through_prompt_ids_not_empty_prompt(self):
+        """Bug regression: the kimi_k3 custom encoder yields non-empty
+        prompt_ids but leaves prompt == "" (decode only runs on the
+        prompt_ids-is-None branch). The multimodal branch used to forward that
+        empty prompt as text, so the engine hit _tokenize_texts("") and
+        returned 400 'texts cannot be empty and tokenizer must be initialized'.
+        It must forward prompt_ids instead, mirroring serving_chat."""
+        serving = make_serving(is_multimodal=True)
+        serving.chat_encoding_spec = "kimi_k3"
+        serving._process_messages = Mock(
+            return_value=MessageProcessingResult(
+                prompt="",  # kimi_k3 leaves the text prompt empty
+                prompt_ids=[4, 5, 6],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+        )
+        request = ResponsesRequest(model="x", input="hi", store=False)
+
+        _, request_prompts, engine_prompts, _ = asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        # The empty prompt must not leak through as the engine prompt; the MM
+        # processor expands prompt_ids, not a re-tokenized empty string.
+        self.assertEqual(engine_prompts, [[4, 5, 6]])
+        self.assertEqual(request_prompts, [[4, 5, 6]])
+
 
 class OutputItemsTestCase(CustomTestCase):
     def setUp(self):
