@@ -112,10 +112,6 @@ class VDNH3Layout(msgspec.Struct, frozen=True):
         return self.video_start + self.num_frames * self.tokens_per_frame
 
     @property
-    def text_range(self) -> tuple[int, int]:
-        return 0, self.text_len
-
-    @property
     def frame_size(self) -> tuple[int, int]:
         return self.frame_height, self.frame_width
 
@@ -832,10 +828,6 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         """x [T, hidden] -> beta [T, H_local] (sigmoid)."""
         beta, _ = self.beta_proj(x)
         return torch.sigmoid(beta)
-
-    def gate(self, x: torch.Tensor) -> torch.Tensor:
-        """x [T, hidden] -> output gate [T, H_local, d]."""
-        return self.output_gate(x)
 
     # ---- the text state -----------------------------------------------------
 

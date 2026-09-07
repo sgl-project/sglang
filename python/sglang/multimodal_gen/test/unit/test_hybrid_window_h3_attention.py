@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""hybrid_window_attn_h3 (VDN-H3 window softmax) backend contracts.
-
-The load-bearing check: on a ragged packed layout the backend must reproduce
-a masked dense softmax with exactly the VDN mask (chunk-aligned window,
-anchor frames dense as rows and columns, text/audio dense both ways, padding
-outside everything) to bf16 rounding. radius >= F must reproduce dense
-attention.
-"""
+"""hybrid_window_attn_h3 must reproduce a masked dense softmax with exactly the VDN
+mask on a ragged packed layout, and dense attention once the window covers the clip."""
 
 from __future__ import annotations
 

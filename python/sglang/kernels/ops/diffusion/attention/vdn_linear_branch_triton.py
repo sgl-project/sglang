@@ -113,28 +113,30 @@ def _tconv_act_kernel(
     X,
     W,
     OUT,
-    T,
-    S_,
-    C_,
+    num_frames,
+    tokens_per_frame,
+    channels,
     BLOCK_T: tl.constexpr,
-    D_: tl.constexpr,
-    L2: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    L2NORM: tl.constexpr,
     HEADS: tl.constexpr,
     FRAME_MAJOR: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
     pid_s = tl.program_id(1)
     pid_h = tl.program_id(2)
-    chan = pid_h * D_ + tl.arange(0, D_)
+    chan = pid_h * HEAD_DIM + tl.arange(0, HEAD_DIM)
     rows = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
-    valid = rows < T
+    valid = rows < num_frames
 
-    acc = tl.zeros((BLOCK_T, D_), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_T, HEAD_DIM), dtype=tl.float32)
     for dt in tl.static_range(5):
         r = rows + dt - 2
-        ok = valid & (r >= 0) & (r < T)  # zero padding, both ends
+        ok = valid & (r >= 0) & (r < num_frames)  # zero padding, both ends
         v = tl.load(
-            X + (r[:, None].to(tl.int64) * S_ + pid_s) * C_ + chan[None, :],
+            X
+            + (r[:, None].to(tl.int64) * tokens_per_frame + pid_s) * channels
+            + chan[None, :],
             mask=ok[:, None],
             other=0.0,
         ).to(tl.float32)
@@ -142,16 +144,18 @@ def _tconv_act_kernel(
         acc += v * wd[None, :]
 
     y = acc * tl.sigmoid(acc)  # SiLU
-    if L2:
+    if L2NORM:
         inv = 1.0 / tl.sqrt(tl.maximum(tl.sum(y * y, axis=1), 1e-12))
         y = y * inv[:, None]
     if FRAME_MAJOR:
         # [T, HEADS, S, D]: the readout bmm reads this layout directly
         dst = (
-            (rows[:, None].to(tl.int64) * HEADS + pid_h) * S_ + pid_s
-        ) * D_ + tl.arange(0, D_)[None, :]
+            (rows[:, None].to(tl.int64) * HEADS + pid_h) * tokens_per_frame + pid_s
+        ) * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
     else:
-        dst = (rows[:, None].to(tl.int64) * S_ + pid_s) * C_ + chan[None, :]
+        dst = (rows[:, None].to(tl.int64) * tokens_per_frame + pid_s) * channels + chan[
+            None, :
+        ]
     tl.store(OUT + dst, y.to(OUT.dtype.element_ty), mask=valid[:, None])
 
 
@@ -168,32 +172,32 @@ def vdn_temporal_conv_act(
     if not x.is_cuda:
         raise ValueError("vdn_temporal_conv_act is a Triton kernel; x must be on CUDA")
     _check_head_dim(head_dim)
-    T, S_, C_ = x.shape
-    if C_ != heads * head_dim:
-        raise ValueError(f"C={C_} != heads*head_dim={heads * head_dim}")
-    if w.shape != (C_, 5):
+    num_frames, tokens_per_frame, channels = x.shape
+    if channels != heads * head_dim:
+        raise ValueError(f"C={channels} != heads*head_dim={heads * head_dim}")
+    if w.shape != (channels, 5):
         raise ValueError(f"w must be [C, 5], got {tuple(w.shape)}")
     x = x.contiguous()
     w = w.contiguous()
     out = torch.empty_like(x)
-    _tconv_act_kernel[(triton.cdiv(T, _BLOCK_T), S_, heads)](
+    _tconv_act_kernel[(triton.cdiv(num_frames, _BLOCK_T), tokens_per_frame, heads)](
         x,
         w,
         out,
-        T,
-        S_,
-        C_,
+        num_frames,
+        tokens_per_frame,
+        channels,
         BLOCK_T=_BLOCK_T,
-        D_=head_dim,
-        L2=l2norm,
+        HEAD_DIM=head_dim,
+        L2NORM=l2norm,
         HEADS=heads,
         FRAME_MAJOR=frame_major,
         num_warps=4,
         num_stages=2,
     )
     if frame_major:
-        return out.view(T, heads, S_, head_dim)
-    return out.view(T * S_, heads, head_dim)
+        return out.view(num_frames, heads, tokens_per_frame, head_dim)
+    return out.view(num_frames * tokens_per_frame, heads, head_dim)
 
 
 # --------------------------------------------------------------------------
@@ -209,35 +213,35 @@ def _silu_l2norm_kernel(
     stride_n,
     stride_h,
     H,
-    S_,
+    tokens_per_frame,
     BLOCK_N: tl.constexpr,
-    D_: tl.constexpr,
-    L2: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    L2NORM: tl.constexpr,
     FRAME_MAJOR: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_h = tl.program_id(1)
     rows = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     valid = rows < N
-    offs = tl.arange(0, D_)
+    offs = tl.arange(0, HEAD_DIM)
     x = tl.load(
         X + rows[:, None].to(tl.int64) * stride_n + pid_h * stride_h + offs[None, :],
         mask=valid[:, None],
         other=0.0,
     ).to(tl.float32)
     y = x * tl.sigmoid(x)
-    if L2:
+    if L2NORM:
         inv = 1.0 / tl.sqrt(tl.maximum(tl.sum(y * y, axis=1), 1e-12))
         y = y * inv[:, None]
     if FRAME_MAJOR:
         # row n = frame * S_ + s -> [F, H, S_, D]
-        frame = rows // S_
-        pos = rows - frame * S_
+        frame = rows // tokens_per_frame
+        pos = rows - frame * tokens_per_frame
         dst = (
-            (frame[:, None].to(tl.int64) * H + pid_h) * S_ + pos[:, None]
-        ) * D_ + offs[None, :]
+            (frame[:, None].to(tl.int64) * H + pid_h) * tokens_per_frame + pos[:, None]
+        ) * HEAD_DIM + offs[None, :]
     else:
-        dst = (rows[:, None].to(tl.int64) * H + pid_h) * D_ + offs[None, :]
+        dst = (rows[:, None].to(tl.int64) * H + pid_h) * HEAD_DIM + offs[None, :]
     tl.store(OUT + dst, y.to(OUT.dtype.element_ty), mask=valid[:, None])
 
 
@@ -268,8 +272,8 @@ def vdn_silu_l2norm(
         H,
         per_frame if frame_major else 1,
         BLOCK_N=_BLOCK_ROWS,
-        D_=D,
-        L2=l2norm,
+        HEAD_DIM=D,
+        L2NORM=l2norm,
         FRAME_MAJOR=frame_major,
         num_warps=4,
     )
@@ -290,20 +294,22 @@ def _frame_stats_prep_kernel(
     K32,
     KB32,
     VB,
-    S_,
+    tokens_per_frame,
     H,
     BLOCK_S: tl.constexpr,
-    D_: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     pid_s = tl.program_id(0)
     f = tl.program_id(1)
     h = tl.program_id(2)
     s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
-    valid = s < S_
-    offs = tl.arange(0, D_)
-    rows = f * S_ + s  # token rows
-    src = (rows[:, None].to(tl.int64) * H + h) * D_ + offs[None, :]  # [F*S, H, d]
-    dst = ((f * H + h) * S_ + s)[:, None] * D_ + offs[None, :]  # [F, H, S, d]
+    valid = s < tokens_per_frame
+    offs = tl.arange(0, HEAD_DIM)
+    rows = f * tokens_per_frame + s  # token rows
+    src = (rows[:, None].to(tl.int64) * H + h) * HEAD_DIM + offs[None, :]  # [F*S, H, d]
+    dst = ((f * H + h) * tokens_per_frame + s)[:, None] * HEAD_DIM + offs[
+        None, :
+    ]  # [F, H, S, d]
     k = tl.load(K + src, mask=valid[:, None], other=0.0)
     v = tl.load(V + src, mask=valid[:, None], other=0.0)
     beta = tl.load(BETA + rows * H + h, mask=valid, other=0.0)
@@ -354,7 +360,7 @@ def vdn_frame_stats_prep(
         tokens_per_frame,
         H,
         BLOCK_S=_BLOCK_ROWS,
-        D_=D,
+        HEAD_DIM=D,
         num_warps=4,
     )
     return k16, k32, kb32, vb
@@ -371,23 +377,23 @@ def _linear_epilogue_kernel(
     W,
     G,
     OUT,
-    S_,
+    tokens_per_frame,
     H,
     eps,
     BLOCK_S: tl.constexpr,
-    D_: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     pid_s = tl.program_id(0)
     f = tl.program_id(1)
     h = tl.program_id(2)
     s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
-    valid = s < S_
-    offs = tl.arange(0, D_)
-    src = ((f * H + h) * S_ + s)[:, None] * D_ + offs[None, :]
-    rows = f * S_ + s
-    dst = (rows[:, None].to(tl.int64) * H + h) * D_ + offs[None, :]
+    valid = s < tokens_per_frame
+    offs = tl.arange(0, HEAD_DIM)
+    src = ((f * H + h) * tokens_per_frame + s)[:, None] * HEAD_DIM + offs[None, :]
+    rows = f * tokens_per_frame + s
+    dst = (rows[:, None].to(tl.int64) * H + h) * HEAD_DIM + offs[None, :]
     r = tl.load(R + src, mask=valid[:, None], other=0.0).to(tl.float32)
-    ms = tl.sum(r * r, axis=1) / D_
+    ms = tl.sum(r * r, axis=1) / HEAD_DIM
     w = tl.load(W + offs).to(tl.float32)
     g = tl.load(G + dst, mask=valid[:, None], other=0.0).to(tl.float32)
     y = r * (1.0 / tl.sqrt(ms + eps))[:, None] * w[None, :] * g
@@ -406,21 +412,23 @@ def vdn_linear_epilogue(
         raise ValueError(
             "vdn_linear_epilogue is a Triton kernel; readout must be on CUDA"
         )
-    F, H, S_, D = readout.shape
+    F, H, tokens_per_frame, D = readout.shape
     _check_head_dim(D)
     readout = readout.contiguous()
-    gate = gate.reshape(F * S_, H, D).to(readout.dtype).contiguous()
-    out = torch.empty((F * S_, H * D), dtype=readout.dtype, device=readout.device)
-    _linear_epilogue_kernel[(triton.cdiv(S_, _BLOCK_ROWS), F, H)](
+    gate = gate.reshape(F * tokens_per_frame, H, D).to(readout.dtype).contiguous()
+    out = torch.empty(
+        (F * tokens_per_frame, H * D), dtype=readout.dtype, device=readout.device
+    )
+    _linear_epilogue_kernel[(triton.cdiv(tokens_per_frame, _BLOCK_ROWS), F, H)](
         readout,
         norm_weight.contiguous(),
         gate,
         out,
-        S_,
+        tokens_per_frame,
         H,
         float(eps),
         BLOCK_S=_BLOCK_ROWS,
-        D_=D,
+        HEAD_DIM=D,
         num_warps=4,
     )
     return out

@@ -1,12 +1,5 @@
-"""Fused VDN-H3 delta-rule factors against the eager Cholesky chain.
-
-``vdn_delta_factors`` forms ``(alpha * inv(I + A), B @ inv(I + A))`` in one launch with an
-in-register block Gauss-Jordan inverse.  Both implementations are fp32 and their error against an
-fp64 reference is dominated by cond(I + A), so the kernel is held to the eager chain's error
-(times a small margin) rather than to a fixed tolerance, and to a tight tolerance against the
-eager result itself.  Inputs follow the model: A = k^T diag(beta) k with unit-norm k rows,
-B = v^T diag(beta) k, alpha in (0, 1].
-"""
+"""Fused VDN-H3 delta-rule factors against the eager Cholesky chain: both fp32 paths are
+held to the same cond(I + A)-dominated error band vs fp64, on model-shaped inputs."""
 
 import sys
 
@@ -19,7 +12,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-D_ = 128
+HEAD_DIM = 128
 
 
 def _inputs(
@@ -28,18 +21,18 @@ def _inputs(
     g = torch.Generator(device="cuda").manual_seed(seed)
     k = torch.nn.functional.normalize(
         torch.nn.functional.silu(
-            torch.randn(frames, heads, tokens, D_, device="cuda", generator=g)
+            torch.randn(frames, heads, tokens, HEAD_DIM, device="cuda", generator=g)
         ),
         dim=-1,
     )
     v = torch.nn.functional.silu(
-        torch.randn(frames, heads, tokens, D_, device="cuda", generator=g)
+        torch.randn(frames, heads, tokens, HEAD_DIM, device="cuda", generator=g)
     )
     beta = (
         torch.sigmoid(torch.randn(frames, heads, tokens, device="cuda", generator=g))
         * beta_scale
     )
-    alpha = torch.rand(frames, heads, D_, device="cuda", generator=g) * 0.9 + 0.1
+    alpha = torch.rand(frames, heads, HEAD_DIM, device="cuda", generator=g) * 0.9 + 0.1
     alpha[0] = 1.0
     A = (k * beta.unsqueeze(-1)).transpose(-1, -2) @ k
     A = 0.5 * (A + A.transpose(-1, -2))
@@ -53,7 +46,7 @@ def _rel(x: torch.Tensor, ref: torch.Tensor) -> float:
 
 def _fp64(A, B, alpha):
     inv = torch.linalg.inv(
-        torch.eye(D_, device=A.device, dtype=torch.float64) + A.double()
+        torch.eye(HEAD_DIM, device=A.device, dtype=torch.float64) + A.double()
     )
     return alpha.double().unsqueeze(-1) * inv, B.double() @ inv
 
@@ -74,11 +67,8 @@ def test_matches_eager_and_fp64(frames, heads, tokens, beta_scale):
     # same accuracy class as the Cholesky chain (both fp32, cond-dominated)
     assert _rel(t_fused, t_ref) <= 1.5 * _rel(t_eager, t_ref) + 1e-7
     assert _rel(j_fused, j_ref) <= 1.5 * _rel(j_eager, j_ref) + 1e-7
-    assert (
-        _rel(t_fused, t_ref) < 1e-5 and _rel(j_fused, j_ref) < 3e-5
-    )  # sanity; both fp32 paths sit at 1e-6..7e-6
-    # elementwise, the two fp32 paths differ by a few 1e-5 on ill-conditioned inputs (cancellation);
-    # the Frobenius checks above are the accuracy statement
+    assert _rel(t_fused, t_ref) < 1e-5 and _rel(j_fused, j_ref) < 3e-5
+    # elementwise the two fp32 paths differ by a few 1e-5 on ill-conditioned inputs (cancellation)
     torch.testing.assert_close(t_fused, t_eager, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(j_fused, j_eager, rtol=1e-4, atol=1e-4)
 

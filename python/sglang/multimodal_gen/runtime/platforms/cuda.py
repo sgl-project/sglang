@@ -289,12 +289,8 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
 class _HybridWindowAttentionH3BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
 
-    # The window rides FlashAttention varlen: FA4 on Blackwell (SM100 / SM103,
-    # and SM120 through the sm120 forward kernel), FA3 on Hopper. Ampere and
-    # Ada (SM80 / SM86 / SM89) take sgl-kernel's FA3 build as well, which
-    # carries the Sm80 collective mainloop (mma.sync, FA2-class throughput)
-    # for those targets; head dim 128 is within its range. bf16 only on SM80
-    # (no fp8 tensor cores), so budget the 62 GB DiT accordingly.
+    # the window rides FlashAttention varlen: FA4 on SM100 / SM103 / SM120, FA3 on
+    # SM90; SM80 / SM86 / SM89 run FA3's Sm80 mainloop (FA2-class throughput)
     supported_capabilities = {
         (8, 0),
         (8, 6),
@@ -690,9 +686,8 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def _prepare_flash_attention_for_blackwell(cls) -> bool:
-        # SM100/SM103 and SM120 all take FA4 (the CuTe package ships an sm120
-        # forward kernel); the generic FA backend still resolves to SDPA on
-        # SM120 before reaching this, so only explicit FA4 users are affected.
+        # the FA4 CuTe package ships an sm120 forward kernel; the default FA backend
+        # still resolves to SDPA on SM120 before reaching this
         if not (cls.is_blackwell() or cls.is_sm120()):
             return True
 

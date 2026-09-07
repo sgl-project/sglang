@@ -260,7 +260,6 @@ class _DecomposedPlan:
 @dataclass
 class HybridWindowAttentionH3Metadata(AttentionMetadata):
     layout: VDNH3Layout
-    hybrid: VDNHybridAttentionArchConfig
     # radius >= F: the window IS dense attention and the linear branch is off
     full_cover: bool
     decomposed: _DecomposedPlan | None = None
@@ -295,7 +294,6 @@ class HybridWindowAttentionH3MetadataBuilder(AttentionMetadataBuilder):
         return HybridWindowAttentionH3Metadata(
             current_timestep=current_timestep,
             layout=layout,
-            hybrid=hybrid,
             full_cover=full_cover,
             decomposed=decomposed,
             rope_cache_full=rope_cache_full,

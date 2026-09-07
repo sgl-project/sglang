@@ -1,11 +1,5 @@
-"""VDN-H3 linear-branch kernels against the eager chains they replace.
-
-``vdn_frame_stats_prep`` and ``vdn_gather_linear_state`` move values and form
-the same products, so ``torch.equal`` / fp32 tolerance; the three activation
-kernels round once at the store and are held to one bf16 ulp of the eager
-chain (their documented contract). The whole-branch wiring (fused vs eager
-chain through the real forward) lives with the model tests.
-"""
+"""VDN-H3 linear-branch kernels against the eager chains they replace: the data
+movers bit-exact, the three activation kernels within one bf16 ulp."""
 
 import sys
 
@@ -31,7 +25,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-F_, S_, H_, D_ = 6, 24, 3, 32
+FRAMES, TOKENS, HEADS, HEAD_DIM = 6, 24, 3, 32
 
 
 def _ulp_close(got: torch.Tensor, ref: torch.Tensor) -> bool:
@@ -41,44 +35,59 @@ def _ulp_close(got: torch.Tensor, ref: torch.Tensor) -> bool:
 
 def test_temporal_conv_act_matches_eager_chain() -> None:
     g = torch.Generator(device="cpu").manual_seed(4)
-    x = torch.randn(F_, S_, H_ * D_, generator=g).to("cuda", torch.bfloat16)
-    w = (torch.randn(H_ * D_, 5, generator=g) * 0.4).to("cuda", torch.bfloat16)
-    assert can_use_vdn_temporal_conv_act(x, H_, D_)
-    ref = vdn._activate(vdn._temporal_shift(x, w).reshape(-1, H_, D_), True)
-    assert _ulp_close(vdn_temporal_conv_act(x, w, H_, D_, True), ref)
-    frame_major = vdn_temporal_conv_act(x, w, H_, D_, True, frame_major=True)
-    assert frame_major.shape == (F_, H_, S_, D_) and frame_major.is_contiguous()
+    x = torch.randn(FRAMES, TOKENS, HEADS * HEAD_DIM, generator=g).to(
+        "cuda", torch.bfloat16
+    )
+    w = (torch.randn(HEADS * HEAD_DIM, 5, generator=g) * 0.4).to("cuda", torch.bfloat16)
+    assert can_use_vdn_temporal_conv_act(x, HEADS, HEAD_DIM)
+    ref = vdn._activate(vdn._temporal_shift(x, w).reshape(-1, HEADS, HEAD_DIM), True)
+    assert _ulp_close(vdn_temporal_conv_act(x, w, HEADS, HEAD_DIM, True), ref)
+    frame_major = vdn_temporal_conv_act(x, w, HEADS, HEAD_DIM, True, frame_major=True)
+    assert (
+        frame_major.shape == (FRAMES, HEADS, TOKENS, HEAD_DIM)
+        and frame_major.is_contiguous()
+    )
     assert torch.equal(
-        frame_major, ref.view(F_, S_, H_, D_).permute(0, 2, 1, 3)
-    ) or _ulp_close(frame_major, ref.view(F_, S_, H_, D_).permute(0, 2, 1, 3))
+        frame_major, ref.view(FRAMES, TOKENS, HEADS, HEAD_DIM).permute(0, 2, 1, 3)
+    ) or _ulp_close(
+        frame_major, ref.view(FRAMES, TOKENS, HEADS, HEAD_DIM).permute(0, 2, 1, 3)
+    )
 
 
 def test_silu_l2norm_reads_strided_qkv_views() -> None:
     g = torch.Generator(device="cpu").manual_seed(4)
-    tokens = torch.randn(F_ * S_, 3 * H_ * D_, generator=g).to("cuda", torch.bfloat16)
-    strided = tokens[:, : H_ * D_].view(F_ * S_, H_, D_)
+    tokens = torch.randn(FRAMES * TOKENS, 3 * HEADS * HEAD_DIM, generator=g).to(
+        "cuda", torch.bfloat16
+    )
+    strided = tokens[:, : HEADS * HEAD_DIM].view(FRAMES * TOKENS, HEADS, HEAD_DIM)
     assert can_use_vdn_silu_l2norm(strided)
     got = vdn_silu_l2norm(strided, True)
     assert got.is_contiguous() and _ulp_close(got, vdn._activate(strided, True))
     got_v = vdn_silu_l2norm(strided, False)
     assert _ulp_close(got_v, torch.nn.functional.silu(strided))
-    frame_major = vdn_silu_l2norm(strided, True, per_frame=S_)
-    assert frame_major.shape == (F_, H_, S_, D_)
-    assert torch.equal(got.view(F_, S_, H_, D_).permute(0, 2, 1, 3), frame_major)
+    frame_major = vdn_silu_l2norm(strided, True, per_frame=TOKENS)
+    assert frame_major.shape == (FRAMES, HEADS, TOKENS, HEAD_DIM)
+    assert torch.equal(
+        got.view(FRAMES, TOKENS, HEADS, HEAD_DIM).permute(0, 2, 1, 3), frame_major
+    )
     with pytest.raises(ValueError):
-        vdn_silu_l2norm(strided, True, per_frame=S_ + 1)
+        vdn_silu_l2norm(strided, True, per_frame=TOKENS + 1)
 
 
 def test_frame_stats_prep_is_bit_exact() -> None:
     g = torch.Generator(device="cpu").manual_seed(4)
-    key = torch.randn(F_ * S_, H_, D_, generator=g).to("cuda", torch.bfloat16)
-    value = torch.randn(F_ * S_, H_, D_, generator=g).to("cuda", torch.bfloat16)
-    beta = torch.rand(F_ * S_, H_, generator=g).to("cuda", torch.bfloat16)
+    key = torch.randn(FRAMES * TOKENS, HEADS, HEAD_DIM, generator=g).to(
+        "cuda", torch.bfloat16
+    )
+    value = torch.randn(FRAMES * TOKENS, HEADS, HEAD_DIM, generator=g).to(
+        "cuda", torch.bfloat16
+    )
+    beta = torch.rand(FRAMES * TOKENS, HEADS, generator=g).to("cuda", torch.bfloat16)
     assert can_use_vdn_frame_stats_prep(key, value)
-    k16, k32, kb32, vb = vdn_frame_stats_prep(key, value, beta, F_, S_)
-    kf = key.view(F_, S_, H_, D_).permute(0, 2, 1, 3)
-    vf = value.view(F_, S_, H_, D_).permute(0, 2, 1, 3)
-    bf = beta.view(F_, S_, H_).permute(0, 2, 1)
+    k16, k32, kb32, vb = vdn_frame_stats_prep(key, value, beta, FRAMES, TOKENS)
+    kf = key.view(FRAMES, TOKENS, HEADS, HEAD_DIM).permute(0, 2, 1, 3)
+    vf = value.view(FRAMES, TOKENS, HEADS, HEAD_DIM).permute(0, 2, 1, 3)
+    bf = beta.view(FRAMES, TOKENS, HEADS).permute(0, 2, 1)
     assert torch.equal(k16, kf.contiguous())
     assert torch.equal(k32, kf.float().contiguous())
     assert torch.equal(kb32, (kf.float() * bf.unsqueeze(-1).float()).contiguous())
@@ -87,9 +96,13 @@ def test_frame_stats_prep_is_bit_exact() -> None:
 
 def test_linear_epilogue_matches_eager_chain() -> None:
     g = torch.Generator(device="cpu").manual_seed(4)
-    readout = torch.randn(F_, H_, S_, D_, generator=g).to("cuda", torch.bfloat16)
-    weight = (1 + 0.1 * torch.randn(D_, generator=g)).to("cuda", torch.bfloat16)
-    gate = torch.rand(F_ * S_, H_, D_, generator=g).to("cuda", torch.bfloat16)
+    readout = torch.randn(FRAMES, HEADS, TOKENS, HEAD_DIM, generator=g).to(
+        "cuda", torch.bfloat16
+    )
+    weight = (1 + 0.1 * torch.randn(HEAD_DIM, generator=g)).to("cuda", torch.bfloat16)
+    gate = torch.rand(FRAMES * TOKENS, HEADS, HEAD_DIM, generator=g).to(
+        "cuda", torch.bfloat16
+    )
     assert can_use_vdn_linear_epilogue(readout)
     got = vdn_linear_epilogue(readout, weight, gate, 1e-6)
     assert _ulp_close(got, vdn.linear_epilogue(readout, weight, gate, 1e-6))

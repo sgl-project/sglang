@@ -795,7 +795,7 @@ sglang serve \
 
 `--warmup-num-frames` / `--warmup-resolutions` make the startup warmup run
 at the clip length and canvas you will serve (here the 14.375 s paper
-workload; the H3 warmup honors them since sgl-project/sglang#37945). Without them H3 warms up on a 5-second clip, and the first
+workload). Without them H3 warms up on a 5-second clip, and the first
 forward of the first longer request pays allocator growth and kernel setup
 in every DiT block (2 to 3 s on this workload, for base H3 as well).
 

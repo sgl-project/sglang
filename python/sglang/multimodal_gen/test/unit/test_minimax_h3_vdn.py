@@ -220,17 +220,17 @@ def test_layout_from_packed_t2va() -> None:
 # the linear branch arithmetic
 # --------------------------------------------------------------------------
 
-F_, H_, S_, D_ = 6, 2, 16, 32
+FRAMES, HEADS, TOKENS, HEAD_DIM = 6, 2, 16, 32
 
 
 def _random_stats(device, seed=0):
     g = torch.Generator(device="cpu").manual_seed(seed)
     k = torch.nn.functional.normalize(
-        torch.randn(F_, H_, S_, D_, generator=g), dim=-1
+        torch.randn(FRAMES, HEADS, TOKENS, HEAD_DIM, generator=g), dim=-1
     ).to(device)
-    v = torch.randn(F_, H_, S_, D_, generator=g).to(device)
-    beta = torch.rand(F_, H_, S_, generator=g).to(device)
-    alpha = torch.rand(F_, H_, D_, generator=g).to(device) * 0.5 + 0.5
+    v = torch.randn(FRAMES, HEADS, TOKENS, HEAD_DIM, generator=g).to(device)
+    beta = torch.rand(FRAMES, HEADS, TOKENS, generator=g).to(device)
+    alpha = torch.rand(FRAMES, HEADS, HEAD_DIM, generator=g).to(device) * 0.5 + 0.5
     return k, v, beta, alpha
 
 
@@ -241,9 +241,9 @@ def test_frame_statistics_and_delta_rule_match_dense_algebra() -> None:
     B_ref = torch.einsum("fhsv,fhs,fhsk->fhvk", v, beta, k)
     assert torch.allclose(A, A_ref, atol=1e-4) and torch.allclose(B, B_ref, atol=1e-4)
     transition, injection = delta_factor_apply(
-        "vdn_solve", alpha, A, B, tokens_per_frame=S_
+        "vdn_solve", alpha, A, B, tokens_per_frame=TOKENS
     )
-    inv = torch.linalg.inv(torch.eye(D_) + A)
+    inv = torch.linalg.inv(torch.eye(HEAD_DIM) + A)
     assert torch.allclose(transition, alpha.unsqueeze(-1) * inv, atol=1e-4)
     assert torch.allclose(injection, B @ inv, atol=1e-4)
 
@@ -252,16 +252,16 @@ def test_scans_match_step_reference_and_text_seed() -> None:
     k, v, beta, alpha = _random_stats("cpu", seed=1)
     A, B = frame_statistics(k, v, beta, a_fp32=True)
     transition, injection = delta_factor_apply(
-        "vdn_solve", alpha, A, B, tokens_per_frame=S_
+        "vdn_solve", alpha, A, B, tokens_per_frame=TOKENS
     )
-    text_state = torch.randn(H_, D_, D_)
+    text_state = torch.randn(HEADS, HEAD_DIM, HEAD_DIM)
     prefix, suffix = run_scans(transition, injection, text_state)
     state = text_state.clone()
-    for f in range(F_):
+    for f in range(FRAMES):
         state = state @ transition[f] + injection[f]
         assert torch.allclose(prefix[f], state, atol=1e-4)
     state = text_state.clone()
-    for f in range(F_ - 1, -1, -1):
+    for f in range(FRAMES - 1, -1, -1):
         state = state @ transition[f] + injection[f]
         assert torch.allclose(suffix[f], state, atol=1e-4)
 
@@ -341,7 +341,7 @@ def test_branch_forward_matches_reference(
         k_raw=k,
         v_raw=v,
         beta=branch.beta(x),
-        gate=branch.gate(x),
+        gate=branch.output_gate(x),
         frame_mean=x.view(num_frames, tpf, hidden).mean(1, dtype=torch.float32),
         layout=layout,
         text_k_raw=tk,
@@ -513,7 +513,7 @@ def test_branch_head_slice_equals_full_run() -> None:
     )
     x = torch.randn(V, hidden, generator=g).to(device, torch.bfloat16)
     tx = torch.randn(10, hidden, generator=g).to(device, torch.bfloat16)
-    beta, gate = branch.beta(x), branch.gate(x)
+    beta, gate = branch.beta(x), branch.output_gate(x)
     tbeta = branch.beta(tx)
     frame_mean = x.view(num_frames, tpf, hidden).mean(1, dtype=torch.float32)
     full = branch(
@@ -585,7 +585,7 @@ def test_branch_matches_eager_reference_algorithm() -> None:
     )
     x = torch.randn(V, hidden, generator=g).to(device, torch.bfloat16)
     tx = torch.randn(8, hidden, generator=g).to(device, torch.bfloat16)
-    beta, gate, tbeta = branch.beta(x), branch.gate(x), branch.beta(tx)
+    beta, gate, tbeta = branch.beta(x), branch.output_gate(x), branch.beta(tx)
     frame_mean = x.view(num_frames, tpf, hidden).mean(1, dtype=torch.float32)
     got = branch(
         q_raw=q,

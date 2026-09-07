@@ -344,6 +344,12 @@ so the metadata is built once per request. The checkpoint's
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Allows a dense transformer backend (`fa`) on the VDN-H3 weights for the base-H3 + LoRA equivalence smoke. The gates and the linear branch are skipped: a study, not a sample.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`false`</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`vdn_max_gather_rows`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`int`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Upper bound on the gathered K/V rows per window FlashAttention call; consecutive chunk groups fill one call up to it. Splitting changes no query's kept key set, only the pass count and the gather's peak memory.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`200000`</td>
+    </tr>
   </tbody>
 </table>
 

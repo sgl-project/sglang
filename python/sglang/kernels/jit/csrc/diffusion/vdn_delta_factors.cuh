@@ -4,10 +4,10 @@
 // Per (frame, head) the linear branch needs, for M = I + A (128x128 fp32, symmetric positive definite):
 //   transition = diag(alpha) M^-1        [F, H, dk, dk]
 //   injection  = B M^-1                  [F, H, dv, dk]
-// The eager path is cholesky + solve_triangular + two GEMMs (~40 launches, ~0.94 ms for 707 matrices
-// on B200).  This kernel does it in one launch (~0.17 ms): one CTA of 256 threads per matrix, thread
-// (ti, tj) owns rows 8ti.., cols 8tj.. as float2 pairs t[8][4] so the rank-2 updates and the final
-// GEMM run on packed FFMA2 (sm_100+, scalar fallback elsewhere).
+// The eager path is cholesky + solve_triangular + two GEMMs (~40 launches); this kernel is one
+// launch: one CTA of 256 threads per matrix, thread (ti, tj) owns rows 8ti.., cols 8tj.. as float2
+// pairs t[8][4] so the rank-2 updates and the final GEMM run on packed FFMA2 (sm_100+, scalar
+// fallback elsewhere).
 //
 // M^-1 is formed in place by block Gauss-Jordan elimination without pivoting (stable for SPD, the
 // same class as Cholesky), two pivots per barrier.  For the pivot block S = {k, k+1} with
@@ -19,8 +19,7 @@
 // the next step.  Shared rows are column-swizzled so the float4 reads are bank-conflict free; the
 // same swizzle is used for the smem copy of M^-1 consumed by the register-tiled GEMM B M^-1.
 //
-// Accuracy: relative error vs fp64 matches the cholesky path (3e-7 transition, 1e-6 injection on
-// the paper workload; the injection error is dominated by cond(M) in both implementations).
+// Accuracy: the relative error vs fp64 matches the cholesky path; both are dominated by cond(M).
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 

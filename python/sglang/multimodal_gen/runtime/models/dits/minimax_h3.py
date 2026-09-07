@@ -1428,10 +1428,10 @@ class MiniMaxH3DiTBlock(nn.Module):
         h_prequant = None
         if _accepts_mxfp8_input(self.attn.qkv_proj) and can_use_mxfp8_swizzled(h):
             # the bf16 modulated rows stay in h for the VDN branch projections
-            h, h_q, h_s = indexed_scale_shift_mxfp8_(
+            h, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
                 h, shift_msa, scale_msa, combined_indices, keep_bf16=True
             )
-            h_prequant = (h_q, h_s)
+            h_prequant = (h_fp8, h_scales)
         else:
             h = _modulate_scale_shift(
                 h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
@@ -1459,10 +1459,10 @@ class MiniMaxH3DiTBlock(nn.Module):
         residual = x
         h = self.norm2(x)
         if _accepts_mxfp8_input(self.mlp.fc1) and can_use_mxfp8_swizzled(h):
-            _, h_q, h_s = indexed_scale_shift_mxfp8_(
+            _, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
                 h, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
             )
-            h = self.mlp((h_q, h_s))
+            h = self.mlp((h_fp8, h_scales))
         else:
             h = _modulate_scale_shift(
                 h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
