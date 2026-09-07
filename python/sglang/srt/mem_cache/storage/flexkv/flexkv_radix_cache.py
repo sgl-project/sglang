@@ -491,6 +491,26 @@ class FlexKVRadixCache(RadixCache):
         # Free the tail of the over-allocation when FlexKV returned
         # fewer than expected.
         if num_retrieved < uncached_len:
+            if request_owned_req is not None:
+                # IP/layerwise: load_fn only *launches* the transfer, and it was
+                # handed the full token_slots mapping. Freeing the tail here
+                # would release slots the H2D engine is still writing into, so
+                # the next allocator client would see its KV corrupted. Treat a
+                # short layerwise restore as all-or-nothing, like the hybrid
+                # cache does, and let the request re-prefill instead.
+                logger.warning(
+                    "[FlexKV] discarding short layerwise restore rid=%s "
+                    "retrieved=%d requested=%d",
+                    tracking_rid,
+                    num_retrieved,
+                    uncached_len,
+                )
+                self.token_to_kv_pool_allocator.free(token_slots)
+                return (
+                    (reused_indices, last_node) if reused_indices.numel() > 0 else None
+                )
+            # MP/synchronous: retrieve_kv has already completed, so the tail is
+            # idle and safe to hand back.
             self.token_to_kv_pool_allocator.free(token_slots[num_retrieved:])
             fetched_slots = token_slots[:num_retrieved]
         else:
@@ -972,7 +992,9 @@ class FlexKVRadixCache(RadixCache):
         pop = getattr(self.flexkv_connector, "pop_prefetch_loaded_tokens", None)
         if callable(pop):
             return int(pop(rid))
-        # Fallback until connector exposes actual prefetch hit length (M1).
+        # Older FlexKV builds do not track the materialized REMOTE2H prefix.
+        # Reporting 0 attributes the whole hit to the host tier, which only
+        # skews the #cached-host / #cached-storage split in the logs.
         del rid
         return 0
 

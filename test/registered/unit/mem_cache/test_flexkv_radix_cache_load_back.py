@@ -259,6 +259,64 @@ def test_reset_drains_flexkv_before_freeing_leased_restore_slots():
     assert cache._restore_leases == {}
 
 
+def test_short_layerwise_restore_is_discarded_whole_not_truncated():
+    """IP load_fn only *launches*, against the full slot mapping.
+
+    Freeing just the tail would release slots the H2D engine is still writing
+    into, corrupting whoever allocates them next. A short layerwise restore is
+    therefore all-or-nothing, matching FlexKVHybridRadixCache.
+    """
+    cache, allocator = _make_cache()
+    req = SimpleNamespace(
+        rid="short-ip",
+        kv=SimpleNamespace(cache_protected_len=0),
+        _flexkv_uncached_restore=False,
+        pending_restore_generation=None,
+        pending_restore_slots=None,
+    )
+
+    result = cache._allocate_and_load(
+        key=RadixKey(array("q", range(8))),
+        value_numel=0,
+        uncached_len=8,
+        last_node=cache.root_node,
+        tracking_rid="short-ip",
+        sglang_req_id="short-ip",
+        load_fn=MagicMock(return_value=4),  # launched 8, reports only 4
+        request_owned_req=req,
+    )
+
+    assert result is None
+    # The whole allocation goes back, not just token_slots[4:].
+    freed = torch.cat([call.args[0] for call in allocator.free.call_args_list])
+    assert freed.numel() == 8
+    # No lease, and the request must not think it owns a restore.
+    assert cache._restore_leases == {}
+    assert req._flexkv_uncached_restore is False
+
+
+def test_short_mp_restore_keeps_the_loaded_prefix():
+    """MP retrieve_kv is synchronous, so the unused tail is idle and the
+    partially loaded prefix is safe to keep."""
+    cache, allocator = _make_cache()
+
+    result = cache._allocate_and_load(
+        key=RadixKey(array("q", range(8))),
+        value_numel=0,
+        uncached_len=8,
+        last_node=cache.root_node,
+        tracking_rid="short-mp",
+        sglang_req_id="short-mp",
+        load_fn=MagicMock(return_value=4),
+    )
+
+    assert result is not None
+    restored, _node = result
+    assert restored.numel() == 4
+    freed = torch.cat([call.args[0] for call in allocator.free.call_args_list])
+    assert freed.numel() == 4  # only the unused tail
+
+
 def test_partial_duplicate_restore_relooks_up_only_missing_suffix():
     cache, _allocator = _make_cache()
     first_page = RadixKey(array("q", range(4)))
