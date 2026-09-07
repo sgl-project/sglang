@@ -1,5 +1,6 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -401,6 +402,32 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     assert out_tokens.tolist() == [[7, 0]]
     assert target_predict.tolist() == [[1, 0]]
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+def test_selector_empty_proposals(batch_size):
+    from sglang.srt.speculative.dflash_worker_v2 import _selector_lattice
+
+    selector = CandidateSelector(hidden_size=4, vocab_size=16, state_rank=2, top_k=4)
+    draft = SimpleNamespace(candidate_selector=selector, compute_candidates=Mock())
+    candidates, scores = _selector_lattice(
+        draft, torch.empty(batch_size, 0, 4), torch.zeros(batch_size, dtype=torch.int64)
+    )
+    # There is no draft distribution to compute for an anchor-only window.
+    draft.compute_candidates.assert_not_called()
+    assert candidates.shape == (batch_size, 0, 4)
+    assert scores.shape == (batch_size, 0, 4, 4)
+    tokens, q_rows = selector.sample_path(
+        candidate_ids=candidates,
+        scores=scores,
+        uniforms=torch.empty(batch_size, 0),
+        temperatures=torch.ones(batch_size),
+        greedy_mask=torch.arange(batch_size) % 2 == 0,
+    )
+    assert tokens.shape == (batch_size, 0)
+    assert tokens.dtype == torch.int64
+    assert q_rows.shape == (batch_size, 0, 4)
+    assert q_rows.dtype == torch.float32
 
 
 def test_grouped_conv_supports_runtime_block_sizes():
