@@ -269,7 +269,7 @@ def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
         "inc_host_lock_ref": lambda: core.inc_host_lock_ref(stale_root),
         "dec_host_lock_ref": lambda: core.dec_host_lock_ref(stale_root),
         "mark_write_through_pending": lambda: core.mark_write_through_pending(
-            stale_root
+            [stale_root], stale_root
         ),
         "finish_write_through": lambda: core.finish_write_through(
             [stale_root], stale_root

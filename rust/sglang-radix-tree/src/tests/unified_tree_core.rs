@@ -2218,16 +2218,17 @@ fn mark_write_through_pending_stamps_one_ack_on_every_published_node() {
     for node_id in [parent, leaf] {
         assert_eq!(
             tc.arena
-                .node(tc.arena.resolve(node_id))
+                .node(tc.arena.resolve(node_id).expect("live test node"))
                 .write_through_pending_id,
             Some(leaf)
         );
     }
-    tc.finish_write_through(vec![parent, leaf], /* ack_id = */ leaf);
+    tc.finish_write_through(vec![parent, leaf], /* ack_id = */ leaf)
+        .expect("live test nodes");
     for node_id in [parent, leaf] {
         assert_eq!(
             tc.arena
-                .node(tc.arena.resolve(node_id))
+                .node(tc.arena.resolve(node_id).expect("live test node"))
                 .write_through_pending_id,
             None
         );
