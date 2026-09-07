@@ -1498,6 +1498,149 @@ class TestHiCacheArgs(unittest.TestCase):
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
 
+    def test_unified_layout_normalization(self):
+        """Every layout converges on `page_first_direct`, with or without
+        partition configs; only a head cut additionally forces `kernel`.
+        """
+        for mem_layout, io_backend, extra, expected in (
+            # A head cut: head-group-major page blocks, kernel io.
+            (
+                "page_first",
+                "direct",
+                {"head_group": 1},
+                ("page_first_direct", "kernel"),
+            ),
+            (
+                "layer_first",
+                "direct",
+                {"head_group": 1},
+                ("page_first_direct", "kernel"),
+            ),
+            (
+                "page_first_direct",
+                "direct",
+                {"head_group": 1},
+                ("page_first_direct", "kernel"),
+            ),
+            (
+                "page_first",
+                "kernel",
+                {"head_group": 1},
+                ("page_first_direct", "kernel"),
+            ),
+            # A layer partition needs no permutation.
+            (
+                "page_first",
+                "kernel",
+                {"layer_partition": 8},
+                ("page_first_direct", "direct"),
+            ),
+            # No partition configs: the layout is still normalized, or
+            # page_first and page_first_direct deployments of the same model
+            # would sit in different keyspaces.
+            ("page_first", "kernel", None, ("page_first_direct", "direct")),
+            ("layer_first", "kernel", None, ("page_first_direct", "direct")),
+        ):
+            args = self._make_args(
+                enable_hierarchical_cache=True,
+                hicache_mem_layout=mem_layout,
+                hicache_io_backend=io_backend,
+                hicache_storage_backend="mooncake",
+                hicache_storage_key_scheme="unified",
+                hicache_storage_backend_extra_config=(
+                    json.dumps(extra) if extra else None
+                ),
+            )
+            # The hook asks the model config for the head axis; the dummy
+            # model path has none to load.
+            with patch(
+                "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                return_value=False,
+            ):
+                handle_hicache(args)
+            self._assert_hicache_fields(
+                args,
+                expected_io_backend=expected[1],
+                expected_mem_layout=expected[0],
+            )
+
+    def test_the_unified_scheme_rejects_the_ascend_io_backend(self):
+        """The NPU platform hook pins (io backend, layout) together and runs
+        FIRST, so normalizing the layout under `kernel_ascend` would hand its
+        transfer arms a pair they reject -- at the first L2 transfer, not at
+        launch. Refuse at launch instead. `page_first_kv_split` is the MLA pin
+        and `page_first_direct` the MHA one; neither has a unified page view
+        the Ascend arms can also read.
+        """
+        for mem_layout in ("page_first_kv_split", "page_first_direct"):
+            args = self._make_args(
+                enable_hierarchical_cache=True,
+                hicache_io_backend="kernel_ascend",
+                hicache_mem_layout=mem_layout,
+                hicache_storage_backend="file",
+                hicache_storage_key_scheme="unified",
+            )
+            with self.subTest(mem_layout=mem_layout):
+                with self.assertRaisesRegex(NotImplementedError, "kernel_ascend"):
+                    handle_hicache(args)
+
+    def test_the_unified_scheme_rejects_malformed_partition_configs(self):
+        """head_group=0 read as "absent" under a truthiness test: it passed
+        startup and then failed at attach with the wrong message ("only
+        mooncake supports them"). Both entries are validated here with the same
+        rules the controller applies, so a bad value is diagnosed once, at
+        launch. `True` is an `int` in Python and must not pass as head_group=1.
+        """
+        for field, value in (
+            ("head_group", 0),
+            ("head_group", -2),
+            ("head_group", True),
+            ("head_group", 1.5),
+            ("layer_partition", 0),
+            ("layer_partition", -1),
+            ("layer_partition", False),
+        ):
+            args = self._make_args(
+                enable_hierarchical_cache=True,
+                hicache_storage_backend="mooncake",
+                hicache_storage_key_scheme="unified",
+                hicache_storage_backend_extra_config=json.dumps({field: value}),
+            )
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValueError, f"{field}.*positive integer"):
+                    handle_hicache(args)
+
+    def test_the_layout_override_warning_names_the_layout_it_replaced(self):
+        """`cfg` is a live view of the declarations, so reading the field back
+        after declare_resolution reports the NEW value: the warning used to say
+        "switching --hicache-mem-layout from page_first_direct" for every
+        input, hiding the layout the operator actually asked for.
+        """
+        # `page_first` is paired with `kernel`: under `direct` the layout-io
+        # resolver rewrites it first, so this resolver has nothing left to say.
+        for mem_layout, io_backend in (
+            ("page_first", "kernel"),
+            ("layer_first", "direct"),
+            ("page_head", "direct"),
+        ):
+            args = self._make_args(
+                enable_hierarchical_cache=True,
+                hicache_mem_layout=mem_layout,
+                hicache_io_backend=io_backend,
+                hicache_storage_backend="file",
+                hicache_storage_key_scheme="unified",
+            )
+            with self.subTest(mem_layout=mem_layout):
+                with self.assertLogs(
+                    "sglang.srt.arg_groups.hicache_hook", level="WARNING"
+                ) as logs:
+                    handle_hicache(args)
+                switched = [
+                    line for line in logs.output if "--hicache-mem-layout from" in line
+                ]
+                self.assertEqual(len(switched), 1, logs.output)
+                self.assertIn(f"from {mem_layout}.", switched[0])
+
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
             {

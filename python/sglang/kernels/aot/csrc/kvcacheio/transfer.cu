@@ -171,6 +171,37 @@ __device__ __forceinline__ T* get_global_offset_ph(
          layer_id * item_size_bytes / head_num;               // layer_num dimension offset
 }
 
+// Head-group-major page block, as a set of unified L3 chunks lands it.
+//
+// page_first_direct stores a page as [layer_num, page_size, head_num, head_dim].
+// When the unified L3 grid cuts the kv-head axis, each chunk covers one head
+// group across the whole layer range, so a page reassembled from those chunks is
+// [head_group_num, layer_num, page_size, heads_per_group, head_dim] -- the same
+// bytes, permuted. Reading that order here is what lets the L3 fetch write pool
+// memory directly and drop the host-side scatter; the permutation is free
+// because it only reorders addresses this kernel already computes per head.
+//
+// head_id / head_num are the head GROUP index and count, not individual heads,
+// so head_size_bytes = item_size_bytes / head_num is one group's contiguous run.
+// Every division is exact: head_num divides the pool's head count, which divides
+// item_size_bytes.
+template <typename T>
+__device__ __forceinline__ T* get_global_offset_pfd_hg(
+    T* base,
+    const uintptr_t* __restrict__ /*unused*/,
+    int64_t layer_id,
+    int64_t page_dim,
+    int64_t page_id,
+    int64_t item_size_bytes,
+    int64_t head_id,
+    int64_t head_num,
+    int64_t page_size) {
+  return base + page_id / page_size * page_size * page_dim +  // page offset
+         head_id * page_size * page_dim / head_num +          // head group offset
+         layer_id * page_size * item_size_bytes / head_num +  // layer offset
+         page_id % page_size * item_size_bytes / head_num;    // token-in-page offset
+}
+
 template <auto SrcOffsetFn, auto DstOffsetFn>
 __global__ void transfer_page_head_kernel_impl(
     const void* __restrict__ src_k,
@@ -334,6 +365,18 @@ void transfer_kv_launcher(
   TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "Destination indices must be of type long");
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
   TORCH_CHECK(item_size % 8 == 0, "Item byte size must be divisible by 8");
+  TORCH_CHECK(block_quota > 0, "block_quota must be positive, got ", block_quota);
+  TORCH_CHECK(num_warps_per_block > 0, "num_warps_per_block must be positive, got ", num_warps_per_block);
+  if constexpr (PageHeadLayout) {
+    TORCH_CHECK(page_size > 0, "page_size must be positive, got ", page_size);
+    TORCH_CHECK(head_num > 0, "head_num must be positive, got ", head_num);
+    TORCH_CHECK(item_size % head_num == 0, "item_size must be divisible by head_num");
+    TORCH_CHECK(item_size / head_num % 8 == 0, "Per-head-group item byte size must be divisible by 8");
+    TORCH_CHECK(src_layout_dim % head_num == 0, "src_layout_dim must be divisible by head_num");
+  }
+  if (src_indices.numel() == 0) {
+    return;
+  }
 
   auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
   const int64_t num_items = src_indices.numel();
@@ -497,6 +540,43 @@ void transfer_kv_per_layer_ph_lf(
       head_num);
 }
 
+void transfer_kv_per_layer_pfdhg_lf(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_pfd_hg<const char>, get_global_offset_per_head_lf<char>, false, true>(
+      src_k,
+      dst_k,
+      src_v,
+      dst_v,
+      src_indices,
+      dst_indices,
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      empty,
+      empty,
+      empty,
+      empty,
+      block_quota,
+      num_warps_per_block,
+      page_size,
+      head_num);
+}
+
 void transfer_kv_all_layer(
     const at::Tensor src_k_layers,
     const at::Tensor dst_k_layers,
@@ -581,6 +661,57 @@ void transfer_kv_all_layer_lf_ph(
   TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
   at::Tensor empty;
   transfer_kv_launcher<get_global_offset_per_head_lf_tbl<const char>, get_global_offset_ph<char>, false, true>(
+      empty,
+      dst_k,
+      empty,
+      dst_v,
+      src_indices,
+      dst_indices,
+      0,
+      num_layers,
+      item_size,
+      0,
+      dst_layout_dim,
+      src_k_layers,
+      empty,
+      src_v_layers,
+      empty,
+      block_quota,
+      num_warps_per_block,
+      page_size,
+      head_num);
+}
+
+// D2H mirror of transfer_kv_per_layer_pfdhg_lf: write the device pool's
+// per-layer NHD rows back into a head-group-major page block.
+//
+// Required so the host pool has ONE byte order. The unified L3 grid reads and
+// writes page blocks as (page_num, HG, L, P, hg, D); if write-back kept
+// page_first_direct's natural (L, P, H, D) order, a page's order would depend
+// on whether it came from L3 or from the device, and the H2D would have no way
+// to tell. Same functor as the H2D, used as the destination.
+void transfer_kv_all_layer_lf_pfdhg(
+    const at::Tensor src_k_layers,
+    at::Tensor dst_k,
+    const at::Tensor src_v_layers,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+  // The launcher's PageHeadLayout precondition only checks src_layout_dim,
+  // which is 0 in this direction; the head-group offset arithmetic divides
+  // dst_layout_dim here, so check that instead.
+  TORCH_CHECK(head_num > 0, "head_num must be positive, got ", head_num);
+  TORCH_CHECK(dst_layout_dim % head_num == 0, "dst_layout_dim must be divisible by head_num");
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_per_head_lf_tbl<const char>, get_global_offset_pfd_hg<char>, false, true>(
       empty,
       dst_k,
       empty,

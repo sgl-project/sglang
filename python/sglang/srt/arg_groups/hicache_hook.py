@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -16,13 +17,21 @@ logger = logging.getLogger(__name__)
 
 
 def handle_hicache(server_args: Any):
-    """Normalize hicache-related knobs into a valid runtime configuration.
+    """Normalize hicache-related configs into a valid runtime configuration.
 
     Resolution order:
     1) Layout <-> I/O compatibility for direct conflicts.
     2) Storage <-> layout compatibility (may rewrite layout).
+    3) The unified layout / io backend, which reads the layout both of the
+       above may have rewritten.
     """
     cfg = resolving_view(server_args)
+    # Step 0: L3 key-scheme validation. A no-op for the default rank-suffix
+    # scheme, so it runs ahead of every early return below and a unified flag
+    # is never silently inert -- including under the external linker, which
+    # has no L3 of its own.
+    resolve_hicache_key_scheme(server_args)
+
     if cfg.enable_unified_cache_external_linker:
         if cfg.enable_hierarchical_cache:
             raise ValueError(
@@ -55,7 +64,10 @@ def handle_hicache(server_args: Any):
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
 
-    # Step 3: DCP compatibility for the L2 (device<->host) path.
+    # Step 3: the unified layout / io backend, after every rewrite above.
+    resolve_unified_layout_io(server_args)
+
+    # Step 4: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
 
 
@@ -78,6 +90,98 @@ def handle_hicache_ratio_default(server_args: Any):
             hicache_ratio=(
                 1.2 if cfg.hicache_host_memory_mode == "buffer_only" else 2.0
             ),
+        )
+
+
+def resolve_hicache_key_scheme(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.hicache_storage_key_scheme == "rank-suffix":
+        return
+    if not (
+        cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+    ):
+        raise ValueError(
+            "--hicache-storage-key-scheme unified has no effect "
+            "without --enable-hierarchical-cache (or decode KV offload); "
+            "refusing a silently inert flag."
+        )
+    if cfg.hicache_storage_backend is None:
+        raise ValueError(
+            "--hicache-storage-key-scheme unified requires an L3 "
+            "backend (--hicache-storage-backend)."
+        )
+    if cfg.hicache_storage_backend not in ("file", "mooncake"):
+        raise NotImplementedError(
+            "the unified key scheme v1 supports --hicache-storage-backend file "
+            f"or mooncake; got {cfg.hicache_storage_backend!r}. Other "
+            "backends need chunk-granular key support first."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise NotImplementedError(
+            "the unified key scheme does not cover speculative-decoding draft "
+            "pools yet; use --hicache-storage-key-scheme rank-suffix."
+        )
+    # TODO: a unified chunk names whole pages, but both context-parallel modes
+    # shard a page below that granularity -- DCP interleaves tokens across
+    # ranks, attention CP holds sub-page slices (NSA) or replicated pages. Both
+    # need the token-granule extension; support them once the layouts converge.
+    # Checked here, not only at attach, because the decode-offload attach path
+    # has no CP/DCP group wired into its controller.
+    if cfg.dcp_size > 1:
+        raise NotImplementedError(
+            "the unified key scheme with --dcp-size > 1 is not supported: each "
+            "DCP rank holds an interleaved token shard (needs the "
+            "token-granule extension)."
+        )
+    # Read through the resolved view: prefill-CP overrides stash attn_cp_size
+    # without mutating the raw field.
+    if cfg.attn_cp_size > 1:
+        raise NotImplementedError(
+            "the unified key scheme with --attn-cp-size > 1 is not supported: "
+            "CP ranks hold sub-page slices or replicated pages (needs "
+            "token-granule chunks / writer election)."
+        )
+
+    configs = _unified_extra_config(server_args)
+    if configs is not None:
+        tp_lcm_size = configs.get("tp_lcm_size")
+        head_group = configs.get("head_group")
+        layer_partition = configs.get("layer_partition")
+        if tp_lcm_size:
+            raise ValueError(
+                "tp_lcm_size is the legacy rank-suffix split-heads config; "
+                "the unified key scheme uses head_group in the extra "
+                "config (heads per chunk)."
+            )
+
+        _validate_partition_config("head_group", head_group)
+        _validate_partition_config("layer_partition", layer_partition)
+        # head_group is ignored on rank-replicated (MLA-family) pools, so a
+        # shared fleet extra-config must not be rejected for them here.
+        adapter = layer_partition is not None or (
+            head_group is not None and not use_mla_backend(server_args)
+        )
+        if adapter and cfg.hicache_storage_backend != "mooncake":
+            # Not "the file backend cannot do unified" -- it can, and v1
+            # supports it. What it cannot do is the per-chunk key fan-out these
+            # two configs create: it stores one object per page.
+            raise NotImplementedError(
+                "unified-scheme partition configs (head_group / "
+                "layer_partition) need a multi-key-per-page backend; only "
+                "mooncake supports them (--hicache-storage-backend "
+                f"{cfg.hicache_storage_backend!r} stores one object per page). "
+                "Drop them to run the unified scheme on this backend."
+            )
+
+
+def _validate_partition_config(name: str, value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(
+            f"{name} in --hicache-storage-backend-extra-config must be a "
+            f"positive integer, got {value!r}."
         )
 
 
@@ -124,11 +228,40 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     )
 
 
-def resolve_layout_io_compatibility(server_args: Any):
+def _unified_extra_config(server_args: Any) -> dict | None:
     cfg = resolving_view(server_args)
+    if cfg.hicache_storage_key_scheme != "unified":
+        return None
+    extra = cfg.hicache_storage_backend_extra_config
+    if not extra or extra.startswith("@"):
+        return None
+    try:
+        parsed = json.loads(extra)
+    except (ValueError, AttributeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _unified_scheme(server_args: Any) -> bool:
+    cfg = resolving_view(server_args)
+    return cfg.hicache_storage_key_scheme == "unified"
+
+
+def _unified_head_cut(server_args: Any) -> bool:
+    configs = _unified_extra_config(server_args)
+    if configs is None:
+        return False
+    return configs.get("head_group") is not None and not use_mla_backend(server_args)
+
+
+def resolve_layout_io_compatibility(server_args: Any):
+    """Settle (layout, io_backend) into a combination the pools can serve."""
+    cfg = resolving_view(server_args)
+    head_cut = _unified_head_cut(server_args)
     if (
         cfg.hicache_mem_layout == "page_first_direct"
         and cfg.hicache_io_backend == "kernel"
+        and not head_cut
     ):
         declare_resolution(
             server_args,
@@ -147,6 +280,79 @@ def resolve_layout_io_compatibility(server_args: Any):
         )
         logger.warning(
             "Page first layout is not supported with direct IO backend, switching to page first direct layout"
+        )
+
+
+def resolve_unified_layout_io(server_args: Any):
+    """Pin the unified scheme's host layout and io backend, overriding both.
+
+    Layout is always page_first_direct: it enters the namespace digest, so
+    operator choice would split one model across keyspaces, and it is the only
+    layout that serves an L3 chunk in a single descriptor rather than one per
+    (layer, token). The io backend then follows the head cut -- kernel to read
+    head-group-major page blocks, direct otherwise.
+    """
+    cfg = resolving_view(server_args)
+    if not _unified_scheme(server_args):
+        return
+    # The Ascend io backend reads exactly one layout per pool family
+    # (page_first_direct for MHA, page_first_kv_split for MLA) and is pinned by
+    # the platform hook, which runs BEFORE this one. Rewriting the layout under
+    # it would produce a pair its transfer arms reject -- at the first L2
+    # transfer, not at launch -- so refuse here instead.
+    if cfg.hicache_io_backend == "kernel_ascend":
+        raise NotImplementedError(
+            "the unified key scheme does not support --hicache-io-backend "
+            f"kernel_ascend (--hicache-mem-layout {cfg.hicache_mem_layout}): "
+            "the Ascend transfer path reads only the layout the NPU platform "
+            "pins, which the unified object order cannot be normalized onto. "
+            "Use --hicache-storage-key-scheme rank-suffix."
+        )
+    # Read the layout being replaced BEFORE declaring: `cfg` is a live view of
+    # the declarations, so after declare_resolution it already reports the new
+    # value and the warning would name page_first_direct as its own origin.
+    previous_layout = cfg.hicache_mem_layout
+    if previous_layout != "page_first_direct":
+        declare_resolution(
+            server_args,
+            "_resolve_unified_layout_io",
+            hicache_mem_layout="page_first_direct",
+        )
+        logger.warning(
+            "The unified key scheme serves an L3 chunk at one descriptor only "
+            "from page_first_direct page blocks; switching "
+            "--hicache-mem-layout from %s. (Other layouts hold the same bytes "
+            "but serve each chunk as layers x tokens separate runs.)",
+            previous_layout,
+        )
+    # Only a HEAD cut makes page blocks head-group-major, and only the pfdhg
+    # transfer kernels can read that; the copy-engine 'direct' path moves a
+    # page block verbatim. A layer partition alone leaves the natural order.
+    if _unified_head_cut(server_args):
+        if cfg.hicache_io_backend != "kernel":
+            declare_resolution(
+                server_args,
+                "_resolve_unified_layout_io",
+                hicache_io_backend="kernel",
+            )
+            logger.warning(
+                "The unified key scheme with head_group stores host pages "
+                "head-group-major, which only the kernel io backend can read; "
+                "switching to the kernel io backend"
+            )
+    elif cfg.hicache_io_backend == "kernel":
+        # Re-apply the rule the first resolver would have: it saw the layout
+        # BEFORE this one rewrote it, so without this an operator asking for
+        # page_first + kernel and one asking for page_first_direct + kernel end
+        # on the same layout but different io backends.
+        declare_resolution(
+            server_args,
+            "_resolve_unified_layout_io",
+            hicache_io_backend="direct",
+        )
+        logger.warning(
+            "Kernel io backend does not support page first direct layout, "
+            "switching to direct io backend"
         )
 
 
