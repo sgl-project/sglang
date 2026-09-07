@@ -117,6 +117,7 @@ if HAS_TILELANG:
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
             tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
         }
     )
     def _tilelang_qsa_mqa_prefill_kernel(
@@ -150,14 +151,28 @@ if HAS_TILELANG:
                 start_min = 2147483647
                 end_max = -2147483648
                 for qi in T.serial(block_q):
-                    start_min = T.min(start_min, T.min(Starts[row_base + qi], keys))
-                    end_max = T.max(end_max, T.min(Ends[row_base + qi], keys))
+                    row_idx = row_base + qi
+                    s = T.if_then_else(row_idx < rows, Starts[row_idx], T.int32(keys))
+                    e = T.if_then_else(
+                        row_idx < rows, T.min(Ends[row_idx], keys), T.int32(0)
+                    )
+                    start_min = T.min(start_min, s)
+                    end_max = T.max(end_max, e)
 
                 T.copy(Q[row_base * heads, 0], q_shared)
                 for ni in T.Pipelined(
                     T.ceildiv(end_max - start_min, block_n), num_stages=num_stages
                 ):
-                    T.copy(K[start_min + ni * block_n, 0], k_shared)
+                    k_pos = start_min + ni * block_n
+                    # Predicated load into k_shared: entries past K or past
+                    # end_max are zeroed so they contribute nothing after ReLU.
+                    for n, d in T.Parallel(block_n, head_dim):
+                        k_idx = k_pos + n
+                        k_shared[n, d] = T.if_then_else(
+                            k_idx < end_max,
+                            K[k_idx, d],
+                            T.bfloat16(0),
+                        )
                     T.gemm(
                         k_shared,
                         q_shared,
@@ -170,9 +185,15 @@ if HAS_TILELANG:
                         scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
                     T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
                     for qi, n in T.Parallel(block_q, block_n):
-                        Logits[row_base + qi, start_min + ni * block_n + n] = reduced[
-                            n, qi
-                        ]
+                        row_idx = row_base + qi
+                        col = k_pos + n
+                        valid = (
+                            (row_idx < rows)
+                            & (col >= Starts[row_idx])
+                            & (col < Ends[row_idx])
+                        )
+                        if valid:
+                            Logits[row_idx, col] = reduced[n, qi]
 
         return kernel
 
