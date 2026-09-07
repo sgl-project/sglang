@@ -64,7 +64,10 @@ from sglang.srt.layers.cp.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import (
+    is_cp_v2_active,
+    is_mla_prefill_cp_enabled,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -72,7 +75,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -361,8 +363,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
-        # storage; same physical tensors, stable data_ptr for capture vs
-        # replay. Replaces populate_from_forward_batch on capture/replay paths.
+        # storage; same physical tensors, stable data_ptr for capture vs replay.
         self.buffer_registry: CudaGraphBufferRegistry = build_prefill_registry(
             device=self.device,
             max_bs=self.max_bs,
@@ -581,7 +582,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = 0
 
     def _is_mamba_track_enabled(self) -> bool:
-        return self.model_runner.server_args.enable_mamba_extra_buffer() and (
+        return get_exec().mamba.enable_mamba_extra_buffer and (
             not get_memory().disable_radix_cache
         )
 
@@ -1413,7 +1414,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+        with freeze_gc(get_exec().graph.enable_cudagraph_gc):
             with graph_capture(
                 stream=get_or_create_global_graph_capture_stream()
             ) as graph_capture_context:
