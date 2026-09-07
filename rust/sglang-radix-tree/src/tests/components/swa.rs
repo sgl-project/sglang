@@ -3910,7 +3910,7 @@ fn backup_host_commit_sets_the_host_value() {
 }
 
 #[test]
-#[should_panic(expected = "is not device-only")]
+#[should_panic(expected = "slot already set")]
 fn backup_host_commit_rejects_a_target_that_is_already_backed_up() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
@@ -3924,8 +3924,8 @@ fn backup_host_commit_rejects_a_target_that_is_already_backed_up() {
 fn backup_host_commit_without_offsets_attaches_the_whole_span_once() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
-    // A hand-built transfer carries no offsets to scatter by, so the legacy
-    // single-node attach still applies and stays idempotent.
+    // A hand-built transfer carries no offsets to scatter by, so the whole
+    // span attaches to this node and a repeat commit is a no-op.
     for host in [30i64, 31] {
         commit_backup(&mut tc, a, &[host], /* nodes_to_load = */ None);
     }
