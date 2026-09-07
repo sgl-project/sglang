@@ -131,8 +131,8 @@ class Mm:
         "Device for fast visual (image and video) preprocessing, which runs in "
         "the tokenizer process. 'auto' takes the model processor's default, "
         "otherwise the platform's choice (the serving GPU on CUDA). 'cpu' keeps "
-        "preprocessing and JPEG decode off the GPU so the tokenizer process "
-        "creates no CUDA context. 'cuda' forces the serving GPU.",
+        "base preprocessing and JPEG decode off the GPU. Custom processors "
+        "and feature transports may still use CUDA. 'cuda' forces the serving GPU.",
     ] = "auto"
     mm_global_cache_backend: A[
         str,
