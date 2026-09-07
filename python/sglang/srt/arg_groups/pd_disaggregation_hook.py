@@ -211,6 +211,21 @@ def handle_encoder_disaggregation(server_args: Any):
             "EncoderBootstrapServer."
         )
 
+    if getattr(cfg, "enable_mooncake_kv_reshard", False):
+        if cfg.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(
+                "--enable-mooncake-kv-reshard requires PD prefill/decode mode"
+            )
+        if cfg.disaggregation_transfer_backend != "mooncake":
+            raise ValueError(
+                "--enable-mooncake-kv-reshard requires the mooncake transfer backend"
+            )
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+            raise ValueError(
+                "--enable-mooncake-kv-reshard is mutually exclusive with "
+                "SGLANG_DISAGG_STAGING_BUFFER=1 in V1"
+            )
+
     # Validate IB devices when mooncake backend is used
     if (
         cfg.disaggregation_transfer_backend == "mooncake"
