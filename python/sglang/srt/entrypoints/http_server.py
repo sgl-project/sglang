@@ -2374,16 +2374,28 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     freeze_headers = {}
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
-    try:
-        res = requests.post(
-            server_args.url() + "/freeze_gc",
-            headers=freeze_headers,
-            timeout=10,
-            verify=ssl_verify_of(server_args),
-        )
-        res.raise_for_status()
-    except requests.exceptions.RequestException:
-        logger.warning("post-warmup freeze_gc failed", exc_info=True)
+    # --skip-server-warmup bypasses the wait-for-server loop, so this request
+    # can race uvicorn binding its socket. The connect timeout and retry delay
+    # bound repeated connection failures to about 30 seconds.
+    max_attempts = 15
+    for attempt in range(max_attempts):
+        try:
+            res = requests.post(
+                server_args.url() + "/freeze_gc",
+                headers=freeze_headers,
+                timeout=(1, 10),
+                verify=ssl_verify_of(server_args),
+            )
+            res.raise_for_status()
+            return
+        except requests.exceptions.ConnectionError:
+            if attempt == max_attempts - 1:
+                logger.warning("post-warmup freeze_gc failed", exc_info=True)
+                return
+            time.sleep(1)
+        except requests.exceptions.RequestException:
+            logger.warning("post-warmup freeze_gc failed", exc_info=True)
+            return
 
 
 def _wait_and_warmup(
