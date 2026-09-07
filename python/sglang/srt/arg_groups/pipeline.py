@@ -287,8 +287,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Normalize load balancing defaults.
     handle_load_balance_method(server_args)
 
-    # The old runtime distinguishes DSA from other CP paths through legacy
-    # fields, so project only after attention_backend has been resolved.
+    # Protected runtimes still consume platform CP fields after backend selection.
     handle_legacy_cp_runtime_compatibility(server_args)
 
     # Handle context parallelism.

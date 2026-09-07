@@ -165,10 +165,11 @@ class UnifiedTreeNode:
         return self.hash_value[-1]
 
     def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
-        if node is None or node.hash_value is None:
-            return []
-
-        return node.get_prefix_hash_values(node.parent) + node.hash_value
+        chunks = []
+        while node is not None and node.hash_value is not None:
+            chunks.append(node.hash_value)
+            node = node.parent
+        return [value for chunk in reversed(chunks) for value in chunk]
 
 
 class UnifiedLRUList:
@@ -404,7 +405,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
-        self.eviction_strategy = get_eviction_strategy(params.eviction_policy.lower())
+        self.eviction_strategy = get_eviction_strategy(
+            params.eviction_policy.lower(), params.eviction_policy_config
+        )
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
