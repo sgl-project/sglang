@@ -58,6 +58,9 @@ class RequestMetrics:
         self.request_id = request_id
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
+        self.steps_by_stage: Dict[str, list[float]] = {}
+        self.stage_iterations: Dict[str, tuple[int, int]] = {}
+        self.active_stage_name: str | None = None
         self.total_duration_ms: float = 0.0
         self.suppress_stage_breakdown: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
@@ -77,7 +80,26 @@ class RequestMetrics:
         """Records the duration of a denoising step in execution order."""
         if self.suppress_stage_breakdown:
             return
-        self.steps.append(duration_s * 1000)
+        duration_ms = duration_s * 1000
+        self.steps.append(duration_ms)
+        if self.active_stage_name is not None:
+            self.steps_by_stage.setdefault(self.active_stage_name, []).append(
+                duration_ms
+            )
+
+    def record_stage_iterations(
+        self, measured_iterations: int, target_iterations: int
+    ) -> None:
+        """Record calibration and default-workload iterations for this stage."""
+        if self.suppress_stage_breakdown or self.active_stage_name is None:
+            return
+        measured = max(1, int(measured_iterations))
+        target = max(1, int(target_iterations))
+        previous = self.stage_iterations.get(self.active_stage_name, (0, 0))
+        self.stage_iterations[self.active_stage_name] = (
+            previous[0] + measured,
+            previous[1] + target,
+        )
 
     def record_memory_snapshot(self, checkpoint_name: str, snapshot: MemorySnapshot):
         if self.suppress_stage_breakdown:
