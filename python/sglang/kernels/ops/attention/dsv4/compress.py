@@ -49,6 +49,7 @@ def _jit_compress_norm_rope_module(
     rope_dim: int,
     page_size: int,
     bf16_store: bool = False,
+    uniform_fp8_store: bool = False,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -58,6 +59,7 @@ def _jit_compress_norm_rope_module(
         is_arch_support_pdl(),
         INDEXER_K_CACHE_PRESHUFFLE_TILE if aiter_can_use_preshuffle_paged_mqa() else 0,
         bf16_store,
+        uniform_fp8_store,
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
@@ -430,6 +432,7 @@ def compress_norm_rope_store(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    uniform_fp8_store: bool = False,
     # HIP FP4 uses split scale storage and precomputed BF16 RoPE tables.
     kvcache_scale: Optional[torch.Tensor] = None,
     rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
@@ -437,6 +440,10 @@ def compress_norm_rope_store(
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
+    if uniform_fp8_store:
+        # Uniform 512-byte-per-token e4m3 pool (trtllm backend): plain cast at
+        # per-tensor scale 1.0, rope tail included; no packed scales.
+        assert kv.shape[-1] == 512 and not use_fp4 and not bf16_store
     if is_hip() and use_fp4:
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
             aiter_k_indexer_fp4_cache_write,
@@ -456,7 +463,6 @@ def compress_norm_rope_store(
             write_metadata=fp4_k_write_metadata,
         )
         return
-
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     if _is_xpu:
         compress_norm_rope_store_xpu(
@@ -474,7 +480,12 @@ def compress_norm_rope_store(
         )
     else:
         module = _jit_compress_norm_rope_module(
-            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
+            kv.dtype,
+            kv.shape[-1],
+            freq_cis.shape[-1],
+            page_size,
+            bf16_store,
+            uniform_fp8_store,
         )
         fn = module.forward_fp4 if use_fp4 else module.forward
         if norm_weight.dtype != kv.dtype:

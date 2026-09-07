@@ -718,7 +718,9 @@ class MqaAttentionBase(nn.Module):
         self.fuse_wqa_wkv = fuse
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self._attn_sink_local: Optional[torch.Tensor] = None
+        # Cached per-rank sink slices, keyed by whether the head dim is
+        # padded to match a padded q (see pads_tp_q_heads).
+        self._attn_sink_local: dict = {}
         if fuse:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -826,17 +828,19 @@ class MqaAttentionBase(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
-    def _local_attn_sink(self) -> torch.Tensor:
+    def _local_attn_sink(self, padded: bool = True) -> torch.Tensor:
         if self.attn_tp_size == 1:
             return self.attn_sink
-        if self._attn_sink_local is None:
+        if self._attn_sink_local.get(padded) is None:
             rank = self.attn_tp_rank
             num_heads = self.n_local_heads
-            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            padded_num_heads = (
+                (64 if num_heads <= 64 else self.n_heads) if padded else num_heads
+            )
             sink = self.attn_sink.new_zeros(padded_num_heads)
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
-            self._attn_sink_local = sink
-        return self._attn_sink_local
+            self._attn_sink_local[padded] = sink
+        return self._attn_sink_local[padded]
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -1028,7 +1032,20 @@ class MQALayer(MqaAttentionBase):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if q_out is None:
-            q_out = torch.empty_like(q)
+            # The trtllm-gen backend consumes q as e4m3: have the fused
+            # kernel store fp8 directly (bit-identical to a bf16 store
+            # followed by .to(float8_e4m3fn)) instead of paying a separate
+            # per-layer cast pass. Paths that pass a preallocated bf16
+            # q_out (TP head padding) keep the backend-side cast.
+            fp8_out = getattr(self, "_q_fp8_out", None)
+            if fp8_out is None:
+                fp8_out = bool(getattr(get_attn_backend(), "trtllm_attn", False))
+                self._q_fp8_out = fp8_out
+            q_out = torch.empty(
+                q.shape,
+                dtype=torch.float8_e4m3fn if fp8_out else q.dtype,
+                device=q.device,
+            )
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
@@ -1153,6 +1170,13 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+
+        # qkv_a is consumed on stream_kv (a stream it was not allocated on),
+        # so its reference must outlive the stream join above: dropping it
+        # right after the fork lets the caching allocator hand its block to a
+        # later allocation with no cross-stream dependency edge, and under
+        # CUDA graph capture the recorded overwrite races the side-stream KV
+        # store on replay (silently garbage KV; see the TP bs=1 collapse).
         del qkv_a
 
         return q
@@ -1653,16 +1677,20 @@ class MQALayer(MqaAttentionBase):
         # Above this the SM120 route is the prefill kernel, which takes
         # arbitrary h_q, so the decode pad below would just be sliced back off.
         skip_decode_pad = is_sm120_supported() and x.shape[0] > SM120_DECODE_MAX_TOKENS
-        if self.attn_tp_size > 1:
-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
-            padded_num_heads = (
-                self.n_local_heads
-                if skip_decode_pad
-                else (64 if self.n_local_heads <= 64 else self.n_heads)
-            )
+        # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64,
+        # 128}, so TP-sharded heads are padded up to 64 for it. The trtllm-gen
+        # kernel handles per-rank head counts natively (verified bit-identical
+        # h=16 vs padded h=64), so it opts out and skips the pad entirely.
+        pad_q_heads = (
+            self.attn_tp_size > 1
+            and not skip_decode_pad
+            and getattr(attn_backend, "pads_tp_q_heads", True)
+        )
+        if pad_q_heads:
+            # Pad the per-rank heads to 64 (not the full n_heads) when they fit,
+            # to dispatch the cheaper decode::head64 variant; attn_sink is
+            # sliced to this rank and padded to match.
+            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
@@ -1673,7 +1701,7 @@ class MQALayer(MqaAttentionBase):
                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink()
+        attn_sink = self._local_attn_sink(padded=pad_q_heads)
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -1743,8 +1771,11 @@ class MQALayer(MqaAttentionBase):
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+                # Attention emits bf16 regardless of q's dtype (q may be e4m3
+                # on the trtllm fused-q path); don't derive o's dtype from q.
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                    dtype=torch.bfloat16,
                 )
                 bcg_deepseek_v4_attention_with_output(
                     attn_q,

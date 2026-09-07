@@ -365,6 +365,12 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         metadata.c128_topk_lengths_clamp1 = torch.tensor(
             [base + 39, base + 40], dtype=torch.int32
         )
+        metadata.trtllm_seq_lens_req = torch.tensor(
+            [base + 41, base + 42], dtype=torch.int32
+        )
+        metadata.trtllm_cum_seq_lens_q = torch.tensor(
+            [0, base + 1, base + 2], dtype=torch.int32
+        )
         metadata.c1_flashmla_metadata = object()
         metadata.c4_flashmla_metadata = object()
         metadata.c128_flashmla_metadata = object()
@@ -412,6 +418,26 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             backend.shared_read_ends(ForwardMode.EXTEND),
             SharedReadEnds.PRE_REPLAY,
         )
+
+    def test_trtllm_warmup_does_not_create_flashmla_scheduler_metadata(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.trtllm_attn = True
+        backend.forward_metadata = DSV4Metadata(
+            self._make_core_metadata(0), indexer_metadata=None
+        )
+        backend._current_capture_raw = None
+
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend._create_flashmla_metadata"
+        ) as create:
+            backend.on_after_cuda_graph_warmup()
+
+        create.assert_not_called()
 
     def test_snapshot_builds_cache_only_for_sparse_prefill(self):
         from sglang.srt.environ import envs
@@ -512,6 +538,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
+            "trtllm_seq_lens_req",
+            "trtllm_cum_seq_lens_q",
         ]
         reference_assign_fields = [
             "page_table",
@@ -619,6 +647,84 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertEqual(grown.shape, (7, 1, 512))
         self.assertNotEqual(grown.data_ptr(), first.data_ptr())
         self.assertEqual(workspace._buffer.data_ptr(), grown.data_ptr())
+
+    def test_trtllm_padded_output_reuses_storage_and_zeros_only_tail(self):
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            DeepseekV4TrtllmAttnBackend,
+        )
+
+        backend = object.__new__(DeepseekV4TrtllmAttnBackend)
+        backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
+        backend.trtllm_eager_output_buffer = None
+
+        output = backend._padded_output_buffer(num_rows=8, num_real_rows=6, num_heads=2)
+
+        self.assertEqual(
+            output.data_ptr(), backend.trtllm_graph_output_buffer.data_ptr()
+        )
+        self.assertTrue(torch.all(output[:6] == 7))
+        self.assertTrue(torch.all(output[6:] == 0))
+
+    def test_trtllm_prefill_slices_padding_in_dense_token_layout(self):
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            DeepseekV4TrtllmAttnBackend,
+        )
+
+        core = SimpleNamespace(
+            trtllm_prefill_qmeta=None,
+            seq_lens_casual=torch.tensor(
+                [6, 7, 8, 14, 15, 16, 0, 0], dtype=torch.int64
+            ),
+            trtllm_prefill_swa_indices=torch.zeros((6, 128), dtype=torch.int32),
+            trtllm_prefill_swa_lens=torch.full((6,), 128, dtype=torch.int32),
+            trtllm_prefill_c4_indices=None,
+            trtllm_prefill_c4_lens=None,
+            trtllm_prefill_c128=None,
+        )
+        backend = object.__new__(DeepseekV4TrtllmAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.forward_metadata = SimpleNamespace(core_attn_metadata=core)
+        backend.trtllm_workspace_buffer = torch.empty(1, dtype=torch.int8)
+        backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
+        backend.trtllm_eager_output_buffer = None
+        backend._trtllm_kv_cache_views = lambda _layer_id, _ratio: (
+            torch.empty(1),
+            torch.empty(1),
+        )
+        backend._get_trtllm_bmm_scales = lambda _layer: (1.0, 1.0)
+
+        captured = {}
+
+        def fake_attention(**kwargs):
+            captured.update(kwargs)
+            return kwargs["out"]
+
+        forward_batch = SimpleNamespace(
+            extend_seq_lens_cpu=[3, 3],
+        )
+        q = torch.empty((8, 2, 512), dtype=torch.float8_e4m3fn)
+
+        with mock.patch(
+            "flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4",
+            side_effect=fake_attention,
+        ):
+            output = backend._forward_trtllm_prefill(
+                q=q,
+                layer=SimpleNamespace(layer_id=0),
+                compress_ratio=0,
+                forward_batch=forward_batch,
+                attn_sink=torch.zeros(2, dtype=torch.float32),
+                extra_indices=None,
+            )
+
+        self.assertEqual(captured["query"].shape, (6, 1, 2, 512))
+        self.assertNotIn("cum_seq_lens_q", captured)
+        self.assertNotIn("max_q_len", captured)
+        self.assertEqual(captured["seq_lens"].tolist(), [6, 7, 8, 14, 15, 16])
+        self.assertEqual(captured["sparse_indices"].shape, (6, 128))
+        self.assertEqual(captured["out"].shape, (6, 1, 2, 512))
+        self.assertEqual(output.shape, (8, 2, 512))
+        self.assertTrue(torch.all(output[6:] == 0))
 
     def test_sparse_prefill_c4_uses_live_extent(self):
         page_table = torch.zeros((2, 4096), dtype=torch.int32)
