@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
@@ -13,7 +15,6 @@ except ImportError:
     StructuralTag = Any
     get_model_structural_tag = None
 
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -25,6 +26,11 @@ from sglang.srt.function_call.utils import (
     _is_complete_json,
     _partial_json_loads,
 )
+
+if TYPE_CHECKING:
+    # Lazy: importing protocol eagerly would pull the whole openai SDK into
+    # the scheduler import path.
+    from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
 logger = logging.getLogger(__name__)
 
@@ -417,6 +423,9 @@ class BaseFormatDetector(ABC):
             return None
 
         converted_tools = [tool.model_dump() for tool in tools or []]
+        # Lazy import: keeps the openai SDK off the scheduler import path.
+        from sglang.srt.entrypoints.openai.protocol import ToolChoice
+
         converted_tool_choice = (
             tool_choice.model_dump()
             if isinstance(tool_choice, ToolChoice)

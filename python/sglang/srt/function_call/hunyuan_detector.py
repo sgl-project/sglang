@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
-from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -13,6 +14,11 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import get_schema_properties
+
+if TYPE_CHECKING:
+    # Lazy: importing protocol eagerly would pull the whole openai SDK into
+    # the scheduler import path.
+    from sglang.srt.entrypoints.openai.protocol import Tool
 
 logger = logging.getLogger(__name__)
 
