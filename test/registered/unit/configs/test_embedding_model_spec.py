@@ -14,7 +14,7 @@ from sglang.srt.configs.embedding_model_spec import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestEmbeddingModelSpec(unittest.TestCase):
@@ -71,7 +71,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         )
         plan = resolved_embedding_plan(
             spec,
-            server_args=SimpleNamespace(
+            config=SimpleNamespace(
                 is_embedding=True,
                 cuda_graph_config=SimpleNamespace(
                     prefill=SimpleNamespace(

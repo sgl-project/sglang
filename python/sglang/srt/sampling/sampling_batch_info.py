@@ -20,6 +20,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,6 @@ class SamplingBatchInfo:
 
     # Per-request flag for returning sparse sampling support metadata.
     return_sampling_masks: Optional[List[bool]] = None
-    sampling_mask_max_top_k: int = 0
 
     # Device
     device: str = "cuda"
@@ -145,10 +145,6 @@ class SamplingBatchInfo:
             and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
-        sampling_mask_max_top_k = max(
-            (r.sampling_params.top_k for r in reqs if r.return_sampling_mask),
-            default=0,
-        )
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -214,7 +210,6 @@ class SamplingBatchInfo:
             device=device,
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
-            sampling_mask_max_top_k=sampling_mask_max_top_k,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -280,7 +275,7 @@ class SamplingBatchInfo:
             self.acc_additive_penalties = None
             self.acc_scaling_penalties = None
 
-    def apply_logits_bias(self, logits: torch.Tensor):
+    def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
         if self.acc_additive_penalties is not None:
             # Used in the overlap mode
             logits.add_(self.acc_additive_penalties)
@@ -293,11 +288,32 @@ class SamplingBatchInfo:
             # Used in the non-overlap mode
             self.penalizer_orchestrator.apply(logits)
 
+    def _apply_post_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
+        if self.logit_bias is not None:
+            logits.add_(self.logit_bias)
+
+    def apply_logits_bias(self, logits: torch.Tensor):
+        self._apply_pre_grammar_logits_transforms(logits)
+
         if self.grammar_mask is not None:
             self.grammar_mask.apply(logits)
 
-        if self.logit_bias is not None:
-            logits.add_(self.logit_bias)
+        self._apply_post_grammar_logits_transforms(logits)
+
+    def apply_logits_bias_with_observer(
+        self,
+        logits: torch.Tensor,
+        observer: SamplingObserver,
+    ) -> Any:
+        self._apply_pre_grammar_logits_transforms(logits)
+        observer_state = observer.before_grammar(logits, self)
+
+        if self.grammar_mask is not None:
+            self.grammar_mask.apply(logits)
+
+        self._apply_post_grammar_logits_transforms(logits)
+
+        return observer_state
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
@@ -423,9 +439,6 @@ class SamplingBatchInfo:
             self.return_sampling_masks = (
                 self.return_sampling_masks or [False] * self_len
             ) + (other.return_sampling_masks or [False] * other_len)
-            self.sampling_mask_max_top_k = max(
-                self.sampling_mask_max_top_k, other.sampling_mask_max_top_k
-            )
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before

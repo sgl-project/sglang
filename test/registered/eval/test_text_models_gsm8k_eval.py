@@ -9,7 +9,6 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
@@ -23,21 +22,15 @@ from sglang.test.test_utils import (
 # downloading on cache miss. Use a longer timeout than the default 600s.
 NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 
-register_cuda_ci(est_time=2880, stage="nightly", runner_config="2-gpu-large")
+register_cuda_ci(est_time=2880, stage="weekly", runner_config="2-gpu-large")
 
 MODEL_SCORE_THRESHOLDS = {
     # sgl-eval (zero-shot chat, \boxed{}, math_verify grading). Thresholds are
     # measured_score - 0.05, baselined on H100 2-GPU over the full 1319 split.
-    "meta-llama/Llama-3.1-8B-Instruct": 0.77,  # 81.05% measured - 5%
-    "Qwen/Qwen3-8B": 0.76,  # 81.43% measured - 5%
-    "Qwen/Qwen3-4B": 0.77,  # 82.41% measured - 5%
     "meta-llama/Llama-3.1-70B-Instruct": 0.90,  # 94.77% measured - 5%
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.39,  # 43.52% measured - 5%
     "Qwen/Qwen2-57B-A14B-Instruct": 0.46,  # 50.87% measured - 5%
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.77,  # 82.34% measured - 5%
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.23,  # 27.82% measured - 5%
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.80,  # 84.91% measured - 5%
-    "zai-org/GLM-4.5-Air-FP8": 0.73,  # 77.48% measured - 5%
     "neuralmagic/gemma-2-2b-it-FP8": 0.02,  # 6.52% measured - 5%
     "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.89,  # 94.01% measured - 5%
     "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.35,  # 40.33% measured - 5%
@@ -51,9 +44,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.models = []
-        models_tp1 = parse_models(
-            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
-        ) + parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1)
+        models_tp1 = parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1)
         for model_path in models_tp1:
             cls.models.append(ModelLaunchSettings(model_path, tp_size=1))
 

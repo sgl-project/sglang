@@ -6,7 +6,7 @@ from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=500, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(est_time=500, suite="full-4-npu-a3", nightly=True)
 
 
 class TestQwen330BAttnCP(GSM8KAscendMixin, CustomTestCase):

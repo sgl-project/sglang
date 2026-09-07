@@ -34,7 +34,7 @@ the full contract):
 | `quantizations` | `{id, label}[]` | 3rd-dim option list. |
 | `strategies` | `{id, label}[]` | 4th-dim option list. Canonical ids: `low-latency` / `balanced` / `high-throughput` (never model-specific ids like `mtp`). **The count follows the page's operating points**: one recipe → a single `balanced`; two → `low-latency` + `high-throughput`; three → the full trio (the ideal). Tiers apply per (hw × variant × quant) combination — a single-recipe combination parks under its semantically honest tier (clear slant → that tier, e.g. DSv4's RTX 6000 → `low-latency`; no slant → `balanced`, e.g. Qwen3.5's Xeon); the page's list is the union and the engine greys unused chips per selection. Never invent a recipe just to fill chips. When two recipes differ by MTP / speculative decoding, the assignment is deterministic: spec ON → `low-latency`, spec OFF → `high-throughput` (at saturation the draft+verify overhead outweighs the speedup — same reason DSv4's high-throughput recipes disable MTP). The recurring markers in the other direction: dp-attention ON (MLA-attention models) and EP / DP+EP ON (MoE models) → `high-throughput`. |
 | `nodesOptions` | `{id, label}[]` | 5th-dim option list. The `id` MUST be `single` or `multi-N` — the engine parses N from the id for `--nnodes`. |
-| `cells` | `{match, verified?, nnodes?, env, flags}[]` | One per supported (hw × match-dim) combination. See §2.2. `nnodes` supplies the node count when the config declares no `nodes` dim (default 1). |
+| `cells` | `{match, verified?, verificationStatus?, nnodes?, env, flags}[]` | One per supported (hw × match-dim) combination. See §2.2. `nnodes` supplies the node count when the config declares no `nodes` dim (default 1). |
 | `modelNames` | `{[key]: string}` | HF slug lookup. Keys are either `hw\|variant\|quant` (most specific) or `variant\|quant` (fallback). |
 | `placeholders` | `{[key]: {target, label, default?}}` | `{{KEY}}` interpolation map for command + curl. `target` is `'command'` or `'curl'`. Editable through the Env modal. |
 | `curl` | string | cURL template. Uses `{{MODEL_NAME}}` + placeholder keys. |
@@ -44,7 +44,7 @@ the full contract):
 | Field | Type | Purpose |
 |---|---|---|
 | `multiNodeHints` | `{[hwId]: string[]}` | Lines prepended as `# ...` comments to multi-node commands (env-var hints). Per-hw, and only for hw whose **cluster fabric needs manual NIC config** (e.g. `gb200` NVL72/MNNVL → NVSHMEM/Gloo hints). NOT every multi-N hw needs an entry — standard-IB DeepEP (h200) auto-detects the HCA, and Marlin multi-node (h100) uses no DeepEP/NVSHMEM at all. Hints render above **both** run modes, so keep them mode-agnostic: `docker run` flags belong in the hardware entry's `multiNodeDockerFlags` (above), which the engine puts in the command itself. |
-| `dockerImages` | `{[key]: string}` | Image for `docker run` framing, keyed by `hw\|quant` (most specific) then `hw`. Use a `hw\|quant` key only when one quant on a shared GPU needs a different image (e.g. an NVFP4 dev build on b300/gb300 while FP8/BF16 stay on the release image); otherwise key by plain `hw`. **Ask the user which sglang build the recipes ran on; don't guess a supporting release.** Falls back to `lmsysorg/sglang:dev` if missing — also the sensible default when unsure. |
+| `dockerImages` | `{[key]: string}` | Image for `docker run` framing, keyed by `hw\|variant\|quant` (most specific), then `variant\|quant`, `hw\|quant\|strategy`, `hw\|quant`, `hw`. Key by plain `hw` unless a subset needs a different image: `hw\|quant` when one quant on a shared GPU needs its own build (e.g. an NVFP4 dev build on b300/gb300 while FP8/BF16 stay on the release image); the `variant` keys when one checkpoint needs its own build (e.g. a preview image for a not-yet-released variant); the `strategy` key when one tier needs one (e.g. a spec-decoding preview). **Ask the user which sglang build the recipes ran on; don't guess a supporting release.** Falls back to `lmsysorg/sglang:dev` if missing — also the sensible default when unsure. |
 | `playgroundFeatures` | `{[axisId]: {...}}` | Opts into the Playground widget. See §2.3. |
 | `benchmarkCommands` | `{speed: string, accuracy: {[accKey]: string \| {[variant]: string}}, numPromptsByConc?: {[c]: number}}` | Powers the benchmark card's **"⚡ Reproduce"** modal. `speed` is ONE `bench_serving` template; the engine fills `{{DATASET}}`/`{{ISL}}`/`{{OSL}}` from each cell's `speed[].workload`, the chip-picked `{{MAX_CONCURRENCY}}`, and `{{NUM_PROMPTS}}` (resolved `workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)`). `accuracy` maps an accuracy field (e.g. `gsm8k_pct`) to a per-eval template — a string, OR a `{flash, pro, …}` object keyed by variant when the command differs per variant (e.g. GPQA/AIME `--max-tokens`). The modal renders a chip per eval (one command area, like Speed). Both also use `{{MODEL_NAME}}` + `{{CURL_HOST}}`/`{{CURL_PORT}}` like `curl`. `speed` should carry `--flush-cache` (bench_serving's `random` prompts are deterministic — warm reruns hit the radix cache and inflate throughput; measure cache-cold). Optional; the button only appears when this AND `benchmarks` are present. |
 | `defaultAccuracy` | `{[variant]: {[accKey]: number}}` | Model-level accuracy applied to **every** cell of a variant (e.g. GPQA Diamond / AIME25 — hardware-independent). Merged UNDER each cell's measured `accuracy` (a per-cell value wins), so you set a variant's score once instead of copying it onto every benchmark entry. Keys must match `accuracyLabels` (below) + `benchmarkCommands.accuracy`. |
@@ -114,6 +114,17 @@ Each cell describes one verified (or auto-estimated) launch recipe.
 
 - `match` MUST contain exactly the 5 keys: `hw`, `variant`, `quant`,
   `strategy`, `nodes`. The engine looks up cells by tuple equality.
+- `verified` is the badge baseline (`true` → green **Verified**, absent →
+  yellow **Not Verified**). `verificationStatus` overrides it with a third
+  state — `"verified" | "in-progress" | "unverified"` — for a recipe whose
+  verification round is OPEN rather than absent. It may also be a FUNCTION of
+  the selection, which is how a cell reports a per-pick state: e.g.
+  `verificationStatus: (sel) => sel.spec === "dflash" ? "in-progress" :
+  "verified"` marks one speculative option as still being validated while the
+  cell's other picks stay Verified. An unrecognized string falls back to
+  `unverified`, so a typo can never render as a green badge — and
+  `check_cookbook_configs.mjs` probes the function over every reachable
+  selection, so a typo or a crash fails the check instead of reaching the page.
 - `env` and `flags` are FLAT literals. The engine does NOT expand
   fragments, aliases, or templates — it consumes them verbatim
   (only `{{PLACEHOLDER}}` substitutions happen at render time).

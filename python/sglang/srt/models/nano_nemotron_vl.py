@@ -41,7 +41,6 @@ from sglang.srt.models.parakeet import ProjectedParakeet
 from sglang.srt.models.radio import RadioModel
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.evs import EVS, EVSConfig
-from sglang.srt.multimodal.evs.evs_module import VideoEVSDataItem
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -148,8 +147,11 @@ class NemotronH_Nano_VL_V2(EVS):
 
         if audio_items:
             for item in visual_items:
-                if isinstance(item, VideoEVSDataItem):
-                    item.pre_chunked_input_ids = input_ids
+                if (
+                    item.is_video()
+                    and "pre_chunked_input_ids" in item.model_specific_data
+                ):
+                    item.set("pre_chunked_input_ids", input_ids)
 
         return input_ids
 

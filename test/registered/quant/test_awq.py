@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=220, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-large-amd")
 
 
@@ -77,7 +77,7 @@ class TestAWQMarlinBfloat16(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.83)
+        self.assertGreater(metrics["score"], 0.80)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ try:
 except ImportError:
     _HAS_GRANIAN = False
 
-register_cuda_ci(est_time=150, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=108, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -41,7 +41,11 @@ class TestHTTP2Server(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-http2"],
+            other_args=[
+                "--enable-http2",
+                "--http2-max-concurrent-streams",
+                "64",
+            ],
         )
 
     @classmethod
@@ -126,7 +130,13 @@ class TestHTTP2ServerMultiTokenizer(TestHTTP2Server):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-http2", "--tokenizer-worker-num", "2"],
+            other_args=[
+                "--enable-http2",
+                "--http2-max-concurrent-streams",
+                "64",
+                "--tokenizer-worker-num",
+                "2",
+            ],
         )
 
 

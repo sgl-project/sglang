@@ -31,15 +31,15 @@ def _check_msa_dtypes(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Ten
     # on q.dtype alone and casts the k/v pointers to the same element type, so
     # a mismatched cache would be silently reinterpreted.
     if q.dtype == torch.bfloat16:
-        assert (
-            k_cache.dtype == torch.bfloat16
-        ), f"MSA bf16 requires a bf16 K cache, got {k_cache.dtype}"
+        assert k_cache.dtype == torch.bfloat16, (
+            f"MSA bf16 requires a bf16 K cache, got {k_cache.dtype}"
+        )
     elif q.dtype == torch.float8_e4m3fn:
         # e5m2 is rejected here too: fmha_sm100's variant lookup falls back to
         # the e4m3 kernel for unknown dtype codes.
-        assert (
-            k_cache.dtype == torch.float8_e4m3fn
-        ), f"MSA fp8 requires an fp8_e4m3fn K cache, got {k_cache.dtype}"
+        assert k_cache.dtype == torch.float8_e4m3fn, (
+            f"MSA fp8 requires an fp8_e4m3fn K cache, got {k_cache.dtype}"
+        )
     else:
         raise AssertionError(f"MSA supports bf16 or fp8_e4m3fn Q, got {q.dtype}")
     assert v_cache.dtype == k_cache.dtype

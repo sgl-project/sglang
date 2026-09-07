@@ -30,9 +30,9 @@ import triton.language as tl
 def unpack_aux_tensors(score_mod, aux_tensors):
     if score_mod is None:
         return None, 0, 0, 0
-    assert (
-        aux_tensors is not None and len(aux_tensors) == 1
-    ), "Triton score_mod currently requires exactly one aux tensor"
+    assert aux_tensors is not None and len(aux_tensors) == 1, (
+        "Triton score_mod currently requires exactly one aux tensor"
+    )
     aux0 = aux_tensors[0]
     assert aux0.dim() == 3 and aux0.stride(2) == 1, (
         f"aux_tensors[0] must be 3D with a contiguous last dim, "

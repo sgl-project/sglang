@@ -30,14 +30,14 @@ from sglang.kernels.ops.layernorm.norm import (
     fused_inplace_qknorm,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -296,11 +296,11 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         _is_cuda
         and pool.dtype == torch.bfloat16
         and not isinstance(pool, SWAKVPool)
-        and not is_prefill_context_parallel_enabled()
+        and not is_cp_v2_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
     ) or (
         _is_hip
-        and not is_prefill_context_parallel_enabled()
+        and not get_parallel().enable_prefill_context_parallel
         and getattr(forward_batch, "dcp_kv_mask", None) is None
     )
 
@@ -382,9 +382,9 @@ def compute_cu_seqlens_from_grid_numpy(grid_thw: torch.Tensor) -> torch.Tensor:
     Returns:
         cu_seqlens: 1D int32 tensor on CPU, shape [N + 1]
     """
-    assert (
-        grid_thw.device.type == "cpu"
-    ), "compute_cu_seqlens_from_grid_numpy expects a CPU tensor"
+    assert grid_thw.device.type == "cpu", (
+        "compute_cu_seqlens_from_grid_numpy expects a CPU tensor"
+    )
     arr = grid_thw.numpy()
 
     cu_seqlens = np.repeat(arr[:, 1] * arr[:, 2], arr[:, 0]).cumsum(
@@ -593,6 +593,9 @@ def fused_qk_gemma_rmsnorm(
     q_out = torch.empty(q_rows, head_dim, dtype=q.dtype, device=q.device)
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
 
+    if _is_hip and q_rows == 0:
+        return q_out, k_out
+
     BLOCK_HD = triton.next_power_of_2(head_dim)
 
     _fused_qk_gemma_rmsnorm_kernel[(q_rows,)](
@@ -708,6 +711,9 @@ def fused_qk_gemma_rmsnorm_with_gate(
     q_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
     gate_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
+
+    if _is_hip and q_rows == 0:
+        return q_out, k_out, gate_out
 
     BLOCK_HD = triton.next_power_of_2(head_dim)
 

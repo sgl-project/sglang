@@ -5,7 +5,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.gpt_oss_common import BaseTestGptOss
 
-register_cuda_ci(est_time=345, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=336, stage="extra-a", runner_config="1-gpu-small")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is not available")
@@ -22,10 +22,12 @@ class TestGptOssSm120(BaseTestGptOss):
         self.run_test(
             model_variant="20b",
             quantization="mxfp4",
+            # high and medium sit below low because max_tokens=4096 truncates
+            # 70% / 34% of their answers, not because the model degrades.
             expected_score_of_reasoning_effort={
-                "low": 0.34,
-                "medium": 0.34,
-                "high": 0.27,
+                "low": 0.48,
+                "medium": 0.39,
+                "high": 0.26,
             },
         )
 

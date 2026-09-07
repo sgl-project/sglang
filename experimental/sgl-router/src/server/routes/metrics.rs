@@ -95,7 +95,6 @@ mod tests {
         let body = std::str::from_utf8(&body).unwrap();
         // Every metric family should at least carry its HELP/TYPE lines.
         assert!(body.contains("# TYPE sgl_router_requests_total counter"));
-        assert!(body.contains("# TYPE sgl_router_overlap_blocks histogram"));
         assert!(body.contains("# TYPE sgl_router_active_load gauge"));
     }
 

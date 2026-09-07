@@ -60,7 +60,6 @@ def _interp_clamped(xs: list[int], ys: list[float], x: float) -> float:
 
 
 class SpsAdditiveCostTable(msgspec.Struct, frozen=True):
-
     bias_seconds: float
     bs_probes: list[int]
     alpha_seconds: list[float]
