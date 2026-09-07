@@ -1,5 +1,5 @@
 import abc
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -15,6 +15,10 @@ class BaseSWAKVPool(KVCache):
     """
 
     swa_kv_pool: KVCache
+    # Set when SWA KV is a fixed per-request ring of this many tokens, addressed
+    # by req_pool_idx, instead of a paged token pool. The paged SWA allocator is
+    # then vestigial and SWA must not be budgeted per token.
+    swa_req_ring_size: Optional[int] = None
 
     @abc.abstractmethod
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:

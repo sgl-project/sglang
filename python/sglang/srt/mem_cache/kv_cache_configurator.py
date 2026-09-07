@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
+    is_swa_req_ring,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
@@ -337,25 +338,20 @@ class KVCacheConfigurator:
         )
 
         swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
-        # Unified-KV DSV4: swa_max_total_num_tokens was sized from the vestigial
-        # SWA pool; reconcile to real ring capacity. swa_kv_pool is None here.
-        if (
-            self.is_hybrid_swa
-            and not self.is_draft_worker
-            and getattr(pools.token_to_kv_pool, "_unified_kv", False) is True
-        ):
-            alloc = pools.token_to_kv_pool_allocator
-            if hasattr(alloc, "swa_available_size"):
-                ring_capacity = int(alloc.swa_available_size())
-                # Only reconcile downward: a value >= the current total means
-                # swa_available_size() hit its non-binding fallback.
-                if 0 < ring_capacity < swa_max_total_num_tokens:
-                    logger.info(
-                        "Unified-KV: reconciling swa_max_total_num_tokens "
-                        f"{swa_max_total_num_tokens} -> {ring_capacity} "
-                        "(fixed per-request SWA ring capacity)."
-                    )
-                    swa_max_total_num_tokens = ring_capacity
+        # Per-request SWA ring: swa_max_total_num_tokens was sized from the
+        # vestigial paged SWA pool; reconcile to the real ring capacity.
+        alloc = pools.token_to_kv_pool_allocator
+        if not self.is_draft_worker and is_swa_req_ring(alloc):
+            ring_capacity = int(alloc.swa_available_size())
+            # Only reconcile downward: a value >= the current total means
+            # swa_available_size() hit its non-binding fallback.
+            if 0 < ring_capacity < swa_max_total_num_tokens:
+                logger.info(
+                    "SWA ring: reconciling swa_max_total_num_tokens "
+                    f"{swa_max_total_num_tokens} -> {ring_capacity} "
+                    "(fixed per-request SWA ring capacity)."
+                )
+                swa_max_total_num_tokens = ring_capacity
 
         logger.info(
             f"Memory pool end. "
@@ -1368,6 +1364,13 @@ class KVCacheConfigurator:
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
         )
+        if not self.is_draft_worker and token_to_kv_pool._unified_kv:
+            # Unified-KV C4 state is a per-request ring: reset a row's ring
+            # whenever its req slot is handed out again. The draft pool has no
+            # C4 layers and shares this req pool, so only the target registers.
+            req_to_token_pool.register_on_alloc_rows(
+                token_to_kv_pool.clear_c4_req_states
+            )
         return token_to_kv_pool
 
     def _build_oot_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:

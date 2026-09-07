@@ -656,6 +656,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.unified_swa_window = self.sliding_window
             self.unified_swa_ring_size = self.sliding_window + spec_extra
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
+            self.swa_req_ring_size = self.unified_swa_ring_size
         else:
             self.unified_kv_pool = None
             self.swa_kv_pool = self._make_kv_pool(

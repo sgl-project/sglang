@@ -27,7 +27,7 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -138,6 +138,9 @@ class DecodeReqToTokenPool:
     #running <= 8, #pre-allocated + #transfer <= pre_alloc_size, so we can use the free memory to pre-allocate requests to unblock prefill.
     """
 
+    # Mirrors ReqToTokenPool.register_on_alloc_rows.
+    _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+
     def __init__(
         self,
         size: int,
@@ -203,6 +206,8 @@ class DecodeReqToTokenPool:
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        if self._on_alloc_rows is not None and select_index:
+            self._on_alloc_rows(select_index)
         offset = 0
         for r in reqs:
             if not r.kv.holds_kv:
@@ -219,6 +224,10 @@ class DecodeReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
+
+    def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
+        assert self._on_alloc_rows is None
+        self._on_alloc_rows = hook
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -1768,22 +1777,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        is_new_req_slot = req.kv.req_pool_idx is None
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert req_pool_indices is not None, (
             "req_pool_indices is full! There is a bug in memory estimation."
         )
-        if (
-            is_new_req_slot
-            and getattr(self.token_to_kv_pool, "_unified_kv", False) is True
-        ):
-            # Unified-KV DSV4 only: reset the stale C4 ring on a fresh slot.
-            clear_c4_req_states = getattr(
-                self.token_to_kv_pool, "clear_c4_req_states", None
-            )
-            if clear_c4_req_states is not None:
-                clear_c4_req_states(req_pool_indices)
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len

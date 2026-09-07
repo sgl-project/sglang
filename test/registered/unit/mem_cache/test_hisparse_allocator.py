@@ -131,7 +131,6 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.req_to_token_pool = req_to_token_pool
         queue.token_to_kv_pool_allocator = allocator
-        queue.token_to_kv_pool = None
         queue.tree_cache = SimpleNamespace(
             evictable_size=MagicMock(return_value=0),
             protected_size=MagicMock(return_value=0),

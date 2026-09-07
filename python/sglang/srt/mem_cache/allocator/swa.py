@@ -32,6 +32,10 @@ _SWA_PEER_RELEASED = Invariant("swa.peer_released", Bucket.GUARD, IsTrue())
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
+    # Per-request SWA ring (BaseSWAKVPool.swa_req_ring_size). Class default so
+    # subclasses that bypass this __init__ read False.
+    _swa_req_ring = False
+
     def __init__(
         self,
         size: int,
@@ -110,22 +114,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self._kvcache = kvcache
 
-        # Unified-KV DSV4: the DSV4 kernels address SWA as a per-request ring, so
-        # the paged indices built here are unused and the bound is num_req_slots.
-        self._unified = getattr(kvcache, "_unified_kv", False) is True
+        # Per-request SWA ring: the paged SWA indices built here are unused and
+        # SWA capacity is bounded by req slots, not tokens.
+        ring_size = kvcache.swa_req_ring_size
+        self._swa_req_ring = ring_size is not None
         self._req_to_token_pool = req_to_token_pool
-        if self._unified:
-            ring_size = getattr(kvcache, "unified_swa_ring_size", self.page_size)
+        if self._swa_req_ring:
             self._swa_ring_cost = (
                 (ring_size + self.page_size - 1) // self.page_size
             ) * self.page_size
             logger.info(
-                "[SWA-BOOKKEEPING] unified ring accounting enabled: "
-                f"num_slots={getattr(kvcache, 'num_req_slots', '?')}, "
-                f"swa_ring_size={ring_size}, "
-                f"ring_cost_tokens={self._swa_ring_cost}, "
-                f"unified_swa_pages={getattr(kvcache, 'unified_swa_pages', '?')} | "
-                f"legacy paged size_swa={self._size_swa} (bypassed)"
+                "SWA per-request ring accounting enabled: "
+                f"ring_size={ring_size}, ring_cost_tokens={self._swa_ring_cost}, "
+                f"paged size_swa={self._size_swa} (bypassed)"
             )
         else:
             self._swa_ring_cost = 0
@@ -134,12 +135,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     @property
+    def swa_req_ring(self) -> bool:
+        """SWA is a per-request ring; no per-token SWA budget applies."""
+        return self._swa_req_ring
+
+    @property
     def swa_ring_cost_tokens(self) -> int:
-        """Unified: paged SWA cost of one request's ring slot (0 otherwise)."""
+        """Ring mode: paged SWA cost of one request's ring slot (0 otherwise)."""
         return self._swa_ring_cost
 
     def available_size(self):
-        if self._unified:
+        if self._swa_req_ring:
             # The SWA ring is pre-allocated per slot and reused by decode, so it
             # never constrains token growth; full attention is the real limiter.
             return self.full_attn_allocator.available_size()
@@ -152,7 +158,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.full_attn_allocator.available_size()
 
     def swa_available_size(self):
-        if self._unified:
+        if self._swa_req_ring:
             # Ring-based availability: free request slots * per-slot ring cost.
             # Fall back to non-binding if the req pool wasn't wired in.
             if self._req_to_token_pool is None:
@@ -216,7 +222,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             num_full_pages
             <= self.full_attn_allocator.available_size() // self.page_size
         )
-        if self._unified:
+        if self._swa_req_ring:
             # SWA ring rows are pre-allocated per slot; no per-token SWA paging.
             return full_ok
         return full_ok and (
@@ -240,7 +246,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if not self.new_pages_available(num_new_pages, num_new_pages):
             return None
 
-        if self._unified:
+        if self._swa_req_ring:
             # The unified SWA ring is slot-addressed, not paged here, so the
             # vestigial paged allocator and full->swa mapping are skipped.
             return self.full_attn_allocator.alloc_extend(
@@ -303,7 +309,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if not self.new_pages_available(num_full_pages, num_swa_pages):
             return None
 
-        if self._unified:
+        if self._swa_req_ring:
             # See alloc_extend. new_pages_available already ignored
             # num_swa_pages, so the paged allocator has no capacity gate left.
             return self.full_attn_allocator.alloc_extend(
@@ -362,7 +368,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
         assert self.page_size > 1
-        if self._unified:
+        if self._swa_req_ring:
             # See alloc_extend: slot-addressed ring, so full-attention KV only.
             return self.full_attn_allocator.alloc_decode(
                 seq_lens, seq_lens_cpu, last_loc
@@ -693,3 +699,9 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def clear(self):
         self.swa_attn_allocator.clear()
         self.free_group = None
+
+
+def is_swa_req_ring(allocator) -> bool:
+    """True when the allocator's SWA side is a per-request ring (see
+    BaseSWAKVPool.swa_req_ring_size), so SWA carries no per-token budget."""
+    return isinstance(allocator, SWATokenToKVPoolAllocator) and allocator.swa_req_ring

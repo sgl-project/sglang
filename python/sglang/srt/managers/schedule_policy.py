@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
+    is_swa_req_ring,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
@@ -502,16 +503,8 @@ class PrefillAdder:
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        # Unified-KV DSV4 sizes SWA as a fixed per-request ring slot, not a
-        # token budget. `is True`: a duck-typed stub must not select that path.
-        self._unified_kv = (
-            getattr(
-                getattr(token_to_kv_pool_allocator, "get_kvcache", lambda: None)(),
-                "_unified_kv",
-                False,
-            )
-            is True
-        )
+        # Per-request SWA ring: one fixed slot per request, not a token budget.
+        self._swa_req_ring = is_swa_req_ring(token_to_kv_pool_allocator)
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
@@ -674,7 +667,7 @@ class PrefillAdder:
     @property
     def rem_swa_tokens(self):
         allocator = self.token_to_kv_pool_allocator
-        if self._unified_kv:
+        if self._swa_req_ring:
             # swa_available_size() already reports ring capacity; tree
             # swa_evictable is in linear token units and frees no ring space.
             return allocator.swa_available_size() - self.rem_swa_token_offset
@@ -727,7 +720,7 @@ class PrefillAdder:
         from double-counting extend, so budget <= extend + max_new_tokens + page.
         """
         allocator = self.token_to_kv_pool_allocator
-        if self._unified_kv:
+        if self._swa_req_ring:
             # One fixed ring slot per request, independent of context or chunk
             # length; pairs with the ring-based swa_available_size.
             return allocator.swa_ring_cost_tokens
@@ -884,7 +877,7 @@ class PrefillAdder:
         if self.is_hybrid_swa:
             # The ring slot is reserved once at first admission; charging it
             # again on a continuation would double-count and over-throttle.
-            if not (self._unified_kv and is_chunked_continuation):
+            if not (self._swa_req_ring and is_chunked_continuation):
                 self.rem_swa_token_offset += self._swa_budget_for_req(
                     extend_input_len, max_new_tokens
                 )
@@ -1022,7 +1015,7 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-            if self.is_hybrid_swa and not self._unified_kv:
+            if self.is_hybrid_swa and not self._swa_req_ring:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM.
                 # Unified-KV: rem_swa_tokens is ring capacity, not a per-chunk
@@ -1279,7 +1272,7 @@ class PrefillAdder:
             # fits; the legacy SWA-token path keeps its conservative `>=`.
             if (
                 swa_needed > self.rem_swa_tokens
-                if self._unified_kv
+                if self._swa_req_ring
                 else swa_needed >= self.rem_swa_tokens
             ):
                 if not self._swa_req_never_fits(
@@ -1319,7 +1312,7 @@ class PrefillAdder:
                 )
                 if (
                     swa_needed > self.rem_swa_tokens
-                    if self._unified_kv
+                    if self._swa_req_ring
                     else swa_needed >= self.rem_swa_tokens
                 ):
                     if not self._swa_req_never_fits(
