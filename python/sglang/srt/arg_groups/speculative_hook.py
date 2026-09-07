@@ -187,9 +187,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not (cfg.device.startswith("cuda") or cfg.device == "npu"):
+    if not (
+        cfg.device.startswith("cuda") or cfg.device == "npu" or cfg.device == "xpu"
+    ):
         raise ValueError(
-            "DFLASH speculative decoding only supports CUDA and NPU devices."
+            "DFLASH speculative decoding only supports CUDA, NPU and XPU devices."
         )
 
     if resolved_view(server_args).enable_dp_attention:
@@ -718,9 +720,12 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         "triton",
         "trtllm_mha",
         "ascend",
+        "intel_xpu",
     )
-    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
-    fallback_backend = "triton" if get_platform().is_hip else "flashinfer"
+    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
+    fallback_backend = (
+        "triton" if (get_platform().is_xpu or get_platform().is_hip) else "flashinfer"
+    )
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
