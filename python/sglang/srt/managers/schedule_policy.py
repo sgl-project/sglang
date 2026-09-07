@@ -835,8 +835,6 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
-        host_hit_len: int = 0,
-        storage_hit_len: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -876,15 +874,40 @@ class PrefillAdder:
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
-        elif prefix_len > 0:
+
+    def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
+        if req.retracted_stain:
+            # Retraction attribution is intentionally omitted for now; discard
+            # its lifecycle state so a later abort cannot report it as a drop.
+            self.tree_cache.discard_storage_prefetch_accounting(req.rid)
+            return
+
+        if prefix_len > 0:
             device_hit, host_hit, storage_hit = split_cached_prefix_by_tier(
                 prefix_len=prefix_len,
-                host_hit_len=host_hit_len,
-                storage_hit_len=storage_hit_len,
+                host_hit_len=req.materialized_host_hit_len(),
+                storage_hit_len=req.storage_hit_length,
+                storage_hit_start=req.storage_hit_start,
+                host_hit_is_storage=req.host_hit_is_storage,
             )
             self.log_device_hit_tokens += device_hit
             self.log_host_hit_tokens += host_hit
             self.log_storage_hit_tokens += storage_hit
+
+        fulfilled_storage_hit = req.fulfilled_storage_hit_len(prefix_len)
+        reason = None
+        if fulfilled_storage_hit < req.storage_hit_length:
+            reason = (
+                "device_capacity"
+                if req.needs_host_load_back()
+                and req.host_loaded_length < req.host_hit_length
+                else "shrunk"
+            )
+        self.tree_cache.finish_storage_prefetch_admission(
+            req.rid,
+            fulfilled_tokens=fulfilled_storage_hit,
+            reason=reason,
+        )
 
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
@@ -917,9 +940,8 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-            host_hit_len=req.host_hit_length,
-            storage_hit_len=req.storage_hit_length,
         )
+        self._account_prefill_cache_admission(req, prefix_len)
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -1292,6 +1314,7 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                req.host_loaded_length = len(new_indices)
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.kv.cache_protected_len = prefix_len
@@ -1347,9 +1370,8 @@ class PrefillAdder:
                     ),
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                    host_hit_len=req.host_hit_length,
-                    storage_hit_len=req.storage_hit_length,
                 )
+                self._account_prefill_cache_admission(req, prefix_len)
             else:
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
@@ -1395,9 +1417,8 @@ class PrefillAdder:
                     0,
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                    host_hit_len=req.host_hit_length,
-                    storage_hit_len=req.storage_hit_length,
                 )
+                self._account_prefill_cache_admission(req, prefix_len)
 
         return self.budget_state()
 

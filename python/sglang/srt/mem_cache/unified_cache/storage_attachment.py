@@ -367,6 +367,7 @@ class StorageAttachment:
         for req_id in list(cache.ongoing_prefetch):
             info = cache.ongoing_prefetch[req_id]
             try:
+                cache.discard_storage_prefetch_accounting(req_id)
                 if info.host_indices is None:
                     # Host pages were never allocated for this operation.
                     cache.revoke_pending_prefetch(req_id)
@@ -394,4 +395,7 @@ class StorageAttachment:
             except Exception:
                 logger.exception("Failed to release host lock for backup op %s", ack_id)
 
+        for req_id in list(cache._storage_prefetch_hit_remaining_by_reqid):
+            cache.discard_storage_prefetch_accounting(req_id)
         cache.prefetch_loaded_tokens_by_reqid.clear()
+        cache.prefetch_loaded_storage_start_by_reqid.clear()

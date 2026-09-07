@@ -8,7 +8,7 @@
 
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -46,10 +46,12 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             cache_aware: None,
             sticky: Some(StickyConfig {
                 header_name: header_name.to_string(),
-                fallback_policy: PolicyKind::RoundRobin,
+                fallback_policy: StickyFallbackKind::RoundRobin,
                 idle_secs: 3600,
                 eviction_interval_secs: 3600,
             }),
+            fused: None,
+            eligibility: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

@@ -439,6 +439,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def finish_storage_prefetch_admission(
+        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+    ) -> None:
+        """Resolve storage-hit accounting once a request is admitted.
+
+        Non-storage caches have no lifecycle state to resolve.
+        """
+
+    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
+        """Forget storage-hit lifecycle state without emitting a result."""
+
+    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
+        """Pop L3-loaded tokens and their absolute prefix start, if known."""
+        return self.pop_prefetch_loaded_tokens(req_id), None
+
     def ready_to_load_host_cache(self) -> Any:
         """
         Notify the cache controller to start the KV cache loading

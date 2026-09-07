@@ -2326,6 +2326,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 if (
                     self.enable_deferred_kv_release
+                    and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
                     and decode_req.kv_receiver.abort_notified
                 ):
                     # Decode-initiated abort: a prefill write may still target

@@ -70,7 +70,8 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky`.
+/// `power_of_two` / `load_based` / `fused_score` / `cache_aware_zmq` /
+/// `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -83,6 +84,9 @@ pub enum PolicyKind {
     /// Selects the currently least-loaded worker.
     #[value(name = "load_based")]
     LoadBased,
+    /// Weighted sum of `--fuse` terms.
+    #[value(name = "fused_score")]
+    FusedScore,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
@@ -95,6 +99,78 @@ pub enum PolicyKind {
     /// `ModelConfig::sticky`.
     #[value(name = "sticky")]
     Sticky,
+}
+
+impl std::fmt::Display for PolicyKind {
+    /// The CLI spelling for this policy kind.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = <Self as clap::ValueEnum>::to_possible_value(self)
+            .expect("PolicyKind skips no variants");
+        f.write_str(v.get_name())
+    }
+}
+
+/// A hard admission constraint accepted by `--filter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum FilterKind {
+    /// Router-local in-flight capacity limit.
+    #[value(name = "overloaded")]
+    Overloaded,
+    /// Requires a minimum share of cached prompt blocks.
+    #[value(name = "prefix_cache")]
+    PrefixCache,
+}
+
+impl std::fmt::Display for FilterKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = <Self as clap::ValueEnum>::to_possible_value(self)
+            .expect("FilterKind skips no variants");
+        f.write_str(v.get_name())
+    }
+}
+
+/// A soft scoring term accepted by `--fuse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ScoreTermKind {
+    /// Independent uniform-random preference.
+    #[value(name = "random")]
+    Random,
+    /// Prefers the least router-local active load.
+    #[value(name = "load_based")]
+    LoadBased,
+    /// Prefers the largest local prefix-cache overlap.
+    #[value(name = "prefix_cache")]
+    PrefixCache,
+}
+
+impl std::fmt::Display for ScoreTermKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = <Self as clap::ValueEnum>::to_possible_value(self)
+            .expect("ScoreTermKind skips no variants");
+        f.write_str(v.get_name())
+    }
+}
+
+/// Policy choices that can initialize or handle a keyless sticky request.
+/// These policies have no request-scoped cache or sticky-state dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum StickyFallbackKind {
+    #[value(name = "round_robin")]
+    RoundRobin,
+    #[value(name = "random")]
+    Random,
+    #[value(name = "power_of_two")]
+    PowerOfTwo,
+    #[value(name = "load_based")]
+    LoadBased,
+}
+
+impl std::fmt::Display for StickyFallbackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = <Self as clap::ValueEnum>::to_possible_value(self)
+            .expect("StickyFallbackKind skips no variants");
+        f.write_str(v.get_name())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +222,7 @@ pub struct ModelConfig {
     pub tokenizer_path: String,
     pub policy: PolicyKind,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Tuning for cache-aware routing. Ignored unless
+    /// Tuning for the cache-aware ZMQ policy. Ignored unless
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
     /// policy construction time.
     pub cache_aware: Option<CacheAwareConfig>,
@@ -155,6 +231,10 @@ pub struct ModelConfig {
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
+    /// Terms for `policy = "fused_score"`.
+    pub fused: Option<Vec<FusedTerm>>,
+    /// Hard constraints applied before policy selection.
+    pub eligibility: Option<EligibilityConfig>,
 }
 
 /// External KV Indexer client settings.
@@ -163,6 +243,54 @@ pub struct KvIndexerEndpointConfig {
     pub url: String,
     pub query_timeout_ms: u64,
     pub query_max_inflight: usize,
+}
+
+/// Eligibility filter configuration.
+#[derive(Debug, Clone, Default)]
+pub struct EligibilityConfig {
+    /// Filters in priority order.
+    pub filters: Vec<FilterKind>,
+    /// `overloaded`: in-flight count at which a worker stops being eligible.
+    pub max_in_flight: Option<usize>,
+    /// `prefix_cache` minimum cached prompt share.
+    pub min_prefix_share: Option<f32>,
+}
+
+/// Default `--policy fused_score` terms.
+pub const DEFAULT_FUSE: [ScoreTermKind; 2] = [ScoreTermKind::PrefixCache, ScoreTermKind::LoadBased];
+
+/// One `--fuse` policy and optional weight.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FusedTerm {
+    pub kind: ScoreTermKind,
+    /// Weight override; `None` keeps the term's own `Criterion::weight()`.
+    pub weight: Option<f32>,
+}
+
+impl std::str::FromStr for FusedTerm {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (name, weight) = match s.split_once('=') {
+            Some((n, w)) => (n, Some(parse_fuse_weight(n, w)?)),
+            None => (s, None),
+        };
+        let kind = <ScoreTermKind as clap::ValueEnum>::from_str(name, false)
+            .map_err(|_| format!("--fuse: `{name}` is not a score term"))?;
+        Ok(FusedTerm { kind, weight })
+    }
+}
+
+/// Parses a finite, non-negative term weight.
+fn parse_fuse_weight(name: &str, raw: &str) -> Result<f32, String> {
+    let w: f32 = raw
+        .parse()
+        .map_err(|_| format!("--fuse: `{name}` weight `{raw}` is not a number"))?;
+    if !w.is_finite() || w < 0.0 {
+        return Err(format!(
+            "--fuse: `{name}` weight `{raw}` must be finite and >= 0"
+        ));
+    }
+    Ok(w)
 }
 
 /// Per-model cache-aware tuning.
@@ -182,8 +310,7 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
-    /// Optional external KV Indexer client configuration. When configured, it
-    /// replaces the local ZMQ radix tree as the cache signal.
+    /// Optional external KV Indexer client configuration.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
@@ -215,8 +342,7 @@ pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
 
 /// Per-model sticky-session tuning. Built from the `--routing-key-header`
 /// / `--sticky-*` flags by [`crate::config::cli::Cli::into_config`], which
-/// also validates that `header_name` parses as an HTTP header name and
-/// that `fallback_policy` is one of the dependency-free policies.
+/// also validates that `header_name` parses as an HTTP header name.
 #[derive(Debug, Clone)]
 pub struct StickyConfig {
     /// Request header carrying the routing key. Validated to parse as a
@@ -226,9 +352,8 @@ pub struct StickyConfig {
     /// to pick the initial worker when a new key is first seen. One of
     /// `round_robin` / `random` / `power_of_two` / `load_based` — the
     /// dependency-free policies the factory can build standalone (no
-    /// `HashTree` / tokenizer / ZMQ feed). `cache_aware_zmq` and `sticky`
-    /// are rejected at config-build time.
-    pub fallback_policy: PolicyKind,
+    /// `HashTree` / tokenizer / ZMQ feed).
+    pub fallback_policy: StickyFallbackKind,
     /// Evict an assignment after it has been idle (unreferenced) this many
     /// seconds. Bounds the map against unbounded routing-key cardinality.
     pub idle_secs: u64,
@@ -247,7 +372,7 @@ impl Default for StickyConfig {
     fn default() -> Self {
         Self {
             header_name: DEFAULT_STICKY_HEADER.to_string(),
-            fallback_policy: PolicyKind::RoundRobin,
+            fallback_policy: StickyFallbackKind::RoundRobin,
             idle_secs: default_sticky_idle_secs(),
             eviction_interval_secs: default_sticky_eviction_interval_secs(),
         }

@@ -132,7 +132,6 @@ QUANTIZATION_CHOICES = [
     "fp8",  # MOE + linear online quantization.
     "mxfp8",  # MOE + linear online quantization.
     "gptq",
-    "marlin",
     "gptq_marlin",
     "awq_marlin",
     "bitsandbytes",
@@ -2067,7 +2066,12 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
+        NS("spec"),
+    ] = None
+    uno_lora_path: A[
+        Optional[str],
+        "Path to the UNO draft LoRA checkpoint.",
         NS("spec"),
     ] = None
     speculative_draft_model_path: A[
@@ -2815,6 +2819,23 @@ class ServerArgs:
         "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
         NS("memory"),
     ] = 4
+
+    # -------------------------------------------------------------------------
+    # Unified Radix Cache
+    # -------------------------------------------------------------------------
+    enable_unified_cache_external_linker: A[
+        bool,
+        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
+        NS("memory"),
+    ] = False
+    unified_cache_external_linker_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-cache-external-linker.",
+            choices=["mooncake"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -3999,13 +4020,6 @@ class ServerArgs:
             help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
-            "--enable-dsa-prefill-context-parallel",
-            dest="enable_dsa_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
             "--enable-nsa-prefill-context-parallel",
             dest="enable_dsa_prefill_context_parallel",
             action=DeprecatedStoreTrueAction,
@@ -4027,20 +4041,6 @@ class ServerArgs:
             help="[Deprecated] Use --enable-prefill-cp instead.",
         )
         parser.add_argument(
-            "--dsa-prefill-cp-mode",
-            dest="dsa_prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=ServerArgs.dsa_prefill_cp_mode,
-            choices=["in-seq-split", "round-robin-split"],
-            help=(
-                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
-                "'in-seq-split' maps to 'zigzag'; 'round-robin-split' maps to "
-                "'interleave'."
-            ),
-        )
-        parser.add_argument(
             "--nsa-prefill-cp-mode",
             dest="dsa_prefill_cp_mode",
             action=DeprecatedAliasStoreAction,
@@ -4049,19 +4049,6 @@ class ServerArgs:
             default=argparse.SUPPRESS,
             choices=["in-seq-split", "round-robin-split"],
             help="[Deprecated] Use --cp-strategy instead.",
-        )
-        parser.add_argument(
-            "--prefill-cp-mode",
-            dest="prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=ServerArgs.prefill_cp_mode,
-            choices=["in-seq-split"],
-            help=(
-                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
-                "'in-seq-split' maps to 'zigzag'."
-            ),
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",

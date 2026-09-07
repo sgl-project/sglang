@@ -468,8 +468,10 @@ export const config = {
     gb300:  "lmsysorg/sglang:kimi-k3",
     b200:   "lmsysorg/sglang:kimi-k3",
     gb200:  "lmsysorg/sglang:kimi-k3",
-    mi350x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260817",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260817",
+    // 20260903 or newer: the AITER SiTU A4W4/A8W4 layout fix (sgl-project/sglang#33838,
+    // merged Sep 3) and the fused gfx950 KDA decode boundary (#34198) first ship here.
+    mi350x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260903",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260903",
     // NVFP4 needs a build with sgl-project/sglang#35077; the purpose-built dev
     // image is cut from that PR's head (CUDA 13).
     "b300|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
@@ -841,6 +843,32 @@ export const config = {
         options: [
           { id: "off", label: "Off" },
           { id: "on",  label: "On", env: ["SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"] },
+        ],
+      },
+      {
+        // AITER SiTU v2 activation-quant mode (ROCm only). A8W4 rides AITER's
+        // GU-interleaved preshuffled weights, A4W4 the generic separated layout;
+        // SGLang mirrors AITER's precedence (A8W4 wins when both are set), so the
+        // row emits exactly one. Needs AITER >= ROCm/aiter#4534.
+        id: "situActMode", title: "SiTU MoE Activation Quant (AMD)",
+        showWhen: (b) => ["mi350x", "mi355x"].includes(b.hw),
+        stripEnv: ["AITER_SITUV2_A8W4", "AITER_SITUV2_A4W4"],
+        options: [
+          { id: "a8w4", label: "A8W4 (default)", env: ["AITER_SITUV2_A8W4=1"] },
+          { id: "a4w4", label: "A4W4 — correct, ~1% slower", env: ["AITER_SITUV2_A4W4=1"] },
+        ],
+      },
+      {
+        // Opt-in fused gfx950 KDA decode boundary (f_b + conv + recurrence +
+        // gated RMSNorm). Fail-closed: init arms it only on gfx950 with the
+        // FlyDSL kernels importable, and every decode step re-validates before
+        // dispatch. Env var, not a flag, so it emits via env/stripEnv.
+        id: "kdaFusedDecode", title: "Fused KDA Decode (AMD gfx950)",
+        showWhen: (b) => ["mi350x", "mi355x"].includes(b.hw),
+        stripEnv: ["SGLANG_K3_KDA_FUSED_BACKEND"],
+        options: [
+          { id: "off",   label: "Off" },
+          { id: "aiter", label: "On (AITER fused boundary)", env: ["SGLANG_K3_KDA_FUSED_BACKEND=aiter"] },
         ],
       },
       {

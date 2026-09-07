@@ -1051,6 +1051,12 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
         )
     if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
+    elif batch.spec_algorithm.is_uno():
+        from sglang.srt.speculative.uno_info import UnoDraftInput
+
+        if not isinstance(batch.spec_info, UnoDraftInput):
+            raise RuntimeError("UNO decode preparation requires UnoDraftInput")
+        batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 

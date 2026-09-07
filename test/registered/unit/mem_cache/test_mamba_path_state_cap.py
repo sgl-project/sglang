@@ -47,6 +47,10 @@ class _FakeTreeCore:
         }
         self.evicted = []
         self.cascaded = []
+        # The real eviction helper reports unbacked FULL evictions to the
+        # write-through drop counter; this fake never tracks a walk.
+        self._is_tracking_unbacked_tokens = False
+        self._tracked_unbacked_tokens = 0
 
     def _evict_component_and_detach_lru(self, node, component, *args, **kwargs):
         self.evicted.append(node)

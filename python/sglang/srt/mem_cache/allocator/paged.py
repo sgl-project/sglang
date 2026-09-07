@@ -282,36 +282,33 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._debug_check_no_duplicate_pages()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Fixed-shape counterpart of free(): a page's tokens sit consecutively
-        in the kv row, so page representatives are stride slices -- no
-        torch.unique, whose data-dependent output shape forces a device sync.
-        Contract: see base; a page must be freed by only one call per group."""
+        """Fixed-shape counterpart of free().
+
+        The segment starts on a page boundary and a page's tokens sit
+        consecutively in the kv row, so ``free_index[::page_size]`` is one
+        token from each page the segment covers -- including a partial last
+        page. No torch.unique, whose data-dependent output shape forces a
+        device sync. Contract: see base."""
         if free_index.numel() == 0:
             return
 
         ps = self.page_size
-        offset = start_pos % ps
-        if offset == 0:
-            pieces = (free_index[::ps],)
-        else:
-            pieces = (free_index[:1], free_index[ps - offset :: ps])
+        assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        reps = free_index[::ps]
 
         if self.debug_mode:
             # reference unique on CPU: the NPU subclass deliberately avoids device unique
-            page_ids = torch.cat([p // ps for p in pieces])
             assert torch.equal(
-                torch.sort(page_ids.cpu())[0],
+                torch.sort(reps.cpu() // ps)[0],
                 torch.unique(free_index.cpu() // ps),
             )
 
         if self.free_group is None:
-            self._release_page_ids(*(p // ps for p in pieces))
+            self._release_page_ids(reps // ps)
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
         else:
-            self.free_page_reps_group.extend(
-                self._copy_for_free_group(piece) for piece in pieces
-            )
+            self.free_page_reps_group.append(self._copy_for_free_group(reps))
 
     def _debug_check_no_duplicate_pages(self):
         pages = self.get_all_free_pages()

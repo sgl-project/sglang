@@ -724,9 +724,16 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
 
+        # The preshuffle rewrites the weight into a layout only
+        # aiter_w8a8_block_fp8_linear can read, so it is correct exactly when
+        # this quant method is what consumes the weight. A layer whose weight is
+        # read directly by the model (DeepSeek-V4 wo_a, whose absorb GEMM takes
+        # .weight/.weight_scale_inv and runs its own batched kernel) sets
+        # skip_aiter_bpreshuffle and keeps the plain row-major layout.
         if (
             _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+            and not getattr(layer, "skip_aiter_bpreshuffle", False)
         ):
             n, k = layer.weight.shape
             if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
@@ -735,6 +742,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 t = shuffle_weight(layer.weight, (16, 16))
                 layer.weight.copy_(t)
                 del t
+                # The shuffle is in place and preserves shape, dtype and
+                # strides, so nothing downstream can tell it happened. Record
+                # it so a consumer that needs the row-major layout can assert
+                # instead of silently reading a permuted weight.
+                layer.aiter_bpreshuffled = True
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:

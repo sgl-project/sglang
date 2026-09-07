@@ -86,6 +86,7 @@ These fusion families mount under both `quality="extra-high"` and
 | Gate RMSNorm (BF16-native) | `RMSNorm + tanh + mul + add` in one pass |
 | HunyuanVideo strided QK RMSNorm | Per-head QK RMSNorm over the packed QKV layout |
 | LingBot Video fused RMSNorm | Replaces the handwritten cast, square, mean, rsqrt, and multiply chain with existing Triton RMSNorm kernels |
+| LingBot Video per-token gated residual + RMSNorm modulate | Folds `residual + gate * update` (per-token `[B, S, 1]` gate) and the `rmsnorm(x) * (1 + scale) + shift` adaLN chain (strided `[B, S, 6D]` chunk views) into single kernels |
 | SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
 | FLUX-family VAE fast paths | Channels-last decode, GroupNorm(+SiLU), upsample, and attention replacements for FLUX.2 and AutoencoderKL-based FLUX.1, Z-Image, and SD3 pipelines |
 | Wan VAE RMSNorm + SiLU | Replaces the channel-first RMSNorm/SiLU chain while keeping the decode in `channels_last_3d` |
@@ -192,7 +193,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
 | LTX-2.5 decoder | paired 3D RoPE with shared axis-table cache |
 | HunyuanVideo / Helios | QKV+RoPE pack, strided QK RMSNorm, linear+GELU; Helios also has paired in-place Q/K RoPE |
-| LingBot Video MoE | Fused RMSNorm at `quality=extra-high` or `quality=high` |
+| LingBot Video MoE | Fused RMSNorm, per-token gated residual, and fused RMSNorm+modulate at `quality=extra-high` or `quality=high` |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
 | SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; LN+modulate, GLUMB bias+SiLU / bias+GLU, and residual-gate add during BCG; BF16-input linear attention at `quality=extra-high` or `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |

@@ -777,6 +777,12 @@ class ModelRunner:
             self.apply_torch_tp()
 
     def maybe_init_lora_manager(self):
+        if self.spec_algorithm.is_uno():
+            from sglang.srt.speculative.uno_lora import init_uno_lora_manager
+
+            self.lora_manager, self.uno_lora_id = init_uno_lora_manager(self)
+            return
+
         # Adapters apply to the target model only; the draft runs unadapted.
         if get_lora().enable_lora and not self.is_draft_worker:
             self.init_lora_manager()
@@ -1430,6 +1436,13 @@ class ModelRunner:
 
         Subclasses can override this to install specialized decode graph runners.
         """
+        if self.spec_algorithm.is_uno():
+            from sglang.srt.speculative.uno_cuda_graph_runner import (
+                UnoDecodeCudaGraphRunner,
+            )
+
+            return UnoDecodeCudaGraphRunner
+
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )

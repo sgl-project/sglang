@@ -78,6 +78,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
+    """Return the padded per-request width in flattened speculative output."""
+    stride = result.speculative_output_stride
+    if stride is None:
+        stride = result.speculative_num_draft_tokens
+    if stride is None or stride < 1:
+        raise RuntimeError("speculative result is missing a positive output row stride")
+    return stride
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -711,8 +721,12 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
-        result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+        stride = _get_speculative_output_stride(result)
+        num_non_draft = result.num_non_draft_tokens_per_req
+        result.num_correct_drafts_per_req_cpu = [
+            length - num_non_draft for length in accept_lens
+        ]
+        result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
 
         block_accept_lens = (
             result.block_accept_lens.tolist()
@@ -740,11 +754,6 @@ class SchedulerBatchResultProcessor:
         self.advance_grammar_fsm(result, batch)
 
         predict_tokens = []
-        # In adaptive spec-v2, the worker state may already have switched when this
-        # delayed result is processed. Use the draft token count recorded on result.
-        stride = result.speculative_num_draft_tokens
-        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
-
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
@@ -853,8 +862,7 @@ class SchedulerBatchResultProcessor:
         if result.accept_lens is None:
             return
         accept_lens = result.accept_lens.tolist()
-        stride = result.speculative_num_draft_tokens
-        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+        stride = _get_speculative_output_stride(result)
         retained = [None] * len(batch.reqs)
         for i, req in enumerate(batch.reqs):
             if req.grammar is None or req.is_retracted or req.finished():
@@ -907,11 +915,14 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
-        self.metrics_reporter.num_generated_tokens += len(batch.reqs)
+        batch_size = batch.batch_size()
+        num_generated_tokens = result.get_num_generated_tokens(batch_size)
+        self.metrics_reporter.num_generated_tokens += num_generated_tokens
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(),
+                batch_size,
                 result.num_correct_drafts,
+                num_accept_tokens=num_generated_tokens,
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
             )
@@ -982,8 +993,8 @@ class SchedulerBatchResultProcessor:
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
-                # token; stride = speculative_num_draft_tokens for spec, 1 for non-spec.
-                stride = result.speculative_num_draft_tokens or 1
+                # token; speculative workers record their padded row width.
+                stride = _get_speculative_output_stride(result) if is_spec else 1
                 accept_len = len(next_token_id)
                 start = i * stride
                 self._append_decode_hidden_states(
@@ -1016,7 +1027,7 @@ class SchedulerBatchResultProcessor:
         self.metrics_reporter.report_decode_stats(
             can_run_cuda_graph,
             running_batch=batch,
-            num_correct_drafts=result.num_correct_drafts,
+            num_generated_tokens=num_generated_tokens,
         )
 
     def _normalize_decode_outputs(

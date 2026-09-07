@@ -32,9 +32,9 @@ HW_MAPPING = {
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
-        "base-b-test-cpu",
-        "base-b-tp-test-cpu",
-        "base-c-test-cpu",
+        "stage-a-test-cpu-intel",
+        "stage-a-tp-test-cpu-intel",
+        "stage-b-test-cpu-intel",
         "base-b-test-cpu-arm64",
     ],
     HWBackend.AMD: [
@@ -425,7 +425,7 @@ def main():
         required=True,
         help=(
             "Test suite to run. Accepts a comma-separated list of suites "
-            "(e.g. 'base-b-test-cpu,base-c-test-cpu'); their tests are unioned "
+            "(e.g. 'stage-a-test-cpu-intel,stage-b-test-cpu-intel'); their tests are unioned "
             "into one pool before partitioning."
         ),
     )

@@ -445,6 +445,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
+        self._tracked_unbacked_tokens = 0
+        self._is_tracking_unbacked_tokens = False
 
         self.root_node = self._new_node()
         self.root_node.priority = -sys.maxsize
@@ -1317,6 +1319,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Begin a component's device-eviction walk for up to request_cnt tokens."""
         self.components_by_type[component_type].evict_device_start(request_cnt)
 
+    def _begin_tracking_unbacked_tokens(self) -> None:
+        assert not self._is_tracking_unbacked_tokens
+        assert self._tracked_unbacked_tokens == 0
+        self._is_tracking_unbacked_tokens = True
+
+    def _finish_tracking_unbacked_tokens(self) -> int:
+        assert self._is_tracking_unbacked_tokens
+        self._is_tracking_unbacked_tokens = False
+        result = self._tracked_unbacked_tokens
+        self._tracked_unbacked_tokens = 0
+        return result
+
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
@@ -1325,9 +1339,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
         updated_tracker = defaultdict(int, tracker)
-        result.node_id = self.components_by_type[component_type].evict_device_next_node(
-            updated_tracker, result.device_frees, result.host_frees
-        )
+        self._begin_tracking_unbacked_tokens()
+        try:
+            result.node_id = self.components_by_type[
+                component_type
+            ].evict_device_next_node(
+                updated_tracker, result.device_frees, result.host_frees
+            )
+        finally:
+            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
         for ct, n in updated_tracker.items():
             delta = n - tracker.get(ct, 0)
             if delta:
@@ -1348,25 +1368,31 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
-        if not node.backuped:
-            if is_write_back:
-                result.backup_kv = self._build_backup_kv_action(node, write_back=True)
+        self._begin_tracking_unbacked_tokens()
+        try:
+            if not node.backuped:
+                if is_write_back:
+                    result.backup_kv = self._build_backup_kv_action(
+                        node, write_back=True
+                    )
+                    return result
+                # Write-through: node has no backup, delete entirely.
+                self._delete_unbacked_device_leaf(
+                    node,
+                    result.tracker,
+                    device_frees=result.device_frees,
+                    host_frees=result.host_frees,
+                )
                 return result
-            # Write-through: node has no backup, delete entirely.
-            self._delete_unbacked_device_leaf(
+            self._demote(
                 node,
                 result.tracker,
                 device_frees=result.device_frees,
                 host_frees=result.host_frees,
             )
             return result
-        self._demote(
-            node,
-            result.tracker,
-            device_frees=result.device_frees,
-            host_frees=result.host_frees,
-        )
-        return result
+        finally:
+            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
 
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Write-back fallback when a D-leaf's D->H backup fails under host
@@ -1727,6 +1753,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         target: EvictLayer = EvictLayer.DEVICE,
         tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
+        had_host_copy = node.component_data[comp.component_type].host_value is not None
         device_freed, host_freed = comp.evict_component(
             node, target=target, device_frees=device_frees, host_frees=host_frees
         )
@@ -1735,6 +1762,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 tracker[comp.component_type] += device_freed
             elif EvictLayer.HOST in target:
                 tracker[comp.component_type] += host_freed
+        if (
+            self._is_tracking_unbacked_tokens
+            and comp.component_type == BASE_COMPONENT_TYPE
+            and device_freed > 0
+            and not had_host_copy
+        ):
+            self._tracked_unbacked_tokens += device_freed
 
         # Detach from the appropriate LRU list(s)
         ct = comp.component_type

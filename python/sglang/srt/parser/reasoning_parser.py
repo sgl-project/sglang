@@ -549,6 +549,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = True,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         # strict-thinking flattens these to single token ids, so the full marker
         # "<|open|>response<|sep|>" is inexpressible. The bare name works: it
@@ -574,8 +575,12 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
             reasoning_default="thinking",
         )
+        # Unlike the base class, K3 cannot use `normal_text == ""` alone:
+        # skipped-think and truncated marker-free reasoning end up identical.
+        self._force_nonempty_content = force_nonempty_content
         self._reasoning_done = False
         self._tools_passthrough = False
+        self._stream_text = ""
 
     def _clean_content(self, text: str) -> str:
         tools_idx = text.find(TOOLS_OPEN)
@@ -594,6 +599,8 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
         if not in_reasoning and self.think_end_token not in text:
+            return StreamingParseResult(normal_text=self._clean_content(text))
+        if self._force_nonempty_content and self._is_skipped_think_answer(text):
             return StreamingParseResult(normal_text=self._clean_content(text))
 
         open_idx = text.find(self.think_start_token)
@@ -622,8 +629,19 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             reasoning_text=reasoning_text, normal_text=self._clean_content(rest)
         )
 
+    def _is_skipped_think_answer(self, text: str) -> bool:
+        return (
+            self.think_start_token not in text
+            and self.think_end_token not in text
+            and self.think_start_token.removesuffix("<|sep|>") not in text
+            and self.think_end_token.removesuffix("<|sep|>") not in text
+            and (RESPONSE_CLOSE in text or MESSAGE_CLOSE in text)
+        )
+
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         self._buffer += new_text
+        if self._force_nonempty_content:
+            self._stream_text += new_text
 
         if not self._in_reasoning and not self._reasoning_done:
             open_idx = self._buffer.find(self.think_start_token)
@@ -683,6 +701,23 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             return StreamingParseResult(reasoning_text=emit)
 
         return StreamingParseResult(normal_text=self._drain_content())
+
+    def finish(self) -> StreamingParseResult:
+        if not self._force_nonempty_content:
+            return super().finish()
+        text, self._stream_text = self._stream_text, ""
+        if self._in_reasoning and self._is_skipped_think_answer(text):
+            # _in_reasoning means no channel decision happened mid-stream, so the
+            # answer went out as reasoning; without this gate the re-emit duplicates
+            # answers already streamed as content (RESPONSE_OPEN / force_reasoning=False).
+            self._buffer = ""
+            return StreamingParseResult(normal_text=self._clean_content(text))
+        if self._in_reasoning and not self.stream_reasoning and self._buffer:
+            # super().finish() would emit this buffer as content under
+            # force_nonempty_content — the leak the flag exists to prevent.
+            buffer, self._buffer = self._buffer, ""
+            return StreamingParseResult(reasoning_text=buffer)
+        return StreamingParseResult()
 
     def _drain_content(self) -> str:
         buf = self._buffer

@@ -14,6 +14,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     SamplingParams,
@@ -101,16 +102,10 @@ def _make_req(terminate_after: int) -> Req:
 
 
 def _make_result(num_draft_tokens, accept_lens, flat_tokens):
-    return SimpleNamespace(
+    return GenerationBatchResult(
         next_token_ids=torch.tensor(flat_tokens, dtype=torch.long),
         accept_lens=torch.tensor(accept_lens, dtype=torch.long),
         speculative_num_draft_tokens=num_draft_tokens,
-        num_correct_drafts=None,
-        num_correct_drafts_per_req_cpu=None,
-        block_accept_lens=None,
-        cap_lens=None,
-        copy_done=None,
-        grammar_advanced=False,
     )
 
 

@@ -264,11 +264,10 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
 class TestFreeSegment(unittest.TestCase):
     """Mirrors `test_paged_free_segment.TestFreeSegment`."""
 
-    def test_matches_unique_over_alignments(self):
-        """Sweep (start, end) so segments cover aligned/unaligned head and
-        tail, a single partial page, and the full row."""
+    def test_matches_unique_over_tail_alignments(self):
+        """Page-aligned starts against every tail alignment."""
         for num_tokens in (1, PAGE_SIZE, PAGE_SIZE + 1, 3 * PAGE_SIZE - 1):
-            for start in range(0, num_tokens, max(1, num_tokens // 4)):
+            for start in range(0, num_tokens, PAGE_SIZE):
                 for end in (start + 1, num_tokens):
                     if end <= start:
                         continue
@@ -286,7 +285,7 @@ class TestFreeSegment(unittest.TestCase):
     def test_never_calls_unique(self):
         """The decisive check -- make `torch.unique` explode. A textual guard
         can be fooled; this cannot."""
-        for start in (0, 1, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 3):
+        for start in (0, PAGE_SIZE, 2 * PAGE_SIZE):
             alloc = _paged_allocator(lazy=True)
             row = alloc.alloc(3 * PAGE_SIZE)
             with self.subTest(start_pos=start):
@@ -294,6 +293,12 @@ class TestFreeSegment(unittest.TestCase):
                     torch, "unique", side_effect=AssertionError("sync path taken")
                 ):
                     alloc.free_segment(row[start : start + PAGE_SIZE], start_pos=start)
+
+    def test_unaligned_start_is_rejected(self):
+        alloc = _paged_allocator(lazy=True)
+        row = alloc.alloc(3 * PAGE_SIZE)
+        with self.assertRaises(AssertionError):
+            alloc.free_segment(row[1 : PAGE_SIZE + 1], start_pos=1)
 
     def test_empty_segment_is_noop(self):
         alloc = _paged_allocator(lazy=True)
@@ -342,9 +347,7 @@ class TestFreeGroupKeepsPositions(unittest.TestCase):
         row = alloc.alloc(3 * PAGE_SIZE)
         alloc.free_group_begin()
         alloc.free_segment(row[:PAGE_SIZE], start_pos=0)
-        alloc.free_segment(
-            row[PAGE_SIZE + 3 : 2 * PAGE_SIZE + 3], start_pos=PAGE_SIZE + 3
-        )
+        alloc.free_segment(row[PAGE_SIZE : 2 * PAGE_SIZE + 3], start_pos=PAGE_SIZE)
         with mock.patch.object(
             torch, "unique", side_effect=AssertionError("sync path taken")
         ):
@@ -401,6 +404,26 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
         ):
             with self.subTest(cls=cls.__name__):
                 self.assertIn("free_page_reps_group", inspect.getsource(cls))
+
+
+class TestUnifiedSwaFullSideGroup(unittest.TestCase):
+    """`free_full` inside a free group must defer and land at `free_group_end`;
+    the composite carries that pile itself, not through the SWA parent's hooks."""
+
+    def test_full_only_frees_defer_until_group_end(self):
+        from test_unified_swa_shared_virtual_ids import _build
+
+        alloc = _build(64, 32, 2, 4)
+        idx = alloc.alloc(8)
+        alloc.free_swa(idx)
+        before = alloc.full_available_size()
+
+        alloc.free_group_begin()
+        alloc.free_full(idx[:4])
+        alloc.free_full_segment(idx[4:], start_pos=4)
+        self.assertEqual(alloc.full_available_size(), before)
+        alloc.free_group_end()
+        self.assertEqual(alloc.full_available_size(), before + 8)
 
 
 class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
@@ -468,14 +491,30 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
             alloc.free_swa(v[: 4 * self.PS], start_pos=0)
             alloc.free_swa(v[4 * self.PS :], start_pos=4 * self.PS)
 
-    def test_unaligned_start_pos_still_no_sync(self):
-        """`_page_reps_pieces` covers a misaligned start with a second piece;
-        the sync-free property must not depend on alignment."""
+    def test_full_only_segment_free_never_syncs(self):
+        """The request-finish dead half (swa already tombstoned) frees the full
+        side by page reps: no unique from free_full's token dedup."""
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(8 * self.PS)
-        with mock.patch.object(
-            torch, "unique", side_effect=AssertionError("unique = host sync")
+        alloc.free_swa(v, start_pos=0)
+        before = alloc.full_available_size()
+        with (
+            mock.patch.object(
+                torch, "unique", side_effect=AssertionError("unique = host sync")
+            ),
+            mock.patch.object(
+                torch.Tensor, "item", side_effect=AssertionError("item = host sync")
+            ),
         ):
+            alloc.free_full_segment(v[: 4 * self.PS], start_pos=0)
+            alloc.free_full_segment(v[4 * self.PS :], start_pos=4 * self.PS)
+        self.assertEqual(alloc.full_available_size(), before + 8 * self.PS)
+
+    def test_unaligned_start_pos_is_rejected(self):
+        """A mid-page start must fail loudly, not release the head page whole."""
+        alloc = self._swa_composite(lazy=True)
+        v = alloc.alloc(8 * self.PS)
+        with self.assertRaises(AssertionError):
             alloc.free_swa(v[1 : 5 * self.PS], start_pos=1)
 
     def test_start_pos_path_matches_the_fallback_end_state(self):
