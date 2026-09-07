@@ -6,11 +6,11 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 on:
   schedule:
     # ROCm 7.0 rollback shadow. pr-test-amd-rocm720.yml is the PR gate; this
-    # workflow now only proves ROCm 7.0 still works, so it fires once a day
+    # workflow now only proves ROCm 7.0 still works, so it fires every two days
     # alongside nightly-test-amd.yml and chases coverage rather than latency:
     # no matrix parallelism caps, no stage fast-fail (the `schedule` escape in
     # each job's `if`), and continue-on-error via check-changes.
-    - cron: '30 17 * * *'
+    - cron: '30 17 */2 * *'
   workflow_dispatch:
     inputs:
       target_stage_select:

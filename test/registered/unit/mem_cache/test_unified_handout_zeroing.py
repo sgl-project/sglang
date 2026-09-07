@@ -1,12 +1,12 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=4, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 
 import torch
 
-from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MLASubPoolSpec,

@@ -83,7 +83,6 @@ _is_cpu = is_cpu()
 
 
 class DpPaddingMode(IntEnum):
-
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
     MAX_LEN = auto()
     # Padding tokens to sum length and then gather tokens using `all_reduce`
@@ -215,6 +214,21 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
+    def get_local_dp_buffer_mhc(
+        cls, group: GroupCoordinator, n: int = 1
+    ) -> torch.Tensor:
+        from sglang.srt.runtime_context import get_flags
+
+        dp = get_flags().dp
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
+            buffer = torch.empty(
+                (cls._local_dp_buffer_len, dp.buffer_hidden_size * n),
+                dtype=dp.buffer_dtype,
+                device=dp.buffer_device,
+            )
+        return buffer
+
+    @classmethod
     def get_global_dp_buffer_len(cls) -> int:
         return cls._global_dp_buffer_len
 
@@ -276,6 +290,10 @@ def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
 
 def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
     return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
+
+
+def get_local_dp_buffer_mhc(group: GroupCoordinator, n: int = 1) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer_mhc(group=group, n=n)
 
 
 def get_global_dp_buffer_len() -> int:
@@ -512,9 +530,9 @@ def _dp_gather_via_all_reduce(
     if local_tokens.shape[0] > 0 and (
         is_partial or get_attn_tensor_model_parallel_rank() == 0
     ):
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between global_tokens and local_tokens not allowed"
+        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
+            "aliasing between global_tokens and local_tokens not allowed"
+        )
 
         memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
 
@@ -865,9 +883,9 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between local_tokens and global_tokens not allowed"
+        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
+            "aliasing between local_tokens and global_tokens not allowed"
+        )
 
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 
