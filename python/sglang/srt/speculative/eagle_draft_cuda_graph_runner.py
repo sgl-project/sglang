@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -669,9 +668,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Prepare per-step draft attention metadata (kv_indptr / kv_indices for
         # each speculative step).  The glue-graph optimisation is not applied
         # here — see __init__ comment for why.
-        self.draft_attn_backend.init_forward_metadata_out_graph(
-            SimpleNamespace(**vars(forward_batch), num_padding=bs - raw_bs)
-        )
+        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
         self.raw_bs = raw_bs
         self.bs = bs
 

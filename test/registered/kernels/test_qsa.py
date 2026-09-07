@@ -362,39 +362,6 @@ def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
         raise AssertionError("QSA must fail when no indexer metadata exists")
 
 
-def test_qsa_cuda_graph_padding_reaches_hybrid_children():
-    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-        HybridLinearAttnBackend,
-    )
-
-    class Recorder:
-        def __init__(self):
-            self.num_padding = None
-            self.token_to_kv_pool = None
-            self.req_to_token_pool = None
-            self.kv_index_translator = None
-            self.needs_cpu_seq_lens = True
-
-        def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
-            self.num_padding = getattr(forward_batch, "num_padding", None)
-
-    qsa = Recorder()
-    linear = Recorder()
-    hybrid_linear = HybridLinearAttnBackend(qsa, linear, full_attn_layers=[0])
-    replay_fb = SimpleNamespace(
-        batch_size=2,
-        req_pool_indices=torch.zeros(2, dtype=torch.int32),
-        seq_lens=torch.ones(2, dtype=torch.int32),
-        seq_lens_cpu=torch.ones(2, dtype=torch.int32),
-        forward_mode=ForwardMode.DECODE,
-        spec_info=None,
-        num_padding=1,
-    )
-    hybrid_linear.init_forward_metadata_out_graph(replay_fb)
-    assert qsa.num_padding == 1
-    assert linear.num_padding == 1
-
-
 def test_qsa_draft_extend_backend_decision_follows_profile():
     from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
     from sglang.srt.speculative.draft_utils import DraftBackendFactory
