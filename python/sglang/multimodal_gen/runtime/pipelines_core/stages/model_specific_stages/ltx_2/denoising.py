@@ -1,4 +1,5 @@
 import math
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -180,6 +181,10 @@ class LTX2DenoisingStage(DenoisingStage):
         self.sampler_name = sampler_name
         # set per request by _prepare_denoising_loop before the cache-dit hook
         self._disable_cache_dit_for_request = False
+        self._ltx2_coords_cache: OrderedDict[
+            tuple, tuple[torch.Tensor | None, torch.Tensor | None]
+        ] = OrderedDict()
+        self._ltx2_coords_cache_max_entries = 4
 
     def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
         return self.prepare_extra_func_kwargs(
@@ -1180,19 +1185,45 @@ class LTX2DenoisingStage(DenoisingStage):
             f"{audio_latent_model_input.ndim}, shape={tuple(audio_latent_model_input.shape)}"
         )
 
-    def _prepare_ltx2_model_inputs(
+    def _get_ltx2_rope_coords(
         self,
         ctx: LTX2DenoisingContext,
         step: DenoisingStepState,
         batch: Req,
         server_args: ServerArgs,
-        sigma: torch.Tensor,
-    ) -> LTX2ModelInputs:
-        latent_model_input = ctx.latents.to(ctx.target_dtype)
-        audio_latent_model_input = ctx.audio_latents.to(ctx.target_dtype)
-        audio_num_frames_latent = self._get_audio_num_frames_latent(
-            audio_latent_model_input
+        latent_model_input: torch.Tensor,
+        audio_latent_model_input: torch.Tensor,
+        audio_num_frames_latent: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        video_sp_start = (
+            int(batch.sp_video_start_frame) if batch.did_sp_shard_latents else None
         )
+        audio_sp_start = (
+            int(batch.sp_audio_start_frame)
+            if batch.did_sp_shard_audio_latents
+            else None
+        )
+        key = (
+            id(step.current_model),
+            id(server_args.pipeline_config),
+            latent_model_input.device,
+            audio_latent_model_input.device,
+            tuple(latent_model_input.shape),
+            tuple(audio_latent_model_input.shape),
+            ctx.latent_num_frames_for_model,
+            ctx.latent_height,
+            ctx.latent_width,
+            float(batch.fps),
+            audio_num_frames_latent,
+            ctx.use_ltx23_legacy_one_stage,
+            server_args.enable_breakable_cuda_graph,
+            video_sp_start,
+            audio_sp_start,
+        )
+        cached = self._ltx2_coords_cache.get(key)
+        if cached is not None:
+            self._ltx2_coords_cache.move_to_end(key)
+            return cached
 
         video_coords = None
         audio_coords = None
@@ -1211,7 +1242,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 audio_latent_model_input,
                 num_frames=audio_num_frames_latent,
             )
-        video_coords, audio_coords = _prepare_ltx2_rope_coords_for_bcg(
+        coords = _prepare_ltx2_rope_coords_for_bcg(
             enabled=server_args.enable_breakable_cuda_graph,
             current_model=step.current_model,
             latent_model_input=latent_model_input,
@@ -1223,6 +1254,34 @@ class LTX2DenoisingStage(DenoisingStage):
             width=ctx.latent_width,
             audio_num_frames=audio_num_frames_latent,
             fps=batch.fps,
+        )
+        self._ltx2_coords_cache[key] = coords
+        if len(self._ltx2_coords_cache) > self._ltx2_coords_cache_max_entries:
+            self._ltx2_coords_cache.popitem(last=False)
+        return coords
+
+    def _prepare_ltx2_model_inputs(
+        self,
+        ctx: LTX2DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+        sigma: torch.Tensor,
+    ) -> LTX2ModelInputs:
+        latent_model_input = ctx.latents.to(ctx.target_dtype)
+        audio_latent_model_input = ctx.audio_latents.to(ctx.target_dtype)
+        audio_num_frames_latent = self._get_audio_num_frames_latent(
+            audio_latent_model_input
+        )
+
+        video_coords, audio_coords = self._get_ltx2_rope_coords(
+            ctx,
+            step,
+            batch,
+            server_args,
+            latent_model_input=latent_model_input,
+            audio_latent_model_input=audio_latent_model_input,
+            audio_num_frames_latent=audio_num_frames_latent,
         )
 
         batch_size = int(latent_model_input.shape[0])
