@@ -720,6 +720,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For DeepSeek V4, quantize the SWA FP8 KV cache from BF16-rounded values instead of FP32 registers. This matches trainer-side QAT and the DSA prefill-CP path, at the cost of an extra BF16 KV materialization and separate cache-store kernels.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_ROCM_ATTN_MULTI_STREAM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimentally overlap the DeepSeek V4 C4 core compressor with the Q/K and indexer branch on ROCm. The validated path requires gfx950, AITER, <code>unified_kv_triton</code>, DP8 attention with outer TP8, MoE EP1/TP8, pipeline parallel size 1, and a full <code>TARGET_VERIFY</code> graph capture bucket containing 4 to 8 local query rows. Other configurations use the serial path. Enabling this flag also disables the generic ROCm attention-overlap path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 

@@ -1429,6 +1429,8 @@ class Envs:
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+    # Experimental gfx950 DSV4 target-verify attention overlap.
+    SGLANG_DSV4_ROCM_ATTN_MULTI_STREAM = EnvBool(False)
 
     # ===================================================================
     # Inkling
