@@ -219,7 +219,11 @@ def _make_sparse_prefill_case(
         * 0.05
     ).to(torch.bfloat16)
     attn_sink = torch.zeros(local_heads, dtype=torch.float32, device=device)
-    core_attn_metadata = SimpleNamespace()
+    core_attn_metadata = SimpleNamespace(
+        positions_casual=torch.tensor(
+            [93, 94, 95, 142, 143], dtype=torch.int32, device=device
+        )
+    )
     return backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata
 
 

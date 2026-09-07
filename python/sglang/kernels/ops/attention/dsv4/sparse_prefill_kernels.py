@@ -44,8 +44,8 @@ def _combine_topk_swa_indices_kernel(
     topk_indices_ptr,
     topk_indices_stride,
     query_start_loc_ptr,
-    seq_lens_ptr,
-    gather_lens_ptr,
+    query_positions_ptr,
+    swa_first_pos_ptr,
     compressed_base_ptr,
     swa_base_ptr,
     top_k,
@@ -62,20 +62,16 @@ def _combine_topk_swa_indices_kernel(
     base = tl.load(query_start_loc_ptr)
     query_start = tl.load(query_start_loc_ptr + batch_idx) - base
     query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
-    query_len = query_end - query_start
-    seq_len = tl.load(seq_lens_ptr + batch_idx)
-    gather_len = tl.load(gather_lens_ptr + batch_idx)
+    gather_start = tl.load(swa_first_pos_ptr + batch_idx)
     compressed_base = tl.load(compressed_base_ptr + batch_idx)
     swa_base = tl.load(swa_base_ptr + batch_idx)
-    start_pos = seq_len - query_len
-    # SWA portion of the gathered buffer starts from position
-    # (seq_len - gather_len), not 0. The +pos-gather_start formula maps a
-    # query's window back into the workspace's SWA region.
-    gather_start = seq_len - gather_len
 
     for token_idx in range(query_start + worker_id, query_end, num_workers):
-        token_idx_in_query = token_idx - query_start
-        pos = start_pos + token_idx_in_query
+        # Query rows are rank-local under interleave CP, but their causal
+        # positions still live in the original global request coordinate.
+        # Loading the position explicitly also preserves the regular
+        # contiguous prefill behavior.
+        pos = tl.load(query_positions_ptr + token_idx)
         # Both the C4 indexer and the C128 metadata builder emit
         # min((pos+1)//compress_ratio, topk_tokens) valid entries. Caller
         # passes top_k=0 for SWA-only layers to zero this out.

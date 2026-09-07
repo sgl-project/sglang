@@ -172,6 +172,11 @@ class TestPrepareServerArgs(CustomTestCase):
         default_args = parser.parse_args(base_args)
         self.assertEqual(default_args.dsv4_prefill_backend, "auto")
 
+        kvcache_args = parser.parse_args(
+            base_args + ["--dsv4-prefill-backend", "flashmla_kvcache"]
+        )
+        self.assertEqual(kvcache_args.dsv4_prefill_backend, "flashmla_kvcache")
+
         q8_args = parser.parse_args(
             base_args + ["--dsv4-prefill-backend", "flashmla_sparse_q8"]
         )
