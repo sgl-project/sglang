@@ -3101,14 +3101,12 @@ class TestDcpWidening(unittest.TestCase):
 
 
 class TestFusedWriteLocTranslate(unittest.TestCase):
-    """`write_loc_to_kernel_ids` must equal the eager formula it replaced.
+    """`write_loc_to_kernel_ids` must equal the arithmetic it stands for.
 
-    The fused kernel collapses ~12 launches into one, so nothing downstream
-    can tell them apart except by value -- which is why the reference here is
-    the arithmetic definition rather than a recorded expectation.
-
-    Triton truncates division toward zero where torch floors it, so the
-    negative-loc and tombstoned-page cases are the ones that matter.
+    Nothing downstream can tell the two apart except by value, so the reference
+    here is the definition rather than a recorded expectation. Triton truncates
+    division toward zero where torch floors it, so the negative-loc and
+    tombstoned-page cases are the ones that matter.
     """
 
     def _reference(self, loc, v2p, page_size, stride, dcp_size, dcp_rank):

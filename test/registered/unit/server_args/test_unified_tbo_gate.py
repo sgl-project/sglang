@@ -13,12 +13,9 @@
 # ==============================================================================
 """`--enable-unified-memory` refuses `--enable-two-batch-overlap`.
 
-BUG REGRESSION. The combination launches and captures fine, then dies inside
-the forward path on the first captured decode replay: TBO's replay split
-builds a per-child fb_view carrying `out_cache_loc` but not the pre-translate
-`out_cache_loc_virtual`, which the write-loc fill reads. Nothing else rejects
-the pair -- TBO's own preconditions do not overlap the unified pool's -- so
-without this gate a running server crashes mid-serving.
+BUG REGRESSION. The combination launches and captures fine, then dies in the
+forward path on the first captured decode replay. Nothing else rejects the
+pair, so without this gate a running server crashes mid-serving.
 
     python -m pytest test/registered/unit/server_args/test_unified_tbo_gate.py -v
 """

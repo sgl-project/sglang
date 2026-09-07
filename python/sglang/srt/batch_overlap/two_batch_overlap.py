@@ -693,8 +693,6 @@ class TboForwardBatchPreparer:
             )
             output_dict[key] = old_value[start_token_index:end_token_index]
 
-        # The pre-translate write loc is the same per-token tensor, so it
-        # splits the same way; None on a static pool.
         if batch.out_cache_loc_virtual is not None:
             output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
                 start_token_index:end_token_index

@@ -147,8 +147,7 @@ class TestFusedReplayStateIndices(CustomTestCase):
         """Same equivalence, with the unified pool's virtual slot ids.
 
         The mapping yields VIRTUAL slots there and the kernel folds the v2p
-        gather in, which is what lets the unified pool take this path at all
-        instead of ~7 launches of the reference chain.
+        gather in, so the two must still agree element for element.
         """
         device = torch.device("cuda")
         gen = torch.Generator(device="cpu").manual_seed(seed + 1000)

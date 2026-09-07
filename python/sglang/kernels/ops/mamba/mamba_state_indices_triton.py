@@ -70,8 +70,7 @@ def fused_replay_state_indices(
     ids are virtual (the unified memory pool). Pass None when the mapping
     already yields physical slots (the static hybrid pool). The unified
     allocator runs the mamba sub-pool at page_size 1, so its translate is a
-    plain table gather and folds into this launch; without it the caller pays
-    the reference chain, roughly seven launches per replay.
+    plain table gather and folds into this launch.
 
     Returns the filled ``out_state_indices[:total_bs]`` view.
     """

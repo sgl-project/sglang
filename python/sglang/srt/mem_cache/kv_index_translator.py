@@ -471,8 +471,7 @@ class KVIndexTranslator:
             if loc is None:
                 return None
             # The runner builds the capture batch outside `init_new`, so no
-            # rebind marked its virtual source. Bake this buffer holding sink
-            # ids, which is what the pre-fusion copy of the zero slot did.
+            # rebind marked its virtual source; bake it holding sink ids.
             width = int(loc.numel()) if width is None else int(width)
             out[:width].zero_()
             return out[: int(loc.numel())]

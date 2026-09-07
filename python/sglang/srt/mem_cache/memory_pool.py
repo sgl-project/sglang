@@ -1388,12 +1388,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     @property
     def mamba_v2p_table(self) -> Optional[torch.Tensor]:
         """The mamba virtual->physical slot table, or None when the ids this
-        pool hands out are already physical.
-
-        Exists so the replay fast path can fold the translate into its own
-        launch instead of excluding any pool that overrides
-        `translate_mamba_indices`.
-        """
+        pool hands out are already physical."""
         return None
 
     @property

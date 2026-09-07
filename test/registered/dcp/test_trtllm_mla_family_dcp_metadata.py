@@ -436,13 +436,10 @@ class TestFusedFp8WriteGate(CustomTestCase):
 class TestFusedWriteLocTranslateCuda(CustomTestCase):
     """The fused write-loc translate must agree with its own CPU branch.
 
-    `write_loc_to_kernel_ids` collapses the ~12-op eager chain (floor_divide,
-    remainder, take, mul, add, clamp, plus the DCP owner rule) into one launch,
-    which is what keeps the unified pool off the per-step launch path. The two
-    implementations must not drift: Triton truncates division toward zero where
-    torch floors it, so a negative loc and a tombstoned v2p row are where a
-    divergence would appear -- and the CPU branch is all the CPU suites ever
-    exercise.
+    The two implementations must not drift: Triton truncates division toward
+    zero where torch floors it, so a negative loc and a tombstoned v2p row are
+    where a divergence would appear -- and the CPU branch is all the CPU suites
+    ever exercise.
     """
 
     def test_cuda_matches_the_cpu_branch(self):

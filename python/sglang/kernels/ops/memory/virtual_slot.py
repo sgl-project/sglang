@@ -215,15 +215,13 @@ def write_loc_to_kernel_id_kernel(
     and ``loc // dcp_size`` is the row. Ids this rank does not own resolve to
     kernel id 0, the padding sink every write kernel skips.
 
-    A negative loc resolves to 0, matching the torch path: it floor-divides to
-    page -1, gathers the v2p sentinel row (-1), and clamps. Triton truncates
-    toward zero instead, so the sign is tested explicitly rather than relying
-    on the division.
+    Triton truncates ``//`` toward zero where torch floors it, so a negative
+    loc is tested explicitly rather than left to the division; it resolves to
+    0, as the torch path does.
 
-    Writing ``W > N`` lanes fills ``[N, W)`` with 0, the padding sink. That is
-    what lets a caller hand in a capture-stable buffer wider than this batch
-    and get the stale tail cleared in the same launch, instead of a separate
-    copy and zero_.
+    Writing ``W > N`` lanes fills ``[N, W)`` with 0, the padding sink, so a
+    caller may hand in a capture-stable buffer wider than this batch and have
+    the stale tail cleared in the same launch.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -263,8 +261,8 @@ def write_loc_to_kernel_ids(
     the ``out=`` path.
 
     ``out_width`` writes that many lanes rather than ``loc.numel()``, zeroing
-    the ones past the batch. Pass the captured tier's width to have a stale
-    tail cleared here instead of by a follow-up ``zero_``.
+    the ones past the batch; pass the captured tier's width to clear a stale
+    tail here.
     """
     N = int(loc.numel())
     # Flat-indexed as `ptr + offs`, so a strided view is mis-addressed.
