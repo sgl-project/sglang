@@ -1018,32 +1018,25 @@ class AiterAttnBackend(AttentionBackend):
         k_descale,
     ):
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        q_mla = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         max_q_len = self.forward_metadata.max_q_len or 1
 
-        if (
-            prefer_mla_gluon_decode(
-                head_pad_mode=getattr(self, "head_pad_mode", "none"),
-                num_head=getattr(self, "num_head", layer.tp_q_head_num),
-                kv_cache_dtype=self.kv_cache_dtype,
-            )
-            and max_q_len == 1
+        if prefer_mla_gluon_decode(
+            head_pad_mode=getattr(self, "head_pad_mode", "none"),
+            num_head=getattr(self, "num_head", layer.tp_q_head_num),
+            kv_cache_dtype=self.kv_cache_dtype,
         ):
-            kv_scale = self._resolve_fp8_kv_scale_float(layer, k_descale)
-            min_kv_seq_len = self._resolve_mla_gluon_min_kv_seq_len(forward_batch)
-            gluon_out = mla_gluon_decode(
-                q=q_mla,
+            return mla_gluon_decode(
+                q=q,
                 k_buffer=k_buffer,
                 layer=layer,
                 kv_indices=self.forward_metadata.kv_indices,
                 kv_indptr=self.forward_metadata.kv_indptr,
-                seq_lens=forward_batch.seq_lens,
                 sm_scale=layer.scaling,
-                kv_scale=kv_scale,
-                min_kv_seq_len=min_kv_seq_len,
+                kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
+                min_kv_seq_len=self._resolve_mla_gluon_min_kv_seq_len(forward_batch),
+                qlen=max_q_len,
             )
-            if gluon_out is not None:
-                return gluon_out
 
         work_metadata = self.forward_metadata.work_metadata
         work_indptr = self.forward_metadata.work_indptr
@@ -1054,7 +1047,7 @@ class AiterAttnBackend(AttentionBackend):
         num_kv_splits = self.forward_metadata.num_kv_splits
 
         return self._mla_decode_fwd_with_head_pad(
-            q_mla,
+            q,
             k_buffer.view(-1, 1, 1, layer.qk_head_dim),
             layer,
             qo_indptr=self.forward_metadata.qo_indptr,
@@ -2471,6 +2464,25 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                if prefer_mla_gluon_decode(
+                    head_pad_mode=getattr(self, "head_pad_mode", "none"),
+                    num_head=getattr(self, "num_head", layer.tp_q_head_num),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                ):
+                    return mla_gluon_decode(
+                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k_buffer=K_Buffer,
+                        layer=layer,
+                        kv_indices=self.forward_metadata.kv_indices,
+                        kv_indptr=self.forward_metadata.kv_indptr,
+                        sm_scale=layer.scaling,
+                        kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
+                        min_kv_seq_len=self._resolve_mla_gluon_min_kv_seq_len(
+                            forward_batch
+                        ),
+                        qlen=self.forward_metadata.max_q_len or 1,
+                    )
+
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
                 work_info_set = self.forward_metadata.work_info_set
