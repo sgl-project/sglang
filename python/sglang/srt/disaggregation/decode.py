@@ -380,6 +380,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        self._dp_rank_query_last_attempt_time: Dict[str, float] = {}
+        self._dp_rank_query_interval: float = 0.01  # seconds
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -1033,8 +1035,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 else:
                     need_query.append(decode_req)
 
-            # Pass 2: resolve dp rank for addrs whose info is available
+            # Pass 2: resolve dp rank for addrs whose info is available.
+            # Throttled per addr like pass 1: the prefill registers a room's
+            # dp_rank only once it picks the request up, so an unthrottled
+            # query opens one bootstrap connection per scheduling cycle
+            # (thousands per second while the decode is otherwise idle).
             if need_query:
+                now = time.monotonic()
+                last_attempt = self._dp_rank_query_last_attempt_time.get(bootstrap_addr)
+                if last_attempt is not None and (
+                    now - last_attempt < self._dp_rank_query_interval
+                ):
+                    remaining.extend(need_query)
+                    continue
+                self._dp_rank_query_last_attempt_time[bootstrap_addr] = now
+
                 rooms = [decode_req.req.bootstrap_room for decode_req in need_query]
                 prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
                 prefetched_rooms = prefetched[0] if prefetched is not None else ()
