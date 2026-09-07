@@ -16,8 +16,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Runs on any triton GPU; AMD registration exercises the actual ROCm target path.
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, suite="jit-kernel-unit-test-amd")
 
 try:
     import triton  # noqa: F401
