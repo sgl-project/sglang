@@ -2898,7 +2898,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         assert activation in _SUPPORTED_ACT_STRS or (
             activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
         ), f"{activation=} is unsupported by {moe_runner_backend}"
-        moe_runner_config = self.moe_runner_config
 
         if moe_runner_backend.is_marlin():
             quant_info = self.get_marlin_quant_info(layer)
@@ -3002,9 +3001,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 FlashInferCutlassMoeQuantInfo,
             )
 
-            assert not moe_runner_config.apply_router_weight_on_input, (
-                "apply_router_weight_on_input is not supported for Flashinfer"
-            )
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
