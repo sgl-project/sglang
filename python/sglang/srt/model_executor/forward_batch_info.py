@@ -1772,7 +1772,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
                     ]
-                logits_output.hidden_states = logits_output.hidden_states[:bs]
+                # NGRAM captures no hidden states, so an idle DP rank that carries a
+                # (zero-row) NgramVerifyInput reaches here with hidden_states None.
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[:bs]
 
             if hasattr(self, "hidden_states_backup"):
                 self.spec_info.hidden_states = self.hidden_states_backup
