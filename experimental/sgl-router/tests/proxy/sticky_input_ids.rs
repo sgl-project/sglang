@@ -54,6 +54,8 @@ fn config() -> Config {
             id: MODEL.into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::Sticky,
+            decode_policy: Default::default(),
+            bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
             // Push eviction far out so the background sweeper never fires
@@ -64,6 +66,7 @@ fn config() -> Config {
                 idle_secs: 3600,
                 eviction_interval_secs: 3600,
             }),
+            affinity: None,
             fused: None,
             eligibility: None,
         },
