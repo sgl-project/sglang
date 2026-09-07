@@ -57,6 +57,11 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.kvbit_dsv4 import (
+    dsv4_kvbit_enabled_for_worker,
+    require_dsv4_kvbit_runtime_capability,
+    validate_dsv4_int4_geometry,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -82,6 +87,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_mm,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     mamba_extra_buffer_enabled,
@@ -1294,6 +1300,36 @@ class KVCacheConfigurator:
         c128_state_dtype: Optional[torch.dtype],
         req_to_token_pool: ReqToTokenPool,
     ) -> KVCache:
+        enable_kvbit_swa = dsv4_kvbit_enabled_for_worker(
+            kv_cache_dtype=self.kv_cache_dtype_str,
+            is_draft_worker=self.is_draft_worker,
+        )
+        if enable_kvbit_swa:
+            if not current_platform.is_cuda():
+                raise RuntimeError("DSV4 KVBit packed persistent KV is CUDA-only.")
+            if not get_platform().is_sm90:
+                raise RuntimeError(
+                    "DSV4 KVBit FlashMLA packed persistent KV requires SM90."
+                )
+            if get_memory().enable_hisparse:
+                raise RuntimeError(
+                    "DSV4 KVBit packed persistent KV does not support HiSparse."
+                )
+            if get_memory().enable_hierarchical_cache:
+                raise RuntimeError(
+                    "DSV4 KVBit packed persistent KV does not support "
+                    "hierarchical cache."
+                )
+            if get_disagg().disaggregation_mode != "null":
+                raise RuntimeError(
+                    "DSV4 KVBit packed persistent KV does not support disaggregation."
+                )
+            validate_dsv4_int4_geometry(
+                self.model_config.qk_nope_head_dim,
+                self.model_config.qk_rope_head_dim,
+            )
+            require_dsv4_kvbit_runtime_capability()
+
         swa_page_size = get_schedule().page_size
         if not _is_npu:
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
@@ -1349,6 +1385,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            enable_kvbit_swa=enable_kvbit_swa,
         )
         return token_to_kv_pool
 

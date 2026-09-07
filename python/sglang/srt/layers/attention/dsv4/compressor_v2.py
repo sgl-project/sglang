@@ -222,6 +222,69 @@ class CompressorBackendMixin:
             ),
         )
 
+    def _forward_compress_packed(
+        self,
+        *,
+        kv_score_buffer: torch.Tensor,
+        kv_score_input: torch.Tensor,
+        ape: torch.Tensor,
+        compressor: Compressor,
+        layer_id: int,
+        out_loc: torch.Tensor,
+    ) -> None:
+        plan = self._get_paged_compress_metadata(compressor.ratio)
+        is_online = _use_online_compress(compressor.ratio)
+        if is_online:
+            kv_score_buffer = kv_score_buffer.view(-1, 1, compressor.head_dim * 3)
+        else:
+            coff = 2 if is_overlap_compress(compressor.ratio) else 1
+            kv_score_buffer = kv_score_buffer.view(
+                -1, compressor.ratio, 2 * compressor.head_dim * coff
+            )
+        kv_compressed = compress_forward(
+            kv_score_buffer=kv_score_buffer,
+            kv_score_input=kv_score_input,
+            ape=ape.view(-1, compressor.head_dim),
+            plan=plan,
+            compress_ratio=compressor.ratio,
+            head_dim=compressor.head_dim,
+            is_online=is_online,
+        )
+        if kv_compressed.shape[0] == 0:
+            return
+
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            fused_norm_rope_inplace_triton,
+        )
+
+        positions = _extract_positions_from_plan(plan, compressor.ratio)
+        fused_norm_rope_inplace_triton(
+            kv_compressed,
+            compressor.norm.weight,
+            compressor.norm.variance_epsilon,
+            compressor.freqs_cis,
+            positions=positions.clamp(min=0),
+        )
+        if plan.is_decode:
+            seq_lens = plan[1].view(torch.int32)[:, 0]
+            valid = seq_lens % compressor.ratio == 0
+            out_loc_to_store = torch.where(valid, out_loc, torch.full_like(out_loc, -1))
+        else:
+            plan_c = plan[1].view(torch.int32)
+            valid = plan_c[:, 0] != -1
+            ragged_ids = plan_c[:, 1] & 0xFFFF
+            safe_ragged_ids = torch.where(valid, ragged_ids, 0)
+            mapped_out_loc = out_loc[safe_ragged_ids.long()]
+            out_loc_to_store = torch.where(
+                valid, mapped_out_loc, torch.full_like(mapped_out_loc, -1)
+            )
+
+        self.token_to_kv_pool.set_extra_key_buffer_fused(
+            layer_id=layer_id,
+            loc=out_loc_to_store,
+            cache_k=kv_compressed,
+        )
+
     def forward_unified(
         self,
         x: torch.Tensor,
@@ -248,6 +311,7 @@ class CompressorBackendMixin:
         use_hip_fp4 = _is_hip and use_fp4_indexer
         bf16_store = False
         kv_scale_cache = None
+        packed_store = False
         if compressor.is_in_indexer:
             page_size = token_to_kv_pool.get_index_k_page_size()
             if use_hip_fp4:
@@ -266,30 +330,46 @@ class CompressorBackendMixin:
         else:
             _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
             assert compress_kv_pool is not None
-            kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-            page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
-            if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
-                out_loc = compress_kv_pool._translate_loc_to_hisparse_device(out_loc)
-        self._forward_compress_all_in_one(
-            kv_score_buffer=state_pool.kv_score_buffer.kv_score,
-            kv_score_input=kv_score_input,
-            ape=compressor.ape,
-            head_dim=compressor.head_dim,
-            norm=compressor.norm,
-            freqs_cis_cache=compressor.freqs_cis,
-            kv_cache=kv_cache if use_hip_fp4 else kv_cache.view(dtype=torch.uint8),
-            is_indexer=compressor.is_in_indexer,
-            rotate=compressor.rotate,
-            compress_ratio=compressor.ratio,
-            page_size=page_size,
-            out_loc=out_loc,
-            use_fp4_indexer=use_fp4_indexer,
-            bf16_store=bf16_store,
-            kv_scale_cache=kv_scale_cache,
-            rope_cache=(
-                (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None
-            ),
-        )
+            if compress_kv_pool.is_dsv4_kvbit_packed:
+                self._forward_compress_packed(
+                    kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+                    kv_score_input=kv_score_input,
+                    ape=compressor.ape,
+                    compressor=compressor,
+                    layer_id=layer_id,
+                    out_loc=out_loc,
+                )
+                packed_store = True
+            else:
+                kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+                page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+                if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
+                    out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
+                        out_loc
+                    )
+        if not packed_store:
+            self._forward_compress_all_in_one(
+                kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+                kv_score_input=kv_score_input,
+                ape=compressor.ape,
+                head_dim=compressor.head_dim,
+                norm=compressor.norm,
+                freqs_cis_cache=compressor.freqs_cis,
+                kv_cache=(
+                    kv_cache if use_hip_fp4 else kv_cache.view(dtype=torch.uint8)
+                ),
+                is_indexer=compressor.is_in_indexer,
+                rotate=compressor.rotate,
+                compress_ratio=compressor.ratio,
+                page_size=page_size,
+                out_loc=out_loc,
+                use_fp4_indexer=use_fp4_indexer,
+                bf16_store=bf16_store,
+                kv_scale_cache=kv_scale_cache,
+                rope_cache=(
+                    (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None
+                ),
+            )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
             online_c128_mtp.write_prefix_states(

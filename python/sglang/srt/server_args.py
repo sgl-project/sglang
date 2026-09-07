@@ -598,7 +598,10 @@ class ServerArgs:
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                'recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "int4" '
+                "enables the target-only DeepSeek V4 368-byte signed INT4 cache "
+                "with group size 64, seven FP16 steps, and H256. It requires "
+                "CUDA SM90 and resolves its backing dtype as auto."
             ),
             choices=[
                 "auto",
@@ -610,6 +613,7 @@ class ServerArgs:
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",
+                "int4",
             ],
             resolvable=True,
         ),
@@ -2230,8 +2234,9 @@ class ServerArgs:
             "space), so for a small draft it can still rival the target pool: a 5-layer "
             "DFLASH draft costs 10240 bytes/token in bf16. Setting fp8_e4m3 halves the draft "
             "pool; the saving shows up as free device memory, so raise "
-            "--mem-fraction-static to convert it into KV capacity. Default follows "
-            "--kv-cache-dtype.",
+            "--mem-fraction-static to convert it into KV capacity. Defaults to "
+            "fp8_e4m3 when target --kv-cache-dtype is int4; otherwise follows "
+            "the target dtype. An explicit draft dtype always takes precedence.",
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
         ),
         NS("spec"),
