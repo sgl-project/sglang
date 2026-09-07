@@ -389,7 +389,7 @@ class TpModelWorker(BaseTpWorker):
         # broadcast, so they reuse the target's already-broadcast seed.
         if random_seed is not None:
             self.random_seed = random_seed
-        elif server_args.is_ep_joiner:
+        elif get_exec().moe.is_ep_joiner:
             self.random_seed = get_device().random_seed
         else:
             self.random_seed = broadcast_pyobj(

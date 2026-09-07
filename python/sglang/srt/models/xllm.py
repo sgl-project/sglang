@@ -661,10 +661,10 @@ def _validate_mova_config(
                 "the released checkpoints persist float32 dtype metadata but "
                 "their weights and validated runtime contract are BF16."
             )
-        if quant_config is not None:
+        if quant_config is not None and quant_config.get_name() != "compressed_tensors":
             raise ValueError(
-                "Native xLLM/K2 Horizon serving does not support quantized "
-                "model weights"
+                "Native xLLM/K2 Horizon serving supports only "
+                "compressed-tensors quantized model weights"
             )
 
         runtime = get_exec()
@@ -1685,6 +1685,14 @@ class XllmModel(nn.Module):
 
 class XllmForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+
+    # Quantized checkpoints store these projections separately. This mapping
+    # lets quantization configs resolve fused runtime modules and their ignore
+    # lists consistently.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,

@@ -10,6 +10,8 @@ from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+from sglang.srt.runtime_context import get_model, get_serving
+
 
 class ThinkingMode(str, Enum):
     """Mode for message encoding - chat vs thinking/reasoning."""
@@ -89,6 +91,10 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.hunyuan_reasoning import (
+    normalize_hunyuan_reasoning_effort,
+    uses_hunyuan_reasoning_effort,
+)
 from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
@@ -263,7 +269,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self.tool_call_parser = self.tokenizer_manager.config_value("tool_call_parser")
         self.reasoning_parser = self.tokenizer_manager.config_value("reasoning_parser")
         self.default_chat_template_kwargs = (
-            self.tokenizer_manager.server_args.default_chat_template_kwargs or {}
+            get_serving().default_chat_template_kwargs or {}
         )
         self._reasoning_detector = None
         if self.reasoning_parser:
@@ -313,7 +319,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self._dsv4_reasoning_effort_profile = (
             chat_encoding.resolve_dsv4_reasoning_effort_profile(
                 model_path=self.tokenizer_manager.model_path,
-                revision=self.tokenizer_manager.server_args.revision,
+                revision=get_model().revision,
                 override=self.tokenizer_manager.model_config.hf_config.to_dict().get(
                     chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
                 ),
@@ -708,22 +714,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _should_return_input_ids(self, request: ChatCompletionRequest) -> bool:
         """Whether prompt (input) token ids should be returned via sglext."""
-        return (
-            request.return_input_ids_in_sglext
-            or self.tokenizer_manager.server_args.return_input_ids
-        )
+        return request.return_input_ids_in_sglext or get_serving().return_input_ids
 
     def _should_return_output_ids(self, request: ChatCompletionRequest) -> bool:
         """Whether sampled output token ids should be returned via sglext."""
-        return (
-            request.return_output_ids_in_sglext
-            or self.tokenizer_manager.server_args.return_output_ids
-        )
+        return request.return_output_ids_in_sglext or get_serving().return_output_ids
 
     def _continuous_usage_cached_details(
         self, content: Dict[str, Any]
     ) -> Optional[PromptTokensDetails]:
-        if not self.tokenizer_manager.server_args.enable_cache_report:
+        if not get_serving().enable_cache_report:
             return None
         return UsageProcessor._details_if_cached(
             content["meta_info"].get("cached_tokens", 0)
@@ -815,7 +815,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
         offset = stream_offsets.get(index, 0)
-        if self.tokenizer_manager.server_args.incremental_streaming_output:
+        if get_serving().incremental_streaming_output:
             delta = content["text"]
         else:
             delta = content["text"][offset:]
@@ -1003,12 +1003,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
-        server_context_length = self.tokenizer_manager.server_args.context_length
+        server_context_length = get_model().context_length
         if (
             max_output_tokens
             and server_context_length
             and max_output_tokens > server_context_length
-        ) and not self.tokenizer_manager.server_args.allow_auto_truncate:
+        ) and not get_serving().allow_auto_truncate:
             return (
                 f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
@@ -1048,6 +1048,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+
         # Header-based opt-in (same rationale as request_headers.py).
         if raw_request is not None and not request.return_input_ids_in_sglext:
             if raw_request.headers.get("x-sglext-return-input-ids") == "1":
@@ -1057,11 +1058,16 @@ class OpenAIServingChat(OpenAIServingBase):
             if raw_request.headers.get("x-sglext-return-output-ids") == "1":
                 request.return_output_ids_in_sglext = True
 
-        reasoning_effort = (
-            request.chat_template_kwargs.pop("reasoning_effort", None)
-            if request.chat_template_kwargs
-            else None
-        )
+        reasoning_effort = None
+        if not uses_hunyuan_reasoning_effort(
+            self.reasoning_parser, self.template_manager.reasoning_config
+        ):
+            reasoning_effort = (
+                request.chat_template_kwargs.pop("reasoning_effort", None)
+                if request.chat_template_kwargs
+                else None
+            )
+
         if self.is_gpt_oss and reasoning_effort == "none":
             raise ValueError(
                 f"Harmony does not support reasoning effort {reasoning_effort}"
@@ -1204,6 +1210,10 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
+
+        normalize_hunyuan_reasoning_effort(
+            request, self.reasoning_parser, self.template_manager.reasoning_config
+        )
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -1700,7 +1710,7 @@ class OpenAIServingChat(OpenAIServingBase):
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
-                self.tokenizer_manager.server_args.stream_response_default_include_usage,
+                get_serving().stream_response_default_include_usage,
             )
 
             return_input_ids = self._should_return_input_ids(request)
@@ -1752,7 +1762,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if return_output_ids:
                     chunk_output_ids = content.get("output_ids")
                     if chunk_output_ids is not None:
-                        if self.tokenizer_manager.server_args.incremental_streaming_output:
+                        if get_serving().incremental_streaming_output:
                             accumulated = output_ids.setdefault(index, [])
                             if finish_reason_type == "abort":
                                 # The abort chunk re-sends the last token plus any coalesced deltas;
@@ -1971,7 +1981,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens,
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
-                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    enable_cache_report=get_serving().enable_cache_report,
                     image_tokens=total_image_tokens,
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
@@ -2195,7 +2205,7 @@ class OpenAIServingChat(OpenAIServingBase):
         usage = UsageProcessor.calculate_response_usage(
             ret,
             n_choices=request.n,
-            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+            enable_cache_report=get_serving().enable_cache_report,
             image_tokens=image_tokens,
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
@@ -2418,7 +2428,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process logprobs for streaming response"""
         output_token_logprobs = content["meta_info"]["output_token_logprobs"]
         output_top_logprobs = content["meta_info"].get("output_top_logprobs", [])
-        if not self.tokenizer_manager.server_args.incremental_streaming_output:
+        if not get_serving().incremental_streaming_output:
             output_token_logprobs = output_token_logprobs[
                 n_prev_token:total_output_logprobs
             ]
@@ -2575,7 +2585,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return
 
         if self.reasoning_parser == "hunyuan":
-            request.reasoning_effort = "medium" if enabled else "no_think"
+            config = self.template_manager.reasoning_config
+            if config is not None and config.special_case == "hunyuan_effort":
+                request.reasoning_effort = "high" if enabled else "no_think"
+            else:
+                request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
         if self.reasoning_parser == "inkling":
@@ -2644,6 +2658,9 @@ class OpenAIServingChat(OpenAIServingBase):
             ) == "enabled"
 
         if self.reasoning_parser == "hunyuan":
+            config = self.template_manager.reasoning_config
+            if config is not None and config.special_case == "hunyuan_effort":
+                return request.reasoning_effort not in ("none", "no_think")
             # Hy3-preview template emits no <think> when reasoning_effort is
             # "no_think" / "none" / unset; forcing reasoning would route all
             # output into reasoning_content.
