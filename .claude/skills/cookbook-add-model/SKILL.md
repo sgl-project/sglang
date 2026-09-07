@@ -164,8 +164,10 @@ least one real deployment or capability boundary. Put orthogonal runtime feature
 4. **Fill `cells[]`** with the verified recipes from Phase 1 (replace every EXAMPLE cell;
    set `verified: true` only on tested combos), and `modelNames` with real HF slugs,
    `dockerImages` for your hw (use the Phase-1 tag, or default `lmsysorg/sglang:dev` — never
-   a guessed release; key by `hw`, or `hw|quant` when one quant on a shared GPU needs its own
-   image), `multiNodeHints` only for fabric-specific hw (e.g. gb200).
+   a guessed release; key by `hw`, or a more specific key — `hw|variant|quant`, `variant|quant`,
+   `hw|quant|strategy`, `hw|quant`, resolved in that order before `hw` — when one
+   variant/quant/strategy needs its own image), `multiNodeHints` only for fabric-specific hw
+   (e.g. gb200).
 
 ### Site-wiring (do all three)
 

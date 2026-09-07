@@ -87,7 +87,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel, get_schedule, publish
+from sglang.srt.runtime_context import (
+    get_model,
+    get_parallel,
+    get_schedule,
+    publish,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -356,12 +361,12 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         model_runner = MlxModelRunnerStub(**runner_kwargs)
     else:
         model_runner = ModelRunner(**runner_kwargs)
-        if cfg.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             model_runner.start_startup_weight_load()
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
         model_runner.init_cuda_graphs()
-        if cfg.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             model_runner.finalize_startup_weight_load()
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
@@ -432,9 +437,9 @@ def prepare_extend_inputs_for_correctness_test(
         req: Req = reqs[i]
         req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
-            # Use req.req_pool_idx instead of i to handle slot 0 padding correctly
+            # Use req.kv.req_pool_idx instead of i to handle slot 0 padding correctly
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : bench_args.cut_len
+                req.kv.req_pool_idx, : bench_args.cut_len
             ].to(req.prefix_indices.dtype)
             req.logprob_start_len = -1
         req.set_extend_range(

@@ -189,7 +189,7 @@ class TestMultiTenantRadixTree(unittest.TestCase):
         for i in range(100):
             for j, prefix in enumerate(prefixes):
                 random_suffix = "".join(random.choices(string.ascii_letters, k=10))
-                self.tree.insert(prefix + random_suffix, f"tenant{j+1}")
+                self.tree.insert(prefix + random_suffix, f"tenant{j + 1}")
 
         sizes_before = self.tree.get_used_size_per_tenant()
         print(sizes_before)

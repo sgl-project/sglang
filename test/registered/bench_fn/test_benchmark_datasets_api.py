@@ -87,8 +87,8 @@ parse_prefix_cache_args = _PREFIX_CACHE_MODULE.parse_args
 result_validation_error = _PREFIX_CACHE_MODULE.result_validation_error
 write_summary = _PREFIX_CACHE_MODULE.write_summary
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
-register_cpu_ci(est_time=46, suite="base-c-test-cpu")
+register_cpu_ci(est_time=38, suite="base-a-test-cpu")
+register_cpu_ci(est_time=46, suite="stage-b-test-cpu-intel")
 
 
 _BENCH_SERVING_CLI_CASES = {

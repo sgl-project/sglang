@@ -213,9 +213,7 @@ def _format_standalone_estimate_snippet(
     suite: str, standalone_file: str, measured_full_test_time_s: float
 ) -> str:
     return (
-        f'"{suite}": {{\n'
-        f'    "{standalone_file}": {measured_full_test_time_s:.1f},\n'
-        f"}}"
+        f'"{suite}": {{\n    "{standalone_file}": {measured_full_test_time_s:.1f},\n}}'
     )
 
 
@@ -228,13 +226,13 @@ def _print_missing_standalone_estimate_message(
         suite, standalone_file, measured_full_test_time_s
     )
     logger.error(
-        f'\n{"=" * 60}\n'
+        f"\n{'=' * 60}\n"
         f'Add standalone estimate for suite "{suite}" and file "{standalone_file}":\n\n'
         f"File: python/sglang/multimodal_gen/test/run_suite.py\n\n"
         f"Current partition used fallback estimate: "
         f"{DEFAULT_STANDALONE_EST_TIME_SECONDS:.1f}s\n\n"
         f"{snippet}\n"
-        f'{"=" * 60}\n'
+        f"{'=' * 60}\n"
     )
 
 
@@ -579,8 +577,7 @@ def _run_partition_assignment(
                 else ""
             )
             print(
-                f"  - standalone: {standalone_file} "
-                f"({est_time:.1f}s{fallback_suffix})"
+                f"  - standalone: {standalone_file} ({est_time:.1f}s{fallback_suffix})"
             )
 
         for standalone_file in assignment.standalone_files:

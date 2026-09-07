@@ -13,7 +13,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def test_flashinfer_prefill_returns_standard_combine_input():
@@ -31,6 +31,7 @@ def test_flashinfer_prefill_returns_standard_combine_input():
     wrapper.run.return_value = expected_output
     quant_info = SimpleNamespace(
         wrapper=wrapper,
+        quant_mode="w4a4",
         use_per_token_activation=False,
         a1_scale=torch.tensor(1.0),
         a2_scale=torch.tensor(1.0),

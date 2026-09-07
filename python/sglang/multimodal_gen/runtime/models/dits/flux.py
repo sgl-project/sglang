@@ -169,10 +169,11 @@ def _flux_norm_modulate(
     """``norm(x) * (1 + scale) + shift`` for the FLUX adaLN sites.
 
     Priority: (1) the bit-exact single-kernel LN+modulate -- lossless, so it
-    needs no quality gate and also supersedes the ``quality="high"`` affine
+    needs no quality gate and also supersedes the request-gated affine
     fold wherever it verifies; (2) when the site is mounted
-    (``quality="high"``) and the bit-exact kernel is unavailable, the
-    modulate folded into the LN affine (one aten kernel; not bit-exact);
+    (``quality="extra-high"`` or ``"high"``) and the bit-exact kernel is
+    unavailable, the modulate folded into the LN affine (one aten kernel; not
+    bit-exact);
     (3) affine-free LayerNorm + the bit-exact fused modulate.
     """
     out = _flux_fused_ln_modulate(norm, x, scale, shift)
@@ -387,7 +388,7 @@ class FluxGELU(nn.Module):
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.gelu = nn.GELU(approximate="tanh")
-        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # extra-high/high fusion site: up-proj GEMM + tanh-GELU in the cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 
@@ -407,7 +408,7 @@ class FluxFusedGELUProj(nn.Module):
     ``approximate="tanh"`` that keeps the ``net.0.proj`` parameter path. The
     default path is the bit-exact reference (plain Linear + tanh-GELU); the
     cublasLt GELU epilogue is mounted per batch by the denoising stage for
-    quality="high" requests only.
+    requests with ``quality="extra-high"`` or ``quality="high"`` only.
     """
 
     def __init__(self, proj: nn.Linear):
@@ -790,7 +791,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
-            # quality="high" fusion site: proj_mlp GEMM + tanh-GELU in the
+            # extra-high/high fusion site: proj_mlp GEMM + tanh-GELU in the
             # cublasLt epilogue (mounted per batch by the denoising stage).
             mark_fused_gelu_site(self, "proj_mlp")
             proj_out_cls = (
@@ -954,7 +955,7 @@ class FluxTransformerBlock(nn.Module):
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-        # quality="high" site: the norm2/norm2_context modulate folds into the
+        # extra-high/high site: norm2/norm2_context modulate folds into the
         # LN affine when mounted.
         mark_fused_ln_modulate_site(self)
 
@@ -1009,7 +1010,7 @@ class FluxTransformerBlock(nn.Module):
                 activation_fn="gelu-approximate",
             )
             # Re-home each FF's tanh-GELU up-projection onto a marked
-            # quality="high" fusion site (bit-exact reference by default).
+            # extra-high/high fusion site (bit-exact reference by default).
             self.ff.net[0] = FluxFusedGELUProj(self.ff.net[0].proj)
             self.ff_context.net[0] = FluxFusedGELUProj(self.ff_context.net[0].proj)
 
