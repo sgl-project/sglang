@@ -2,13 +2,17 @@ import math
 import os
 import re
 import time
-from typing import List, Optional, Union
+from copy import deepcopy
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from typing import Any, List, Optional, Union
 
 import numpy as np
 import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
+from transformers import BaseImageProcessor
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -32,6 +36,11 @@ from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+from sglang.srt.multimodal.media_artifacts.base import (
+    MediaArtifactCacheMixin,
+    MediaArtifactInput,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -65,6 +74,37 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
+
+
+@dataclass(frozen=True)
+class QwenVLImagePreprocessArtifact:
+    """Prompt-independent Qwen-VL processor output for one image."""
+
+    content_digest: str
+    artifact_key: str
+    feature_hash: int
+    feature: Optional[torch.Tensor]
+    model_specific_data: dict[str, Any]
+
+    @property
+    def has_feature(self) -> bool:
+        return self.feature is not None
+
+    def cache_value(self) -> "QwenVLImagePreprocessArtifact":
+        """Keep CPU processor outputs but never retain a CUDA tensor."""
+        if self.feature is None or self.feature.device.type == "cpu":
+            return self
+        return replace(self, feature=None)
+
+    def cache_size_items(self) -> tuple:
+        return (
+            self.content_digest,
+            self.artifact_key,
+            self.feature_hash,
+            self.feature,
+            self.model_specific_data,
+        )
+
 
 QWEN_VIDEO_PREPROCESS_CONFIG_KEYS = frozenset(
     {
@@ -286,8 +326,10 @@ async def preprocess_video(
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
-class QwenVLImageProcessor(SGLangBaseProcessor):
+class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     supports_transformers_backend = True
+    generates_input_ids_from_raw_prompt = True
+    artifact_modality = Modality.IMAGE
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
@@ -304,6 +346,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        self.uses_media_artifacts_without_cache = self.model_type in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        )
         if self.model_type in (
             "qwen2_vl",
             "qwen2_5_vl",
@@ -725,7 +771,194 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mrope_position_delta=mrope_position_delta,
         )
 
-    async def process_mm_data_async(
+    def prepare_artifact_batch(
+        self,
+        entries: list[MediaArtifactInput],
+        *,
+        processor=None,
+    ) -> list[QwenVLImagePreprocessArtifact]:
+        """Preprocess image cache misses without retaining prompt-specific state."""
+        if not entries:
+            return []
+
+        processor, _ = self._resolve_processor(processor)
+        image_kwargs = dict(self.image_config or {})
+        processor_device = None
+        if (
+            isinstance(processor.image_processor, BaseImageProcessor)
+            and not self.disable_fast_image_processor
+        ):
+            processor_device = self._fast_image_processor_device(processor)
+            if processor_device is not None:
+                image_kwargs["device"] = processor_device
+
+        with self._temporary_fast_processor_cuda_pool(processor_device):
+            result = processor.image_processor(
+                images=[entry.media for entry in entries],
+                return_tensors="pt",
+                **image_kwargs,
+            )
+            features = self._get_processor_output_value(result, "pixel_values")
+            image_grid_thw = self._get_processor_output_value(result, "image_grid_thw")
+            if (
+                isinstance(features, torch.Tensor)
+                and (
+                    self.mm_preprocess_cache.enabled
+                    or not self.keep_mm_features_on_device
+                )
+                and not self.precompute_hash_before_cpu_transfer
+            ):
+                features = features.cpu()
+
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("Qwen-VL image processor must return pixel_values")
+        if not isinstance(image_grid_thw, torch.Tensor):
+            image_grid_thw = torch.as_tensor(image_grid_thw, dtype=torch.long)
+        if image_grid_thw.ndim != 2 or image_grid_thw.shape != (len(entries), 3):
+            raise ValueError(
+                "Qwen-VL image processor returned an invalid image_grid_thw shape: "
+                f"{tuple(image_grid_thw.shape)}"
+            )
+        feature_lengths = image_grid_thw.prod(dim=1).tolist()
+        if sum(feature_lengths) != features.shape[0]:
+            raise ValueError(
+                "Qwen-VL image processor feature count does not match image grids: "
+                f"{features.shape[0]} != {sum(feature_lengths)}"
+            )
+
+        artifacts = []
+        feature_offset = 0
+        for entry, grid, feature_length in zip(
+            entries, image_grid_thw, feature_lengths
+        ):
+            feature = features[
+                feature_offset : feature_offset + feature_length
+            ].contiguous()
+            feature_offset += feature_length
+            # The artifact key already commits to the media content, processor
+            # fingerprint, and every preprocessing kwarg. Derive the downstream
+            # cache identity from it so independently preprocessed copies in
+            # different tokenizer workers share the same radix/VLM cache key.
+            feature_hash = resolve_multimodal_item_hash(
+                existing_hash=0, namespace=entry.artifact_key
+            )
+            artifacts.append(
+                QwenVLImagePreprocessArtifact(
+                    content_digest=entry.content_digest,
+                    artifact_key=entry.artifact_key,
+                    feature_hash=feature_hash,
+                    feature=feature,
+                    model_specific_data={"image_grid_thw": grid.unsqueeze(0)},
+                )
+            )
+        return artifacts
+
+    def compose_image_artifacts(
+        self,
+        input_text,
+        artifacts: list[QwenVLImagePreprocessArtifact],
+    ) -> MultimodalProcessorOutput:
+        """Compose prompt tokens and request-owned items from cached images."""
+        image_grids = []
+        for artifact in artifacts:
+            grid = self._as_grid_batch(
+                artifact.model_specific_data.get("image_grid_thw")
+            )
+            if grid is None or grid.shape[0] != 1:
+                raise ValueError("Each Qwen-VL image artifact requires one image grid")
+            image_grids.append(grid)
+        image_grid_thw = torch.cat(image_grids, dim=0)
+
+        grid_key = tuple(
+            tuple(int(value) for value in row.tolist()) for row in image_grid_thw
+        )
+        if isinstance(input_text, str):
+            (
+                input_ids_tuple,
+                offsets,
+                mrope_positions,
+                mrope_position_delta,
+            ) = self._cached_image_prompt_template(input_text, grid_key)
+        else:
+            (
+                input_ids_tuple,
+                offsets,
+                mrope_positions,
+                mrope_position_delta,
+            ) = self._build_image_prompt_template(input_text, grid_key)
+        input_ids_list = list(input_ids_tuple)
+
+        mm_items = []
+        for artifact, offset in zip(artifacts, offsets):
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=artifact.feature,
+                offsets=[offset],
+                model_specific_data=deepcopy(artifact.model_specific_data),
+            )
+            item.set_hash(artifact.feature_hash)
+            mm_items.append(item)
+
+        padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
+            input_ids_list, mm_items
+        )
+        mm_items = self._prepare_mm_items_for_transport(mm_items)
+        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
+        return MultimodalProcessorOutput(
+            input_ids=input_ids_list,
+            padded_input_ids=padded_input_ids,
+            mm_items=mm_items,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            mrope_positions=mrope_positions.clone(),
+            mrope_position_delta=mrope_position_delta.clone(),
+        )
+
+    @lru_cache(maxsize=256)
+    def _cached_image_prompt_template(self, input_text: str, grid_key: tuple):
+        """Cache prompt expansion and M-RoPE by prompt and image-grid shape."""
+        return self._build_image_prompt_template(input_text, grid_key)
+
+    def _build_image_prompt_template(self, input_text, grid_key: tuple):
+        image_grid_thw = torch.tensor(grid_key, dtype=torch.long)
+        input_ids_list, offsets, modalities = self.build_input_ids(
+            input_text, img_grid_thw=image_grid_thw
+        )
+        if modalities != [Modality.IMAGE] * len(grid_key):
+            raise ValueError("Qwen-VL image artifacts do not match prompt placeholders")
+
+        template_items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=None,
+                offsets=[offset],
+                model_specific_data={"image_grid_thw": grid.unsqueeze(0)},
+            )
+            for grid, offset in zip(image_grid_thw, offsets)
+        ]
+        input_ids = torch.tensor(input_ids_list, dtype=torch.long)
+        mrope_result = self._compute_image_only_mrope_positions_from_offsets(
+            input_len=input_ids.numel(),
+            mm_items=template_items,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        if mrope_result is None:
+            mrope_result = self.compute_mrope_positions(input_ids_list, template_items)
+        mrope_positions, mrope_position_delta = mrope_result
+        if mrope_positions is not None and mrope_positions.ndim == 3:
+            mrope_positions = mrope_positions.squeeze(1)
+        return (
+            tuple(input_ids_list),
+            tuple(offsets),
+            mrope_positions,
+            mrope_position_delta,
+        )
+
+    async def _process_mm_data_uncached(
         self,
         image_data: List[Union[str, bytes]],
         input_text,
@@ -780,7 +1013,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens, **processor_kwargs
         )
 
-        self._mark_dp_encoder_features_for_deferred_reconstruction(mm_items)
+        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
 
         audio_feature_lengths = None
 
@@ -894,10 +1127,46 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mrope_position_delta=mrope_position_delta,
         )
 
-    def _mark_dp_encoder_features_for_deferred_reconstruction(self, mm_items):
+    async def process_mm_data_async(
+        self,
+        image_data: List[Union[str, bytes]],
+        input_text,
+        request_obj,
+        *args,
+        **kwargs,
+    ):
+        if (
+            not image_data
+            or request_obj.video_data
+            or request_obj.audio_data
+            or any(self._is_preprocessed_input(item) for item in image_data)
+            or (
+                not self.mm_preprocess_cache.enabled
+                and not self.uses_media_artifacts_without_cache
+            )
+        ):
+            return await self._process_mm_data_uncached(
+                image_data, input_text, request_obj, *args, **kwargs
+            )
+
+        prepare_artifacts = (
+            self.prepare_media_artifacts
+            if self.mm_preprocess_cache.enabled
+            else self.prepare_media_artifacts_without_cache
+        )
+        artifacts = await prepare_artifacts(
+            image_data, content_hashes=getattr(request_obj, "mm_content_hashes", None)
+        )
+        return self.compose_image_artifacts(input_text, artifacts)
+
+    def _mark_cuda_ipc_features_for_deferred_reconstruction(self, mm_items):
+        supports_deferred_reconstruction = self.server_args.mm_enable_dp_encoder or (
+            self.server_args.tp_size == 1
+            and self.model_type in ("qwen3_vl", "qwen3_vl_moe")
+        )
         if not (
             self.keep_mm_features_on_device
-            and self.server_args.mm_enable_dp_encoder
+            and supports_deferred_reconstruction
             and self.model_type
             in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
         ):

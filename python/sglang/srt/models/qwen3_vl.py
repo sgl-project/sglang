@@ -72,6 +72,10 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    BORROW_CUDA_IPC_FEATURE_ONCE_KEY,
+    CudaIpcTensorTransportProxy,
+)
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
@@ -1427,13 +1431,29 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 pixel_values_device=self.visual.device,
                 pixel_values_dtype=self.visual.dtype,
             )
-        pixel_values = self._materialize_visual_items(items, range(len(items)))
+        pixel_values, borrowed_features = self._materialize_visual_items(
+            items, range(len(items)), borrow_one_shot=True
+        )
         assert pixel_values.dim() == 2, pixel_values.dim()
-        return self.visual(pixel_values, grid_thw=grid_thw)
+        try:
+            return self.visual(pixel_values, grid_thw=grid_thw)
+        finally:
+            for item, proxy in borrowed_features:
+                proxy.release_borrowed_on_current_stream()
+                item.feature = None
 
     def _materialize_visual_items(
-        self, items: List[MultimodalDataItem], indices: Iterable[int]
-    ) -> torch.Tensor:
+        self,
+        items: List[MultimodalDataItem],
+        indices: Iterable[int],
+        borrow_one_shot: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[
+            torch.Tensor,
+            List[Tuple[MultimodalDataItem, CudaIpcTensorTransportProxy]],
+        ],
+    ]:
         device = self.visual.device
         device_index = device.index
         if device.type == "cuda" and device_index is None:
@@ -1443,14 +1463,40 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             consumer_count = max(parallel.tp_size, 1)
 
         features = []
+        borrowed_features = []
         for index in indices:
             item = items[index]
             if device.type == "cuda":
-                item.reconstruct(device_index, ipc_consumer_count=consumer_count)
+                proxy = item.feature
+                can_borrow = (
+                    borrow_one_shot
+                    and consumer_count == 1
+                    and isinstance(proxy, CudaIpcTensorTransportProxy)
+                    and item.model_specific_data.pop(
+                        BORROW_CUDA_IPC_FEATURE_ONCE_KEY, False
+                    )
+                )
+                borrowed = (
+                    proxy.borrow_on_target_device(device_index) if can_borrow else None
+                )
+                if borrowed is not None:
+                    item.feature = borrowed
+                    borrowed_features.append((item, proxy))
+                else:
+                    item.reconstruct(device_index, ipc_consumer_count=consumer_count)
             features.append(item.feature)
-        return materialize_multimodal_features(
-            features, device=device, dtype=self.visual.dtype
-        )
+        try:
+            materialized = materialize_multimodal_features(
+                features, device=device, dtype=self.visual.dtype
+            )
+        except Exception:
+            for item, proxy in borrowed_features:
+                proxy.release_borrowed_on_current_stream()
+                item.feature = None
+            raise
+        if borrow_one_shot:
+            return materialized, borrowed_features
+        return materialized
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

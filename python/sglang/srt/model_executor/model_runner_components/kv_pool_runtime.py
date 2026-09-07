@@ -96,6 +96,7 @@ def compute_post_capture_kv_resize(
     mm_reservation_gb = mm_runtime_reservation_gb(
         is_multimodal=model_runner.model_config.is_multimodal,
         mm_feature_transport=get_mm().mm_feature_transport,
+        model_type=getattr(model_runner.model_config.hf_config, "model_type", ""),
     )
     budget_bytes = (
         int(max(0.0, free_gb - headroom_gb - mm_reservation_gb) * (1 << 30))

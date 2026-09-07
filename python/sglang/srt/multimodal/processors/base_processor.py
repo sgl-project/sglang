@@ -226,6 +226,9 @@ class BaseMultimodalProcessor(ABC):
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
+    # Artifact-based processors may keep their prompt/M-RoPE fast path even
+    # when artifact retention is disabled.
+    uses_media_artifacts_without_cache = False
     # Processors opt out only when their preprocessing is not thread-safe. The
     # worker pool gives each thread its own `copy.deepcopy` of the HF processor
     # and injects it, and the single function it runs --
@@ -286,6 +289,7 @@ class BaseMultimodalProcessor(ABC):
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config)
             if self.mm_preprocess_cache.enabled
+            or self.uses_media_artifacts_without_cache
             else None
         )
         if self.mm_preprocess_cache.enabled:

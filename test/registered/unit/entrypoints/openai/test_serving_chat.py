@@ -6,7 +6,7 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -193,6 +193,75 @@ class _MockTemplateManager:
         self.jinja_template_may_reorder_tool_results = False
 
 
+class TestChatTemplateCache(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.tokenizer_manager = _MockTokenizerManager()
+        self.chat = OpenAIServingChat(
+            self.tokenizer_manager,
+            _MockTemplateManager(),
+        )
+        self.tokenizer_manager.tokenizer.apply_chat_template.return_value = "rendered"
+        self.tokenizer_manager.tokenizer.encode.return_value = [11, 12]
+        self.tokenizer_manager.tokenizer.decode.return_value = "decoded"
+        self.tokenizer_manager.tokenizer.reset_mock()
+
+    def _render(self, **overrides):
+        kwargs = {
+            "messages": [{"role": "user", "content": "same text prefix"}],
+            "tools": None,
+            "template_kwargs": {"enable_thinking": False},
+            "encode_kwargs": {"add_special_tokens": False},
+            "use_cache": True,
+        }
+        kwargs.update(overrides)
+        return self.chat._render_and_encode_chat_template(**kwargs)
+
+    def test_cache_hit_reuses_render_encode_and_returns_an_owned_id_list(self):
+        first = self._render()
+        first[1].append(99)
+        second = self._render()
+
+        self.assertEqual(second, ("rendered", [11, 12], "decoded"))
+        self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
+        self.tokenizer_manager.tokenizer.encode.assert_called_once()
+        self.tokenizer_manager.tokenizer.decode.assert_called_once()
+
+    def test_cache_key_includes_template_and_encode_options(self):
+        self._render()
+        self._render(template_kwargs={"enable_thinking": True})
+        self._render(encode_kwargs={"add_special_tokens": True})
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            3,
+        )
+        self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 3)
+
+    def test_cache_key_tracks_tokenizer_chat_template_updates(self):
+        self.tokenizer_manager.tokenizer.chat_template = "template-v1"
+        self._render()
+        self.tokenizer_manager.tokenizer.chat_template = "template-v2"
+        self._render()
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            2,
+        )
+
+    def test_non_serializable_input_bypasses_cache(self):
+        messages = [{"role": "user", "content": object()}]
+        self._render(messages=messages)
+        self._render(messages=messages)
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            2,
+        )
+        self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 2)
+        self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+
 class ServingChatTestCase(unittest.TestCase):
     # ------------- common fixtures -------------
     def setUp(self):
@@ -368,9 +437,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.tm.tokenizer.apply_chat_template.reset_mock()
         self.chat._apply_jinja_template(ordered_request, None, is_multimodal=True)
-        self.assertEqual(
-            rendered_messages, self.tm.tokenizer.apply_chat_template.call_args[0][0]
-        )
+        self.tm.tokenizer.apply_chat_template.assert_not_called()
 
         self.template_manager.jinja_template_may_reorder_tool_results = False
         self.tm.tokenizer.apply_chat_template.reset_mock()

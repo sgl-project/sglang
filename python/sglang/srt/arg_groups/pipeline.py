@@ -92,6 +92,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_hicache_ratio_default(server_args)
     from sglang.srt.arg_groups.validation_hook import (
+        default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
     )
@@ -235,6 +236,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_model_specific_adjustments(server_args)
+    default_unset_prefill_decode_interval(server_args)
 
     # Set kernel backends.
     run_post_process_pass(server_args, _sampling_backend_default)

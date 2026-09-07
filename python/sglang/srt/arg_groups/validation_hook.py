@@ -415,8 +415,21 @@ def validate_experimental_sgl_marlin(server_args: Any):
 
 def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
-    if cfg.prefill_decode_interval < 0:
+    if cfg.prefill_decode_interval is not None and cfg.prefill_decode_interval < 0:
         raise ValueError("--prefill-decode-interval must be non-negative.")
+
+
+def default_unset_prefill_decode_interval(server_args: Any):
+    """Leave Qwen3-VL Hopper free to pick 22; everyone else stays disabled."""
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    cfg = resolving_view(server_args)
+    if cfg.prefill_decode_interval is None:
+        declare_resolution(
+            server_args,
+            "prefill_decode_interval_default",
+            prefill_decode_interval=0,
+        )
 
 
 def check_two_batch_overlap(server_args: Any):

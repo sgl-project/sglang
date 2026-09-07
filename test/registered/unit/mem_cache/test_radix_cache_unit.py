@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.utils import get_device
+from sglang.test.test_utils import CustomTestCase
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4
@@ -368,7 +369,7 @@ class TestTreeNode(unittest.TestCase):
                 self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
 
-class TestRadixCache(unittest.TestCase):
+class TestRadixCache(CustomTestCase):
     """Test cases for RadixCache class."""
 
     def setUp(self):
@@ -539,6 +540,52 @@ class TestRadixCache(unittest.TestCase):
         torch.testing.assert_close(
             cache.req_to_token_pool.req_to_token[0], tree_indices
         )
+
+    def test_finished_request_splits_prompt_from_output_for_eviction(self):
+        class ReqToTokenPool:
+            def __init__(self, row):
+                self.req_to_token = row.unsqueeze(0)
+
+        allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(mock_allocator=allocator)
+        prompt_ids = array("q", [1, 2, 3])
+        output_ids = array("q", [4, 5])
+        kv_indices = allocator.alloc(len(prompt_ids) + len(output_ids))
+        self.assertIsNotNone(kv_indices)
+        cache.req_to_token_pool = ReqToTokenPool(kv_indices)
+        req = unittest.mock.Mock(
+            origin_input_ids=prompt_ids,
+            output_ids=output_ids,
+            kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
+            extra_key=None,
+            cache_salt=None,
+            priority=0,
+            last_node=cache.root_node,
+        )
+
+        cache.cache_finished_req(
+            req,
+            is_insert=True,
+            kv_len_to_handle=len(prompt_ids) + len(output_ids),
+        )
+
+        (prompt_node,) = cache.root_node.children.values()
+        (output_node,) = prompt_node.children.values()
+        self.assertEqual(len(prompt_node.key), len(prompt_ids))
+        self.assertEqual(len(output_node.key), len(output_ids))
+
+        result = cache.evict(EvictParams(num_tokens=len(output_ids)))
+        self.assertEqual(result.num_tokens_evicted, len(output_ids))
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(prompt_ids + output_ids))
+        )
+        self.assertEqual(len(match.device_indices), len(prompt_ids))
 
     def test_kv_cache_events(self):
         """Test KV cache events functionality."""

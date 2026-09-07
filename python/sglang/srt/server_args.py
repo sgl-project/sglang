@@ -715,10 +715,13 @@ class ServerArgs:
         NS("schedule"),
     ] = None
     prefill_decode_interval: A[
-        int,
-        "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+        Optional[int],
+        Arg(
+            help="The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+            resolvable=True,
+        ),
         NS("schedule"),
-    ] = 0
+    ] = None
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -844,9 +847,16 @@ class ServerArgs:
                 "for what each policy optimizes for."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
+            resolvable=True,
         ),
         NS("memory"),
     ] = "lru"
+    # Preserve whether the operator wrote the public flag. Its default value is
+    # also "lru", so the value alone cannot distinguish an explicit LRU choice
+    # from an omitted option that a model profile may resolve.
+    _radix_eviction_policy_explicitly_set: A[bool, Arg(no_cli=True), NS("memory")] = (
+        False
+    )
     radix_eviction_policy_config: A[
         Optional[Dict[str, Any]],
         Arg(
@@ -2933,10 +2943,15 @@ class ServerArgs:
     ] = 64
     mm_preprocess_cache_size_mb: A[
         Optional[int],
-        "CPU memory budget for content-addressed multimodal preprocessing "
-        "artifacts. Unset selects a model-specific default (256 MiB for "
-        "Kimi-K3); 0 disables the cache. The budget is divided across "
-        "tokenizer workers and does not reserve GPU memory.",
+        Arg(
+            help=(
+                "CPU memory budget for content-addressed multimodal preprocessing "
+                "artifacts. Unset selects a model-specific default (256 MiB for "
+                "Kimi-K3); 0 disables the cache. The budget is divided across "
+                "tokenizer workers and does not reserve GPU memory."
+            ),
+            resolvable=True,
+        ),
         NS("mm"),
     ] = None
     trust_mm_content_hashes: A[
@@ -2981,13 +2996,18 @@ class ServerArgs:
     ] = False
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
-        "Transport multimodal features through CPU memory, a bounded CUDA IPC "
-        "pool, or a bounded CUDA VMM pool. "
-        "Unset uses cpu except for validated multi-node GB200/GB300 MNNVL models, "
-        "which use cuda_vmm when an IMEX channel is available. Select cuda_ipc "
-        "explicitly for single-node GPU transport. GPU transports reserve "
-        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
-        "back to CPU transport when the pool is full.",
+        Arg(
+            help=(
+                "Transport multimodal features through CPU memory, a bounded CUDA IPC "
+                "pool, or a bounded CUDA VMM pool. "
+                "Unset uses cpu except for validated multi-node GB200/GB300 MNNVL models, "
+                "which use cuda_vmm when an IMEX channel is available. Select cuda_ipc "
+                "explicitly for single-node GPU transport. GPU transports reserve "
+                "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
+                "back to CPU transport when the pool is full."
+            ),
+            resolvable=True,
+        ),
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
@@ -4287,7 +4307,15 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         config_merger = ConfigArgumentMerger(parser)
         argv = config_merger.merge_config_with_args(argv)
 
+    radix_eviction_policy_explicitly_set = any(
+        arg == "--radix-eviction-policy" or arg.startswith("--radix-eviction-policy=")
+        for arg in argv
+    )
+
     raw_args = parser.parse_args(argv)
+    raw_args._radix_eviction_policy_explicitly_set = (
+        radix_eviction_policy_explicitly_set
+    )
 
     # Set up basic logging before ServerArgs.__post_init__ so that
     # logger.info / logger.warning calls there are properly formatted.

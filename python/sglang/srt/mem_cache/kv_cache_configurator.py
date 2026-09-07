@@ -116,6 +116,16 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
 
 _is_hip = is_hip()
 
+# Eager multimodal prefills need transient device memory in addition to the
+# persistent embedding/transport caches. In particular, deepstack models hold
+# wider embedding buffers while the language-model MLP allocates its output.
+# Keep 6 GiB out of the KV pool for that overlap and for fragmentation between
+# the eager-prefill and decode CUDA-graph pools. This headroom is independent
+# of the embedding-cache budget: a disabled cache must not let KV allocation
+# consume the memory required by an uncached high-concurrency ViT prefill.
+_MM_RUNTIME_ACTIVATION_RESERVE_MB = 6144
+_MM_RUNTIME_ACTIVATION_RESERVE_MODEL_TYPES = frozenset({"qwen3_vl", "qwen3_vl_moe"})
+
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
@@ -141,21 +151,29 @@ def _should_enable_lazy_compaction() -> bool:
 
 
 def mm_runtime_reservation_gb(
-    *, is_multimodal: bool, mm_feature_transport: Optional[str]
+    *,
+    is_multimodal: bool,
+    mm_feature_transport: Optional[str],
+    model_type: str = "",
 ) -> float:
-    """Multimodal GPU memory allocated only after the KV pool is sized
-    (mm embedding cache + GPU feature-transport pools); reserve it out of
-    the KV budget so it doesn't have to fit in the runtime slack."""
+    """Reserve persistent multimodal allocations and eager-prefill activations."""
     if not is_multimodal:
         return 0.0
-    reserved_mb = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+    activation_reserve_mb = (
+        _MM_RUNTIME_ACTIVATION_RESERVE_MB
+        if model_type in _MM_RUNTIME_ACTIVATION_RESERVE_MODEL_TYPES
+        else 0
+    )
+    reserved_mb = envs.SGLANG_VLM_CACHE_SIZE_MB.get() + activation_reserve_mb
     if mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
         reserved_mb += envs.SGLANG_MM_FEATURE_CACHE_MB.get()
     if reserved_mb > 0:
         logger.info(
             "Reserving %.2f GB of the KV budget for post-sizing multimodal "
-            "allocations (feature-transport pools + embedding cache).",
+            "allocations and eager-prefill activations (feature-transport "
+            "pools + embedding cache + %.2f GB activation headroom).",
             reserved_mb / 1024,
+            activation_reserve_mb / 1024,
         )
     return reserved_mb / 1024
 
@@ -2096,6 +2114,7 @@ class KVCacheConfigurator:
         mm_reservation_gb = mm_runtime_reservation_gb(
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
+            model_type=getattr(self.model_config.hf_config, "model_type", ""),
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None:
