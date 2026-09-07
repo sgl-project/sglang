@@ -11,7 +11,7 @@ to the HF processor call and the worker-count decision reads the same answer.
 import unittest
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -40,6 +40,10 @@ class _CpuDefaultProcessor(_StubProcessor):
 
 class _Cuda1DefaultProcessor(_StubProcessor):
     mm_preprocessing_device = "cuda:1"
+
+
+class _CpuVideoProcessor(_StubProcessor):
+    video_preprocessing_device = "cpu"
 
 
 def _make(cls=_StubProcessor, **fields):
@@ -346,6 +350,14 @@ class TestProcessMmDataDevice(CustomTestCase):
         self.assertNotIn("images", kwargs)
         self.assertFalse(mem_pool.called)
 
+    def test_cpu_video_override_does_not_enter_a_cuda_pool(self):
+        """The active call device, not the earlier image default, owns the pool."""
+        processor, events = self._harness(_CpuVideoProcessor)
+        with self._cuda_pool_spy() as mem_pool:
+            processor.process_mm_data("t", videos=["video"])
+        self.assertEqual(self._call_device(events)[0], "cpu")
+        self.assertFalse(mem_pool.called)
+
     def test_pil_backend_passes_no_device(self):
         processor, events = self._harness(mm_preprocessing_device="cpu")
         processor.disable_fast_image_processor = True
@@ -384,8 +396,8 @@ class TestGpuImageDecodeFollowsThePlacement(CustomTestCase):
                     self._decode(_make(NoGpuDecode, mm_preprocessing_device=setting))
                 )
 
-    def test_load_single_item_uses_the_instance_mode(self):
-        image = SimpleNamespace(mode="RGB")
+    def test_load_single_item_uses_decode_mode_and_forces_pil_decode(self):
+        image = SimpleNamespace(mode="RGB", load=Mock())
         with patch(f"{BASE}.load_image", return_value=(image, None)) as load_image:
             _StubProcessor._load_single_item(
                 "data", Modality.IMAGE, gpu_image_decode=False
@@ -394,6 +406,7 @@ class TestGpuImageDecodeFollowsThePlacement(CustomTestCase):
         self.assertEqual(
             [call.args[1] for call in load_image.call_args_list], [False, True]
         )
+        self.assertEqual(image.load.call_count, 2)
 
 
 class TestFastImageProcessorMemoryPool(CustomTestCase):
