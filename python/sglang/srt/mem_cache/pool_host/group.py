@@ -16,6 +16,8 @@ class PoolEntry:
     device_pool: Any
     layer_mapper: Callable[[int], int | None]
     is_primary_index_anchor: bool = False
+    # Reclaim callbacks receive the absolute allocation size n. The host
+    # callback evicts n slots; the device callback makes alloc(n) feasible.
     host_evict_fn: Callable[[int], Any] | None = None
     device_evict_fn: Callable[[int], Any] | None = None
     device_alloc_fn: Callable[[int], Any] | None = None

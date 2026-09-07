@@ -30,6 +30,8 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
     query :attr:`supports_prefill` and fall back to Triton.
     """
 
+    supports_safe_gate: bool = False
+
     def __init__(self):
         self.supports_prefill = _is_blackwell()
         self._extend_fn: Optional[callable] = None
@@ -136,6 +138,8 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         num_tokens = q_n.shape[0]
         g_in = g[0][:num_tokens]  # raw forget gate; activated inside chunk_kda_cutedsl
         beta_in = beta[0][:num_tokens].to(torch.float32)
+        if kwargs.get("beta_is_raw"):
+            beta_in = beta_in.sigmoid()
         cu_seqlens = query_start_loc.to(torch.int32)
 
         # Pool state I/O is fused into the h kernel's TMA load/store: pass the
@@ -161,8 +165,9 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
             h0_indices=ssm_cache_indices,
         )
 
-        # Match chunk_kda's output layout [1, T, HV, V].
-        return o.unsqueeze(0)
+        # CuTeDSL does not emit intermediate chunk states; pairing with None
+        # keeps the upstream extra-buffer radix track contract.
+        return o.unsqueeze(0), None
 
     def target_verify(self, *args, **kwargs):
         raise NotImplementedError("CuteDSLKDAKernel does not support target_verify")

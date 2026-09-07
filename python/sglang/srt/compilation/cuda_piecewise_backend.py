@@ -45,7 +45,6 @@ class ConcreteSizeEntry:
 
 
 class CUDAPiecewiseBackend:
-
     def __init__(
         self,
         graph: fx.GraphModule,
@@ -190,8 +189,9 @@ class CUDAPiecewiseBackend:
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
-                with graph_pool_capture_scope(), torch.cuda.graph(
-                    cudagraph, pool=self.graph_pool, stream=stream
+                with (
+                    graph_pool_capture_scope(),
+                    torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream),
                 ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)

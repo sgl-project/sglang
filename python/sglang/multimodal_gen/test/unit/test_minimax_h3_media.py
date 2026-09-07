@@ -127,7 +127,7 @@ def test_video_transform_can_share_one_host_decode(monkeypatch):
         os.write(output_fd, expected.tobytes())
         return SimpleNamespace(stderr=b"")
 
-    monkeypatch.setattr(reference_encoding, "get_world_group", FakeGroup)
+    monkeypatch.setattr(reference_encoding, "get_replica_group", FakeGroup)
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(subprocess, "run", run)
     reference_encoding._reference_video_host_leader.cache_clear()
@@ -174,7 +174,7 @@ def test_shared_video_transform_falls_back_when_proc_fd_is_blocked(monkeypatch):
             raise PermissionError("blocked by test policy")
         return real_open(path, flags)
 
-    monkeypatch.setattr(reference_encoding, "get_world_group", FakeGroup)
+    monkeypatch.setattr(reference_encoding, "get_replica_group", FakeGroup)
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(os, "open", guarded_open)
@@ -216,7 +216,7 @@ def test_shared_video_transform_propagates_any_host_decode_failure(monkeypatch):
             ]
         gather_index += 1
 
-    monkeypatch.setattr(reference_encoding, "get_world_group", FakeGroup)
+    monkeypatch.setattr(reference_encoding, "get_replica_group", FakeGroup)
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(
         reference_encoding,

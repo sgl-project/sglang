@@ -8,7 +8,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.model_executor.runner import base_runner, flashinfer_autotune
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(
@@ -50,10 +50,7 @@ def test_packed_speculative_extend_is_limited_to_pd_prefill_target(mode, error):
 
 def test_chunked_prefill_disabled_uses_legacy_token_ceiling():
     model_runner = SimpleNamespace(
-        server_args=SimpleNamespace(
-            max_prefill_buffer_tokens=Mock(return_value=0),
-            max_prefill_tokens=32768,
-        ),
+        server_args=SimpleNamespace(),
         is_generation=True,
         is_draft_worker=False,
         spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
@@ -75,6 +72,12 @@ def test_chunked_prefill_disabled_uses_legacy_token_ceiling():
             flashinfer_autotune,
             "get_disagg",
             return_value=SimpleNamespace(disaggregation_mode="prefill"),
+        ),
+        patch.object(flashinfer_autotune, "max_prefill_buffer_tokens", return_value=0),
+        patch.object(
+            flashinfer_autotune,
+            "get_schedule",
+            return_value=SimpleNamespace(max_prefill_tokens=32768),
         ),
         patch.object(flashinfer_autotune, "run_flashinfer_autotune_forward"),
         patch.object(flashinfer_autotune.torch.cuda, "empty_cache"),

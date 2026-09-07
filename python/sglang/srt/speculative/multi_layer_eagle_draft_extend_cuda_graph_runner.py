@@ -60,7 +60,6 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_flags,
     get_parallel,
     get_spec,
@@ -156,13 +155,13 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.ps.tp_size
         self.dp_size = get_parallel().dp_size
-        self.pp_size = configured_pp_size()
+        self.pp_size = get_parallel().pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.require_gathered_buffer = require_gathered_buffer()
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_mlp_sync = require_mlp_sync()
+        self.require_attn_tp_gather = require_attn_tp_gather()
         self.enable_pdmux = model_runner.server_args.enable_pdmux
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
@@ -255,7 +254,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
 
         if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+            is_bs_supported = (
+                is_bs_supported and forward_batch.can_run_decode_cuda_graph
+            )
 
         return is_bs_supported
 
@@ -353,7 +354,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_start_loc=extend_start_loc,
             extend_num_tokens=self.captured_req_width * bs,
-            num_token_non_padded_cpu=self.captured_req_width * bs,
+            global_num_token_non_padded_cpu=self.captured_req_width * bs,
             return_hidden_states_before_norm=True,
         )
         return forward_batch
@@ -811,6 +812,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         out = runner.replay(
             self.bs, self.seq_lens_sum, self._replay_spec_info, self.seq_lens_cpu
         )
+        self._publish_shared_read_done(step)
         raw_bs = self.raw_bs
         raw_num_tokens = self.raw_num_tokens
         num_logit_rows = raw_bs if self.prune_draft_extend_logits else raw_num_tokens
@@ -827,6 +829,14 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             out.topk_p[:raw_bs],
             out.topk_index[:raw_bs],
         )
+
+    def _publish_shared_read_done(self, step: int) -> None:
+        if step != self.speculative_num_steps - 1:
+            return
+        runner = self.runners[step]
+        read_done = runner.device_module.Event()
+        read_done.record()
+        runner.model_runner.shared_read_done_event = read_done
 
     def clone_draft_probs(self) -> torch.Tensor:
         """Materialize the in-graph-written proposal q [raw_bs, num_steps, vocab]
@@ -988,4 +998,6 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
                     out.topk_p[:raw_bs],
                     out.topk_index[:raw_bs],
                 )
-        return self._cached[step]
+        result = self._cached[step]
+        self._publish_shared_read_done(step)
+        return result

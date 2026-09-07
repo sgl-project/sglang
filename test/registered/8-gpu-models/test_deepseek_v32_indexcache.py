@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=450, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=575, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -61,7 +61,7 @@ class TestDeepseekV32IndexTopkPattern(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
@@ -108,7 +108,7 @@ class TestDeepseekV32IndexFreq(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 

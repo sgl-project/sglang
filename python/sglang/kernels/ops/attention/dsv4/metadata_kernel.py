@@ -110,9 +110,9 @@ def _init_compressed_attn_metadata_triton(
     # no cache-write locations. Keep the write buffers unpadded and mask those
     # rows in the kernel.
     num_write_tokens = raw_out_loc.shape[0]
-    assert (
-        num_write_tokens <= bs
-    ), f"raw_out_loc has {num_write_tokens} rows, expected at most {bs} metadata rows"
+    assert num_write_tokens <= bs, (
+        f"raw_out_loc has {num_write_tokens} rows, expected at most {bs} metadata rows"
+    )
     device = seq_lens.device
 
     c4_out_loc = torch.empty(num_write_tokens, dtype=torch.int64, device=device)
@@ -126,12 +126,12 @@ def _init_compressed_attn_metadata_triton(
     c128_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
 
     if compute_page_indices:
-        assert (
-            page_table is not None
-        ), "page_table required when compute_page_indices=True"
-        assert (
-            page_size >= 128 and page_size % 128 == 0
-        ), "page_size must be a multiple of 128 when compute_page_indices=True"
+        assert page_table is not None, (
+            "page_table required when compute_page_indices=True"
+        )
+        assert page_size >= 128 and page_size % 128 == 0, (
+            "page_size must be a multiple of 128 when compute_page_indices=True"
+        )
         max_pages = page_table.shape[1]
         c128_page_size = page_size // 128
         c128_cur_max_seq_len = c128_page_size * max_pages
