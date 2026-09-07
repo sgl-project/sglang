@@ -45,7 +45,15 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
+    Dsv4NpuRoPE,
+    prime_rope_cos_sin,
+    rope_cos_sin,
+)
+from sglang.srt.hardware_backend.npu.utils import (
+    is_npu_arch35,
+    use_npu_arch35_mxfp8_wo_a,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -62,7 +70,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
-    cp_round_robin_input_ids_v2,
+    enable_cp_v2,
     is_cp_v2_active,
 )
 from sglang.srt.layers.dp_attention import (
@@ -387,6 +395,33 @@ if _wo_a_aiter_batched_gemm_enabled:
 # instead of re-raising (and re-logging) on every layer/token.
 _wo_a_aiter_batched_gemm_disabled = False
 
+# ROCm fp8 wo_a. The CUDA fp8 path below is built on DeepGEMM's fp8_einsum, so
+# gfx950 runs the equivalent aiter e8m0 block-scale batched GEMM instead. Both
+# the kernel availability and the weight-scale converter resolve once at import;
+# ``None`` here means the platform keeps the bf16 absorb GEMM.
+_wo_a_fp8_mxscale = None
+_wo_a_fp8_mxscale_fused_invrope = None
+_wo_a_weight_scale_to_e8m0 = None
+if _is_hip:
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
+        apply_wo_a_fp8_mxscale,
+        apply_wo_a_fp8_mxscale_fused_invrope,
+        is_wo_a_fp8_fused_invrope_supported,
+        is_wo_a_fp8_mxscale_supported,
+        wo_a_weight_scale_to_e8m0,
+    )
+
+    if is_wo_a_fp8_mxscale_supported():
+        _wo_a_fp8_mxscale = apply_wo_a_fp8_mxscale
+        _wo_a_weight_scale_to_e8m0 = wo_a_weight_scale_to_e8m0
+        # Opt-in fused inverse-RoPE + quant front end (env-gated for A/B). Only
+        # bind it when both the flatmm and the fused aiter op are available.
+        if (
+            envs.SGLANG_OPT_FP8_WO_A_FUSED_INVROPE.get()
+            and is_wo_a_fp8_fused_invrope_supported()
+        ):
+            _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
+
 
 def _apply_wo_a_bf16_matmul(
     o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
@@ -569,7 +604,7 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         output.zero_()
@@ -676,12 +711,16 @@ class MqaAttentionBase(nn.Module):
             if wo_b_reduce_results is None
             else wo_b_reduce_results
         )
+        # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
+        # but it needs the same quantized weights.
+        self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
+        quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
                 quant_config is not None and quant_config.get_name() == "expert_pack"
             )
             wo_a_quant_config: Optional[QuantizationConfig] = (
-                quant_config if fp8 or keep_source_quant else None
+                quant_config if quantize_wo_a or keep_source_quant else None
             )
         elif wo_a_keeps_quant_config:
             wo_a_quant_config = quant_config
@@ -734,17 +773,34 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_a", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            **({} if fp8 else {"params_dtype": torch.bfloat16}),
+            **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
-        if fp8:
-            from sglang.srt.layers import deep_gemm_wrapper
-
+        if quantize_wo_a:
             assert hasattr(self.wo_a, "weight_scale_inv"), (
                 "FP8 quant_config must create weight_scale_inv"
             )
+        if self.use_npu_arch35_mxfp8_wo_a:
+            # Read by the NPU arch35 MXFP8 weight processor to batch the
+            # weight/scale per attention group for npu_transpose_quant_batchmatmul.
+            self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
+            self.wo_a._dsv4_num_groups = self.n_local_groups
+            self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
+        elif fp8:
+            from sglang.srt.layers import deep_gemm_wrapper
+
             self.wo_a.weight_scale_inv.format_ue8m0 = (
                 deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             )
+            # wo_a is quantized but never *applied* through its quant method:
+            # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
+            # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
+            # mxscale BMM on gfx950), both of which want the plain row-major
+            # [G, R, D] weight. Opt out of any backend-private weight layout the
+            # linear method would otherwise install for its own GEMM -- on ROCm
+            # that is aiter's B-preshuffle, which silently permutes the weight
+            # in place (same shape, dtype and strides) and makes this GEMM
+            # return noise.
+            self.wo_a.skip_aiter_bpreshuffle = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -868,9 +924,22 @@ class MQALayer(MqaAttentionBase):
         )
 
         if _is_npu:
-            Dsv4NpuRoPE.for_freqs(
+            rope = Dsv4NpuRoPE.for_freqs(
                 self.freqs_cis, getattr(self, "rotary_emb", None)
-            ).ensure_tables(torch.float32)
+            )
+            # fp32 tables feed the compressor gather; bf16 tables make the
+            # activation-dtype gathers cast-free. Bit-identical values:
+            # rounding the table once equals rounding each gathered element.
+            rope.ensure_tables(torch.float32)
+            rope.ensure_tables(torch.bfloat16)
+            # npu_rms_norm has no weight-free overload; the per-head q norm
+            # reads this cached ones vector instead of paying a per-call
+            # alloc + fill.
+            self.register_buffer(
+                "q_rms_norm_ones",
+                torch.ones(self.head_dim, dtype=torch.bfloat16),
+                persistent=False,
+            )
 
         if _is_hip:
             cos_cache = (
@@ -953,22 +1022,25 @@ class MQALayer(MqaAttentionBase):
         return result
 
     def _get_npu_rope_position_cache(
-        self, positions: torch.Tensor, dtype: torch.dtype, inverse: bool = False
+        self,
+        forward_batch: ForwardBatch,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+        inverse: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # ``rotary_emb`` is shared by layers with the same RoPE configuration and
-        # can also be shared by the target and NextN models.  Only cache the
-        # immutable full table on it.  A position-gathered tensor is specific to
-        # this forward and reusing it based on shape alone gives MTP decode the
-        # previous step's RoPE values when positions change but batch size does not.
-        return Dsv4NpuRoPE.for_freqs(
-            self.freqs_cis, getattr(self, "rotary_emb", None)
-        ).get_cos_sin(
+        # can also be shared by the target and NextN models.  Only the immutable
+        # full table is cached on it; position-gathered tensors are memoized per
+        # forward (prime_rope_cos_sin / rope_cos_sin), never across forwards --
+        # reusing them based on shape alone gives MTP decode the previous step's
+        # RoPE values when positions change but batch size does not.
+        return rope_cos_sin(
+            self.freqs_cis,
+            getattr(self, "rotary_emb", None),
+            forward_batch,
             positions,
             dtype,
-            view_4d=True,
             inverse=inverse,
-            allow_build=False,
-            cache_dtype=torch.float32,
         )
 
     def _compute_q_a(
@@ -1163,7 +1235,7 @@ class MQALayer(MqaAttentionBase):
                 kv, _ = self.wkv(x)
             kv = self.kv_norm(kv)
             cos4_k, sin4_k = self._get_npu_rope_position_cache(
-                positions, kv.dtype, inverse=False
+                forward_batch, positions, kv.dtype, inverse=False
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 kv.unsqueeze(1),
@@ -1183,10 +1255,9 @@ class MQALayer(MqaAttentionBase):
             stream_q.wait_event(q_lora_ready)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            _dummy = q.new_ones(q.shape[-1])
-            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
             cos4_q, sin4_q = self._get_npu_rope_position_cache(
-                positions, q.dtype, inverse=False
+                forward_batch, positions, q.dtype, inverse=False
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 q,
@@ -1478,8 +1549,7 @@ class MQALayer(MqaAttentionBase):
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            _dummy = q.new_ones(q.shape[-1])
-            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -1488,7 +1558,7 @@ class MQALayer(MqaAttentionBase):
             kv = self.kv_norm(kv)
 
             cos4, sin4 = self._get_npu_rope_position_cache(
-                positions, q.dtype, inverse=False
+                forward_batch, positions, q.dtype, inverse=False
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 q,
@@ -1730,72 +1800,122 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
-        if _is_npu:
-            cos4, sin4 = self._get_npu_rope_position_cache(
-                positions, o.dtype, inverse=True
-            )
-            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+        if (
+            _FP8_WO_A_GEMM
+            and _wo_a_fp8_mxscale_fused_invrope is not None
+            and not _is_npu
+        ):
+            # ROCm gfx950 fused path: inverse-RoPE + per-token-group mxfp8 quant
+            # in one aiter kernel on the pre-view [T,H,Dh] output, then the a8w8
+            # mxscale absorb GEMM. Replaces the standalone inverse RoPE, the
+            # [T,G,D] view, and the quant inside the two-kernel fp8 path below.
+            G = self.n_local_groups
+            cos_c, sin_c = _freqs_cis_to_cos_sin(self.freqs_cis, o.dtype, o.device)
+            o = _wo_a_fp8_mxscale_fused_invrope(
                 o,
-                None,
-                cos4,
-                sin4,
-                qk_nope_dim=self.qk_nope_head_dim,
+                positions,
+                cos_c,
+                sin_c,
+                G,
+                self.wo_a.weight.view(G, self.o_lora_rank, -1),
+                self.wo_a.weight_scale_inv.data,
             )
         else:
-            fused_rope_inplace(
-                o[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-                inverse=True,
-            )
-
-        o = o.view(o.shape[0], self.n_local_groups, -1)
-
-        if _FP8_WO_A_GEMM:
-            import deep_gemm
-
-            from sglang.srt.layers import deep_gemm_wrapper
-
-            T, G, D = o.shape
-            R = self.o_lora_rank
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
-                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
-                recipe = (1, 1, 128)
-            else:
-                # sm90 (Hopper): fp32 scales.
-                o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                    o.reshape(T * G, D).contiguous(),
-                    group_size=128,
-                    scale_ue8m0=False,
+            if _is_npu:
+                cos4, sin4 = self._get_npu_rope_position_cache(
+                    forward_batch, positions, o.dtype, inverse=True
                 )
-                o_fp8 = o_fp8.view(T, G, D)
-                o_s = o_s.view(T, G, -1)
-                recipe = (1, 128, 128)
-            output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
-                (o_fp8, o_s),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
-                output,
-                recipe=recipe,
-            )
-            o = output
-        else:
-            wo_a_weight = getattr(self.wo_a, "weight", None)
-            if wo_a_weight is not None:
-                wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
-                o = _apply_wo_a_bf16_matmul(
-                    o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
-                )
-            else:
-                o = _apply_gguf_grouped_wo_a(
+                Dsv4NpuRoPE.apply_rotary_mul_inplace(
                     o,
-                    self.wo_a.qweight,
-                    self.wo_a.qweight_type.weight_type,
-                    self.o_lora_rank,
+                    None,
+                    cos4,
+                    sin4,
+                    qk_nope_dim=self.qk_nope_head_dim,
                 )
+            else:
+                fused_rope_inplace(
+                    o[..., -self.qk_rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions=positions,
+                    inverse=True,
+                )
+
+            o = o.view(o.shape[0], self.n_local_groups, -1)
+
+            if self.use_npu_arch35_mxfp8_wo_a:
+                o, o_scale = torch_npu.npu_dynamic_mx_quant(
+                    o, dst_type=torch.float8_e4m3fn
+                )
+                o = torch_npu.npu_transpose_quant_batchmatmul(
+                    o,
+                    self.wo_a.weight,
+                    dtype=torch.bfloat16,
+                    bias=None,
+                    group_sizes=(0, 0, 32),
+                    x1_scale=o_scale.view(torch.float8_e8m0fnu),
+                    x2_scale=self.wo_a.weight_scale_inv.view(torch.float8_e8m0fnu),
+                    perm_x1=(1, 0, 2),
+                    perm_x2=(0, 1, 2),
+                    perm_y=(1, 0, 2),
+                )
+            elif _FP8_WO_A_GEMM and _wo_a_fp8_mxscale is not None:
+                # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below,
+                # but through aiter's e8m0 block-scale batched GEMM. The
+                # activation is quantized per token-group inside the helper.
+                T, G, D = o.shape
+                o = _wo_a_fp8_mxscale(
+                    o,
+                    self.wo_a.weight.view(G, self.o_lora_rank, D),
+                    self.wo_a.weight_scale_inv.data,
+                )
+            elif _FP8_WO_A_GEMM:
+                import deep_gemm
+
+                from sglang.srt.layers import deep_gemm_wrapper
+
+                T, G, D = o.shape
+                R = self.o_lora_rank
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                    # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
+                    o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                    recipe = (1, 1, 128)
+                else:
+                    # sm90 (Hopper): fp32 scales.
+                    o_fp8, o_s = sglang_per_token_group_quant_fp8(
+                        o.reshape(T * G, D).contiguous(),
+                        group_size=128,
+                        scale_ue8m0=False,
+                    )
+                    o_fp8 = o_fp8.view(T, G, D)
+                    o_s = o_s.view(T, G, -1)
+                    recipe = (1, 128, 128)
+                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_fp8, o_s),
+                    (
+                        self.wo_a.weight.view(G, R, D),
+                        self.wo_a.weight_scale_inv.data,
+                    ),
+                    output,
+                    recipe=recipe,
+                )
+                o = output
+            else:
+                wo_a_weight = getattr(self.wo_a, "weight", None)
+                if wo_a_weight is not None:
+                    wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                    o = _apply_wo_a_bf16_matmul(
+                        o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+                    )
+                else:
+                    o = _apply_gguf_grouped_wo_a(
+                        o,
+                        self.wo_a.qweight,
+                        self.wo_a.qweight_type.weight_type,
+                        self.o_lora_rank,
+                    )
 
         o, _ = self.wo_b(o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
@@ -2091,7 +2211,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _is_npu:
-            return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+            if not is_npu_arch35():
+                return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+            # The A5 build of npu_hc_post is batched — it requires a leading
+            # batch axis on every operand.
+            return torch.ops.custom.npu_hc_post(
+                x.unsqueeze(0),
+                residual.unsqueeze(0),
+                post.unsqueeze(0),
+                comb.unsqueeze(0),
+            ).squeeze(0)
 
         if _is_xpu:
             return _get_mhc_ops().mhc_post(x, residual, post, comb)
@@ -2316,8 +2445,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         *,
-        input_ids: torch.Tensor,
-        input_ids_global: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        input_ids_global: Optional[torch.Tensor],
     ) -> torch.Tensor:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -2404,8 +2533,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
             _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
             hidden_states = _a2a_scatter_chunks[r].contiguous()
-            input_ids = input_ids.tensor_split(s)[r].contiguous()
-            input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
+            # DSpark next-token layers are not hash-routed and intentionally do not
+            # carry token IDs. Only split IDs for callers that actually provide them.
+            if input_ids is not None:
+                input_ids = input_ids.tensor_split(s)[r].contiguous()
+            if input_ids_global is not None:
+                input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
         # Skip the MoE-internal post-experts all_reduce when we will do the
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
@@ -3152,8 +3285,6 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        cp_v2_active = is_cp_v2_active(forward_batch)
-        use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -3183,7 +3314,7 @@ class DeepseekV4Model(nn.Module):
             )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
-            input_ids_global = input_ids
+            input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states: List[torch.Tensor] = []
@@ -3191,22 +3322,31 @@ class DeepseekV4Model(nn.Module):
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
-        if use_prefill_cp and not run_tbo:
-            if cp_v2_active:
-                input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
-            else:
-                if self.pp_group.is_first_rank:
-                    hidden_states = cp_split_and_rebuild_data(
-                        forward_batch, hidden_states
-                    )
-                positions = cp_split_and_rebuild_position(forward_batch, positions)
-                input_ids = cp_round_robin_input_ids(input_ids)
+        use_platform_cp = not enable_cp_v2() and dsa_use_prefill_cp(forward_batch)
+        if use_platform_cp and not run_tbo:
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+            input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
+        if _is_npu and not run_tbo:
+            # Rope cos/sin for the whole forward: one bf16 gather per rope
+            # config on the current stream, before the layer loop forks the
+            # KV/Q side streams. TBO children carry their own positions and
+            # recompute per layer.
+            prime_rope_cos_sin(
+                (
+                    self.layers[i].self_attn
+                    for i in range(self.start_layer, self.end_layer)
+                ),
+                forward_batch,
+                positions,
+            )
         if run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
@@ -3252,12 +3392,7 @@ class DeepseekV4Model(nn.Module):
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if (
-            self.pp_group.is_last_rank
-            and use_prefill_cp
-            and not cp_v2_active
-            and not run_tbo
-        ):
+        if self.pp_group.is_last_rank and use_platform_cp and not run_tbo:
             stream = torch.cuda.current_stream()
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
@@ -3418,7 +3553,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp:
+        if not enable_cp_v2() and self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
@@ -3479,6 +3614,28 @@ class DeepseekV4ForCausalLM(nn.Module):
             G = attn.n_local_groups
             R = attn.o_lora_rank
             D = attn.wo_a.weight.shape[1]
+
+            if _wo_a_weight_scale_to_e8m0 is not None:
+                # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
+                # requantizes the weight when the checkpoint's scales are not
+                # already powers of two. It also needs the weight row-major, so
+                # check the linear method honoured skip_aiter_bpreshuffle: a
+                # preshuffled weight has the same shape, dtype and strides and
+                # would only show up as garbage output.
+                assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
+                    "DSV4 wo_a was B-preshuffled by the fp8 linear method; the "
+                    "aiter mxscale absorb GEMM needs the row-major weight"
+                )
+                weight, scale = _wo_a_weight_scale_to_e8m0(
+                    attn.wo_a.weight.data,
+                    attn.wo_a.weight_scale_inv.data,
+                    G,
+                    R,
+                )
+                attn.wo_a.weight.data = weight.view(G * R, D)
+                attn.wo_a.weight_scale_inv.data = scale
+                attn.wo_a.weight_scale_inv.format_ue8m0 = True
+                continue
 
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
             if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
@@ -3663,7 +3820,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not _FP8_WO_A_GEMM:
+        # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
+        # while the layer allocated an FP8 parameter (or vice versa) fails the
+        # weight loader's dtype check.
+        if not (_FP8_WO_A_GEMM or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING

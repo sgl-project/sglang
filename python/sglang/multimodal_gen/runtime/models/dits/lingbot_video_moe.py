@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any, Iterable, Iterator, Optional
 
@@ -11,7 +12,12 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from torch import nn
 
 from sglang.kernels.ops.diffusion import (
+    can_use_rmsnorm_scale_shift_per_token,
+    lingbot_video_gated_residual_active,
+    mark_lingbot_video_gated_residual_site,
     mark_lingbot_video_rmsnorm_site,
+    rmsnorm_scale_shift_per_token,
+    try_lingbot_video_gated_residual,
     try_lingbot_video_rmsnorm,
 )
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
@@ -64,6 +70,9 @@ LINGBOT_VIDEO_FP32_MODULES = (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 def is_lingbot_block(name: str, _module: object) -> bool:
     return "blocks" in name and name.split(".")[-1].isdigit()
 
@@ -93,6 +102,51 @@ class LingBotVideoRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return (self.weight * hidden_states).to(input_dtype)
+
+
+def _lingbot_gated_residual(
+    block: LingBotVideoBlock,
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """``residual + (gate * update).to(residual.dtype)`` at a block update.
+
+    Uses the request-gated per-token ``residual_gate_add`` fast path when the
+    block's quality-gated site is enabled; otherwise the reference FP32
+    multiply form (bit-exact for ``quality="lossless"``).
+    """
+    fused = try_lingbot_video_gated_residual(block, residual, update, gate)
+    if fused is not None:
+        return fused
+    return residual + (gate * update).to(residual.dtype)
+
+
+def _lingbot_norm_modulate(
+    block: LingBotVideoBlock,
+    norm: LingBotVideoRMSNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """``(norm(x) * scale + shift).to(out_dtype)`` at a block modulate site.
+
+    Uses the request-gated fused RMSNorm+scale+shift kernel when the block's
+    quality-gated site is enabled; otherwise the reference chain. ``scale`` is
+    the raw ``scale_msa/mlp``; the kernel applies ``x * (1 + scale)``.
+    """
+    if lingbot_video_gated_residual_active(
+        block
+    ) and can_use_rmsnorm_scale_shift_per_token(x, norm.weight, scale, shift):
+        try:
+            out = rmsnorm_scale_shift_per_token(
+                x, norm.weight, scale, shift, norm.variance_epsilon
+            )
+            return out if out.dtype == out_dtype else out.to(out_dtype)
+        except Exception:
+            pass
+    return (norm(x) * (1.0 + scale) + shift).to(out_dtype)
 
 
 def make_joint_position_ids(
@@ -283,6 +337,7 @@ class LingBotVideoBlock(nn.Module):
         self.layer_idx = layer_idx
         h = hidden_size
         self.scale_shift_table = nn.Parameter(torch.zeros(1, 6 * h))
+        mark_lingbot_video_gated_residual_site(self)
         self.norm1 = LingBotVideoRMSNorm(h, norm_eps)
         self.attn = LingBotVideoAttention(
             h,
@@ -336,22 +391,25 @@ class LingBotVideoBlock(nn.Module):
             6, dim=-1
         )
         gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
-        scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
         bulk_dtype = self.attn.to_q.weight.dtype
-        attn_in = (self.norm1(x) * scale_msa + shift_msa).to(bulk_dtype)
+        attn_in = _lingbot_norm_modulate(
+            self, self.norm1, x, scale_msa, shift_msa, bulk_dtype
+        )
         attn_out = self.attn(
             attn_in,
             freqs_cis,
             attention_mask=attention_mask,
             attn_mask_meta=attn_mask_meta,
         )
-        x = x + (gate_msa * self.norm_post_attn(attn_out)).to(x.dtype)
+        x = _lingbot_gated_residual(self, x, self.norm_post_attn(attn_out), gate_msa)
 
-        ffn_in = (self.norm2(x) * scale_mlp + shift_mlp).to(bulk_dtype)
+        ffn_in = _lingbot_norm_modulate(
+            self, self.norm2, x, scale_mlp, shift_mlp, bulk_dtype
+        )
         ffn_out = self.ffn(ffn_in)
         ffn_normed = self.norm_post_ffn(ffn_out)
-        x = x + (gate_mlp * ffn_normed).to(x.dtype)
+        x = _lingbot_gated_residual(self, x, ffn_normed, gate_mlp)
         return x
 
 
