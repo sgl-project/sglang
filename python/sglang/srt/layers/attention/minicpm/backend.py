@@ -435,6 +435,35 @@ class MiniCPMSparseBackend(AttentionBackend):
         )
         return compressed_k, compressed_k2
 
+    def _prepare_selector_query(
+        self,
+        selection_query: torch.Tensor,
+        selector_query: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Adapt a Forecast query to the InfLLM stage-1 sequence layout.
+
+        Forecast projections have one head per KV head, while the stage-1
+        kernel represents the GQA groups as repeated query positions. Repeat
+        each Forecast token across the local GQA group so the kernel returns
+        one score row per token and KV head, matching the page-table layout.
+        """
+        if selector_query is None:
+            return selection_query
+
+        if selection_query.ndim != 3:
+            raise ValueError(
+                "MiniCPM Forecast selector must have shape "
+                "[num_tokens, num_kv_heads, head_dim]."
+            )
+        if selection_query.shape[1] != self.head_group_num:
+            raise ValueError(
+                "MiniCPM Forecast selector must use one head per KV head, "
+                f"got {selection_query.shape[1]} heads for "
+                f"{self.head_group_num} KV heads."
+            )
+
+        return selection_query.repeat_interleave(self.heads_per_group, dim=0)
+
     def get_topk_for_sparse(
         self,
         query_states,
@@ -491,6 +520,9 @@ class MiniCPMSparseBackend(AttentionBackend):
                 ),
             ) = compressed
 
+            selection_query = self._prepare_selector_query(
+                selection_query, selector_query
+            )
             ret = self.sparse_get_topk_impl(
                 selection_query,
                 metadata.topk_cu_seqlens_q,
@@ -538,6 +570,9 @@ class MiniCPMSparseBackend(AttentionBackend):
                 )
                 cu_seqlens_q = metadata.topk_cu_seqlens_q
 
+            selection_query = self._prepare_selector_query(
+                selection_query, selector_query
+            )
             ret = self.sparse_get_topk_impl(
                 selection_query,
                 cu_seqlens_q,

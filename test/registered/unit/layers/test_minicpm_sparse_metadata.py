@@ -189,6 +189,34 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         self.assertEqual(cu_seqlens.dtype, torch.int32)
         self.assertEqual(cu_seqlens.tolist(), [0, 3])
 
+    def test_forecast_selector_expands_gqa_sequence_layout(self):
+        backend = object.__new__(MiniCPMSparseBackend)
+        backend.head_group_num = 1
+        backend.heads_per_group = 16
+        forecast = torch.arange(3 * 1 * 2).reshape(3, 1, 2)
+
+        expanded = backend._prepare_selector_query(forecast, forecast)
+
+        self.assertEqual(tuple(expanded.shape), (48, 1, 2))
+        for token_idx in range(3):
+            start = token_idx * backend.heads_per_group
+            self.assertTrue(
+                torch.equal(
+                    expanded[start : start + backend.heads_per_group],
+                    forecast[token_idx : token_idx + 1].expand(
+                        backend.heads_per_group, -1, -1
+                    ),
+                )
+            )
+
+    def test_current_query_keeps_existing_layout(self):
+        backend = object.__new__(MiniCPMSparseBackend)
+        current_query = torch.randn(3, 16, 2)
+
+        prepared = backend._prepare_selector_query(current_query, None)
+
+        self.assertIs(prepared, current_query)
+
     def test_registered_variants_select_adapter_explicitly(self):
         runner = object()
 
