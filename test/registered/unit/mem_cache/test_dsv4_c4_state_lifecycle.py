@@ -1,4 +1,4 @@
-"""CPU/mock tests for unified DSV4 C4 request-state lifecycle."""
+"""CPU/mock tests for ring_kv DSV4 C4 request-state lifecycle."""
 
 import unittest
 from types import SimpleNamespace
@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 from sglang.srt.mem_cache.allocation import alloc_req_slots
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.dsv4_kv_layout import DSV4KVLayout
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,7 +45,7 @@ def _c4_pool(rows: int, width: int, ring_size: int):
     )
 
 
-def _token_pool(unified: bool, ring_size: int = 8):
+def _token_pool(ring_kv: bool, ring_size: int = 8):
     logical_rows = 4 * ring_size
     physical_rows = logical_rows + ring_size + 4
     attn = _c4_pool(physical_rows, width=12, ring_size=ring_size)
@@ -55,26 +56,26 @@ def _token_pool(unified: bool, ring_size: int = 8):
         kv_score_buffer=KVAndScore(torch.full((physical_rows, 8), 9.0)),
     )
     token_pool = object.__new__(DeepSeekV4TokenToKVPool)
-    token_pool._unified_kv = unified
+    token_pool.kv_layout = DSV4KVLayout.RING if ring_kv else DSV4KVLayout.PAGED
     token_pool.compress_state_pools = [attn, c128]
     token_pool.indexer_compress_state_pools = [indexer, None]
     token_pool.get_ring_size = MagicMock(return_value=ring_size)
     return token_pool, attn, indexer, c128, logical_rows
 
 
-class TestUnifiedC4StateLifecycle(unittest.TestCase):
+class TestRingC4StateLifecycle(unittest.TestCase):
     def test_pool_size_is_exact_request_ring_product(self):
         configurator = object.__new__(DSV4PoolConfigurator)
         configurator.disaggregation_mode = "decode"
         configurator.disaggregation_decode_extra_slots = 3
         configurator.c4_ring_size = 16
 
-        self.assertEqual(configurator._unified_c4_state_pool_size(10), 14 * 16)
+        self.assertEqual(configurator._ring_c4_state_pool_size(10), 14 * 16)
 
     def test_clear_resets_only_selected_request_rings(self):
         ring_size = 8
         token_pool, attn, indexer, c128, logical_rows = _token_pool(
-            unified=True, ring_size=ring_size
+            ring_kv=True, ring_size=ring_size
         )
 
         token_pool.clear_c4_req_states([1, 3])
@@ -94,10 +95,10 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
             self.assertTrue((state[logical_rows:] == 7).all())
         self.assertTrue((c128.kv_score_buffer.kv_score == 9).all())
 
-    def test_clear_is_noop_off_the_unified_path(self):
-        """The non-unified (fp8) pool addresses C4 state by SWA page, so a
+    def test_clear_is_noop_off_the_ring_path(self):
+        """The non-ring_kv (fp8) pool addresses C4 state by SWA page, so a
         req-slot reset must not touch it."""
-        token_pool, attn, indexer, _, _ = _token_pool(unified=False)
+        token_pool, attn, indexer, _, _ = _token_pool(ring_kv=False)
 
         token_pool.clear_c4_req_states([1, 3])
 

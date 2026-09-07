@@ -3071,7 +3071,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_reprefill_tail_tokens(self) -> int:
         """
-        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
+        Only ring_kv + HiCache needs this: SWA lives in a per-request ring
         (state_slot/pos), not content-stable and never offloaded to host, so a
         reused prefix's trailing sliding window would read another request's
         stale ring slots. Re-prefilling that window rewrites this request's ring

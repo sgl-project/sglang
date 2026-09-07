@@ -376,7 +376,7 @@ class SWARadixCache(BasePrefixCache):
     def swa_reprefill_tail_tokens(self) -> int:
         """Tokens at the tail of a matched prefix that must NOT be reused.
 
-        The DeepSeek-V4 unified_kv layout keeps SWA in a per-request ring
+        The DeepSeek-V4 ring_kv layout keeps SWA in a per-request ring
         (addressed by ``req_pool_idx * window + pos % window``), which is NOT
         content-stable and is never stored in the radix tree. A reused prefix
         therefore carries another request's stale SWA in the ring. Hold back the
@@ -386,11 +386,9 @@ class SWARadixCache(BasePrefixCache):
         No-op (0) for the index-addressed SWA pool, whose slots are
         content-stable and safe to reuse.
         """
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
+        from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 
-        if self.sliding_window_size and is_unified_kv_triton():
+        if self.sliding_window_size and is_dsv4_ring_kv():
             return self.sliding_window_size
         return 0
 

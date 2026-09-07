@@ -1,8 +1,8 @@
-"""MI35x DeepSeek-V4-Pro-DSpark unified_kv GSM8K accuracy test (8-GPU).
+"""MI35x DeepSeek-V4-Pro-DSpark ring_kv GSM8K accuracy test (8-GPU).
 
 Runs the production AMD DSpark static configuration with the HIP dsv4 backend and
-SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton. The test uses the full GSM8K set
-to catch regressions in unified-KV target-hidden injection, verify metadata, and
+SGLANG_HACK_FLASHMLA_BACKEND=ring_kv_triton. The test uses the full GSM8K set
+to catch regressions in ring-KV target-hidden injection, verify metadata, and
 DSpark acceptance.
 
 Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark suite
@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import requests
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+from sglang.kernels.ops.attention.dsv4.ring_kv_kernels import runtime
 from sglang.kernels.ops.speculative.dspark import dspark_verify_window
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -36,7 +36,7 @@ DEEPSEEK_V4_DSPARK_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V4_DSPARK_MODEL_PATH", "deepseek-ai/DeepSeek-V4-Pro-DSpark"
 )
 SERVER_LAUNCH_TIMEOUT = 5400
-FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
+FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "ring_kv_triton")
 GSM8K_ACCURACY_THRESHOLD = 0.92
 AVG_SPEC_ACCEPT_LENGTH_THRESHOLD = 3.0
 DEVICE = torch.device("cuda")
@@ -59,8 +59,8 @@ FP4_ENV_VARS = {
 }
 
 
-class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
-    def test_build_unified_commit_inject_layout(self):
+class TestDSparkRingKVKernelsAMD(CustomTestCase):
+    def test_build_ring_kv_commit_inject_layout(self):
         stride, ring_stride = 7, 128
         req_pool_indices = torch.tensor([3, 0, 5, 1], device=DEVICE, dtype=torch.int32)
         prefix_lens = torch.tensor(
@@ -69,7 +69,7 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
         block_pos_offsets = torch.arange(stride, device=DEVICE, dtype=torch.int64)
         commit_lens = torch.tensor([0, 3, stride, 5], device=DEVICE, dtype=torch.int32)
 
-        got = dspark_verify_window.build_unified_commit_inject_layout(
+        got = dspark_verify_window.build_ring_kv_commit_inject_layout(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             block_pos_offsets=block_pos_offsets,
@@ -90,26 +90,26 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
         self.assertTrue(torch.equal(got.positions, positions_2d.reshape(-1)))
         self.assertTrue(torch.equal(got.swa_loc, ref_loc.reshape(-1)))
 
-    def test_scatter_bf16_into_unified(self):
+    def test_scatter_bf16_into_ring_kv(self):
         torch.manual_seed(20)
         n_rows, dim, n_pages = 8, 16, 32
         kv = torch.randn(n_rows, dim, device=DEVICE).to(torch.bfloat16).contiguous()
         loc = torch.tensor(
             [3, -1, 5, 7, 0, -1, 9, 11], device=DEVICE, dtype=torch.int32
         )
-        unified = torch.zeros(n_pages, dim, device=DEVICE, dtype=torch.bfloat16)
-        expected = unified.clone()
+        ring_kv = torch.zeros(n_pages, dim, device=DEVICE, dtype=torch.bfloat16)
+        expected = ring_kv.clone()
         keep = loc >= 0
         expected[loc[keep].long()] = kv[keep]
 
-        runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=unified)
-        self.assertTrue(torch.equal(unified, expected))
+        runtime.scatter_bf16_into_ring_kv(kv=kv, loc=loc, ring_kv=ring_kv)
+        self.assertTrue(torch.equal(ring_kv, expected))
 
         with self.assertRaises(AssertionError):
-            runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=unified.t())
+            runtime.scatter_bf16_into_ring_kv(kv=kv, loc=loc, ring_kv=ring_kv.t())
 
 
-class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
+class TestDeepseekV4DSparkRingKVGSM8K(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_V4_DSPARK_MODEL_PATH
@@ -167,7 +167,7 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
         if getattr(cls, "process", None) is not None:
             kill_process_tree(cls.process.pid)
 
-    def test_full_gsm8k_unified_kv_dspark_static(self):
+    def test_full_gsm8k_ring_kv_dspark_static(self):
         requests.get(self.base_url + "/flush_cache")
         args = SimpleNamespace(
             num_shots=5,
@@ -189,7 +189,7 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                "### test_gsm8k (deepseek-v4-pro-dspark unified_kv static MI35x)\n"
+                "### test_gsm8k (deepseek-v4-pro-dspark ring_kv static MI35x)\n"
                 f"accuracy={metrics['accuracy']:.3f}\n"
                 f"avg_spec_accept_length={avg_spec_accept_length:.2f}\n"
             )

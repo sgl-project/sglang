@@ -65,7 +65,7 @@ def _v4_paged_decode_indices_kernel(
     swa_indices_ptr,  # [swa_total] int32, output
     csa_indices_ptr,  # [csa_total] int32, output (writes SWA-prefix segment only)
     hca_indices_ptr,  # [hca_total] int32, output (writes SWA-prefix segment only)
-    ring_stride,  # win_with_spec — stride into unified_kv SWA region (paper §3.6.1)
+    ring_stride,  # win_with_spec — stride into ring_kv SWA region (paper §3.6.1)
     win: tl.constexpr,  # window_size — max SWA prefix slots
     BLOCK_N: tl.constexpr,  # next_pow2(win)
 ):
@@ -158,7 +158,7 @@ def write_v4_paged_decode_indices(
       T:                   int — number of real tokens (grid size).
       win:                 int — SWA window size (typically 128 for V4-Pro).
       ring_stride:                  int — `win_with_spec = window_size + max_spec_steps`,
-                                 stride into unified_kv SWA region per slot
+                                 stride into ring_kv SWA region per slot
                                  AND modulo for ring-index wrap.
     """
     if T == 0:

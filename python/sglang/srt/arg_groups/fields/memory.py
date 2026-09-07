@@ -73,6 +73,19 @@ class Memory:
         "(layer-major) layout. Requires the Triton attention / linear-attn / "
         "Mamba backends.",
     ] = False
+    dsv4_kv_layout: A[
+        str,
+        Arg(
+            help=(
+                "DeepSeek-V4 KV cache layout. 'paged' keeps separate packed-fp8 "
+                "SWA / C4 / C128 pools with a paged SWA token pool. 'ring' stores "
+                "each layer in one bf16 buffer, a per-request SWA ring followed by "
+                "the compressed rows, served by the ROCm ring attention kernels; "
+                "ROCm only."
+            ),
+            choices=["paged", "ring"],
+        ),
+    ] = "paged"
     enable_unified_memory: A[
         bool,
         "Replace the statically-partitioned hybrid-model pools (full-attn KV + "

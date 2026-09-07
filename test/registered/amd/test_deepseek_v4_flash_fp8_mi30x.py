@@ -61,7 +61,6 @@ ENV_VARS = {
     # factor-of-2 shape mismatch. Set it rather than depend on cache state.
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_USE_ROCM700A": "0",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
     "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
@@ -77,6 +76,8 @@ class TestDeepseekV4FlashFp8Mi30x(CustomTestCase):
 
         other_args = [
             "--trust-remote-code",
+            "--dsv4-kv-layout",
+            "ring",
             "--tp",
             "8",
             "--attention-backend",

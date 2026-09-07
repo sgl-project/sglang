@@ -1428,8 +1428,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
-                ring_stride = self.token_to_kv_pool.unified_swa_ring_size
-                window_size = self.token_to_kv_pool.unified_swa_window
+                ring_stride = self.token_to_kv_pool.swa_ring_size
+                window_size = self.token_to_kv_pool.swa_ring_window
                 window_start = max(0, seq_len - window_size)
                 positions = np.arange(window_start, seq_len, dtype=np.int64)
                 state_slot = int(decode_req.req.kv.req_pool_idx)

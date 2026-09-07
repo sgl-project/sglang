@@ -106,9 +106,11 @@ class _DeepSeekV4LayerMappings(NamedTuple):
 def _resolve_deepseek_v4_layer_mappings(
     kvcache: Any,
 ) -> _DeepSeekV4LayerMappings:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import is_dsv4_ring_pool
+
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full = {layer: layer for layer in range(transfer_layer_num)}
-    swa = {} if getattr(kvcache, "_unified_kv", False) else full.copy()
+    swa = {} if is_dsv4_ring_pool(kvcache) else full.copy()
 
     c4, c128, c4_state_global_layers = {}, {}, []
     for local_layer, item in enumerate(
@@ -464,8 +466,10 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     Resolve ``(device_buffers, item_bytes)`` for a DeepSeek V4 C4/C128 main-KV
     HiCache pool, hiding the device KV layout from the stack builder.
     """
-    if getattr(kvcache, "_unified_kv", False):
-        return kvcache.unified_region_buffers(ratio)
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import is_dsv4_ring_pool
+
+    if is_dsv4_ring_pool(kvcache):
+        return kvcache.ring_kv_region_buffers(ratio)
     pool = kvcache.c4_kv_pool if ratio == 4 else kvcache.c128_kv_pool
     return pool.kv_buffer, pool.bytes_per_page_padded
 
@@ -555,10 +559,12 @@ def build_deepseek_v4_hicache_stack(
     transfer_layer_num = layer_mappings.transfer_layer_num
     full_layer_mapping = layer_mappings.full
 
-    is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import is_dsv4_ring_pool
+
+    is_ring_kv = is_dsv4_ring_pool(kvcache)
     mtp_swa_device_buffers = []
-    if is_unified_kv:
-        # unified_kv keeps the SWA ring inside the unified pool and never offloads it,
+    if is_ring_kv:
+        # ring_kv keeps the SWA ring inside the unified pool and never offloads it,
         # so there is no separate SWA host pool to map.
         swa_layer_mapping = {}
     else:
@@ -608,7 +614,7 @@ def build_deepseek_v4_hicache_stack(
         ),
     ]
 
-    if not is_unified_kv:
+    if not is_ring_kv:
         swa_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.SWA),
             device_buffers=[
@@ -677,7 +683,7 @@ def build_deepseek_v4_hicache_stack(
                 )
             )
 
-        if not is_unified_kv:
+        if not is_ring_kv:
             c4_state_host_pool = DeepSeekV4StateHostPool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
                 state_pools=[

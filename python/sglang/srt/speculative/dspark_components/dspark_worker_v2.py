@@ -5,9 +5,6 @@ from typing import Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -16,6 +13,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -577,12 +575,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
+        # ring_kv injects into the SWA ring keyed by (draft req slot, position);
         # thread the per-token state_slot + the req's final position so the
         # injector keeps only the last SWA window (older prefill tokens share a
-        # ring slot and would race). Cheap; only consumed under unified_kv.
+        # ring slot and would race). Cheap; only consumed under ring_kv.
         state_slot = final_pos = None
-        if is_unified_kv_triton():
+        if is_dsv4_ring_kv():
             repeats = ctx_lens.to(torch.int64)
             state_slot = torch.repeat_interleave(
                 batch.req_pool_indices.to(device=device, dtype=torch.int64), repeats

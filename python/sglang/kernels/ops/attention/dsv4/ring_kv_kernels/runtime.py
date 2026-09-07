@@ -1,10 +1,10 @@
-"""Runtime glue for the unified_kv backend.
+"""Runtime glue for the ring_kv backend.
 
-Builds unified_kv-style flat ``kv_indices`` / ``kv_indptr`` from SGLang's already-computed
-DSV4 metadata, scatters SWA K into the bf16 ``unified_kv`` ring, and dispatches the
+Builds ring_kv-style flat ``kv_indices`` / ``kv_indptr`` from SGLang's already-computed
+DSV4 metadata, scatters SWA K into the bf16 ``ring_kv`` ring, and dispatches the
 vendored paged decode/prefill kernels.
 
-unified_kv[L] layout (page_size 1, bf16, row-major):
+ring_kv[L] layout (page_size 1, bf16, row-major):
   - rows ``[0, swa_pages)``    = SWA ring (``state_slot * win + pos % win``);
   - rows ``[swa_pages, ...)``  = compressed K (``swa_pages + page_index``), where
     SGLang metadata already encodes the compressed slot id:
@@ -17,7 +17,7 @@ attention K-loop scans only real entries. The backing buffer is still
 allocated at the fixed worst-case capacity ``N * (win + Wc)`` so its shape is
 static across CUDA-graph replay; only ``kv_indptr`` values (and the written
 prefix) vary per forward. Compressed valid entries are front-packed in the
-``*_page_indices`` rows (the same contract the non-unified_kv flashmla path relies
+``*_page_indices`` rows (the same contract the non-ring_kv flashmla path relies
 on via ``topk_length``); the per-token compressed count is recovered from the
 ``kv_indptr`` delta inside the kernel, so no extra length tensor is threaded.
 """
@@ -31,13 +31,13 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
+from sglang.kernels.ops.attention.dsv4.ring_kv_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
 )
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode_indices import (
+from sglang.kernels.ops.attention.dsv4.ring_kv_kernels.paged_decode_indices import (
     write_v4_paged_decode_indices,
 )
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_prefill import (
+from sglang.kernels.ops.attention.dsv4.ring_kv_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill,
 )
 
@@ -51,7 +51,7 @@ def _swa_scatter_kernel(
     state_slot_ptr,  # [T] int
     positions_ptr,  # [T] int
     final_pos_ptr,  # [T] int
-    unified_ptr,  # [pages, D] bf16
+    ring_kv_ptr,  # [pages, D] bf16
     n_rows,
     ring_stride,  # SWA ring per-slot stride
     win: tl.constexpr,
@@ -72,15 +72,15 @@ def _swa_scatter_kernel(
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
     vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
-    tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
+    tl.store(ring_kv_ptr + loc * D + offs, vals, mask=mask)
 
 
-def store_swa_into_unified(
+def store_swa_into_ring_kv(
     *,
     kv: torch.Tensor,  # [T, head_dim] bf16
     state_slot: torch.Tensor,  # [T] int
     positions: torch.Tensor,  # [T] int
-    unified_kv: torch.Tensor,  # [pages, head_dim] bf16
+    ring_kv: torch.Tensor,  # [pages, head_dim] bf16
     win: int,  # SWA attention window length
     ring_stride: int,  # SWA ring stride
     final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
@@ -91,7 +91,7 @@ def store_swa_into_unified(
 
     has_final = final_pos is not None
     fp_arg = final_pos if has_final else positions
-    assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
+    assert kv.is_contiguous() and kv.dtype == ring_kv.dtype
     assert state_slot.is_contiguous() and positions.is_contiguous()
     assert fp_arg.is_contiguous()
     _swa_scatter_kernel[(n_rows,)](
@@ -99,7 +99,7 @@ def store_swa_into_unified(
         state_slot,
         positions,
         fp_arg,
-        unified_kv,
+        ring_kv,
         n_rows,
         ring_stride,
         win=win,
@@ -113,8 +113,8 @@ def store_swa_into_unified(
 @triton.jit
 def _scatter_loc_kernel(
     kv_ptr,  # [T, D] bf16
-    loc_ptr,  # [T] int (unified row index; <0 => skip)
-    unified_ptr,  # [pages, D] bf16
+    loc_ptr,  # [T] int (ring row index; <0 => skip)
+    ring_kv_ptr,  # [pages, D] bf16
     n_rows,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -128,32 +128,32 @@ def _scatter_loc_kernel(
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
     vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
-    tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
+    tl.store(ring_kv_ptr + loc * D + offs, vals, mask=mask)
 
 
-def scatter_bf16_into_unified(
+def scatter_bf16_into_ring_kv(
     *,
     kv: torch.Tensor,  # [T, head_dim] bf16 (already norm+rope'd)
-    loc: torch.Tensor,  # [T] int32/int64 unified ring row; <0 => skip
-    unified_kv: torch.Tensor,  # [pages, head_dim] bf16
+    loc: torch.Tensor,  # [T] int32/int64 ring row; <0 => skip
+    ring_kv: torch.Tensor,  # [pages, head_dim] bf16
 ) -> None:
-    """Scatter already-norm+rope'd bf16 K into ``unified_kv[loc]`` (skip loc < 0).
+    """Scatter already-norm+rope'd bf16 K into ``ring_kv[loc]`` (skip loc < 0).
 
-    Companion to ``store_swa_into_unified`` for callers that already hold the
-    precomputed ring row index (the DSpark draft: ``get_unified_swa_loc`` for the
+    Companion to ``store_swa_into_ring_kv`` for callers that already hold the
+    precomputed ring row index (the DSpark draft: ``get_swa_ring_loc`` for the
     draft forward, or the commit-inject layout for target-hidden injection) and
     need per-row commit masking expressed as ``loc == -1``.
     """
     n_rows, D = kv.shape
     if n_rows == 0:
         return
-    assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
+    assert kv.is_contiguous() and kv.dtype == ring_kv.dtype
     assert loc.is_contiguous()
-    assert unified_kv.is_contiguous()
+    assert ring_kv.is_contiguous()
     _scatter_loc_kernel[(n_rows,)](
         kv,
         loc,
-        unified_kv,
+        ring_kv,
         n_rows,
         D=D,
         BLOCK_D=triton.next_power_of_2(D),
@@ -172,14 +172,14 @@ def _lengths_to_indptr(lengths: torch.Tensor) -> torch.Tensor:
 def decode(
     *,
     q: torch.Tensor,  # [T, H, D] (local heads)
-    unified_kv: torch.Tensor,  # [pages, D] bf16
+    ring_kv: torch.Tensor,  # [pages, D] bf16
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_decode(
-        q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
+        q, ring_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
     )
 
 
@@ -402,7 +402,7 @@ def build_prefill_indices(
     c128_page_indices: Optional[torch.Tensor],
     c4_sparse_page_indices: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into unified_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr)."""
+    """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into ring_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr)."""
     device = state_slot.device
     T = state_slot.shape[0]
     assert positions.is_contiguous() and chunk_start.is_contiguous()
@@ -469,7 +469,7 @@ def build_prefill_indices(
 def prefill(
     *,
     q: torch.Tensor,  # [T, H, D]
-    unified_kv: torch.Tensor,  # [pages, D]
+    ring_kv: torch.Tensor,  # [pages, D]
     kv_indices_prefix: torch.Tensor,
     kv_indptr_prefix: torch.Tensor,
     kv_extend: torch.Tensor,  # [T, D] current-chunk K (bf16, norm+rope'd)
@@ -480,7 +480,7 @@ def prefill(
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_prefill(
         q,
-        unified_kv,
+        ring_kv,
         kv_indices_prefix,
         kv_indptr_prefix,
         kv_extend,

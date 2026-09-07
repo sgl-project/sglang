@@ -9,9 +9,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     BuildStepLocal,
     CommitKvProj,
@@ -29,6 +26,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -155,13 +153,13 @@ class DSparkAttention(MqaAttentionBase):
         attn_backend,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
-        if is_unified_kv_triton():
-            # unified_kv: SWA K lives in the shared bf16 ring (swa_kv_pool is
-            # None). Use the unified ring write target -- get_unified_swa_loc
+        if is_dsv4_ring_kv():
+            # ring_kv: SWA K lives in the shared bf16 ring (swa_kv_pool is
+            # None). Use the ring write target -- get_swa_ring_loc
             # recomputes it from live positions for multi-step draft decode.
-            pool.set_unified_key_buffer_radix_fused_norm_rope(
+            pool.set_ring_kv_key_buffer_radix_fused_norm_rope(
                 layer_id=self.layer_id,
-                swa_loc=attn_backend.get_unified_swa_loc(forward_batch),
+                swa_loc=attn_backend.get_swa_ring_loc(forward_batch),
                 kv=kv,
                 kv_weight=self.kv_norm.weight.data,
                 eps=self.eps,
@@ -798,13 +796,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
         )
-        # Under unified_kv the swa_kv_pool is None; the caller passes a unified
+        # Under ring_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
         # store just needs to target the bf16 ring instead of the fp8 flashmla
         # buffer. Same swa_loc/positions contract either way.
         store_kv = (
-            pool.set_unified_key_buffer_radix_fused_norm_rope
-            if is_unified_kv_triton()
+            pool.set_ring_kv_key_buffer_radix_fused_norm_rope
+            if is_dsv4_ring_kv()
             else pool.set_swa_key_buffer_radix_fused_norm_rope
         )
         for stage, kv in zip(self.stages, kvs):

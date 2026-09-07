@@ -41,6 +41,7 @@ from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.dsv4_kv_layout import DSV4KVLayout
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
@@ -588,37 +589,35 @@ def _buf_infos(*ptrs):
     return list(ptrs), [ptr + 100 for ptr in ptrs], [ptr + 200 for ptr in ptrs]
 
 
-def _make_dsv4_target(*, unified, mapping=None):
+def _make_dsv4_target(*, ring_kv, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
-    pool._unified_kv = unified
+    pool.kv_layout = DSV4KVLayout.RING if ring_kv else DSV4KVLayout.PAGED
     pool.page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
-    pool.unified_swa_window = 128
-    pool.unified_swa_ring_size = 131
-    pool.unified_swa_pages = 524
+    pool.swa_ring_window = 128
+    pool.swa_ring_size = 131
+    pool.swa_ring_rows = 524
     pool.get_state_buf_infos = lambda: _buf_infos(11)
-    pool.get_unified_swa_ring_buf_infos = lambda: (
-        _buf_infos(12) if unified else ([], [], [])
-    )
+    pool.get_swa_ring_buf_infos = lambda: _buf_infos(12) if ring_kv else ([], [], [])
     pool.get_c128_state_buf_infos = lambda: ([], [], [])
     return pool
 
 
-def _make_dsv4_draft(*, unified, mapping=None):
+def _make_dsv4_draft(*, ring_kv, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
-    pool._unified_kv = unified
+    pool.kv_layout = DSV4KVLayout.RING if ring_kv else DSV4KVLayout.PAGED
     pool.compression_ratios = [0]
     pool.page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
-    pool.unified_swa_window = 128
-    pool.unified_swa_ring_size = 131
-    pool.unified_swa_pages = 524
+    pool.swa_ring_window = 128
+    pool.swa_ring_size = 131
+    pool.swa_ring_rows = 524
     pool.compress_state_pools = [None]
     pool.indexer_compress_state_pools = [None]
-    if unified:
-        pool.unified_kv_pool = SimpleNamespace(
+    if ring_kv:
+        pool.ring_kv_pool = SimpleNamespace(
             swa_pages=524,
             kv_buffer=[torch.empty((524, 16), dtype=torch.uint8)],
         )
@@ -635,15 +634,15 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
         cases = [
             (
                 "paged",
-                _make_dsv4_target(unified=False, mapping=mapping),
-                _make_dsv4_draft(unified=False, mapping=mapping),
+                _make_dsv4_target(ring_kv=False, mapping=mapping),
+                _make_dsv4_draft(ring_kv=False, mapping=mapping),
                 [StateType.SWA, StateType.SWA],
                 [[11]],
             ),
             (
-                "unified",
-                _make_dsv4_target(unified=True),
-                _make_dsv4_draft(unified=True),
+                "ring_kv",
+                _make_dsv4_target(ring_kv=True),
+                _make_dsv4_draft(ring_kv=True),
                 [StateType.SWA, StateType.SWA_RING, StateType.SWA_RING],
                 [[11], [12]],
             ),
@@ -651,8 +650,8 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
 
         for name, target, draft, expected_types, target_ptrs in cases:
             with self.subTest(name=name):
-                if draft._unified_kv:
-                    expected_infos = draft.get_unified_swa_ring_buf_infos()
+                if draft.is_ring_kv:
+                    expected_infos = draft.get_swa_ring_buf_infos()
                 else:
                     expected_infos = draft.get_state_buf_infos()
                 kv_args = KVArgs()
