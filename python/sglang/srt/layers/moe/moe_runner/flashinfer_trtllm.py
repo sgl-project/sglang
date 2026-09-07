@@ -1066,15 +1066,18 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
 
         if is_standard:
             if prepared_packed_topk is not None:
-                packed_topk = prepared_packed_topk
+                routing = prepared_packed_topk
+                routed_top_k = prepared_packed_topk.shape[1]
             else:
-                packed_topk = PackTopkIds.execute(
-                    topk_output.topk_ids, topk_output.topk_weights
+                routed_ids, routed_weights = _get_routing_for_flashinfer_routed(
+                    topk_output
                 )
+                routing = (routed_ids, routed_weights)
+                routed_top_k = routed_ids.shape[1]
 
             defer_finalize = _deferred_finalize_enabled.get()
             result = trtllm_fp4_block_scale_routed_moe(
-                topk_ids=packed_topk,
+                topk_ids=routing,
                 routing_bias=None,
                 hidden_states=x_quant,
                 hidden_states_scale=x_scale,
@@ -1091,7 +1094,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 output1_scale_gate_scalar=None,
                 output2_scale_scalar=None,
                 num_experts=quant_info.global_num_experts,
-                top_k=packed_topk.shape[1],
+                top_k=routed_top_k,
                 n_group=None,
                 topk_group=None,
                 intermediate_size=quant_info.intermediate_size_per_partition,
@@ -1111,7 +1114,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                     gemm2_out=gemm2_out,
                     expert_weights=topk_weights,
                     expanded_idx_to_permuted_idx=expanded_idx,
-                    top_k=packed_topk.shape[1],
+                    top_k=routed_top_k,
                 )
                 return StandardCombineInput(hidden_states=result)
             # The finalized kernel writes to its explicit output argument. Do
