@@ -281,6 +281,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
+    # Class-level default so tests that build the runner via __new__ (without
+    # __init__) still read a sane value from load_batch / _execute_body_capture.
+    _use_draft_input_embeds = False
+
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
             backend = get_exec().graph.cuda_graph_config.prefill.backend
