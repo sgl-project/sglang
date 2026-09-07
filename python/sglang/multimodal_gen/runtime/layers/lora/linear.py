@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -115,6 +116,16 @@ class BaseLayerWithLoRA(nn.Module):
     @property
     def bias(self):
         return getattr(self.base_layer, "bias", None)
+
+    @property
+    def can_merge_base_weight(self) -> bool:
+        """Whether a LoRA delta may safely replace the stored base weight."""
+        weight = self.weight
+        if not (weight.dtype.is_floating_point or weight.dtype.is_complex):
+            return False
+        if isinstance(self.base_layer, LinearBase):
+            return isinstance(self.base_layer.quant_method, UnquantizedLinearMethod)
+        return True
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:

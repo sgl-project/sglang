@@ -71,9 +71,9 @@ def create_offloader(dp_rank: int):
             cpu_offload_max_bytes=int(get_exec().offload.cpu_offload_gb * 1024**3)
         )
     if get_exec().offload.offload_group_size > 0:
-        assert (
-            get_exec().offload.cpu_offload_gb == 0
-        ), "V2 offload does not support cpu_offload_gb yet"
+        assert get_exec().offload.cpu_offload_gb == 0, (
+            "V2 offload does not support cpu_offload_gb yet"
+        )
         return OffloaderV2(
             group_size=get_exec().offload.offload_group_size,
             num_in_group=get_exec().offload.offload_num_in_group,
@@ -173,7 +173,6 @@ class OffloaderV2(BaseOffloader):
 
         # Temporarily init inside Offloader, can move if other modules also need this
         if self.mode in {"sharded_gpu", "shm_cpu"}:
-
             assert get_parallel().tp_size == 1, "not yet support tp_size!=1"
             set_naive_distributed(
                 NaiveDistributed(
@@ -288,17 +287,17 @@ class _ModuleOffloader(ABC):
         self.device = next(module.parameters()).device
         self.alt_stream = alt_stream
 
-        assert self.device != torch.device(
-            "cpu"
-        ), "not handled device=cpu case yet (should skip this tensor)"
+        assert self.device != torch.device("cpu"), (
+            "not handled device=cpu case yet (should skip this tensor)"
+        )
 
         self._device_tensors = None
         self._load_event = None
 
         param_dict = dict(self.module.named_parameters())
-        assert all(
-            name in param_dict for name in whitelist_param_names
-        ), f"{whitelist_param_names=} {list(param_dict.keys())=}"
+        assert all(name in param_dict for name in whitelist_param_names), (
+            f"{whitelist_param_names=} {list(param_dict.keys())=}"
+        )
 
         self._param_offloaders = {
             name: _BaseParamOffloader.create(mode, module=module, param_name=name)
@@ -391,9 +390,9 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
         self._world_size = get_naive_distributed().get_world_size()
 
         assert get_parallel().tp_size == 1, "not yet support tp_size!=1"
-        assert (
-            self._param.data.is_contiguous()
-        ), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+        assert self._param.data.is_contiguous(), (
+            f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+        )
 
         self.shm_cpu_data = get_host_shared_memory_manager().malloc(
             shape=self._param.shape, dtype=self._param.dtype
@@ -408,9 +407,9 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
 
     def post_init(self):
         if self._rank == 0:
-            assert (
-                self.shm_cpu_data.data_ptr() == self._param.data.data_ptr()
-            ), f"{self.shm_cpu_data.data_ptr()=} {self._param.data.data_ptr()=} {self.shm_cpu_data=} {self._param.data=}"
+            assert self.shm_cpu_data.data_ptr() == self._param.data.data_ptr(), (
+                f"{self.shm_cpu_data.data_ptr()=} {self._param.data.data_ptr()=} {self.shm_cpu_data=} {self._param.data=}"
+            )
 
         _move_param_to_meta(self._module, self._param_name)
 
@@ -424,9 +423,9 @@ def update_param(param, new_tensor):
     if param.device == new_tensor.device:
         param.data = new_tensor
     else:
-        assert param.device == torch.device(
-            "cpu"
-        ), f"{param.device=} {new_tensor.device=}"
+        assert param.device == torch.device("cpu"), (
+            f"{param.device=} {new_tensor.device=}"
+        )
         param.data = _create_cpu_data(new_tensor, pin_memory=True)
 
 
@@ -496,9 +495,9 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         self._world_size = get_naive_distributed().get_world_size()
 
         assert get_parallel().tp_size == 1, "not yet support tp_size!=1"
-        assert (
-            self._param.data.is_contiguous()
-        ), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+        assert self._param.data.is_contiguous(), (
+            f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+        )
 
         if self._rank == 0:
             _move_param_to_cpu(self._param, pin_memory=True)
@@ -509,9 +508,9 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
     def post_init(self):
         # check again since it may be changed
-        assert (
-            self._param.data.is_contiguous()
-        ), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+        assert self._param.data.is_contiguous(), (
+            f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+        )
 
         scatter_src = self._param.data
 

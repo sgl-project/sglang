@@ -87,7 +87,6 @@ def apply_rope(
 
 
 class MoonViTEncoderLayer(nn.Module):
-
     def __init__(
         self,
         num_heads: int,
@@ -226,7 +225,6 @@ def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
 
 
 class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
-
     def __init__(
         self,
         height: int,
@@ -370,7 +368,6 @@ class Rope2DPosEmbRepeated(nn.Module):
 
 
 class MoonVision3dPatchEmbed(nn.Module):
-
     def __init__(
         self,
         out_dim: int,
@@ -382,14 +379,14 @@ class MoonVision3dPatchEmbed(nn.Module):
         pos_emb_type: str = "divided_fixed",
     ):
         super().__init__()
-        assert isinstance(
-            patch_size, int | Sequence
-        ), f"Invalid patch_size type: {type(patch_size)}"
+        assert isinstance(patch_size, int | Sequence), (
+            f"Invalid patch_size type: {type(patch_size)}"
+        )
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
-        assert (
-            len(patch_size) == 2
-        ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        assert len(patch_size) == 2, (
+            f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        )
         self.patch_size = patch_size
 
         self.proj = Conv2dLayer(
@@ -436,9 +433,9 @@ class MoonViT3dEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        assert (
-            video_attn_type == "spatial_temporal"
-        ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        assert video_attn_type == "spatial_temporal", (
+            f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        )
         self.video_attn_type = video_attn_type
         self.rope_2d = Rope2DPosEmbRepeated(
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512

@@ -397,8 +397,7 @@ class FlexKVConnector:
             payload = self._sync_ctx.scatter_pp(None)
             if payload.get("cmd") != CMD_LAYERWISE:
                 raise RuntimeError(
-                    f"Tag mismatch: expected CMD_LAYERWISE, got "
-                    f"{payload.get('cmd')}"
+                    f"Tag mismatch: expected CMD_LAYERWISE, got {payload.get('cmd')}"
                 )
             producer_id = int(payload["counter_id"])
             self.layer_done_counter.register_task_with_explicit_counter_id(
@@ -518,7 +517,7 @@ class FlexKVConnector:
             payload = self._sync_ctx.scatter_pp(None)
             if payload.get("cmd") != CMD_PUT_META:
                 raise RuntimeError(
-                    f"Tag mismatch: expected CMD_PUT_META, got " f"{payload.get('cmd')}"
+                    f"Tag mismatch: expected CMD_PUT_META, got {payload.get('cmd')}"
                 )
             fkv_task_id = int(payload["fkv_task_id"])
             mask_list = payload.get("unmatched_mask", [])
@@ -758,7 +757,7 @@ class FlexKVConnector:
                     raise
                 if attempt % 30 == 0:
                     logger.info(
-                        "[FlexKV] GPU register retry %s attempt=%d/%d " "error=%s",
+                        "[FlexKV] GPU register retry %s attempt=%d/%d error=%s",
                         self._label,
                         attempt + 1,
                         max_retries,
@@ -772,9 +771,9 @@ class FlexKVConnector:
         indexer_buffers: Optional[List[torch.Tensor]] = None,
     ) -> None:
         assert len(kv_caches) > 0
-        assert (
-            kv_caches[0].ndim == 3
-        ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
+        assert kv_caches[0].ndim == 3, (
+            f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
+        )
 
         is_mla = self.model_config.use_mla
         num_blocks, num_kv_heads, head_size = kv_caches[0].shape
@@ -896,8 +895,7 @@ class FlexKVConnector:
                     ) from exc
                 if not ack or ack[0] != 1:
                     raise RuntimeError(
-                        f"FlexKV layerwise worker NACK'd eventfd transfer "
-                        f"(ack={ack!r})"
+                        f"FlexKV layerwise worker NACK'd eventfd transfer (ack={ack!r})"
                     )
                 logger.info(
                     "[FlexKV] Eventfd handshake complete %s counters=%d layers=%d",

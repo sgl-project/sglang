@@ -645,8 +645,6 @@ class KimiK3ImageProcessor(
                 model_specific_data=model_specific_data,
             )
             item.set_hash(artifact.feature_hash)
-            if self.use_cuda_ipc and isinstance(item.feature, torch.Tensor):
-                item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
             if self.keep_mm_features_on_device and item.feature is not None:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True
@@ -655,7 +653,7 @@ class KimiK3ImageProcessor(
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
-            mm_items=items,
+            mm_items=self._prepare_mm_items_for_transport(items),
             im_token_id=self.mm_tokens.image_token_id,
         )
 
