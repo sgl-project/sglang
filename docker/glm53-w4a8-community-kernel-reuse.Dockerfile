@@ -50,7 +50,6 @@ RUN set -eux; \
     test -z "$(git -C /glm53-community/sglang status --porcelain=v1 --untracked-files=all)"; \
     ln -s /glm53-community/sglang /sgl-workspace/sglang; \
     test "$(readlink -f /sgl-workspace/sglang)" = /glm53-community/sglang; \
-    python3 -c 'import torch; from importlib.metadata import distribution; from importlib.util import module_from_spec, spec_from_file_location; dist = distribution("sglang-kernel"); path = next(dist.locate_file(item) for item in dist.files or () if str(item).startswith("sgl_kernel/flashmla_ops.") and str(item).endswith(".so")); spec = spec_from_file_location("flashmla_ops", path); module = module_from_spec(spec); spec.loader.exec_module(module)'; \
     printf '%s\n' "${SGLANG_SOURCE_ARCHIVE_SHA256}" > /opt/sglang-source-archive-sha256; \
     PYTHONPATH=/glm53-community/sglang/python python3 -c 'import importlib.machinery, pathlib; expected = pathlib.Path("/glm53-community/sglang/python/sglang/__init__.py"); actual = pathlib.Path(importlib.machinery.PathFinder.find_spec("sglang").origin).resolve(); print(f"SGLANG_SPEC_ORIGIN={actual}"); assert actual == expected'
 
