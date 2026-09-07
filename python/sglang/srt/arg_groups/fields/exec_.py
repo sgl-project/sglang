@@ -141,6 +141,20 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    prefill_kv_cache_dtype: A[
+        str,
+        Arg(
+            help=(
+                "KV representation consumed by prefill attention when "
+                "--kv-cache-dtype=nvfp4. 'nvfp4' reads the packed cache "
+                "directly; 'fp8_e4m3' dequantizes it into a temporary FP8 "
+                "workspace. This does not change the stored KV-cache dtype. "
+                "'auto' selects native NVFP4 on SM100 and FP8 E4M3 otherwise."
+            ),
+            choices=["auto", "fp8_e4m3", "nvfp4"],
+            resolvable=True,
+        ),
+    ] = "auto"
     sampling_backend: A[
         Optional[str],
         Arg(

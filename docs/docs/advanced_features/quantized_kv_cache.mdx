@@ -30,9 +30,10 @@ SGLang supports the following quantized KV cache formats:
 FP4 quantization is currently experimental.
 </Warning>
 
-[OCP (Open Compute Project)](https://www.opencompute.org) specifies MXFP4 (Microscaling FP4), a 4-bit floating-point format:
+[OCP (Open Compute Project)](https://www.opencompute.org) specifies MXFP4 (Microscaling FP4), a 4-bit floating-point format. SGLang exposes two experimental E2M1 KV-cache recipes:
 
-- **E2M1** (1 sign bit, 2 exponent bits, 1 mantissa bit): Uses block-based microscaling where tensors are divided into blocks of consecutive elements, with each block sharing a single 8-bit exponential scaling factor. While OCP specifies blocks of 32 elements, SGLang's current implementation uses blocks of 16 elements for KV cache quantization.
+- **`nvfp4`**: NVIDIA FP4 with 16-value blocks, E4M3 block scales, and a per-tensor global scale.
+- **`fp4_mx_block16`**: An E2M1 block-size-16 compatibility recipe. It is distinct from the standard OCP MXFP4 block-size-32 format.
 
 ## Usage
 
@@ -61,6 +62,38 @@ python3 -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-R1-0528 \
     --kv-cache-dtype fp4_mx_block16 \
 ```
+
+### SM100 native NVFP4 recipes
+
+On SM100, prefill can either consume packed NVFP4 directly or dequantize it into an FP8 E4M3 workspace. Select the representation with `--prefill-kv-cache-dtype`; SGLang chooses the corresponding attention implementation.
+
+For native NVFP4 prefill and decode:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
+    --tp-size 1 \
+    --kv-cache-dtype nvfp4 \
+    --prefill-kv-cache-dtype nvfp4 \
+    --page-size 16
+```
+
+For FP8 prefill backed by a temporary dequantization workspace, with native NVFP4 decode:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
+    --tp-size 1 \
+    --kv-cache-dtype nvfp4 \
+    --prefill-kv-cache-dtype fp8_e4m3 \
+    --page-size 16
+```
+
+The default value, `auto`, selects native NVFP4 prefill on SM100 and FP8 E4M3 prefill on SM120. Decode consumes native NVFP4 in both recipes. The native recipe avoids the FP8 workspace and its token-linear scale copy; the FP8 recipe retains both the linear scales used during prefill and the physical scale layout used during decode. KV data remains stored as packed FP4 either way.
+
+<Note>
+Native NVFP4 prefill requires SM100, a page size divisible by 4, and an attention head dimension divisible by 64. TRT-LLM GenMHA uses FP8 query and output buffers internally; SGLang converts the result back to the model activation dtype. Top-k-1 EAGLE/EAGLE3/NEXTN and breadth-1 NGRAM speculative decoding are supported: an EAGLE-family draft worker uses `trtllm_mha`, and target verification consumes the physical NVFP4 cache directly in eager execution and CUDA Graphs. Set `--speculative-ngram-max-bfs-breadth=1` for NGRAM. With the mixed FlashInfer-prefill/TRT-LLM-decode recipe, SGLang resolves `--speculative-attention-mode` to `decode` so verification does not depend on FlashInfer's transient dequantization workspace. Other speculative algorithms, PD disaggregation, hierarchical KV cache, and LMCache are not currently supported by the SM100 native NVFP4 path. SM120 XQA continues to use its architecture-specific linear scale layout and BF16 query/output path.
+</Note>
 
 ### Scaling Factors
 
@@ -113,6 +146,8 @@ FP4 and FP8 quantization require additional memory for block-based scaling facto
 </Note>
 
 This enables longer context lengths or more concurrent requests within the same memory budget.
+
+For native `nvfp4`, each logical scalar costs 0.5 bytes of packed FP4 data plus 1/16 byte of block-scale storage, compared with 2 bytes for BF16. The resulting theoretical KV-token capacity multiplier is `2 / 0.5625 = 3.56×`. The mixed SM100 recipe owns a second scale layout and a shared one-layer FP8 prefill workspace, so its exact capacity depends on the number of full-attention layers. SGLang includes those auxiliary buffers in its KV-pool sizing calculation.
 
 ### Accuracy Impact
 
