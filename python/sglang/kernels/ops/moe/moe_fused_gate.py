@@ -127,16 +127,21 @@ def _router_triton_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    # Prefetch a real bias before the PDL wait. Plain softmax routing has no
-    # bias, so keep the zero value in registers rather than materializing and
-    # clearing a device tensor for every routing call.
+    # With programmatic dependent launch this grid may start before the
+    # preceding kernel's stores are visible, so every load that can depend on
+    # prior work must come after the wait. The bias is such an input: callers
+    # pass buffers produced right before this launch (a dtype cast of the
+    # correction bias, or historically a fresh torch.zeros), and a load placed
+    # before the wait read the buffer's previous contents.
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    # Plain softmax routing has no bias, so keep the zero value in registers
+    # rather than materializing and clearing a device tensor per call.
     if HAS_BIAS:
         bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
     else:
         bias = tl.zeros([BLOCK_N], dtype=tl.float32)
-
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
 
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     mask2d = mask_m[:, None] & mask_n[None, :]
