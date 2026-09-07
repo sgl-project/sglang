@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ComponentOffloadStrategy,
     ResidentStrategy,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageEncodingStage,
 )
@@ -37,7 +40,9 @@ def _server_args(*, supports_auto_residency=True):
 
 
 def test_component_offload_releases_preferred_component_after_request():
-    strategy = ComponentOffloadStrategy()
+    strategy = ComponentOffloadStrategy(
+        component_name="text_encoder", pin_budget=HostPinBudget()
+    )
     strategy.finish_use = Mock()
     module = torch.nn.Linear(2, 2)
     use = ComponentUse(
@@ -53,7 +58,9 @@ def test_component_offload_releases_preferred_component_after_request():
 
 
 def test_component_offload_keeps_preferred_component_after_warmup():
-    strategy = ComponentOffloadStrategy()
+    strategy = ComponentOffloadStrategy(
+        component_name="text_encoder", pin_budget=HostPinBudget()
+    )
     strategy.prepare_for_use = Mock()
     strategy.wait_for_use = Mock()
     strategy.finish_use = Mock()
@@ -100,6 +107,7 @@ def test_strategy_cache_replaces_stale_component_instance():
     server_args = SimpleNamespace(
         enable_layerwise_nvtx_marker=False,
         residency_mode=lambda _component_name: "resident",
+        node_local_gpu_worker_count=1,
     )
     pipeline = SimpleNamespace(
         modules={},
@@ -728,3 +736,116 @@ def test_component_is_not_kept_across_another_component_use():
     manager.end_use(text_use)
 
     strategy.finish_use.assert_called_once_with(module, text_use, manager.state)
+
+
+# ------------------------------------------------------------- host store
+
+_requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="component offload swaps to a CUDA device"
+)
+
+
+def _swap_cycle(strategy, module, use, state):
+    strategy.prepare_for_use(module, use, state)
+    strategy.wait_for_use(module, use, state)
+    weight = next(module.parameters())
+    assert weight.device.type == "cuda" and weight.numel() > 1
+    strategy.finish_use(module, use, state)
+
+
+@_requires_cuda
+def test_component_offload_round_trips_on_the_host_store():
+    """Swap-out must park the module on placeholders with the weights still
+    in the host store, never copy device memory back: the residency buckets
+    are identical after every cycle, a granted pin budget pins standalone
+    weights without severing a shared storage, and the values are untouched."""
+    from sglang.multimodal_gen.runtime.loader.utils import component_residency_bytes
+
+    module = torch.nn.Module()
+    module.register_parameter(
+        "w", torch.nn.Parameter(torch.randn(64, 64), requires_grad=False)
+    )
+    backing = torch.randn(32)
+    module.register_parameter(
+        "a", torch.nn.Parameter(backing[:16].view(4, 4), requires_grad=False)
+    )
+    module.register_parameter(
+        "b", torch.nn.Parameter(backing[16:].view(4, 4), requires_grad=False)
+    )
+    before = {name: p.detach().clone() for name, p in module.named_parameters()}
+    strategy = ComponentOffloadStrategy(
+        component_name="text_encoder",
+        pin_budget=HostPinBudget(available_bytes=64 * 1024**3),
+    )
+    use = ComponentUse("stage", "text_encoder")
+    state = ResidencyState()
+
+    _swap_cycle(strategy, module, use, state)  # the first swap builds the store
+    rest_totals = component_residency_bytes(module)
+    assert rest_totals["host_pinned"] == 64 * 64 * 4
+    # the tied views keep their one shared pageable storage (never pinned)
+    assert rest_totals["host"] == 32 * 4
+
+    for _ in range(2):
+        _swap_cycle(strategy, module, use, state)
+        assert component_residency_bytes(module) == rest_totals
+
+    strategy.prepare_for_use(module, use, state)
+    strategy.wait_for_use(module, use, state)
+    torch.cuda.synchronize()
+    for name, parameter in module.named_parameters():
+        assert torch.equal(parameter.cpu(), before[name])
+
+
+@_requires_cuda
+def test_component_offload_budget_denial_degrades_to_pageable():
+    """A denied pin request must not error or copy: the loader's storage
+    stays in the host store and the swap still round-trips the weights."""
+    from sglang.multimodal_gen.runtime.loader.utils import component_residency_bytes
+
+    module = torch.nn.Linear(8, 8)
+    weight_before = module.weight.detach().clone()
+    strategy = ComponentOffloadStrategy(
+        component_name="text_encoder", pin_budget=HostPinBudget(available_bytes=0)
+    )
+    use = ComponentUse("stage", "text_encoder")
+    state = ResidencyState()
+
+    _swap_cycle(strategy, module, use, state)
+
+    totals = component_residency_bytes(module)
+    assert totals["host_pinned"] == 0 and totals["host"] > 0
+    strategy.prepare_for_use(module, use, state)
+    strategy.wait_for_use(module, use, state)
+    torch.cuda.synchronize()
+    assert torch.equal(module.weight.cpu(), weight_before)
+
+
+@_requires_cuda
+def test_component_offload_writers_reach_the_host_store():
+    """Both writer paths must land in the host store, or the next swap serves
+    stale weights: update_host_weights while the module is loaded (refit),
+    and in-place mutation under begin/end_host_update (LoRA merge)."""
+    module = torch.nn.Linear(4, 4)
+    strategy = ComponentOffloadStrategy(
+        component_name="transformer", pin_budget=HostPinBudget()
+    )
+    use = ComponentUse("stage", "transformer")
+    state = ResidencyState()
+    _swap_cycle(strategy, module, use, state)
+
+    strategy.prepare_for_use(module, use, state)
+    strategy.wait_for_use(module, use, state)
+    store = module.component_offload_host_store
+    assert store.update_host_weights({"weight": torch.full((4, 4), 3.0)}) == {"weight"}
+    strategy.finish_use(module, use, state)
+
+    store.begin_host_update()
+    with torch.no_grad():
+        module.weight.add_(1.0)
+    store.end_host_update()
+
+    strategy.prepare_for_use(module, use, state)
+    strategy.wait_for_use(module, use, state)
+    torch.cuda.synchronize()
+    assert torch.equal(module.weight.cpu(), torch.full((4, 4), 4.0))

@@ -822,7 +822,11 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa.enable_breakable_cuda_graph = True
         sa.warmup_resolutions = None
         sa.bcg_text_buckets = None
-        sa._validate_breakable_cuda_graph()  # must not raise
+        # the resident-DiT guard resolves residency, which a bare stub lacks
+        with patch.object(
+            ServerArgs, "residency_mode", new=lambda _self, _component: "resident"
+        ):
+            sa._validate_breakable_cuda_graph()  # must not raise
 
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -1711,6 +1715,57 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+
+    def test_bcg_rejects_explicit_layerwise_offload(self):
+        """Offload hooks rebind weight storage between forwards; a captured
+        graph replays the addresses recorded at capture, so the combination
+        must fail at startup rather than corrupt a replay."""
+        for selection in (
+            {"layerwise_offload_components": ["dit"]},
+            {"component_residency": {"transformer": "layerwise-offload"}},
+            {"dit_cpu_offload": True},
+        ):
+            with self.subTest(selection=selection):
+                with self.assertRaisesRegex(ValueError, "breakable-cuda-graph"):
+                    self._from_dict_with_pipeline_config(
+                        QwenImagePipelineConfig(),
+                        kwargs={
+                            "model_path": "Qwen/Qwen-Image",
+                            "enable_breakable_cuda_graph": True,
+                            **selection,
+                        },
+                    )
+
+    def test_bcg_ignores_non_dit_layerwise_components(self):
+        """Only the DiT enters the captured graph; an encoder or VAE on
+        layerwise offload must not trip the guard."""
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "enable_breakable_cuda_graph": True,
+                "performance_mode": "manual",
+                "component_residency": {"text_encoder": "layerwise-offload"},
+            },
+        )
+
+        self.assertTrue(args.enable_breakable_cuda_graph)
+
+    def test_bcg_auto_disables_when_dit_layerwise_is_auto_selected(self):
+        """Auto-selected DiT placement must not turn a working flag into an
+        error: the graph is the optional feature, so it is the one that
+        yields."""
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "enable_breakable_cuda_graph": True,
+                "performance_mode": "memory",
+            },
+        )
+
+        self.assertTrue(args.is_dit_layerwise_offload_selected)
+        self.assertFalse(args.enable_breakable_cuda_graph)
 
     def test_cache_dit_allows_explicit_dit_layerwise_offload(self):
         with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):

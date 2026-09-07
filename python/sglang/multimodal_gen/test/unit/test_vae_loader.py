@@ -131,6 +131,67 @@ class TestKeepCheckpointMapped(unittest.TestCase):
             )
 
 
+class TestComponentOffloadKeepsCheckpointMapping(unittest.TestCase):
+    """A checkpoint-mapped weight must still be file-backed after a
+    component-offload GPU round trip; a swap-out that copies it into fresh
+    anonymous host memory destroys the mapping for good (H3's video VAE)."""
+
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "component offload swaps to a CUDA device"
+    )
+    def test_round_trip_stays_host_mapped(self):
+        import os
+
+        from safetensors.torch import load_file, save_file
+
+        from sglang.multimodal_gen.runtime.loader.utils import (
+            MappedRegions,
+            component_residency_bytes,
+        )
+        from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+            ComponentUse,
+            ResidencyState,
+        )
+        from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+            ComponentOffloadStrategy,
+        )
+        from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+            HostPinBudget,
+        )
+
+        module = nn.Linear(16, 16, bias=True)
+        with TemporaryDirectory() as root:
+            checkpoint = os.path.join(root, "vae.safetensors")
+            save_file(
+                {"weight": torch.randn(16, 16), "bias": torch.randn(16)}, checkpoint
+            )
+            module.load_state_dict(load_file(checkpoint), assign=True)
+            self.assertTrue(
+                MappedRegions().holds(module.weight),
+                "precondition: assign=True must leave the weight file-backed",
+            )
+
+            strategy = ComponentOffloadStrategy(
+                component_name="vae", pin_budget=HostPinBudget()
+            )
+            use = ComponentUse(stage_name="DecodingStage", component_name="vae")
+            state = ResidencyState()
+
+            strategy.prepare_for_use(module, use, state)
+            strategy.wait_for_use(module, use, state)
+            self.assertEqual(module.weight.device.type, "cuda")
+            strategy.finish_use(module, use, state)
+            torch.cuda.synchronize()
+
+            totals = component_residency_bytes(module)
+            self.assertGreater(
+                totals["host_mapped"],
+                0,
+                "swap-out replaced the checkpoint mapping with host copies",
+            )
+            self.assertEqual(totals["host"] + totals["host_pinned"], 0)
+
+
 class TestMatchCheckpointDtypes(CustomTestCase):
     """Assignment replaces a parameter, so only matching dtypes may stay mapped."""
 

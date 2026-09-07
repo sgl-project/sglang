@@ -226,6 +226,28 @@ class TestHostPinBudget:
         budget = HostPinBudget(available_bytes=0)
         assert budget.request(component_name="scheduler", weight_bytes=0)
 
+    def test_node_local_ranks_share_one_hosts_headroom(self, monkeypatch):
+        """N ranks on one node must not plan against the same bytes N times.
+
+        Each GPU worker process constructs its own budget from one host-wide
+        free-memory reading with no cross-rank coordination, so without the
+        divisor 4 ranks on a 32 GiB host could book ~128 GiB of pins.
+        """
+        monkeypatch.setenv("SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB", "32")
+        ranks = 4
+        booked = 0
+        for _ in range(ranks):
+            budget = HostPinBudget(node_local_ranks=ranks)
+            # each rank pins as much as its budget will grant, 1 GiB at a time
+            while budget.request(component_name="dit", weight_bytes=GIB_BYTES):
+                booked += GIB_BYTES
+        assert 0 < booked <= 32 * GIB_BYTES
+
+    def test_the_reserve_scales_with_the_per_rank_share(self):
+        # 5% of the 100 GiB share, not of the undivided 800 GiB host
+        budget = HostPinBudget(available_bytes=800 * GIB_BYTES, node_local_ranks=8)
+        assert budget.reserve_bytes == 5 * GIB_BYTES
+
 
 class TestModuleWeightBytes:
     def test_parameters_and_buffers_are_counted(self):
