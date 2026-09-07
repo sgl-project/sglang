@@ -31,6 +31,7 @@ pub struct CapturedHeaders {
 pub struct MockWorkerState {
     pub captured: Arc<Mutex<CapturedHeaders>>,
     pub stream_chunks: Arc<Vec<&'static str>>,
+    pub response_headers: HeaderMap,
 }
 
 /// A running mock SGLang worker. Shuts down on Drop via the oneshot sender.
@@ -49,10 +50,21 @@ impl MockWorker {
     /// chat-completion request arrives.
     #[allow(dead_code)] // Only used by some test files.
     pub async fn start(stream_chunks: Vec<&'static str>) -> Self {
+        Self::start_with_response_headers(stream_chunks, HeaderMap::new()).await
+    }
+
+    /// Start a worker that adds `response_headers` to both buffered and
+    /// streaming chat-completion responses.
+    #[allow(dead_code)] // Only used by some test files.
+    pub async fn start_with_response_headers(
+        stream_chunks: Vec<&'static str>,
+        response_headers: HeaderMap,
+    ) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
         let state = MockWorkerState {
             captured: captured.clone(),
             stream_chunks: Arc::new(stream_chunks),
+            response_headers,
         };
         // /server_info advertises served_model_name="tiny" so the
         // worker-manager introspect step resolves model_ids for the
@@ -421,6 +433,7 @@ async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes)
             HeaderName::from_static("content-type"),
             "text/event-stream".parse().unwrap(),
         );
+        r.headers_mut().extend(s.response_headers.clone());
         return r;
     }
     let resp = serde_json::json!({
@@ -433,5 +446,7 @@ async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes)
             "finish_reason": "stop"
         }]
     });
-    Json(resp).into_response()
+    let mut response = Json(resp).into_response();
+    response.headers_mut().extend(s.response_headers.clone());
+    response
 }
