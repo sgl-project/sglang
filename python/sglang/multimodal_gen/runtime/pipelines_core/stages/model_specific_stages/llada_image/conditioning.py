@@ -72,7 +72,7 @@ class LLaDAImageTextEncoderRunner:
         from sglang.srt.managers.tp_worker import TpModelWorker
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
         from sglang.srt.mem_cache.chunk_cache import ChunkCache
-        from sglang.srt.runtime_context import publish as srt_publish
+        from sglang.srt.runtime_context import create_context, use_context
         from sglang.srt.server_args import ServerArgs as SRTServerArgs
 
         # Keep the SRT world aligned with the pure-Ulysses ranks. Within that
@@ -123,64 +123,63 @@ class LLaDAImageTextEncoderRunner:
                 server_args.pipeline_config.text_encoder_mem_fraction_static
             ),
         )
-        # TpModelWorker reads the runtime_context config bags the srt
-        # scheduler process publishes before construction.
-        srt_publish(srt_args, role="scheduler")
-        # The diffusion runtime mirrors its TP group into the srt globals.
-        # Clear it so the worker can install the encoder's real srt groups,
-        # then restore the mirror and keep the encoder group for forwards.
-        saved_srt_tp = srt_parallel_state._TP
-        saved_srt_attn_tp = srt_parallel_state._ATTN_TP
-        try:
-            mm_parallel_state._clear_srt_tp_group()
-            self.worker = TpModelWorker(
-                server_args=srt_args,
-                gpu_id=gpu_id,
-                ps=ParallelState.trivial(
-                    tp_rank=text_tp_rank,
-                    tp_size=text_tp_size,
-                    dp_rank=text_tp_rank if text_dp_attention else 0,
-                    dp_size=text_tp_size if text_dp_attention else 1,
-                    attn_tp_rank=0 if text_dp_attention else text_tp_rank,
-                    attn_tp_size=1 if text_dp_attention else text_tp_size,
-                    attn_cp_rank=0,
-                    attn_cp_size=1,
-                    attn_dcp_rank=0,
-                    attn_dcp_size=1,
-                    attn_dp_rank=text_tp_rank if text_dp_attention else 0,
-                    attn_dp_size=text_tp_size if text_dp_attention else 1,
-                    moe_ep_rank=0,
-                    moe_ep_size=1,
-                    moe_dp_rank=text_tp_rank if text_dp_attention else 0,
-                    moe_dp_size=text_tp_size if text_dp_attention else 1,
+        self.runtime_context = create_context(srt_args, role="scheduler")
+        with use_context(self.runtime_context):
+            # The diffusion runtime mirrors its TP group into the srt globals.
+            # Clear it so the worker can install the encoder's real srt groups,
+            # then restore the mirror and keep the encoder group for forwards.
+            saved_srt_tp = srt_parallel_state._TP
+            saved_srt_attn_tp = srt_parallel_state._ATTN_TP
+            try:
+                mm_parallel_state._clear_srt_tp_group()
+                self.worker = TpModelWorker(
+                    server_args=srt_args,
                     gpu_id=gpu_id,
-                ),
-                nccl_port=server_args.nccl_port or 29500,
+                    ps=ParallelState.trivial(
+                        tp_rank=text_tp_rank,
+                        tp_size=text_tp_size,
+                        dp_rank=text_tp_rank if text_dp_attention else 0,
+                        dp_size=text_tp_size if text_dp_attention else 1,
+                        attn_tp_rank=0 if text_dp_attention else text_tp_rank,
+                        attn_tp_size=1 if text_dp_attention else text_tp_size,
+                        attn_cp_rank=0,
+                        attn_cp_size=1,
+                        attn_dcp_rank=0,
+                        attn_dcp_size=1,
+                        attn_dp_rank=text_tp_rank if text_dp_attention else 0,
+                        attn_dp_size=text_tp_size if text_dp_attention else 1,
+                        moe_ep_rank=0,
+                        moe_ep_size=1,
+                        moe_dp_rank=text_tp_rank if text_dp_attention else 0,
+                        moe_dp_size=text_tp_size if text_dp_attention else 1,
+                        gpu_id=gpu_id,
+                    ),
+                    nccl_port=server_args.nccl_port or 29500,
+                )
+                # Run the post-construction init phases the srt scheduler drives.
+                self.worker.alloc_memory_pool()
+                self.worker.init_attention_backends()
+                self.worker.init_cuda_graphs()
+                self.encoder_tp_group = srt_parallel_state._TP
+                self.encoder_attn_tp_group = srt_parallel_state._ATTN_TP
+            finally:
+                srt_parallel_state._TP = saved_srt_tp
+                srt_parallel_state._ATTN_TP = saved_srt_attn_tp
+            self.server_args = srt_args
+            self.text_dp_attention = text_dp_attention
+            self.model_runner = self.worker.model_runner
+            self.page_size = self.model_runner.page_size
+            self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+                self.worker.get_memory_pool()
             )
-            # Run the post-construction init phases the srt scheduler drives.
-            self.worker.alloc_memory_pool()
-            self.worker.init_attention_backends()
-            self.worker.init_cuda_graphs()
-            self.encoder_tp_group = srt_parallel_state._TP
-            self.encoder_attn_tp_group = srt_parallel_state._ATTN_TP
-        finally:
-            srt_parallel_state._TP = saved_srt_tp
-            srt_parallel_state._ATTN_TP = saved_srt_attn_tp
-        self.server_args = srt_args
-        self.text_dp_attention = text_dp_attention
-        self.model_runner = self.worker.model_runner
-        self.page_size = self.model_runner.page_size
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            self.worker.get_memory_pool()
-        )
-        self.tree_cache = ChunkCache(
-            CacheInitParams(
-                disable=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
+            self.tree_cache = ChunkCache(
+                CacheInitParams(
+                    disable=True,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                )
             )
-        )
 
     def _prepare_input_embeds(
         self,
@@ -240,10 +239,13 @@ class LLaDAImageTextEncoderRunner:
     ):
         import sglang.multimodal_gen.runtime.distributed.parallel_state as mm_parallel_state
         import sglang.srt.distributed.parallel_state as srt_parallel_state
+        from sglang.srt.runtime_context import use_context
 
-        # srt modules resolve their TP group through the srt globals, which
-        # hold the diffusion mirror between encodes.
-        with mm_parallel_state.use_tensor_parallel_group(self.encoder_tp_group):
+        # The worker serializes stages so encoder state can follow its groups.
+        with (
+            use_context(self.runtime_context),
+            mm_parallel_state.use_tensor_parallel_group(self.encoder_tp_group),
+        ):
             saved_attn_tp = srt_parallel_state._ATTN_TP
             try:
                 srt_parallel_state._ATTN_TP = self.encoder_attn_tp_group

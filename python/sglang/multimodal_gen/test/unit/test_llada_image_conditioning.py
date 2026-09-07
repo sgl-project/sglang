@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     LLaDAImageTextConditioningStage,
     LLaDAImageTextEncoderRunner,
 )
+from sglang.srt.runtime_context import ParallelContext, RuntimeContext
 
 _GLOBAL_ARGS_PATCH = (
     "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
@@ -173,7 +174,10 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
                 worker_module,
                 return_value=fake_worker,
             ) as worker_cls,
-            patch("sglang.srt.runtime_context.publish"),
+            patch(
+                "sglang.srt.runtime_context.create_context",
+                side_effect=lambda *_args, **_kwargs: RuntimeContext(ParallelContext()),
+            ),
             patch(
                 "sglang.srt.mem_cache.cache_init_params.CacheInitParams",
                 return_value=object(),
@@ -289,6 +293,7 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
         encoder_group = SimpleNamespace(world_size=2, rank_in_group=1)
         encoder_attention_group = object()
         runner = object.__new__(LLaDAImageTextEncoderRunner)
+        runner.runtime_context = RuntimeContext(ParallelContext())
         runner.encoder_tp_group = encoder_group
         runner.encoder_attn_tp_group = encoder_attention_group
         observed = {}
@@ -439,7 +444,10 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
                 "sglang.srt.managers.tp_worker.TpModelWorker",
                 side_effect=fail_after_installing_encoder_groups,
             ),
-            patch("sglang.srt.runtime_context.publish"),
+            patch(
+                "sglang.srt.runtime_context.create_context",
+                side_effect=lambda *_args, **_kwargs: RuntimeContext(ParallelContext()),
+            ),
             patch(
                 "sglang.srt.server_args.ServerArgs",
                 side_effect=lambda **kwargs: SimpleNamespace(page_size=1, **kwargs),
@@ -474,6 +482,151 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
 
             self.assertIs(srt_parallel_state._TP, diffusion_group)
             self.assertIs(srt_parallel_state._ATTN_TP, diffusion_group)
+
+
+class TestLLaDAImageRuntimeContext(unittest.TestCase):
+    def test_encoder_preserves_diffusion_runtime(self):
+        import sglang.multimodal_gen.runtime.distributed.parallel_state as mm_state
+        import sglang.srt.distributed.parallel_state as srt_state
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.server_args import ServerArgs as SRTServerArgs
+
+        saved = rc.snapshot_context()
+        self.addCleanup(rc.restore_context, saved)
+        conditioning = LLaDAImageTextEncoderRunner.__module__
+        for fail_init in (False, True):
+            with self.subTest(fail_init=fail_init):
+                rc.reset_context()
+                diffusion_args = SRTServerArgs(model_path="dummy", tp_size=1)
+                diffusion_context = rc.publish(
+                    diffusion_args, role="diffusion_gpu_worker"
+                )
+                diffusion_context.override("diffusion.setup", grammar_backend="none")
+                diffusion_bags = diffusion_context._config_bags
+                diffusion_log = diffusion_context.overrides_log()
+                diffusion_buffer = rc.get_buffer("conditioning", object)
+                diffusion_group = SimpleNamespace(world_size=1, rank_in_group=0)
+                encoder_group = SimpleNamespace(world_size=2, rank_in_group=1)
+                encoder_attention_group = SimpleNamespace(world_size=1, rank_in_group=0)
+                observed = {}
+
+                def make_args(**kwargs):
+                    kwargs["model_path"] = "dummy"
+                    return SRTServerArgs(**kwargs)
+
+                def check_encoder_context():
+                    context = rc.assert_published(observed["args"], role="scheduler")
+                    self.assertEqual(rc.get_parallel().tp_size, 2)
+                    self.assertEqual(rc.get_schedule().max_running_requests, 4)
+                    return context
+
+                def allocate():
+                    context = check_encoder_context()
+                    context.override("encoder.setup", page_size=16)
+                    rc.get_buffer("conditioning", object)
+                    if fail_init:
+                        raise RuntimeError("allocation failed")
+
+                def make_worker(**kwargs):
+                    observed["args"] = kwargs["server_args"]
+                    observed["context"] = check_encoder_context()
+                    srt_state._TP = encoder_group
+                    srt_state._ATTN_TP = encoder_attention_group
+                    return SimpleNamespace(
+                        model_runner=SimpleNamespace(page_size=16),
+                        get_memory_pool=lambda: (object(), object()),
+                        alloc_memory_pool=allocate,
+                        init_attention_backends=check_encoder_context,
+                        init_cuda_graphs=check_encoder_context,
+                    )
+
+                def make_cache(_params):
+                    self.assertEqual(rc.get_schedule().page_size, 16)
+                    return object()
+
+                def check_diffusion_context():
+                    self.assertIs(rc.get_context(), diffusion_context)
+                    self.assertIs(rc.get_server_args(), diffusion_args)
+                    self.assertEqual(rc.publish_role(), "diffusion_gpu_worker")
+                    self.assertIs(rc.get_context()._config_bags, diffusion_bags)
+                    self.assertEqual(rc.get_context().overrides_log(), diffusion_log)
+                    self.assertEqual(rc.get_exec().kernel.grammar_backend, "none")
+                    self.assertEqual(rc.get_parallel().tp_size, 1)
+                    self.assertIs(
+                        rc.get_buffer("conditioning", object), diffusion_buffer
+                    )
+                    self.assertIs(mm_state._TP, diffusion_group)
+                    self.assertIs(srt_state._TP, diffusion_group)
+                    self.assertIs(srt_state._ATTN_TP, diffusion_group)
+
+                with (
+                    patch("sglang.srt.server_args.ServerArgs", side_effect=make_args),
+                    patch(
+                        "sglang.srt.managers.tp_worker.TpModelWorker",
+                        side_effect=make_worker,
+                    ),
+                    patch(
+                        "sglang.srt.mem_cache.chunk_cache.ChunkCache",
+                        side_effect=make_cache,
+                    ),
+                    patch(
+                        f"{conditioning}.get_local_torch_device",
+                        return_value=torch.device("cpu"),
+                    ),
+                    patch(f"{conditioning}.get_sp_parallel_rank", return_value=1),
+                    patch.object(mm_state, "_TP", diffusion_group),
+                    patch.object(srt_state, "_TP", diffusion_group),
+                    patch.object(srt_state, "_ATTN_TP", diffusion_group),
+                ):
+                    kwargs = dict(
+                        model_root="/unused/model",
+                        queryformer=object(),
+                        text_projection=object(),
+                        tokenizer=object(),
+                        server_args=SimpleNamespace(
+                            sp_degree=2,
+                            nccl_port=29500,
+                            trust_remote_code=False,
+                            revision=None,
+                            component_paths={},
+                            pipeline_config=SimpleNamespace(
+                                text_encoder_mem_fraction_static=0.1
+                            ),
+                        ),
+                    )
+                    if fail_init:
+                        with self.assertRaisesRegex(RuntimeError, "allocation failed"):
+                            LLaDAImageTextEncoderRunner(**kwargs)
+                        check_diffusion_context()
+                        continue
+                    runner = LLaDAImageTextEncoderRunner(**kwargs)
+                    check_diffusion_context()
+                    self.assertIsNot(observed["context"], diffusion_context)
+
+                    def encode(*_args, **_kwargs):
+                        self.assertIs(check_encoder_context(), observed["context"])
+                        self.assertEqual(rc.get_schedule().page_size, 16)
+                        self.assertEqual(len(rc.get_context().overrides_log()), 1)
+                        self.assertIsNot(
+                            rc.get_buffer("conditioning", object), diffusion_buffer
+                        )
+                        self.assertIs(srt_state._ATTN_TP, encoder_attention_group)
+                        if observed["fail_encode"]:
+                            raise RuntimeError("encode failed")
+                        return ["encoded"]
+
+                    runner._encode_impl = encode
+                    for fail_encode in (False, True, False):
+                        observed["fail_encode"] = fail_encode
+                        if fail_encode:
+                            with self.assertRaisesRegex(RuntimeError, "encode failed"):
+                                runner.encode(["hello"], max_sequence_length=16)
+                        else:
+                            self.assertEqual(
+                                runner.encode(["hello"], max_sequence_length=16),
+                                ["encoded"],
+                            )
+                        check_diffusion_context()
 
 
 class TestLLaDAImageConditionKwargs(unittest.TestCase):
