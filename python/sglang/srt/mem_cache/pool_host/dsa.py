@@ -230,9 +230,16 @@ class DSAIndexerPoolHost(HostKVCache):
     ):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        device_layer_id = 0 if is_draft else layer_id
+        if is_draft:
+            # MTP draft layers do not participate in CP layer sharding.
+            # Place the draft offset after the padded local target layers.
+            host_layer_id = self.target_layer_num + (
+                layer_id - self.device_pool.layer_num
+            )
+            device_layer_id = 0
+        else:
+            host_layer_id = self._host_layer_index(layer_id)
+            device_layer_id = layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -292,9 +299,16 @@ class DSAIndexerPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        device_layer_id = 0 if is_draft else layer_id
+        if is_draft:
+            # MTP draft layers do not participate in CP layer sharding.
+            # Place the draft offset after the padded local target layers.
+            host_layer_id = self.target_layer_num + (
+                layer_id - self.device_pool.layer_num
+            )
+            device_layer_id = 0
+        else:
+            host_layer_id = self._host_layer_index(layer_id)
+            device_layer_id = layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
