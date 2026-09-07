@@ -121,7 +121,6 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -530,11 +529,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             with torch.cuda.stream(self.alt_stream):
                 key = self._maybe_rotate(key)
             current_stream.wait_stream(self.alt_stream)
-        elif (
-            self.alt_stream is not None
-            and forward_batch.attn_cp_metadata is not None
-            and self.dsa_enable_prefill_cp
-        ):
+        elif self.alt_stream is not None and is_cp_v2_active(forward_batch):
             key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -543,17 +538,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # Gather the full key on alt_stream so the CP all-gather overlaps
             # with the query rotate above on the current stream.
             with torch.cuda.stream(self.alt_stream):
-                if is_cp_v2_active(forward_batch):
-                    key = get_cp_strategy().materialize_full_indexer_k_cache(
-                        key, forward_batch
-                    )
-                else:
-                    key = cp_all_gather_rerange_output(
-                        key.contiguous(),
-                        self.cp_size,
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
+                key = get_cp_strategy().materialize_full_indexer_k_cache(
+                    key, forward_batch
+                )
             current_stream.wait_stream(self.alt_stream)
             return query, key, weights_raw
         else:
@@ -563,13 +550,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # allgather+rerrange
         if is_cp_v2_active(forward_batch):
             key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
-        elif forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
-            key = cp_all_gather_rerange_output(
-                key.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
         return query, key, weights_raw
 
     def _get_k_bf16(
