@@ -61,13 +61,12 @@ SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
 python3 -m sglang.launch_server \
   --model Qwen/Qwen3-VL-8B-Instruct
 ```
-Or you can run CUDA Graph for ViT together with Piecewise CUDA Graph feature by both setting env variable `SGLANG_VIT_ENABLE_CUDA_GRAPH=1` and setting `--enable-piecewise-cuda-graph`, for example:
+Or you can run CUDA Graph for ViT together with the Piecewise CUDA Graph feature (enabled by default) by setting env variable `SGLANG_VIT_ENABLE_CUDA_GRAPH=1`, for example:
 ```shell Command
 SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
 python3 -m sglang.launch_server \
   --model Qwen/Qwen3-VL-8B-Instruct \
   --piecewise-cuda-graph-max-tokens 4096 \
-  --enable-piecewise-cuda-graph \
   --piecewise-cuda-graph-compiler eager
 ```
 

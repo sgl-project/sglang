@@ -15,7 +15,7 @@ See [Production Metrics](../references/production_metrics) and [Production Reque
 ## Logging
 
 By default, SGLang does not log any request contents. You can log them by using `--log-requests`.
-You can control the verbosity by using `--log-request-level`.
+You can control the verbosity by using `--log-requests-level`.
 See [Logging](./server_arguments#logging) for more details.
 
 You can change verbosity at runtime:
