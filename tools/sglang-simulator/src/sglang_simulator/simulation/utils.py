@@ -2,7 +2,6 @@ import numpy as np
 from sglang_simulator.simulation.types import RequestStats, SchedulerConfig
 from sglang_simulator.spec.accelerator import AcceleratorInfo
 from sglang_simulator.spec.model import ModelInfo
-from sglang_simulator.time_predictor.aiconfigurator import get_perf_model
 
 
 def calc_kv_cache_cell_elems(model_info: ModelInfo, tp_size: int, pp_size: int) -> int:
@@ -40,6 +39,16 @@ def profile_device_available_bytes(
             "simulation config, or set max_total_tokens explicitly. The "
             "simulator never falls back to the local GPU memory capacity."
         )
+
+    try:
+        from sglang_simulator.time_predictor.aiconfigurator import (
+            get_perf_model,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "Automatic max_total_tokens estimation requires "
+            "sglang-simulator[aic]; install it or set max_total_tokens."
+        ) from error
 
     perf_model = get_perf_model(scheduler_config, model)
     weights = 0
