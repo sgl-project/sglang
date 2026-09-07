@@ -29,7 +29,7 @@ class TestBinding(CustomTestCase):
         self.assertEqual(bindings, expected_cores)
 
 
-class TestInitThreadsBinding(unittest.TestCase):
+class TestInitThreadsBinding(CustomTestCase):
     """Tests for init_threads_binding: NUMA/core selection by global rank.
 
     numa_index is the worker's global device id (gpu_id) across all DP
