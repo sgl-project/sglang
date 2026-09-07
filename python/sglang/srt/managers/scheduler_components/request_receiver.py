@@ -79,7 +79,8 @@ class SchedulerRequestReceiver:
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
     # Emits AbortReqs for SGLANG_REQ_WAITING_TIMEOUT / _RUNNING_TIMEOUT on the
-    # request-pulling rank; they must join the recv stream before the broadcast.
+    # rank that owns the waiting queue; broadcast as local reqs, see
+    # _broadcast_reqs_across_ranks().
     poll_timeout_aborts: Optional[Callable[[], List[Any]]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -102,19 +103,22 @@ class SchedulerRequestReceiver:
 
         recv_reqs = self._pull_raw_reqs()
 
-        # Timeout aborts are decided once, on the request-pulling rank, and
-        # ride the same broadcast as tokenizer-initiated aborts.
-        if (
-            recv_reqs is not None
-            and self.ps.pp_rank == 0
-            and self.poll_timeout_aborts is not None
-        ):
-            recv_reqs.extend(self.poll_timeout_aborts())
-
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
+        # Timeout aborts are decided once, on the rank that owns the waiting
+        # queue, and then broadcast as local reqs so that every rank sharing
+        # that queue drops the same requests in the same iteration.
+        local_reqs = []
+        if (
+            self.poll_timeout_aborts is not None
+            and self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            local_reqs = self.poll_timeout_aborts()
+
+        recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
 
         if self.ps.pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
@@ -174,10 +178,23 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         return recv_reqs
 
-    def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
+    def _broadcast_reqs_across_ranks(
+        self, recv_reqs: Optional[List], local_reqs: Optional[List] = None
+    ) -> List:
+        """Broadcast the pulled requests plus any locally generated ones.
+
+        local_reqs (timeout aborts) are produced by the queue-owning rank
+        itself instead of arriving from the tokenizer, so they ride the work
+        channel, which is scoped to exactly the ranks that share that waiting
+        queue. The control channel would be wrong: it fans out from global
+        rank 0, so under DP attention every DP group but the first would have
+        its aborts overwritten and never drop the timed-out requests.
+        """
+        local_reqs = local_reqs or []
         if get_parallel().enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
+                work_reqs.extend(local_reqs)
             else:
                 work_reqs = None
                 control_reqs = None
@@ -203,13 +220,16 @@ class SchedulerRequestReceiver:
                     src=self.tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
-        elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
+        else:
+            if recv_reqs is not None:
+                recv_reqs = [*recv_reqs, *local_reqs]
+            if self.ps.tp_size != 1:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
