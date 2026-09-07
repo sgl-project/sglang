@@ -2593,9 +2593,10 @@ def calculate_mla_kv_cache_dim(
         and kv_lora_rank == 512
         and uses_flashinfer_sparse_mla
     ):
-        from flashinfer.mla import supported_sparse_mla_sm120_configs
+        from flashinfer import mla
 
-        config = supported_sparse_mla_sm120_configs()["glm53_nope"]
+        supported_configs = getattr(mla, "supported_sparse_mla_sm120_configs", None)
+        config = supported_configs().get("glm53_nope") if supported_configs else None
         return getattr(config, "compact_bytes_per_token", None) or 656
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:

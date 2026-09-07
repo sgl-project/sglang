@@ -50,8 +50,6 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
-    get_dsa_index_topk,
-    is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -88,7 +86,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
@@ -514,6 +511,7 @@ class DeepseekSparseAttnBackend(
 
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             _validate_flashinfer_sparse_mla_backend,
+            create_flashinfer_sparse_mla_runner,
         )
 
         uses_flashinfer_sparse_mla = _validate_flashinfer_sparse_mla_backend(
@@ -532,6 +530,20 @@ class DeepseekSparseAttnBackend(
                     dtype=torch.uint8,
                     device=model_runner.device,
                 ),
+            )
+            max_runner_tokens = max(
+                64,
+                int(getattr(model_runner.server_args, "chunked_prefill_size", 0) or 0),
+                int(getattr(model_runner.server_args, "max_prefill_tokens", 0) or 0),
+                model_runner.max_running_requests
+                * max(1, self.speculative_num_draft_tokens or 1),
+            )
+            self.flashinfer_sparse_mla_runner = create_flashinfer_sparse_mla_runner(
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                max_num_tokens=max_runner_tokens,
+                max_num_heads=self.num_q_heads,
+                device=model_runner.device,
             )
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
@@ -2936,6 +2948,7 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1,
             seq_lens=seq_lens,
             workspace_buffer=self.workspace_buffer,
+            runner=self.flashinfer_sparse_mla_runner,
             page_size=self.real_page_size,
             kv_cache_dim=self.kv_cache_dim,
             qk_nope_head_dim=self.qk_nope_head_dim,

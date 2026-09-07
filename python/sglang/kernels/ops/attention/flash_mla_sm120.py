@@ -718,13 +718,42 @@ def _validate_flashinfer_sparse_mla_backend(
     return uses_flashinfer_sparse_mla
 
 
+def create_flashinfer_sparse_mla_runner(
+    *,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    max_num_tokens: int,
+    max_num_heads: int,
+    device: str,
+) -> object | None:
+    """Use native NoPE kernels when available; preserve the existing RoPE API."""
+    if qk_rope_head_dim != 0 or kv_lora_rank != 512:
+        return None
+    from flashinfer import mla
+
+    wrapper = getattr(mla, "SparseMLASm120Wrapper", None)
+    configs = getattr(mla, "supported_sparse_mla_sm120_configs", None)
+    if wrapper is None or configs is None or "glm53_nope" not in configs():
+        raise RuntimeError(
+            "GLM NoPE sparse MLA requires FlashInfer native SM120 support "
+            "with the glm53_nope configuration."
+        )
+    return wrapper(
+        max_num_tokens=max_num_tokens,
+        max_num_heads=max_num_heads,
+        d_v=kv_lora_rank,
+        kv_scale_format="arbitrary_fp32",
+        device=device,
+    )
+
+
 def flashinfer_sparse_mla_forward(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     indices: torch.Tensor,
     seq_lens: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    runner: object,
+    runner: object | None = None,
     *,
     page_size: int,
     kv_cache_dim: int,
@@ -742,6 +771,35 @@ def flashinfer_sparse_mla_forward(
     rows contain 512 FP8 latent values and four inline FP32 scales. Both
     compact 528-byte rows and the padded 656-byte fp8_ds_mla ABI are supported.
     """
+    if runner is None:
+        if qk_rope_head_dim == 0 and kv_lora_rank == 512:
+            raise RuntimeError(
+                "GLM NoPE sparse MLA requires FlashInfer native SM120 support "
+                "with the glm53_nope configuration."
+            )
+        from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+        topk = indices.shape[1]
+        result = trtllm_batch_decode_with_kv_cache_mla(
+            query=q.unsqueeze(1),
+            kv_cache=kv_cache.view(torch.uint8)
+            .view(-1, page_size, kv_cache_dim)
+            .unsqueeze(1),
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=indices.unsqueeze(1),
+            seq_lens=seq_lens,
+            max_seq_len=topk,
+            sparse_mla_top_k=topk,
+            bmm1_scale=float(sm_scale),
+            bmm2_scale=1.0,
+            kv_scale_format="arbitrary_fp32",
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
+        return result.squeeze(1)
+
     if skip_softmax_threshold_scale_factor is not None:
         raise ValueError(
             "flashinfer_sparse_mla does not support skip-softmax thresholds"
@@ -779,9 +837,7 @@ def flashinfer_sparse_mla_forward(
                 value=-1,
             )
 
-    kv_cache_u8 = kv_cache.view(torch.uint8).view(
-        -1, page_size, kv_cache_dim
-    )
+    kv_cache_u8 = kv_cache.view(torch.uint8).view(-1, page_size, kv_cache_dim)
     output = torch.empty(
         q.shape[0], q.shape[1], kv_lora_rank, dtype=torch.bfloat16, device=q.device
     )
@@ -803,12 +859,16 @@ def flashinfer_sparse_mla_forward(
                 f"need {required_bytes} bytes, have {available_bytes}"
             )
         workspace_u8 = workspace_buffer.view(torch.uint8)
-        mid_out = workspace_u8[:mid_out_bytes].view(torch.bfloat16).view(
-            q.shape[0], scratch_heads, num_splits, kv_lora_rank
+        mid_out = (
+            workspace_u8[:mid_out_bytes]
+            .view(torch.bfloat16)
+            .view(q.shape[0], scratch_heads, num_splits, kv_lora_rank)
         )
-        mid_lse = workspace_u8[
-            mid_out_bytes : mid_out_bytes + mid_lse_bytes
-        ].view(torch.float32).view(q.shape[0], scratch_heads, num_splits)
+        mid_lse = (
+            workspace_u8[mid_out_bytes : mid_out_bytes + mid_lse_bytes]
+            .view(torch.float32)
+            .view(q.shape[0], scratch_heads, num_splits)
+        )
 
     runner.run(
         q,
