@@ -80,7 +80,7 @@ class TestInklingNVFP4Nightly(unittest.TestCase):
 
 class TestInklingSmallCacheConsistencyNightly(unittest.TestCase):
     """Bitwise version of the per-commit check in
-    ``test/registered/models_e2e/test_inkling.py``, on the real checkpoint and
+    ``test/registered/e2e/models/test_inkling.py``, on the real checkpoint and
     at a batch shape the tiny checkpoint never reaches."""
 
     @unittest.skipIf(not is_blackwell_system(), "NVFP4 requires Blackwell")
