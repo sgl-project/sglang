@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=384, stage="base-c", runner_config="4-gpu-gb300")
 
 # Keep rendezvous ports below the ephemeral range on the 4-GPU GB300 runner.
 NCCL_PORT_BASE = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 100

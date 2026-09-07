@@ -42,6 +42,8 @@ class TestDeepSeekOCR(CustomTestCase):
             "xpu",
             "--attention-backend",
             "intel_xpu",
+            "--mem-fraction-static",
+            "0.7",
         ]
         cls.process = popen_launch_server(
             cls.model,
