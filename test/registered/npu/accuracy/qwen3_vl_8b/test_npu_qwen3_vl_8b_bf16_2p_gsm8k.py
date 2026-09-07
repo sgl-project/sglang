@@ -40,7 +40,7 @@ QWEN3_VL_8B_OTHER_ARGS = [
     "qwen",
     "--reasoning-parser",
     "qwen3",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     8,
     16,
     32,

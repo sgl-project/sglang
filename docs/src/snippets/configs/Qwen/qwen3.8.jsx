@@ -233,7 +233,7 @@ export const config = {
     // ----- Card: "PD Disaggregation" -----
     // Role flags follow the P/D bundle's own prefill and decode workers. Two
     // flags those recipes carry are deliberately not emitted:
-    // --prefill-round-robin-balance is a DeprecatedAction on current SGLang and
+    // is a DeprecatedAction on current SGLang and
     // does nothing, and --mamba-track-interval is context-dependent (the source
     // recipes set it equal to their context cap) so a fixed value here would be
     // wrong for cells serving the native window.

@@ -68,7 +68,7 @@ class TestDFlashServerBase(
             # private pools on 32GB CI cards.
             "--mem-fraction-static",
             "0.7",
-            "--cuda-graph-bs",
+            "--cuda-graph-bs-decode",
             *[str(i) for i in range(1, cls.max_running_requests + 1)],
         ]
         if cls.disable_overlap:

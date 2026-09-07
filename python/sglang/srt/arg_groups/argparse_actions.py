@@ -74,7 +74,7 @@ class DeprecatedStoreConstAction(argparse.Action):
     """Deprecated boolean flag that stores a fixed string/value into ``dest``
     and prints a warning. Used to translate a legacy boolean flag into a
     setting on the new per-phase config dict (e.g.
-    ``--disable-piecewise-cuda-graph`` -> ``cuda_graph_backend_prefill="disabled"``)."""
+    ``--cuda-graph-backend-prefill=disabled`` -> ``cuda_graph_backend_prefill="disabled"``)."""
 
     def __init__(
         self,

@@ -50,7 +50,7 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 str(cls.max_running_requests),
                 "--max-total-tokens",
                 "14000",  # loadback trigger
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
                 "--enable-hierarchical-cache",

@@ -57,7 +57,7 @@ class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "--enable-dp-lm-head",
         "--mem-fraction-static",
         0.7,
-        "--cuda-graph-bs",
+        "--cuda-graph-bs-decode",
         16,
         20,
         24,

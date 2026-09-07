@@ -80,7 +80,7 @@ QWEN3_NEXT_80B_A3B_OTHER_ARGS = [
     -1,
     "--max-running-requests",
     16,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     2,
     4,
     8,

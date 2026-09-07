@@ -66,9 +66,9 @@ Or you can run CUDA Graph for ViT together with Piecewise CUDA Graph feature by 
 SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
 python3 -m sglang.launch_server \
   --model Qwen/Qwen3-VL-8B-Instruct \
-  --piecewise-cuda-graph-max-tokens 4096 \
+  --cuda-graph-max-bs-prefill 4096 \
   --enable-piecewise-cuda-graph \
-  --piecewise-cuda-graph-compiler eager
+  --cuda-graph-tc-compiler eager
 ```
 
 ## Known supported models

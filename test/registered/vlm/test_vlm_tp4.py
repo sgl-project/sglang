@@ -39,7 +39,7 @@ class TestVLMTP4(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--trust-remote-code",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 "128",

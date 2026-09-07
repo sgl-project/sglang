@@ -24,7 +24,7 @@ class TestGraniteMoeHybridExtraBuffer(
     other_args = [
         "--mem-fraction-static",
         "0.8",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
     ]
 

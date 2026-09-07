@@ -20,8 +20,7 @@ captured store would silently write wrong slots.
 
 The old gate only rejected `TC_PIECEWISE`, but the generic prefill default is
 `BREAKABLE` -- so the DEFAULT unified invocation was broken; it only ever
-worked when `--disable-piecewise-cuda-graph` (a deprecated alias for
-`--cuda-graph-backend-prefill=disabled`) happened to be passed.
+worked when `--cuda-graph-backend-prefill=disabled` happened to be passed.
 
 Pinned: the default is auto-disabled with a warning (unified boots out of the
 box), an EXPLICIT prefill backend still raises (never silently override a

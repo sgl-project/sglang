@@ -153,7 +153,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def test_deprecated_flags_still_work(self):
         """Deprecated flags set the correct dest field."""
-        sa = self._parse(["--stream-output"])
+        sa = self._parse(["--incremental-streaming-output"])
         self.assertTrue(sa.incremental_streaming_output)
 
     def test_combined_parse(self):

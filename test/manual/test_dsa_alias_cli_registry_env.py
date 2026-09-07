@@ -43,7 +43,7 @@ class TestDSAChoicesAndFields(unittest.TestCase):
 
     def test_nsa_choices_match_dsa_choices(self):
         self.assertEqual(
-            self.actions["--nsa-prefill-backend"].choices,
+            self.actions["--dsa-prefill-backend"].choices,
             self.actions["--dsa-prefill-backend"].choices,
         )
 
@@ -135,7 +135,7 @@ class TestCLIDeprecatedFlags(unittest.TestCase):
 
     def test_nsa_prefill_backend_deprecated_writes_to_dsa(self):
         args, log_output = self._parse_capture_warnings(
-            ["--nsa-prefill-backend", "fa3"]
+            ["--dsa-prefill-backend", "fa3"]
         )
         self.assertEqual(args.dsa_prefill_backend, "fa3")
         self.assertIn(
@@ -146,7 +146,7 @@ class TestCLIDeprecatedFlags(unittest.TestCase):
 
     def test_nsa_decode_backend_deprecated_writes_to_dsa(self):
         args, log_output = self._parse_capture_warnings(
-            ["--nsa-decode-backend", "tilelang"]
+            ["--dsa-decode-backend", "tilelang"]
         )
         self.assertEqual(args.dsa_decode_backend, "tilelang")
         self.assertIn("deprecated", log_output.lower())

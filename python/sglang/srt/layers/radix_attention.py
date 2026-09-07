@@ -314,7 +314,7 @@ def _unified_attention_with_output_impl(
     sinks: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
     # MLA / TRT-LLM / NSA paths pass these through RadixAttention.forward(**kwargs);
-    # they must appear in the schema when --enforce-piecewise-cuda-graph is on.
+    # they must appear in the schema when --cuda-graph-backend-prefill=tc_piecewise is on.
     cos_sin_cache: Optional[torch.Tensor] = None,
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,

@@ -81,7 +81,7 @@ class TestBasicSanityDSpark(
                 "--page-size",
                 "1",
                 "--enable-metrics",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
             ],
             env={
                 "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
