@@ -55,11 +55,11 @@ Laguna-XS.2 support is on `main` but not yet in a tagged release; install from t
 ```bash Command
 # Install SGLang via pip (CUDA 13) — requires Python 3.10 (nightly wheels are cp310 only)
 python3 -m pip install --upgrade pip
-python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu130 \
+python3 -m pip install --extra-index-url https://docs.sglang.io/whl/cu130 \
   "sglang[all]==0.5.12.dev20260509+g096ad02b0"
 
 # CUDA 12: swap to the cu129 index
-python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu129 \
+python3 -m pip install --extra-index-url https://docs.sglang.io/whl/cu129 \
   "sglang[all]==0.5.12.dev20260509+g096ad02b0"
 
 # Or use Docker (multi-arch amd64/arm64; CUDA 13, H200 / B200)
