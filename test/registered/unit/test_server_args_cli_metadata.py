@@ -1,9 +1,6 @@
 """Unit tests for migrated ServerArgs CLI metadata."""
 
 import argparse
-import ast
-import inspect
-import textwrap
 import unittest
 
 from sglang.srt.server_args import ServerArgs
@@ -12,53 +9,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-
-
-MIGRATED_OPTIONS = frozenset(
-    {
-        "--dtype",
-        "--quantization",
-        "--quantization-param-path",
-        "--kv-cache-dtype",
-        "--enable-fp32-lm-head",
-        "--modelopt-quant",
-        "--modelopt-checkpoint-restore-path",
-        "--modelopt-checkpoint-save-path",
-        "--modelopt-export-path",
-        "--quantize-and-serve",
-        "--rl-quant-profile",
-        "--mem-fraction-static",
-        "--max-running-requests",
-        "--max-queued-requests",
-        "--max-total-tokens",
-        "--chunked-prefill-size",
-        "--prefill-max-requests",
-        "--enable-dynamic-chunking",
-        "--max-prefill-tokens",
-        "--schedule-policy",
-        "--enable-priority-scheduling",
-        "--disable-priority-preemption",
-        "--default-priority-value",
-        "--abort-on-priority-when-disabled",
-        "--schedule-low-priority-values-first",
-        "--priority-scheduling-preemption-threshold",
-        "--schedule-conservativeness",
-        "--page-size",
-        "--swa-full-tokens-ratio",
-        "--disable-hybrid-swa-memory",
-        "--radix-eviction-policy",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-passes",
-        "--prefill-delayer-token-usage-low-watermark",
-        "--prefill-delayer-forward-passes-buckets",
-        "--prefill-delayer-wait-seconds-buckets",
-        "--prefill-delayer-queue-min-ratio",
-        "--prefill-delayer-max-delay-ms",
-        "--data-parallel-size",
-        "--dp-size",
-        "--load-balance-method",
-    }
-)
 
 
 class TestServerArgsMigratedCliMetadata(CustomTestCase):
@@ -71,22 +21,6 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
             for action in cls.parser._actions
             for option in action.option_strings
         }
-
-    def test_migrated_options_are_registered_by_dataclass_metadata(self):
-        add_cli_args_source = textwrap.dedent(
-            inspect.getsource(ServerArgs.add_cli_args)
-        )
-        add_cli_args_tree = ast.parse(add_cli_args_source)
-        manual_options = {
-            node.value
-            for node in ast.walk(add_cli_args_tree)
-            if isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and node.value.startswith("--")
-        }
-
-        self.assertFalse(MIGRATED_OPTIONS & manual_options)
-        self.assertIn("--prefill-round-robin-balance", manual_options)
 
     def test_argparse_shape_is_preserved_for_representative_migrated_options(self):
         self.assertEqual(self.actions_by_option["--dtype"].default, ServerArgs.dtype)

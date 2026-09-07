@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -12,20 +14,11 @@ from sglang.srt.layers.linear import LinearBase
 from sglang.srt.models.qwen2 import Qwen2MLP
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import add_prefix, get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(
-    est_time=9,
-    stage="base-b",
-    runner_config="1-gpu-small",
-    disabled="Test uses pytest-style function without TestCase class - see #17145",
-)
-register_amd_ci(
-    est_time=15,
-    suite="stage-b-test-1-gpu-small-amd",
-    disabled="Test uses pytest-style function without TestCase class - see #17145",
-)
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 TEST_HIDDEN_SIZE = 32
 
@@ -73,26 +66,29 @@ def init_weights(module):
         torch.nn.init.ones_(module.weight)
 
 
-def test_model_forward_dump(tmp_path):
-    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-    device = get_device()
-    init_single_process_dist(backend=get_default_distributed_backend(device))
-    model = MockCausalLM()
-    model.apply(init_weights)
-    model = model.to(device=device, dtype=torch.bfloat16)
-    dumper = register_forward_hook_for_model(
-        model, tmp_path / "sglang_dump", [0], 0, 0, 0
-    )
+class TestTensorDumpForwardHook(CustomTestCase):
+    def test_model_forward_dump(self):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        device = get_device()
+        init_single_process_dist(backend=get_default_distributed_backend(device))
+        model = MockCausalLM()
+        model.apply(init_weights)
+        model = model.to(device=device, dtype=torch.bfloat16)
 
-    dir_path = dumper.get_dump_dir()
-    inp = torch.randn(4, TEST_HIDDEN_SIZE, dtype=torch.bfloat16) * 0.01
-    result = model(inp.to(device))
-    data = torch.load(f"{dir_path}/Pass00000.pt")
-    assert "model.layernorm" in data
-    assert "model.mlp.down_proj" in data
-    assert torch.allclose(
-        data["model.mlp.down_proj"], result.cpu(), rtol=1e-5, atol=1e-5
-    )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dumper = register_forward_hook_for_model(
+                model, Path(temp_dir) / "sglang_dump", [0], 0, 0, 0
+            )
+            dir_path = dumper.get_dump_dir()
+            inp = torch.randn(4, TEST_HIDDEN_SIZE, dtype=torch.bfloat16) * 0.01
+            result = model(inp.to(device))
+            data = torch.load(f"{dir_path}/Pass00000.pt")
+
+        self.assertIn("model.layernorm", data)
+        self.assertIn("model.mlp.down_proj", data)
+        torch.testing.assert_close(
+            data["model.mlp.down_proj"], result.cpu(), rtol=1e-5, atol=1e-5
+        )
 
 
 if __name__ == "__main__":
