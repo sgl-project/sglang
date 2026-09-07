@@ -542,7 +542,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 row_token_starts[rows] + blocks * compress_ratio - prefix_lens[rows],
                 torch.zeros_like(blocks),
             )
-        return write_locs, group_end_positions, rows, member_rows
+        return write_locs, group_end_positions, rows, member_rows, valid
 
     def _qsa_build_write_plan(
         self,
@@ -554,9 +554,9 @@ class QwenSparseAttnBackend(AttentionBackend):
     ):
         """Plan the compressed writes for this forward, device-side only.
 
-        Returns (write_locs, group_end_positions, sequence_ids). The only
-        per-mode part is the block range each row owns, which is device
-        arithmetic over lengths the batch already carries.
+        Returns (write_locs, group_end_positions, sequence_ids, member_rows,
+        plan_valid). The only per-mode part is the block range each row owns,
+        which is device arithmetic over lengths the batch already carries.
         """
         ratio = self.token_to_kv_pool.qsa_compress_ratio
         lengths = sequence_lengths.long()
@@ -700,6 +700,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         group_positions = None
         group_sequence_ids = None
         group_member_rows = None
+        group_plan_valid = None
         decode_page_table = None
         decode_lengths = None
         decode_logical_positions = None
@@ -710,13 +711,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.qsa_profile is None
             or self.qsa_profile.variant == QSA_VARIANT_COMPRESSED
         ):
-            write_locs, group_positions, group_sequence_ids, group_member_rows = (
-                self._qsa_build_write_plan(
-                    forward_batch=forward_batch,
-                    speculative_paged=speculative_paged,
-                    token_slot_table=token_slot_table,
-                    sequence_lengths=sequence_lengths,
-                )
+            (
+                write_locs,
+                group_positions,
+                group_sequence_ids,
+                group_member_rows,
+                group_plan_valid,
+            ) = self._qsa_build_write_plan(
+                forward_batch=forward_batch,
+                speculative_paged=speculative_paged,
+                token_slot_table=token_slot_table,
+                sequence_lengths=sequence_lengths,
             )
             decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
             if decode_like:
@@ -780,6 +785,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_group_positions=group_positions,
             compress_sequence_ids=group_sequence_ids,
             compress_member_rows=group_member_rows,
+            compress_plan_valid=group_plan_valid,
             decode_page_table=decode_page_table,
             decode_lengths=decode_lengths,
             decode_logical_positions=decode_logical_positions,
