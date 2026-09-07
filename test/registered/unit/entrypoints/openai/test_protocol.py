@@ -152,6 +152,26 @@ class TestChatCompletionRequest(unittest.TestCase):
                     {**base_request, "response_format": response_format}
                 )
 
+    def test_non_dict_body_raises_validation_error(self):
+        """A JSON body that is not an object must fail pydantic validation,
+        not crash inside a mode="before" validator with AttributeError
+        (which FastAPI surfaces as HTTP 500 instead of 422)."""
+        for body in ([], "hello", 42, [{"role": "user", "content": "hi"}]):
+            with self.subTest(body=body), self.assertRaises(ValidationError):
+                ChatCompletionRequest.model_validate(body)
+
+    def test_non_dict_response_format_raises_validation_error(self):
+        """A response_format that is not an object (e.g. the common typo
+        "json") must be reported as a validation error, not crash
+        set_json_schema with AttributeError."""
+        request = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "response_format": "json",
+        }
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest.model_validate(request)
+
     def test_basic_chat_completion_request(self):
         """Test basic chat completion request"""
         messages = [{"role": "user", "content": "Hello"}]
