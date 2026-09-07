@@ -1,7 +1,8 @@
 from contextlib import contextmanager, nullcontext
-from typing import Iterator, Optional, Union
+from typing import Iterator, List, Optional, Union
 
 import torch
+import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
@@ -202,3 +203,24 @@ def temporary_module_dtype(
         yield module
     finally:
         module.to(dtype=original_dtype)
+
+
+@contextmanager
+def temporary_modules_dtype(
+    modules: List[nn.Module],
+    dtype: torch.dtype,
+    *,
+    enabled: Union[bool, List[bool]] = True,
+    restore_dtype: Optional[torch.dtype] = None,
+) -> Iterator[List[nn.Module]]:
+    """Temporarily cast multiple modules to the given dtype, restoring original dtype on exit."""
+    enabled_list = [enabled] * len(modules) if isinstance(enabled, bool) else enabled
+
+    original_dtypes = [restore_dtype or get_module_dtype(m) for m in modules]
+    modules = [m.to(dtype=dtype) if en else m for m, en in zip(modules, enabled_list)]
+    try:
+        yield modules
+    finally:
+        for m, orig_dtype, en in zip(modules, original_dtypes, enabled_list):
+            if en:
+                m.to(dtype=orig_dtype)

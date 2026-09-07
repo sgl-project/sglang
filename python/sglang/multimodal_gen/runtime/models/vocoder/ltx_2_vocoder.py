@@ -1,6 +1,5 @@
 import math
 from abc import ABC
-from contextlib import nullcontext
 from typing import Tuple
 
 import einops
@@ -12,6 +11,7 @@ from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderC
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.utils.precision import temporary_module_dtype
 
 LRELU_SLOPE = 0.1
 
@@ -705,12 +705,22 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         """
         if hasattr(self, "bwe_generator"):
             input_dtype = hidden_states.dtype
+            # [Note] Use temporary_module_dtype for the upcast on CPU
+            # On CPU, torch.autocast("cpu", dtype=torch.float32) emits a warning and silently disables autocast (enabled = False)
+            # CPU takes the non-CUDA branch in autocast.__init__. That branch defines a device_supported_dtypes list containing only bfloat16 and float16.
+            # Since float32 is not in the list, the code hits the "target dtype is not supported. Disabling autocast." branch, warns, and turns autocast off.
+            # https://github.com/pytorch/pytorch/blob/d7245544ad8fe2816425bfac5d2312b6f6f37386/torch/amp/autocast_mode.py#L297-L305
+            # https://github.com/pytorch/pytorch/blob/d7245544ad8fe2816425bfac5d2312b6f6f37386/torch/amp/autocast_mode.py#L248
             autocast_ctx = (
                 torch.autocast(
                     device_type=hidden_states.device.type, dtype=torch.float32
                 )
                 if hidden_states.device.type != "cpu"
-                else nullcontext()
+                else temporary_module_dtype(
+                    self,
+                    torch.float32,
+                    enabled=next(self.parameters()).dtype != torch.float32,
+                )
             )
             with autocast_ctx:
                 waveform = self.vocoder(hidden_states.float())

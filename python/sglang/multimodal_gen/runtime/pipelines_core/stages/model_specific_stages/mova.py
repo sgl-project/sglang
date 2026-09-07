@@ -71,6 +71,10 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context as precision_autocast_context,
 )
+from sglang.multimodal_gen.runtime.utils.precision import (
+    temporary_module_dtype,
+    temporary_modules_dtype,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.utils.common import get_compiler_backend
@@ -696,9 +700,23 @@ class MOVADenoisingStage(PipelineStage):
 
         visual_context = context.to(device=device, dtype=model_dtype)
         audio_context = context.to(device=device, dtype=model_dtype)
-        with torch.autocast(
-            device_type=current_platform.device_type, dtype=torch.float32
-        ):
+
+        # See [Note] Use temporary_module_dtype for the upcast on CPU
+        autocast_ctx = (
+            torch.autocast(
+                device_type=current_platform.device_type, dtype=torch.float32
+            )
+            if current_platform.device_type != "cpu"
+            else temporary_modules_dtype(
+                [visual_dit, self.audio_dit],
+                dtype=torch.float32,
+                enabled=[
+                    next(m.parameters()).dtype != torch.float32
+                    for m in [visual_dit, self.audio_dit]
+                ],
+            )
+        )
+        with autocast_ctx:
             visual_t = visual_dit.time_embedding(
                 video_sinusoidal_embedding_1d(visual_dit.freq_dim, timestep)
             )
@@ -999,9 +1017,19 @@ class MOVADecodingStage(PipelineStage):
         ) as audio_vae:
             assert audio_vae is not None
             self.audio_vae = audio_vae
-            with torch.autocast(
-                device_type=current_platform.device_type, dtype=torch.float32
-            ):
+            # See [Note] Use temporary_module_dtype for the upcast on CPU
+            autocast_ctx = (
+                torch.autocast(
+                    device_type=current_platform.device_type, dtype=torch.float32
+                )
+                if current_platform.device_type != "cpu"
+                else temporary_module_dtype(
+                    self.audio_vae,
+                    torch.float32,
+                    enabled=next(self.audio_vae.parameters()).dtype != torch.float32,
+                )
+            )
+            with autocast_ctx:
                 audio = self.audio_vae.decode(batch.audio_latents)
         output_batch = OutputBatch(
             output=video,
