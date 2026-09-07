@@ -116,6 +116,14 @@ class EnvTuple(EnvField):
         return tuple(s.strip() for s in value.split(",") if s.strip())
 
 
+class EnvIntTuple(EnvField):
+    def parse(self, value: str) -> tuple[int, ...]:
+        try:
+            return tuple(int(s.strip()) for s in value.split(",") if s.strip())
+        except ValueError:
+            raise ValueError(f'"{value}" is not a comma-separated integer list')
+
+
 class EnvStr(EnvField):
     def parse(self, value: str) -> str:
         return value
@@ -1286,6 +1294,9 @@ class Envs:
 
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
+    # Opt-in XPU DSV4 decode-graph sequence widths. The full configured context
+    # is appended automatically so every accepted request retains a graph.
+    SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS = EnvIntTuple(tuple())
 
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
