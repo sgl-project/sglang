@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
     get_dsv4_indexer_bytes_per_token,
+    get_swa_ring_size,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
@@ -911,12 +912,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         self._unified = is_unified_kv_triton()
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        # Mirror DeepSeekV4TokenToKVPool: swa_ring_size = sliding_window +
-        # (speculative_num_draft_tokens - 1).
-        spec_num_draft = get_spec().speculative_num_draft_tokens or 1
-        self._swa_ring_size = self.swa_page_size + (
-            (spec_num_draft - 1) if self.is_speculative else 0
-        )
+        # swa_page_size is the model's sliding window (cfg.window_size).
+        self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
         self._spec_infl = 1.0
 
         if self.is_speculative:

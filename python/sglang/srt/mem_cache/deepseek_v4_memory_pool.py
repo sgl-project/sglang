@@ -63,6 +63,13 @@ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
     return ring_size - window_size + 2 if ring_size > window_size else 0
 
 
+def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
+    """Rows per request in the per-request SWA ring: the window plus room for
+    the draft tokens a verify batch writes ahead of the committed position."""
+    spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
+    return sliding_window + spec_extra
+
+
 class DeepSeekV4SingleKVPool(KVCache):
     def __init__(
         self,
@@ -635,10 +642,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_kv_pool = None
             self.c4_kv_pool = None
             self.c128_kv_pool = None
-            spec_extra = (
-                (get_spec().speculative_num_draft_tokens - 1)
-                if get_spec().speculative_algorithm is not None
-                else 0
+            swa_ring_size = get_swa_ring_size(
+                self.sliding_window, get_spec().speculative_algorithm is not None
             )
             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
                 stage_ratios=stage_ratios,
@@ -650,11 +655,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
-                swa_ring_size=self.sliding_window + spec_extra,
+                swa_ring_size=swa_ring_size,
             )
 
             self.unified_swa_window = self.sliding_window
-            self.unified_swa_ring_size = self.sliding_window + spec_extra
+            self.unified_swa_ring_size = swa_ring_size
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
             self.swa_req_ring_size = self.unified_swa_ring_size
         else:
