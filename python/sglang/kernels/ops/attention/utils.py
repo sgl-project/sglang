@@ -231,7 +231,8 @@ def concat_mla_absorb_q_general(q_nope, q_rope):
         )
     if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
         return concat_mla_absorb_q(q_nope, q_rope)
-    return torch.cat([q_nope, q_rope], dim=-1)
+    else:
+        return torch.cat([q_nope, q_rope], dim=-1)
 
 
 @triton.jit
