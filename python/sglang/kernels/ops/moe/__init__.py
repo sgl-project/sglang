@@ -175,6 +175,15 @@ for _mod, _fn in _PHASE25_TRITON_KERNELS:
     )
 del _mod, _fn
 
+register_kernel(
+    KernelSpec(
+        op="moe.deepep_post_reorder_gluon_kernel",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.ep_moe_kernels:deepep_post_reorder_gluon_kernel",
+        capabilities=_CUDA,
+    )
+)
+
 # Packed (topk_id << 16 | bf16-weight) kernel migrated from
 # srt/layers/quantization/mxfp4_flashinfer_trtllm_moe (RFC #29630, Phase 2.5).
 register_kernel(
