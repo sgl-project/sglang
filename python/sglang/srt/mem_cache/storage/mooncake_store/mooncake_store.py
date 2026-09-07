@@ -29,7 +29,7 @@ from sglang.srt.observability.metrics_collector import StorageMetrics
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
-# MooncakeDistributedStore.setup(..., tenant_id=...) landed in 0.3.12.
+# setup(..., tenant_id=...) first shipped in mooncake-transfer-engine 0.3.12.
 MOONCAKE_MIN_VERSION_FOR_TENANT_ID = "0.3.12"
 
 logger = logging.getLogger(__name__)
@@ -77,39 +77,24 @@ def _normalize_tenant_id(value) -> str:
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
 
 
-def _mooncake_package_version() -> Optional[str]:
-    try:
-        from importlib.metadata import version
-
-        return version("mooncake-transfer-engine")
-    except Exception:
-        return None
+def _compose_tenant_id(tenant_id: str, kv_cache_dtype: Optional[str]) -> str:
+    tenant_id = _normalize_tenant_id(tenant_id)
+    dtype = format_kv_cache_dtype(kv_cache_dtype)
+    if dtype is None:
+        return tenant_id
+    prefix = "" if tenant_id == DEFAULT_TENANT_ID else f"{tenant_id}_"
+    return f"{prefix}dtype_{dtype}"
 
 
 def _tenant_id_unsupported_message() -> str:
-    installed = _mooncake_package_version()
-    installed_msg = (
-        f" Installed mooncake-transfer-engine=={installed}." if installed else ""
-    )
     return (
         "The installed Mooncake version does not support tenant_id in "
-        "MooncakeDistributedStore.setup()."
-        f"{installed_msg} "
-        "SGLang isolates KV-cache dtypes through Mooncake tenant namespaces "
-        f"and requires mooncake-transfer-engine>={MOONCAKE_MIN_VERSION_FOR_TENANT_ID}. "
+        "MooncakeDistributedStore.setup(). SGLang uses tenant_id to isolate "
+        "KV-cache dtypes and requires "
+        f"mooncake-transfer-engine>={MOONCAKE_MIN_VERSION_FOR_TENANT_ID}. "
         "Upgrade with: pip install -U "
         f"'mooncake-transfer-engine>={MOONCAKE_MIN_VERSION_FOR_TENANT_ID}'"
     )
-
-
-def _compose_tenant_id(tenant_id: str, kv_cache_dtype: Optional[str]) -> str:
-    tenant_id = _normalize_tenant_id(tenant_id)
-    formatted = format_kv_cache_dtype(kv_cache_dtype)
-    if not formatted:
-        return tenant_id
-    if tenant_id == DEFAULT_TENANT_ID:
-        return f"dtype_{formatted}"
-    return f"{tenant_id}_dtype_{formatted}"
 
 
 def _parse_global_segment_size(value) -> int:
@@ -479,31 +464,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.config.global_segment_size // tp_scale_factor
             )
 
-            # Isolate KV-cache dtypes with Mooncake tenant namespaces.
-            kv_cache_dtype = (
-                storage_config.kv_cache_dtype if storage_config is not None else None
-            )
             self.config.tenant_id = _compose_tenant_id(
-                self.config.tenant_id, kv_cache_dtype
+                self.config.tenant_id,
+                storage_config.kv_cache_dtype if storage_config is not None else None,
             )
-
             self.extra_backend_tag = None
             if extra_config and "extra_backend_tag" in extra_config:
                 self.extra_backend_tag = extra_config["extra_backend_tag"]
                 logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
-            if format_kv_cache_dtype(kv_cache_dtype):
+            if self.config.tenant_id != DEFAULT_TENANT_ID:
                 logger.info(
-                    "Isolating Mooncake KV objects with tenant_id=%s. "
-                    "This requires mooncake-transfer-engine>=%s whose "
-                    "MooncakeDistributedStore.setup() accepts tenant_id. "
-                    "Upgrade with: pip install -U "
-                    "'mooncake-transfer-engine>=%s'",
+                    "Using Mooncake tenant_id=%s "
+                    "(requires mooncake-transfer-engine>=%s)",
                     self.config.tenant_id,
                     MOONCAKE_MIN_VERSION_FOR_TENANT_ID,
-                    MOONCAKE_MIN_VERSION_FOR_TENANT_ID,
                 )
-            elif self.config.tenant_id != DEFAULT_TENANT_ID:
-                logger.info(f"Using Mooncake tenant_id: {self.config.tenant_id}")
 
             # Check server status
             if self.config.check_server:
@@ -538,11 +513,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
                     logger.warning(
                         "Mooncake dummy/standalone setup does not pass tenant_id. "
-                        "Start the external mooncake_client with --tenant_id=%s "
-                        "so KV-cache dtype isolation takes effect. "
-                        "Requires mooncake-transfer-engine>=%s.",
+                        "Start mooncake_client with --tenant_id=%s.",
                         self.config.tenant_id,
-                        MOONCAKE_MIN_VERSION_FOR_TENANT_ID,
                     )
                 ret_code = self.store.setup_dummy(
                     required_bytes,

@@ -1,4 +1,4 @@
-"""Unit tests for Mooncake KV-cache dtype isolation via extra_config/tenant."""
+"""Unit tests for Mooncake KV-cache dtype isolation via tenant_id."""
 
 import json
 import tempfile
@@ -193,6 +193,20 @@ def _make_store(**kwargs):
     return store, fake_store_cls.instances[-1]
 
 
+def _assert_old_mooncake_rejects_tenant(test_case, **cfg_kwargs):
+    OldMooncakeDistributedStore.instances = []
+    cfg = _make_config(**cfg_kwargs)
+    with patch.dict("sys.modules", _import_stubs(OldMooncakeDistributedStore)):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        with test_case.assertRaisesRegex(
+            RuntimeError, "mooncake-transfer-engine>=0.3.12"
+        ):
+            MooncakeStore(cfg)
+
+
 class TestFormatKvCacheDtype(CustomTestCase):
     def test_formats_torch_dtype(self):
         self.assertEqual(format_kv_cache_dtype(torch.bfloat16), "bfloat16")
@@ -224,14 +238,11 @@ class TestMooncakeKvCacheDtypeIsolation(CustomTestCase):
 
         store_bf16.batch_set_v1(["page0"], torch.tensor([0]))
         store_fp8.batch_set_v1(["page0"], torch.tensor([0]))
-
         self.assertEqual(
-            fake_bf16.batch_put_calls[0]["keys"],
-            ["page0_0_k", "page0_0_v"],
+            fake_bf16.batch_put_calls[0]["keys"], ["page0_0_k", "page0_0_v"]
         )
         self.assertEqual(
-            fake_fp8.batch_put_calls[0]["keys"],
-            ["page0_0_k", "page0_0_v"],
+            fake_fp8.batch_put_calls[0]["keys"], ["page0_0_k", "page0_0_v"]
         )
 
     def test_user_tag_is_independent_of_dtype_tenant(self):
@@ -261,25 +272,11 @@ class TestMooncakeKvCacheDtypeIsolation(CustomTestCase):
         )
         store.batch_set_v1(["page0"], torch.tensor([0]))
         self.assertEqual(
-            fake_store.batch_put_calls[0]["keys"],
-            ["page0_0_k", "page0_0_v"],
+            fake_store.batch_put_calls[0]["keys"], ["page0_0_k", "page0_0_v"]
         )
 
     def test_dtype_isolation_requires_mooncake_tenant_id(self):
-        OldMooncakeDistributedStore.instances = []
-        cfg = _make_config(kv_cache_dtype="bfloat16")
-        with patch.dict(
-            "sys.modules",
-            _import_stubs(OldMooncakeDistributedStore),
-        ):
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStore,
-            )
-
-            with self.assertRaisesRegex(
-                RuntimeError, "mooncake-transfer-engine>=0.3.12"
-            ):
-                MooncakeStore(cfg)
+        _assert_old_mooncake_rejects_tenant(self, kv_cache_dtype="bfloat16")
 
 
 class TestMooncakeTenantConfig(CustomTestCase):
@@ -349,18 +346,7 @@ class TestMooncakeTenantConfig(CustomTestCase):
         self.assertNotIn("tenant_id", fake_store.setup_calls[0][1])
 
     def test_non_default_tenant_requires_new_mooncake(self):
-        OldMooncakeDistributedStore.instances = []
-        cfg = _make_config(tenant_id="tenant-a")
-        with patch.dict(
-            "sys.modules",
-            _import_stubs(OldMooncakeDistributedStore),
-        ):
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStore,
-            )
-
-            with self.assertRaisesRegex(RuntimeError, "tenant_id"):
-                MooncakeStore(cfg)
+        _assert_old_mooncake_rejects_tenant(self, tenant_id="tenant-a")
 
     def test_embedding_store_forwards_tenant_id(self):
         fake_store_cls = _fake_store_class()
@@ -378,12 +364,6 @@ class TestMooncakeTenantConfig(CustomTestCase):
             MooncakeEmbeddingStore(storage_config)
         fake_store = fake_store_cls.instances[-1]
         self.assertEqual(fake_store.setup_calls[0][1]["tenant_id"], "tenant-embedding")
-
-
-class TestHiCacheStorageConfigDtype(CustomTestCase):
-    def test_storage_config_carries_kv_cache_dtype(self):
-        cfg = _make_config(kv_cache_dtype="bfloat16")
-        self.assertEqual(cfg.kv_cache_dtype, "bfloat16")
 
 
 if __name__ == "__main__":

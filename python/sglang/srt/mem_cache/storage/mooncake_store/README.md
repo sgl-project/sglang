@@ -39,11 +39,7 @@ This integration is particularly valuable for production deployments involving l
 pip install 'mooncake-transfer-engine>=0.3.12'
 ```
 
-HiCache isolates KV-cache dtypes through Mooncake `tenant_id`. That requires `mooncake-transfer-engine >= 0.3.12`, where `MooncakeDistributedStore.setup()` accepts `tenant_id`. Upgrade an older install with:
-
-```bash
-pip install -U 'mooncake-transfer-engine>=0.3.12'
-```
+KV-cache dtype isolation uses Mooncake `tenant_id`, which requires **0.3.12+**. Upgrade an older install with `pip install -U 'mooncake-transfer-engine>=0.3.12'`.
 
 **Method 2: from source**
 
@@ -313,14 +309,12 @@ python -m sglang.launch_server \
 
 **KV Cache Dtype Isolation:**
 
-HiCache keys do not include `--kv-cache-dtype` by default. Sharing one Mooncake store between a `bfloat16` instance and an `fp8_e4m3` instance would therefore collide on the same object keys. SGLang namespaces Mooncake objects by the host KV cache dtype through Mooncake `tenant_id`:
+HiCache keys do not include `--kv-cache-dtype`. Sharing one Mooncake store between a `bfloat16` instance and an `fp8_e4m3` instance would otherwise collide on the same object keys. SGLang isolates them through Mooncake `tenant_id`:
 
-- Default tenant + dtype `bfloat16` → `dtype_bfloat16`
-- Explicit tenant `tenant-a` + dtype `fp8_e4m3` → `tenant-a_dtype_fp8_e4m3`
+- Default tenant + `bfloat16` → `dtype_bfloat16`
+- Explicit tenant `tenant-a` + `fp8_e4m3` → `tenant-a_dtype_fp8_e4m3`
 
-This requires **`mooncake-transfer-engine >= 0.3.12`**, which added `tenant_id` to `MooncakeDistributedStore.setup()`. Older packages raise a startup error; upgrade with `pip install -U 'mooncake-transfer-engine>=0.3.12'`.
-
-A user-provided `extra_backend_tag` still prefixes object keys, but it is not used for dtype isolation.
+This requires **mooncake-transfer-engine >= 0.3.12**. Older packages fail at `setup()` with an upgrade hint. `extra_backend_tag` still prefixes object keys and is independent of dtype isolation.
 
 ```bash
 python -m sglang.launch_server \
@@ -332,9 +326,9 @@ python -m sglang.launch_server \
 
 **Mooncake Tenant ID (`tenant_id`):**
 
-Mooncake Store can isolate object namespaces by tenant. SGLang forwards a non-default `tenant_id` to `MooncakeDistributedStore.setup(..., tenant_id=...)`. Configure it in `--hicache-storage-backend-extra-config`, in the JSON file selected by `SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`, or with `MOONCAKE_TENANT_ID`. The default value is `default`; that default is not passed to `setup()` unless KV-cache dtype isolation produces a composed tenant such as `dtype_bfloat16`.
+SGLang forwards a non-default `tenant_id` to `MooncakeDistributedStore.setup(..., tenant_id=...)`. Set it in `--hicache-storage-backend-extra-config`, in the JSON file selected by `SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`, or with `MOONCAKE_TENANT_ID`. The default `"default"` is not passed to `setup()` unless dtype isolation composes a tenant such as `dtype_bfloat16`.
 
-When strict multi-tenant mode is enabled on the master (`--enable_multi_tenants=true`), write requests must use a registered tenant. Register the composed tenant name (including the dtype suffix) if you use this mode. All instances that should share KV cache entries must use the same `tenant_id` and compatible model / dtype / release namespaces.
+When the master is started with `--enable_multi_tenants=true`, register the composed tenant name (including the dtype suffix). Instances that should share KV entries must use the same tenant and compatible model / dtype / release namespaces.
 
 **HiCache Related Parameters for SGLang Server**
 
@@ -377,7 +371,7 @@ mooncake_master --eviction_high_watermark_ratio=0.95
 mooncake_client --global_segment_size=4GB
 ```
 
-Dummy `setup_dummy()` does not pass `tenant_id`. If you rely on KV-cache dtype isolation, start `mooncake_client` with the matching composed tenant, for example `--tenant_id=dtype_fp8_e4m3`. This also requires **mooncake-transfer-engine >= 0.3.12**.
+Dummy `setup_dummy()` does not pass `tenant_id`. For dtype isolation, start `mooncake_client` with the matching composed tenant, e.g. `--tenant_id=dtype_fp8_e4m3`.
 
 **Parameter Explanation:**
 
