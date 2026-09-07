@@ -552,7 +552,7 @@ return {
         { id: "b200-fsdp-4", hw: "b200", nodes: 1, gpus_per_node: 4, placement: "fsdp", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "b300-resident-8", hw: "b300", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
         { id: "b300-fsdp-8", hw: "b300", nodes: 1, gpus_per_node: 8, placement: "fsdp", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto" },
-        { id: "gb300-resident-4", hw: "gb300", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto", default: true, unverified: true },
+        { id: "gb300-resident-4", hw: "gb300", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto", default: true },
         { id: "gb300-cross-node-8", hw: "gb300", nodes: 2, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 2, encoder: "replicate", unverified: true },
         { id: "gb200-resident-4", hw: "gb200", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto", default: true, unverified: true },
         { id: "h200-resident-4", hw: "h200", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto", default: true },
@@ -678,9 +678,12 @@ return {
         || (s.precision === "fp8" && ["b200", "b300"].includes(s.hw));
       const executionVerified = s.execution === "eager"
         || (s.execution === "bcg" && ["b200", "h200"].includes(s.hw) && s.weights === "ref2va");
+      const checkpointVerified = s.hw !== "gb300" || s.weights === "fl2va";
       const serveVerified = topologyVerified && encoderVerified && attentionVerified
-        && precisionVerified && executionVerified;
-      const requestVerified = topologyVerified && (["lossless", "extra-high"].includes(s.quality)
+        && precisionVerified && executionVerified && checkpointVerified;
+      const requestCovered = s.hw !== "gb300" || (s.weights === "fl2va"
+        && s.mode === "t2va" && s.quality === "lossless" && Number(s.outputs) === 1);
+      const requestVerified = topologyVerified && requestCovered && (["lossless", "extra-high"].includes(s.quality)
         || (s.quality === "high" && highAudited && s.execution === "eager"));
 
       const topologyParts = [];

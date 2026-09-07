@@ -301,7 +301,7 @@ for (const path of walk(CONFIGS)) {
       checkH3("H100 1x4", { hw: "h100", nodes: 1, gpus_per_node: 4, placement: "resident" }, { tp_size: 2, ulysses_degree: 2, ring_degree: 1 });
       checkH3("H200 2x8", { hw: "h200", nodes: 2, gpus_per_node: 8, placement: "resident" }, { tp_size: 1, ulysses_degree: 8, ring_degree: 2 });
       for (const hw of ["gb200", "gb300"]) {
-        checkH3(`${hw} 1x4`, { hw, nodes: 1, gpus_per_node: 4, placement: "resident" }, { tp_size: 1, ulysses_degree: 4, ring_degree: 1 }, false);
+        checkH3(`${hw} 1x4`, { hw, nodes: 1, gpus_per_node: 4, placement: "resident" }, { tp_size: 1, ulysses_degree: 4, ring_degree: 1 }, hw === "gb300");
         checkH3(`${hw} 2x4`, { hw, nodes: 2, gpus_per_node: 4, placement: "resident" }, { tp_size: 1, ulysses_degree: 4, ring_degree: 2 }, false);
         const selection = selectionOf({ hw, nodes: 2, gpus_per_node: 4 });
         const encoder = config.overlayDims.find((dim) => dim.id === "encoder").options.find((option) => option.id === "auto");
@@ -310,6 +310,19 @@ for (const path of walk(CONFIGS)) {
         }
         if (config.runModes(selection).includes("docker")) {
           fail(where, `${hw} must not advertise an unvalidated Docker command`);
+        }
+      }
+      for (const extra of [
+        { hw: "gb200" },
+        { hw: "gb300", mode: "i2va" },
+        { hw: "gb300", weights: "ref2va", mode: "v2v" },
+        { hw: "gb300", quality: "extra-high" },
+        { hw: "gb300", outputs: "2" },
+      ]) {
+        const selection = selectionOf({ nodes: 1, gpus_per_node: 4, placement: "resident", ...extra });
+        const resolved = validateResolved(selection, "H3 Grace Blackwell coverage");
+        if (resolved?.builder.verification?.request !== "unverified") {
+          fail(where, `H3 Grace Blackwell request is outside the measured scope: ${JSON.stringify(extra)}`);
         }
       }
       for (const hw of ["mi300x", "mi355x"]) {
