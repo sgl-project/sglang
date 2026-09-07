@@ -5,8 +5,8 @@ This module is the **only** supported import surface for these kernels::
     from sglang.kernels.ops.diffusion import fused_rmsnorm_scale_shift_bitexact
 
 Importing a submodule directly (``...diffusion.norm.norm_triton``) couples the
-caller to the file layout; ``test_import_surface.py`` guards against it.  The
-one exception is a test that deliberately exercises a single backend.
+caller to the file layout. The one exception is a test that deliberately
+exercises a single backend.
 
 Layout -- ordinary implementations use one subpackage per **operator domain**
 (``norm``, ``modulate``, ``rope``, ``activation``, ``attention``, ``routing``,

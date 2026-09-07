@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Process-shared per-(cache-aware-zmq) `block_size`, sourced from the
-//! workers themselves.
+//! Process-shared KV-cache block size, sourced from the workers.
 //!
 //! # Why an oracle instead of a config field?
 //!
@@ -10,10 +9,6 @@
 //! worker uses to publish KV-cache events; otherwise every cache-aware
 //! lookup misses silently. The worker advertises its `page_size` via
 //! `/server_info` (parsed into [`crate::policies::kv_events::EventConfig::block_size`]).
-//! Earlier versions of sgl-router carried a static `block_size` field on
-//! `CacheAwareConfig`; nothing reconciled it with the worker-reported
-//! value, so a mismatch silently destroyed cache-hit routing.
-//!
 //! Dynamo's design treats `kv_cache_block_size` as a property of the
 //! `ModelDeploymentCard` populated by the worker registrar (see
 //! `~/dynamo/components/src/dynamo/sglang/register.py`); a mismatch
@@ -73,9 +68,7 @@ impl BlockSizeOracle {
     }
 
     /// Returns the established block size, or `None` if no worker has
-    /// reported one yet. Routing-time consumers (`CacheAwareZmqPolicy`)
-    /// fall back to min-load when this is `None`, because they cannot
-    /// hash a prompt without a block size.
+    /// reported one yet.
     pub fn get(&self) -> Option<u32> {
         let v = self.value.load(Ordering::Relaxed);
         if v == 0 {
