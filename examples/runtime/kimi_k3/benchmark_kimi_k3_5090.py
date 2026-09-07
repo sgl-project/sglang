@@ -45,7 +45,7 @@ def find_sglang_repo() -> Path:
         return Path(configured).expanduser().resolve()
     for candidate in (SCRIPT_DIR, *SCRIPT_DIR.parents):
         if (candidate / "python" / "sglang").is_dir() and (
-            candidate / "tools" / "expert_pack"
+            candidate / "python" / "sglang" / "srt" / "model_loader" / "expert_pack"
         ).is_dir():
             return candidate
     raise RuntimeError("could not locate the SGLang repository")

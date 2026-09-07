@@ -57,9 +57,9 @@ def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_S
 def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_STEPS):
     assert prompt_tokens, "warmup_radix needs a non-empty prompt"
     token = prompt_tokens[0]
-    assert all(
-        x == token for x in prompt_tokens
-    ), "warmup_radix supports only uniform prompts"
+    assert all(x == token for x in prompt_tokens), (
+        "warmup_radix supports only uniform prompts"
+    )
     handle = t.start_req(
         prompt_len=len(prompt_tokens), max_new_tokens=1, prompt_token=token
     )
@@ -126,9 +126,9 @@ def advance_to_decode_step(
     r, target_output_len: int, *, max_steps: int = DEFAULT_MAX_STEPS
 ):
     for _ in range(max_steps):
-        assert (
-            not r.finished
-        ), f"req finished before reaching decode step {target_output_len}"
+        assert not r.finished, (
+            f"req finished before reaching decode step {target_output_len}"
+        )
         req = r.req
         if req is not None and len(req.output_ids) >= target_output_len:
             return

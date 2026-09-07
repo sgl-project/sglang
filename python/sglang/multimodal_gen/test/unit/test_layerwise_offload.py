@@ -1375,15 +1375,45 @@ def test_mapped_layers_ship_through_the_courier(tmp_path, monkeypatch):
 
     manager.prefetch_layer(0, non_blocking=True)
     assert 0 in manager._courier_inflight, "an async prefetch hands the layer over"
-    assert (
-        0 not in manager._gpu_layers
-    ), "the layer is not ready until its tensors are bound on this thread"
+    assert 0 not in manager._gpu_layers, (
+        "the layer is not ready until its tensors are bound on this thread"
+    )
 
     manager.prefetch_layer(0, non_blocking=False)
     assert 0 in manager._gpu_layers and not manager._courier_inflight
-    assert torch.equal(
-        model.blocks[0].weight.detach().cpu(), expected
-    ), "the bytes that went through the courier's slot must be the checkpoint's"
+    assert torch.equal(model.blocks[0].weight.detach().cpu(), expected), (
+        "the bytes that went through the courier's slot must be the checkpoint's"
+    )
+
+
+def test_collected_mapped_weights_record_the_compute_stream(monkeypatch):
+    """Courier tensors must stay live until their compute-stream kernels finish."""
+    compute_stream = _FakeStream()
+    recorded_streams = []
+    gpu_tensor = SimpleNamespace(
+        device=torch.device("cuda"), record_stream=recorded_streams.append
+    )
+    monkeypatch.setattr(
+        _FakeDeviceModule, "current_stream", staticmethod(lambda: compute_stream)
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+
+    manager = object.__new__(LayerwiseOffloadManager)
+    target = torch.nn.Parameter(torch.zeros(1))
+    manager._mapped_courier = SimpleNamespace(
+        collect=lambda _layer_idx: (_FakeEvent(), {"weight": gpu_tensor})
+    )
+    manager._named_parameters = {"weight": target}
+    manager._named_buffers = {}
+    manager._wrap_for_target = lambda _target, _tensor: target.data
+    manager._courier_inflight = {0}
+    manager._gpu_layers = set()
+
+    manager._collect_mapped_layer(0)
+
+    assert recorded_streams == [compute_stream]
 
 
 def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypatch):
@@ -1397,9 +1427,9 @@ def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypat
     manager.release_all()
     manager.prefetch_layer(0, non_blocking=True)
     assert not manager._courier_inflight and manager._mapped_courier is None
-    assert (
-        0 in manager._gpu_layers
-    ), "with the courier disabled the direct synchronous path serves the layer"
+    assert 0 in manager._gpu_layers, (
+        "with the courier disabled the direct synchronous path serves the layer"
+    )
 
 
 def test_release_all_drains_the_courier(tmp_path, monkeypatch):
@@ -1872,6 +1902,36 @@ def test_host_copies_are_given_back_when_room_appears(monkeypatch):
     assert not comp._parked_non_layer_weights, "host copies should be released"
 
 
+def test_releasing_host_copies_restores_placeholders(monkeypatch):
+    """When room appears, release host copies but restore parameters from placeholders."""
+    local_device = layerwise_offload_mod.current_platform.get_local_torch_device()
+    if local_device.type == "cpu":
+        pytest.skip("parking targets device-resident parameters")
+
+    # The parking path is for the non-MPS accelerator path, so bypass the
+    # MPS-specific early return while still using the real local device.
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "is_mps", lambda: False)
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    assert comp.non_layer.device.type == local_device.type
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    assert comp._parked_non_layer_weights
+    comp.restore_non_layer_weights()
+
+    _headroom(monkeypatch, 400)
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights
+    # Only the non-layer parameter must be restored; streamed layer weights are
+    # intentionally left as placeholders by the layerwise manager.
+    assert comp.non_layer.shape != (1,), (
+        "non_layer left as a (1,) placeholder after host copies were released"
+    )
+
+
 def test_park_placeholders_are_shared(monkeypatch):
     """One stand-in per (device, dtype), not one allocation per parked weight."""
     comp = _ParkableResidentComponent(4)
@@ -1883,3 +1943,182 @@ def test_park_placeholders_are_shared(monkeypatch):
         id(p) for n, p in comp.named_parameters() if n not in managed and p.numel() == 1
     }
     assert len(stand_ins) <= len(comp._park_placeholders)
+
+
+def _layer_weight_ok(layer: torch.nn.Module) -> bool:
+    return tuple(layer.weight.shape) != (1,)
+
+
+def test_skip_middle_layers_loads_destination_weights(monkeypatch):
+    """Cache-DiT DBCache shape: run Fn, jump to Bn, middle never forwards.
+
+    The destination layer used to see empty(1,) weights when wraparound
+    prefetch and the sequential i+1 window desynced. The jump must sync-load
+    Bn and leave the skipped gap released.
+    """
+    _patch_fake_device(monkeypatch)
+    model = _RunnableBlockModel(8)
+    manager = _resident_manager(model, num_layers=8, prefetch_size=1)
+
+    hidden = torch.ones(1, 2)
+    fn_end = 1
+    bn_start = 6
+    for layer in model.blocks[:fn_end]:
+        hidden = layer(hidden)
+    for layer in model.blocks[bn_start:]:
+        hidden = layer(hidden)
+
+    assert hidden.shape == (1, 2)
+    for idx in range(fn_end, bn_start):
+        assert idx not in manager._gpu_layers, idx
+        assert not _layer_weight_ok(model.blocks[idx]), idx
+
+
+def test_skip_only_fn_releases_speculative_prefetch_on_next_step(monkeypatch):
+    """Fn-only step (Cache-DiT hit with Bn=0) must not leak the i+1 prefetch."""
+    _patch_fake_device(monkeypatch)
+    model = _RunnableBlockModel(8)
+    manager = _resident_manager(model, num_layers=8, prefetch_size=1)
+
+    hidden = torch.ones(1, 2)
+    hidden = model.blocks[0](hidden)
+    # Layer 0's leading burst prefetches layer 1; that layer never runs.
+    assert 1 in manager._gpu_layers
+
+    # Next denoise step's prepare drops leftovers that never posted.
+    manager.prepare_for_next_req(non_blocking=False)
+    assert 1 not in manager._gpu_layers
+
+
+def test_last_layer_wraps_to_next_step_head(monkeypatch):
+    """A full-stack step may hide the next step's layer 0 behind the last layer."""
+    _patch_fake_device(monkeypatch)
+    model = _RunnableBlockModel(8)
+    manager = _resident_manager(model, num_layers=8, prefetch_size=1)
+
+    hidden = torch.ones(1, 2)
+    for layer in model.blocks:
+        hidden = layer(hidden)
+
+    assert hidden.shape == (1, 2)
+    assert 0 in manager._gpu_layers
+    assert 7 not in manager._gpu_layers
+
+
+def _dbcache_layers(num_layers: int, fn: int, bn: int) -> list[int]:
+    """Layers CachedBlocks would call for one DBCache step."""
+    fn = min(max(fn, 0), num_layers)
+    bn = min(max(bn, 0), num_layers - fn)
+    layers = list(range(fn))
+    if bn:
+        layers.extend(range(num_layers - bn, num_layers))
+    return layers
+
+
+def _run_layer_set(model, layer_indices: list[int]) -> torch.Tensor:
+    hidden = torch.ones(1, 2)
+    for idx in layer_indices:
+        hidden = model.blocks[idx](hidden)
+    return hidden
+
+
+@pytest.mark.parametrize("num_layers", [8, 12])
+@pytest.mark.parametrize(
+    "fn,bn",
+    [
+        (1, 0),  # default Cache-DiT hit
+        (1, 1),
+        (1, 2),
+        (2, 0),
+        (2, 2),
+        (4, 2),
+        (3, 5),  # Fn+Bn == 8, no gap when num_layers=8
+        (8, 0),  # full stack / miss
+    ],
+)
+@pytest.mark.parametrize("prefetch_size", [1, 2])
+@pytest.mark.parametrize(
+    "residency_policy",
+    [RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_STRIDED],
+)
+def test_dbcache_layer_patterns_never_see_empty_weights(
+    monkeypatch, num_layers, fn, bn, prefetch_size, residency_policy
+):
+    """Hit / miss / hit-again under several Cache-DiT Fn/Bn and prefetch windows."""
+    if fn + bn > num_layers:
+        pytest.skip("Fn+Bn exceeds this stack")
+    _patch_fake_device(monkeypatch)
+    model = _RunnableBlockModel(num_layers)
+    manager = _resident_manager(
+        model,
+        num_layers=num_layers,
+        prefetch_size=prefetch_size,
+        residency_policy=residency_policy,
+        resident_layers=0,
+    )
+
+    hit_layers = _dbcache_layers(num_layers, fn, bn)
+    miss_layers = list(range(num_layers))
+    gap = [idx for idx in miss_layers if idx not in set(hit_layers)]
+
+    def _assert_gpu_layers_have_real_weights() -> None:
+        for idx in range(num_layers):
+            on_gpu = idx in manager._gpu_layers
+            assert _layer_weight_ok(model.blocks[idx]) is on_gpu, idx
+
+    hidden = _run_layer_set(model, hit_layers)
+    assert hidden.shape == (1, 2)
+    _assert_gpu_layers_have_real_weights()
+
+    # Speculative Mn prefetch may still sit on GPU until the next prepare.
+    manager.prepare_for_next_req(non_blocking=False)
+    keep = set(manager._head_of_stream()) | set(manager._retained_set)
+    for idx in gap:
+        if idx not in keep:
+            assert idx not in manager._gpu_layers, idx
+            assert not _layer_weight_ok(model.blocks[idx]), idx
+
+    hidden = _run_layer_set(model, miss_layers)
+    assert hidden.shape == (1, 2)
+    _assert_gpu_layers_have_real_weights()
+
+    manager.prepare_for_next_req(non_blocking=False)
+    hidden = _run_layer_set(model, hit_layers)
+    assert hidden.shape == (1, 2)
+    _assert_gpu_layers_have_real_weights()
+
+    # Two hits in a row (Bn=0 never reaches last layer; still must rematerialize 0).
+    manager.prepare_for_next_req(non_blocking=False)
+    hidden = _run_layer_set(model, hit_layers)
+    assert hidden.shape == (1, 2)
+    _assert_gpu_layers_have_real_weights()
+
+
+@pytest.mark.parametrize(
+    "step_kinds",
+    [
+        # SCM-style: forced compute (full stack) mixed with DBCache hits.
+        ("full", "hit10", "hit10", "full", "hit12", "hit10"),
+        # TaylorSeer does not change which blocks CachedBlocks calls.
+        ("full", "full", "hit20", "hit20", "hit12", "full"),
+    ],
+)
+def test_mixed_scm_and_dbcache_step_schedule(monkeypatch, step_kinds):
+    """A request is a sequence of full-stack and skip-compute steps."""
+    _patch_fake_device(monkeypatch)
+    num_layers = 8
+    model = _RunnableBlockModel(num_layers)
+    manager = _resident_manager(model, num_layers=num_layers, prefetch_size=2)
+    kind_to_layers = {
+        "full": list(range(num_layers)),
+        "hit10": _dbcache_layers(num_layers, 1, 0),
+        "hit12": _dbcache_layers(num_layers, 1, 2),
+        "hit20": _dbcache_layers(num_layers, 2, 0),
+    }
+    for kind in step_kinds:
+        hidden = _run_layer_set(model, kind_to_layers[kind])
+        assert hidden.shape == (1, 2)
+        for idx in range(num_layers):
+            on_gpu = idx in manager._gpu_layers
+            assert _layer_weight_ok(model.blocks[idx]) is on_gpu, (kind, idx)
+        manager.prepare_for_next_req(non_blocking=False)

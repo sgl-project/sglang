@@ -296,6 +296,6 @@ def test_the_forced_host_size_behaves_like_a_machine_of_that_size(monkeypatch):
     # and a larger pretend machine reports more room, same process
     monkeypatch.setenv("SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB", "64")
     larger = host_memory_budget.host_memory_available_bytes()
-    assert (
-        abs((larger - available) - 32 * 1024**3) < 512 * 1024**2
-    ), "the same process on a machine twice the size has one machine more room"
+    assert abs((larger - available) - 32 * 1024**3) < 512 * 1024**2, (
+        "the same process on a machine twice the size has one machine more room"
+    )

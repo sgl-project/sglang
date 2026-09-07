@@ -4,6 +4,7 @@ Usage:
 python3 -m unittest test_xpu_classification.TestXPUClassification
 """
 
+import gc
 import multiprocessing as mp
 import unittest
 
@@ -11,9 +12,9 @@ import torch
 
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-register_xpu_ci(est_time=120, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=120, suite="nightly-xpu-1-gpu", nightly=True)
 
 MODEL_PATH = "jason9693/Qwen2.5-1.5B-apeach"
 TP_SIZE = 1
@@ -60,6 +61,7 @@ class TestXPUClassification(CustomTestCase):
             model_type="embedding",
             attention_backend="intel_xpu",
             trust_remote_code=True,
+            mem_fraction_static=0.55,
         ) as srt_runner:
             srt_logits = srt_runner.forward(PROMPTS).embed_logits
 
@@ -72,6 +74,8 @@ class TestXPUClassification(CustomTestCase):
 
     def test_classification_logits(self):
         hf_probs = self._hf_probs()
+        gc.collect()
+        empty_gpu_cache()
         srt_probs = self._srt_probs()
 
         self.assertEqual(len(hf_probs), len(PROMPTS))
