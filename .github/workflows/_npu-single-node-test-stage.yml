@@ -63,6 +63,10 @@ on:
         type: string
         default: '300'
         description: 'timeout-minutes for the Run test step'
+      use_run_selected_tests:
+        description: 'If true, delegate test execution to scripts/run_selected_tests.sh instead of running via run_suite.py directly'
+        type: boolean
+        default: false
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -390,6 +394,20 @@ jobs:
           LOG_TEE_TARGETS=("/tmp/test_output.log")
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             LOG_TEE_TARGETS+=("${log_path}/${tc_name}.log")
+          fi
+
+          # Optional: delegate execution to scripts/run_selected_tests.sh when the
+          # caller sets use_run_selected_tests=true. The original run_suite.py
+          # execution below is preserved unchanged for the default (false) path.
+          if [[ "${{ inputs.use_run_selected_tests }}" == "true" ]]; then
+            pip install coverage==7.8.*
+            ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 --list-tests-output /tmp/selected_tests.txt
+            echo "Selected test files:"
+            cat /tmp/selected_tests.txt
+            if [ -s /tmp/selected_tests.txt ]; then
+              bash ../scripts/run_selected_tests.sh $(cat /tmp/selected_tests.txt)
+            fi
+            exit 0
           fi
 
           # Run NPU test suite with run_suite.py.

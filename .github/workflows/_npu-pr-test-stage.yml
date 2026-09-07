@@ -44,6 +44,10 @@ on:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
         default: false
+      use_run_selected_tests:
+        description: 'If true, delegate test execution to scripts/run_selected_tests.sh instead of running via run_suite.py directly'
+        type: boolean
+        default: false
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -263,6 +267,25 @@ jobs:
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             NIGHTLY_FLAG="--nightly --continue-on-error"
           fi
+
+          # Optional: delegate execution to scripts/run_selected_tests.sh when the
+          # caller sets use_run_selected_tests=true. The original run_suite.py
+          # execution below is preserved unchanged for the default (false) path.
+          if [[ "${{ inputs.use_run_selected_tests }}" == "true" ]]; then
+            pip install coverage==7.8.*
+            python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
+              --auto-partition-id ${{ matrix.partition }} \
+              --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
+              ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
+              $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG --list-tests-output /tmp/selected_tests.txt
+            echo "Selected test files:"
+            cat /tmp/selected_tests.txt
+            if [ -s /tmp/selected_tests.txt ]; then
+              bash ../scripts/run_selected_tests.sh $(cat /tmp/selected_tests.txt)
+            fi
+            exit 0
+          fi
+
           python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \

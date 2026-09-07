@@ -1,0 +1,17 @@
+[run]
+branch = True
+relative_files = False
+data_file = /root/.cache/tests/precise-test/coverage/coverage
+parallel = True
+concurrency = thread,multiprocessing
+sigterm = False
+disable_warnings = no-data-collected,module-not-python
+
+include =
+    */python/sglang/*
+
+omit =
+    */.local/*
+    /usr/*
+    */sglang/test/*
+    */sglang/benchmark/*
