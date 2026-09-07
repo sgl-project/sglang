@@ -28,6 +28,12 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
         with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
             _check_tilelang_dsa_fp8_kv("fp8_e4m3", "tilelang", "tilelang", hip=False)
 
+    def test_cuda_fp8_tilelang_pair_rejected_with_dcp(self):
+        with self.assertRaisesRegex(ValueError, "incompatible with --dcp-size > 1"):
+            _check_tilelang_dsa_fp8_kv(
+                "fp8_e4m3", "tilelang", "tilelang", hip=False, dcp_size=2
+            )
+
     def test_cuda_fp8_tilelang_pair_rejected_before_sm89(self):
         with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
             with self.assertRaisesRegex(ValueError, r"SM89\+"):
