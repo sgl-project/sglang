@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.models.llada2_weight_utils import prepare_llada2_language_weights
+from sglang.srt.model_loader.llada2_weight_utils import prepare_llada2_language_weights
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

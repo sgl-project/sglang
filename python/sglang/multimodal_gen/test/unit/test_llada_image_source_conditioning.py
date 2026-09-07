@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_source import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.source import (
     LLaDAImageSourceImageConditioningStage,
 )
 

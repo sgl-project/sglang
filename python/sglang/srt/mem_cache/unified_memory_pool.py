@@ -1193,7 +1193,7 @@ def init_unified_mamba_pools(
     unified_total_bytes: Optional[int] = None,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
-    from sglang.srt.mem_cache.multi_ended_allocator import (
+    from sglang.srt.mem_cache.allocator.unified_mamba import (
         UnifiedMambaTokenToKVPoolAllocator,
     )
 
@@ -1621,23 +1621,29 @@ class UnifiedSWAKVPool(SWAKVPool):
         phys_pages = allocator.virtual_to_physical[virt_pages]
         return phys_pages * ps + offsets
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         assert self._full_allocator is not None
         assert self._swa_allocator is not None
         # `indices` are virtual TOKEN ids; translate per sub-pool.
         full_phys = self._virt_tokens_to_phys_tokens(indices, self._full_allocator)
         swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
-        full_cpu = self.full_kv_pool.get_cpu_copy(full_phys)
+        full_cpu = self.full_kv_pool.get_cpu_copy(
+            full_phys, req_pool_index=req_pool_index
+        )
         valid = swa_phys >= 0
         swa_cpu = None
         if bool(valid.any().item()):
             swa_cpu = self.swa_kv_pool.get_cpu_copy(swa_phys[valid])
         return {"full": full_cpu, "swa": swa_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         assert self._full_allocator is not None
         full_phys = self._virt_tokens_to_phys_tokens(indices, self._full_allocator)
-        self.full_kv_pool.load_cpu_copy(kv_cache_cpu["full"], full_phys)
+        self.full_kv_pool.load_cpu_copy(
+            kv_cache_cpu["full"], full_phys, req_pool_index=req_pool_index
+        )
         if kv_cache_cpu.get("swa") is not None:
             assert self._swa_allocator is not None
             swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
@@ -1676,7 +1682,7 @@ def init_unified_swa_pools(
     sliding_window_size: Optional[int] = None,
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack."""
-    from sglang.srt.mem_cache.multi_ended_allocator import (
+    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedSWATokenToKVPoolAllocator,
     )
 
@@ -1860,7 +1866,7 @@ def init_unified_mamba_swa_pools(
     fed until the byte configurator lands); the buffer budget is their byte
     sum and the runtime split floats.
     """
-    from sglang.srt.mem_cache.multi_ended_allocator import (
+    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedMambaSWATokenToKVPoolAllocator,
     )
 

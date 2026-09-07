@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 # `sglang.srt.ray.engine` imports `ray` at module scope, and the CPU runner has
 # no ray wheel. The file-scoped source scan below is the part that has to run

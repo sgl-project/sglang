@@ -10,7 +10,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.llada_image import (
     LLaDAImagePipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
-from sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning import (
     LLaDAImageTextConditioningStage,
     LLaDAImageTextEncoderRunner,
 )
@@ -83,7 +83,7 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
         self.assertEqual(result.negative_attention_mask, [])
 
     def test_conditioning_mask_guard_fails_closed(self):
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning import (
             ensure_conditioning_mask_active,
         )
 
@@ -187,15 +187,15 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
                 side_effect=lambda **kwargs: SimpleNamespace(page_size=None, **kwargs),
             ),
             patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning.get_local_torch_device",
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.get_local_torch_device",
                 return_value=torch.device("cpu"),
             ),
             patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning.get_sp_parallel_rank",
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.get_sp_parallel_rank",
                 return_value=1,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning.prepare_diffusers_component_path_for_loading",
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.prepare_diffusers_component_path_for_loading",
                 side_effect=lambda path: f"resolved:{path}",
             ),
         ):
@@ -445,11 +445,11 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
                 side_effect=lambda **kwargs: SimpleNamespace(page_size=1, **kwargs),
             ),
             patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning.get_local_torch_device",
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.get_local_torch_device",
                 return_value=torch.device("cpu"),
             ),
             patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning.get_sp_parallel_rank",
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.get_sp_parallel_rank",
                 return_value=0,
             ),
             patch.object(srt_parallel_state, "_TP", diffusion_group),

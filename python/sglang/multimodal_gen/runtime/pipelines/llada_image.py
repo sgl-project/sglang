@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    PlainStateDictComponentLoader,
+)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     SP_STOCHASTIC_NOISE_KEY,
 )
@@ -23,11 +26,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     LatentPreparationStage,
     TimestepPreparationStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning import (
     LLaDAImageTextConditioningStage,
     LLaDAImageTextEncoderRunner,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_source import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.source import (
     LLaDAImageSourceImageConditioningStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -75,6 +78,11 @@ class LLaDAImageLatentPreparationStage(LatentPreparationStage):
 
 class LLaDAImagePipeline(ComposedPipelineBase):
     pipeline_name = "LLaDAImagePipeline"
+    component_loaders = {
+        "queryformer": PlainStateDictComponentLoader,
+        "text_projection": PlainStateDictComponentLoader,
+        "sigvq": PlainStateDictComponentLoader,
+    }
 
     _required_config_modules: ClassVar[list[str]] = [
         "queryformer",

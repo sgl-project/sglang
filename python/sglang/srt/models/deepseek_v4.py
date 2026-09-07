@@ -387,6 +387,33 @@ if _wo_a_aiter_batched_gemm_enabled:
 # instead of re-raising (and re-logging) on every layer/token.
 _wo_a_aiter_batched_gemm_disabled = False
 
+# ROCm fp8 wo_a. The CUDA fp8 path below is built on DeepGEMM's fp8_einsum, so
+# gfx950 runs the equivalent aiter e8m0 block-scale batched GEMM instead. Both
+# the kernel availability and the weight-scale converter resolve once at import;
+# ``None`` here means the platform keeps the bf16 absorb GEMM.
+_wo_a_fp8_mxscale = None
+_wo_a_fp8_mxscale_fused_invrope = None
+_wo_a_weight_scale_to_e8m0 = None
+if _is_hip:
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
+        apply_wo_a_fp8_mxscale,
+        apply_wo_a_fp8_mxscale_fused_invrope,
+        is_wo_a_fp8_fused_invrope_supported,
+        is_wo_a_fp8_mxscale_supported,
+        wo_a_weight_scale_to_e8m0,
+    )
+
+    if is_wo_a_fp8_mxscale_supported():
+        _wo_a_fp8_mxscale = apply_wo_a_fp8_mxscale
+        _wo_a_weight_scale_to_e8m0 = wo_a_weight_scale_to_e8m0
+        # Opt-in fused inverse-RoPE + quant front end (env-gated for A/B). Only
+        # bind it when both the flatmm and the fused aiter op are available.
+        if (
+            envs.SGLANG_OPT_FP8_WO_A_FUSED_INVROPE.get()
+            and is_wo_a_fp8_fused_invrope_supported()
+        ):
+            _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
+
 
 def _apply_wo_a_bf16_matmul(
     o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
@@ -569,7 +596,7 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         output.zero_()
@@ -745,6 +772,16 @@ class MqaAttentionBase(nn.Module):
             self.wo_a.weight_scale_inv.format_ue8m0 = (
                 deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             )
+            # wo_a is quantized but never *applied* through its quant method:
+            # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
+            # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
+            # mxscale BMM on gfx950), both of which want the plain row-major
+            # [G, R, D] weight. Opt out of any backend-private weight layout the
+            # linear method would otherwise install for its own GEMM -- on ROCm
+            # that is aiter's B-preshuffle, which silently permutes the weight
+            # in place (same shape, dtype and strides) and makes this GEMM
+            # return noise.
+            self.wo_a.skip_aiter_bpreshuffle = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -1699,7 +1736,7 @@ class MQALayer(MqaAttentionBase):
                 layer=self.attn_mqa,
                 forward_batch=forward_batch,
                 compress_ratio=self.compress_ratio,
-                attn_sink=self.attn_sink,
+                attn_sink=attn_sink[: self.n_local_heads],
                 save_kv_cache=kv is not None,
             )
         else:
@@ -1730,72 +1767,106 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
-        if _is_npu:
-            cos4, sin4 = self._get_npu_rope_position_cache(
-                positions, o.dtype, inverse=True
-            )
-            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+        if (
+            _FP8_WO_A_GEMM
+            and _wo_a_fp8_mxscale_fused_invrope is not None
+            and not _is_npu
+        ):
+            # ROCm gfx950 fused path: inverse-RoPE + per-token-group mxfp8 quant
+            # in one aiter kernel on the pre-view [T,H,Dh] output, then the a8w8
+            # mxscale absorb GEMM. Replaces the standalone inverse RoPE, the
+            # [T,G,D] view, and the quant inside the two-kernel fp8 path below.
+            G = self.n_local_groups
+            cos_c, sin_c = _freqs_cis_to_cos_sin(self.freqs_cis, o.dtype, o.device)
+            o = _wo_a_fp8_mxscale_fused_invrope(
                 o,
-                None,
-                cos4,
-                sin4,
-                qk_nope_dim=self.qk_nope_head_dim,
+                positions,
+                cos_c,
+                sin_c,
+                G,
+                self.wo_a.weight.view(G, self.o_lora_rank, -1),
+                self.wo_a.weight_scale_inv.data,
             )
         else:
-            fused_rope_inplace(
-                o[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-                inverse=True,
-            )
-
-        o = o.view(o.shape[0], self.n_local_groups, -1)
-
-        if _FP8_WO_A_GEMM:
-            import deep_gemm
-
-            from sglang.srt.layers import deep_gemm_wrapper
-
-            T, G, D = o.shape
-            R = self.o_lora_rank
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
-                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
-                recipe = (1, 1, 128)
-            else:
-                # sm90 (Hopper): fp32 scales.
-                o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                    o.reshape(T * G, D).contiguous(),
-                    group_size=128,
-                    scale_ue8m0=False,
+            if _is_npu:
+                cos4, sin4 = self._get_npu_rope_position_cache(
+                    positions, o.dtype, inverse=True
                 )
-                o_fp8 = o_fp8.view(T, G, D)
-                o_s = o_s.view(T, G, -1)
-                recipe = (1, 128, 128)
-            output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
-                (o_fp8, o_s),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
-                output,
-                recipe=recipe,
-            )
-            o = output
-        else:
-            wo_a_weight = getattr(self.wo_a, "weight", None)
-            if wo_a_weight is not None:
-                wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
-                o = _apply_wo_a_bf16_matmul(
-                    o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
-                )
-            else:
-                o = _apply_gguf_grouped_wo_a(
+                Dsv4NpuRoPE.apply_rotary_mul_inplace(
                     o,
-                    self.wo_a.qweight,
-                    self.wo_a.qweight_type.weight_type,
-                    self.o_lora_rank,
+                    None,
+                    cos4,
+                    sin4,
+                    qk_nope_dim=self.qk_nope_head_dim,
                 )
+            else:
+                fused_rope_inplace(
+                    o[..., -self.qk_rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions=positions,
+                    inverse=True,
+                )
+
+            o = o.view(o.shape[0], self.n_local_groups, -1)
+
+            if _FP8_WO_A_GEMM and _wo_a_fp8_mxscale is not None:
+                # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below,
+                # but through aiter's e8m0 block-scale batched GEMM. The
+                # activation is quantized per token-group inside the helper.
+                T, G, D = o.shape
+                o = _wo_a_fp8_mxscale(
+                    o,
+                    self.wo_a.weight.view(G, self.o_lora_rank, D),
+                    self.wo_a.weight_scale_inv.data,
+                )
+            elif _FP8_WO_A_GEMM:
+                import deep_gemm
+
+                from sglang.srt.layers import deep_gemm_wrapper
+
+                T, G, D = o.shape
+                R = self.o_lora_rank
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                    # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
+                    o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                    recipe = (1, 1, 128)
+                else:
+                    # sm90 (Hopper): fp32 scales.
+                    o_fp8, o_s = sglang_per_token_group_quant_fp8(
+                        o.reshape(T * G, D).contiguous(),
+                        group_size=128,
+                        scale_ue8m0=False,
+                    )
+                    o_fp8 = o_fp8.view(T, G, D)
+                    o_s = o_s.view(T, G, -1)
+                    recipe = (1, 128, 128)
+                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_fp8, o_s),
+                    (
+                        self.wo_a.weight.view(G, R, D),
+                        self.wo_a.weight_scale_inv.data,
+                    ),
+                    output,
+                    recipe=recipe,
+                )
+                o = output
+            else:
+                wo_a_weight = getattr(self.wo_a, "weight", None)
+                if wo_a_weight is not None:
+                    wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                    o = _apply_wo_a_bf16_matmul(
+                        o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+                    )
+                else:
+                    o = _apply_gguf_grouped_wo_a(
+                        o,
+                        self.wo_a.qweight,
+                        self.wo_a.qweight_type.weight_type,
+                        self.o_lora_rank,
+                    )
 
         o, _ = self.wo_b(o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
@@ -3479,6 +3550,28 @@ class DeepseekV4ForCausalLM(nn.Module):
             G = attn.n_local_groups
             R = attn.o_lora_rank
             D = attn.wo_a.weight.shape[1]
+
+            if _wo_a_weight_scale_to_e8m0 is not None:
+                # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
+                # requantizes the weight when the checkpoint's scales are not
+                # already powers of two. It also needs the weight row-major, so
+                # check the linear method honoured skip_aiter_bpreshuffle: a
+                # preshuffled weight has the same shape, dtype and strides and
+                # would only show up as garbage output.
+                assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
+                    "DSV4 wo_a was B-preshuffled by the fp8 linear method; the "
+                    "aiter mxscale absorb GEMM needs the row-major weight"
+                )
+                weight, scale = _wo_a_weight_scale_to_e8m0(
+                    attn.wo_a.weight.data,
+                    attn.wo_a.weight_scale_inv.data,
+                    G,
+                    R,
+                )
+                attn.wo_a.weight.data = weight.view(G * R, D)
+                attn.wo_a.weight_scale_inv.data = scale
+                attn.wo_a.weight_scale_inv.format_ue8m0 = True
+                continue
 
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
             if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:

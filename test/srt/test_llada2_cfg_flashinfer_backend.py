@@ -83,7 +83,7 @@ class TestLLaDA2CFGFlashInferBackend(unittest.TestCase):
 
         stock_init.assert_called_once_with(forward_batch)
         self.assertFalse(backend.conditioning_mask_active)
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning import (
             ensure_conditioning_mask_active,
         )
 

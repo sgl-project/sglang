@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
@@ -265,6 +266,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Kill-switch for the warmup-calibrated auto residency promotion that runs
+    # under `--performance-mode auto` with server warmup. Set to disable the
+    # promotion without giving up the rest of the auto performance policy.
+    "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
+    ),
     # Plan slots in the MiniMax-H3 --minimax-h3-adaln-online GPU slab
     # (9.25 MiB per slot-timestep; 64 x width 4 = 2.31 GiB). A request needs
     # up to num_inference_steps - 1 slots; the default covers the 50-step

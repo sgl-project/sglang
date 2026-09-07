@@ -24,7 +24,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
 from sglang.multimodal_gen.runtime.pipelines.llada_image import (
     LLaDAImageLatentPreparationStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.llada_image_conditioning import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning import (
     format_llada_image_prompt,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (

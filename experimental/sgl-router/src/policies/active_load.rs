@@ -4,11 +4,8 @@
 //! Per-worker active-load tracking with RAII guards and a stale-request
 //! janitor.
 //!
-//! The cache-aware-zmq policy ([`super::cache_aware_zmq`]) needs to combine
-//! the hash tree's overlap score with a per-worker load signal. The
-//! per-worker `Worker::active_requests` counter tracks one axis — number of
-//! in-flight HTTP requests — and is already drop-safe through
-//! [`crate::workers::LoadGuard`].
+//! The per-worker `Worker::active_requests` counter tracks in-flight HTTP
+//! requests and is drop-safe through [`crate::workers::LoadGuard`].
 //!
 //! This module adds two things on top of that:
 //!
@@ -72,10 +69,7 @@ impl std::fmt::Display for RequestId {
     }
 }
 
-/// Per-worker counters: one for prefill (token) load, one for decode (block)
-/// load. The two axes are tracked separately so cache-aware-zmq can score
-/// prefill candidates by token load and decode candidates by block load
-/// without each axis spamming through the other's counter.
+/// Per-worker counters for prefill and decode work.
 ///
 /// Production tracks **active requests** as the unit (count of in-flight
 /// requests pinning the worker), not raw token / block counts — until the
@@ -172,10 +166,8 @@ impl Clock for MockClock {
 
 /// Registry of in-flight requests + per-worker active-load counters.
 ///
-/// Constructed once per `AppContext`; the cache-aware-zmq policy reads
-/// per-worker `prefill_load` / `decode_load` from here when scoring
-/// candidates, and the proxy holds an [`ActiveLoadGuard`] per request so
-/// counters decrement on drop. A background task periodically calls
+/// Constructed once per `AppContext`; the proxy holds an [`ActiveLoadGuard`]
+/// per request so counters decrement on drop. A background task periodically calls
 /// [`Self::sweep_stale`] to evict requests that outlived
 /// `stale_request_timeout`.
 #[derive(Debug)]

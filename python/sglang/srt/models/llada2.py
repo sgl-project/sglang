@@ -71,8 +71,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_loader.llada2_weight_utils import prepare_llada2_language_weights
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.llada2_weight_utils import prepare_llada2_language_weights
 from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
