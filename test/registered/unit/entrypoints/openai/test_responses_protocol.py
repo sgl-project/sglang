@@ -267,6 +267,39 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
         )
         self.assertFalse(response.parallel_tool_calls)
 
+    def test_max_tool_calls_preserved(self):
+        import openai.types.responses as ort
+
+        for max_tool_calls in (None, 0, 3):
+            with self.subTest(max_tool_calls=max_tool_calls):
+                request = ResponsesRequest(
+                    model="x",
+                    input="hi",
+                    max_tool_calls=max_tool_calls,
+                    store=False,
+                )
+                response = ResponsesResponse.from_request(
+                    request,
+                    sampling_params={},
+                    model_name="x",
+                    created_time=0,
+                    output=[],
+                    status="completed",
+                    usage=UsageInfo(
+                        prompt_tokens=1, completion_tokens=1, total_tokens=2
+                    ),
+                )
+
+                self.assertEqual(response.max_tool_calls, max_tool_calls)
+                self.assertEqual(
+                    response.model_dump()["max_tool_calls"], max_tool_calls
+                )
+                ort.ResponseCreatedEvent(
+                    type="response.created",
+                    sequence_number=0,
+                    response=response.model_dump(),
+                )
+
     def test_incomplete_status_sets_incomplete_details(self):
         request = ResponsesRequest(model="x", input="hi", store=False)
         incomplete = ResponsesResponse.from_request(

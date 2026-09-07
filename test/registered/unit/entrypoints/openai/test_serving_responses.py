@@ -22,6 +22,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
@@ -482,6 +483,96 @@ class InputItemNormalizationTestCase(CustomTestCase):
             )
 
 
+class _BuiltinToolSequenceContext:
+    def __init__(self, requested_tools):
+        self.requested_tools = requested_tools
+        self.generation_turns = 0
+        self.executed_tools = []
+
+    def append_output(self, output):
+        if isinstance(output, dict) and "engine_turn" in output:
+            self.generation_turns += 1
+
+    def need_builtin_tool_call(self):
+        return self.generation_turns <= len(self.requested_tools)
+
+    async def call_tool(self):
+        tool = self.requested_tools[self.generation_turns - 1]
+        self.executed_tools.append(tool)
+        return [{"tool": tool}]
+
+    def render_for_completion(self):
+        return [1, 2, 3]
+
+
+class BuiltinToolCallLimitTestCase(CustomTestCase):
+    def _run_tool_sequence(self, requested_tools, max_tool_calls, stream):
+        serving = make_serving()
+        context = _BuiltinToolSequenceContext(requested_tools)
+        engine_requests = []
+
+        async def generate(adapted_request, _raw_request):
+            engine_requests.append(adapted_request)
+            yield {"engine_turn": len(engine_requests)}
+
+        serving.tokenizer_manager.generate_request.side_effect = generate
+        adapted_request = GenerateReqInput(
+            input_ids=[1],
+            sampling_params={},
+            stream=stream,
+            rid="resp_tool_limit",
+        )
+
+        async def consume():
+            async for _ in serving._generate_with_builtin_tools(
+                "resp_tool_limit",
+                [1],
+                adapted_request,
+                {},
+                context,
+                max_tool_calls=max_tool_calls,
+            ):
+                pass
+
+        asyncio.run(consume())
+        return context, engine_requests
+
+    def test_builtin_tool_limit_matrix(self):
+        cases = (
+            ("zero", ["browser.search"], 0, [], 1),
+            ("one_shared", ["browser.search", "python"], 1, ["browser.search"], 2),
+            (
+                "exact_boundary",
+                ["browser.search", "python"],
+                2,
+                ["browser.search", "python"],
+                3,
+            ),
+            (
+                "unlimited",
+                ["browser.search", "python"],
+                None,
+                ["browser.search", "python"],
+                3,
+            ),
+            ("no_tool", [], 1, [], 1),
+        )
+
+        for stream in (False, True):
+            for name, tools, limit, expected_tools, expected_turns in cases:
+                with self.subTest(name=name, stream=stream):
+                    context, engine_requests = self._run_tool_sequence(
+                        tools, limit, stream
+                    )
+
+                    self.assertEqual(context.executed_tools, expected_tools)
+                    self.assertEqual(context.generation_turns, expected_turns)
+                    self.assertEqual(len(engine_requests), expected_turns)
+                    self.assertTrue(
+                        all(request.stream is stream for request in engine_requests)
+                    )
+
+
 class FullResponseUsageTestCase(CustomTestCase):
     def test_full_response_uses_dict_meta_info_for_usage(self):
         serving = make_serving()
@@ -906,6 +997,7 @@ class EnginePassthroughTestCase(CustomTestCase):
         ):
             captured["adapted_request"] = adapted_request
             captured["sampling_params"] = sampling_params
+            captured["generator_kwargs"] = kwargs
             context.append_output(
                 {
                     "text": "ok",
@@ -988,6 +1080,16 @@ class EnginePassthroughTestCase(CustomTestCase):
         )
 
         self.assertFalse(captured["sampling_params"]["skip_special_tokens"])
+
+    def test_max_tool_calls_forwarded_to_builtin_loop(self):
+        serving = make_serving()
+
+        captured = self._capture(
+            serving,
+            ResponsesRequest(model="x", input="hi", max_tool_calls=3, store=False),
+        )
+
+        self.assertEqual(captured["generator_kwargs"]["max_tool_calls"], 3)
 
 
 class CancelIdempotencyTestCase(CustomTestCase):

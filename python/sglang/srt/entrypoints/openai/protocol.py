@@ -1896,6 +1896,7 @@ class ResponsesResponse(BaseModel):
     incomplete_details: Optional[dict] = None  # TODO(v) support this input
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
+    max_tool_calls: Optional[int] = None
     previous_response_id: Optional[str] = None
     reasoning: Optional[dict] = (
         # Unused. No model supports this. For GPT-oss, system prompt sets
@@ -2008,6 +2009,7 @@ class ResponsesResponse(BaseModel):
             ),
             instructions=request.instructions,
             max_output_tokens=request.max_output_tokens,
+            max_tool_calls=request.max_tool_calls,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
                 "effort": (
