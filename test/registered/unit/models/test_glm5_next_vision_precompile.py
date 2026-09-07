@@ -90,10 +90,13 @@ class TestGlm5NextVisionPrecompile(CustomTestCase):
     def _run_hook(self, model, stub):
         prefill_attention = ModuleType("sglang.kernels.ops.attention.prefill_attention")
         prefill_attention.context_attention_fwd = stub
-        with patch.dict(
-            sys.modules,
-            {"sglang.kernels.ops.attention.prefill_attention": prefill_attention},
-        ), patch.object(glm5_next, "VisionAttention", _FakeVisionAttention):
+        with (
+            patch.dict(
+                sys.modules,
+                {"sglang.kernels.ops.attention.prefill_attention": prefill_attention},
+            ),
+            patch.object(glm5_next, "VisionAttention", _FakeVisionAttention),
+        ):
             model.precompile_kernels_after_loading()
 
     def test_triton_backend_precompiles_with_vision_head_dim(self):
