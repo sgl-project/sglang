@@ -112,6 +112,25 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
             logger.warning("KV cache is forced as chunk cache for decode server")
 
+        if server_args.disaggregation_decode_l2_only_radix_cache:
+            if server_args.disaggregation_transfer_backend not in (
+                "mooncake",
+                "nixl",
+            ):
+                raise ValueError(
+                    "--disaggregation-decode-l2-only-radix-cache requires "
+                    "--disaggregation-transfer-backend to be mooncake or nixl, "
+                    f"but got {server_args.disaggregation_transfer_backend!r}."
+                )
+            if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+                raise ValueError(
+                    "--disaggregation-decode-l2-only-radix-cache is not "
+                    "supported with SGLANG_DISAGG_STAGING_BUFFER."
+                )
+            logger.warning(
+                "EXPERIMENTAL: L2-Only radix cache is enabled for decode server"
+            )
+
         # Default the number of *extra* decode req_to_token slots reserved for
         # in-transfer (being-received-from-prefill) requests, on top of the
         # max_running_requests-derived pool. Large batches get none; small

@@ -47,6 +47,7 @@ class HostPoolGroup:
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
         self.logical_size = self.anchor_entry.host_pool.logical_size
+        self.logical_page_size = self.anchor_entry.host_pool.logical_page_size
         self._refresh_transfer_capabilities()
 
     def _refresh_transfer_capabilities(self) -> None:
@@ -70,6 +71,10 @@ class HostPoolGroup:
 
     def get_pool(self, name: PoolName):
         return self.get_entry(name).host_pool
+
+    def get_contiguous_buf_infos(self):
+        """Per-layer anchor-pool buffer descriptors, for RDMA registration."""
+        return self.get_entry().host_pool.get_contiguous_buf_infos()
 
     def alloc(
         self,

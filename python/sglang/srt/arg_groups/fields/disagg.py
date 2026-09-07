@@ -87,6 +87,10 @@ class Disagg(msgspec.Struct):
         bool,
         "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
     ] = False
+    disaggregation_decode_l2_only_radix_cache: A[
+        bool,
+        "Enable L2-Only radix cache on decode server (PD mode). Stages the transferred KV delta in the HiCache host pool instead of HBM. Requires --enable-hierarchical-cache and --disaggregation-decode-enable-radix-cache.",
+    ] = False
     disaggregation_decode_enable_offload_kvcache: A[
         bool, "Enable async KV cache offloading on decode server (PD mode)."
     ] = False
