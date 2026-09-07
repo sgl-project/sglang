@@ -46,7 +46,7 @@ Then run the **Python** output of the command panel below in that environment.
 docker pull lmsysorg/sglang:qwen38flashnext
 ```
 
-**DGX Spark and RTX PRO 6000**: the `qwen4-main-squashed` build (`9b2aee2283`), which carries the ModelOpt MIXED_PRECISION loader ([#38121](https://github.com/sgl-project/sglang/pull/38121)) and the file-backed PLE table backend ([#37068](https://github.com/sgl-project/sglang/pull/37068)). The `qwen38flashnext` image predates both, so the command generator uses this image for those two hardware rows:
+**DGX Spark and RTX PRO 6000**: the `qwen4-main-squashed` build (`4ccff141db`), which carries the ModelOpt MIXED_PRECISION loader ([#38121](https://github.com/sgl-project/sglang/pull/38121)), the file-backed PLE table backend ([#37068](https://github.com/sgl-project/sglang/pull/37068)), and the router-kernel fixes for the MTP output collapse on GB10 ([#36811](https://github.com/sgl-project/sglang/pull/36811) via [#38308](https://github.com/sgl-project/sglang/pull/38308), [#38290](https://github.com/sgl-project/sglang/pull/38290)). The `qwen38flashnext` image predates both, so the command generator uses this image for those two hardware rows:
 
 ```bash Command
 docker pull lmsysorg/sglang:dev-qwen38-next-local

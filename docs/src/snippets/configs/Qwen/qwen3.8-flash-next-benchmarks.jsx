@@ -67,12 +67,14 @@ export const benchmarks = [
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
   // 2x DGX Spark, TP=2, lmsysorg/sglang:qwen38flashnext (SGLang 593134d17a),
   // 2026-09-04. GSM8K is the full 1,319-question set via the chat API (thinking
-  // off, greedy, 8192 max tokens) on lmsysorg/sglang:dev-qwen38-next-local
-  // (9b2aee2283), 2026-09-06; rows without it are still being run. AIME26 and
-  // MMMU-Pro not run.
+  // off, greedy, 8192 max tokens) on lmsysorg/sglang:dev-qwen38-next-local:
+  // high-throughput rows on 9b2aee2283 (2026-09-06), low-latency (MTP) rows on
+  // 4ccff141db (2026-09-07, after #36811/#38290 fixed the router PDL race that
+  // collapsed MTP batches to token 0 on GB10). AIME26 and MMMU-Pro not run.
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
     sglang_version: "qwen38flashnext image @ 593134d17a",
+    accuracy: { gsm8k_pct: 97.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 457.14, tpot_ms: 19.94, tokens_per_sec_per_gpu: 116 },
@@ -102,6 +104,7 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "qwen4-main-squashed @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 97.1 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 648.92, tpot_ms: 33.59, tokens_per_sec_per_gpu: 137 },
@@ -132,7 +135,7 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "multi-2" },
     sglang_version: "qwen4-main-squashed @ 9b2aee2283",
-    accuracy: { gsm8k_pct: 96.8 },
+    accuracy: { gsm8k_pct: 97.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 447.13, tpot_ms: 18.70, tokens_per_sec_per_gpu: 119 },
@@ -162,6 +165,7 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 9b2aee2283",
+    accuracy: { gsm8k_pct: 97.1 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 650.03, tpot_ms: 33.26, tokens_per_sec_per_gpu: 136 },
