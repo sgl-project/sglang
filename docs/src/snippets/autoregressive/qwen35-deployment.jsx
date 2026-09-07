@@ -410,8 +410,11 @@ export const Qwen35Deployment = () => {
       }
     }
 
-    // Enable NCCL symmetric memory for H100 FP8 deployments.
-    if (hardware === 'h100' && quantization === 'fp8' && hwConfig.tp > 1) {
+    // Enable NCCL symmetric memory for H100 and Blackwell FP8 deployments.
+    // Only multi-GPU configs benefit, so this is gated on tp > 1 (on B200/B300
+    // that is the 397B-A17B recipe at tp=4; the 122B / 35B FP8 recipes are tp=1).
+    const symmMemFp8Hw = ['h100', 'b200', 'b300'];
+    if (symmMemFp8Hw.includes(hardware) && quantization === 'fp8' && hwConfig.tp > 1) {
       cmd += ` \\\n  --enable-symm-mem`;
     }
 
@@ -453,6 +456,15 @@ export const Qwen35Deployment = () => {
     }
     if (hardware === 'b300' && quantization !== 'fp4') {
       cmd += ` \\\n  --attention-backend flashinfer`;
+    }
+
+    // FP8 MoE on Blackwell runs the trtllm-gen fused MoE. This is not a default:
+    // the auto-promotion to flashinfer_trtllm in arg_groups/overrides.py is gated
+    // to the DeepSeek arch family, and Fp8MoEMethod.create_moe_runner resolves
+    // "auto" to Triton for a TP-only run, so the flag has to be explicit.
+    // Dense sizes have no MoE layers, so restrict it to MOE_MODELS.
+    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8' && MOE_MODELS.has(model)) {
+      cmd += ` \\\n  --moe-runner-backend flashinfer_trtllm`;
     }
 
     // Append AMD GPU-specific backend configurations.
