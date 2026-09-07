@@ -3856,11 +3856,7 @@ class ServerArgs:
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
-        if (
-            self.dcp_size > 1
-            and is_cuda()
-            and self.speculative_algorithm is not None
-        ):
+        if self.dcp_size > 1 and is_cuda() and self.speculative_algorithm is not None:
             logger.warning(
                 "Decode context parallel (--dcp-size > 1) with "
                 "speculative decoding is experimental: validated for DSA "
