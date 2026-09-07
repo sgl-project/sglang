@@ -5487,8 +5487,15 @@ class Scheduler(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ) -> LoadLoRAAdapterFromTensorsReqOutput:
         """In-place loading a new lora adapter from serialized tensors."""
-
-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+        try:
+            result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+        except Exception as e:
+            # A malformed/malicious serialized payload (e.g. one rejected by
+            # SafeUnpickler) must not take down the scheduler event loop.
+            logger.error("Failed to load LoRA adapter from tensors: %s", e)
+            return LoadLoRAAdapterFromTensorsReqOutput(
+                success=False, error_message=str(e)
+            )
         return result
 
     def unload_lora_adapter(
