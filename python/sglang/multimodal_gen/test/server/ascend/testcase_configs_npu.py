@@ -39,6 +39,10 @@ Z_IMAGE_WEIGHTS_PATH = use_modelscope("Tongyi-MAI/Z-Image")
 
 EXTRAS_DISABLE_WARMUP = ["--warmup-mode", "request"]
 
+# Adding a case to either list below with run_consistency_check enabled, or
+# changing its num_gpus or modality, also requires updating CONSISTENCY_CASES in
+# scripts/ci/utils/diffusion/prefetch_consistency_gt.py -- the NPU CI prefetches
+# ground truth from that list and cannot import this module to derive it.
 ONE_NPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
@@ -108,6 +112,8 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
     ),
 ]
 
+# Consistency-checked cases here are mirrored in CONSISTENCY_CASES in
+# scripts/ci/utils/diffusion/prefetch_consistency_gt.py; keep the two in step.
 TWO_NPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
