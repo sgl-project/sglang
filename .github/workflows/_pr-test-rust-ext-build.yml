@@ -326,6 +326,7 @@ jobs:
           # both have to check out the same set for hashFiles to agree.
           sparse-checkout: |
             rust
+            proto
             python/setup.py
             python/pyproject.toml
             python/sglang/srt/rust_extensions/torch_build.py
