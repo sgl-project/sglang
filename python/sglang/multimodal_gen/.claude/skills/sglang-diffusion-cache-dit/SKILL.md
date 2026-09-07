@@ -1,6 +1,6 @@
 ---
 name: sglang-diffusion-cache-dit
-description: "Workflow for upgrading/integrating cache-dit in SGLang diffusion (multimodal_gen): DBCache, DMD calibrator, TaylorSeer, SVDQuant DQ; porting upstream PRs and resolving conflicts against the per-request knob system; adding new cache knobs; building the sglang generate CLI test matrix; precision validation (PSNR / log evidence); troubleshooting environment issues (wheel ABI, svdq extension, flashinfer conflicts). Use when upgrading or integrating cache-dit in sglang diffusion, porting cache-dit PRs with conflicts, adding cache knobs, running the sglang generate CLI test matrix, or validating precision (PSNR) for DBCache/DMD/SVDQuant paths."
+description: "Workflow for upgrading/integrating cache-dit in SGLang diffusion (multimodal_gen): DBCache, DMD calibrator, TaylorSeer, SVDQuant DQ; porting upstream PRs and resolving conflicts against the per-request knob system; adding new cache knobs; building the sglang generate CLI test matrix; precision validation (PSNR / log evidence); troubleshooting environment issues (wheel ABI, svdq extension, flashinfer conflicts). Use when upgrading or integrating cache-dit in sglang diffusion, porting cache-dit PRs with conflicts, adding cache knobs, running the sglang generate CLI test matrix, or validating precision (PSNR) for DBCache/DMD/SVDQuant(DQ) paths."
 user-invocable: true
 ---
 
