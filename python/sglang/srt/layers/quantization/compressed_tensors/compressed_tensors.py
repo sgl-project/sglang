@@ -192,7 +192,10 @@ class CompressedTensorsConfig(QuantizationConfig):
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
 
-        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+        from sglang.srt.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+            VocabParallelEmbedding,
+        )
 
         if isinstance(layer, ParallelLMHead):
             scheme = self.get_lm_head_scheme(layer=layer, layer_name=prefix)
@@ -201,6 +204,19 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return None
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
+
+        # Quantized embed_tokens: VocabParallelEmbedding performs a gather (not
+        # a matmul), so it needs its own quantized embedding method. Match on
+        # the target map instead of layer_name because embed_tokens is created
+        # without a prefix, so layer-name matching would never hit the
+        # `re:.*embed_tokens$` target.
+        if isinstance(layer, VocabParallelEmbedding):
+            for target, scheme_map in self.target_scheme_map.items():
+                if "embed" in str(target):
+                    weight_quant = scheme_map.get("weights")
+                    if weight_quant is not None:
+                        return CompressedTensorsEmbeddingMethod(weight_quant)
+                    break
 
         from sglang.srt.layers.radix_attention import RadixAttention
 
@@ -1320,4 +1336,100 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
             group_list_type,
             group_list,
             output_dtype,
+        )
+
+
+class CompressedTensorsEmbeddingMethod(QuantizeMethodBase):
+    """Quantized embedding (embed_tokens) for compressed-tensors checkpoints.
+
+    Supports pack-quantized INT weights (2-8 bit, group- or channel-quantized)
+    stored as ``weight_packed`` (int32) / ``weight_scale`` / ``weight_shape``.
+    Weights stay packed so the GPU-memory savings of quantization are kept;
+    only the gathered token rows are unpacked and dequantized at forward time
+    (dequant-on-gather, same pattern as ``ModelOptNvFp4EmbeddingMethod`` and
+    vLLM's ``CompressedTensorsEmbeddingWNA16Int``).
+    """
+
+    def __init__(self, weight_quant: QuantizationArgs):
+        self.weight_quant = weight_quant
+        self.num_bits = weight_quant.num_bits
+        self.pack_factor = 32 // self.num_bits
+        self.group_size = weight_quant.group_size
+        self.is_group = (
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.group_size is not None
+        )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader", default_weight_loader)
+
+        scale_size = input_size // self.group_size if self.is_group else 1
+
+        for name, data in [
+            (
+                "weight_packed",
+                torch.empty(
+                    output_size_per_partition,
+                    input_size // self.pack_factor,
+                    dtype=torch.int32,
+                ),
+            ),
+            (
+                "weight_scale",
+                torch.empty(output_size_per_partition, scale_size, dtype=params_dtype),
+            ),
+            (
+                "weight_shape",
+                torch.tensor(
+                    [output_size_per_partition, input_size], dtype=torch.int64
+                ),
+            ),
+        ]:
+            param = torch.nn.Parameter(data, requires_grad=False)
+            setattr(param, "weight_loader", weight_loader)
+            layer.register_parameter(name, param)
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        packed = layer.weight_packed  # [V, H/pack_factor] int32
+        scale = layer.weight_scale  # [V, G] (or [V, 1] for channel)
+        p = packed[input_.long()]  # [B, H/pack_factor]
+        s = scale[input_.long()]  # [B, G]
+
+        # Unpack each int32 into `pack_factor` unsigned values (little-endian
+        # bit order, value at column c lives in bits (c % pack_factor)*num_bits)
+        # then convert to a signed range: q = v - 2^(num_bits-1).
+        mask = (1 << self.num_bits) - 1
+        half_range = 1 << (self.num_bits - 1)
+        u = torch.stack(
+            [(p >> (self.num_bits * i)) & mask for i in range(self.pack_factor)],
+            dim=-1,
+        )
+        q = u.reshape(*u.shape[:-2], -1).to(torch.float32) - half_range
+
+        if self.is_group:
+            sc = s.repeat_interleave(self.group_size, dim=-1).to(torch.float32)
+        else:
+            sc = s.to(torch.float32)
+        return (q * sc).to(scale.dtype)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            "CompressedTensorsEmbeddingMethod supports embedding gather only"
         )
