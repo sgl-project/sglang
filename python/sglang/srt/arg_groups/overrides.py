@@ -69,6 +69,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     get_context,
@@ -548,7 +549,8 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
-    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
+    # MLX only implements the no_buffer mamba radix-cache strategy.
+    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS and not use_mlx():
         return view.linear_attn_backend == "triton"
     return False
 

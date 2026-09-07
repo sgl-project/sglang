@@ -2352,6 +2352,41 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         )
 
+    def test_mlx_never_uses_mamba_extra_buffer(self):
+        # Regression: on the MLX backend (Apple Silicon, SGLANG_USE_MLX=1) the
+        # extra_buffer Mamba radix-cache strategy is unimplemented, so the
+        # auto-resolution must fall back to no_buffer instead of picking
+        # extra_buffer and crashing in validate_mamba_extra_buffer with
+        # "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)".
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _mamba_radix_cache_resolution,
+        )
+
+        view = ResolvedView(
+            SimpleNamespace(
+                _model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["Qwen3NextForCausalLM"])
+                ),
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="auto",
+                disable_overlap_schedule=False,
+                page_size=None,
+                linear_attn_backend="triton",
+                linear_attn_prefill_backend=None,
+            )
+        )
+        target = "sglang.srt.arg_groups.overrides"
+        with patch(target + ".use_mlx", return_value=True):
+            self.assertEqual(
+                _mamba_radix_cache_resolution(view),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "no_buffer",
+                    "disable_overlap_schedule": True,
+                },
+            )
+
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_5 import (
             _qwen3_5_hybrid_overrides,
