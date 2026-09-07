@@ -110,6 +110,10 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.cache_controller import (
+    CacheReadStallCollector,
+    set_cache_read_collector,
+)
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -1215,6 +1219,14 @@ class Scheduler(
         # the metrics reporter to append "step time (ms)" onto the Prefill/Decode
         # batch log line. Populated only when enable_step_time_logging is set.
         self._step_events: Dict[int, Tuple] = {}
+        # Per-forward CUDA event pairs bracketing the per-layer HiCache
+        # host->device KV waits, keyed like _step_events. Stays empty without
+        # --enable-hierarchical-cache: nothing gates on a load then, so
+        # LayerDoneCounter.wait_until returns before recording anything.
+        self._cache_read_events: Dict[int, List[Tuple]] = {}
+        # Built lazily in run_batch -- self.device_module is assigned later in
+        # __init__ than this block.
+        self._cache_read_collector: Optional[CacheReadStallCollector] = None
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -4082,6 +4094,19 @@ class Scheduler(
         if step_timing:
             _sstep_start = self.device_module.Event(enable_timing=True)
             _sstep_start.record(_sstep_stream)
+            if self.enable_hierarchical_cache:
+                if self._cache_read_collector is None:
+                    self._cache_read_collector = CacheReadStallCollector(
+                        self.device_module
+                    )
+                # The stream is resolved rather than left as None so the
+                # collector can compare it against current_stream() at each
+                # wait: only a stall on the stream the step is timed on belongs
+                # in cache_read time.
+                self._cache_read_collector.begin(
+                    _sstep_stream or self.device_module.current_stream()
+                )
+                set_cache_read_collector(self._cache_read_collector)
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -4300,9 +4325,25 @@ class Scheduler(
             _sstep_end = self.device_module.Event(enable_timing=True)
             _sstep_end.record(_sstep_stream)
             self._step_events[batch.forward_iter] = (_sstep_start, _sstep_end)
+            if self._cache_read_collector is not None:
+                set_cache_read_collector(None)
+                self._cache_read_events[batch.forward_iter] = (
+                    self._cache_read_collector.end()
+                )
             # Bound memory: only recent iters can still be logged.
             while len(self._step_events) > 256:
-                self._step_events.pop(next(iter(self._step_events)))
+                stale = next(iter(self._step_events))
+                self._step_events.pop(stale)
+                dropped = self._cache_read_events.pop(stale, None)
+                if dropped:
+                    self._cache_read_collector.recycle(dropped)
+            # Capped separately rather than only alongside _step_events: a
+            # consumer that drains one dict and not the other (an older
+            # metrics_reporter, a rank whose reporter path changes) would
+            # otherwise keep _step_events small forever while this one grew.
+            while len(self._cache_read_events) > 256:
+                stale = next(iter(self._cache_read_events))
+                self._cache_read_collector.recycle(self._cache_read_events.pop(stale))
 
         self._maybe_report_active_ranks()
 
@@ -5273,6 +5314,7 @@ class Scheduler(
         self.metrics_reporter.last_gen_throughput = 0.0
         # Drop any recorded per-step timing events on pause/idle.
         self._step_events.clear()
+        self._cache_read_events.clear()
         if self.metrics_reporter.current_scheduler_metrics_enabled:
             self.metrics_reporter.metrics_collector.last_log_time = 0.0
             self.metrics_reporter._maybe_log_idle_metrics()

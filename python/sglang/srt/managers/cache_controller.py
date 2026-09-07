@@ -50,6 +50,120 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+# --------------------------------------------------------------------------
+# HiCache load-stall accounting (--enable-step-time-logging).
+#
+# With --enable-hierarchical-cache a prefill forward does not wait for the whole
+# host->device KV load up front: the copy runs on L2TransferEngine's
+# host_to_device_stream and records one event per layer, and the forward stream
+# blocks layer by layer in LayerDoneCounter.wait_until just before it reads that
+# layer's KV buffer. Whatever the copy stream failed to hide therefore shows up
+# inside the step-time window as dead time on the forward stream, which is why a
+# HiCache prefill "step time" is not prefill compute.
+#
+# Bracketing each of those waits with a CUDA event pair on the same stream
+# measures that dead time directly -- the elapsed time between the two events is
+# exactly how long the stream sat blocked at the wait, since nothing else is
+# enqueued between them. Summing the pairs over a forward gives the load stall
+# the step paid, so `step time - cache_read time` is the compute.
+#
+# wait_until is the single choke point: every KV pool (MHA/MLA/DSA/SWA/hybrid),
+# both the HiRadixCache and the UnifiedRadixCache, funnels its per-layer HiCache
+# gate through it, so instrumenting here covers them all without touching a
+# get_*_buffer.
+# --------------------------------------------------------------------------
+
+# Cap on pooled event pairs kept for reuse. A DSv4-class model gates ~60 layers
+# and some pools wait twice per layer (key then value), so a few hundred pairs
+# covers the steady state; anything beyond is dropped rather than retained.
+_MAX_POOLED_CACHE_READ_EVENTS = 512
+
+
+class CacheReadStallCollector:
+    """Pools CUDA event pairs that bracket per-layer HiCache load waits.
+
+    One instance per scheduler. ``begin`` opens a forward's window, every
+    ``wait_until`` that lands on the timed stream while it is open appends a
+    pair, and ``end`` hands the pairs to the caller. They are read (and returned
+    via ``recycle``) by the metrics reporter once the step's own end event has
+    synchronized -- every pair was recorded on the timed stream before that end
+    event, so no extra synchronization is needed to read them.
+    """
+
+    def __init__(self, device_module_):
+        self._device_module = device_module_
+        self._free = []
+        self._current = None
+        self._stream = None
+        # Waits seen on a stream other than the timed one; see acquire_pair.
+        self.num_off_stream_waits = 0
+        self._warned_off_stream = False
+
+    def begin(self, stream) -> None:
+        """Open a window for a forward timed on ``stream``.
+
+        A previous window that was never closed (an exception escaped the
+        forward) is dropped here rather than merged into this step.
+        """
+        self._current = []
+        self._stream = stream
+
+    def end(self) -> list:
+        pairs, self._current = self._current, None
+        self._stream = None
+        return pairs or []
+
+    def acquire_pair(self):
+        """Return an (start, end) event pair to bracket a wait, or None.
+
+        None means "do not instrument this wait": either no window is open, or
+        the wait is being issued on a stream other than the one the step is
+        timed on. The latter happens only on the attention layer-split KV
+        broadcast path (DSACacheLayerSplit.prefetch_kv_buffer waits inside a
+        kv_broadcast_stream context). Bracketing there would measure a stall on
+        a stream whose time is not the step-time window, so it would break the
+        `step - cache_read = compute` arithmetic; such a stall reaches the
+        forward stream only indirectly, through the later wait_stream join, and
+        is left inside the compute term. The count is surfaced so the exclusion
+        is detectable rather than silent.
+        """
+        if self._current is None:
+            return None
+        if self._device_module.current_stream() != self._stream:
+            self.num_off_stream_waits += 1
+            if not self._warned_off_stream:
+                self._warned_off_stream = True
+                logger.warning(
+                    "HiCache layer wait issued off the timed stream; its stall is "
+                    "counted as compute, not as cache_read time."
+                )
+            return None
+        if self._free:
+            pair = self._free.pop()
+        else:
+            pair = (
+                self._device_module.Event(enable_timing=True),
+                self._device_module.Event(enable_timing=True),
+            )
+        self._current.append(pair)
+        return pair
+
+    def recycle(self, pairs) -> None:
+        room = _MAX_POOLED_CACHE_READ_EVENTS - len(self._free)
+        if room > 0:
+            self._free.extend(pairs[:room])
+
+
+# Set by Scheduler.run_batch for the duration of a timed forward; None the rest
+# of the time, which is the fast path for every run without step-time logging.
+_cache_read_collector: Optional[CacheReadStallCollector] = None
+
+
+def set_cache_read_collector(collector: Optional[CacheReadStallCollector]) -> None:
+    global _cache_read_collector
+    _cache_read_collector = collector
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -90,7 +204,16 @@ class LayerDoneCounter:
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
+        collector = _cache_read_collector
+        pair = collector.acquire_pair() if collector is not None else None
+        if pair is None:
+            self.events[self.consumer_index].wait(threshold)
+            return
+        # The stream is blocked between these two records and nothing else is
+        # enqueued there, so their elapsed time is the stall itself.
+        pair[0].record()
         self.events[self.consumer_index].wait(threshold)
+        pair[1].record()
 
     def reset(self):
         self.producer_index = -1

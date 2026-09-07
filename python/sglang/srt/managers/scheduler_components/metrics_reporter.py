@@ -583,13 +583,45 @@ class SchedulerMetricsReporter:
         were recorded under batch_iter (see Scheduler._step_events), or '' if
         unavailable. Consumes the stored events. The end event is already
         complete by the time stats are reported (the forward's outputs were
-        copied to host), so reading it does not stall the scheduler."""
+        copied to host), so reading it does not stall the scheduler.
+
+        Under --enable-hierarchical-cache a second term is appended:
+
+            , cache_read time (ms): Y.YYY
+
+        the summed GPU time the forward stream sat blocked in
+        LayerDoneCounter.wait_until waiting for the per-layer host->device KV
+        load to reach the layer it was about to read. It is measured the same
+        way as the step time -- CUDA events on the same stream, not derived from
+        transfer sizes or bandwidth -- so `step time - cache_read time` is the
+        forward's compute time. A zero means the copy stream fully hid the load
+        behind compute, not that no load happened.
+        """
         evts = self.scheduler._step_events.pop(batch_iter, None)
+        pairs = self.scheduler._cache_read_events.pop(batch_iter, None)
+        collector = self.scheduler._cache_read_collector
         if evts is None:
+            # Never recorded, or already consumed. Give the pairs back either
+            # way so a rank that does not log cannot exhaust the pool.
+            if pairs and collector is not None:
+                collector.recycle(pairs)
             return ""
         start_evt, end_evt = evts
         end_evt.synchronize()
-        return f", step time (ms): {start_evt.elapsed_time(end_evt):.3f}"
+        suffix = f", step time (ms): {start_evt.elapsed_time(end_evt):.3f}"
+        if pairs is not None:
+            if pairs:
+                # end_evt.synchronize() above already covers these -- every pair
+                # was recorded on the same stream ahead of it. Synchronizing the
+                # last one anyway costs nothing on an already-signalled event and
+                # removes the dependence on that ordering argument, which would
+                # otherwise be the only thing keeping elapsed_time from raising.
+                pairs[-1][1].synchronize()
+            stall_ms = sum(s.elapsed_time(e) for s, e in pairs)
+            suffix += f", cache_read time (ms): {stall_ms:.3f}"
+            if collector is not None:
+                collector.recycle(pairs)
+        return suffix
 
     def log_unreported_step_time(self, batch: Optional[ScheduleBatch]) -> None:
         """Emit a step-time line for a forward that no per-mode reporter claimed.
@@ -621,7 +653,13 @@ class SchedulerMetricsReporter:
         if not self.is_stats_logging_rank:
             # Drop the events regardless so they cannot pile up on ranks that
             # never log; _step_time_suffix would otherwise be the only consumer.
+            # The cache-read pairs go back to the pool rather than being freed,
+            # and neither event is read, so this costs no synchronization.
             self.scheduler._step_events.pop(batch.forward_iter, None)
+            pairs = self.scheduler._cache_read_events.pop(batch.forward_iter, None)
+            collector = self.scheduler._cache_read_collector
+            if pairs and collector is not None:
+                collector.recycle(pairs)
             return
 
         suffix = self._step_time_suffix(batch.forward_iter)
