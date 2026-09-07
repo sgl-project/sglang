@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_mm,
     get_model,
     get_observability,
     get_serving,
@@ -81,6 +82,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
             if get_serving().preferred_sampling_params is not None
             else None
         ),
+        limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
         # Not a `server_args` field: `TokenizerManager` derives it, and the

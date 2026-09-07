@@ -27,6 +27,8 @@ from unittest.mock import Mock
 
 from sglang.srt.entrypoints.openai.protocol import RequestResponseMetadata
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.runtime_context import get_context, publish
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
@@ -79,9 +81,15 @@ class MockTemplateManager:
         self.completion_template_name = None
         self.reasoning_config = None
         self.force_reasoning = False
+        self.jinja_template_may_reorder_tool_results = False
 
 
 def make_serving(*, is_multimodal: bool = False) -> OpenAIServingResponses:
+    """The serving layer reads its config from the bags, so the fixture
+    publishes one. Idempotent: a caller that already published keeps its own,
+    which is how a test states a value the default record does not carry."""
+    if not get_context().is_config_namespace_published("serving"):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
     return OpenAIServingResponses(
         MockTokenizerManager(is_multimodal=is_multimodal), MockTemplateManager()
     )

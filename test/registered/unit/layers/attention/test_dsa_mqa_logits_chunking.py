@@ -17,7 +17,7 @@ torch = pytest.importorskip("torch")
 from sglang.srt.layers.attention.dsa import dsa_indexer  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 CEILING = dsa_indexer.Indexer._MQA_LOGITS_MAX_BYTES_ROCM
 # More than any single logits tensor here needs, so it never decides a case.
@@ -27,10 +27,13 @@ HUGE_MEM_BUDGET = 64 * 2**30
 def _decide(num_q, num_k, mem_budget=HUGE_MEM_BUDGET, is_hip=True):
     # __new__ skips an __init__ that needs a model config and a device.
     indexer = dsa_indexer.Indexer.__new__(dsa_indexer.Indexer)
-    with mock.patch.object(dsa_indexer, "_is_hip", is_hip), mock.patch.object(
-        dsa_indexer.Indexer,
-        "_get_mqa_logits_budget_bytes",
-        return_value=mem_budget,
+    with (
+        mock.patch.object(dsa_indexer, "_is_hip", is_hip),
+        mock.patch.object(
+            dsa_indexer.Indexer,
+            "_get_mqa_logits_budget_bytes",
+            return_value=mem_budget,
+        ),
     ):
         return indexer._should_chunk_mqa_logits(num_q, num_k, 0)
 

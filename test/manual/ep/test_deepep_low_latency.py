@@ -36,9 +36,9 @@ def test_main(
 
     # NOTES: the integers greater than 256 exceeds the BF16 precision limit
     rank_offset = 128
-    assert (
-        num_ranks - rank_offset < 257
-    ), "Too many ranks (exceeding test precision limit)"
+    assert num_ranks - rank_offset < 257, (
+        "Too many ranks (exceeding test precision limit)"
+    )
 
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * (
         rank - rank_offset
@@ -55,9 +55,9 @@ def test_main(
 
     # Randomly mask some positions
     for i in range(10):
-        topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = (
-            -1
-        )
+        topk_idx[
+            random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)
+        ] = -1
 
     # Check dispatch correctness
     do_check = True
@@ -114,9 +114,9 @@ def test_main(
                 assert (
                     num_valid_tokens == (recv_layout_range & int_mask).sum().item()
                 ), f"{num_valid_tokens} != {recv_layout_range & int_mask}.sum().item()"
-                assert (
-                    num_valid_tokens == (all_topk_idx == expert_id).sum().item()
-                ), f"{num_valid_tokens} != {(all_topk_idx == expert_id).sum().item()}"
+                assert num_valid_tokens == (all_topk_idx == expert_id).sum().item(), (
+                    f"{num_valid_tokens} != {(all_topk_idx == expert_id).sum().item()}"
+                )
 
                 # Check received data
                 recv_x = recv_x[:num_valid_tokens]
@@ -127,9 +127,10 @@ def test_main(
                     recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens
                 ).sum().item() == 0
                 for j in range(num_ranks):
-                    begin_idx, count = (recv_layout_range[j] >> 32).item(), (
-                        recv_layout_range[j] & int_mask
-                    ).item()
+                    begin_idx, count = (
+                        (recv_layout_range[j] >> 32).item(),
+                        (recv_layout_range[j] & int_mask).item(),
+                    )
                     assert (recv_x_amin == j - rank_offset).sum().item() == (
                         all_topk_idx[j] == expert_id
                     ).sum().item()
@@ -145,9 +146,9 @@ def test_main(
             # Check combine correctness
             for zero_copy in (False, True):
                 if zero_copy:
-                    buffer.get_next_low_latency_combine_buffer(handle)[
-                        :, :, :
-                    ] = simulated_gemm_x
+                    buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = (
+                        simulated_gemm_x
+                    )
                 out = torch.empty(
                     (num_tokens, hidden), dtype=torch.bfloat16, device="cuda"
                 )
@@ -203,9 +204,9 @@ def test_main(
         )
         large_gemm_with_hook(hook) if return_recv_hook else None
         if zero_copy:
-            buffer.get_next_low_latency_combine_buffer(handle)[
-                :, :, :
-            ] = simulated_gemm_x
+            buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = (
+                simulated_gemm_x
+            )
         combined_x, event, hook = buffer.low_latency_combine(
             simulated_gemm_x,
             topk_idx,

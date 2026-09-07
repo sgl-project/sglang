@@ -115,7 +115,6 @@ class GraniteMoeMoE(nn.Module):
 
 
 class GraniteMoeSharedMLP(nn.Module):
-
     def __init__(
         self,
         config: GraniteConfig,
@@ -155,7 +154,6 @@ class GraniteMoeSharedMLP(nn.Module):
 
 
 class GraniteMoeAttention(nn.Module):
-
     def __init__(
         self,
         config: GraniteConfig,
@@ -254,7 +252,6 @@ class GraniteMoeAttention(nn.Module):
 
 
 class GraniteMoeDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: GraniteConfig,
@@ -333,7 +330,6 @@ class GraniteMoeDecoderLayer(nn.Module):
 
 
 class GraniteMoeModel(nn.Module):
-
     def __init__(
         self,
         config: GraniteConfig,
@@ -389,7 +385,6 @@ class GraniteMoeModel(nn.Module):
 
 
 class GraniteMoeForCausalLM(nn.Module):
-
     # Legacy and current HF expert / router names with otherwise shared layout
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_suffix={

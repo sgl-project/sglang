@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
@@ -29,19 +29,6 @@ def apply_w8a8_block_int8_linear(
     if bias is not None:
         output = output + bias
     return output.to(dtype=input.dtype).view(*output_shape)
-
-
-def input_to_int8(
-    x: torch.Tensor, dtype: torch.dtype = torch.int8
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """This function quantizes input values to int8 values with tensor-wise quantization."""
-    iinfo = torch.iinfo(dtype)
-    min_val, max_val = x.aminmax()
-    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
-    int8_min, int8_max = iinfo.min, iinfo.max
-    scale = int8_max / amax
-    x_scl_sat = (x * scale).clamp(min=int8_min, max=int8_max)
-    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
 def block_dequant(
