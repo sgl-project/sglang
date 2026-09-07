@@ -97,7 +97,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 2",
+        "--tp 4",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
