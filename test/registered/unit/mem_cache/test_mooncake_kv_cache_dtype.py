@@ -150,7 +150,6 @@ def _make_config(
     extra_backend_tag=None,
     kv_cache_dtype=None,
     tenant_id=None,
-    kv_cache_dtype_isolation=None,
 ):
     extra_config = {
         "master_server_address": "127.0.0.1:50051",
@@ -161,8 +160,6 @@ def _make_config(
         extra_config["extra_backend_tag"] = extra_backend_tag
     if tenant_id is not None:
         extra_config["tenant_id"] = tenant_id
-    if kv_cache_dtype_isolation is not None:
-        extra_config["kv_cache_dtype_isolation"] = kv_cache_dtype_isolation
 
     return HiCacheStorageConfig(
         tp_rank=0,
@@ -218,47 +215,45 @@ class TestMooncakeKvCacheDtypeIsolation(CustomTestCase):
             ["page0_0_k", "page0_0_v"],
         )
 
-    def test_extra_backend_tag_includes_dtype(self):
+    def test_dtype_is_isolated_by_tenant_id(self):
         store_bf16, fake_bf16 = _make_store(kv_cache_dtype="bfloat16")
         store_fp8, fake_fp8 = _make_store(kv_cache_dtype="fp8_e4m3")
+
+        self.assertEqual(fake_bf16.setup_calls[0][1]["tenant_id"], "dtype_bfloat16")
+        self.assertEqual(fake_fp8.setup_calls[0][1]["tenant_id"], "dtype_fp8_e4m3")
 
         store_bf16.batch_set_v1(["page0"], torch.tensor([0]))
         store_fp8.batch_set_v1(["page0"], torch.tensor([0]))
 
         self.assertEqual(
             fake_bf16.batch_put_calls[0]["keys"],
-            ["dtype_bfloat16_page0_0_k", "dtype_bfloat16_page0_0_v"],
+            ["page0_0_k", "page0_0_v"],
         )
         self.assertEqual(
             fake_fp8.batch_put_calls[0]["keys"],
-            ["dtype_fp8_e4m3_page0_0_k", "dtype_fp8_e4m3_page0_0_v"],
-        )
-        self.assertNotEqual(
-            fake_bf16.batch_put_calls[0]["keys"], fake_fp8.batch_put_calls[0]["keys"]
+            ["page0_0_k", "page0_0_v"],
         )
 
-    def test_user_tag_and_dtype_are_both_applied(self):
+    def test_user_tag_is_independent_of_dtype_tenant(self):
         store, fake_store = _make_store(
             extra_backend_tag="prod", kv_cache_dtype="bfloat16"
         )
+        self.assertEqual(fake_store.setup_calls[0][1]["tenant_id"], "dtype_bfloat16")
         store.batch_set_v1(["page0"], torch.tensor([0]))
         self.assertEqual(
             fake_store.batch_put_calls[0]["keys"],
-            ["prod_dtype_bfloat16_page0_0_k", "prod_dtype_bfloat16_page0_0_v"],
+            ["prod_page0_0_k", "prod_page0_0_v"],
         )
 
-    def test_batch_exists_uses_dtype_tag(self):
+    def test_batch_exists_uses_unprefixed_keys_under_tenant(self):
         store, fake_store = _make_store(kv_cache_dtype="bfloat16")
-        fake_store.existing_keys.update(
-            ["dtype_bfloat16_page0_0_k", "dtype_bfloat16_page0_0_v"]
-        )
+        fake_store.existing_keys.update(["page0_0_k", "page0_0_v"])
         self.assertEqual(store.batch_exists(["page0"]), 1)
 
-    def test_tenant_isolation_puts_dtype_in_tenant_id(self):
+    def test_explicit_tenant_appends_dtype(self):
         store, fake_store = _make_store(
             tenant_id="tenant-a",
             kv_cache_dtype="bfloat16",
-            kv_cache_dtype_isolation="tenant",
         )
         self.assertEqual(
             fake_store.setup_calls[0][1]["tenant_id"],
@@ -270,20 +265,21 @@ class TestMooncakeKvCacheDtypeIsolation(CustomTestCase):
             ["page0_0_k", "page0_0_v"],
         )
 
-    def test_tenant_isolation_with_default_tenant(self):
-        store, fake_store = _make_store(
-            kv_cache_dtype="fp8_e4m3",
-            kv_cache_dtype_isolation="tenant",
-        )
-        self.assertEqual(fake_store.setup_calls[0][1]["tenant_id"], "dtype_fp8_e4m3")
-        store.batch_set_v1(["page0"], torch.tensor([0]))
-        self.assertEqual(
-            fake_store.batch_put_calls[0]["keys"], ["page0_0_k", "page0_0_v"]
-        )
+    def test_dtype_isolation_requires_mooncake_tenant_id(self):
+        OldMooncakeDistributedStore.instances = []
+        cfg = _make_config(kv_cache_dtype="bfloat16")
+        with patch.dict(
+            "sys.modules",
+            _import_stubs(OldMooncakeDistributedStore),
+        ):
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeStore,
+            )
 
-    def test_invalid_isolation_mode_raises(self):
-        with self.assertRaisesRegex(ValueError, "kv_cache_dtype_isolation"):
-            _make_store(kv_cache_dtype_isolation="unknown")
+            with self.assertRaisesRegex(
+                RuntimeError, "mooncake-transfer-engine>=0.3.12"
+            ):
+                MooncakeStore(cfg)
 
 
 class TestMooncakeTenantConfig(CustomTestCase):
