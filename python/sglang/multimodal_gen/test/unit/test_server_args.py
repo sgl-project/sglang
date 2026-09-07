@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.helios import (
+    HeliosDistilledConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
@@ -1595,6 +1598,13 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
+        self.assertEqual(sana_wm_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(sana_wm_deployment.keep_resident_components, ("dit", "vae"))
+
+        helios_deployment = HeliosDistilledConfig().get_model_deployment_config()
+        self.assertEqual(helios_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(helios_deployment.keep_resident_components, ("dit", "vae"))
+        self.assertEqual(helios_deployment.dit_layerwise_offload_modes, ("memory",))
 
         fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
         self.assertEqual(fast_hunyuan_deployment.keep_resident_min_available_gb, 60)
