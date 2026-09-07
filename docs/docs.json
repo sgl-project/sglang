@@ -1405,6 +1405,7 @@
                   {
                     "group": "OpenBMB",
                     "pages": [
+                      "cookbook/autoregressive/OpenBMB/MiniCPM5-2B",
                       "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_6"
                     ]
                   },

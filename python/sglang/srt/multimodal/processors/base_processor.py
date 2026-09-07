@@ -44,6 +44,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_mm,
     get_serving,
 )
@@ -735,7 +736,7 @@ class BaseMultimodalProcessor(ABC):
         preprocessing worker there is one more competitor for that device rather
         than added parallelism.
         """
-        if _is_cpu or self.server_args.rl_on_policy_target is not None:
+        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return False
         if self.disable_fast_image_processor:
             return False
@@ -771,7 +772,7 @@ class BaseMultimodalProcessor(ABC):
         tokenizer process each carry their own ``base_gpu_id``.
         """
         server_args = self.server_args
-        if _is_cpu or server_args.rl_on_policy_target is not None:
+        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return "cpu"
         if _is_xpu:
             return "xpu"

@@ -1107,6 +1107,15 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
                 )
             )
 
+    @property
+    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
+        """This pool's ids ARE virtual; page_size is 1, so the translate is the
+        plain gather this table serves, which keeps `mamba_translate_is_fusable`
+        true despite the override."""
+        if self.mamba_allocator is None:
+            return None
+        return self.mamba_allocator.virtual_to_physical
+
     def translate_mamba_indices(self, virtual_ids: torch.Tensor) -> torch.Tensor:
         """Virtual mamba ids -> physical slot ids."""
         return self.mamba_allocator.translate(virtual_ids).to(torch.int32)

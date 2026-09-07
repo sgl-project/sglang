@@ -44,7 +44,9 @@ STARTUP_OVERHEAD_SECONDS = 120.0
 # Paths relative to repository root
 BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines"
 BASELINE_PLATFORM_ORDER = ("h100", "b200", "5090")
-RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
+RUN_SUITE_REL_PATH = (
+    "python/sglang/multimodal_gen/test/runner/diffusion_suite_runner.py"
+)
 
 USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
 
