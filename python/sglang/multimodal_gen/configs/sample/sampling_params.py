@@ -136,6 +136,58 @@ def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150)
     return ascii_name
 
 
+_SEQUENCE_SHARD_PIPELINE_FAMILIES = ("wan", "helios", "joy", "cosmos3")
+
+
+def resolve_sequence_shard(
+    pipeline_config: Any, enable_sequence_shard: bool | None
+) -> bool:
+    """Whether this pipeline shards the sequence dim instead of aligning frames.
+
+    Shared by ``SamplingParams._adjust_visual_fields`` and the synthetic
+    warmup builder so warmup requests follow the same frame contract as real
+    requests.
+    """
+    pipeline_name_lower = pipeline_config.__class__.__name__.lower()
+    return any(
+        family in pipeline_name_lower for family in _SEQUENCE_SHARD_PIPELINE_FAMILIES
+    ) and (enable_sequence_shard is None or enable_sequence_shard)
+
+
+def align_num_frames_for_num_gpus(
+    num_frames: int,
+    *,
+    num_gpus: int,
+    vae_config: Any,
+    round_down: bool,
+) -> int:
+    """Align the latent frame count to be divisible by ``num_gpus``."""
+    if num_gpus <= 1:
+        return num_frames
+    use_temporal_scaling_frames = vae_config.use_temporal_scaling_frames
+    temporal_scale_factor = vae_config.arch_config.temporal_compression_ratio
+
+    if use_temporal_scaling_frames:
+        orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
+    else:
+        orig_latent_num_frames = num_frames
+
+    if orig_latent_num_frames % num_gpus == 0:
+        return num_frames
+
+    if round_down:
+        # Ensure we have at least 1 batch per GPU
+        new_latent_num_frames = max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+    else:
+        new_latent_num_frames = math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+
+    if use_temporal_scaling_frames:
+        # Convert back to frames, keeping num_frames-1 a multiple of the
+        # temporal scale factor
+        return (new_latent_num_frames - 1) * temporal_scale_factor + 1
+    return new_latent_num_frames
+
+
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
@@ -792,14 +844,9 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
-        pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
-
-        if (
-            "wan" in pipeline_name_lower
-            or "helios" in pipeline_name_lower
-            or "joy" in pipeline_name_lower
-            or "cosmos3" in pipeline_name_lower
-        ) and (self.enable_sequence_shard is None or self.enable_sequence_shard):
+        if resolve_sequence_shard(
+            server_args.pipeline_config, self.enable_sequence_shard
+        ):
             self.enable_sequence_shard = True
             logger.debug("Automatically enabled enable_sequence_shard")
         else:
@@ -832,43 +879,13 @@ class SamplingParams:
             )
 
             if self.adjust_frames:
-                # Adjust number of frames based on number of GPUs for video task
-                use_temporal_scaling_frames = (
-                    pipeline_config.vae_config.use_temporal_scaling_frames
+                new_num_frames = align_num_frames_for_num_gpus(
+                    self.num_frames,
+                    num_gpus=server_args.num_gpus,
+                    vae_config=pipeline_config.vae_config,
+                    round_down=self.num_frames_round_down,
                 )
-                num_frames = self.num_frames
-                num_gpus = server_args.num_gpus
-                temporal_scale_factor = (
-                    pipeline_config.vae_config.arch_config.temporal_compression_ratio
-                )
-
-                if use_temporal_scaling_frames:
-                    orig_latent_num_frames = (
-                        num_frames - 1
-                    ) // temporal_scale_factor + 1
-                else:
-                    orig_latent_num_frames = num_frames
-
-                if orig_latent_num_frames % server_args.num_gpus != 0:
-                    # Adjust latent frames to be divisible by number of GPUs
-                    if self.num_frames_round_down:
-                        # Ensure we have at least 1 batch per GPU
-                        new_latent_num_frames = (
-                            max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
-                        )
-                    else:
-                        new_latent_num_frames = (
-                            math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
-                        )
-
-                    if use_temporal_scaling_frames:
-                        # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
-                        new_num_frames = (
-                            new_latent_num_frames - 1
-                        ) * temporal_scale_factor + 1
-                    else:
-                        new_num_frames = new_latent_num_frames
-
+                if new_num_frames != self.num_frames:
                     logger.info(
                         "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
                         self.num_frames,
