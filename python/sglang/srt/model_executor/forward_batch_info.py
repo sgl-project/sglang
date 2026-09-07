@@ -491,6 +491,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
+    watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -844,6 +846,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            watermark_prompt_tail_ids=(
+                model_runner.watermark_state.prompt_tails(batch)
+                if model_runner.watermark_state is not None
+                else None
+            ),
+            watermark_context_hash_history=(
+                model_runner.watermark_state.retracted_context_hashes(batch)
+                if model_runner.watermark_state is not None
+                else None
+            ),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,

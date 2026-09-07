@@ -375,6 +375,7 @@ class CompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+    watermark: Optional[Dict[str, Any]] = None
 
     images_config: Optional[Dict] = None
 
@@ -942,6 +943,7 @@ class ChatCompletionRequest(BaseModel):
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+    watermark: Optional[Dict[str, Any]] = None
 
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens
@@ -1142,6 +1144,7 @@ class ChatCompletionRequest(BaseModel):
             "custom_params": self.custom_params,
             "sampling_seed": self.seed,
             "spaces_between_special_tokens": spaces_between_special_tokens,
+            "watermark": self.watermark,
         }
 
         if self.response_format and self.response_format.type == "json_schema":

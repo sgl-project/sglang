@@ -19,6 +19,11 @@ from typing import Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
+from sglang.srt.sampling.watermark import (
+    WatermarkRequestConfig,
+    normalize_watermark_request,
+)
+
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
 try:
     import re._parser as sre_parse
@@ -152,6 +157,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
+    watermark: Optional[WatermarkRequestConfig] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -205,6 +211,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.no_stop_trim = (
             self.no_stop_trim if self.no_stop_trim is not None else False
         )
+        self.watermark = normalize_watermark_request(self.watermark)
 
         # An empty grammar constraint means "unset", not "constrain to nothing".
         self.json_schema = self.json_schema or None
