@@ -26,7 +26,7 @@ v0.5.16 or a later version.
 | Expert Parallelism            | `--moe-a2a-backend deepep \`<br/>`--deepep-mode low_latency`                                   |
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`              |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs`; e.g., `--cuda-graph-bs 1 2 4 8 12 16 20 24 28 32` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 1 2 4 8 12 16 20 24 28 32` |
 | Speculative Decoding          | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--enable-multi-layer-eagle` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
