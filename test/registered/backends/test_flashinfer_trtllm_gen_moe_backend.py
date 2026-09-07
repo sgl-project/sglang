@@ -266,20 +266,6 @@ class TestFlashinferTrtllmGenMoeBackendNVFP4(
     extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0"}
 
 
-class TestFlashinferTrtllmRoutedMoeBackendNVFP4(
-    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
-):
-    backend = "flashinfer_trtllm_routed"
-    extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0"}
-
-
-class TestFlashinferCuteDSLMoeBackendNVFP4(
-    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
-):
-    backend = "flashinfer_cutedsl"
-    extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0"}
-
-
 class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
     FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
 ):

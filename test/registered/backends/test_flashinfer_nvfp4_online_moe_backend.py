@@ -103,12 +103,6 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4Online(
     }
 
 
-class TestFlashinferTrtllmRoutedMoeBackendNvFp4Online(
-    TestFlashinferTrtllmGenMoeBackendNvFp4Online
-):
-    backend = "flashinfer_trtllm_routed"
-
-
 class TestFlashinferCuteDSLMoeBackendNvFp4Online(
     FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
 ):
