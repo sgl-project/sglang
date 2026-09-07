@@ -36,7 +36,6 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
-import functools
 import logging
 import tempfile
 import uuid
@@ -482,7 +481,14 @@ class ServerArgs:
         # the record exists to remember, and the decision it meant to record
         # belongs in the stash, where it carries a source and does not destroy
         # the input it was derived from.
-        if not name.startswith("_") or name in _underscore_field_names():
+        # Underscore names are the record's own bookkeeping -- `_input_frozen`,
+        # `_raw_input`, `_resolved_overrides`, the memo slots -- and resolution
+        # writes those on purpose. No *field* starts with an underscore, which
+        # is what makes this spelling test sufficient;
+        # `test_no_field_starts_with_an_underscore` fails if that stops being
+        # true, because then a field would be silently writable during
+        # resolution.
+        if not name.startswith("_"):
             if getattr(self, "_input_frozen", False):
                 raise AttributeError(
                     f"server_args.{name} assigned during resolution; the record "
@@ -609,24 +615,6 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 # for the existing call-sites; they publish/read the same live object by
 # reference. Do not add new call-sites.
 # Imports are in-function so the two modules stay cycle-free at import time.
-@functools.lru_cache(maxsize=1)
-def _underscore_field_names() -> frozenset:
-    """Real dataclass fields whose names start with an underscore.
-
-    The read-only guard exempts underscore names because they are the record's
-    own bookkeeping (the stash, the flags, the cache keys). A *field* that
-    happens to start with an underscore is still configuration, and exempting
-    it by spelling would leave a leaf writable on a read-only record. There is
-    no such field today; the split stays on field-ness rather than spelling so
-    that adding one is not a silent hole.
-    """
-    return frozenset(
-        field.name
-        for field in dataclasses.fields(ServerArgs)
-        if field.name.startswith("_")
-    )
-
-
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
     ``runtime_context.publish(server_args, role=...)`` in new code."""

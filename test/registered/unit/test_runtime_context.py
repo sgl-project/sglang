@@ -411,22 +411,25 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         )
         self.assertEqual(mamba_cache_chunk_size_of(published), 64)
 
-    def test_the_field_split_is_not_by_leading_underscore(self):
-        """`override_server_args` splits on field-ness, not on spelling.
+    def test_no_field_starts_with_an_underscore(self):
+        """What lets the record's write seal test the spelling.
 
-        No `ServerArgs` field starts with an underscore today. If one is added,
-        seeding it as a raw attribute instead of declaring it would leave the
-        earlier resolution authoritative, so the resolution and the bag would
-        keep answering the pre-override value while the record said otherwise.
-        An unknown underscore name is therefore rejected, not quietly seeded.
+        `__setattr__` seals every name that does not start with an underscore,
+        because the underscore ones are the record's own bookkeeping and
+        resolution writes them on purpose. That is only sufficient while no
+        *field* is spelled that way -- one that is would be silently writable
+        during resolution, which is the single thing the seal exists to stop.
         """
-        from sglang.srt.server_args import _underscore_field_names
-
-        spelled = {n for n in ServerArgs.__dataclass_fields__ if n.startswith("_")}
-        self.assertEqual(_underscore_field_names(), spelled)
-        # None today -- the point is that the set is derived, so adding one is
-        # covered without anyone remembering to widen a hand-written list.
-        self.assertEqual(spelled, set())
+        underscore_fields = sorted(
+            n for n in ServerArgs.__dataclass_fields__ if n.startswith("_")
+        )
+        self.assertEqual(
+            underscore_fields,
+            [],
+            "a field now starts with an underscore, so the write seal in "
+            "ServerArgs.__setattr__ no longer covers it; seal on field-ness "
+            "rather than spelling, or rename the field",
+        )
 
     def test_installed_config_arms_the_strict_guard(self):
         # The published dummy must behave like a resolved config: bare writes
