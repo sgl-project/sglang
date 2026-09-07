@@ -24,8 +24,8 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096, num_prompts: 8192 },
         ttft_ms: 555688.12, tpot_ms: 119.86, tokens_per_sec_per_gpu: 12296 },
     ],
-    accuracy: { mmmu_pro_pct: 77.86 },
-    notes: "4×GB300, TP=4. Speed: bench_serving --flush-cache, temperature 0; tok/s/GPU = total (input + output) token throughput ÷ 4. HT columns are queue-dominated (KDA state cache caps concurrent requests at 935 on this cell) — judge HT by TPOT/throughput, not TTFT. Image workload (one 720p JPEG per request, +883 vision tokens, in/out=1024/1024): conc 1: TTFT 320.99 ms, TPOT 3.91 ms, 173 tok/s/GPU; conc 16: TTFT 1490.73 ms, TPOT 6.53 ms, 1381 tok/s/GPU; conc 64: TTFT 3279.24 ms, TPOT 12.67 ms, 2996 tok/s/GPU; conc 128: TTFT 6887.76 ms, TPOT 15.56 ms, 4226 tok/s/GPU. Accuracy: MMMU-Pro (sgl-eval, 1730 examples, single-shot, thinking on, temperature 0 / top-p 0.95) measured at 2×GB300 TP=2, stop rate 99.65%.",
+    accuracy: { mmmu_pro_pct: 75.78 },
+    notes: "4×GB300, TP=4. Speed: bench_serving --flush-cache, temperature 0; tok/s/GPU = total (input + output) token throughput ÷ 4. HT columns are queue-dominated (KDA state cache caps concurrent requests at 935 on this cell) — judge HT by TPOT/throughput, not TTFT. Image workload (one 720p JPEG per request, +883 vision tokens, in/out=1024/1024): conc 1: TTFT 320.99 ms, TPOT 3.91 ms, 173 tok/s/GPU; conc 16: TTFT 1490.73 ms, TPOT 6.53 ms, 1381 tok/s/GPU; conc 64: TTFT 3279.24 ms, TPOT 12.67 ms, 2996 tok/s/GPU; conc 128: TTFT 6887.76 ms, TPOT 15.56 ms, 4226 tok/s/GPU. Accuracy: MMMU-Pro (sgl-eval, 1730 examples, single-shot, thinking on, temperature 0 / top-p 0.95) measured on this recipe, stop rate 99.08%. The same checkpoint measured 77.86% at 2×GB300 TP=2 and 76.71% at 4×H200 TP=4.",
   },
   {
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
