@@ -119,3 +119,30 @@ class XPUAttentionImpl(AttentionImpl):
 
         result = out.reshape(bsz, seqlen_q, nheads_q, d)
         return result
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_host
+        q_ = query.contiguous()
+        k_ = key.contiguous()
+        v_ = value.contiguous()
+        output = flash_attn_func(
+            q=q_,
+            k=k_,
+            v=v_,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+        )
+        return output[0] if isinstance(output, tuple) else output

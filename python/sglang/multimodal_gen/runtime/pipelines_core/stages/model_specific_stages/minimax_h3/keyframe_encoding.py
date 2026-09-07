@@ -48,6 +48,7 @@ def minimax_h3_scoped_encode_rng(seed: int, device: torch.device | None = None):
         current_platform.is_cuda()
         or current_platform.is_rocm()
         or current_platform.is_npu()
+        or current_platform.is_xpu()
     )
     if (
         device is not None
