@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from functools import lru_cache
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
 # Direct-encode text embeddings: {"positive":
 #   {"hidden_states": Tensor[text_len, 5120] bf16 cpu, "text_len": int}}
 MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY = "minimax_h3_text_embeddings"
@@ -23,6 +29,28 @@ MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY = "minimax_h3_prepared_reference_v
 MINIMAX_H3_SUPPORTED_FPS = 24
 MINIMAX_H3_MIN_DURATION_SECONDS = 4.0
 MINIMAX_H3_MAX_DURATION_SECONDS = 15.0
+
+# The short edge every published MiniMax recipe and every reference output uses.
+# The shape math itself is generic -- it scales the requested short edge by the
+# aspect ratio, clamps to the pixel budget and rounds to the canvas multiple --
+# so other values resolve to a valid canvas and generate. They are just not what
+# the checkpoint was tuned and measured on.
+MINIMAX_H3_RECOMMENDED_SHORT_EDGE = 768
+
+
+@lru_cache(maxsize=None)
+def warn_unverified_short_edge(short_edge: int) -> None:
+    """Warn once per distinct value; requests repeat, the caveat does not."""
+    logger.warning(
+        "MiniMax H3 target.short_edge=%d is outside the verified configuration: "
+        "%d is the only short edge MiniMax publishes recipes and reference "
+        "outputs for. Smaller edges cost proportionally less memory and time; "
+        "quality and prompt adherence at this size are not covered by any "
+        "MiniMax or SGLang measurement.",
+        short_edge,
+        MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
+    )
+
 
 # The distilled checkpoint has exactly one positive denoise branch.
 MINIMAX_H3_DEFAULT_BRANCHES: tuple = ({"name": "cond_1"},)

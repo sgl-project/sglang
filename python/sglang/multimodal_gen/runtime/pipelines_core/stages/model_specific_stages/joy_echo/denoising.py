@@ -515,7 +515,9 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
             ]
 
         with self._ltx2_model_forward_context(ctx, step):
-            model_video, model_audio = step.current_model(**model_kwargs)
+            model_video, model_audio = self._ltx2_call_current_model(
+                ctx, step, model_kwargs
+            )
 
         if memory_meta:
             memory_video_len = memory_meta["memory_video_len"]

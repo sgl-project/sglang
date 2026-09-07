@@ -94,3 +94,98 @@ def alloc_bind_inplace(
         BLOCK=ALLOC_BIND_BLOCK,
     )
     return phys_pages
+
+
+@triton.jit
+def free_unbind_inplace_kernel(
+    v_pages_ptr,  # in: [N] int64 — virtual page ids being freed
+    v2p_ptr,  # in/out: int64 — virtual_to_physical table
+    p2v_ptr,  # in/out: int64 — physical_to_virtual table
+    out_phys_ptr,  # out: [N] int64 — physical page ids released
+    N,  # runtime: number of pages to free
+    BLOCK: tl.constexpr,
+):
+    """Fused inverse of `alloc_bind_inplace_kernel`: v2p read + both tombstones.
+
+    Each lane owns one virtual page, so the read-then-tombstone of `v2p[v]` has
+    no cross-lane dependency. That holds only because the caller's ids are
+    unique (`_free_lazy` dedups at ps>1 and takes uniqueness from its contract
+    at ps==1); duplicates would race on `p2v[p]`.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+
+    v = tl.load(v_pages_ptr + offs, mask=mask, other=0).to(tl.int64)
+    p = tl.load(v2p_ptr + v, mask=mask, other=0).to(tl.int64)
+
+    tl.store(out_phys_ptr + offs, p, mask=mask)
+    tl.store(v2p_ptr + v, -1, mask=mask)
+    tl.store(p2v_ptr + p, -1, mask=mask)
+
+
+@triton.jit
+def bind_inplace_kernel(
+    v_pages_ptr,  # in: [N] int64 — virtual page ids
+    p_pages_ptr,  # in: [N] int64 — physical page ids to bind them to
+    v2p_ptr,  # in/out: int64
+    p2v_ptr,  # in/out: int64
+    N,  # runtime: number of pages
+    BLOCK: tl.constexpr,
+):
+    """`alloc_bind_inplace_kernel` for a caller-supplied physical range.
+
+    The fast path generates an ascending range in-kernel; the hole-draining
+    slow path already holds the physical ids, so it passes them instead.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+
+    v = tl.load(v_pages_ptr + offs, mask=mask, other=0).to(tl.int64)
+    p = tl.load(p_pages_ptr + offs, mask=mask, other=0).to(tl.int64)
+
+    tl.store(v2p_ptr + v, p, mask=mask)
+    tl.store(p2v_ptr + p, v, mask=mask)
+
+
+def free_unbind_inplace(
+    v_pages: torch.Tensor,
+    v2p: torch.Tensor,
+    p2v: torch.Tensor,
+) -> torch.Tensor:
+    """Tombstone `v_pages` in both tables and return the physical pages freed."""
+    N = int(v_pages.numel())
+    if N == 0:
+        return torch.empty(0, dtype=torch.int64, device=v_pages.device)
+    v = v_pages.to(torch.int64)
+    if not v_pages.is_cuda:
+        # Pure-torch CPU reference for the CUDA-only kernel.
+        phys_pages = v2p[v].clone()
+        v2p.index_fill_(0, v, -1)
+        p2v.index_fill_(0, phys_pages, -1)
+        return phys_pages
+    phys_pages = torch.empty(N, dtype=torch.int64, device=v_pages.device)
+    grid = (triton.cdiv(N, ALLOC_BIND_BLOCK),)
+    free_unbind_inplace_kernel[grid](v, v2p, p2v, phys_pages, N, BLOCK=ALLOC_BIND_BLOCK)
+    return phys_pages
+
+
+def bind_inplace(
+    v_pages: torch.Tensor,
+    p_pages: torch.Tensor,
+    v2p: torch.Tensor,
+    p2v: torch.Tensor,
+) -> None:
+    """Bind `v_pages` to `p_pages` in both tables."""
+    N = int(v_pages.numel())
+    if N == 0:
+        return
+    v = v_pages.to(torch.int64)
+    p = p_pages.to(torch.int64)
+    if not v_pages.is_cuda:
+        v2p[v] = p
+        p2v[p] = v
+        return
+    grid = (triton.cdiv(N, ALLOC_BIND_BLOCK),)
+    bind_inplace_kernel[grid](v, p, v2p, p2v, N, BLOCK=ALLOC_BIND_BLOCK)

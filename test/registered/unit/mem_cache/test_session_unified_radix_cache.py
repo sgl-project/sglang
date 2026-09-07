@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import ast
 import unittest
@@ -166,7 +166,6 @@ def register(cache, token_ids, session_id, generation=None):
             ).last_device_node,
             origin_input_ids=array("q", token_ids),
             output_ids=array("q"),
-            kv_committed_len=len(token_ids),
             extra_key=None,
         )
     )

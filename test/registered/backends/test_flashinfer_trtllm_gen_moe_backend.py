@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1770, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1770, stage="weekly", runner_config="4-gpu-b200")
 
 
 class FlashinferTrtllmGenMoeBackendFP8Base:
@@ -273,12 +273,6 @@ class TestFlashinferTrtllmGenMoeBackendBF16Routed(
     backend = "flashinfer_trtllm_routed"
 
 
-@unittest.skip(
-    "flashinfer-ai/flashinfer#4486: on SM100/SM103 the TRTLLM_GEN tile-192 BMM "
-    "path returns non-finite MoE output from FlashInfer 0.6.16.post4 on, so the "
-    "first real prefill trips the sampler NaN assert and gsm8k scores 0.0. "
-    "See #34629 for the package bisect."
-)
 class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRouted(
     FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
 ):

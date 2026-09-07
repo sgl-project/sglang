@@ -21,11 +21,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=685, suite="stage-a-tp-test-cpu-intel")
 
 
 class TestIntelAMXAttnBackend(CustomTestCase):
-
     @intel_amx_benchmark(
         extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
         min_throughput=10,
@@ -34,7 +33,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
         return DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
     @intel_amx_benchmark(
-        extra_args=["--batch-size", "4", "--mem-fraction-static", "0.1"],
+        extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
         min_throughput=40,
     )
     def test_latency_default_model(self):
@@ -84,7 +83,7 @@ class TestDPAttention(CustomTestCase):
             "--attention-backend",
             "intel_amx",
             "--mem-fraction-static",
-            "0.1",
+            "0.3",
             "--disable-overlap-schedule",
             "--tp",
             "2",

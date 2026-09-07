@@ -17,7 +17,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import gated_delta_rule_mtp
+from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import (
+    _select_wide_vec_phase_b_unroll,
+    gated_delta_rule_mtp,
+)
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
     commit_gdn_replayssm_fold_all_layers,
@@ -25,7 +28,7 @@ from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=23, stage="base-b", runner_config="1-gpu-large")
 
 T, H, HV, K, V, SLOTS = 4, 4, 16, 128, 128, 16
 DEVICE = "cuda"
@@ -86,6 +89,15 @@ def _verify(gating, inputs, state, slots, rings=None, disable_state_update=True)
 
 
 class TestGdnCuteDSLRingVerify(CustomTestCase):
+    def test_phase_b_unroll_selector(self):
+        select = _select_wide_vec_phase_b_unroll
+        for seq_len in range(3, 9):
+            with self.subTest(seq_len=seq_len, cache_ring=True):
+                self.assertEqual(select(seq_len, cache_ring=True), 2)
+        for seq_len, cache_ring in ((2, True), (9, True), (6, False)):
+            with self.subTest(seq_len=seq_len, cache_ring=cache_ring):
+                self.assertEqual(select(seq_len, cache_ring=cache_ring), 1)
+
     def _run(self, B):
         gating, inputs, state0, slots, rings = _case(B)
 

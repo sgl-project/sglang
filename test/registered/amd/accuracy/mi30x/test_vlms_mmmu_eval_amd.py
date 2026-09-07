@@ -172,14 +172,14 @@ class TestNightlyVLMMmmuEvalAMD(unittest.TestCase):
         all_results = []
         total_test_start = time.time()
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("AMD VLM MMMU Evaluation Test")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"Benchmark: MMMU (100 samples)")
         print(f"Models to test: {len(self.models)}")
         for m in self.models:
             print(f"  - {m['model_path']} (TP={m['tp_size']})")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
 
         for model_config in self.models:
             model_path = model_config["model_path"]
@@ -189,9 +189,9 @@ class TestNightlyVLMMmmuEvalAMD(unittest.TestCase):
             error_message = None
 
             with self.subTest(model=model_path):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {model_path} (TP={tp_size})")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 model_start = time.time()
                 startup_time = None
@@ -358,21 +358,21 @@ class TestNightlyVLMMmmuEvalAMD(unittest.TestCase):
 
             summary += f"| {model} | {tp_size} | {score_str} | {threshold:.2f} | {startup_str} | {eval_str} | {total_str} | {status} |\n"
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("SUMMARY - AMD VLM MMMU Evaluation")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(summary)
         print(f"\n📊 Final Statistics:")
         print(f"   Passed: {passed_count}")
         print(f"   Failed: {failed_count}")
         print(
-            f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time/60:.1f} min)"
+            f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time / 60:.1f} min)"
         )
 
         if is_in_ci():
             write_github_step_summary(
                 f"### TestNightlyVLMMmmuEvalAMD\n{summary}\n\n"
-                f"**Total Runtime:** {total_test_time:.1f}s ({total_test_time/60:.1f} min)"
+                f"**Total Runtime:** {total_test_time:.1f}s ({total_test_time / 60:.1f} min)"
             )
 
         if failed_models:

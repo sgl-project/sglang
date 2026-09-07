@@ -10,11 +10,11 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import build_flat_input_top_logprobs_arrays
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
 
 logger = logging.getLogger(__name__)
 

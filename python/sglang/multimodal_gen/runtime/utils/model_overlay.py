@@ -17,6 +17,7 @@ from huggingface_hub.errors import (
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.utils import load_diffusion_overlay_registry_from_env
@@ -40,6 +41,10 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     "Efficient-Large-Model/SANA-WM_streaming": {
         "overlay_repo_id": "AgainstEntropy/SANA-WM_streaming-overlay",
         "overlay_revision": "62c6840871ecc3559189047513ba0670e1bf62e7",
+    },
+    "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree": {
+        "overlay_repo_id": "kevin-mi/FastH3-4step-Preview-overlay",
+        "overlay_revision": "f769cb8001dae335089de7b250364335bc7cb183",
     },
 }
 
@@ -106,9 +111,7 @@ def _resolve_bundled_overlay_dir(overlay_spec: dict[str, Any]) -> str | None:
 
 
 def get_diffusion_cache_root() -> str:
-    return os.path.expanduser(
-        os.getenv("SGLANG_DIFFUSION_CACHE_ROOT", "~/.cache/sgl_diffusion")
-    )
+    return envs.SGLANG_DIFFUSION_CACHE_ROOT
 
 
 def clear_model_overlay_registry_cache() -> None:

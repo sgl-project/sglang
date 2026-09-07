@@ -35,7 +35,7 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
         default_factory=lambda: (CLIPTextConfig(),)
     )
     text_encoder_precisions: tuple[str, ...] = ("fp16",)
-    native_only_components = ("delight_text_encoder",)
+    native_only_components: tuple[str, ...] = ("delight_text_encoder",)
 
     # Shape model configuration
     shape_model_path: Optional[str] = None

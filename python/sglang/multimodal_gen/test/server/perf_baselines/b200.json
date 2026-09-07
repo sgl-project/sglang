@@ -11,14 +11,18 @@
             "denoise_stage": 0.1,
             "non_denoise_stage": 0.5,
             "denoise_step": 0.25,
-            "denoise_agg": 0.15
+            "denoise_agg": 0.15,
+            "load_peak_vram": 0.01,
+            "runtime_peak_vram": 0.02
         },
         "pr_test": {
             "e2e": 0.25,
             "denoise_stage": 0.25,
             "non_denoise_stage": 0.8,
             "denoise_step": 0.3,
-            "denoise_agg": 0.2
+            "denoise_agg": 0.2,
+            "load_peak_vram": 0.01,
+            "runtime_peak_vram": 0.02
         }
     },
     "improvement_reporting": {

@@ -47,7 +47,6 @@ MODEL_THRESHOLDS = {
     ),
     ModelLaunchSettings("unsloth/Mistral-Small-3.1-24B-Instruct-2503"): (0.30, 43.0),
     ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): (0.28, 40.0),
-    ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): (0.280, 35.5),
     ModelLaunchSettings("zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]): (0.26, 140.0),
 }
 

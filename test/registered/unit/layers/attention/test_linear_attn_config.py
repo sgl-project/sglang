@@ -25,7 +25,7 @@ from sglang.srt.layers.attention.linear.utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _Runner:
@@ -120,11 +120,11 @@ class TestLinearAttnBackends(CustomTestCase):
 
         from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 
+        # The draft-token width is a bag leaf read before the stamp.
+        self._publish(speculative_eagle_topk=0)
         runner = SimpleNamespace(
             device="cpu",
-            server_args=SimpleNamespace(
-                speculative_eagle_topk=0, enable_unified_memory=False
-            ),
+            server_args=SimpleNamespace(enable_unified_memory=False),
             is_draft_worker=False,
             req_to_token_pool=SimpleNamespace(
                 mamba_pool=SimpleNamespace(
