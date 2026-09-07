@@ -35,8 +35,8 @@ pip install --upgrade pip
 pip install uv
 uv pip install --prerelease=allow sglang
 uv pip install --force-reinstall torch==2.13.0 torchaudio==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu129
-uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/
-uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
+uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.io/whl/cu129/
+uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.io/whl/cu129/ --no-deps
 ```
 
 ### Nightly builds
@@ -46,14 +46,14 @@ To pick up the latest features and fixes before the next stable release, install
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu130/ sglang
+uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.io/whl/cu130/ sglang
 ```
 
 To install a nightly build under Cuda 12, swap the index to `cu129`:
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu129/ sglang
+uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.io/whl/cu129/ sglang
 ```
 
 ### Quick fixes to common problems
