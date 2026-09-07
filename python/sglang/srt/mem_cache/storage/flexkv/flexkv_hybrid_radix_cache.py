@@ -178,9 +178,16 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         if params.req is not None and self.has_uncommitted_restore(params.req):
-            raise RuntimeError(
-                f"FlexKV prefix rematch before restore commit: rid={params.req.rid}"
+            # Read-only path, and the decode-disagg rematch sites are not
+            # guarded, so degrade to the inner cache's device-only match
+            # instead of failing the engine. Starting another FlexKV lookup
+            # would overwrite the connector's rid-keyed pending task and
+            # strand the leased slots. Mirrors FlexKVRadixCache.match_prefix.
+            logger.warning(
+                "Skipping FlexKV lookup for uncommitted restore rid=%s",
+                params.req.rid,
             )
+            return self._inner_cache.match_prefix(params)
         result = self._inner_cache.match_prefix(params)
         if self.disable or params.req is None:
             return result
@@ -215,6 +222,13 @@ class FlexKVHybridRadixCache(BasePrefixCache):
     def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, Any]:
         req = params.req
         if req.rid in self._restore_leases:
+            # Engine-fatal on purpose: unlike match_prefix, this path allocates
+            # slots and starts a DMA. A second restore for a request that still
+            # owns leased slots would leave two writers on one region and
+            # overwrite the connector's rid-keyed task, so there is no safe
+            # local degrade. The scheduler guarantees this cannot happen
+            # (admission rejection runs before init_load_back), so reaching
+            # here means that contract broke.
             raise RuntimeError(f"FlexKV load-back before restore commit: rid={req.rid}")
 
         marker = self._load_markers.pop(req.rid, None)
@@ -254,12 +268,21 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         # normally return either the entire mapping or zero.
         if loaded != device_indices.numel():
             if self.flexkv_connector.enable_layerwise and loaded > 0:
-                # A count is not a completion fence for an asynchronous writer.
-                # Keep the whole mapping until reset drains the connector.
+                # A count is not a completion fence for an asynchronous writer,
+                # so there is no safe local recovery: freeing risks handing a
+                # live H2D target to the next allocator client, and continuing
+                # risks serving a partially written prefix. Fail loud -- a
+                # layerwise launch reports either 0 or the full count, so
+                # reaching here means FlexKV changed under us.
+                #
+                # NOTE: engine-fatal (the scheduler loop has no handler). The
+                # lease is left registered for post-mortem, not as a recovery
+                # path: reset() is only reachable via the flush_cache RPC,
+                # which this raise prevents from ever being served.
                 raise RuntimeError(
                     "Unexpected layerwise restore length: "
                     f"rid={req.rid}, retrieved={loaded}, "
-                    f"requested={device_indices.numel()}; slots retained until reset"
+                    f"requested={device_indices.numel()}; slots cannot be proven idle"
                 )
             self._free_restore_lease(lease)
             return self._empty_indices(), req.last_node
@@ -287,14 +310,34 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         # lookup would overwrite connector state owned by the first request.
         return req.rid in self._restore_leases
 
+    @staticmethod
+    def _restore_lease_matches_req(req: Req, lease: _RestoreLease) -> bool:
+        """Whether ``req`` is the exact owner recorded in ``lease``."""
+        return (
+            lease.req is req
+            and getattr(req, "pending_restore_generation", None) == lease.generation
+            and getattr(req, "pending_restore_slots", None) is lease.device_indices
+        )
+
     def _validate_restore_lease(self, req: Req) -> Optional[_RestoreLease]:
+        """Return this request's lease, or None if there is none to act on.
+
+        A mismatch is reported and treated as "no lease": this runs from the
+        normal request-completion path, so failing the engine over it would
+        turn a bookkeeping inconsistency into an outage. The lease stays
+        registered and reset() reclaims the slots.
+        """
         lease = self._restore_leases.get(req.rid)
-        if lease is not None and (
-            lease.req is not req
-            or getattr(req, "pending_restore_generation", None) != lease.generation
-            or getattr(req, "pending_restore_slots", None) is not lease.device_indices
-        ):
-            raise RuntimeError(f"FlexKV restore lease mismatch: rid={req.rid}")
+        if lease is None:
+            return None
+        if not self._restore_lease_matches_req(req, lease):
+            logger.error(
+                "FlexKV restore lease mismatch rid=%s lease_gen=%s req_gen=%s",
+                req.rid,
+                lease.generation,
+                getattr(req, "pending_restore_generation", None),
+            )
+            return None
         return lease
 
     def _commit_restore(self, req: Req) -> None:
@@ -308,20 +351,31 @@ class FlexKVHybridRadixCache(BasePrefixCache):
     def _free_restore_lease(self, lease: _RestoreLease) -> None:
         tracked = self._restore_leases.get(lease.req.rid)
         if tracked is not lease:
+            # Internal inconsistency: this is the only path that reclaims
+            # leased slots, so a silent skip would leak them permanently.
             raise RuntimeError(
                 "FlexKV restore lease changed before free: "
                 f"rid={lease.req.rid} generation={lease.generation}"
             )
-        self._validate_restore_lease(lease.req)
+        # Free first, then reconcile the request-side fields: a stale Req
+        # generation must not stop us reclaiming the slots.
         self.token_to_kv_pool_allocator.free(lease.device_indices)
         self._restore_leases.pop(lease.req.rid)
-        lease.req.pending_restore_generation = None
-        lease.req.pending_restore_slots = None
+        if self._restore_lease_matches_req(lease.req, lease):
+            lease.req.pending_restore_generation = None
+            lease.req.pending_restore_slots = None
         lease.req._flexkv_uncached_restore = False
 
     def _free_uncommitted_restores(self) -> None:
         for lease in list(self._restore_leases.values()):
-            self._free_restore_lease(lease)
+            try:
+                self._free_restore_lease(lease)
+            except Exception:
+                # One bad lease must not abandon the rest of the pool.
+                logger.exception(
+                    "FlexKV failed to release restore lease rid=%s", lease.req.rid
+                )
+                self._restore_leases.pop(lease.req.rid, None)
 
     def _alloc_restore_slots(
         self, req: Req, host_hit_length: int
@@ -659,11 +713,29 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._load_markers.pop(rid, None)
         self.flexkv_connector.release_pending(rid)
         self.flexkv_connector.cancel_prefetch(rid)
-        # Do not free an active restore here. Scheduled aborts immediately flow
-        # through cache_finished_req(is_insert=False), which transfers/frees the
-        # request slots before committing the lease. A direct free here could
-        # race the layerwise H2D writer. Waiting requests cannot own a lease
-        # because every admission rejection runs before init_load_back.
+        # Drop the lease bookkeeping, but do NOT free the slots: a launched
+        # layerwise H2D may still be writing into them, and the request's own
+        # KV release path owns them from here.
+        #
+        # The lease must go even though scheduled aborts usually flow through
+        # cache_finished_req(is_insert=False). Two abort paths --
+        # _abort_on_queued_limit (scheduler.py:3184) and
+        # _abort_on_waiting_timeout (scheduler.py:3213) -- pop a *waiting*
+        # request and never call release_kv_cache, so "waiting requests cannot
+        # own a lease" does not hold. Keeping it would leave
+        # has_uncommitted_restore() True forever: every scheduler pass and both
+        # SchedulePolicy match loops would skip that rid.
+        lease = self._restore_leases.pop(rid, None)
+        if lease is not None:
+            logger.warning(
+                "[FlexKV] aborting rid=%s with an uncommitted restore; "
+                "%d slots stay allocated until the request's KV is released",
+                rid,
+                lease.device_indices.numel(),
+            )
+            lease.req.pending_restore_generation = None
+            lease.req.pending_restore_slots = None
+            lease.req._flexkv_uncached_restore = False
 
     def prefetch_request(self, req: Req) -> None:
         """Wait-complete FlexKV prefetch; see FlexKVRadixCache.prefetch_request."""

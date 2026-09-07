@@ -573,20 +573,41 @@ def test_ip_restore_lease_ends_after_real_cache_completion(completion):
         assert torch.equal(match.device_indices, req.prefix_indices)
 
 
-def test_abort_retains_restore_boundary_until_request_cleanup():
+def test_abort_clears_the_lease_without_freeing_live_slots():
+    """Abort must not leave has_uncommitted_restore() True.
+
+    Two abort paths (_abort_on_queued_limit, _abort_on_waiting_timeout) pop the
+    request and never call release_kv_cache, and the queue-pop path in
+    abort_request only does so for DECODE disagg or a mamba request. A retained
+    lease would make every scheduler pass and both SchedulePolicy match loops
+    skip that rid forever, and init_load_back would raise if it came back.
+
+    The slots are deliberately NOT freed here: the launched layerwise H2D may
+    still be writing into them.
+    """
     cache, allocator = _make_cache()
     req = _restore_request(cache)
-    restored = req.pending_restore_slots
     cache.release_aborted_request(req.rid)
-    # Abort notification is not completion of the asynchronous H2D writer.
-    assert cache.has_uncommitted_restore(req)
-    assert req._flexkv_uncached_restore
-    allocator.free.assert_not_called()
-    cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
-    released, start = allocator.free_segments.call_args.args[0][0]
-    assert start == 0
-    assert torch.equal(released, restored)
+
     assert not cache.has_uncommitted_restore(req)
+    assert not req._flexkv_uncached_restore
+    assert req.pending_restore_slots is None
+    # Abort notification is not completion of the asynchronous H2D writer.
+    allocator.free.assert_not_called()
+
+
+def test_abort_does_not_strand_a_requeued_request():
+    """The stall this guards: an aborted rid must stay schedulable."""
+    cache, _allocator = _make_cache()
+    req = _restore_request(cache)
+    cache.release_aborted_request(req.rid)
+
+    # The scheduler guard and both SchedulePolicy loops key off this.
+    assert not cache.has_uncommitted_restore(req)
+    # And a fresh lookup for the same rid must not raise.
+    cache.flexkv_connector.lookup_kv.return_value = (17, 4)
+    requeued = _restore_request(cache, rid=req.rid)
+    assert cache.has_uncommitted_restore(requeued)
 
 
 def test_mp_restore_is_tree_owned_and_ip_lease_excludes_reused_prefix():
@@ -607,7 +628,13 @@ def test_mp_restore_is_tree_owned_and_ip_lease_excludes_reused_prefix():
 
 @pytest.mark.parametrize("mismatch", ["identity", "generation", "slots"])
 @pytest.mark.parametrize("method", ["cache_finished_req", "cache_unfinished_req"])
-def test_restore_lease_mismatch_fails_before_mutating_cache(mismatch, method):
+def test_restore_lease_mismatch_does_not_release_slots(mismatch, method):
+    """A mismatch means we cannot prove who owns the slots, so leave them.
+
+    This runs on the normal request-completion path, so it degrades (log +
+    treat as "no lease") rather than failing the engine. What must hold is
+    that nothing is freed and the lease stays registered for reset().
+    """
     cache, allocator = _make_cache()
     req = _restore_request(cache)
     if mismatch == "identity":
@@ -616,40 +643,54 @@ def test_restore_lease_mismatch_fails_before_mutating_cache(mismatch, method):
         req.pending_restore_generation += 1
     else:
         req.pending_restore_slots = req.pending_restore_slots.clone()
-    with patch.object(RadixCache, method) as base:
-        with pytest.raises(RuntimeError, match="restore lease mismatch"):
-            if method == "cache_finished_req":
-                cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
-            else:
-                cache.cache_unfinished_req(req)
-        base.assert_not_called()
+
+    with patch.object(RadixCache, method):
+        if method == "cache_finished_req":
+            cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
+        else:
+            cache.cache_unfinished_req(req)
+
+    # The leased slots are never handed back on a mismatch.
     allocator.free.assert_not_called()
+    # And the lease survives, so reset() can still reclaim them.
     assert cache.has_uncommitted_restore(req)
 
 
 @pytest.mark.parametrize("entry", ["match", "init", "allocate"])
 def test_duplicate_restore_cannot_replace_active_lease(entry):
+    """However each entry point reacts, the active lease must survive intact
+    and no second allocation may happen.
+
+    match_prefix degrades (read-only, and the decode-disagg rematch sites are
+    unguarded). init_load_back and _allocate_and_load fail loud: they allocate
+    and start a DMA, so proceeding would leave two writers on one region.
+    """
     cache, allocator = _make_cache()
     req = _restore_request(cache)
     lease = cache._restore_leases[req.rid]
     allocator.alloc.reset_mock()
     cache.flexkv_connector.reset_mock()
     cache.flexkv_connector.lookup_kv.return_value = (17, 4)
-    with pytest.raises(RuntimeError, match="before restore commit|duplicate load-back"):
-        if entry == "match":
-            cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", range(4))), req=req)
-            )
-        elif entry == "init":
+
+    if entry == "match":
+        # Degrades to a device-only match instead of raising.
+        cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", range(4))), req=req)
+        )
+    elif entry == "init":
+        with pytest.raises(RuntimeError, match="before restore commit"):
             cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.last_node, host_hit_length=4, req=req
                 )
             )
-        else:
+    else:
+        with pytest.raises(RuntimeError, match="duplicate load-back"):
             _restore_request(cache)
+
     assert cache._restore_leases[req.rid] is lease
     allocator.alloc.assert_not_called()
+    # No new FlexKV lookup/transfer was started for the duplicate.
     assert cache.flexkv_connector.mock_calls == []
 
 
