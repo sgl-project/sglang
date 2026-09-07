@@ -47,6 +47,9 @@ from sglang.srt.lora.deepseek_mla_correction import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
@@ -65,7 +68,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -74,38 +77,54 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _use_aiter:
-    # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
-    # `aiter.ops.fused_qk_norm_rope_cache_quant` to a private `_fused_qk_rmsnorm`
-    # and introduced a unified entry point in `aiter.ops.fused_qk_rmsnorm_group_quant`
-    # with a different (in-place, kwarg-only, no-return) signature. Probe for the
-    # new symbol first so SGLang works with both pre- and post-#2958 aiter without
-    # requiring the docker pin to be bumped atomically.
-    try:
-        from aiter.ops.enum import QuantType as _AiterQuantType
-        from aiter.ops.fused_qk_rmsnorm_group_quant import (
-            fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm_unified,
-        )
-
-        def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
-            q_out = torch.empty_like(q)
-            k_out = torch.empty_like(k)
-            _aiter_fused_qk_rmsnorm_unified(
-                q_out_quantized=q_out,
-                k_out=k_out,
-                q=q,
-                q_weight=q_weight,
-                q_epsilon=q_eps,
-                k=k,
-                k_weight=k_weight,
-                k_epsilon=k_eps,
-                quant_type=_AiterQuantType.No,
+    # On gfx1250 the aiter `module_fused_qk_norm_rope_cache_quant_shuffle` kernel
+    # fails to JIT-build (its `rope_common.h` / `ck_tile/vec_convert.h` are
+    # incompatible with this image's composable_kernel), which crashes the very
+    # first MLA forward. This path is a pure RMSNorm (quant_type=No), so under the
+    # gfx1250 workaround flag (AITER_FORCE_A8W4) substitute a self-contained Triton
+    # RMSNorm that never touches the aiter fp4 kernel build.
+    if get_bool_env_var("AITER_FORCE_A8W4", "false"):
+        if get_bool_env_var("SGLANG_QK_RMSNORM_TORCH", "false"):
+            from sglang.srt.models.deepseek_common.attention_forward_methods.triton_qk_rmsnorm import (
+                fused_qk_rmsnorm_torch as fused_qk_rmsnorm_bf16,
             )
-            return q_out, k_out
+        else:
+            from sglang.srt.models.deepseek_common.attention_forward_methods.triton_qk_rmsnorm import (
+                fused_qk_rmsnorm_triton as fused_qk_rmsnorm_bf16,
+            )
+    else:
+        # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
+        # `aiter.ops.fused_qk_norm_rope_cache_quant` to a private `_fused_qk_rmsnorm`
+        # and introduced a unified entry point in `aiter.ops.fused_qk_rmsnorm_group_quant`
+        # with a different (in-place, kwarg-only, no-return) signature. Probe for the
+        # new symbol first so SGLang works with both pre- and post-#2958 aiter without
+        # requiring the docker pin to be bumped atomically.
+        try:
+            from aiter.ops.enum import QuantType as _AiterQuantType
+            from aiter.ops.fused_qk_rmsnorm_group_quant import (
+                fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm_unified,
+            )
 
-    except ImportError:
-        from aiter.ops.fused_qk_norm_rope_cache_quant import (
-            fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
-        )
+            def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
+                q_out = torch.empty_like(q)
+                k_out = torch.empty_like(k)
+                _aiter_fused_qk_rmsnorm_unified(
+                    q_out_quantized=q_out,
+                    k_out=k_out,
+                    q=q,
+                    q_weight=q_weight,
+                    q_epsilon=q_eps,
+                    k=k,
+                    k_weight=k_weight,
+                    k_epsilon=k_eps,
+                    quant_type=_AiterQuantType.No,
+                )
+                return q_out, k_out
+
+        except ImportError:
+            from aiter.ops.fused_qk_norm_rope_cache_quant import (
+                fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
+            )
 
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
@@ -123,6 +142,17 @@ if _use_aiter_gfx95:
         fused_rms_mxfp4_quant,
     )
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
+
+def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
+    """Dequantize an absorbed MLA weight, skipping the pass when it is a no-op."""
+    if (
+        w.dtype == torch.bfloat16
+        and isinstance(w_scale, (int, float))
+        and w_scale == 1.0
+    ):
+        return w
+    return w.to(torch.bfloat16) * w_scale
 
 
 def rocm_absorb_q_bmm(
@@ -170,7 +200,7 @@ def rocm_absorb_q_bmm(
         else:
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
-                attn.w_kc.to(torch.bfloat16) * attn.w_scale,
+                _absorb_weight_bf16(attn.w_kc, attn.w_scale),
             )
     return q_nope_out
 
@@ -224,10 +254,26 @@ def rocm_absorb_v_bmm(
                 transpose_bm_in=True,
                 dtype=torch.bfloat16,
             )
+        elif not is_in_tc_piecewise_cuda_graph():
+            # Same (batch, heads, dim) layout as the quantized paths above, so the
+            # post-GEMM flatten is a view. Skipped under piecewise: torch dynamo
+            # rejects out= with a non-contiguous output tensor.
+            _bmm_buf = torch.empty(
+                attn_output.shape[0],
+                attn.num_local_heads,
+                attn.w_vc.shape[2],
+                device=attn_output.device,
+                dtype=torch.bfloat16,
+            )
+            torch.bmm(
+                attn_output.to(torch.bfloat16).transpose(0, 1),
+                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                out=_bmm_buf.transpose(0, 1),
+            )
         else:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
-                attn.w_vc.to(torch.bfloat16) * attn.w_scale,
+                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
             )
 
     if _bmm_buf is not None:
@@ -301,6 +347,13 @@ def _fused_rope_cat_and_cache(
     kv_cache_dtype = (
         fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
     )
+    # Gluon MLA decode (bh16bn128) requires bf16 Q; vLLM #50563.
+    q_out_dtype = (
+        q_nope_out.dtype
+        if attn.kv_cache_dtype == "fp8_e4m3"
+        and attn.current_attention_backend == "aiter"
+        else kv_cache_dtype
+    )
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
@@ -313,12 +366,11 @@ def _fused_rope_cat_and_cache(
         attn.rotary_emb.sin_cache,
         attn.attn_mqa.k_scale,
         attn.rotary_emb.is_neox_style,
-        q_out_dtype=kv_cache_dtype,
+        q_out_dtype=q_out_dtype,
     )
 
 
 class DeepseekMLARocmForwardMixin:
-
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -552,7 +604,15 @@ class DeepseekMLARocmForwardMixin:
                 not _use_aiter
                 or not _is_gfx95_supported
                 or self.use_dsa
-                or self.current_attention_backend == "triton"
+                # Non-fused, non-specialized attention backends (e.g. Triton) run
+                # the cat path in forward_absorb_core and need RoPE applied here;
+                # only the aiter fused MLA path and the specialized MLA backends
+                # defer RoPE to their own kernels.
+                or (
+                    self.current_attention_backend
+                    not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+                    and self.current_attention_backend != "aiter"
+                )
             )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -647,17 +707,16 @@ class DeepseekMLARocmForwardMixin:
                     forward_batch.out_cache_loc,
                 )
                 save_kv_cache = False
-                # On decode, pass q_cat directly to attn_mqa with q_rope=None so
-                # dsa_backend.forward_decode reuses q_cat as a zero-copy view
-                # (`q.contiguous().view(...)` fast-path) instead of running the
-                # redundant `concat_mla_absorb_q_general(q_nope_fused, q_pe_fused)`
-                # that would otherwise rebuild a tensor byte-identical to q_cat.
-                # On ROCm tilelang decode, this eliminates the
-                # `CatArrayBatchedCopy<OpaqueType<1u>, ...>` kernel that used to
-                # fire once per layer per decode step (~2.6 us / layer saved).
-                # Prefill keeps the split form because dsa_backend.forward_extend
-                # asserts `q_rope is not None`.
-                if forward_batch.forward_mode.is_decode_or_idle():
+                # Pass q_cat straight to attn_mqa with q_rope=None so the backend
+                # reuses it as a zero-copy view instead of rebuilding a tensor
+                # byte-identical to it -- one `CatArrayBatchedCopy` per layer per
+                # step. Target-verify is the same absorbed shape as decode, just
+                # more rows; real prefill keeps the split form because the Triton
+                # sparse-MLA kernel reads q_nope/q_rope separately.
+                if (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                ):
                     if llama_4_scaling is not None:
                         # llama_4_scaling applies only to the q_nope portion;
                         # mutate in place via the slice view of q_cat.
@@ -882,6 +941,8 @@ class DeepseekMLARocmForwardMixin:
         rotary_emb.cos_cache, so skipping the standalone rope there ends in
         AttributeError on None. Kimi-K3 has such layers.
         """
+        # NoPE models (rotary_emb=None, e.g. Kimi-K3) have no rope for the
+        # fused kernel to apply; keep both prepare and core on the plain path.
         return (
             _use_aiter_gfx95
             and self.current_attention_backend == "aiter"

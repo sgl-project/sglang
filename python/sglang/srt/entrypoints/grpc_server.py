@@ -17,6 +17,7 @@ import time
 
 from aiohttp import web
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -165,8 +166,6 @@ async def serve_grpc(server_args, model_info=None):
             "version mismatch — see the chained exception above for details."
         ) from e
 
-    from sglang.srt.arg_groups.overrides import resolving_view
-
     # The integrated servicer builds an `Engine`, which validates and publishes
     # on its own. Validating here would run `check_server_args` twice, and the
     # LoRA normalization is not idempotent -- the second pass sees the `LoRARef`
@@ -177,9 +176,9 @@ async def serve_grpc(server_args, model_info=None):
     sidecar_app = web.Application()
     sidecar_runner = None
     sidecar_port = (
-        server_args.smg_http_sidecar_port
-        if server_args.smg_http_sidecar_port is not None
-        else server_args.port + 1
+        cfg.smg_http_sidecar_port
+        if cfg.smg_http_sidecar_port is not None
+        else cfg.port + 1
     )
 
     # Metrics setup: must set PROMETHEUS_MULTIPROC_DIR before scheduler

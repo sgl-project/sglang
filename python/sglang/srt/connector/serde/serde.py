@@ -7,7 +7,6 @@ import torch
 
 
 class Serializer(ABC):
-
     @abstractmethod
     def to_bytes(self, t: torch.Tensor) -> bytes:
         """
@@ -25,7 +24,6 @@ class Serializer(ABC):
 
 
 class Deserializer(metaclass=abc.ABCMeta):
-
     def __init__(self, dtype):
         self.dtype = dtype
 

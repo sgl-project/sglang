@@ -1,5 +1,6 @@
 import asyncio
 import os
+from concurrent.futures.process import BrokenProcessPool
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -28,7 +29,13 @@ from sglang.srt.multimodal.mm_utils import (
     process_anyres_image,
 )
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import ImageData, get_image_bytes, load_image, logger
+from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    get_image_bytes,
+    load_image,
+    logger,
+)
 from sglang.utils import get_exception_traceback
 
 
@@ -93,8 +100,11 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     pixel_values = pixel_values.astype(np.float16)
 
                 return pixel_values, image_hash, image.size
+        except CLIENT_MEDIA_EXCEPTIONS as error:
+            raise ValueError(f"Error while processing image: {error}") from error
         except Exception:
             logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            raise
 
     async def _fetch_remote_image_bytes(self, url):
         # Fetch a remote image's compressed bytes in the io thread pool, retrying
@@ -137,17 +147,32 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
-            fut = loop.run_in_executor(
-                self.cpu_executor,
-                LlavaImageProcessor._preprocess_image_task,
-                image_input,
-                image_hash,
-                aspect_ratio,
-                grid_pinpoints,
-                self._processor,
-            )
+            executor = self.cpu_executor
             timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
-            return await asyncio.wait_for(fut, timeout=timeout)
+            deadline = loop.time() + timeout
+            try:
+                # ProcessPoolExecutor.submit() can itself block after a worker
+                # exits. Keep submission off the request event loop so the
+                # timeout can still replace the failed pool.
+                process_future = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        executor.submit,
+                        LlavaImageProcessor._preprocess_image_task,
+                        image_input,
+                        image_hash,
+                        aspect_ratio,
+                        grid_pinpoints,
+                        self._processor,
+                    ),
+                    timeout=timeout,
+                )
+                remaining = max(0.0, deadline - loop.time())
+                return await asyncio.wait_for(
+                    asyncio.wrap_future(process_future), timeout=remaining
+                )
+            except (BrokenProcessPool, asyncio.TimeoutError):
+                self._replace_broken_cpu_executor(executor)
+                raise
         else:
             return LlavaImageProcessor._preprocess_image_task(
                 image_input,

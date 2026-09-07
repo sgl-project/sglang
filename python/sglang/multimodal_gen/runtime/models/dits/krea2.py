@@ -264,9 +264,9 @@ class Attention(nn.Module):
         # Parameter names match the released checkpoint (to_q/to_k/to_v/to_gate,
         # norm_q/norm_k, to_out.0) so the checkpoint loads with an identity mapping.
         tp = get_tp_world_size()
-        assert (
-            self.heads % tp == 0 and self.kvheads % tp == 0
-        ), f"heads={self.heads}, kvheads={self.kvheads} must be divisible by tp={tp}"
+        assert self.heads % tp == 0 and self.kvheads % tp == 0, (
+            f"heads={self.heads}, kvheads={self.kvheads} must be divisible by tp={tp}"
+        )
         self.local_heads = self.heads // tp
         self.local_kvheads = self.kvheads // tp
 

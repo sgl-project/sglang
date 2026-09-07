@@ -46,7 +46,7 @@ class SSLCertRefresher:
         try:
             async for _changes in awatch(self._cert_path, self._key_path):
                 logger.info(
-                    "SSL cert/key file change detected, reloading: " "cert=%s key=%s",
+                    "SSL cert/key file change detected, reloading: cert=%s key=%s",
                     self._cert_path,
                     self._key_path,
                 )

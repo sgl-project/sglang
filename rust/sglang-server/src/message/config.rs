@@ -1,7 +1,7 @@
 //! Runtime configuration: the rust-server boot knobs
 //! ([`RustServerServerArgs`]), the scheduler's typed `server_args` handoff
 //! ([`ServerArgs`] / [`ModelConfig`]), the [`RuntimeConfig`] pairing them for
-//! `runtime::start`, and the native MM pipeline handoff ([`MmSpec`]).
+//! `runtime::start`, and the Rust MM pipeline handoff ([`MmSpec`]).
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`DefaultSamplingParams`] /
 //! [`DisaggregationMode`] / [`MmSpec`] / [`MmFamily`] / [`MmResample`] are
@@ -15,6 +15,7 @@
 //! [`PreferredSamplingParams`] — are the only Python-facing code in this file;
 //! the rest is pure Rust.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -29,7 +30,7 @@ pub struct RustServerServerArgs {
     pub http_api_worker_num: usize,
     pub to_scheduler_cap: usize,
     pub from_scheduler_cap: usize,
-    pub channel_cap: usize,
+    pub stage_channel_cap: usize,
     /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
     /// the scheduler's reserved launch cores). `None` → run unpinned.
     pub cores: Option<Vec<usize>>,
@@ -42,7 +43,7 @@ impl Default for RustServerServerArgs {
             http_api_worker_num: 2,
             to_scheduler_cap: 8192,
             from_scheduler_cap: 8192,
-            channel_cap: 8192,
+            stage_channel_cap: 8192,
             cores: None,
         }
     }
@@ -126,9 +127,11 @@ pub struct ServerArgs {
     pub disaggregation_mode: DisaggregationMode,
     /// The resolved Python `ModelConfig`, attached at handoff time.
     pub model_config: ModelConfig,
-    /// Default sampling params advertised by `/get_model_info`, verbatim from
-    /// `server_args.preferred_sampling_params` (a JSON object or null).
+    /// Launch-time sampling defaults merged beneath per-request values and
+    /// advertised by `/get_model_info`.
     pub preferred_sampling_params: Option<PreferredSamplingParams>,
+    /// Per-modality media-count limits from `--limit-mm-data-per-request`.
+    pub limit_mm_data_per_request: BTreeMap<String, usize>,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
@@ -172,6 +175,7 @@ impl ServerArgs {
         disaggregation_mode,
         model_config,
         preferred_sampling_params,
+        limit_mm_data_per_request,
         allow_auto_truncate,
         enable_return_hidden_states,
         num_reserved_tokens,
@@ -202,6 +206,7 @@ impl ServerArgs {
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
         preferred_sampling_params: Option<PreferredSamplingParams>,
+        limit_mm_data_per_request: BTreeMap<String, usize>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
@@ -230,6 +235,7 @@ impl ServerArgs {
             disaggregation_mode,
             model_config,
             preferred_sampling_params,
+            limit_mm_data_per_request,
             allow_auto_truncate,
             enable_return_hidden_states,
             num_reserved_tokens,
@@ -266,6 +272,7 @@ impl Default for ServerArgs {
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
             preferred_sampling_params: None,
+            limit_mm_data_per_request: BTreeMap::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,
@@ -404,15 +411,15 @@ impl DefaultSamplingParams {
     }
 }
 
-/// The native MM pipeline handoff, built by `RustServer._build_mm_spec` from
-/// the resolved `NativeMmSpec` and passed to `Server.start_mm_workers`. Same
+/// The Rust MM pipeline handoff, built by `RustServer._build_mm_spec` from
+/// the resolved `RustMmSpec` and passed to `Server.start_mm_workers`. Same
 /// contract as [`ServerArgs`]: every field is a required, typed constructor
 /// keyword, so a drifted Python caller fails at boot.
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct MmSpec {
     /// Park feature buffers in POSIX shm rather than inline. Set by the Python
-    /// launcher (`NativeMmHost._use_feature_shm`) exactly when the scheduler
+    /// launcher (`RustMmProcessor._use_feature_shm`) exactly when the scheduler
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
     /// The family pipeline and its resolved processor parameters.
@@ -475,7 +482,7 @@ impl MmSpec {
 
 /// Which `sglang_mm` family pipeline serves the model — one variant per
 /// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
-/// (`MmFamily.QwenVl`); `NativeMmFamily.name` maps onto it at handoff.
+/// (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it at handoff.
 #[pyo3::pyclass(
     eq,
     frozen,
@@ -487,9 +494,9 @@ pub enum MmFamily {
     QwenVl,
 }
 
-/// The HF image processor the native resize must reproduce bit-exactly (see
+/// The HF image processor the Rust resize must reproduce bit-exactly (see
 /// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
-/// (`MmResample.AtenU8` / `.Pil`); `NativeMmFamily.image_processors` maps each
+/// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
 /// processor class onto it.
 #[pyo3::pyclass(
     eq,
@@ -527,6 +534,10 @@ impl ServerArgs {
     pub fn validate(&self) -> Result<(), String> {
         if self.served_model_name.is_empty() {
             return Err("empty 'served_model_name' in server_args".into());
+        }
+        if let Some(preferred) = &self.preferred_sampling_params {
+            super::sampling::SamplingParamsInput::from_preferred(&preferred.0)
+                .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
         }
         Ok(())
     }
