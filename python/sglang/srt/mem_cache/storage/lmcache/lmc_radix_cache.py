@@ -463,7 +463,7 @@ class LMCRadixCache(RadixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.kv.req_pool_idx, :kv_committed_len
         ]
 
         # Use super() to avoid a redundant LOOKUP — we only need new_last_node from radix.

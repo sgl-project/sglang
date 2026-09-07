@@ -27,6 +27,7 @@ import triton
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
+    qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
@@ -182,6 +183,7 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
 
     if not (
         isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
+        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
         and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
     ):
         return
@@ -388,8 +390,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
-                and self.in_proj_qkvz.weight.dtype == torch.bfloat16
-                and self.in_proj_ba.weight.dtype == torch.bfloat16
+                and self.in_proj_qkvz._parameters.get("weight") is not None
+                and self.in_proj_ba._parameters.get("weight") is not None
+                and self.in_proj_qkvz._parameters["weight"].dtype == torch.bfloat16
+                and self.in_proj_ba._parameters["weight"].dtype == torch.bfloat16
                 and self.in_proj_qkvz.bias is None
                 and self.in_proj_ba.bias is None
                 and use_intel_amx_backend(self.in_proj_qkvz)
@@ -556,9 +560,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                             cpu_split_sizes.append(
                                 int(target_size_sim * split_sizes[i] / split_size_sum)
                             )
-                        assert (
-                            sum(cpu_split_sizes) == target_size_sim
-                        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
+                        assert sum(cpu_split_sizes) == target_size_sim, (
+                            f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
+                        )
                         chunks = loaded_weight.split(cpu_split_sizes, dim=split_dim)
                     else:
                         chunks = loaded_weight.split(split_sizes, dim=split_dim)
@@ -778,6 +782,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     backend, projected_states_qkvz, projected_states_ba, forward_batch
                 )
 
+        use_strided_prefill_z = False
         use_fused_decode_proj_conv = (
             _gdn_decode_fused_proj_conv
             and forward_batch.forward_mode.is_decode()
@@ -801,7 +806,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+            use_strided_prefill_z = (
+                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+            split_fn = (
+                qwen3_5_gdn_prefill_projection_views
+                if use_strided_prefill_z
+                else fused_qkvzba_split_reshape_cat_contiguous
+            )
+            mixed_qkv, z, b, a = split_fn(
                 projected_states_qkvz,
                 projected_states_ba,
                 num_k_heads_tp,
@@ -841,11 +854,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        if use_strided_prefill_z:
+            z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
+        else:
+            z = z.reshape(-1, z.shape[-1])
+            z_flat_shape = z.shape
 
         # Add padding for DP-Attn
-        if core_attn_out.shape != z.shape:
-            core_attn_out_pad = torch.zeros_like(z)
+        if core_attn_out.shape != z_flat_shape:
+            core_attn_out_pad = z.new_zeros(z_flat_shape)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
@@ -1244,6 +1261,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.head_dim,
             self.rotary_emb.rotary_dim,
             has_gate=self.attn_output_gate,
+            mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
         )
         seq_len = hidden_states.shape[0]
         q = q_out.view(seq_len, -1)

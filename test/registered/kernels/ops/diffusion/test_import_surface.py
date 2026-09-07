@@ -26,7 +26,7 @@ from sglang.kernels.ops.diffusion import _EXPORTS, _SPECS
 from sglang.kernels.registry import registry
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=25, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 PACKAGE = "sglang.kernels.ops.diffusion"
 _PACKAGE_DIR = pathlib.Path(importlib.import_module(PACKAGE).__file__ or "").parent
@@ -49,10 +49,15 @@ def _module_defines(module_path: str) -> set[str]:
     Importing would pull in Triton / CuTe-DSL / FlyDSL, none of which are
     installed on the CPU CI lane -- so this reads the source instead.
     """
-    path = _PACKAGE_DIR / (module_path.replace(".", "/") + ".py")
-    if not path.exists():
-        path = _PACKAGE_DIR / module_path.replace(".", "/") / "__init__.py"
-    assert path.exists(), f"{PACKAGE}.{module_path} does not exist"
+    if module_path.startswith("sglang."):
+        spec = importlib.util.find_spec(module_path)
+        assert spec is not None and spec.origin is not None, module_path
+        path = pathlib.Path(spec.origin)
+    else:
+        path = _PACKAGE_DIR / (module_path.replace(".", "/") + ".py")
+        if not path.exists():
+            path = _PACKAGE_DIR / module_path.replace(".", "/") / "__init__.py"
+        assert path.exists(), f"{PACKAGE}.{module_path} does not exist"
 
     names: set[str] = set()
     for node in ast.parse(path.read_text(encoding="utf-8")).body:
@@ -85,7 +90,12 @@ def _scan_root(root: str) -> tuple[frozenset[str], tuple[str, ...]]:
 
     for path in root_dir.rglob("*.py"):
         rel = path.relative_to(_REPO_ROOT).as_posix()
-        if rel.startswith("python/sglang/kernels/ops/diffusion/"):
+        if rel.startswith(
+            (
+                "python/sglang/kernels/ops/diffusion/",
+                "python/sglang/kernels/kda_kernels/",
+            )
+        ):
             continue
         try:
             source = path.read_text(encoding="utf-8")

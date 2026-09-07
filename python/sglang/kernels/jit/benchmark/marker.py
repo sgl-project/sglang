@@ -253,9 +253,9 @@ class Benchmark(Generic[F]):
                 f"parametrize name {name!r} is not a parameter of "
                 f"{self._fn.__name__}; available: {list(self._fn_params)}"
             )
-            assert (
-                name not in self._seen_args
-            ), f"parametrize name {name!r} is already used"
+            assert name not in self._seen_args, (
+                f"parametrize name {name!r} is already used"
+            )
             self._seen_args.add(name)
         self._configs.insert(0, (names, vals))
 
@@ -305,8 +305,7 @@ class Benchmark(Generic[F]):
             if p.default is inspect.Parameter.empty and p.kind in kinds
         } - (set(flat_names) | {self._line_arg})
         assert not missing, (
-            f"parameters not parametrized for {self._fn.__name__}: "
-            f"{sorted(missing)}"
+            f"parameters not parametrized for {self._fn.__name__}: {sorted(missing)}"
         )
 
         results, bandwidths, should_log_bw = self._collect_results()
@@ -360,13 +359,13 @@ def parametrize(names: str, vals: List[Any], ci_vals: Optional[List[Any]] = None
             return [(v,) for v in vs]
         out: List[Tuple[Any, ...]] = []
         for v in vs:
-            assert isinstance(
-                v, (tuple, list)
-            ), f"parametrize: multi-name values must be tuples, got {v!r}"
+            assert isinstance(v, (tuple, list)), (
+                f"parametrize: multi-name values must be tuples, got {v!r}"
+            )
             t = tuple(v)
-            assert (
-                len(t) == arity
-            ), f"parametrize: each value must have length {arity}, got {t!r}"
+            assert len(t) == arity, (
+                f"parametrize: each value must have length {arity}, got {t!r}"
+            )
             out.append(t)
         return out
 

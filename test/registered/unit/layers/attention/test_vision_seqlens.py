@@ -4,7 +4,7 @@ import torch
 from sglang.srt.layers.attention.vision import SingletonCache, resolve_max_seqlen
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def test_resolve_max_seqlen_accepts_raw_tensor_without_attribute_cache():

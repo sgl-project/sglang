@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     declare_resolution,
     model_config_of,
     resolved_view,
@@ -22,12 +23,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     with_phase,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     is_cpu,
-    is_hip,
     is_mps,
-    is_npu,
-    is_xpu,
     parse_connector_type,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
@@ -111,10 +110,27 @@ def apply_cuda_graph_compatibility(server_args: Any):
     prefill backend (this folds in the old
     --enforce-piecewise-cuda-graph contract).
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
+        return
+
+    # PP prefill graph replay is opt-in. It is most useful for small
+    # aggregate forwards, while enabling it implicitly would also capture
+    # large buckets that can be slower than eager. An explicit backend
+    # selection bypasses this default policy.
+    if cfg.pp_size > 1 and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+        logger.info(
+            "Disabling breakable prefill CUDA graph by default for pipeline "
+            "parallelism. Set --cuda-graph-backend-prefill=breakable to opt in."
+        )
+        declare_resolution(
+            server_args,
+            "_apply_cuda_graph_compatibility",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
         return
 
     # Breakable is the CUDA default but not multimodal-compatible;
@@ -132,7 +148,7 @@ def apply_cuda_graph_compatibility(server_args: Any):
         and attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla"
     ):
         logger.info(
-            "Using tc_piecewise CUDA graph for validated multimodal " "decoder prefill."
+            "Using tc_piecewise CUDA graph for validated multimodal decoder prefill."
         )
         declare_resolution(
             server_args,
@@ -167,12 +183,20 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         ("pipeline parallelism (pp_size > 1)", lambda: cfg.pp_size > 1),
         (
             "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
-            lambda: is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu(),
+            lambda: (
+                get_platform().is_hip
+                or get_platform().is_npu
+                or is_cpu()
+                or is_mps()
+                or get_platform().is_xpu
+            ),
         ),
         (
             "OOT platform without piecewise support",
-            lambda: current_platform.is_out_of_tree()
-            and not current_platform.support_piecewise_cuda_graph(),
+            lambda: (
+                current_platform.is_out_of_tree()
+                and not current_platform.support_piecewise_cuda_graph()
+            ),
         ),
         (
             "MoE A2A backend",
@@ -183,16 +207,20 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         ("LoRA", lambda: bool(cfg.lora_paths) or cfg.enable_lora),
         (
             "multimodal model",
-            lambda: model_config_of(server_args).is_multimodal
-            and not model_config_of(
-                server_args
-            ).is_multimodal_piecewise_cuda_graph_supported,
+            lambda: (
+                model_config_of(server_args).is_multimodal
+                and not model_config_of(
+                    server_args
+                ).is_multimodal_piecewise_cuda_graph_supported
+            ),
         ),
         (
             "GGUF quantization",
-            lambda: cfg.load_format == "gguf"
-            or resolved_view(server_args).quantization == "gguf"
-            or check_gguf_file(cfg.model_path),
+            lambda: (
+                cfg.load_format == "gguf"
+                or resolved_view(server_args).quantization == "gguf"
+                or check_gguf_file(cfg.model_path)
+            ),
         ),
         ("DLLM (diffusion LLM)", lambda: cfg.dllm_algorithm is not None),
         (
@@ -207,8 +235,9 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         ("symmetric memory", lambda: cfg.enable_symm_mem),
         (
             "expert distribution recorder",
-            lambda: cfg.enable_eplb
-            or cfg.expert_distribution_recorder_mode is not None,
+            lambda: (
+                cfg.enable_eplb or cfg.expert_distribution_recorder_mode is not None
+            ),
         ),
         (
             "context parallel (attn_cp_size > 1)",
@@ -246,10 +275,17 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     """
 
     cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.configs.model_config import (
+        is_deepseek_v4,
+        uses_kda_attention,
+    )
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
     rules = [
+        (
+            "KDA hybrid linear attention",
+            lambda: uses_kda_attention(model_config_of(server_args).hf_config),
+        ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
         # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
         (
@@ -259,8 +295,10 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         # CP all_gather replay size mismatch under BCG.
         (
             "context parallel (attn_cp_size > 1)",
-            lambda: resolved_view(server_args).attn_cp_size > 1
-            and not supports_prefill_cp_bcg(server_args),
+            lambda: (
+                resolved_view(server_args).attn_cp_size > 1
+                and not supports_prefill_cp_bcg(server_args)
+            ),
         ),
         # Capture builds a dummy extend forward with attn_dcp_metadata=None.
         (
@@ -274,16 +312,20 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         ),
         (
             "unvalidated a2a backend",
-            lambda: resolved_view(server_args).moe_a2a_backend
-            not in ("none", "deepep", "megamoe", "flashinfer"),
+            lambda: (
+                resolved_view(server_args).moe_a2a_backend
+                not in ("none", "deepep", "megamoe", "flashinfer")
+            ),
         ),
         # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
         (
             "multimodal model",
-            lambda: model_config_of(server_args).is_multimodal
-            and not model_config_of(
-                server_args
-            ).is_multimodal_breakable_cuda_graph_supported,
+            lambda: (
+                model_config_of(server_args).is_multimodal
+                and not model_config_of(
+                    server_args
+                ).is_multimodal_breakable_cuda_graph_supported
+            ),
         ),
     ]
     for name, predicate in rules:
@@ -330,7 +372,6 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
     breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
     performance, so disable whichever prefill graph backend is in effect.
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
 

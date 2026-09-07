@@ -21,7 +21,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _self_written_attributes() -> set:
@@ -59,11 +59,14 @@ def _self_written_attributes() -> set:
 class TestNoPublicNonFieldSlot(CustomTestCase):
     def test_every_public_attribute_is_a_field(self):
         written = _self_written_attributes()
-        self.assertGreater(
-            len(written),
-            3,
-            f"only {len(written)} self-writes found; the scan is broken, not the "
-            "record",
+        # Anchor on a name, not a count: the count falls every time a derived
+        # read leaves the record, so a floor erodes with what it measures.
+        self.assertIn(
+            "_resolution_finished",
+            written,
+            f"the scan did not find the resolution flag the record sets on "
+            f"itself, so it is the scan that is broken, not the record: "
+            f"{sorted(written)}",
         )
         fields = {field.name for field in dataclasses.fields(ServerArgs)}
         stray = sorted(

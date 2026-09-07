@@ -79,7 +79,7 @@ Send this MessagePack map immediately after the WebSocket opens.
 | `num_inference_steps` | integer | No | Denoising steps per chunk. LingBot defaults to `4` when omitted. |
 | `guidance_scale` | number | No | Classifier-free guidance scale. Realtime LingBot commonly uses `1`. |
 | `negative_prompt` | string | No | Negative prompt passed to the diffusion pipeline. |
-| `quality` | `"lossless"`, `"high"` | No | `lossless` keeps FP32 VAE decode. `high` uses the validated BF16 decode path for lower per-chunk latency. |
+| `quality` | `"lossless"`, `"extra-high"`, `"high"` | No | `lossless` keeps FP32 VAE decode. `extra-high` keeps FP32 decode and enables only any eligible request-gated kernel fusions. `high` includes those fusions and uses the validated BF16 decode path for lower per-chunk latency. |
 | `max_chunks` | integer | No | Stop after this many chunks. Omit for a continuous session. |
 | `realtime_causal_sink_size` | integer | No | Number of sink frames/tokens retained in the causal attention window. |
 | `realtime_causal_kv_cache_num_frames` | integer | No | Number of recent frames retained in the causal KV cache window. |

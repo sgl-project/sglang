@@ -83,6 +83,7 @@ from sglang.srt.models.kimi_linear import KimiDeltaAttention
 from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
+    get_platform,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -91,7 +92,6 @@ from sglang.srt.utils import (
     bind_or_assign,
     is_cuda,
     is_flashinfer_available,
-    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -111,7 +111,7 @@ elif not (_is_cpu and _is_cpu_amx_available):
     from vllm._custom_ops import awq_dequantize
 
 _is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and is_sm100_supported()
+_is_sm100_supported = is_cuda() and get_platform().is_sm100
 
 
 class DsV3MLA(DeepseekV2AttentionMLA):
@@ -494,7 +494,9 @@ class BailingMoE(nn.Module):
                 self.score_function == "softmax" and self.correction_bias is None
             ) or (
                 self.score_function == "sigmoid" and self.correction_bias is not None
-            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            ), (
+                "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            )
 
         self._enable_a2a_moe = not get_moe_a2a_backend().is_none()
 
@@ -1156,7 +1158,9 @@ class BailingMoELinearModel(nn.Module):
         assert (
             isinstance(self.layer_group_size, list)
             or self.num_layers % self.layer_group_size == 0
-        ), f"num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}"
+        ), (
+            f"num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}"
+        )
 
         if self.pp_group.is_first_rank:
             self.word_embeddings = VocabParallelEmbedding(

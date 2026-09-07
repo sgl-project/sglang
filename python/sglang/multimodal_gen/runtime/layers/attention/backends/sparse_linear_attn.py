@@ -356,9 +356,9 @@ class SageSparseLinearAttentionImpl(AttentionImpl, nn.Module):
     ) -> None:
         nn.Module.__init__(self)
 
-        assert (
-            SAGESLA_ENABLED
-        ), "Install spas_sage_attn(pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation) first to enable SageSLA."
+        assert SAGESLA_ENABLED, (
+            "Install spas_sage_attn(pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation) first to enable SageSLA."
+        )
 
         self.num_heads = num_heads
         self.head_size = head_size
@@ -454,7 +454,9 @@ class SageSparseLinearAttentionImpl(AttentionImpl, nn.Module):
         assert headdim in [
             64,
             128,
-        ], "headdim should be in [64, 128]. For other headdim, you can use padding and specify the softmax scale."
+        ], (
+            "headdim should be in [64, 128]. For other headdim, you can use padding and specify the softmax scale."
+        )
 
         # Quantize Q, K to INT8
         q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q, k, km, BLKQ, BLKK)

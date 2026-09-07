@@ -34,9 +34,9 @@ class PureSWARadixCache(RadixCache):
         self.sliding_window_size = params.sliding_window_size
 
     def supports_swa(self) -> bool:
-        assert (
-            self.sliding_window_size is not None
-        ), "sliding_window_size must be set for PureSWARadixCache"
+        assert self.sliding_window_size is not None, (
+            "sliding_window_size must be set for PureSWARadixCache"
+        )
         return True
 
     def swa_evictable_size(self):
@@ -78,14 +78,14 @@ class PureSWARadixCache(RadixCache):
         kv_committed_len = kv_len_to_handle
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
+                req.kv.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.kv.req_pool_idx, :kv_committed_len
         ]
 
         radix_key = RadixKey(

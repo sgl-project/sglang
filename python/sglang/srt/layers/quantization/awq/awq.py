@@ -468,7 +468,6 @@ class AWQLinearMethod(LinearMethodBase):
 
 
 class AWQMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quant_config: AWQMarlinConfig):
         self.quant_config = quant_config
         self.quant_type = scalar_types.uint4

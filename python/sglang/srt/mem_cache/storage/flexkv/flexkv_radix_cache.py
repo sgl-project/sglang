@@ -409,7 +409,7 @@ class FlexKVRadixCache(RadixCache):
         if not token_ids:
             return
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.kv.req_pool_idx, :kv_committed_len
         ]
 
         # Anchor on the new last_device_node so FlexKV's lock matches

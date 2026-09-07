@@ -31,7 +31,6 @@ TEST_HIDDEN_SIZE = 32
 
 
 class SimpleModel(nn.Module):
-
     def __init__(self) -> None:
         super().__init__()
         self.hidden_size = TEST_HIDDEN_SIZE

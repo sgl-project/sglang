@@ -500,7 +500,9 @@ def test_refiner_round_trip_matches_the_declared_decode_precision(monkeypatch):
     # The decode-only override must win over vae_precision on both halves.
     config.vae_decode_precision = "fp32"
     config.refiner_height, config.refiner_width = 8, 16
-    server_args = SimpleNamespace(pipeline_config=config, disable_autocast=False)
+    server_args = SimpleNamespace(
+        pipeline_config=config, disable_autocast=False, component_precisions={}
+    )
     batch = SimpleNamespace(
         latents=torch.zeros(1, 4, 1, 2, 2),
         extra={},
