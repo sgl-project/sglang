@@ -159,10 +159,17 @@ def _should_use_channels_last_3d(
 
 
 def _decode_dtype_store_path(
-    component_model_path: str, component_name: str, dtype: torch.dtype
+    component_model_path: str, component_name: str, dtype: torch.dtype, vae=None
 ) -> str:
+    # The module layout is part of the key: two runtime versions that expose a
+    # different parameter set for the same checkpoint must not share a store.
+    layout = ""
+    if vae is not None:
+        layout = "|" + ",".join(
+            f"{name}:{tuple(tensor.shape)}" for name, tensor in vae.state_dict().items()
+        )
     key = hashlib.sha1(
-        f"{os.path.realpath(component_model_path)}|{component_name}|{dtype}".encode()
+        f"{os.path.realpath(component_model_path)}|{component_name}|{dtype}{layout}".encode()
     ).hexdigest()[:16]
     return os.path.join(
         envs.SGLANG_DIFFUSION_CACHE_ROOT, "decode_dtype_store", f"{key}.safetensors"
@@ -211,7 +218,7 @@ def _rehome_cast_weights_to_file(
 
     Returns (weights held, file-backed?).
     """
-    path = _decode_dtype_store_path(component_model_path, component_name, dtype)
+    path = _decode_dtype_store_path(component_model_path, component_name, dtype, vae)
     try:
         if os.path.exists(path):
             mapped = _load_store(path)
