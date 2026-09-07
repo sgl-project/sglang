@@ -463,6 +463,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
+        self.disable_chunked_radix_insert = params.disable_chunked_radix_insert
         self.kv_event_queue = []
 
         if not self.enable_mamba_extra_buffer:
@@ -692,6 +693,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             else len(token_ids)
         )
         if self.disable or cache_len is None:
+            return _skip_cache_unfinished_req(req)
+
+        # Skip the radix insert during chunked prefill when the flag is set.
+        # This eliminates the race where a retracted request frees KV pages
+        # that the radix tree already references (dangling node → QSA
+        # compressed-KV corruption via full_slot // ratio).  The insert is
+        # deferred to cache_finished_req, which runs after the request is
+        # fully committed and no longer subject to retraction.
+        if self.disable_chunked_radix_insert and chunked:
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[

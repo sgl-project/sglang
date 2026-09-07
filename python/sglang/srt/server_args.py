@@ -961,6 +961,15 @@ class ServerArgs:
         "Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
         NS("schedule"),
     ] = False
+    disable_chunked_radix_insert: A[
+        Optional[bool],
+        "Skip the radix-cache insert during chunked prefill and defer it to "
+        "request completion. Prevents the race where a retracted request frees "
+        "KV pages that the radix tree already references, which corrupts QSA "
+        "compressed-KV slots (full_slot // ratio). None (default) auto-enables "
+        "for QSA compressed-attention hybrid models; set True/False to override.",
+        NS("schedule"),
+    ] = None
     disable_overlap_schedule: A[
         bool,
         Arg(
