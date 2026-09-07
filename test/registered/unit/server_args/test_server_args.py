@@ -237,20 +237,11 @@ class TestPrepareServerArgs(CustomTestCase):
             resolution_result(inherited, "speculative_draft_model_quantization"),
             "modelopt_fp4",
         )
-        self.assertFalse(
-            resolution_result(
-                inherited, "_speculative_draft_quantization_explicitly_set"
-            )
-        )
-
-        reconstructed = ServerArgs(**dataclasses.asdict(inherited))
-        handle_missing_default_values(reconstructed)
-
-        self.assertFalse(
-            resolution_result(
-                reconstructed, "_speculative_draft_quantization_explicitly_set"
-            )
-        )
+        # The record still says the operator typed nothing, which is how
+        # `ModelConfig.from_server_args` tells an inherited draft quantization
+        # from an explicit one. Resolution decided a value; it did not consume
+        # the evidence of what was asked for.
+        self.assertIsNone(inherited.speculative_draft_model_quantization)
 
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:

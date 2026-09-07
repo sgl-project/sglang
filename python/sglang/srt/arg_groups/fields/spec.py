@@ -196,10 +196,6 @@ class Spec:
     # Internal provenance used after the public draft quantization inherits the
     # target value. It is a dataclass field so ServerArgs round-trips preserve
     # whether the user explicitly set the draft option; it has no CLI surface.
-    _speculative_draft_quantization_explicitly_set: A[
-        Optional[bool],
-        Arg(no_cli=True),
-    ] = None
     speculative_skip_dp_mlp_sync: A[
         bool,
         "Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.",

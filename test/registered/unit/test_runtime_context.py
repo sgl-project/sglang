@@ -411,27 +411,22 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         )
         self.assertEqual(mamba_cache_chunk_size_of(published), 64)
 
-    def test_an_underscore_field_is_declared_like_any_other(self):
-        """The split is fields vs not-fields, not the leading underscore.
+    def test_the_field_split_is_not_by_leading_underscore(self):
+        """`override_server_args` splits on field-ness, not on spelling.
 
-        `_speculative_draft_quantization_explicitly_set` is a real field
-        published under `spec`. Seeding it as a raw attribute instead of
-        declaring it would leave the earlier resolution authoritative, so both
-        the resolution and the bag would keep answering the pre-override value
-        while the record said otherwise.
+        No `ServerArgs` field starts with an underscore today. If one is added,
+        seeding it as a raw attribute instead of declaring it would leave the
+        earlier resolution authoritative, so the resolution and the bag would
+        keep answering the pre-override value while the record said otherwise.
+        An unknown underscore name is therefore rejected, not quietly seeded.
         """
-        from sglang.srt.arg_groups.overrides import resolution_result
-        from sglang.srt.runtime_context import get_spec
+        from sglang.srt.server_args import _underscore_field_names
 
-        name = "_speculative_draft_quantization_explicitly_set"
-        self.assertIn(name, ServerArgs.__dataclass_fields__)
-
-        published = get_context().override_server_args(**{name: True}).install()
-        # The record keeps the operator's input, as it does for every other
-        # field; the override travels as a declaration.
-        self.assertIsNone(getattr(published, name))
-        self.assertIs(resolution_result(published, name), True)
-        self.assertIs(getattr(get_spec(), name), True)
+        spelled = {n for n in ServerArgs.__dataclass_fields__ if n.startswith("_")}
+        self.assertEqual(_underscore_field_names(), spelled)
+        # None today -- the point is that the set is derived, so adding one is
+        # covered without anyone remembering to widen a hand-written list.
+        self.assertEqual(spelled, set())
 
     def test_installed_config_arms_the_strict_guard(self):
         # The published dummy must behave like a resolved config: bare writes

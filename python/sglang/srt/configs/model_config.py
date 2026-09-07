@@ -715,8 +715,12 @@ class ModelConfig:
             language_model_only=cfg.language_model_only,
             encoder_only=cfg.encoder_only,
             is_draft_model=is_draft_model,
+            # The record, not `cfg`: "did the operator type a draft
+            # quantization" is a question about the input, and resolution
+            # answers `cfg` with the target model's value when they did not.
             is_draft_quantization_explicit=(
-                is_draft_model and cfg._speculative_draft_quantization_explicitly_set
+                is_draft_model
+                and server_args.speculative_draft_model_quantization is not None
             ),
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,

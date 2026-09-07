@@ -1295,10 +1295,10 @@ class _ServerArgsOverride:
         # Declared so the projection sees it; late, because the record is
         # resolved already and not yet published.
         # Split on whether the name is a field, not on whether it starts with
-        # an underscore: `_speculative_draft_quantization_explicitly_set` is a
-        # real field, and seeding it as a raw attribute would leave the earlier
-        # declaration authoritative, so `resolution_result` and the bag would
-        # both keep answering the pre-override value.
+        # an underscore. No field starts with one today, but seeding a real
+        # field as a raw attribute would leave the earlier declaration
+        # authoritative, so `resolution_result` and the bag would both keep
+        # answering the pre-override value.
         fields = set(type(server_args).__dataclass_fields__)
         declared = {n: v for n, v in self._fields.items() if n in fields}
         if declared:
