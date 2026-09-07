@@ -379,6 +379,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        force_fp4: bool = False,
     ) -> NPUDeepSeekV4IndexerPool:
         # Indexer shares C4 addresses and therefore uses the same native page.
         return NPUDeepSeekV4IndexerPool(

@@ -1074,15 +1074,16 @@ class ModelConfig:
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
             or "DeepseekV4ForCausalLMDSpark" in self.hf_config.architectures
         ):
-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
-            self.window_size = self.hf_config.sliding_window
+            _cfg = self.hf_text_config if self.hf_text_config is not self.hf_config else self.hf_config
+            self.qk_rope_head_dim = _cfg.qk_rope_head_dim
+            self.qk_nope_head_dim = _cfg.head_dim - self.qk_rope_head_dim
+            self.window_size = _cfg.sliding_window
             self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
             self.v_head_dim = self.head_dim
-            self.index_head_dim = self.hf_config.index_head_dim
-            self.compress_ratios = self.hf_config.compress_ratios
+            self.index_head_dim = _cfg.index_head_dim
+            self.compress_ratios = _cfg.compress_ratios
             self.attention_arch = AttentionArch.MHA
-            self._init_mla_scaling(self.hf_config.rope_scaling)
+            self._init_mla_scaling(_cfg.rope_scaling)
         elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
             if self.head_dim is None:
                 self.head_dim = (
