@@ -141,11 +141,9 @@ logger = logging.getLogger(__name__)
 
 _EAGLE_CUDA_SYNC_DEBUG_CHECKPOINTS = frozenset(
     {
-        "before_draft_extend",
+        "after_verify",
         "after_draft_extend",
-        "after_prepare_pp_next_draft_batch",
         "after_draft",
-        "before_pp_raw_tree_to_cpu",
     }
 )
 
@@ -173,10 +171,10 @@ def _resolve_eagle_cuda_sync_debug_checkpoints(device: str) -> frozenset[str]:
 
 
 def _sync_eagle_cuda_debug(checkpoint: str, device: str) -> None:
-    """Synchronize one previously validated EAGLE diagnostic boundary."""
+    """Synchronize the current compute stream at one EAGLE debug boundary."""
     logger.warning("EAGLE CUDA sync debug begin: checkpoint=%s", checkpoint)
     try:
-        torch.cuda.synchronize(device=device)
+        torch.cuda.current_stream(device=device).synchronize()
     except RuntimeError as exc:
         raise RuntimeError(
             f"EAGLE CUDA sync debug failed: checkpoint={checkpoint}"
@@ -1443,6 +1441,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 grammar_barrier=grammar_barrier,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if "after_verify" in self._eagle_cuda_sync_debug_checkpoints:
+                _sync_eagle_cuda_debug("after_verify", self.device)
             if self._pp_enabled and not self._pp_is_last_rank:
                 return batch_output
 
@@ -1463,23 +1463,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    if "before_draft_extend" in (
+                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                    if "after_draft_extend" in (
                         self._eagle_cuda_sync_debug_checkpoints
                     ):
-                        _sync_eagle_cuda_debug("before_draft_extend", self.device)
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                        _sync_eagle_cuda_debug("after_draft_extend", self.device)
                     if self._pp_enabled:
-                        if "after_draft_extend" in (
-                            self._eagle_cuda_sync_debug_checkpoints
-                        ):
-                            _sync_eagle_cuda_debug("after_draft_extend", self.device)
                         self._prepare_pp_next_draft_batch(batch, batch_output)
-                        if "after_prepare_pp_next_draft_batch" in (
-                            self._eagle_cuda_sync_debug_checkpoints
-                        ):
-                            _sync_eagle_cuda_debug(
-                                "after_prepare_pp_next_draft_batch", self.device
-                            )
                         (
                             pp_draft_tokens,
                             pp_parent_list,
@@ -1489,10 +1479,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                             _sync_eagle_cuda_debug("after_draft", self.device)
 
             if self._pp_enabled:
-                if "before_pp_raw_tree_to_cpu" in (
-                    self._eagle_cuda_sync_debug_checkpoints
-                ):
-                    _sync_eagle_cuda_debug("before_pp_raw_tree_to_cpu", self.device)
                 batch_output.pp_verify_input_raw = EaglePPVerifyInputRaw(
                     draft_tokens=pp_draft_tokens.reshape(
                         batch.batch_size(), self.speculative_num_draft_tokens

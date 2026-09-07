@@ -69,6 +69,56 @@ class TestEaglePPVerifyInputRaw(unittest.TestCase):
 
 
 class TestEagleCudaSyncDebug(unittest.TestCase):
+    @staticmethod
+    def _decode_batch():
+        return SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            is_extend_in_batch=False,
+            spec_info=None,
+            seq_lens=torch.tensor([1]),
+            batch_size=lambda: 1,
+        )
+
+    @staticmethod
+    def _decode_output():
+        return SimpleNamespace(
+            next_draft_input=SimpleNamespace(bonus_tokens=torch.tensor([7])),
+            new_seq_lens=torch.tensor([2]),
+            accept_lens=torch.tensor([1]),
+            accept_index=None,
+        )
+
+    @classmethod
+    def _pp_worker(cls, *, is_last_rank, checkpoints):
+        output = cls._decode_output()
+        draft_worker = SimpleNamespace(
+            draft_runner=SimpleNamespace(tp_group=object()),
+            draft_tp_context=MagicMock(return_value=nullcontext()),
+            _draft_extend_for_decode=MagicMock(),
+            draft=MagicMock(
+                return_value=(
+                    torch.tensor([7, 8]),
+                    torch.tensor([-1]),
+                    torch.tensor([0]),
+                )
+            ),
+        )
+        worker = SimpleNamespace(
+            _pp_enabled=True,
+            _pp_is_last_rank=is_last_rank,
+            _eagle_cuda_sync_debug_checkpoints=frozenset(checkpoints),
+            device="cuda:1",
+            speculative_algorithm=SimpleNamespace(is_standalone=lambda: False),
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=2,
+            topk=1,
+            draft_worker=draft_worker,
+            _build_idle_verify_input=MagicMock(return_value=object()),
+            verify=MagicMock(return_value=output),
+            _prepare_pp_next_draft_batch=MagicMock(),
+        )
+        return worker, output
+
     def test_unset_resolves_empty(self):
         from sglang.srt.environ import envs
 
@@ -77,8 +127,8 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
                 _resolve_eagle_cuda_sync_debug_checkpoints("cuda:0"), frozenset()
             )
 
-    @patch("sglang.srt.speculative.eagle_worker_v2.torch.cuda.synchronize")
-    def test_selected_checkpoint_synchronizes(self, synchronize):
+    @patch("sglang.srt.speculative.eagle_worker_v2.torch.cuda.current_stream")
+    def test_selected_checkpoint_synchronizes_current_stream(self, current_stream):
         from sglang.srt.environ import envs
 
         with (
@@ -95,7 +145,8 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
         self.assertEqual(selected, frozenset({"after_draft_extend", "after_draft"}))
         _sync_eagle_cuda_debug("after_draft", "cuda:1")
 
-        synchronize.assert_called_once_with(device="cuda:1")
+        current_stream.assert_called_once_with(device="cuda:1")
+        current_stream.return_value.synchronize.assert_called_once_with()
 
     def test_unknown_checkpoint_fails_closed(self):
         from sglang.srt.environ import envs
@@ -110,7 +161,7 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
         from sglang.srt.environ import envs
 
         with (
-            envs.SGLANG_EAGLE_CUDA_SYNC_DEBUG.override("before_draft_extend"),
+            envs.SGLANG_EAGLE_CUDA_SYNC_DEBUG.override("after_verify"),
             patch(
                 "sglang.srt.speculative.eagle_worker_v2._is_cuda",
                 False,
@@ -119,14 +170,97 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
         ):
             _resolve_eagle_cuda_sync_debug_checkpoints("cpu")
 
-    @patch("sglang.srt.speculative.eagle_worker_v2.torch.cuda.synchronize")
-    def test_sync_error_identifies_checkpoint(self, synchronize):
-        synchronize.side_effect = RuntimeError("illegal memory access")
+    @patch("sglang.srt.speculative.eagle_worker_v2.torch.cuda.current_stream")
+    def test_sync_error_identifies_checkpoint(self, current_stream):
+        current_stream.return_value.synchronize.side_effect = RuntimeError(
+            "illegal memory access"
+        )
         with self.assertRaisesRegex(
             RuntimeError,
             "EAGLE CUDA sync debug failed: checkpoint=after_draft_extend",
         ):
             _sync_eagle_cuda_debug("after_draft_extend", "cuda:0")
+
+    @patch("sglang.srt.speculative.eagle_worker_v2._sync_eagle_cuda_debug")
+    def test_pp_non_last_syncs_after_verify_before_return(self, sync_debug):
+        worker, output = self._pp_worker(
+            is_last_rank=False,
+            checkpoints={"after_verify", "after_draft_extend", "after_draft"},
+        )
+        events = MagicMock()
+        events.attach_mock(worker.verify, "verify")
+        sync_debug.side_effect = events.sync
+
+        result = EAGLEWorkerV2.forward_batch_generation(worker, self._decode_batch())
+
+        self.assertIs(result, output)
+        self.assertEqual(
+            [str(call).split("(", maxsplit=1)[0] for call in events.mock_calls],
+            ["call.verify", "call.sync"],
+        )
+        sync_debug.assert_called_once_with("after_verify", "cuda:1")
+        worker.draft_worker._draft_extend_for_decode.assert_not_called()
+        worker.draft_worker.draft.assert_not_called()
+
+    @patch("sglang.srt.speculative.eagle_worker_v2.spec_stage_span", nullcontext)
+    @patch(
+        "sglang.srt.speculative.eagle_worker_v2.speculative_moe_a2a_backend_context",
+        nullcontext,
+    )
+    @patch(
+        "sglang.srt.speculative.eagle_worker_v2.speculative_moe_backend_context",
+        nullcontext,
+    )
+    @patch("sglang.srt.speculative.eagle_worker_v2._sync_eagle_cuda_debug")
+    def test_pp_last_syncs_three_boundaries_in_order(self, sync_debug):
+        worker, output = self._pp_worker(
+            is_last_rank=True,
+            checkpoints={"after_verify", "after_draft_extend", "after_draft"},
+        )
+        events = MagicMock()
+        events.attach_mock(worker.verify, "verify")
+        events.attach_mock(worker.draft_worker._draft_extend_for_decode, "draft_extend")
+        events.attach_mock(worker._prepare_pp_next_draft_batch, "prepare")
+        events.attach_mock(worker.draft_worker.draft, "draft")
+        sync_debug.side_effect = events.sync
+
+        result = EAGLEWorkerV2.forward_batch_generation(worker, self._decode_batch())
+
+        self.assertIs(result, output)
+        self.assertEqual(
+            [call.args[0] for call in sync_debug.call_args_list],
+            ["after_verify", "after_draft_extend", "after_draft"],
+        )
+        self.assertEqual(
+            [str(call).split("(", maxsplit=1)[0] for call in events.mock_calls],
+            [
+                "call.verify",
+                "call.sync",
+                "call.draft_extend",
+                "call.sync",
+                "call.prepare",
+                "call.draft",
+                "call.sync",
+            ],
+        )
+
+    @patch("sglang.srt.speculative.eagle_worker_v2.spec_stage_span", nullcontext)
+    @patch(
+        "sglang.srt.speculative.eagle_worker_v2.speculative_moe_a2a_backend_context",
+        nullcontext,
+    )
+    @patch(
+        "sglang.srt.speculative.eagle_worker_v2.speculative_moe_backend_context",
+        nullcontext,
+    )
+    @patch("sglang.srt.speculative.eagle_worker_v2._sync_eagle_cuda_debug")
+    def test_empty_checkpoint_set_never_synchronizes(self, sync_debug):
+        worker, output = self._pp_worker(is_last_rank=True, checkpoints=set())
+
+        result = EAGLEWorkerV2.forward_batch_generation(worker, self._decode_batch())
+
+        self.assertIs(result, output)
+        sync_debug.assert_not_called()
 
 
 class TestEaglePPVerifyRebuild(unittest.TestCase):

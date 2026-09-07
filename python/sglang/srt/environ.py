@@ -1478,7 +1478,7 @@ class Envs:
     # therefore also keeps the seed-bearing draft decode/extend phases eager.
     SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK = EnvBool(True)
     # Diagnostic-only comma-separated EAGLE checkpoints at which the current
-    # CUDA device is synchronized. The runtime rejects unknown checkpoints.
+    # CUDA compute stream is synchronized. The runtime rejects unknown checkpoints.
     # Keep unset outside targeted fault localization because synchronization
     # changes execution timing and is not valid for performance evidence.
     SGLANG_EAGLE_CUDA_SYNC_DEBUG = EnvTuple(())
