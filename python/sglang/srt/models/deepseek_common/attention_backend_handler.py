@@ -1,5 +1,6 @@
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.cp.utils import enable_cp_v2, is_cp_v2_active
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -111,10 +112,12 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
-    # MLA prefill CP forces absorbed MLA regardless of prefix length: the
-    # CP path gathers latent KV via rebuild_cp_kv_cache and feeds the
-    # backend's absorbed-MLA kernel.
-    if mla_use_prefill_cp(forward_batch):
+    # Strategy CP gathers latent KV in the backend's absorbed MLA path;
+    # normal MHA would write rank-local KV against full cache locations.
+    # Protected platform CP retains its model-side materialization path.
+    if is_cp_v2_active(forward_batch) or (
+        not enable_cp_v2() and mla_use_prefill_cp(forward_batch)
+    ):
         return _dispatch_mla_subtype(attn, forward_batch)
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
