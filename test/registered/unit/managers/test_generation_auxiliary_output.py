@@ -15,6 +15,8 @@ from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -69,11 +71,25 @@ def _model_runner_for_sampling_path(
     spec_algorithm=SpeculativeAlgorithm.NONE,
     dllm_algorithm=None,
 ):
+    # `supports_sampling_observer` reads the dLLM algorithm from the bags, so
+    # the path is stated by publishing it rather than by standing one in.
+    reset_context()
+    publish(ServerArgs(model_path="dummy", dllm_algorithm=dllm_algorithm), role="test")
     runner = object.__new__(ModelRunner)
-    runner.server_args = SimpleNamespace(dllm_algorithm=dllm_algorithm)
+    runner.server_args = SimpleNamespace()
     runner.spec_algorithm = spec_algorithm
     runner._sampling_observer = None
     return runner
+
+
+def setup_function(_):
+    # The code under test reads its config from the bags.
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+
+def teardown_function(_):
+    reset_context()
 
 
 def test_auxiliary_output_releases_device_holder_after_copy():

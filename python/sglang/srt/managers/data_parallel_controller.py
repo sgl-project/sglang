@@ -449,7 +449,7 @@ class DataParallelController:
         Returns:
             List of worker ports (same on all nodes after broadcast).
         """
-        is_joiner = server_args.is_ep_scale_joiner
+        is_joiner = get_exec().moe.is_ep_scale_joiner
         if get_parallel().dist_init_addr is None or is_joiner:
             na = NetworkAddress(
                 get_serving().host or "127.0.0.1",
@@ -561,7 +561,7 @@ class DataParallelController:
             bind_host = NetworkAddress.parse(get_parallel().dist_init_addr).host
 
         worker_ports = []
-        if server_args.is_ep_scale_joiner:
+        if get_exec().moe.is_ep_scale_joiner:
             # Scale joiners connect to their pre-bound primary worker sockets.
             primary = NetworkAddress.parse(get_parallel().dist_init_addr)
             primary_endpoint = NetworkAddress(
@@ -626,7 +626,7 @@ class DataParallelController:
 
         nnodes_per_tp_group = nnodes_per_pp_rank
         tp_size_per_node = get_parallel().tp_size // nnodes_per_tp_group
-        if server_args.is_ep_scale_joiner:
+        if get_exec().moe.is_ep_scale_joiner:
             # Scale joiners enumerate their full local TP span.
             tp_rank_range = range(get_parallel().tp_size)
             tp_size_per_node = get_parallel().tp_size
@@ -655,7 +655,7 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
-                    if server_args.is_ep_scale_joiner:
+                    if get_exec().moe.is_ep_scale_joiner:
                         # Scale-joiner outputs return through the primary tokenizer.
                         primary_addr = NetworkAddress.parse(
                             get_parallel().dist_init_addr
@@ -866,7 +866,7 @@ def run_data_parallel_controller_process(
             }
         )
         # The primary owns routing for the expanded scheduler set.
-        if get_parallel().node_rank == 0 and not server_args.is_ep_scale_joiner:
+        if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
             controller.event_loop()
         for proc in controller.scheduler_procs:
             proc.join()

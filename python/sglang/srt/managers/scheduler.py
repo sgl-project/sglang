@@ -1092,7 +1092,7 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
-        if self.server_args.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
 
@@ -1117,7 +1117,7 @@ class Scheduler(
             model_runner.post_capture_resize_kv_pool()
             self.kv_cache_allocation_time += time.perf_counter() - tic
 
-        if self.server_args.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             self.tp_worker.finalize_startup_weight_load()
 
         # Adaptive/speculative graphs and post-capture KV sizing can consume

@@ -158,6 +158,9 @@ class _TiedWeightModel(nn.Module):
 
 class TestStartupWeightLoadSelector(CustomTestCase):
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.load_config = LoadConfig(load_format=LoadFormat.SAFETENSORS)
         self.loader = DefaultModelLoader(self.load_config)
         self.device_config = DeviceConfig("cuda", 0)
@@ -324,6 +327,12 @@ class TestStartupWeightLoadSelector(CustomTestCase):
 
 
 class TestStartupWeightLoadManager(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _manager(self, loader):
         return StartupWeightLoadManager(
             loader=loader,
@@ -512,6 +521,12 @@ class TestStartupWeightLoadManager(CustomTestCase):
 
 
 class TestModelStorageManifest(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_in_place_updates_preserve_the_manifest(self):
         model = _TiedWeightModel()
         manifest = ModelStorageManifest.capture(model)
@@ -554,6 +569,12 @@ class TestModelStorageManifest(CustomTestCase):
 
 
 class TestCaptureSafeWeightInitialization(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_only_parameters_are_filled(self):
         model = _TiedWeightModel()
 
@@ -576,6 +597,12 @@ class _LifecycleRunner:
 
 
 class TestStartupWeightLoadFanout(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_primary_and_multi_runner_extras_are_started_once(self):
         trace = []
         primary = _LifecycleRunner("primary", trace)
@@ -629,6 +656,12 @@ class _RunnerStartupManager:
 
 
 class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     @staticmethod
     def _runner(manager):
         runner = ModelRunner.__new__(ModelRunner)
@@ -689,14 +722,21 @@ class _SchedulerWorker:
 
 
 class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
-    @staticmethod
-    def _scheduler(worker, trace, *, mode, draft_worker=None):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def _scheduler(self, worker, trace, *, mode, draft_worker=None):
         from sglang.srt.managers.scheduler import Scheduler
 
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.server_args = SimpleNamespace(
-            is_startup_weight_load_overlap=mode == "overlap"
+        # The schedule reads the mode from the bags, so the test states it by
+        # publishing a record rather than by standing one in.
+        reset_context()
+        publish(
+            ServerArgs(model_path="dummy", startup_weight_load_mode=mode),
+            role="scheduler",
         )
+        scheduler = Scheduler.__new__(Scheduler)
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", draft_worker

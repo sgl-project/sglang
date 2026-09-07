@@ -109,6 +109,34 @@ class Arg:
 
 
 @dataclasses.dataclass(frozen=True)
+class Derived:
+    """Metadata for a field the configuration implies, not one anyone types.
+
+    The other half of a namespace. An ``Arg`` field is the operator's input and
+    is collected into ``ServerArgs``; a ``Derived`` field carries no annotation,
+    so it is not a dataclass field and never reaches the record -- which is
+    right, because it has no input to preserve and the record is what crosses a
+    process boundary.
+
+    ``fn`` names what computes it, as a dotted path resolved lazily so that a
+    declaration module stays free of runtime imports. Such a field is a pure
+    function of the published configuration, so it is computed once at
+    ``publish`` and stored as an ordinary bag leaf -- a plain attribute load,
+    which is what a read inside compiled model code needs.
+
+    Every declaration carries ``fn`` today, the parallel quotients included:
+    they are a function of the configured leaves, so they are computed at
+    publish like the rest. What is special about them is not how they are
+    computed but that a stamp can move one afterwards -- an elastic scale-up
+    restamps ``attn_dp_size`` -- which ``ParallelContext`` answers above the
+    published leaf.
+    """
+
+    doc: str = ""
+    fn: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
 class NS:
     """Namespace-path marker for a ServerArgs field, attached alongside the
     field's metadata in ``Annotated``:
