@@ -73,7 +73,7 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
     used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     in_fake_mode = active_fake_mode() is not None
     if not in_fake_mode:
-        indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
+        indices = all_masks.flatten().nonzero(as_tuple=False).flatten()
         max_seqlen_in_batch = seqlens_in_batch.max().item()
     else:
         # torch.nonzero and .item() are not supported in FakeTensorMode

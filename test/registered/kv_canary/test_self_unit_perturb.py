@@ -267,7 +267,7 @@ class TestReqToTokenPerturb(CustomTestCase):
 
         diff = pool.req_to_token != snapshot
         self.assertEqual(int(diff.sum().item()), 1)
-        rows, cols = torch.nonzero(diff, as_tuple=True)
+        rows, cols = diff.nonzero(as_tuple=True)
         row, col = int(rows[0].item()), int(cols[0].item())
         original = int(snapshot[row, col].item())
         replacement = int(pool.req_to_token[row, col].item())

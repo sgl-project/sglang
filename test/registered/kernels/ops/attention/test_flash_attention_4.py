@@ -105,7 +105,7 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
     )
     seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
     used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
+    indices = all_masks.flatten().nonzero(as_tuple=False).flatten()
     max_seqlen_in_batch = seqlens_in_batch.max().item()
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
     # TD [2022-03-04] We don't want to index with a bool mask, because Pytorch will expand the

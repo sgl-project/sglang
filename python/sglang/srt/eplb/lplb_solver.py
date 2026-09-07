@@ -127,11 +127,11 @@ class LPLBSolver:
         # Separate single-copy vs replicated experts.
         # Stored as int64 so they can be used directly as index tensors in
         # _solve without per-call .long() casts (Tier 1 optimization).
-        self.log_single = torch.nonzero(logcnt == 1).flatten().to(torch.int64)
+        self.log_single = logcnt == 1.nonzero().flatten().to(torch.int64)
         self.phy_single = log2phy[self.log_single, 0].to(torch.int64)
-        self.log_replicated = torch.nonzero(logcnt > 1).flatten().to(torch.int64)
+        self.log_replicated = logcnt > 1.nonzero().flatten().to(torch.int64)
         self.phy_replicated = (
-            torch.nonzero(logcnt[phy2log] > 1).flatten().to(torch.int64)
+            logcnt[phy2log] > 1.nonzero().flatten().to(torch.int64)
         )
 
         self.num_single = len(self.log_single)
