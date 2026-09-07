@@ -322,6 +322,7 @@ def _fused_rope_cat_and_cache(
         q_nope_out.dtype
         if attn.kv_cache_dtype == "fp8_e4m3"
         and attn.current_attention_backend == "aiter"
+        and q_nope_out.shape[-2] == 12
         else kv_cache_dtype
     )
     return fused_qk_rope_cat_and_cache_mla(
