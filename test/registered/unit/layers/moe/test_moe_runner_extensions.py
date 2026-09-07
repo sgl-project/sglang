@@ -32,7 +32,7 @@ from sglang.srt.lora.layers import FusedMoEWithLoRA
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-c-test-cpu")
+register_cpu_ci(est_time=15, suite="stage-b-test-cpu-intel")
 
 
 class _TestDispatchRunnerCore(DispatchMoeRunnerCore):

@@ -17,7 +17,7 @@ from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestGraphPoolBorrow(CustomTestCase):
@@ -121,6 +121,20 @@ class TestGraphPoolBorrow(CustomTestCase):
             self.assertTrue(pool.graph_pool_borrow_enabled())
             pool.disable_graph_pool_borrow("graph storage is externally managed")
             self.assertFalse(pool.graph_pool_borrow_enabled())
+
+    def test_setting_static_runs_retires_previous_borrow_pool(self):
+        runs = [(0x1000, 4096), (0x2000, 8192)]
+
+        def reset_static_runs():
+            pool._borrow_static_runs = None
+
+        with patch.object(
+            pool, "_teardown_borrow_pool", side_effect=reset_static_runs
+        ) as teardown:
+            pool.set_graph_pool_borrow_runs(runs)
+
+        teardown.assert_called_once_with()
+        self.assertEqual(pool._borrow_static_runs, [(0x2000, 8192), (0x1000, 4096)])
 
     def test_eagle_non_greedy_probabilities_do_not_borrow_graph_pool(self):
         def fake_sampling(**kwargs):
