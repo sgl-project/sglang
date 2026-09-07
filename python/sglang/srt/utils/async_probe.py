@@ -174,3 +174,14 @@ def maybe_detect_page_aligned(
         (indices % page_size == 0).all(),
         f"page-misaligned indices (page_size={page_size}): {msg}",
     )
+
+
+def maybe_sync_eagle_cuda_debug(forward_batch, checkpoint: str) -> None:
+    """Run the optional EAGLE-owned current-stream boundary callback."""
+    callback = getattr(forward_batch, "_eagle_cuda_sync_debug_callback", None)
+    if callback is None:
+        return
+    callback(
+        checkpoint,
+        detail=getattr(forward_batch, "_eagle_cuda_sync_debug_detail", None),
+    )

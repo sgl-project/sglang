@@ -149,6 +149,16 @@ _EAGLE_CUDA_SYNC_DEBUG_CHECKPOINTS = frozenset(
         "after_draft_topk",
         "after_draft_pp_tree",
         "after_draft",
+        "after_nextn_embed",
+        "after_nextn_attention",
+        "after_nextn_moe",
+        "after_nextn_decoder",
+        "after_nextn_norm",
+        "after_nextn_logits",
+        "after_megamoe_shared",
+        "after_megamoe_topk",
+        "after_megamoe_pre_dispatch",
+        "after_megamoe_routed",
     }
 )
 
@@ -304,9 +314,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     ) -> None:
         # Some unit-test and backend harnesses intentionally construct a
         # minimal worker with object.__new__. Keep that default-off path valid.
-        selected = getattr(
-            self, "_eagle_cuda_sync_debug_checkpoints", frozenset()
-        )
+        selected = getattr(self, "_eagle_cuda_sync_debug_checkpoints", frozenset())
         if checkpoint not in selected:
             return
         _maybe_sync_eagle_cuda_debug(
@@ -315,6 +323,32 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.device,
             detail=detail,
         )
+
+    @contextlib.contextmanager
+    def _model_forward_cuda_debug(self, forward_batch: ForwardBatch, detail: str):
+        """Scope owning-layer probes to one eager draft-model forward."""
+        if not getattr(self, "_eagle_cuda_sync_debug_checkpoints", frozenset()):
+            yield
+            return
+
+        missing = object()
+        callback_attr = "_eagle_cuda_sync_debug_callback"
+        detail_attr = "_eagle_cuda_sync_debug_detail"
+        previous_callback = getattr(forward_batch, callback_attr, missing)
+        previous_detail = getattr(forward_batch, detail_attr, missing)
+        setattr(forward_batch, callback_attr, self._maybe_sync_cuda_debug)
+        setattr(forward_batch, detail_attr, detail)
+        try:
+            yield
+        finally:
+            for attr, previous in (
+                (callback_attr, previous_callback),
+                (detail_attr, previous_detail),
+            ):
+                if previous is missing:
+                    delattr(forward_batch, attr)
+                else:
+                    setattr(forward_batch, attr, previous)
 
     def alloc_memory_pool(
         self,
@@ -840,6 +874,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         )
                     ),
                     canary_index_ctx,
+                    self._model_forward_cuda_debug(forward_batch, f"step={i}"),
                 ):
                     logits_output = self.draft_runner.forward(
                         forward_batch
@@ -948,6 +983,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                 ),
                 canary_index_ctx,
+                self._model_forward_cuda_debug(forward_batch, f"idle_step={i}"),
             ):
                 self.draft_runner.forward(forward_batch)
             self._maybe_sync_cuda_debug("after_draft_forward", detail=f"idle_step={i}")
@@ -1178,7 +1214,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         dsa_seed_topk_indices = None
         if self.seed_dsa_topk_from_draft_extend:
             if can_run_decode_cuda_graph:
-                dsa_extend_topk_capture = self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
+                dsa_extend_topk_capture = (
+                    self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
+                )
             else:
                 dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
             # Fancy indexing returns a fresh tensor (detached from the buffer).
@@ -1608,9 +1646,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             raw.top_scores_index, dtype=torch.long, device=device
         )
         bs = batch.seq_lens.shape[0]
-        assert parent_list.shape == (bs, num_draft - 1), (
-            f"topology shape mismatch: {parent_list.shape} vs ({bs}, {num_draft - 1})"
-        )
+        assert parent_list.shape == (
+            bs,
+            num_draft - 1,
+        ), f"topology shape mismatch: {parent_list.shape} vs ({bs}, {num_draft - 1})"
 
         attn_backend = self.target_worker.model_runner.attn_backend
         verify_mask = attn_backend.verify_mask

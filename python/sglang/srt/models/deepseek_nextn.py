@@ -62,6 +62,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForC
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+from sglang.srt.utils.async_probe import maybe_sync_eagle_cuda_debug
 
 
 def _gather_dsa_topk_indices_for_cp(
@@ -251,6 +252,7 @@ class DeepseekModelNextN(nn.Module):
                     hidden_states, _ = self.eh_proj(eh_input)
                 else:
                     hidden_states = self.eh_proj(eh_input)
+            maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_embed")
 
             # CP-v2 shards/gathers hidden states at the eager-runner boundary.
             cp_v2_active = is_cp_v2_active(forward_batch)
@@ -272,11 +274,13 @@ class DeepseekModelNextN(nn.Module):
                     zero_allocator,
                     prev_topk_indices=index_topk_share.topk_indices,
                 )
+            maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_decoder")
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
                     hidden_states, _ = self.shared_head.norm(hidden_states, residual)
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
+                maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_norm")
 
                 if use_cp_v1:
                     local_num_tokens = hidden_states.shape[0]
@@ -403,9 +407,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                     )
         hidden_states = self.model(input_ids, positions, forward_batch)
-        return self.logits_processor(
+        output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+        maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_logits")
+        return output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)

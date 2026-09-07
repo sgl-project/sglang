@@ -215,6 +215,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.async_probe import maybe_sync_eagle_cuda_debug
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
@@ -2514,6 +2515,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 layer_scatter_modes=self.layer_scatter_modes,
                 prev_topk_indices=prev_topk_indices,
             )
+        if self.is_nextn:
+            maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_attention")
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
@@ -2563,6 +2566,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                     forward_batch,
                     gemm_output_zero_allocator,
                 )
+        if self.is_nextn:
+            maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_moe")
 
         if (
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)

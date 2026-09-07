@@ -1,16 +1,21 @@
 import unittest
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.layers.attention.verify_mask import VerifyMask
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+    CudaGraphBufferRegistry,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     _assert_pp_mtp_compat,
 )
 from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import (
@@ -21,6 +26,7 @@ from sglang.srt.speculative.eagle_worker_v2 import (
     _sync_eagle_cuda_debug,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.async_probe import maybe_sync_eagle_cuda_debug
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -70,6 +76,20 @@ class TestEaglePPVerifyInputRaw(unittest.TestCase):
 
 
 class TestEagleCudaSyncDebug(unittest.TestCase):
+    @staticmethod
+    def _forward_batch(**overrides):
+        values = dict(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=1,
+            input_ids=torch.tensor([1]),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([1]),
+            out_cache_loc=torch.tensor([0]),
+            seq_lens_sum=1,
+        )
+        values.update(overrides)
+        return ForwardBatch(**values)
+
     @staticmethod
     def _decode_batch():
         return SimpleNamespace(
@@ -161,6 +181,16 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
                 "after_draft_forward",
                 "after_draft_topk",
                 "after_draft_pp_tree",
+                "after_nextn_embed",
+                "after_nextn_attention",
+                "after_nextn_moe",
+                "after_nextn_decoder",
+                "after_nextn_norm",
+                "after_nextn_logits",
+                "after_megamoe_shared",
+                "after_megamoe_topk",
+                "after_megamoe_pre_dispatch",
+                "after_megamoe_routed",
             }
         )
         with (
@@ -173,6 +203,95 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
             selected = _resolve_eagle_cuda_sync_debug_checkpoints("cuda:1")
 
         self.assertEqual(selected, expected)
+
+    def test_owning_layer_callback_defaults_to_noop(self):
+        forward_batch = SimpleNamespace()
+
+        maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_attention")
+
+        self.assertFalse(hasattr(forward_batch, "_eagle_cuda_sync_debug_callback"))
+
+    def test_owning_layer_callback_forwards_draft_step(self):
+        callback = MagicMock()
+        forward_batch = SimpleNamespace(
+            _eagle_cuda_sync_debug_callback=callback,
+            _eagle_cuda_sync_debug_detail="step=1",
+        )
+
+        maybe_sync_eagle_cuda_debug(forward_batch, "after_megamoe_routed")
+
+        callback.assert_called_once_with("after_megamoe_routed", detail="step=1")
+
+    def test_owning_layer_callback_survives_forward_batch_clone(self):
+        callback = MagicMock()
+        forward_batch = self._forward_batch(
+            _eagle_cuda_sync_debug_callback=callback,
+            _eagle_cuda_sync_debug_detail="step=1",
+        )
+
+        cloned_batch = replace(forward_batch)
+        maybe_sync_eagle_cuda_debug(cloned_batch, "after_nextn_decoder")
+
+        callback.assert_called_once_with("after_nextn_decoder", detail="step=1")
+
+    def test_owning_layer_callback_survives_both_eager_load_paths(self):
+        from sglang.srt.environ import envs
+
+        for no_copy in (True, False):
+            with self.subTest(no_copy=no_copy):
+                callback = MagicMock()
+                forward_batch = self._forward_batch(
+                    _eagle_cuda_sync_debug_callback=callback,
+                    _eagle_cuda_sync_debug_detail="step=1",
+                )
+                runner = SimpleNamespace(
+                    _eager_registry=CudaGraphBufferRegistry(
+                        device=torch.device("cpu"),
+                        max_bs=1,
+                        max_num_tokens=1,
+                    )
+                )
+
+                with envs.SGLANG_EAGER_INPUT_NO_COPY.override(no_copy):
+                    loaded_batch = EagerRunner.load_batch(runner, forward_batch)
+                maybe_sync_eagle_cuda_debug(loaded_batch, "after_megamoe_pre_dispatch")
+
+                callback.assert_called_once_with(
+                    "after_megamoe_pre_dispatch", detail="step=1"
+                )
+
+    def test_owning_layer_callback_is_scoped_to_model_forward(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.device = "cuda:1"
+        worker._eagle_cuda_sync_debug_checkpoints = frozenset({"after_nextn_attention"})
+        previous_callback = MagicMock()
+        forward_batch = SimpleNamespace(
+            _eagle_cuda_sync_debug_callback=previous_callback,
+            _eagle_cuda_sync_debug_detail="previous",
+        )
+
+        with worker._model_forward_cuda_debug(forward_batch, "step=1"):
+            self.assertEqual(forward_batch._eagle_cuda_sync_debug_detail, "step=1")
+            self.assertEqual(
+                forward_batch._eagle_cuda_sync_debug_callback,
+                worker._maybe_sync_cuda_debug,
+            )
+
+        self.assertIs(forward_batch._eagle_cuda_sync_debug_callback, previous_callback)
+        self.assertEqual(forward_batch._eagle_cuda_sync_debug_detail, "previous")
+
+    def test_owning_layer_callback_scope_restores_after_error(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.device = "cuda:1"
+        worker._eagle_cuda_sync_debug_checkpoints = frozenset({"after_nextn_attention"})
+        forward_batch = self._forward_batch()
+
+        with self.assertRaisesRegex(RuntimeError, "model failure"):
+            with worker._model_forward_cuda_debug(forward_batch, "step=1"):
+                raise RuntimeError("model failure")
+
+        self.assertIsNone(forward_batch._eagle_cuda_sync_debug_callback)
+        self.assertIsNone(forward_batch._eagle_cuda_sync_debug_detail)
 
     @patch("sglang.srt.speculative.eagle_worker_v2._sync_eagle_cuda_debug")
     def test_maybe_sync_forwards_step_detail_only_when_selected(self, sync_debug):
@@ -241,6 +360,19 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
             "checkpoint=after_draft_topk detail=step=1",
         ):
             _sync_eagle_cuda_debug("after_draft_topk", "cuda:0", detail="step=1")
+
+    @patch("sglang.srt.speculative.eagle_worker_v2.torch.cuda.current_stream")
+    def test_sync_error_identifies_owning_layer_step(self, current_stream):
+        current_stream.return_value.synchronize.side_effect = RuntimeError(
+            "illegal memory access"
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "checkpoint=after_megamoe_pre_dispatch detail=step=1",
+        ):
+            _sync_eagle_cuda_debug(
+                "after_megamoe_pre_dispatch", "cuda:0", detail="step=1"
+            )
 
     @patch("sglang.srt.speculative.eagle_worker_v2._sync_eagle_cuda_debug")
     def test_pp_non_last_syncs_after_verify_before_return(self, sync_debug):

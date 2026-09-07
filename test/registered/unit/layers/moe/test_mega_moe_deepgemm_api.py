@@ -381,6 +381,74 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         )
         deep_gemm.fp8_mega_moe.assert_not_called()
 
+    def test_sm90_layer_probes_bracket_dispatch_and_routed_kernel(self):
+        events = []
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.mega_moe_pre_dispatch_sm90 = MagicMock(
+            side_effect=lambda *_args, **_kwargs: events.append("pre_dispatch")
+        )
+        deep_gemm.fp8_fp4_mega_moe = MagicMock(
+            side_effect=lambda *_args, **_kwargs: events.append("routed")
+        )
+        deep_gemm.fp8_mega_moe = MagicMock()
+        experts = SimpleNamespace(
+            _mega_moe_sm90_fp4_weights=True,
+            should_fuse_routed_scaling_factor_in_topk=True,
+            mega_l1_weights=(torch.empty(0), torch.empty(0)),
+            mega_l2_weights=(torch.empty(0), torch.empty(0)),
+        )
+        moe = SimpleNamespace(
+            experts=experts,
+            config=SimpleNamespace(hidden_size=4, swiglu_limit=None),
+            routed_scaling_factor=1.0,
+        )
+        buffer = SimpleNamespace(
+            x=torch.empty((1, 4)),
+            x_sf=torch.empty((1, 1)),
+            topk_idx=torch.empty((1, 1), dtype=torch.int32),
+            topk_weights=torch.empty((1, 1)),
+        )
+        forward_batch = object()
+
+        def record_probe(actual_batch, checkpoint):
+            self.assertIs(actual_batch, forward_batch)
+            events.append(checkpoint)
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(
+                mega_moe_sm90,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(enable_w4a4_mxfp4_megamoe=False)
+                ),
+            ),
+            patch.object(
+                mega_moe_sm90,
+                "maybe_sync_eagle_cuda_debug",
+                side_effect=record_probe,
+            ),
+        ):
+            mega_moe_sm90.run_sm90_mega_routed(
+                moe,
+                torch.ones((1, 4), dtype=torch.bfloat16),
+                torch.zeros((1, 1), dtype=torch.int32),
+                torch.ones((1, 1)),
+                buffer,
+                1,
+                forward_batch=forward_batch,
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "pre_dispatch",
+                "after_megamoe_pre_dispatch",
+                "routed",
+                "after_megamoe_routed",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

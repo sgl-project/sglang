@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
@@ -540,6 +540,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # therefore gives an idle DP rank padded rows to enter the same dispatch as
     # active peers. These rows are valid for MoE routing but have no request KV.
     symmetric_spec_megamoe_dummy: bool = False
+
+    # EAGLE-only, current-stream diagnostic callback. These must be dataclass
+    # fields because eager runners clone ForwardBatch with dataclasses.replace
+    # before invoking the model. They remain None in normal execution.
+    _eagle_cuda_sync_debug_callback: Optional[Callable[..., None]] = field(
+        default=None, repr=False, compare=False
+    )
+    _eagle_cuda_sync_debug_detail: Optional[str] = field(
+        default=None, repr=False, compare=False
+    )
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 

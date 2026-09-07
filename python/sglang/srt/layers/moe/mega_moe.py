@@ -35,6 +35,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils.async_probe import maybe_sync_eagle_cuda_debug
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -181,6 +182,7 @@ def forward_mega_moe(
     else:
         shared_output = moe._forward_shared_experts(hidden_states)
         mega_stream_ctx = nullcontext()
+    maybe_sync_eagle_cuda_debug(forward_batch, "after_megamoe_shared")
 
     with mega_stream_ctx:
         y = _run_mega_routed(
@@ -229,6 +231,7 @@ def _run_mega_routed(
     else:
         topk_ids = None
         topk_weights = None
+    maybe_sync_eagle_cuda_debug(forward_batch, "after_megamoe_topk")
 
     ep_group = get_moe_ep_group().device_group
     num_experts = moe.experts.num_experts
@@ -268,6 +271,7 @@ def _run_mega_routed(
             topk_weights_in,
             buf,
             num_tokens,
+            forward_batch=forward_batch,
         )
 
     mma_type = _mega_moe_mma_type()

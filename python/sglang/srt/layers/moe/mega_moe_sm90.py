@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils.async_probe import maybe_sync_eagle_cuda_debug
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ def run_sm90_mega_routed(
     topk_weights: torch.Tensor,
     buf: SymmBuffer,
     num_tokens: int,
+    forward_batch=None,
 ) -> torch.Tensor:
     import deep_gemm
 
@@ -101,6 +103,7 @@ def run_sm90_mega_routed(
         group_size=128,
         routed_scaling_factor=routed_scaling_factor,
     )
+    maybe_sync_eagle_cuda_debug(forward_batch, "after_megamoe_pre_dispatch")
 
     y = torch.empty(
         (max(num_tokens, 1), moe.config.hidden_size),
@@ -129,6 +132,7 @@ def run_sm90_mega_routed(
             activation_clamp=getattr(moe.config, "swiglu_limit", None),
             fast_math=True,
         )
+    maybe_sync_eagle_cuda_debug(forward_batch, "after_megamoe_routed")
     y = y[:num_tokens]
 
     return y
@@ -164,7 +168,9 @@ def _transform_weights_for_mega_moe_sm90_fp4_compat(
         bits = sf_fp32.view(torch.int32)
         ue8m0 = (bits.bitwise_right_shift(23).bitwise_and(0xFF)).to(torch.uint8)
         ue8m0 = ue8m0.contiguous().view(num_experts, n, k_groups // 4, 4)
-        return ue8m0.view(torch.int32).reshape(num_experts, n, k_groups // 4).contiguous()
+        return (
+            ue8m0.view(torch.int32).reshape(num_experts, n, k_groups // 4).contiguous()
+        )
 
     def _as_packed_fp4_storage(fp4: torch.Tensor) -> torch.Tensor:
         assert fp4.dtype in (
@@ -279,7 +285,9 @@ def build_sm90_fp4_mega_moe_experts_weights(experts) -> None:
 
     transform = _resolve_sm90_fp4_weight_transform(deep_gemm)
     scale_suffix = (
-        "weight_scale_inv" if hasattr(experts, "w13_weight_scale_inv") else "weight_scale"
+        "weight_scale_inv"
+        if hasattr(experts, "w13_weight_scale_inv")
+        else "weight_scale"
     )
     w13_scale = getattr(experts, f"w13_{scale_suffix}")
     w2_scale = getattr(experts, f"w2_{scale_suffix}")
