@@ -249,6 +249,14 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "not translate speculative verify indices to the unified "
             "pool's kernel-facing space yet."
         )
+    assert not cfg.enable_two_batch_overlap, (
+        "--enable-unified-memory does not support --enable-two-batch-overlap: "
+        "the TBO replay path builds its per-child fb_view in "
+        "`_build_tbo_child_replay_fb_view`, which carries `out_cache_loc` but "
+        "not the pre-translate `out_cache_loc_virtual` the write-loc fill "
+        "reads, so a captured decode replay raises on the child view. "
+        "TODO(ch-wan): slice the virtual write loc into the child view."
+    )
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "
         "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
