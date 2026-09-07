@@ -122,6 +122,8 @@ def handle_multimodal(server_args: Any):
         and cfg.mm_preprocess_cache_size_mb < 0
     ):
         raise ValueError("mm_preprocess_cache_size_mb must be non-negative")
+    if cfg.mm_global_cache_size_gb <= 0:
+        raise ValueError("mm_global_cache_size_gb must be positive")
     if cfg.mm_process_config is not None:
         if not isinstance(cfg.mm_process_config, dict):
             raise TypeError(

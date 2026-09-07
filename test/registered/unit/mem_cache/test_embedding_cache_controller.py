@@ -1,9 +1,10 @@
 """Unit tests for EmbeddingCacheController paged host pool behavior."""
 
+import asyncio
 import threading
 import unittest
 from queue import Queue
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -79,6 +80,45 @@ def _make_controller(num_pages=16, dim=4, page_size=2, enable_eviction=True):
     ctrl.prefetch_tp_group = None
     ctrl._copy_streams = {}
     return ctrl
+
+
+class TestEmbeddingStoreLifecycle(unittest.TestCase):
+    def _construct(self, embedding_store=None):
+        with (
+            patch.object(
+                EmbeddingCacheController,
+                "_create_pools",
+                return_value=(MagicMock(), MagicMock()),
+            ),
+            patch.object(
+                EmbeddingCacheController, "_register_pool_buffer"
+            ) as register_pool,
+            patch(
+                "sglang.srt.mem_cache.embedding_cache_controller.threading.Thread"
+            ) as thread_cls,
+        ):
+            controller = EmbeddingCacheController(
+                tp_rank=0,
+                tp_size=1,
+                max_pool_size_gb=4.0,
+                embedding_store=embedding_store,
+            )
+        return controller, register_pool, thread_cls
+
+    def test_store_controls_remote_initialization(self):
+        local_controller, register_pool, thread_cls = self._construct()
+
+        self.assertIsNone(local_controller.io_thread)
+        register_pool.assert_not_called()
+        thread_cls.assert_not_called()
+
+        store = MagicMock()
+        remote_controller, register_pool, thread_cls = self._construct(store)
+
+        self.assertIs(remote_controller.embedding_store, store)
+        self.assertEqual(register_pool.call_count, 2)
+        thread_cls.assert_called_once()
+        thread_cls.return_value.start.assert_called_once_with()
 
 
 class TestRangePageAllocator(unittest.TestCase):
@@ -304,6 +344,32 @@ def _insert_ready_entry(ctrl, mm_hash, tensor, modality=Modality.IMAGE):
     ctrl.entries[mm_hash] = entry
     pool.evictable.touch(mm_hash)
     return entry
+
+
+class TestLocalOnlyMode(unittest.TestCase):
+    def test_batch_is_exist_only_uses_ready_local_entries(self):
+        ctrl = _make_controller()
+        ctrl.embedding_store = None
+        tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        _insert_ready_entry(ctrl, "hit", tensor)
+
+        results = asyncio.run(ctrl.batch_is_exist(["hit", "miss"]))
+
+        self.assertEqual(results, [True, False])
+
+    def test_remote_operations_are_noops(self):
+        ctrl = _make_controller()
+        ctrl.embedding_store = None
+        tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        entry = _insert_ready_entry(ctrl, "ready", tensor)
+
+        ctrl.prefetch("req", ["remote"], [2], Modality.IMAGE)
+        ctrl.insert_batch(["ready"], Modality.IMAGE)
+
+        self.assertNotIn("remote", ctrl.entries)
+        self.assertEqual(entry.ref_count, 0)
+        self.assertTrue(ctrl.prefetch_queue.empty())
+        self.assertTrue(ctrl.insert_queue.empty())
 
 
 class TestMooncakeLifecycle(unittest.TestCase):

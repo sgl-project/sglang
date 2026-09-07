@@ -637,28 +637,30 @@ class MMEncoder:
         ).element_size()
         self._embedding_dims = self._infer_embedding_dims()
 
-        if get_mm().enable_mm_global_cache:
-            from sglang.srt.mem_cache.embedding_cache_controller import (
-                EmbeddingCacheController,
-            )
-            from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
-
-            embedding_store = EmbeddingStoreFactory.create_backend(
-                get_mm().mm_global_cache_backend,
-            )
-            self.mm_global_cache = EmbeddingCacheController(
-                rank,
-                get_parallel().tp_size,
-                embedding_store=embedding_store,
-                hidden_dims=self._embedding_dims,
-                tp_group=get_tp_group().cpu_group,
-                all_rank_get=False,
-                dtype=self._embedding_dtype,
-            )
-        else:
-            self.mm_global_cache = None
-
+        self.mm_global_cache_enabled = get_mm().enable_mm_global_cache
+        self.mm_global_cache = None
         if self.rank == 0:
+            if self.mm_global_cache_enabled:
+                from sglang.srt.mem_cache.embedding_cache_controller import (
+                    EmbeddingCacheController,
+                )
+                from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
+
+                backend = get_mm().mm_global_cache_backend
+                embedding_store = (
+                    EmbeddingStoreFactory.create_backend(backend)
+                    if backend is not None
+                    else None
+                )
+                self.mm_global_cache = EmbeddingCacheController(
+                    rank,
+                    get_parallel().tp_size,
+                    max_pool_size_gb=get_mm().mm_global_cache_size_gb,
+                    embedding_store=embedding_store,
+                    hidden_dims=self._embedding_dims,
+                    dtype=self._embedding_dtype,
+                )
+
             logger.info(
                 f"Using transfer backend: {get_disagg().encoder_transfer_backend}"
             )
@@ -1337,7 +1339,7 @@ class MMEncoder:
             torch.distributed.broadcast(
                 mask_tensor,
                 src=0,
-                group=self.mm_global_cache.prefetch_tp_group,
+                group=get_tp_group().cpu_group,
             )
 
     async def _lookup_global_cache(
@@ -2219,7 +2221,7 @@ class MMEncoder:
             is_health_check_request(req["req_id"]) for req in requests
         )
         keep_on_gpu = self.use_mooncake and not is_health_check
-        use_global_cache = self.mm_global_cache is not None and not is_health_check
+        use_global_cache = self.mm_global_cache_enabled and not is_health_check
         try:
             if self.rank == 0:
                 async with encode_state_condition:
