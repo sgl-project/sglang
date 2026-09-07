@@ -99,6 +99,31 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def dcp_virtual_loc_extent(
+    max_total_num_tokens: int, attn_dcp_size: int, loc_space_scale: int
+) -> int:
+    """How many token rows span the whole DCP virtual location space.
+
+    A replicated buffer -- the LightningIndexer's index-K, and a draft worker's
+    pools -- is addressed at a raw, untranslated ``loc``, so it must cover every
+    location the allocator can issue: ``max_total * dcp_size``. A sharded buffer
+    translates ``// dcp_size`` and stays at ``max_total``.
+
+    The subtlety this exists for: ``max_total_num_tokens`` reaches the pool
+    builders *already* multiplied by ``loc_space_scale`` (``_derive_pool_sizes``),
+    which is ``attn_dcp_size`` on a draft worker and 1 on the target. Multiplying
+    unconditionally therefore double-counts on the draft and asks for
+    ``max_total * dcp_size**2`` rows -- at 1M tokens and DCP16 that is sixteen
+    times the intended buffer, and it is invisible in every configuration CI runs
+    because both scales are 1 without DCP.
+    """
+    assert loc_space_scale in (1, attn_dcp_size), (
+        f"loc_space_scale {loc_space_scale} is neither 1 nor attn_dcp_size "
+        f"{attn_dcp_size}; the virtual extent below assumes one of the two"
+    )
+    return max_total_num_tokens * attn_dcp_size // loc_space_scale
+
+
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
     return (
@@ -1515,10 +1540,14 @@ class KVCacheConfigurator:
             # and under DCP they diverge: the latent KV is sharded, so this pool
             # keeps max_total rows and translates writes into them, while the
             # LightningIndexer is replicated, addresses every global position at
-            # a raw loc, and so spans the whole virtual range.
-            # `_build_dsa_kv_pool` omits this argument on the CUDA path and so
-            # silently under-allocates the indexer by exactly this factor.
-            index_buf_size=max_total_num_tokens * get_parallel().attn_dcp_size,
+            # a raw loc, and so spans the whole virtual range. Not a bare
+            # multiply -- see dcp_virtual_loc_extent for why the draft worker
+            # would otherwise be scaled twice.
+            index_buf_size=dcp_virtual_loc_extent(
+                max_total_num_tokens,
+                get_parallel().attn_dcp_size,
+                self.loc_space_scale,
+            ),
             skip_topk_layers=skip_topk_layers,
         )
         return token_to_kv_pool

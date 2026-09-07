@@ -860,6 +860,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         # means the pool's mask disagrees with the model's own
         # `self.indexer is None` decision -- fail loudly rather than scatter into
         # a zero-page tensor.
+        # The indexer is replicated: this writes at the raw, untranslated loc,
+        # so the bound is index_buf_size rather than size. That makes the two
+        # numbers a contract, and this is where a breach shows up -- an
+        # index_buf_size that did not span the virtual range would run off the
+        # end here rather than wrap, because nothing masks the scatter.
+        maybe_detect_oob(
+            loc,
+            0,
+            self.index_buf_size + self.page_size,
+            "set_index_k_buffer (NPU MLA, raw virtual loc)",
+        )
         assert not self.skip_topk_layers[layer_id - self.start_layer], (
             f"layer {layer_id} was elided as skip-topk but wrote index-K; the "
             "pool's skip_topk_layers disagrees with the model's indexer layout"
