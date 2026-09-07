@@ -152,11 +152,10 @@ def is_deepseek_dsa(config) -> bool:
 
 
 def is_glm_moe_dsa(config) -> bool:
-    """True for GLM-5.2 GlmMoeDsa models. The ``"GlmMoeDsa"`` substring matches
-    both the main arch ``GlmMoeDsaForCausalLM`` and the NextN draft head
-    ``GlmMoeDsaForCausalLMNextN``."""
-    return any(
-        "GlmMoeDsa" in arch for arch in (_hf_attr(config, "architectures") or [])
+    """True for GLM-5.2, both the main arch and the NextN draft head."""
+    return _hf_arch(config) in (
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
     )
 
 
@@ -691,7 +690,6 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
-
         cfg = resolving_view(server_args)
         quantization = (
             cfg.speculative_draft_model_quantization
@@ -2248,7 +2246,6 @@ def is_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
 ):
-
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
         "DeepseekV4ForCausalLM",

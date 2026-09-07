@@ -85,8 +85,10 @@ class TestIsGlmMoeDsaHelper(CustomTestCase):
         self.assertTrue(is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_MAIN_ARCH])))
         self.assertTrue(is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_NEXTN_ARCH])))
 
-    def test_matches_when_present_among_others(self):
-        self.assertTrue(
+    def test_reads_the_first_architecture_like_its_neighbours(self):
+        # is_deepseek_dsa and is_kimi_k3 next to it both decide on
+        # architectures[0]; a HF config carries the model's own arch there.
+        self.assertFalse(
             is_glm_moe_dsa(SimpleNamespace(architectures=["Foo", GLM_MAIN_ARCH]))
         )
 
@@ -95,8 +97,7 @@ class TestIsGlmMoeDsaHelper(CustomTestCase):
 
     def test_returns_false_for_none_or_empty_architectures(self):
         # A config with architectures=None or [] must return False, never
-        # mis-gating a non-GLM model (matches the direct-access idiom in
-        # configs/model_config.py, which reads config.architectures unguarded).
+        # mis-gating a non-GLM model. _hf_arch() returns None for both.
         self.assertFalse(is_glm_moe_dsa(SimpleNamespace(architectures=None)))
         self.assertFalse(is_glm_moe_dsa(SimpleNamespace(architectures=[])))
 
