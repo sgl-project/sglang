@@ -510,6 +510,7 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_born_q_tbo = get_exec().overlap.enable_two_batch_overlap
 
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
+            _flashinfer_sparse_mla_max_tokens,
             _validate_flashinfer_sparse_mla_backend,
             create_flashinfer_sparse_mla_runner,
         )
@@ -531,14 +532,12 @@ class DeepseekSparseAttnBackend(
                     device=model_runner.device,
                 ),
             )
-            # Mixed chunks can include decode or verify tokens in addition
-            # to the prefill token budget.
-            max_runner_tokens = max(
-                64,
-                int(getattr(model_runner.server_args, "chunked_prefill_size", 0) or 0),
-                int(getattr(model_runner.server_args, "max_prefill_tokens", 0) or 0),
-            ) + model_runner.max_running_requests * max(
-                1, self.speculative_num_draft_tokens or 1
+            max_runner_tokens = _flashinfer_sparse_mla_max_tokens(
+                chunked_prefill_size=model_runner.server_args.chunked_prefill_size,
+                max_prefill_tokens=model_runner.server_args.max_prefill_tokens,
+                context_len=model_runner.model_config.context_len,
+                max_running_requests=model_runner.max_running_requests,
+                speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             )
             self.flashinfer_sparse_mla_runner = create_flashinfer_sparse_mla_runner(
                 qk_rope_head_dim=self.qk_rope_head_dim,

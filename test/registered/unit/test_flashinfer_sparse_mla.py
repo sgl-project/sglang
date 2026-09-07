@@ -5,6 +5,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.flash_mla_sm120 import (
+    _flashinfer_sparse_mla_max_tokens,
     _validate_flashinfer_sparse_mla_backend,
     create_flashinfer_sparse_mla_runner,
     flashinfer_sparse_mla_forward,
@@ -237,6 +238,40 @@ class TestFlashInferSparseMLAKVLayout(unittest.TestCase):
                     ),
                     expected,
                 )
+
+
+class TestFlashInferSparseMLARunnerCapacity(unittest.TestCase):
+    def test_unchunked_first_prompt_can_exceed_prefill_budget(self):
+        for chunk in (None, 0, -1):
+            with self.subTest(chunk=chunk):
+                capacity = _flashinfer_sparse_mla_max_tokens(
+                    chunked_prefill_size=chunk,
+                    max_prefill_tokens=16384,
+                    context_len=32768,
+                    max_running_requests=4,
+                    speculative_num_draft_tokens=6,
+                )
+                self.assertGreaterEqual(capacity, 32768 + 4 * 6)
+
+    def test_chunked_mixed_batch_does_not_reserve_entire_context(self):
+        capacity = _flashinfer_sparse_mla_max_tokens(
+            chunked_prefill_size=4096,
+            max_prefill_tokens=4096,
+            context_len=524288,
+            max_running_requests=4,
+            speculative_num_draft_tokens=6,
+        )
+        self.assertEqual(capacity, 4120)
+
+    def test_unchunked_batch_budget_can_exceed_one_context(self):
+        capacity = _flashinfer_sparse_mla_max_tokens(
+            chunked_prefill_size=None,
+            max_prefill_tokens=65536,
+            context_len=32768,
+            max_running_requests=4,
+            speculative_num_draft_tokens=None,
+        )
+        self.assertGreaterEqual(capacity, 65536 + 4)
 
 
 class TestFlashInferSparseMLAIndexAndWorkspaceBounds(unittest.TestCase):

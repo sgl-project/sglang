@@ -680,6 +680,26 @@ def _flash_mla_flashinfer(
     return (output.unsqueeze(1), None)
 
 
+def _flashinfer_sparse_mla_max_tokens(
+    *,
+    chunked_prefill_size: Optional[int],
+    max_prefill_tokens: int,
+    context_len: int,
+    max_running_requests: int,
+    speculative_num_draft_tokens: Optional[int],
+) -> int:
+    chunk_size = int(chunked_prefill_size or 0)
+    prefill_tokens = max(64, chunk_size, max_prefill_tokens)
+    if chunk_size <= 0:
+        # Unchunked admission allows the first prompt to exceed the prefill
+        # budget. The configured model context still bounds that request.
+        prefill_tokens = max(prefill_tokens, context_len)
+    # Mixed batches can add decode or verify tokens to the prefill budget.
+    return prefill_tokens + max_running_requests * max(
+        1, speculative_num_draft_tokens or 1
+    )
+
+
 def _validate_flashinfer_sparse_mla_backend(
     *,
     model_arch: str,
