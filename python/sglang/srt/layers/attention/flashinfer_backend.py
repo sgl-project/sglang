@@ -555,7 +555,7 @@ class FlashInferAttnBackend(AttentionBackend):
             and model_runner.sliding_window_size is None
             and not model_config.is_encoder_decoder
             and model_config.head_dim == model_config.v_head_dim
-            and server_args.cuda_graph_config.prefill.backend == Backend.DISABLED
+            and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
             and self.token_to_kv_pool.kv_cache_layout == "nhd"
             and not self.prefill_uses_dequant_workspace
         ):
