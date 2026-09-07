@@ -1041,6 +1041,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
         host.device_pool = device_pool
         host.layout = "page_first_direct"
+        host.mtp_draft_device_pools = ()
         host.page_size = page_size
         host.layer_num = owned_end - owned_start
         host.indexer_page_stride_size = indexer_page_stride_size

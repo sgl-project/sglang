@@ -425,16 +425,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device_indices = self.maybe_dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):
             owned_layer_ids = self._owned_device_layer_ids(device_pool)
-            if not owned_layer_ids:
-                return
             if io_backend == "direct" and self.layout == "page_first_direct":
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=[device_pool.kv_buffer[i] for i in owned_layer_ids],
-                    dst_ptrs=[self.kv_buffer],
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    page_size=self.page_size,
-                )
+                if owned_layer_ids:
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=[device_pool.kv_buffer[i] for i in owned_layer_ids],
+                        dst_ptrs=[self.kv_buffer],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        page_size=self.page_size,
+                    )
+                if self.mtp_draft_device_pools:
+                    # Draft layers follow the padded local target-layer region.
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=[
+                            pool.kv_buffer[0] for pool in self.mtp_draft_device_pools
+                        ],
+                        dst_ptrs=[self.kv_buffer[:, self.target_layer_num :]],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        page_size=self.page_size,
+                    )
                 return
             for layer_id in owned_layer_ids:
                 self._backup_from_device_per_layer(
