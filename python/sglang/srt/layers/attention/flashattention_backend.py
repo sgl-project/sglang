@@ -1544,7 +1544,7 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         metadata.fa_skip_cu_seqlens_q = cu_seqlens_q
                         metadata.fa_skip_max_seqlen_q = max_seqlen_q
-                result = flash_attn_varlen_func(
+                result = self.flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
