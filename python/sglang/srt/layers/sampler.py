@@ -20,7 +20,12 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_server_args,
+    get_spec,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
@@ -109,11 +114,28 @@ def _select_sampling_mask_rows(
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tp_sync_group = get_tp_group().device_group
+        tp_sync_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        self.tp_sync_group = tp_sync_group.device_group
         self.cp_sync_group = None
         if is_dp_attention_enabled():
-            self.tp_sync_group = get_parallel().attn_tp_group.device_group
             self.cp_sync_group = get_parallel().attn_cp_group.device_group
+        # With grammar-constrained sampling, no speculative decoding and no
+        # context parallelism, only the entry rank of the sync group applies
+        # the grammar vocab mask and its sampled token ids are broadcast
+        # (see _sync_token_ids_across_tp).
+        cp_active = self.cp_sync_group is not None and (
+            dist.get_world_size(self.cp_sync_group) > 1
+        )
+        self.tp_grammar_entry_only = (
+            tp_sync_group.world_size > 1
+            and get_spec().speculative_algorithm is None
+            and not cp_active
+        )
+        self.is_tp_grammar_entry = tp_sync_group.rank_in_group == 0
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -647,7 +669,18 @@ class Sampler(nn.Module):
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+        if sampling_info.grammars and self.tp_grammar_entry_only:
+            # Only the entry rank of the TP group applies the grammar vocab
+            # mask, so its sampled token ids are authoritative: broadcast them
+            # instead of relying on bitwise-identical sampling kernels on
+            # every rank. Non-entry ranks carry placeholder grammar objects,
+            # which keeps `sampling_info.grammars` truthy here on all ranks.
+            torch.distributed.broadcast(
+                batch_next_token_ids,
+                group_src=0,
+                group=self.tp_sync_group,
+            )
+        elif SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
