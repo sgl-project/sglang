@@ -25,7 +25,7 @@ _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
 def handle_offload_compatibility(server_args: Any) -> None:
-    """Validation only; safe to re-run once the model overrides have materialized."""
+    """Flag-only check; re-run after the model overrides fill in the PLE default."""
     cfg = resolving_view(server_args)
     if cfg.ple_offload_embedding and (
         cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0

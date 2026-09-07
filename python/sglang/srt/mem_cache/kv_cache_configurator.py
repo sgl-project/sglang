@@ -1274,7 +1274,6 @@ class KVCacheConfigurator:
             elif self.mambaish_config:
                 token_to_kv_pool = self._build_hybrid_linear_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
-                    max_running_requests=sizes.max_running_requests,
                     req_to_token_pool=req_to_token_pool,
                     mha_pool_class=mha_pool_class,
                 )
@@ -1782,7 +1781,6 @@ class KVCacheConfigurator:
         self,
         *,
         max_total_num_tokens: int,
-        max_running_requests: int,
         req_to_token_pool: ReqToTokenPool,
         mha_pool_class: type,
     ) -> KVCache:
@@ -2075,7 +2073,6 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
-            # The draft's QSA page ledger is registered with its pools at the
             if self.is_hybrid_swa:
                 if isinstance(
                     token_to_kv_pool_allocator,

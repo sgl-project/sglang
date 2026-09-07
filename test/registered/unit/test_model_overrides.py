@@ -613,6 +613,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # value: readers only ever read flags.
         self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "auto")
 
+    def test_qwen4_rejects_pd_and_unified_memory(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        for kwargs, message in (
+            ({"disaggregation_mode": "prefill"}, "PD disaggregation"),
+            ({"disaggregation_mode": "decode"}, "PD disaggregation"),
+            ({"enable_unified_memory": True}, "enable-unified-memory"),
+        ):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._construct(*qwen4, **kwargs)
+
     def test_qwen4_ple_offload_default(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
         with override_platform(is_cuda=True):

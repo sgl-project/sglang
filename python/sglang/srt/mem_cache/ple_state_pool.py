@@ -46,16 +46,15 @@ class ShortConvPool:
         self.layer_map = {layer_id: i for i, layer_id in enumerate(layer_ids)}
         self.conv_state = None
         self.intermediate_conv_state = None
+        if not layer_ids or state_shape is None:
+            return
+
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
-
-        if not layer_ids or state_shape is None:
-            return
-
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
             (
@@ -139,15 +138,15 @@ class NGramPool:
         self.device = device
         self.context = None
         self.intermediate_context = None
+        if context_len <= 0:
+            return
+
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
-        if context_len <= 0:
-            return
-
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
             (

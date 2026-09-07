@@ -238,8 +238,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_model_specific_adjustments(server_args)
-    # Re-check after the model overrides materialize: Qwen4-Exp declares the
-    # PLE offload default there.
+    # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     handle_offload_compatibility(server_args)
 
     # Set kernel backends.

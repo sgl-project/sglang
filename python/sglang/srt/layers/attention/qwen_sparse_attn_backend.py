@@ -168,14 +168,6 @@ class QSAMTPSharedSparseIndices:
         return out
 
 
-def _count_padded_rows(seq_lens_cpu, seq_len_fill_value: int) -> int:
-    """Replay rows padded up to the captured batch size carry the graph runner's
-    seq_len fill value; MambaAttnBackendBase._replay_metadata counts them the same way."""
-    if seq_lens_cpu is None:
-        return 0
-    return int(torch.count_nonzero(seq_lens_cpu == seq_len_fill_value))
-
-
 class QwenSparseAttnBackend(AttentionBackend):
     """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
 
@@ -755,6 +747,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
             )
         else:
+            num_padding = getattr(forward_batch, "num_padding", None)
             self._replay_cuda_graph_metadata(
                 bs=forward_batch.batch_size,
                 req_pool_indices=forward_batch.req_pool_indices,
@@ -762,7 +755,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 forward_mode=forward_batch.forward_mode,
                 spec_info=forward_batch.spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
-                num_padding=getattr(forward_batch, "num_padding", None),
+                num_padding=num_padding if num_padding is not None else 0,
             )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -939,13 +932,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_mode,
         spec_info,
         seq_lens_cpu,
-        num_padding: Optional[int] = None,
+        num_padding: int = 0,
     ) -> None:
         self._require_chain_speculation(forward_mode, spec_info)
-        if num_padding is None:
-            num_padding = _count_padded_rows(
-                seq_lens_cpu, self.get_cuda_graph_seq_len_fill_value()
-            )
         metadata = self._cuda_graph_metadata[(forward_mode, bs)]
         # Compressed addressing is arithmetic over req_to_token; pure reads below.
         if self._can_replay_with_gpu_kernels(metadata, seq_lens):
@@ -1748,11 +1737,7 @@ class QwenSparseMultiStepDraftBackend:
             return
 
         num_padding = getattr(forward_batch, "num_padding", None)
-        if num_padding is None:
-            num_padding = _count_padded_rows(
-                forward_batch.seq_lens_cpu,
-                self.attn_backends[0].get_cuda_graph_seq_len_fill_value(),
-            )
+        num_padding = num_padding if num_padding is not None else 0
         for step, backend in enumerate(self.attn_backends):
             step_batch = self._make_step_forward_batch(
                 forward_batch, step, num_padding=num_padding

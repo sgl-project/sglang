@@ -1236,6 +1236,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
+        self.ple_window_cache = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -1308,7 +1309,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
-        self.ple_window_cache = None
         self.ngram_pool = NGramPool(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
@@ -1506,9 +1506,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_pool.mamba2_layer_cache(self.mamba2_layer_index(layer_id))
 
-    def get_short_conv_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
-        return self.get_mamba_indices(req_indices)
-
     def short_conv_layer_cache(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -1518,9 +1515,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self, layer_id: int
     ) -> Optional[torch.Tensor]:
         return self.short_conv_pool.layer_intermediate_cache(layer_id)
-
-    def get_ngram_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
-        return self.get_mamba_indices(req_indices)
 
     def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
         return self.ngram_pool.get_context(ngram_indices)
