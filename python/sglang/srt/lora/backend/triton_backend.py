@@ -1,4 +1,3 @@
-import copy
 import dataclasses
 from typing import List, Optional, Tuple
 
@@ -26,7 +25,7 @@ from sglang.srt.lora.utils import (
     merge_and_chunk_segments,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import LoRABatchLayout, get_forward
+from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 
 # Fixed segment slots (one per request) baked into the captured prefill LoRA
 # kernel grids; batches with more requests fall back to eager prefill.
@@ -154,7 +153,9 @@ def gather_dp_attention_lora_batch_info(
         global_batch_info = graph_batch_info
     global_batch_info.has_active_lora = has_global_active_lora
 
-    if local_batch_info.use_cuda_graph and not forward_batch.is_extend_in_batch:
+    # Decode/verify graphs use the same padded rows for the model and LM head.
+    # A DP-local LM head must keep the local pruning prepared by the backend.
+    if local_batch_info.use_cuda_graph or get_parallel().enable_dp_lm_head:
         return local_batch_info, global_batch_info, None
 
     global_num_tokens = forward_batch.global_num_tokens_for_logprob_cpu
@@ -162,14 +163,14 @@ def gather_dp_attention_lora_batch_info(
         return local_batch_info, global_batch_info, None
 
     assert forward_batch.global_num_tokens_for_logprob_gpu is not None
-    routing_forward_batch = copy.copy(forward_batch)
-    routing_forward_batch.global_num_tokens_cpu = global_num_tokens
-    routing_forward_batch.global_num_tokens_gpu = (
-        forward_batch.global_num_tokens_for_logprob_gpu
+    routing_forward_batch = dataclasses.replace(
+        forward_batch,
+        global_num_tokens_cpu=global_num_tokens,
+        global_num_tokens_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+        dp_padding_mode=DpPaddingMode.SUM_LEN,
+        dp_local_start_pos=None,
+        dp_local_num_tokens=None,
     )
-    routing_forward_batch.dp_padding_mode = DpPaddingMode.SUM_LEN
-    routing_forward_batch.dp_local_start_pos = None
-    routing_forward_batch.dp_local_num_tokens = None
     _, global_weight_indices = _gather_dp_attention_weight_indices(
         routing_forward_batch,
         local_lm_head_batch_info or local_batch_info,

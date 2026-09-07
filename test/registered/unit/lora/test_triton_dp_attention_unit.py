@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.lora.backend.triton_backend import (
     TritonLoRABackend,
@@ -17,6 +18,14 @@ from sglang.srt.runtime_context import LoRABatchLayout, get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def global_lm_head(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        "sglang.srt.lora.backend.triton_backend.get_parallel",
+        lambda: SimpleNamespace(enable_dp_lm_head=False),
+    )
 
 
 def _batch_info(weight_indices: list[int], seg_lens: list[int]) -> LoRABatchInfo:
@@ -65,6 +74,45 @@ def test_layout_selects_routing_without_shape_inference():
     assert _routes(backend._sgemm_info()) == [1, 0]
 
 
+@pytest.mark.parametrize("mlp_mode", [ScatterMode.FULL, ScatterMode.TP_ATTN_FULL])
+@pytest.mark.parametrize("num_tokens", [0, 2])
+@pytest.mark.parametrize("enable_dp_attention", [False, True])
+def test_communicator_publishes_layout_at_each_transition(
+    monkeypatch, mlp_mode, num_tokens, enable_dp_attention
+):
+    monkeypatch.setattr(
+        "sglang.srt.layers.communicator.get_parallel",
+        lambda: SimpleNamespace(enable_dp_attention=enable_dp_attention),
+    )
+    expected = (
+        LoRABatchLayout.TP_GLOBAL
+        if enable_dp_attention and mlp_mode is ScatterMode.FULL
+        else LoRABatchLayout.DP_LOCAL
+    )
+    communicator = LayerCommunicator.__new__(LayerCommunicator)
+    communicator.layer_scatter_modes = SimpleNamespace(mlp_mode=mlp_mode)
+    communicator._context = SimpleNamespace()
+    communicator.post_attention_layernorm = None
+    communicator.input_layernorm = lambda x: x
+    communicator.qkv_latent_func = None
+    communicator._communicate_simple_fn = lambda **kwargs: kwargs["hidden_states"]
+    communicator._communicate_with_all_reduce_and_layer_norm_fn = lambda **kwargs: (
+        kwargs["hidden_states"],
+        kwargs["residual"],
+    )
+    monkeypatch.setattr(
+        "sglang.srt.layers.communicator.get_attn_tp_context",
+        lambda: SimpleNamespace(input_scattered=False),
+    )
+    hidden = torch.zeros(num_tokens, 4)
+    with get_forward().scoped(lora_batch_layout=LoRABatchLayout.DP_LOCAL):
+        for _ in range(2):
+            communicator.prepare_mlp(hidden, hidden, None)
+            assert get_forward().lora_batch_layout is expected
+            communicator.prepare_attn(hidden, None, None)
+            assert get_forward().lora_batch_layout is LoRABatchLayout.DP_LOCAL
+
+
 def test_dp_cuda_graph_global_routing_does_not_require_logprob_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -97,13 +145,17 @@ def test_dp_cuda_graph_global_routing_does_not_require_logprob_metadata(
     assert lm_head_batch_infos is None
 
 
-def test_dp_cuda_graph_mixed_prefill_gathers_lm_head_routes_from_replay_view(
+def test_local_lm_head_keeps_local_pruned_routing(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    local_batch_info = _batch_info([1, 2], [1, 1])
-    local_batch_info.use_cuda_graph = True
-    graph_batch_info = _batch_info([0, 0, 0, 0], [1, 1, 1, 1])
-    graph_batch_info.use_cuda_graph = True
+    backend = TritonLoRABackend(3, torch.device("cpu"))
+    backend.batch_info = _batch_info([1, 2], [3, 1])
+    local_lm_head = backend.lm_head_batch_info = _batch_info([1, 2], [1, 1])
+    backend.has_global_active_lora = True
+    monkeypatch.setattr(
+        "sglang.srt.lora.backend.triton_backend.get_parallel",
+        lambda: SimpleNamespace(enable_dp_lm_head=True),
+    )
     monkeypatch.setattr(
         "sglang.srt.lora.backend.triton_backend.get_attention_dp_rank", lambda: 0
     )
@@ -112,43 +164,25 @@ def test_dp_cuda_graph_mixed_prefill_gathers_lm_head_routes_from_replay_view(
 
     def gather(output, local, forward_batch):
         nonlocal gather_count
-        if gather_count == 0:
-            assert local.tolist() == [1, 2]
-            output.copy_(torch.tensor([1, 2, 0, 0], dtype=torch.int32))
-        else:
-            assert local.tolist() == [1]
-            assert forward_batch.dp_padding_mode is DpPaddingMode.SUM_LEN
-            output.copy_(torch.tensor([1, 2], dtype=torch.int32))
+        assert local.tolist() == [1, 1, 1, 2]
+        output.copy_(torch.tensor([1, 1, 1, 2, 0, 0, 0, 0], dtype=torch.int32))
         gather_count += 1
 
     monkeypatch.setattr(
         "sglang.srt.lora.backend.triton_backend.dp_gather_replicate", gather
     )
-    replay_view = SimpleNamespace(
-        global_num_tokens_cpu=[2, 2],
-        global_num_tokens_gpu=torch.tensor([2, 2]),
-        global_num_tokens_for_logprob_cpu=[1, 1],
-        global_num_tokens_for_logprob_gpu=torch.tensor([1, 1]),
+    forward_batch = SimpleNamespace(
+        global_num_tokens_cpu=[4, 4],
         is_extend_in_batch=True,
         dp_padding_mode=DpPaddingMode.MAX_LEN,
         dp_local_start_pos=None,
         dp_local_num_tokens=None,
     )
 
-    _, global_batch_info, lm_head_batch_infos = gather_dp_attention_lora_batch_info(
-        replay_view,
-        local_batch_info,
-        graph_batch_info,
-        True,
-        0,
-        _batch_info([1], [1]),
-    )
-
-    assert gather_count == 2
-    assert global_batch_info is graph_batch_info
-    assert lm_head_batch_infos is not None
-    lm_head_batch_info, _ = lm_head_batch_infos
-    assert _routes(lm_head_batch_info) == [1, 2]
+    backend.prepare_global_lora_batch(forward_batch)
+    assert gather_count == 1
+    assert backend.lm_head_batch_info is local_lm_head
+    assert _routes(backend.lm_head_batch_info) == [1, 2]
 
 
 def test_prepare_global_routing_gathers_pruned_lm_head_routes(

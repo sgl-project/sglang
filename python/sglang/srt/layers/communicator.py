@@ -73,7 +73,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    LoRABatchLayout,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -567,6 +573,8 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        if get_parallel().enable_dp_attention:
+            get_forward().set("lora_batch_layout", LoRABatchLayout.DP_LOCAL)
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -763,6 +771,15 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        if get_parallel().enable_dp_attention:
+            get_forward().set(
+                "lora_batch_layout",
+                (
+                    LoRABatchLayout.TP_GLOBAL
+                    if self.layer_scatter_modes.mlp_mode is ScatterMode.FULL
+                    else LoRABatchLayout.DP_LOCAL
+                ),
+            )
         if cache is not None:
             self._context.cache = cache
 

@@ -426,11 +426,12 @@ python3 -m sglang.launch_server \
     --enable-dp-attention \
     --enable-lora \
     --lora-backend triton \
-    --lora-paths ADAPTER_NAME=ADAPTER_PATH
+    --lora-paths '{"lora_name":"ADAPTER_NAME","lora_path":"ADAPTER_PATH","pinned":true}'
 ```
 
 Keep these constraints in mind:
 
+- All adapters must be GPU-pinned (`pinned: true`), including dynamically loaded adapters. You can pin at most `--max-loras-per-batch - 1` adapters; the remaining slot is reserved for the base model.
 - Decode CUDA graphs are supported. LoRA prefill runs eagerly when DPA is enabled.
 - `--max-loras-per-batch` limits the union of adapters active across all DP ranks in a synchronized forward, not the adapters on one rank alone.
 - Dynamic load and unload requests are sent to every DP rank. An operation succeeds only if every rank reports success. After a partially successful load, retry unloading the same adapter name before loading it again.

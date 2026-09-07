@@ -300,6 +300,9 @@ class LoRAManager:
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
+        assert (
+            not self.enable_dp_attention or lora_ref.pinned
+        ), "DP-attention LoRA requires pinned adapters"
         if lora_config.lora_added_tokens_size > 0:
             raise ValueError(
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
