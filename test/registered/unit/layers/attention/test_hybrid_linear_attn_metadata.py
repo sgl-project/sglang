@@ -59,7 +59,7 @@ def _target_verify_batch(
             ragged_verify_layout=ragged_layout,
         ),
         input_ids=torch.arange(physical_tokens),
-        num_token_non_padded_cpu=(
+        global_num_token_non_padded_cpu=(
             original_batch_size * draft_token_num
             if ragged_query_start_loc is None
             else int(ragged_query_start_loc[-1])
@@ -77,7 +77,7 @@ class TestHybridLinearAttentionMetadata(CustomTestCase):
         self.assertEqual(metadata.mamba_cache_indices.tolist(), [17, -1])
         self.assertEqual(
             int(metadata.query_start_loc[-1]),
-            forward_batch.num_token_non_padded_cpu,
+            forward_batch.global_num_token_non_padded_cpu,
         )
         self.assertEqual(
             metadata.query_start_loc.shape[0] - 1,
@@ -91,6 +91,16 @@ class TestHybridLinearAttentionMetadata(CustomTestCase):
 
         self.assertEqual(metadata.query_start_loc.tolist(), [0, 6])
         self.assertEqual(metadata.mamba_cache_indices.tolist(), [17])
+
+    def test_eager_target_verify_has_no_queries_on_padded_idle_rank(self):
+        forward_batch = _target_verify_batch(
+            draft_token_num=6, physical_tokens=24, original_batch_size=0
+        )
+
+        metadata = _backend()._forward_metadata(forward_batch)
+
+        self.assertEqual(metadata.query_start_loc.tolist(), [0, 0, 0, 0, 0])
+        self.assertEqual(metadata.mamba_cache_indices.tolist(), [-1, -1, -1, -1])
 
     def test_eager_target_verify_preserves_real_requests_before_padding(self):
         forward_batch = _target_verify_batch(

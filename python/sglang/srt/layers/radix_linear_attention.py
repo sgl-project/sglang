@@ -157,6 +157,13 @@ def _linear_attention_with_output_impl(
         forward_batch.global_num_token_non_padded_cpu, mixed_qkv.shape[0]
     )
 
+    # MLP sync can turn an idle hybrid rank into a padded target-verify batch.
+    # Skip kernels that require real requests while retaining the physical
+    # output shape for later collectives.
+    if real_num_tokens == 0:
+        output.zero_()
+        return
+
     physical_num_tokens = mixed_qkv.shape[0]
 
     def _real_token_prefix(tensor: torch.Tensor) -> torch.Tensor:

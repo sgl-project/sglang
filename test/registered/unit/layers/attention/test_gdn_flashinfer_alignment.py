@@ -366,6 +366,70 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         )
         self.assertEqual(len(kernel._verify_intermediate_buffers), 0)
 
+    def test_mtp_padded_logical_prefix_keeps_fixed_width_grouping(self):
+        """FlashInfer must use cache_steps, not the padded qsl request count."""
+        for seq_len, cache_steps, query_start_loc, cache_indices, expected_bs in (
+            (
+                18,
+                6,
+                torch.tensor([0, 6, 12, 18, 18], dtype=torch.int32),
+                torch.tensor([11, 12, 13, -1], dtype=torch.int32),
+                3,
+            ),
+            (
+                4,
+                4,
+                torch.tensor([0, 4, 4], dtype=torch.int32),
+                torch.tensor([21, -1], dtype=torch.int32),
+                1,
+            ),
+        ):
+            with self.subTest(seq_len=seq_len, cache_steps=cache_steps):
+                kernel = _make_kernel_without_flashinfer()
+                kernel.use_state_pool = True
+                captured = {}
+
+                def fake_mtp(**kwargs):
+                    captured.update(kwargs)
+                    return torch.zeros_like(kwargs["v"]), None
+
+                kernel._mtp_fn = fake_mtp
+                q = torch.arange(seq_len * 2, dtype=torch.bfloat16).view(
+                    1, seq_len, 1, 2
+                )
+                k = q.clone()
+                v = q.clone()
+                a = torch.zeros((1, seq_len, 1), dtype=torch.bfloat16)
+                b = torch.zeros_like(a)
+                workspace = torch.zeros((4, cache_steps, 1, 2, 2), dtype=torch.bfloat16)
+
+                result = kernel.target_verify(
+                    torch.zeros(1),
+                    torch.zeros(1, dtype=torch.bfloat16),
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    ssm_states=torch.zeros(32, 1, 2, 2, dtype=torch.bfloat16),
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    intermediate_states_buffer=workspace,
+                    intermediate_state_indices=torch.arange(4, dtype=torch.int32),
+                    cache_steps=cache_steps,
+                    retrieve_parent_token=None,
+                )
+
+                self.assertEqual(
+                    tuple(captured["q"].shape),
+                    (expected_bs, cache_steps, 1, 2),
+                )
+                torch.testing.assert_close(captured["q"].reshape(-1), q.reshape(-1))
+                torch.testing.assert_close(
+                    captured["initial_state_indices"], cache_indices[:expected_bs]
+                )
+                self.assertEqual(tuple(result.shape), (1, seq_len, 1, 2))
+
     def test_mtp_padded_workspace_is_reused_across_sequential_layer_pools(self):
         kernel = _make_kernel_without_flashinfer()
         kernel.use_state_pool = True

@@ -608,8 +608,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             )
 
         seq_len = q.shape[1]
-        batch_size = query_start_loc.shape[0] - 1
-        draft_token_num = seq_len // batch_size
+        # Tokens may be trimmed while metadata retains MLP-sync padding rows.
+        # Keep the speculative width fixed when recovering the real batch size.
+        draft_token_num = cache_steps
+        batch_size = seq_len // draft_token_num
 
         num_heads = q.shape[2]
         head_k_dim = q.shape[3]
@@ -677,7 +679,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
         A_log_fi, dt_bias_fi = self._prepare_gate_parameters(A_log, dt_bias)
         cache_indices_fi = self._prepare_dynamic_input(
-            "verify_cache_indices", cache_indices
+            "verify_cache_indices", cache_indices[:batch_size]
         )
 
         output_fi, _ = self._mtp_fn(

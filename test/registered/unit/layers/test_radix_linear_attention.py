@@ -202,6 +202,79 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
 
         self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
 
+    def test_padded_idle_verify_skips_backend_and_preserves_collective_shape(self):
+        layer = radix_linear_attention.RadixLinearAttention(
+            layer_id=0,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=2,
+            head_q_dim=4,
+            head_k_dim=4,
+            head_v_dim=4,
+        )
+        for physical_tokens in (1, 24):
+            with self.subTest(physical_tokens=physical_tokens):
+                original_out_cache_loc = torch.arange(physical_tokens)
+                forward_batch = SimpleNamespace(
+                    forward_mode=_TargetVerifyMode(),
+                    global_num_token_non_padded_cpu=0,
+                    out_cache_loc=original_out_cache_loc,
+                    _original_batch_size=0,
+                    spec_info=SimpleNamespace(draft_token_num=6),
+                )
+                with (
+                    patch.object(
+                        radix_linear_attention,
+                        "get_tc_piecewise_forward_context",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        radix_linear_attention, "get_attn_backend"
+                    ) as get_backend,
+                ):
+                    output = layer.forward(
+                        forward_batch=forward_batch,
+                        mixed_qkv=torch.full((physical_tokens, 8), float("nan")),
+                        a=torch.full((1, physical_tokens, 8), float("nan")),
+                        b=torch.full((1, physical_tokens, 2), float("nan")),
+                    )
+
+                get_backend.assert_not_called()
+                torch.testing.assert_close(
+                    output, torch.zeros((1, physical_tokens, 2, 4))
+                )
+                self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+
+    def test_piecewise_empty_prefix_initializes_output_without_backend(self):
+        original_out_cache_loc = torch.arange(8)
+        forward_batch = SimpleNamespace(
+            global_num_token_non_padded_cpu=0,
+            out_cache_loc=original_out_cache_loc,
+        )
+        context = SimpleNamespace(
+            forward_batch=forward_batch, attention_layers=[object()]
+        )
+        output = torch.full((1, 8, 2, 4), float("nan"))
+        with (
+            patch.object(
+                radix_linear_attention,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(radix_linear_attention, "get_attn_backend") as get_backend,
+        ):
+            radix_linear_attention._unified_linear_attention_with_output_impl(
+                mixed_qkv=torch.zeros((8, 8)),
+                a=torch.zeros((8, 2)),
+                b=torch.zeros((8, 2)),
+                output=output,
+                layer_id=0,
+            )
+
+        get_backend.assert_not_called()
+        torch.testing.assert_close(output, torch.zeros_like(output))
+        self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+
     def test_padded_output_tail_is_initialized(self):
         for padded_num_tokens in (3, 5):
             with self.subTest(padded_num_tokens=padded_num_tokens):

@@ -8,6 +8,9 @@ from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
+    _cache_indices,
+    _clone_gdn_cache,
+    _restore_gdn_cache,
     build_gdn_attention_fixture,
     make_gdn_cases,
     run_gdn_attention_case,
@@ -17,6 +20,8 @@ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner i
     run_gdn_cuda_graph_decode_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+    _make_spec_verify_input,
+    _prepare_target_verify_batch,
     run_gdn_eagle_verify_case,
     run_gdn_eagle_verify_cuda_graph_case,
 )
@@ -390,6 +395,219 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         torch.testing.assert_close(
             flashinfer_tracked, triton_tracked, atol=3e-2, rtol=3e-2
         )
+
+    def _install_flashinfer_verify(self, fixture):
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        verify_kernel = FlashInferGDNKernel()
+        self.assertTrue(verify_kernel.supports_target_verify)
+        dispatcher = fixture.backend.linear_attn_backend.kernel_dispatcher
+        dispatcher.verify_kernel = verify_kernel
+        dispatcher.verify_kernel_is_flashinfer = True
+
+    def _run_padded_verify_pair(
+        self,
+        *,
+        real_prefix_lens: tuple[int, ...],
+        draft_token_num: int,
+        padded_prefix_lens: tuple[int, ...],
+    ) -> None:
+        real_batch_size = len(real_prefix_lens)
+        padded_batch_size = len(padded_prefix_lens)
+        real_case = GDNAttentionCase(
+            name=(
+                f"flashinfer_gdn_verify_reference_b{real_batch_size}_t{draft_token_num}"
+            ),
+            backend="triton",
+            linear_attn_prefill_backend="flashinfer",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_k_heads=2,
+            num_v_heads=4,
+            page_size=16,
+            prefix_lens=real_prefix_lens,
+            extend_lens=(draft_token_num,) * real_batch_size,
+        )
+        padded_case = GDNAttentionCase(
+            name=(
+                f"flashinfer_gdn_verify_padded_b{real_batch_size}_"
+                f"p{padded_batch_size}_t{draft_token_num}"
+            ),
+            backend=real_case.backend,
+            linear_attn_prefill_backend=real_case.linear_attn_prefill_backend,
+            forward_mode=real_case.forward_mode,
+            num_k_heads=real_case.num_k_heads,
+            num_v_heads=real_case.num_v_heads,
+            page_size=real_case.page_size,
+            prefix_lens=padded_prefix_lens,
+            extend_lens=(draft_token_num,) * padded_batch_size,
+        )
+        max_context_len = max(padded_prefix_lens) + draft_token_num + 1
+        reference = build_gdn_attention_fixture(
+            self,
+            real_case,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=max_context_len,
+        )
+        padded = build_gdn_attention_fixture(
+            self,
+            padded_case,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=max_context_len,
+            runner_batch_size=padded_batch_size,
+        )
+        self._install_flashinfer_verify(reference)
+        self._install_flashinfer_verify(padded)
+
+        real_num_tokens = real_batch_size * draft_token_num
+        with torch.no_grad():
+            padded.actual_module.A_log.copy_(reference.actual_module.A_log)
+            padded.actual_module.dt_bias.copy_(reference.actual_module.dt_bias)
+            padded.mixed_qkv[:real_num_tokens].copy_(reference.mixed_qkv)
+            padded.a[:real_num_tokens].copy_(reference.a)
+            padded.b[:real_num_tokens].copy_(reference.b)
+
+            reference_cache = _clone_gdn_cache(reference)
+            padded_cache = _clone_gdn_cache(padded)
+            reference_indices = _cache_indices(reference)
+            padded_indices = _cache_indices(padded)
+            padded_cache[0][padded_indices[:real_batch_size]] = reference_cache[0][
+                reference_indices
+            ]
+            padded_cache[1][padded_indices[:real_batch_size]] = reference_cache[1][
+                reference_indices
+            ]
+            _restore_gdn_cache(reference, reference_cache)
+            _restore_gdn_cache(padded, padded_cache)
+
+        for fixture, is_padded in ((reference, False), (padded, True)):
+            _prepare_target_verify_batch(fixture.forward_batch, fixture.case, "cuda")
+            fixture.forward_batch.spec_info = _make_spec_verify_input(
+                fixture.case,
+                fixture.forward_batch,
+                topk=1,
+                device="cuda",
+                spec_kind="eagle",
+            )
+            if is_padded:
+                # Mirror MLP-sync metadata: physical rows remain in the batch,
+                # while only the first real requests own target-verify tokens.
+                fixture.forward_batch._original_batch_size = real_batch_size
+                fixture.forward_batch.global_num_token_non_padded = torch.tensor(
+                    real_num_tokens, dtype=torch.int32, device="cuda"
+                )
+                fixture.forward_batch.global_num_token_non_padded_cpu = real_num_tokens
+
+        reference_output = run_gdn_fixture_eager(reference)
+        padded_output = run_gdn_fixture_eager(padded)
+        expected_query_start_loc = torch.tensor(
+            [
+                *range(0, real_num_tokens + 1, draft_token_num),
+                *([real_num_tokens] * (padded_batch_size - real_batch_size)),
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        torch.testing.assert_close(
+            padded.backend.linear_attn_backend.forward_metadata.query_start_loc,
+            expected_query_start_loc,
+        )
+        torch.testing.assert_close(
+            padded.backend.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                :real_batch_size
+            ],
+            padded_indices[:real_batch_size],
+        )
+        self.assertTrue(
+            torch.all(
+                padded.backend.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                    real_batch_size:
+                ]
+                == -1
+            ).item()
+        )
+        reference_intermediate = (
+            reference.runner.req_to_token_pool.mamba2_layer_cache(0)
+            .intermediate_ssm[:real_batch_size]
+            .clone()
+        )
+        padded_intermediate = (
+            padded.runner.req_to_token_pool.mamba2_layer_cache(0)
+            .intermediate_ssm[:real_batch_size]
+            .clone()
+        )
+
+        torch.testing.assert_close(
+            padded_output[:, :real_num_tokens],
+            reference_output,
+            atol=3e-2,
+            rtol=3e-2,
+        )
+        torch.testing.assert_close(
+            padded_output[:, real_num_tokens:],
+            torch.zeros_like(padded_output[:, real_num_tokens:]),
+        )
+        torch.testing.assert_close(
+            padded_intermediate,
+            reference_intermediate,
+            atol=3e-2,
+            rtol=3e-2,
+        )
+
+    def test_target_verify_padded_requests_match_flashinfer_reference(self):
+        # 18 real tokens in a 24-token physical bucket: old FI verify inferred
+        # B=4 and T=4, instead of the real B=3, T=6.
+        self._run_padded_verify_pair(
+            real_prefix_lens=(4, 7, 5),
+            draft_token_num=6,
+            padded_prefix_lens=(4, 7, 5, 0),
+        )
+
+    def test_target_verify_divisible_padding_matches_flashinfer_reference(self):
+        # A divisible padded shape still catches the old inference: 4 real
+        # tokens in an 8-token bucket must stay B=1, T=4 rather than B=2, T=2.
+        self._run_padded_verify_pair(
+            real_prefix_lens=(4,),
+            draft_token_num=4,
+            padded_prefix_lens=(4, 0),
+        )
+
+    def test_target_verify_padded_idle_rank_preserves_state(self):
+        case = GDNAttentionCase(
+            name="flashinfer_gdn_verify_idle_rank",
+            backend="triton",
+            linear_attn_prefill_backend="flashinfer",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_k_heads=2,
+            num_v_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7, 5, 0),
+            extend_lens=(6, 6, 6, 6),
+        )
+        fixture = build_gdn_attention_fixture(
+            self, case, head_k_dim=self.HEAD_DIM, head_v_dim=self.HEAD_DIM
+        )
+        self._install_flashinfer_verify(fixture)
+        _prepare_target_verify_batch(fixture.forward_batch, case, "cuda")
+        fixture.forward_batch.spec_info = _make_spec_verify_input(
+            case, fixture.forward_batch, topk=1, device="cuda", spec_kind="eagle"
+        )
+        fixture.forward_batch._original_batch_size = 0
+        fixture.forward_batch.global_num_token_non_padded_cpu = 0
+        original_cache = _clone_gdn_cache(fixture)
+        output = run_gdn_fixture_eager(fixture)
+        self.assertEqual(tuple(output.shape), (1, 24, 4, self.HEAD_DIM))
+        torch.testing.assert_close(output, torch.zeros_like(output))
+        for actual, expected in zip(_clone_gdn_cache(fixture), original_cache):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        metadata = fixture.backend.linear_attn_backend.forward_metadata
+        torch.testing.assert_close(
+            metadata.query_start_loc, torch.zeros_like(metadata.query_start_loc)
+        )
+        self.assertTrue(torch.all(metadata.mamba_cache_indices == -1).item())
 
 
 if __name__ == "__main__":
