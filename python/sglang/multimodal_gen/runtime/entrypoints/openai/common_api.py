@@ -5,11 +5,13 @@ from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel, Field
 
 from sglang.multimodal_gen.registry import get_model_info
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
     format_lora_message,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch

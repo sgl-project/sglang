@@ -50,6 +50,7 @@ def cutlass_fused_experts_fp8(
     use_mxfp8: bool = False,
     output: Optional[torch.Tensor] = None,
     enable_es: Tuple[bool, bool] = (False, False),
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
 
@@ -271,7 +272,12 @@ def cutlass_fused_experts_fp8(
         )
 
     intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
-    silu_and_mul(c1, intermediate)
+    if swiglu_limit is None:
+        silu_and_mul(c1, intermediate)
+    else:
+        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+
+        silu_and_mul_clamp(c1, intermediate, swiglu_limit)
 
     if use_mxfp8 and es_down:
         intemediate_q = torch.empty_like(intermediate, dtype=torch.float8_e4m3fn)
