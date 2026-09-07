@@ -143,6 +143,15 @@ class TestPublicationOverlap(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(entered.wait(), 1)
                 with self.assertRaisesRegex(ValueError, "not ready"):
                     await tm.lora_registry.acquire("A@2")
+
+                async def admit_untouched_adapter():
+                    async with tm.model_update_lock.reader_lock:
+                        lora_id = await tm.lora_registry.acquire("C")
+                        self.assertEqual(lora_id, old_ids[2])
+                        await tm.lora_registry.release(lora_id)
+
+                await asyncio.wait_for(admit_untouched_adapter(), 1)
+                self.assertFalse(task.done())
                 finish.set()
                 self.assertTrue((await asyncio.wait_for(task, 1))[0])
                 new_id = await tm.lora_registry.acquire("A@2")

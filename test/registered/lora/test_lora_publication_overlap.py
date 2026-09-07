@@ -1,4 +1,4 @@
-"""Publish A@2 before live A@1/B/C streams finish, without changing their outputs."""
+"""Publish A/B versions while existing and newly admitted C requests progress."""
 
 import concurrent.futures
 import json
@@ -105,7 +105,7 @@ class TestLoRAPublicationOverlap(CustomTestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("not ready", response.text)
 
-    def _publish(self, name, tensors):
+    def _publish(self, name, tensors, during_transfer=None):
         result = self._post(
             "register_lora_adapter",
             {
@@ -128,7 +128,7 @@ class TestLoRAPublicationOverlap(CustomTestCase):
         )
         items = [(f"{name}:{key}", tensor) for key, tensor in tensors.items()]
         midpoint = len(items) // 2
-        for bucket in (items[:midpoint], items[midpoint:]):
+        for index, bucket in enumerate((items[:midpoint], items[midpoint:])):
             transfer = [(key, tensor.clone()) for key, tensor in bucket]
             self._post(
                 "update_weights_from_tensor",
@@ -144,6 +144,8 @@ class TestLoRAPublicationOverlap(CustomTestCase):
                 tensor.zero_()
             torch.cuda.synchronize()
             self._assert_pending(name)
+            if index == 0 and during_transfer is not None:
+                during_transfer()
         self._post(
             "end_weight_update",
             {
@@ -156,14 +158,14 @@ class TestLoRAPublicationOverlap(CustomTestCase):
             },
         )
 
-    def _stream(self, name, started, progress):
+    def _stream(self, name, started, progress, request_id=None, max_new_tokens=1536):
         payload = {
             "text": "Continue counting integers, separated by commas: 1, 2, 3,",
             "lora_path": name,
             "stream": True,
             "sampling_params": {
                 "temperature": 0,
-                "max_new_tokens": 1536,
+                "max_new_tokens": max_new_tokens,
                 "ignore_eos": True,
             },
         }
@@ -182,11 +184,22 @@ class TestLoRAPublicationOverlap(CustomTestCase):
                 chunk = json.loads(line[6:])
                 self.assertNotIn("error", chunk, chunk)
                 tokens.extend(chunk.get("output_ids", []))
-                progress[name] = len(tokens)
+                progress[request_id or name] = len(tokens)
                 if len(tokens) >= 8:
                     started.set()
-        self.assertEqual(len(tokens), 1536)
+        self.assertEqual(len(tokens), max_new_tokens)
         return tokens, time.monotonic()
+
+    def _cached_probe(self):
+        result = self._post(
+            "generate",
+            {
+                "text": "A separate cached prefix for adapter C. " * 32,
+                "lora_path": "C",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+            },
+        )
+        return result["meta_info"]["cached_tokens"]
 
     def _probe(self, name):
         result = self._post(
@@ -208,11 +221,14 @@ class TestLoRAPublicationOverlap(CustomTestCase):
         )
 
     def test_publish_completes_before_existing_streams_and_preserves_old_versions(self):
-        names = ("A@1", "B", "C")
+        names = ("A@1", "B@1", "C")
         for seed, name in enumerate(names, start=1):
             self._publish(name, self._weights(seed))
         before = {name: self._probe(name) for name in names}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        new_weights = {
+            name: self._weights(seed) for name, seed in (("A@2", 4), ("B@2", 5))
+        }
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
             baseline = {
                 name: pool.submit(self._stream, name, threading.Event(), {})
                 for name in names
@@ -229,8 +245,42 @@ class TestLoRAPublicationOverlap(CustomTestCase):
             for event in started.values():
                 self.assertTrue(event.wait(30), "generation did not start")
             self.assertTrue(all(not future.done() for future in active.values()))
+            self._cached_probe()
+            cached_before = self._cached_probe()
+            self.assertGreater(cached_before, 0)
             publish_start = time.monotonic()
-            self._publish("A@2", self._weights(4))
+            new_requests = {}
+            progress_during_publish = {}
+            cached_after = {}
+            for new_name, tensors in new_weights.items():
+
+                def assert_generation_progress():
+                    before_transfer = progress["C"]
+                    request_id = f"C during {new_name}"
+                    entered = threading.Event()
+                    new_requests[request_id] = pool.submit(
+                        self._stream, "C", entered, progress, request_id, 128
+                    )
+                    self.assertTrue(entered.wait(30), "new C request was not admitted")
+                    deadline = time.monotonic() + 30
+                    while (
+                        progress["C"] < before_transfer + 8
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.01)
+                    self.assertGreaterEqual(progress["C"], before_transfer + 8)
+                    self.assertTrue(
+                        all(not future.done() for future in active.values())
+                    )
+                    progress_during_publish[new_name] = {
+                        "existing_c_before": before_transfer,
+                        "existing_c_after": progress["C"],
+                        "new_c_tokens": progress[request_id],
+                    }
+
+                self._publish(new_name, tensors, assert_generation_progress)
+                cached_after[new_name] = self._cached_probe()
+                self.assertGreaterEqual(cached_after[new_name], cached_before)
             published = time.monotonic()
             self.assertTrue(
                 all(not future.done() for future in active.values()), progress
@@ -239,20 +289,28 @@ class TestLoRAPublicationOverlap(CustomTestCase):
             results = {
                 name: future.result(timeout=120) for name, future in active.items()
             }
+            for request_id, future in new_requests.items():
+                self.assertEqual(
+                    future.result(timeout=120)[0], expected["C"][:128], request_id
+                )
         for name, (tokens, finished) in results.items():
             self.assertLess(published, finished)
             self.assertEqual(
-                tokens, expected[name], f"{name} changed during A@2 publication"
+                tokens, expected[name], f"{name} changed during A/B publication"
             )
             np.testing.assert_allclose(
                 self._probe(name), before[name], atol=0.01, rtol=0.001
             )
         self.assertGreater(np.max(np.abs(self._probe("A@2") - before["A@1"])), 0.001)
+        self.assertGreater(np.max(np.abs(self._probe("B@2") - before["B@1"])), 0.001)
         print(
             json.dumps(
                 {
                     "publish_seconds": published - publish_start,
                     "tokens_at_publish": progress_at_publish,
+                    "progress_during_publish": progress_during_publish,
+                    "c_cached_tokens_before": cached_before,
+                    "c_cached_tokens_after": cached_after,
                     "remaining_generation_seconds": {
                         name: finish - published
                         for name, (_, finish) in results.items()
