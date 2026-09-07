@@ -27,8 +27,9 @@ export const benchmarks = [
     accuracy: { mmmu_pro_pct: 77.86 },
     notes: "4×GB300, TP=4. Speed: bench_serving --flush-cache, temperature 0; tok/s/GPU = total (input + output) token throughput ÷ 4. HT columns are queue-dominated (KDA state cache caps concurrent requests at 935 on this cell) — judge HT by TPOT/throughput, not TTFT. Image workload (one 720p JPEG per request, +883 vision tokens, in/out=1024/1024): conc 1: TTFT 320.99 ms, TPOT 3.91 ms, 173 tok/s/GPU; conc 16: TTFT 1490.73 ms, TPOT 6.53 ms, 1381 tok/s/GPU; conc 64: TTFT 3279.24 ms, TPOT 12.67 ms, 2996 tok/s/GPU; conc 128: TTFT 6887.76 ms, TPOT 15.56 ms, 4226 tok/s/GPU. Accuracy: MMMU-Pro (sgl-eval, 1730 examples, single-shot, thinking on, temperature 0 / top-p 0.95) measured at 2×GB300 TP=2, stop rate 99.65%.",
   },
+  { match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
   {
-    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+    match: { hw: "gb300", variant: "default", quant: "fp8-online", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ 1242867bcb",
     accuracy: { mmmu_pro_pct: 76.01, gsm8k_pct: 97.19 },
     notes: "4×GB300, TP=4, --quantization fp8 (online dynamic w8a8 on the BF16 checkpoint — no official FP8 export exists). Accuracy vs BF16 on the same box: MMMU-Pro 76.01% vs 77.86% (stop 99.36%), GSM8K 97.19% vs 97.35% (stop 100%). Speed (LL points, same protocol as the BF16 card): text 8192/1024 conc 1: TTFT 174.80 ms, TPOT 3.95 ms, 546 tok/s/GPU; conc 16: TTFT 981.25 ms, TPOT 7.49 ms, 4273 tok/s/GPU. Image 1024/1024 conc 1: TTFT 272.09 ms, TPOT 4.51 ms, 153 tok/s/GPU; conc 16: TTFT 1389.27 ms, TPOT 7.15 ms, 1369 tok/s/GPU. FP8 prefill (TTFT) is consistently faster than BF16 while TPOT is ~10% slower.",
