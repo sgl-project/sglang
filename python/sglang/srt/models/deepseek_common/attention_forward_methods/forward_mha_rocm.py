@@ -268,6 +268,18 @@ class DeepseekMHARocmForwardMixin:
             positions, hidden_states, forward_batch, zero_allocator
         )
 
+    def forward_normal_chunked_kv_rocm_prepare(
+        self: DeepseekV2AttentionMLA,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        # First do normal mha forward to get output for extended part
+        return self.forward_normal_rocm_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+
     def _concat_and_cast_mha_k_rocm(
         self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,
