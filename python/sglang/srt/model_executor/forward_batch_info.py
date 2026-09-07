@@ -1348,19 +1348,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.spec_info is not None
             and not self.spec_info.is_draft_input()
             and self.spec_info.ragged_verify_layout is None
-            and (
-                self.forward_mode.is_target_verify()
-                or self.forward_mode.is_idle()
-            )
+            and self.spec_info.num_tokens_per_req > 0
+            and (self.forward_mode.is_target_verify() or self.forward_mode.is_idle())
             and mambaish_config(model_runner.model_config) is not None
         ):
             token_alignment = math.lcm(
                 token_alignment, self.spec_info.num_tokens_per_req
             )
             if not enable_cp_v2():
-                token_alignment = math.lcm(
-                    token_alignment, get_cp_padding_align_size()
-                )
+                token_alignment = math.lcm(token_alignment, get_cp_padding_align_size())
 
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
