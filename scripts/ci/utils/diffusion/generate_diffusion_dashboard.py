@@ -15,6 +15,7 @@ Usage:
 import argparse
 import json
 import os
+import statistics
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -26,6 +27,8 @@ CI_DATA_REPO_NAME = "ci-data-diffusion"
 CI_DATA_BRANCH = "main"
 HISTORY_PREFIX = "diffusion-comparisons"
 MAX_HISTORY_RUNS = 29
+HISTORICAL_BASELINE_RUNS = 5
+REGRESSION_THRESHOLD = 0.05
 
 # Base URL for chart images pushed to sgl-project/ci-data-diffusion
 CHARTS_RAW_BASE_URL = (
@@ -136,6 +139,19 @@ def _short_sha(sha: str) -> str:
     return sha[:7] if sha and sha != "unknown" else "?"
 
 
+def _historical_latency_baseline(
+    cid: str, framework: str, history: list[dict]
+) -> tuple[float | None, int]:
+    values = []
+    for run in history[:HISTORICAL_BASELINE_RUNS]:
+        latency = _extract_case_results(run).get(cid, {}).get(framework)
+        if latency is not None:
+            values.append(latency)
+    if not values:
+        return None, 0
+    return statistics.median(values), len(values)
+
+
 def _assess_risk(
     cid: str,
     current_cases: dict[str, dict[str, float | None]],
@@ -146,7 +162,7 @@ def _assess_risk(
 
     Rules (checked in order):
     - N/A latency → ❌ broken
-    - History exists: SGLang latency >5% vs avg of last 3 runs → ⚠️ regression
+    - History exists: SGLang latency >5% vs median of recent runs → ⚠️ regression
     - Competitor exists & SGLang slower → 🔴 competitive risk
     - SGLang faster than all competitors by >20% → 🟢 strong advantage
     - SGLang faster than all competitors by ≤20% → 🟡 moderate advantage
@@ -158,23 +174,18 @@ def _assess_risk(
     if sg_lat is None:
         return "❌", f"{cid}: SGLang latency is N/A (broken)"
 
-    # Check regression against 3-run historical average
-    if history:
-        hist_lats: list[float] = []
-        for run in history[:3]:
-            run_cases = _extract_case_results(run)
-            h_lat = run_cases.get(cid, {}).get("sglang")
-            if h_lat is not None:
-                hist_lats.append(h_lat)
-        if hist_lats:
-            avg_3 = sum(hist_lats) / len(hist_lats)
-            if avg_3 > 0 and (sg_lat - avg_3) / avg_3 > 0.05:
-                pct = (sg_lat - avg_3) / avg_3 * 100
-                return (
-                    "⚠️",
-                    f"{cid}: SGLang regression +{pct:.1f}% vs 3-run avg "
-                    f"({sg_lat:.2f}s vs {avg_3:.2f}s)",
-                )
+    baseline, baseline_runs = _historical_latency_baseline(cid, "sglang", history)
+    if (
+        baseline is not None
+        and baseline > 0
+        and (sg_lat - baseline) / baseline > REGRESSION_THRESHOLD
+    ):
+        pct = (sg_lat - baseline) / baseline * 100
+        return (
+            "⚠️",
+            f"{cid}: SGLang regression +{pct:.1f}% vs {baseline_runs}-run "
+            f"median ({sg_lat:.2f}s vs {baseline:.2f}s)",
+        )
 
     # Check competitive risk
     if other_frameworks:
@@ -229,6 +240,24 @@ def _extract_case_results(run_data: dict) -> dict[str, dict[str, float | None]]:
     return mapping
 
 
+def _extract_case_records(run_data: dict) -> dict[str, dict[str, dict]]:
+    """Extract {case_id: {framework: result record}} from a run."""
+    mapping: dict[str, dict[str, dict]] = {}
+    for result in run_data.get("results", []):
+        mapping.setdefault(result["case_id"], {})[result["framework"]] = result
+    return mapping
+
+
+def _stage_group_seconds(result: dict, suffixes: str | tuple[str, ...]) -> float | None:
+    if isinstance(suffixes, str):
+        suffixes = (suffixes,)
+    stages = result.get("server_stage_medians_ms") or {}
+    values = [value for name, value in stages.items() if name.endswith(suffixes)]
+    if not values:
+        return None
+    return sum(values) / 1000.0
+
+
 def _sanitize_filename(name: str) -> str:
     """Sanitize a case ID to be a safe filename."""
     return name.replace("/", "_").replace(" ", "_").replace(":", "_")
@@ -257,22 +286,22 @@ def generate_dashboard(
     lines.append(f"*Generated: {_short_date(ts)} | Commit: `{_short_sha(sha)}`*\n")
 
     current_cases = _extract_case_results(current)
+    current_records = _extract_case_records(current)
     case_ids = list(current_cases.keys())
 
     # ---- Regression detection ----
-    REGRESSION_THRESHOLD = 0.05  # 5%
     regressions: list[str] = []
     if history:
-        prev_cases = _extract_case_results(history[0])
         for cid in case_ids:
             for fw in ("sglang", "vllm-omni"):
                 cur = current_cases.get(cid, {}).get(fw)
-                prev = prev_cases.get(cid, {}).get(fw)
-                if cur and prev and prev > 0:
-                    pct = (cur - prev) / prev
+                baseline, baseline_runs = _historical_latency_baseline(cid, fw, history)
+                if cur is not None and baseline is not None and baseline > 0:
+                    pct = (cur - baseline) / baseline
                     if pct > REGRESSION_THRESHOLD:
                         regressions.append(
-                            f"**{cid}** ({fw}): {prev:.2f}s -> {cur:.2f}s "
+                            f"**{cid}** ({fw}): {cur:.2f}s vs "
+                            f"{baseline_runs}-run median {baseline:.2f}s "
                             f"(+{pct * 100:.1f}%)"
                         )
 
@@ -305,10 +334,10 @@ def generate_dashboard(
         risk_map[cid] = _assess_risk(cid, current_cases, history, other_frameworks)
 
     # Dynamic header
-    header = "| Model | Risk |"
-    sep = "|-------|------|"
+    header = "| Model | Risk | Samples |"
+    sep = "|-------|------|---------|"
     for fw in all_frameworks:
-        header += f" {fw} (s) |"
+        header += f" {fw} median (s) |"
         sep += "---------|"
     for ofw in other_frameworks:
         header += f" vs {ofw} |"
@@ -326,9 +355,15 @@ def generate_dashboard(
 
         case_fws = current_cases.get(cid, {})
         sg_lat = case_fws.get("sglang")
+        sg_record = current_records.get(cid, {}).get("sglang", {})
+        sample_count = sg_record.get("measurement_count")
+        if not sample_count and sg_lat is not None:
+            sample_count = 1
 
         risk_emoji, _ = risk_map.get(cid, ("✅", ""))
-        row = f"| {r['model'].split('/')[-1]} | {risk_emoji} |"
+        row = (
+            f"| {r['model'].split('/')[-1]} | {risk_emoji} | {sample_count or 'N/A'} |"
+        )
         # Latency columns -- bold the fastest
         lats = {fw: case_fws.get(fw) for fw in all_frameworks}
         valid_lats = [v for v in lats.values() if v is not None]
@@ -343,6 +378,38 @@ def generate_dashboard(
         for ofw in other_frameworks:
             row += f" {_fmt_speedup(sg_lat, case_fws.get(ofw))} |"
         lines.append(row)
+
+    server_records = [
+        current_records.get(cid, {}).get("sglang", {}) for cid in case_ids
+    ]
+    if any(record.get("server_latency_s") is not None for record in server_records):
+        lines.append("\n## SGLang Server-Side Breakdown\n")
+        lines.append(
+            "| Model | Server total (s) | Text encode (s) | Denoise (s) | "
+            "Decode (s) | Median denoise step (ms) |"
+        )
+        lines.append(
+            "|-------|------------------|-----------------|--------------|"
+            "------------|---------------------------|"
+        )
+        for record in server_records:
+            if record.get("server_latency_s") is None:
+                continue
+            model = record["model"].split("/")[-1]
+            text_encode = _stage_group_seconds(
+                record, ("TextEncodingStage", "TokenizationStage")
+            )
+            denoise = _stage_group_seconds(record, "DenoisingStage")
+            decode = _stage_group_seconds(record, "DecodingStage")
+            denoise_step = record.get("median_denoise_step_ms")
+            denoise_step_text = (
+                f"{denoise_step:.2f}" if denoise_step is not None else "N/A"
+            )
+            lines.append(
+                f"| {model} | {_fmt_latency(record['server_latency_s'])} | "
+                f"{_fmt_latency(text_encode)} | {_fmt_latency(denoise)} | "
+                f"{_fmt_latency(decode)} | {denoise_step_text} |"
+            )
 
     # ---- Section 2: Speedup-over-time vs. other frameworks (rendered only when present) ----
     if history and other_frameworks:

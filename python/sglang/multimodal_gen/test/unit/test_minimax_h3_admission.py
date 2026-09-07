@@ -206,6 +206,22 @@ def test_loaded_weight_partition_admits_only_its_declared_tasks(partition, tasks
         metadata.canonical_task(rejected)
 
 
+def test_synthetic_warmup_target_honors_warmup_flags():
+    def target(num_frames=None, resolution=None):
+        width, height = map(int, (resolution or "896x512").split("x"))
+        req = SimpleNamespace(num_frames=17, width=width, height=height)
+        server_args = SimpleNamespace(
+            warmup_num_frames=num_frames,
+            warmup_resolutions=None if resolution is None else [resolution],
+        )
+        return MiniMaxH3SamplingParams._synthetic_warmup_target(req, server_args)
+
+    assert target() == TARGET
+    assert target(num_frames=345) == {**TARGET, "duration_seconds": 345 / 24.0}
+    assert target(resolution="768x1344") == {**TARGET, "aspect_ratio": "9:16"}
+    assert target(resolution="832x464") == TARGET
+
+
 def test_duration_admission_accepts_released_4_to_15_second_range():
     for duration in (4.0, 15.0):
         target = {**TARGET, "duration_seconds": duration}
