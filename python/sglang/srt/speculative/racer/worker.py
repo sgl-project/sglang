@@ -309,12 +309,19 @@ class RACERWorker(NGRAMWorker):
         prompt_lens: list[int],
         vocab_size: int,
     ) -> tuple[torch.Tensor, list[int]]:
-        """Keep only the latest EXTEND row for each token id per request.
+        """Keep only the latest EXTEND row for each in-vocab token id per request.
 
         TokenBin is a mapping from token id to its latest copy-logit top-k row,
         so earlier occurrences of the same token in one EXTEND segment are
         overwritten before decoding can observe them. Selecting exactly the
         last row for each token therefore preserves the final TokenBin state.
+
+        Ids outside ``[0, vocab_size)`` are skipped rather than clamped. They
+        are not vocabulary keys: multimodal pad hashes sit at
+        ``1_000_000 + hash``, CUDA-graph tails can hold leftover dummy ids,
+        and ``-1`` is used as a sentinel. Clamping would seed the wrong
+        TokenBin row; scattering them as-is trips
+        ``ScatterGatherKernel`` ``idx_dim`` asserts.
 
         The selection stays on GPU. A reusable vocab-sized int32 workspace
         stores the maximum local position for every token id via scatter-reduce,
@@ -327,9 +334,11 @@ class RACERWorker(NGRAMWorker):
         selected: list[torch.Tensor] = []
         selected_lens: list[int] = []
         offset = 0
+        vocab_size = int(vocab_size)
         last_positions = torch.empty(
-            (int(vocab_size),), dtype=torch.int32, device=prompt_tokens.device
+            (vocab_size,), dtype=torch.int32, device=prompt_tokens.device
         )
+        dropped = 0
 
         for length in prompt_lens:
             length = int(length)
@@ -339,14 +348,23 @@ class RACERWorker(NGRAMWorker):
                 offset = end
                 continue
 
-            tokens = prompt_tokens[offset:end]
-            last_positions.fill_(-1)
+            tokens = prompt_tokens[offset:end].to(torch.int64)
             positions = torch.arange(
                 length, dtype=torch.int32, device=prompt_tokens.device
             )
+            valid = tokens.ge(0) & tokens.lt(vocab_size)
+            tokens = tokens[valid]
+            positions = positions[valid]
+            dropped += length - int(tokens.numel())
+            if tokens.numel() == 0:
+                selected_lens.append(0)
+                offset = end
+                continue
+
+            last_positions.fill_(-1)
             last_positions.scatter_reduce_(
                 0,
-                tokens.to(torch.int64),
+                tokens,
                 positions,
                 reduce="amax",
                 include_self=True,
@@ -356,9 +374,57 @@ class RACERWorker(NGRAMWorker):
             selected_lens.append(int(local_indices.numel()))
             offset = end
 
+        if dropped:
+            logger.warning(
+                "RACER prompt warm-up dropped %d token ids outside [0, %d); "
+                "typically multimodal pad hashes or CUDA-graph padding.",
+                dropped,
+                vocab_size,
+            )
         if selected:
             return torch.cat(selected, dim=0), selected_lens
-        return torch.empty(0, dtype=torch.int64, device=prompt_tokens.device), selected_lens
+        return (
+            torch.empty(0, dtype=torch.int64, device=prompt_tokens.device),
+            selected_lens,
+        )
+
+    @staticmethod
+    def _prompt_warmup_token_ids(batch, prompt_lens: list[int], device) -> torch.Tensor:
+        """EXTEND token ids aligned with ``prompt_lens``, from request fill ids.
+
+        Prefer ``Req.get_fill_ids()`` over ``batch.input_ids``. After a prefill
+        CUDA-graph replay, ``ScheduleBatch.input_ids`` can alias a padded
+        static buffer whose tail is intentionally left stale. Fill ids keep
+        the prompt TokenBin keys identical to the scheduler's EXTEND chunk.
+        """
+
+        total = sum(int(x) for x in prompt_lens)
+        reqs = getattr(batch, "reqs", None)
+        if reqs is not None and len(reqs) == len(prompt_lens):
+            pieces: list[int] = []
+            aligned = True
+            for req, length in zip(reqs, prompt_lens):
+                length = int(length)
+                if length <= 0:
+                    continue
+                fill = req.get_fill_ids()
+                prefix = len(req.prefix_indices)
+                chunk = fill[prefix : prefix + length]
+                if len(chunk) != length:
+                    aligned = False
+                    break
+                pieces.extend(int(token) for token in chunk)
+            if aligned and len(pieces) == total:
+                return torch.tensor(pieces, dtype=torch.int64, device=device)
+
+        input_ids = getattr(batch, "input_ids", None)
+        if input_ids is None or input_ids.numel() < total:
+            raise ValueError(
+                "RACER prompt warm-up could not recover EXTEND token ids "
+                f"(total={total}, input_ids="
+                f"{None if input_ids is None else tuple(input_ids.shape)})."
+            )
+        return input_ids[:total].to(device=device, dtype=torch.int64)
 
     def _warm_prompt_tokenbin(self, batch, hidden_states: torch.Tensor) -> None:
         """Seed RACER's copy-logit adjacency from prompt positions.
@@ -405,7 +471,7 @@ class RACERWorker(NGRAMWorker):
         total = sum(prompt_lens)
         if total <= 0:
             return
-        if hidden_states.shape[0] != total:
+        if hidden_states.shape[0] < total:
             logger.warning(
                 "RACER prompt warm-up hidden/token mismatch: hidden_rows=%d total_extend=%d; "
                 "skipping this extend batch.",
@@ -413,8 +479,18 @@ class RACERWorker(NGRAMWorker):
                 total,
             )
             return
+        if hidden_states.shape[0] > total:
+            # Prefill CUDA-graph buckets can emit padded hidden rows. TokenBin
+            # keys must stay aligned with the unpadded EXTEND chunk.
+            hidden_states = hidden_states[:total]
 
-        prompt_tokens = batch.input_ids[:total]
+        try:
+            prompt_tokens = self._prompt_warmup_token_ids(
+                batch, prompt_lens, hidden_states.device
+            )
+        except ValueError as exc:
+            logger.warning("%s; skipping this extend batch.", exc)
+            return
         model = self.model_runner.model
         logits_processor = model.logits_processor
         lm_head = model.lm_head
