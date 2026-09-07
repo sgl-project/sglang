@@ -61,14 +61,15 @@ Launch the server with:
 ```bash
 SGLANG_USE_MLX=1 python -m sglang.launch_server \
   --model <MODEL_ID_OR_PATH> \
-  --disable-cuda-graph \
+  --cuda-graph-backend-decode=disabled \
+  --cuda-graph-backend-prefill=disabled \
   --host 0.0.0.0
 ```
 
 **Key Parameters Explained:**
 
 1. `SGLANG_USE_MLX=1` - Enables the use of MLX as the SGLang runtime backend (if disabled, SGLang will fall back to `torch.mps`, which has less support)
-2. `--disable-cuda-graph` - Disables usage of CUDA graph, which is not relevant for Apple Metal.
+2. `--cuda-graph-backend-decode=disabled` / `--cuda-graph-backend-prefill=disabled` - Disables CUDA graph backends, which are not relevant for Apple Metal.
 3. `--disable-overlap-schedule` - Disables overlap scheduling (enabled/not present by default) achieved using MLX's `async_eval()`
 4. `SGLANG_MLX_USE_CUSTOM_ROPE=1` - Enables the optional custom Metal RoPE kernel. It is disabled by default, so the MLX backend uses the standard RoPE path unless you opt in for A/B testing.
 5. `SGLANG_MLX_FUSE_SWIGLU=1` - Enables the use of fused Swish-Gated Linear Unit kernel (disabled by default)
@@ -82,14 +83,16 @@ The MLX backend supports two quantization paths on Apple Silicon:
    ```bash
    SGLANG_USE_MLX=1 python -m sglang.launch_server \
      --model-path mlx-community/Qwen3-0.6B-4bit \
-     --disable-cuda-graph
+     --cuda-graph-backend-decode=disabled \
+     --cuda-graph-backend-prefill=disabled
    ```
 2. **On-the-fly quantization.** For any fp16 model, pass `--quantization mlx_q4` or `--quantization mlx_q8` to have sglang quantize the weights at load time via `mlx_lm.utils.quantize_model` (group size 64, the mlx-community default). The quantized weights stay in process memory; the on-disk model is untouched.
    ```bash
    SGLANG_USE_MLX=1 python -m sglang.launch_server \
      --model-path Qwen/Qwen3-0.6B \
      --quantization mlx_q4 \
-     --disable-cuda-graph
+     --cuda-graph-backend-decode=disabled \
+     --cuda-graph-backend-prefill=disabled
    ```
    Expected log line:
    ```
@@ -110,7 +113,8 @@ Basic synchronous one batch throughput:
 ```bash
 SGLANG_USE_MLX=1 python -m sglang.benchmark.one_batch \
   --model-path <MODEL_ID_OR_PATH> \
-  --disable-cuda-graph \
+  --cuda-graph-backend-decode=disabled \
+  --cuda-graph-backend-prefill=disabled \
   --tp-size 1 \
   --batch-size 1 \
   --input-len 60 \
@@ -121,7 +125,8 @@ Synchronous offline throughput:
 ```bash
 SGLANG_USE_MLX=1 python -m sglang.benchmark.offline_throughput \
   --model-path <MODEL_ID_OR_PATH> \
-  --disable-cuda-graph \
+  --cuda-graph-backend-decode=disabled \
+  --cuda-graph-backend-prefill=disabled \
   --num-prompts 1 \
   --disable-overlap-schedule
 ```
@@ -130,6 +135,7 @@ Asynchronous offline throughput:
 ```bash
 SGLANG_USE_MLX=1 python -m sglang.benchmark.offline_throughput \
   --model-path <MODEL_ID_OR_PATH> \
-  --disable-cuda-graph \
+  --cuda-graph-backend-decode=disabled \
+  --cuda-graph-backend-prefill=disabled \
   --num-prompts 1
 ```
