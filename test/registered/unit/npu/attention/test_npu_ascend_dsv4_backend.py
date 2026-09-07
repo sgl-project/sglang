@@ -67,7 +67,13 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
 )
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    dsv4_state_payloads,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenToKVPool
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+    DSV4ReqToTokenTablesMixin,
+)
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
@@ -301,6 +307,35 @@ class TestMultiStepDraftCompressedLocs(unittest.TestCase):
 
 
 class TestC4StateTransferLayout(unittest.TestCase):
+    @patch(
+        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+        return_value=True,
+    )
+    def test_payload_uses_each_peers_private_ring_size(self, _):
+        def state_rows(ring_size):
+            req_pool = SimpleNamespace(
+                c128_page_size=1,
+                req_to_c128_sidecar=torch.zeros((4, 1), dtype=torch.int32),
+                get_dsv4_c4_state_ring_size=lambda: ring_size,
+            )
+            payloads = dsv4_state_payloads(req_pool, 2, 13, page_size=1)
+            return next(
+                payload()
+                for state_type, payload in payloads.items()
+                if state_type.value == "dsv4_c4_state"
+            )
+
+        self.assertEqual(state_rows(8).tolist(), [16, 17, 18, 19, 20])
+        self.assertEqual(state_rows(16).tolist(), [40, 41, 42, 43, 44])
+
+    def test_req_pool_reads_ring_size_from_registered_kv_pool(self):
+        req_pool = DSV4ReqToTokenTablesMixin.__new__(DSV4ReqToTokenTablesMixin)
+        req_pool._dsv4_allocator = MagicMock()
+        req_pool._dsv4_allocator.get_kvcache().get_ring_size.return_value = 16
+
+        self.assertEqual(req_pool.get_dsv4_c4_state_ring_size(), 16)
+        req_pool._dsv4_allocator.get_kvcache().get_ring_size.assert_called_once_with(4)
+
     def test_registers_single_rows_instead_of_request_banks(self):
         attn_state = torch.empty((32, 5), dtype=torch.float32)
         indexer_state = torch.empty((32, 7), dtype=torch.float32)

@@ -71,7 +71,6 @@ def dsv4_state_payloads(
     page_size: int,
     *,
     prefix_len: int = 0,
-    c4_ring_size: int | None = None,
 ):
     """Build NPU-specific DSV4 PD payloads.
 
@@ -112,14 +111,12 @@ def dsv4_state_payloads(
     payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
 
     if is_npu_arch35():
-        if c4_ring_size is None:
-            raise ValueError("c4_ring_size is required for A5 C4 state transfer")
 
         def c4_state_indices():
             return get_dsv4_c4_state_indices(
                 req_pool_idx,
                 seq_len,
-                ring_size=c4_ring_size,
+                ring_size=req_to_token_pool.get_dsv4_c4_state_ring_size(),
             )
 
         payloads[AscendStateType.DSV4_C4_STATE] = c4_state_indices
