@@ -18,6 +18,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def validate_deepseek_v4_attention_tp(server_args: ServerArgs) -> None:
+    """Ensure DeepSeek V4 attention projections shard into whole groups."""
+    config = server_args.get_model_config().hf_config
+    view = server_args._resolved()
+    attn_dp_size = server_args.dp_size if view.enable_dp_attention else 1
+    attn_partition_size = attn_dp_size * view.attn_cp_size
+    if server_args.tp_size % attn_partition_size != 0:
+        return
+    attn_tp_size = server_args.tp_size // attn_partition_size
+
+    if (
+        config.num_attention_heads % attn_tp_size != 0
+        or config.o_groups % attn_tp_size != 0
+    ):
+        raise ValueError(
+            "DeepSeekV4 requires the effective attention TP size to divide "
+            f"both num_attention_heads={config.num_attention_heads} and "
+            f"o_groups={config.o_groups}; got attn_tp_size={attn_tp_size} "
+            f"(tp_size={server_args.tp_size}, dp_size={server_args.dp_size}, "
+            f"enable_dp_attention={view.enable_dp_attention}, "
+            f"attn_cp_size={view.attn_cp_size}). For global TP24, use "
+            "--data-parallel-size 3 --enable-dp-attention to use attention TP8."
+        )
+
+
 def validate_deepseek_v4_mega_moe_token_budget(
     server_args: ServerArgs,
 ) -> None:
