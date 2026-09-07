@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.runtime_context import get_exec
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
@@ -126,6 +129,7 @@ def uses_ssm_state(model_config) -> bool:
         or mamba2_config(model_config) is not None
         or (spec.uses_mamba_radix_cache if spec is not None else False)
         or kimi_linear_config(model_config) is not None
+        or glm5_next_config(model_config) is not None
         or hybrid_lightning_config(model_config) is not None
     )
 
@@ -306,11 +310,12 @@ def build_kv_cache(
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
         eviction_policy=get_memory().radix_eviction_policy,
+        eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
-        enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-        enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
+        enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         attn_cp_rank=ps.attn_cp_rank,

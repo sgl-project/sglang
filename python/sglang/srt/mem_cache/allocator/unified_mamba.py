@@ -306,11 +306,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.clear_inverse_history()
             self.mamba_allocator.clear_inverse_history()
 
-    def clear(self) -> None:
-        self.full_attn_allocator.clear()
-        self.mamba_allocator.clear()
-        self.free_group = None
-
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
         """Fixed-shape counterpart of `free()`; see `MultiEndedAllocator._page_reps`.
         The mamba sub-pool is slot-granular and untouched by a token free."""
