@@ -1321,11 +1321,11 @@ at::Tensor fp8_scaled_mm_cpu(
   return out;
 }
 
-// mat1    : [*, K]
+// mat1    : [M, K]
 // mat2    : [N, K] fp8_e4m3, actual layout: [N / BLOCK_N, K / 2, BLOCK_N, 2]
 // scales2 : scalar, one scale for the whole mat2
 // bias    : [N]
-// out     : [*, N]
+// out     : [M, N]
 at::Tensor fp8_per_tensor_scaled_mm_cpu(
     at::Tensor& mat1,
     at::Tensor& mat2,
@@ -1338,16 +1338,14 @@ at::Tensor fp8_per_tensor_scaled_mm_cpu(
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales2);
+  CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
 
-  const int64_t ndim = mat1.ndimension();
-  auto input_sizes = mat1.sizes().vec();
+  const int64_t M = mat1.size(0);
   const int64_t N = mat2.size(0);
   const int64_t K = mat2.size(1);
-  const int64_t M = mat1.numel() / K;
 
-  TORCH_CHECK(ndim >= 2, "fp8_per_tensor_scaled_mm_cpu: expect mat1 to be at least 2d, got ", ndim, "d.");
-  CHECK_EQ(mat1.size(ndim - 1), K);
+  CHECK_EQ(mat1.size(1), K);
 
   constexpr int64_t BLOCK_N = block_size_n();
   TORCH_CHECK(
@@ -1378,13 +1376,12 @@ at::Tensor fp8_per_tensor_scaled_mm_cpu(
         M,
         N,
         K,
-        mat1.stride(-2),
+        mat1.stride(0),
         out.stride(0),
         buffer.size(-1));
   });
 
-  input_sizes[ndim - 1] = N;
-  return out.view(input_sizes);
+  return out;
 }
 
 // mat1 : [M, K] bfloat16
