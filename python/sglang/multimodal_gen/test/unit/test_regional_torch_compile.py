@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
     CompiledModuleRegistry,
     build_torch_compile_kwargs,
     compile_matching_submodules,
+    matching_submodule_names,
 )
 
 
@@ -135,6 +136,36 @@ def test_compile_matching_submodules_fails_when_no_region_matches():
         compile_matching_submodules(model, compile_kwargs={"mode": "default"})
 
 
+def test_matching_submodule_names_matches_declared_regions():
+    model = _RegionalModel()
+
+    names = matching_submodule_names(model)
+
+    assert names == ("transformer_blocks.0", "transformer_blocks.1")
+
+
+def test_compiled_module_registry_records_region_digest():
+    model = _RegionalModel()
+    registry = CompiledModuleRegistry()
+
+    assert registry.region_digest(model) is None
+
+    registry.compile_regions_once(model, compile_kwargs={"mode": "default"})
+
+    assert registry.regions_for(model) == (
+        "transformer_blocks.0",
+        "transformer_blocks.1",
+    )
+    digest = registry.region_digest(model)
+    assert digest is not None
+
+    other_model = _RegionalModel()
+    registry.compile_regions_once(other_model, compile_kwargs={"mode": "default"})
+    assert registry.region_digest(other_model) == digest, (
+        "same region names should hash identically across module instances"
+    )
+
+
 def test_compiled_module_registry_installs_regions_once():
     model = _RegionalModel()
     registry = CompiledModuleRegistry()
@@ -196,3 +227,46 @@ def test_denoising_stage_selects_regional_compile():
         [compile_kwargs],
     ]
     assert not model.compile_calls
+
+
+@pytest.mark.parametrize(
+    ("do_cfg", "enable_cfg_parallel", "expected_cfg_mode"),
+    [
+        (False, False, "no_cfg"),
+        (False, True, "no_cfg"),
+        (True, False, "cfg"),
+        (True, True, "cfg_parallel"),
+    ],
+)
+def test_build_compile_workload_signature_distinguishes_cfg_parallel(
+    do_cfg, enable_cfg_parallel, expected_cfg_mode
+):
+    """CFG-serial and CFG-parallel are different workload regimes (RFC: "CFG
+    serial vs CFG parallel where supported") -- a manifest validated for one
+    must not silently cover the other."""
+    stage = DenoisingStage.__new__(DenoisingStage)
+    stage.server_args = SimpleNamespace(
+        model_paths={},
+        model_path="toy-model",
+        transformer_weights_path=None,
+        pipeline_config=None,
+        enable_cfg_parallel=enable_cfg_parallel,
+    )
+    batch = SimpleNamespace(
+        do_classifier_free_guidance=do_cfg,
+        enable_teacache=False,
+        enable_step_reuse=False,
+        enable_spectrum=False,
+        height=512,
+        width=512,
+        num_frames=None,
+    )
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
+        "get_sp_world_size",
+        return_value=1,
+    ):
+        signature = stage._build_compile_workload_signature(4, batch)
+
+    assert signature.cfg_mode == expected_cfg_mode
