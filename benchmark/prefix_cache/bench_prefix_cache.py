@@ -65,8 +65,7 @@ def result_validation_error(
 ) -> str | None:
     if row.get("completed") != expected_requests:
         return (
-            f"completed {row.get('completed')!r} requests; "
-            f"expected {expected_requests}"
+            f"completed {row.get('completed')!r} requests; expected {expected_requests}"
         )
 
     cache_report = row.get("cache_report") or {}

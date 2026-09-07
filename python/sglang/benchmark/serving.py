@@ -2360,8 +2360,7 @@ def _validate_parsed_gsp_args(
     if getattr(args, "gsp_prewarm_prefixes", False):
         if args.dataset_name != "generated-shared-prefix":
             parser.error(
-                "--gsp-prewarm-prefixes requires "
-                "--dataset-name=generated-shared-prefix"
+                "--gsp-prewarm-prefixes requires --dataset-name=generated-shared-prefix"
             )
         if not args.backend.startswith("sglang"):
             parser.error("--gsp-prewarm-prefixes requires an SGLang backend")
