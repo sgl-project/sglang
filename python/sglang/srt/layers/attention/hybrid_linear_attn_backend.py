@@ -666,8 +666,9 @@ class MambaAttnBackendBase(AttentionBackend):
             )
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
-        # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices
-        # [-num_decodes:], which on the full max_bs buffer binds the stale tail.
+        # Hand out only the refreshed [:bs] prefix: the buffer is batch-length by
+        # contract, and Mamba2's track-save indexes it head-relative from
+        # num_prefills. Handing out the whole max_bs buffer binds the stale tail.
         track_buf = None
         if mamba_track_indices is not None:
             assert len(mamba_track_indices) >= bs, (
@@ -1015,12 +1016,22 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
             if self.forward_metadata.num_decodes > 0:
                 num_decodes = self.forward_metadata.num_decodes
+                # Head-relative, not [-num_decodes:]: decode rows sit right after
+                # the prefill rows, and the per-row tensors are not all exactly
+                # num_prefills + num_decodes long (padded batches carry trailing
+                # rows; the cuda-graph track-dest buffer is batch-length only by
+                # contract). Slicing from the tail silently walks off the real
+                # rows and checkpoints into the wrong cache slots.
+                decode_rows = slice(
+                    self.forward_metadata.num_prefills,
+                    self.forward_metadata.num_prefills + num_decodes,
+                )
                 track_mamba_states_if_needed(
                     layer_cache.conv[0],
                     layer_cache.temporal,
-                    self.forward_metadata.mamba_cache_indices[-num_decodes:],
-                    forward_batch.mamba_track_mask[-num_decodes:],
-                    self.forward_metadata.mamba_track_indices[-num_decodes:],
+                    self.forward_metadata.mamba_cache_indices[decode_rows],
+                    forward_batch.mamba_track_mask[decode_rows],
+                    self.forward_metadata.mamba_track_indices[decode_rows],
                     num_decodes,
                     check_freed_slots=self.enable_unified_memory,
                 )
