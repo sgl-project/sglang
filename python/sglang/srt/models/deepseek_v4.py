@@ -2225,6 +2225,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _is_xpu:
             return _get_mhc_ops().mhc_post(x, residual, post, comb)
 
+        if _is_xpu:
+            return _get_mhc_ops().mhc_post(x, residual, post, comb)
+
         if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
             from flashinfer.mhc import mhc_post
 
