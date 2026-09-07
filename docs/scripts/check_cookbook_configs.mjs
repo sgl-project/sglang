@@ -318,6 +318,8 @@ for (const path of walk(CONFIGS)) {
         { hw: "gb300", weights: "ref2va", mode: "v2v" },
         { hw: "gb300", quality: "extra-high" },
         { hw: "gb300", outputs: "2" },
+        { hw: "gb300", precision: "fp8" },
+        { hw: "gb300", attention: "sage" },
       ]) {
         const selection = selectionOf({ nodes: 1, gpus_per_node: 4, placement: "resident", ...extra });
         const resolved = validateResolved(selection, "H3 Grace Blackwell coverage");
