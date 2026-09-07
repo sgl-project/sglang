@@ -11,7 +11,9 @@ from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderC
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
-from sglang.multimodal_gen.runtime.utils.precision import temporary_module_dtype
+from sglang.multimodal_gen.runtime.utils.precision import (
+    temporary_module_fp32_dtype,
+)
 
 LRELU_SLOPE = 0.1
 
@@ -716,11 +718,7 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
                     device_type=hidden_states.device.type, dtype=torch.float32
                 )
                 if hidden_states.device.type != "cpu"
-                else temporary_module_dtype(
-                    self,
-                    torch.float32,
-                    enabled=next(self.parameters()).dtype != torch.float32,
-                )
+                else temporary_module_fp32_dtype(self)
             )
             with autocast_ctx:
                 waveform = self.vocoder(hidden_states.float())

@@ -282,6 +282,24 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             self.assertIs(casted, module)
             self.assertEqual(module.weight.dtype, torch.float32)
 
+    def test_temp_fp32_module_handles_mixed_parameter_dtypes(self):
+        class MixedDtypeModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.first = torch.nn.Parameter(torch.ones(2, dtype=torch.float32))
+                self.second = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+
+        module = MixedDtypeModule()
+        self.assertEqual(module.first.dtype, torch.float32)
+        self.assertEqual(module.second.dtype, torch.bfloat16)
+
+        with precision.temporary_module_fp32_dtype(module):
+            self.assertEqual(module.first.dtype, torch.float32)
+            self.assertEqual(module.second.dtype, torch.float32)
+
+        self.assertEqual(module.first.dtype, torch.float32)
+        self.assertEqual(module.second.dtype, torch.bfloat16)
+
 
 if __name__ == "__main__":
     unittest.main()
