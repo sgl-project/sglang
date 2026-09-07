@@ -1085,6 +1085,53 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         self.assertEqual(kwargs["compressed_cu_seqlens2"].tolist(), [0, 1])
         backend._get_fused_topk_kernel.assert_called_once_with(1, is_prefill=False)
 
+    def test_forecast_decode_uses_selector_query_and_reference_topk(self):
+        backend = MiniCPMSparseBackend.__new__(MiniCPMSparseBackend)
+        backend.forward_metadata = SimpleNamespace(
+            sparse_bs_list=[1],
+            base=SimpleNamespace(
+                cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+                cu_seqlens_k=torch.tensor([0, 3, 8], dtype=torch.int32),
+                max_seq_len_k=5,
+            ),
+            topk_cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+            topk_cu_seqlens_k=torch.tensor([0, 5], dtype=torch.int32),
+            topk_max_seqlen_k=5,
+            k1=SimpleNamespace(
+                cu_seqlens=torch.tensor([0, 1, 3], dtype=torch.int32),
+                cu_seqlens_cpu=[0, 1, 3],
+            ),
+            k2=SimpleNamespace(
+                cu_seqlens=torch.tensor([0, 1, 2], dtype=torch.int32),
+                cu_seqlens_cpu=[0, 1, 2],
+            ),
+        )
+        backend._compress_decode_keys = Mock(
+            return_value=(
+                torch.tensor([[[10.0]], [[20.0]], [[21.0]]]),
+                torch.tensor([[[30.0]], [[31.0]]]),
+            )
+        )
+        backend._get_fused_topk_kernel = Mock(return_value="kernel")
+        backend.sparse_get_topk_impl = Mock(return_value="forecast-topk")
+        forward_batch = SimpleNamespace(batch_size=2)
+        selector_query = torch.tensor([[[11.0]], [[22.0]]])
+
+        result = backend.get_topk_for_sparse(
+            query_states=torch.tensor([[[1.0]], [[2.0]]]),
+            key_states=torch.empty(2, 1, 1),
+            layer=SimpleNamespace(),
+            forward_batch=forward_batch,
+            is_prefill=False,
+            selector_query=selector_query,
+        )
+
+        self.assertEqual(result, "forecast-topk")
+        args = backend.sparse_get_topk_impl.call_args.args
+        self.assertEqual(args[0].flatten().tolist(), [22.0])
+        self.assertIsNone(backend.sparse_get_topk_impl.call_args.kwargs["fused_kernel"])
+        backend._get_fused_topk_kernel.assert_not_called()
+
     def test_fused_topk_prefill_kernels_compile_for_all_batches_at_startup(self):
         fake_fuse_kernel = ModuleType("sglang.srt.layers.attention.minicpm.fuse_kernel")
         fake_fuse_kernel.fused_attn_pooling_online_topk_prefill = Mock(
