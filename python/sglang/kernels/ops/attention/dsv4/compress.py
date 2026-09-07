@@ -179,8 +179,6 @@ class CompressorDecodePlan(NamedTuple):
             int(swa_page_size),
             int(ring_size),
         )
-        # The XPU plan builder has no use_req_ring parameter, so unified-KV
-        # request-ring addressing cannot be expressed there.
         assert not (_is_xpu and use_req_ring), (
             "use_req_ring is not supported by the XPU compress plan builder"
         )
@@ -294,7 +292,6 @@ class CompressorPrefillPlan(NamedTuple):
             int(swa_page_size),
             int(ring_size),
         )
-        # See plan_decode: XPU cannot express the unified-KV request ring.
         assert not (_is_xpu and use_req_ring), (
             "use_req_ring is not supported by the XPU compress plan builder"
         )

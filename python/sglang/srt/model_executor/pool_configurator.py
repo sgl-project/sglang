@@ -1012,8 +1012,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            # Unified_kv: SWA is a fixed per-request ring (see _fixed_swa_bytes),
-            # not a per-token pool, so it is excluded from the per-token coeff.
+            # Ring mode: SWA is a fixed per-request pool (see _fixed_swa_bytes).
             (
                 0.0
                 if self._unified
@@ -1022,8 +1021,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + c4_frac * kv_bytes * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
-            # Unified_kv: c4 state is addressed off the SWA slot, and that pool
-            # is a fixed per-request ring, so the state ring is request-scoped.
+            # Ring mode: C4 state is per-request too (see _fixed_c4_state_bytes).
             + (
                 0.0
                 if self._unified
@@ -1160,8 +1158,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             config.c128_state_pool_size = num_req_slots
         else:
             config.c128_state_pool_size = num_req_slots * self.c128_ring_size
-        # Unified_kv: request-scoped, so it is sized here from the now-known
-        # concurrency rather than from full_token in _compute_dsv4_sizes.
+        # Ring mode: C4 state is request-scoped, so size it from the known concurrency.
         if self._unified and self.num_layers_ca4 > 0:
             config.c4_state_pool_size = self._unified_c4_state_pool_size(
                 config.max_running_requests
@@ -1210,10 +1207,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        """Caller contract: max_total_num_tokens must not exceed what
-        calculate_pool_sizes derived from the same budget (config_from_budget
-        asserts it). Subtracting the fixed-pool bias again here would
-        double-count -- the input is a token count, not a byte budget."""
+        # Token count, not a byte budget: the fixed pools are not re-subtracted, so
+        # the input must not exceed what calculate_pool_sizes derived for it.
         assert page_size % 128 == 0, (
             "page_size must be multiple of 128 for compressed attention"
         )

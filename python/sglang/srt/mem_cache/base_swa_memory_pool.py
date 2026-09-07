@@ -15,9 +15,8 @@ class BaseSWAKVPool(KVCache):
     """
 
     swa_kv_pool: KVCache
-    # Set when SWA KV is a fixed per-request ring of this many tokens, addressed
-    # by req_pool_idx, instead of a paged token pool. The paged SWA allocator is
-    # then vestigial and SWA must not be budgeted per token.
+    # Set when SWA KV is a per-request ring of this many tokens (addressed by
+    # req_pool_idx) rather than a paged token pool; SWA is then not budgeted per token.
     swa_req_ring_size: Optional[int] = None
 
     @abc.abstractmethod

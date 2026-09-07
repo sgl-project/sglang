@@ -352,8 +352,6 @@ class ReqToTokenPool:
         self._aux_cache = aux_cache
 
     def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
-        """Receive the row indices of every fresh allocation. Per-request
-        state pools use it to reset a row's state when the slot is reused."""
         assert self._on_alloc_rows is None
         self._on_alloc_rows = hook
 

@@ -118,8 +118,6 @@ class CompressorHip(_CompressorBase):
             assert isinstance(backend, DeepseekV4HipRadixBackend)
         token_to_kv_pool = backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        # C128 state is always request-addressed; C4 state is too under the
-        # unified-KV request ring.
         req_ring_state = self.ratio == 128 or (
             self.ratio == 4 and token_to_kv_pool._unified_kv
         )
@@ -265,8 +263,6 @@ class CompressorHip(_CompressorBase):
         state_pool = self._get_state_pool(attn_backend)
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        # C128 state is always request-addressed; C4 state is too under the
-        # unified-KV request ring.
         req_ring_state = self.ratio == 128 or (
             self.ratio == 4 and token_to_kv_pool._unified_kv
         )

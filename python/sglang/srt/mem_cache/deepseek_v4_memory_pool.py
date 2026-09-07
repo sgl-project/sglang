@@ -64,8 +64,7 @@ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
 
 
 def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
-    """Rows per request in the per-request SWA ring: the window plus room for
-    the draft tokens a verify batch writes ahead of the committed position."""
+    # A verify batch writes its draft tokens ahead of the committed position.
     spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
     return sliding_window + spec_extra
 
@@ -1063,8 +1062,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.online_c128_mtp_pending_seq_lens
 
     def clear_c4_req_states(self, req_pool_indices: Sequence[int]) -> None:
-        """Reset the request-owned C4 rows; the sentinel/ring padding that
-        CompressStatePool allocates is left intact."""
         if not self._unified_kv or not req_pool_indices:
             return
 
@@ -1117,9 +1114,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         num_draft_tokens: int,
     ) -> None:
         """Clear offline C128 ring slots written for rejected speculative tokens.
-        C4 needs none: its draft states are overwritten in position order before
-        they can be read, while a C128 compression boundary can consume a
-        previously written draft slot directly."""
+        C4 needs no counterpart: its draft states are overwritten in position order
+        before any read; a C128 compression boundary can read a stale draft slot."""
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 

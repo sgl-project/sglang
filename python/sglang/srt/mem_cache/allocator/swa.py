@@ -139,12 +139,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     @property
     def swa_req_ring(self) -> bool:
-        """SWA is a per-request ring; no per-token SWA budget applies."""
         return self._swa_req_ring
 
     @property
     def swa_ring_cost_tokens(self) -> int:
-        """Ring mode: paged SWA cost of one request's ring slot (0 otherwise)."""
         return self._swa_ring_cost
 
     def available_size(self):
@@ -247,8 +245,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         if self._swa_req_ring:
-            # The unified SWA ring is slot-addressed, not paged here, so the
-            # vestigial paged allocator and full->swa mapping are skipped.
+            # Ring mode pages full KV only; full_to_swa_index_mapping stays unwritten.
             return self.full_attn_allocator.alloc_extend(
                 prefix_lens,
                 prefix_lens_cpu,
@@ -310,8 +307,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         if self._swa_req_ring:
-            # See alloc_extend. new_pages_available already ignored
-            # num_swa_pages, so the paged allocator has no capacity gate left.
+            # See alloc_extend: full KV only.
             return self.full_attn_allocator.alloc_extend(
                 prefix_lens,
                 prefix_lens_cpu,
@@ -702,6 +698,4 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
 
 def is_swa_req_ring(allocator) -> bool:
-    """True when the allocator's SWA side is a per-request ring (see
-    BaseSWAKVPool.swa_req_ring_size), so SWA carries no per-token budget."""
     return isinstance(allocator, SWATokenToKVPoolAllocator) and allocator.swa_req_ring

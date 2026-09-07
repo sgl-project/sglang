@@ -1361,9 +1361,8 @@ class KVCacheConfigurator:
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
         )
         if not self.is_draft_worker and token_to_kv_pool._unified_kv:
-            # Unified-KV C4 state is a per-request ring: reset a row's ring
-            # whenever its req slot is handed out again. The draft pool has no
-            # C4 layers and shares this req pool, so only the target registers.
+            # The draft pool has no C4 layers and shares this req pool, so only
+            # the target registers the per-slot C4 reset.
             req_to_token_pool.register_on_alloc_rows(
                 token_to_kv_pool.clear_c4_req_states
             )

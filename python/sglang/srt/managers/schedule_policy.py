@@ -721,8 +721,7 @@ class PrefillAdder:
         """
         allocator = self.token_to_kv_pool_allocator
         if self._swa_req_ring:
-            # One fixed ring slot per request, independent of context or chunk
-            # length; pairs with the ring-based swa_available_size.
+            # One ring slot per request, in the same unit as swa_available_size.
             return allocator.swa_ring_cost_tokens
         if self.rem_chunk_tokens is not None:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
@@ -1018,8 +1017,7 @@ class PrefillAdder:
             if self.is_hybrid_swa and not self._swa_req_ring:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM.
-                # Unified-KV: rem_swa_tokens is ring capacity, not a per-chunk
-                # token budget; clamping against it would truncate the chunk.
+                # Ring mode skips it: rem_swa_tokens counts slots, not chunk tokens.
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
