@@ -339,9 +339,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             in ("gemma4", "gemma4_unified")
         )
-        architectures = getattr(
-            self.tokenizer_manager.model_config.hf_config, "architectures", []
-        )
+        architectures = self.tokenizer_manager.model_config.hf_config.architectures
         self.is_glm_v = bool(GLM_V_ARCHITECTURES.intersection(architectures or []))
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
