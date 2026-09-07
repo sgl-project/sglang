@@ -21,7 +21,7 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 
 # Mamba-1 has no chunk size; the Mamba2 backend only reads mamba_chunk_size to
 # bound the conv window, so a constant is enough.
-_MAMBA1_CHUNK_SIZE = 256
+_MAMBA1_CACHE_CHUNK_SIZE = 256
 
 
 def _mamba1_cache_params(config) -> Mamba2CacheParams:
@@ -50,7 +50,7 @@ class MambaConfig(HFMambaConfig):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.mamba_chunk_size = _MAMBA1_CHUNK_SIZE
+        self.mamba_chunk_size = _MAMBA1_CACHE_CHUNK_SIZE
 
     @property
     def full_attention_layer_ids(self) -> list[int]:
@@ -69,7 +69,7 @@ class FalconMambaConfig(HFFalconMambaConfig):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.mamba_chunk_size = _MAMBA1_CHUNK_SIZE
+        self.mamba_chunk_size = _MAMBA1_CACHE_CHUNK_SIZE
 
     @property
     def full_attention_layer_ids(self) -> list[int]:

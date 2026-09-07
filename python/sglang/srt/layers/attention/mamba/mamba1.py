@@ -220,11 +220,17 @@ class MambaMixer1(nn.Module):
         metadata,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
-    ) -> Tuple[torch.Tensor, None]:
-        # Matches the call contract of Mamba2AttnBackend.forward. Falcon-Mamba
-        # has no speculative-decode / radix-track support yet.
+    ) -> Tuple[torch.Tensor, None, None]:
+        # Matches Mamba2AttnBackend.forward's (out, intermediate_states, track_states)
+        # contract; Mamba-1 has neither extra state, so both are None.
         assert not metadata.is_target_verify, (
             "Mamba-1 (Falcon-Mamba) does not support speculative decoding yet"
+        )
+        # The per-token scan writes no radix track states, so a tracked prefix
+        # would read back unwritten; require --disable-radix-cache.
+        assert not metadata.has_mamba_track_mask, (
+            "Mamba-1 (Falcon-Mamba) does not support radix mamba-state tracking; "
+            "serve with --disable-radix-cache"
         )
 
         conv_state = layer_cache.conv[0]
@@ -294,7 +300,7 @@ class MambaMixer1(nn.Module):
         mixer_out, _ = self.out_proj(out)
         if output is not None:
             output[:num_actual_tokens].copy_(mixer_out)
-        return mixer_out, None
+        return mixer_out, None, None
 
     def _forward_prefill(
         self,

@@ -1308,7 +1308,8 @@ class ModelConfig:
         return self.num_attention_heads
 
     def get_num_attention_heads(self, tensor_parallel_size) -> int:
-        total_num_attention_heads = self.num_attention_heads
+        # Pure-SSM (Mamba) models have no attention; num_attention_heads is None.
+        total_num_attention_heads = self.num_attention_heads or 0
         return max(1, total_num_attention_heads // tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
