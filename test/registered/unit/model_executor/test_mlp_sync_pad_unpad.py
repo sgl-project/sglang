@@ -22,7 +22,7 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _mock_model_runner(seq_len_fill_value: int = 1) -> MagicMock:

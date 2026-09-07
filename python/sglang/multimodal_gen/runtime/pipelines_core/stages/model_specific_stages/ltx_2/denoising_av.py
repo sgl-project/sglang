@@ -108,6 +108,12 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
 
 
 class LTX2RefinementStage(LTX2AVDenoisingStage):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        # the refiner runs its distilled sigma schedule regardless of the request's steps
+        return max(1, len(self.distilled_sigmas) - 1)
+
     """Stage-2 refinement wrapper that re-noises distilled LTX latents once."""
 
     def __init__(

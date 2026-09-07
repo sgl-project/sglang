@@ -6,7 +6,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=480, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=259, stage="base-c", runner_config="4-gpu-h100")
 
 KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
 SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}

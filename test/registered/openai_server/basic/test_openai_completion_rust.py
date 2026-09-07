@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=156, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(
@@ -26,8 +26,7 @@ class TestOpenAICompletionRustParity(CustomTestCase):
     api_key = "sk-123456"
 
     def _get_logprobs(self, *, rust_frontend):
-        # Prefill CUDA graph pads the batch, so numerics follow whichever
-        # requests share the forward pass; the assertions below need equality.
+        # compare identical prefill shapes, without graph padding or warmup cache hits
         process = popen_launch_server(
             self.model,
             DEFAULT_URL_FOR_TEST,
@@ -38,6 +37,7 @@ class TestOpenAICompletionRustParity(CustomTestCase):
                 "--random-seed",
                 "42",
                 "--disable-prefill-cuda-graph",
+                "--disable-radix-cache",
             ],
         )
         try:

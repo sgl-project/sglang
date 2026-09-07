@@ -1441,6 +1441,15 @@ cards and a Host RAM selector: pick your budget and it emits this command with
 your tier's measured expectations attached as comments. The table below is the
 same data in one view.
 
+**Unified-memory machines are the exception**: on a DGX Spark (GB10, 128 GB
+shared between CPU and GPU) launch with **no flags at all**. The deployment
+still exceeds the pool, automatic offload engages on its own, and its placement
+beat the explicit recipe above by 2.1× on the denoise (12.1 vs 25.8 s/it
+measured on the same box) — the VRAM/host split that justifies every flag in
+this section does not exist there. Expect ~12 min of load, a ~5.5 min text
+encoding stage per request (steady-state compute on this chip, not a stall),
+and ~12 min per warm 480P request.
+
 **Two budgets, and what each one buys**
 
 | | 12 GB VRAM + 32 GB host | host free, VRAM 16 GB |

@@ -548,7 +548,7 @@ fn reinsert_full_backed_target_schedules_mamba_only_backup() {
             .equal(&Tensor::from_slice(&[7i64]))
     );
 
-    tc.mark_write_through_pending(leaf);
+    tc.mark_write_through_pending(vec![leaf], /* ack_id = */ leaf);
     let pending = tc.insert(&insert_params_mamba(&key, &[30, 31], Some(9)));
     assert!(
         !pending
