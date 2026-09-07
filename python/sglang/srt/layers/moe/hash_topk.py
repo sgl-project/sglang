@@ -249,6 +249,7 @@ class HashTopK(nn.Module):
             self.allow_routed_experts_capture,
             self.layer_id,
             topk_ids,
+            num_token_non_padded,
         )
 
         num_fused_shared_experts = self.num_fused_shared_experts

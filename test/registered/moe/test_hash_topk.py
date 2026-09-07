@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
+from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
@@ -94,7 +95,7 @@ def test_hash_topk_captures_logical_expert_ids(monkeypatch):
     monkeypatch.setattr(
         hash_topk_module,
         "capture_routed_experts_if_allowed",
-        lambda allow_capture, layer_id, topk_ids: (
+        lambda allow_capture, layer_id, topk_ids, _num_token_non_padded=None: (
             FakeCapturer().capture(layer_id=layer_id, topk_indices=topk_ids)
             if allow_capture
             else None
@@ -124,6 +125,44 @@ def test_hash_topk_captures_logical_expert_ids(monkeypatch):
     assert torch.equal(
         captured["topk_ids"],
         torch.tensor([[1, 5], [2, 7]], dtype=torch.int32),
+    )
+
+
+def test_hash_topk_capture_masks_padded_tokens(monkeypatch):
+    captured = {}
+
+    class FakeCapturer:
+        def capture(self, *, layer_id, topk_indices):
+            captured["layer_id"] = layer_id
+            captured["topk_ids"] = topk_indices.clone()
+
+    monkeypatch.setattr(
+        topk_module, "get_global_experts_capturer", lambda: FakeCapturer()
+    )
+
+    topk = HashTopK(
+        topk=2,
+        num_experts=8,
+        num_fused_shared_experts=0,
+        vocab_size=2,
+        scoring_func="sqrtsoftplus",
+        layer_id=4,
+    )
+    with torch.no_grad():
+        topk.tid2eid.copy_(torch.tensor([[1, 5], [2, 7]], dtype=torch.int32))
+
+    with hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
+        topk(
+            hidden_states=torch.empty(2, 4),
+            router_logits=torch.ones(2, 8),
+            input_ids=torch.tensor([0, 1], dtype=torch.int64),
+            num_token_non_padded=torch.tensor(1),
+        )
+
+    assert captured["layer_id"] == 4
+    assert torch.equal(
+        captured["topk_ids"],
+        torch.tensor([[1, 5], [-1, -1]], dtype=torch.int32),
     )
 
 
