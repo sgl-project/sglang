@@ -60,7 +60,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 Ling-3.0-flash-VL is the vision-language member of the BailingMoeV3 family. Its language backbone is the [Ling-3.0-flash](/cookbook/autoregressive/InclusionAI/Ling-3.0-flash) hybrid-attention Mixture-of-Experts (MoE) model: 42 layers that interleave Kimi Delta Attention (KDA) linear-attention layers with gated Multi-head Latent Attention (MLA) full-attention layers, on top of a fine-grained MoE feed-forward network with 512 routed experts (8 active per token) plus a shared expert. A 27-layer vision encoder (0.4B parameters, 16-pixel patches with 2×2 spatial merging and paired frames for video) feeds image and video tokens into that backbone through a small MLP projector. In total the checkpoint holds **~125B parameters with ~5.1B active per token**, so per-token inference cost stays close to a small model.
 
-It is a thinking model: the chat template turns chain-of-thought on by default and exposes an `enable_thinking` switch. Inputs are text, images, and video; audio is not supported. Native context length is 128K tokens. Unlike Ling-3.0-flash, the VL checkpoint ships no built-in MTP draft layer, so there is no speculative-decoding recipe.
+It is a thinking model: the chat template turns chain-of-thought on by default and exposes an `enable_thinking` switch. It supports structured tool calling. Inputs are text, images, and video; audio is not supported. Native context length is 128K tokens. Unlike Ling-3.0-flash, the VL checkpoint ships no built-in MTP draft layer, so there is no speculative-decoding recipe.
 
 **Available Models:**
 
@@ -78,16 +78,19 @@ It is a thinking model: the chat template turns chain-of-thought on by default a
 - The remote processor imports its helper module (`bailingmm_utils`) by absolute name, so the checkpoint directory must be importable by the server process. When you serve from a local snapshot, launch with `PYTHONPATH=<snapshot-dir>` in front of the generated command. The same applies to `bench_serving`, which loads the processor client-side to count vision tokens.
 - BF16 weights take ~250 GB. The recipes use `--tp 2` on 288 GB-class GPUs (GB300, B300), `--tp 4` on B200 / H200, and `--tp 8` on H100, all with `--mem-fraction-static 0.85`. Only the 2×GB300 recipe has been validated end to end; the other cells are sized by the same rule and carry the unverified badge. Adjust TP in the **Attention Parallelism** card of the [Playground](#playground).
 - Vision token budget: the encoder emits one token per 32×32-pixel block after merging, so a 1280×720 image costs about 880 tokens and the processor's `max_pixels` of 4,194,304 caps a single image at roughly 4,100 tokens. Video frames are paired before patching; the sample clip in §3.2 costs 4,224 tokens. Size `--chunked-prefill-size` and `--max-running-requests` with these counts in mind for image-heavy traffic.
-- Thinking is on by default. The chat template ends the prompt with `<think>`, so the generated `content` starts with the reasoning and switches to the answer after `</think>` (see §3.1). Turn it off per request with `"chat_template_kwargs": {"enable_thinking": false}` (§3.3), or enable `--reasoning-parser ling3` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground](#playground)) to have the server return the reasoning in `message.reasoning_content` and only the answer in `message.content`.
+- Parsers: add `--reasoning-parser auto --tool-call-parser auto` to the launch command. Both resolve to `ling3` from the chat template (the server logs `Auto-detected --reasoning-parser as ling3 from chat template` and the same for the tool-call parser), so no model-specific parser name is needed. The **Parsers** card of the [Playground](#playground) emits the explicit `ling3` values instead. With the parsers on, reasoning is returned in `message.reasoning_content` and structured tool calls in `message.tool_calls`; without them, `message.content` carries the reasoning followed by `</think>` and the answer (the opening `<think>` tag sits in the prompt and is not echoed).
+- Thinking is on by default (`enable_thinking` defaults to true in the chat template, and the `ling3` reasoning parser follows that default). Turn it off per request with `"chat_template_kwargs": {"enable_thinking": false}` (§3.3).
 - Native context is 128K; SGLang reads `max_position_embeddings` from the checkpoint's text config, so no `--context-length` flag is needed.
 - Audio content parts are rejected before preprocessing; send images as `image_url` and clips as `video_url` content parts (§3).
 - No FP8 or FP4 checkpoints are published for this model, so the matrix is BF16 only.
 
 ## 3. Advanced Usage
 
+The examples below were run against a server launched with the recipe above plus `--reasoning-parser auto --tool-call-parser auto`, which resolves both parsers to `ling3` (§2). Reasoning therefore arrives in `message.reasoning_content` and the answer in `message.content`.
+
 ### 3.1 Image Understanding
 
-Send images as OpenAI-style `image_url` content parts. With thinking on (the default), the reasoning arrives inline in `message.content`, terminated by `</think>`:
+Send images as OpenAI-style `image_url` content parts:
 
 <Accordion title="Image Example (Python)">
 
@@ -106,7 +109,9 @@ resp = client.chat.completions.create(
     }],
     max_tokens=2048,
 )
-print(resp.choices[0].message.content)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
 ```
 
 </Accordion>
@@ -114,14 +119,21 @@ print(resp.choices[0].message.content)
 <Accordion title="Example Output">
 
 ```text Output
-The user wants me to describe this image in one sentence. Let me look at the image carefully: a man wearing a yellow shirt is ironing clothes on an ironing board set up on the back of a yellow taxi (SUV type), with another yellow taxi passing by on the street, and there are buildings in the background.
+Reasoning: The user wants a one-sentence description of this image. Let me look at the image carefully.
 
-I need to summarize this in one sentence.</think>A man in a yellow sweatshirt irons clothes on an ironing board attached to the back of a yellow taxi on a city street, while another yellow cab drives past.
+The image shows a man wearing a yellow shirt (with some kind of text on it, probably "Sudsy" or similar) standing behind a yellow taxi SUV, ironing clothes on a portable ironing board set up at the rear of the vehicle. On the left side, another yellow taxi (sedan) is passing by on the street. The background is an urban streetscape with buildings lined up.
+
+I need to write this in one sentence. For example: "A man wearing a yellow shirt irons clothes on a portable ironing board attached to the back of a yellow taxi on a city street, while another taxi passes by."
+
+Let me make it concise yet descriptive. One sentence.
+
+"On a city street, a man in a yellow sweatshirt irons clothes on a portable ironing board mounted on the back of a yellow taxi SUV, while another yellow taxi drives past."
+
+This works. I'll return only the answer.
+Content: A man in a yellow shirt irons clothes on a portable ironing board set up at the back of a yellow taxi on a city street, while another yellow cab drives past.
 ```
 
 </Accordion>
-
-The opening `<think>` tag is part of the prompt, so it is not echoed back. With `--reasoning-parser ling3` the text before `</think>` moves to `message.reasoning_content` and `message.content` holds only the final sentence.
 
 ### 3.2 Video Understanding
 
@@ -144,7 +156,9 @@ resp = client.chat.completions.create(
     }],
     max_tokens=2048,
 )
-print(resp.choices[0].message.content)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
 ```
 
 </Accordion>
@@ -152,18 +166,28 @@ print(resp.choices[0].message.content)
 <Accordion title="Example Output">
 
 ```text Output
-The user wants me to describe what's happening in this video in two sentences. Let me analyze the video frames.
+Reasoning: The user wants me to describe what is happening in this video in two sentences.
 
-The video shows Steve Jobs on stage at what appears to be an Apple keynote event. He's standing in front of a large screen showing a close-up of a hand reaching into a jeans pocket and pulling out a device. The text on screen asks about a pocket, and Jobs reveals it's the new iPod Nano. He holds up the thin iPod Nano device and shows how slim it is. The large screen behind him magnifies his presentation.
+Looking at the video, I can see:
+- A man on stage (appears to be Steve Jobs) presenting something
+- He's wearing a black shirt and jeans
+- There's a large screen behind him showing a close-up of a hand reaching toward a pocket on blue jeans
+- Text appears on screen asking "Anyone know what this pocket is for?"
+- He pulls out a small white device (iPod Nano) from his pocket
+- The text says "I've always wondered that" and "well now we know" and "is the new iPod Nano"
+- He holds up the white iPod Nano device
 
-Let me write a concise two-sentence summary.</think>Steve Jobs is on stage at an Apple keynote, presenting the new iPod Nano by pulling it out of his jeans pocket in front of a large screen displaying a magnified view of the action. He holds up the remarkably thin device to the audience, demonstrating its slim profile while the screen behind him zooms in for a closer look.
+This is clearly Steve Jobs presenting the new iPod Nano at an Apple event. The small white device is the iPod Nano.
+
+I need to summarize this in exactly two sentences.
+Content: A presenter on stage pulls a small white device from his pocket while a large screen behind him displays a close-up image of a hand reaching toward a jeans pocket. He holds the device up to reveal it is the new iPod Nano, answering the on-screen text that questioned what the small pocket was designed for.
 ```
 
 </Accordion>
 
 ### 3.3 Thinking Mode
 
-Disable chain-of-thought for a single request through the chat template's `enable_thinking` kwarg; the model then answers directly:
+Thinking is on by default. Disable it for a single request through the chat template's `enable_thinking` kwarg; the model then answers directly and `reasoning_content` stays empty:
 
 <Accordion title="Thinking-off Example (Python)">
 
@@ -183,7 +207,9 @@ resp = client.chat.completions.create(
     max_tokens=512,
     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
 )
-print(resp.choices[0].message.content)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
 ```
 
 </Accordion>
@@ -191,9 +217,94 @@ print(resp.choices[0].message.content)
 <Accordion title="Example Output">
 
 ```text Output
-A man in a yellow shirt irons clothes on a folding board attached to the back of a yellow taxi SUV while another taxi drives by on a city street.
+Reasoning: None
+Content: A man in a yellow sweatshirt irons a blue shirt on a folding board attached to the back of a parked yellow taxi SUV, while another yellow cab drives past on a city street.
 ```
 
 </Accordion>
 
-For more API examples, see the [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision).
+### 3.4 Tool Calling
+
+With the tool-call parser on, structured calls are parsed into `message.tool_calls` and `finish_reason` is `tool_calls`. Send the tool result back as a `tool` message to get the final answer; on this thinking model the follow-up turn may put text in `reasoning_content` as well as `content`, so print both:
+
+<Accordion title="Tool-calling Example (Python)">
+
+```python Example
+import json
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "City name"}},
+            "required": ["city"],
+        },
+    },
+}]
+messages = [{"role": "user", "content": "What's the weather like in Paris today?"}]
+
+resp = client.chat.completions.create(
+    model="inclusionAI/Ling-3.0-flash-VL",
+    messages=messages,
+    tools=tools,
+    tool_choice="auto",
+    max_tokens=2048,
+)
+msg = resp.choices[0].message
+print("finish_reason:", resp.choices[0].finish_reason)
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+for call in msg.tool_calls:
+    print("Tool call:", call.function.name, call.function.arguments)
+
+messages.append({
+    "role": "assistant",
+    "content": msg.content or "",
+    "tool_calls": [{"id": c.id, "type": "function",
+                    "function": {"name": c.function.name, "arguments": c.function.arguments}}
+                   for c in msg.tool_calls],
+})
+messages.append({
+    "role": "tool",
+    "tool_call_id": msg.tool_calls[0].id,
+    "content": json.dumps({"city": "Paris", "temperature_c": 18, "condition": "light rain"}),
+})
+resp = client.chat.completions.create(
+    model="inclusionAI/Ling-3.0-flash-VL",
+    messages=messages,
+    tools=tools,
+    max_tokens=2048,
+)
+msg = resp.choices[0].message
+print("finish_reason:", resp.choices[0].finish_reason)
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+finish_reason: tool_calls
+Reasoning: The user wants to know the current weather in Paris. I'll call the get_weather function with the city "Paris".
+Content: Let me check the weather in Paris for you right away!
+Tool call: get_weather {"city": "Paris"}
+finish_reason: stop
+Reasoning: None
+Content: Here's the current weather in Paris:
+
+- 🌡️ **Temperature:** 18°C
+- 🌧️ **Condition:** Light rain
+
+It looks like a mild day with some light rain. You might want to bring an umbrella if you're heading out! ☂️
+```
+
+</Accordion>
+
+For more API examples, see the [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision) and the [Tool Parser guide](../../../docs/advanced_features/tool_parser).

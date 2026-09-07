@@ -84,6 +84,7 @@ sgl-eval run mmmu_pro \\
     parsers: {
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser ling3" },
+        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser ling3" },
       ],
     },
   },
