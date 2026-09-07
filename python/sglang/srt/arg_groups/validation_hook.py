@@ -24,6 +24,31 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 logger = logging.getLogger(__name__)
 
 
+def check_pipeline_parallelism(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.pp_size <= 1:
+        return
+    # Only synchronous PD prefill can omit the draft worker on earlier PP ranks.
+    pp_prefill_eagle = (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and not cfg.enable_multi_layer_eagle
+    )
+    assert cfg.speculative_algorithm is None or pp_prefill_eagle, (
+        "Pipeline parallelism with speculative decoding is only supported "
+        "for disaggregation prefill with EAGLE/EAGLE3; speculative decode "
+        "requires a draft worker on ranks where PP does not create one"
+    )
+    assert cfg.disable_overlap_schedule, (
+        "Pipeline parallelism is not compatible with overlap schedule"
+    )
+    assert cfg.min_free_slots_delay is None, (
+        "--min-free-slots-delay is not supported with pipeline "
+        "parallelism: allocatable slots per microbatch are bounded by "
+        "pp-max-micro-batch-size, so the threshold may never be reached"
+    )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
@@ -48,15 +73,7 @@ def check_server_args(server_args: Any):
         "Remove --disable-cuda-graph-padding or --enable-torch-compile."
     )
 
-    if cfg.pp_size > 1:
-        assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-            "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-        )
-        assert cfg.min_free_slots_delay is None, (
-            "--min-free-slots-delay is not supported with pipeline "
-            "parallelism: allocatable slots per microbatch are bounded by "
-            "pp-max-micro-batch-size, so the threshold may never be reached"
-        )
+    check_pipeline_parallelism(server_args)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
         "multi-node data parallel is not supported unless dp attention!"

@@ -27,8 +27,8 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
-    is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
+    sm90_fp8_mega_moe_unavailable_reason,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -122,16 +122,17 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
-def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
-    if not get_moe_a2a_backend().is_megamoe():
-        return False
+def _mega_moe_unavailable_reason(
+    moe: DeepseekV2MoE, hidden_states: torch.Tensor
+) -> str | None:
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
-        return False
+        return "MegaMoE weights were not built"
     if _device_sm == 90:
-        if not is_sm90_fp8_mega_moe_available(moe.experts):
-            return False
+        reason = sm90_fp8_mega_moe_unavailable_reason(moe.experts)
+        if reason is not None:
+            return reason
     if get_is_capture_mode():
-        return True
+        return None
 
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens and not is_dsa_enable_prefill_cp():
@@ -139,7 +140,25 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        return (
+            f"MegaMoE token requirement {max_tokens_per_rank} exceeds "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+            f"{cap}"
+        )
+    return None
+
+
+def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
+    if not get_moe_a2a_backend().is_megamoe():
+        return False
+
+    reason = _mega_moe_unavailable_reason(moe, hidden_states)
+    if reason is None:
+        return True
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED.get():
+        raise RuntimeError(f"MegaMoE fail-closed: {reason}")
+    return False
 
 
 def forward_mega_moe(

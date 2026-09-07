@@ -231,6 +231,35 @@ class MambaAttnBackendBase(AttentionBackend):
                         device=forward_batch.input_ids.device,
                     )
 
+                # MLP sync can pad an eager verify from one real request to a
+                # larger physical request bucket. The input tensor is padded in
+                # token space, but recurrent metadata must keep those fabricated
+                # request rows empty. Otherwise, for example, adaptive N=4 on
+                # attn-TP=8 becomes qsl=[0, 4, 8] with cache slots [real, -1].
+                # RadixLinearAttention trims the tensors back to four real rows,
+                # while the second KDA program still reads rows [4, 8), causing
+                # an out-of-bounds access. Match the CUDA-graph replay contract:
+                # retain padded request rows, poison their cache slots above, and
+                # collapse their query ranges to the logical end.
+                if _real_bs is not None and _real_bs < bs:
+                    if query_start_loc.shape[0] < _real_bs + 1:
+                        raise RuntimeError(
+                            "target-verify query_start_loc does not cover all real "
+                            f"requests: qsl_rows={query_start_loc.shape[0]}, "
+                            f"real_bs={_real_bs}, padded_bs={bs}"
+                        )
+                    logical_end = query_start_loc[_real_bs]
+                    padded_query_start_loc = torch.empty(
+                        (bs + 1,),
+                        dtype=query_start_loc.dtype,
+                        device=query_start_loc.device,
+                    )
+                    padded_query_start_loc[: _real_bs + 1] = query_start_loc[
+                        : _real_bs + 1
+                    ]
+                    padded_query_start_loc[_real_bs + 1 :] = logical_end
+                    query_start_loc = padded_query_start_loc
+
                 if self.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
                     retrieve_next_sibling = (
@@ -1130,6 +1159,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.batch_size == 0:
+            # DP-attention keeps hybrid models in TARGET_VERIFY on idle ranks so
+            # they can still participate in the MoE collectives. Their attention
+            # layers short-circuit on an empty hidden-state tensor, so planning
+            # either child backend is both unnecessary and invalid for backends
+            # (notably DSA) that reduce over the request-length vector.
+            for attn_backend in self.attn_backend_list:
+                attn_backend.forward_metadata = None
+            return
         if forward_batch.forward_mode.is_draft_extend_v2():
             # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model; skip
             # linear/mamba metadata (it requires query_start_loc).
@@ -1259,8 +1297,23 @@ class HybridLinearAttnBackend(AttentionBackend):
         **kwargs,
     ):
         is_linear_attn = not self._is_full_attn(layer, kwargs.get("layer_id"))
+        has_no_query_tokens = (
+            mixed_qkv is not None and mixed_qkv.shape[0] == 0
+            if is_linear_attn
+            else q is not None and q.shape[0] == 0
+        )
 
-        if forward_batch.forward_mode.is_idle():
+        if (
+            forward_batch.batch_size == 0
+            or forward_batch.forward_mode.is_idle()
+            or has_no_query_tokens
+        ):
+            # DP-attention represents an idle hybrid rank as an empty
+            # TARGET_VERIFY batch so the rank can still join the later MoE
+            # collectives. Padding can leave a nonzero request domain after
+            # RadixLinearAttention trims the physical tensor to zero real
+            # tokens, so use both signals. Preserve the expected output shape
+            # instead of entering a child backend with empty metadata.
             if is_linear_attn:
                 return mixed_qkv.new_empty(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim

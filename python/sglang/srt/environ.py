@@ -1163,6 +1163,9 @@ class Envs:
     # ===================================================================
     # DeepGEMM Mega MoE
     # ===================================================================
+    # Explicit opt-in prevents a requested MegaMoE deployment from silently
+    # falling back when weights, the SM90 ABI, or token capacity are unavailable.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.

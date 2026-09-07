@@ -6,12 +6,14 @@ import torch
 import sglang.kernels.ops.attention.dsa.transform_index as transform_index_module
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode_fast,
+    transform_index_page_table_decode_ref,
     transform_index_page_table_prefill_fast,
+    transform_index_page_table_prefill_ref,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 
 TOPK = 2048
 
@@ -33,9 +35,11 @@ class TestDSATransformIndex(CustomTestCase):
         )
         return columns.unsqueeze(0) + row_bias
 
-    def _make_topk(self, rows: int, context_length: int) -> torch.Tensor:
+    def _make_topk(
+        self, rows: int, context_length: int, topk: int = TOPK
+    ) -> torch.Tensor:
         topk = (
-            torch.arange(TOPK, dtype=torch.int64, device=self.device)
+            torch.arange(topk, dtype=torch.int64, device=self.device)
             .remainder(context_length)
             .repeat(rows, 1)
         )
@@ -55,7 +59,7 @@ class TestDSATransformIndex(CustomTestCase):
     ) -> torch.Tensor:
         real_num_tokens = sum(extend_lens_cpu)
         expected = torch.full(
-            (output_num_tokens, TOPK),
+            (output_num_tokens, topk_indices.shape[1]),
             -1,
             dtype=torch.int32,
             device=self.device,
@@ -75,13 +79,14 @@ class TestDSATransformIndex(CustomTestCase):
             source_rows = page_table[request_ids]
 
         real_topk = topk_indices[:real_num_tokens]
+        valid_topk_mask = (real_topk >= 0) & (real_topk < page_table.shape[1])
         torch.gather(
             source_rows,
             dim=1,
-            index=real_topk.clamp(min=0),
+            index=real_topk.clamp(min=0, max=page_table.shape[1] - 1),
             out=expected[:real_num_tokens],
         )
-        expected[:real_num_tokens][real_topk < 0] = -1
+        expected[:real_num_tokens][~valid_topk_mask] = -1
         return expected
 
     def _check_decode_case(
@@ -91,22 +96,24 @@ class TestDSATransformIndex(CustomTestCase):
         *,
         zero_row_stride: bool = False,
         provide_result: bool = False,
+        topk: int = TOPK,
     ) -> None:
         if zero_row_stride:
             page_table = self._make_page_table(1, context_length).expand(batch_size, -1)
         else:
             page_table = self._make_page_table(batch_size, context_length)
-        topk_indices = self._make_topk(batch_size, context_length)
+        topk_indices = self._make_topk(batch_size, context_length, topk)
+        valid_topk_mask = (topk_indices >= 0) & (topk_indices < context_length)
         expected = torch.empty(
-            (batch_size, TOPK), dtype=torch.int32, device=self.device
+            (batch_size, topk), dtype=torch.int32, device=self.device
         )
         torch.gather(
             page_table,
             dim=1,
-            index=topk_indices.clamp(min=0),
+            index=topk_indices.clamp(min=0, max=context_length - 1),
             out=expected,
         )
-        expected[topk_indices < 0] = -1
+        expected[~valid_topk_mask] = -1
         result = torch.empty_like(expected) if provide_result else None
 
         actual = transform_index_page_table_decode_fast(
@@ -127,6 +134,7 @@ class TestDSATransformIndex(CustomTestCase):
         page_table_is_expanded: bool,
         topk_padding: int = 0,
         output_padding: int = 0,
+        topk: int = TOPK,
     ) -> None:
         real_num_tokens = sum(extend_lens_cpu)
         page_table_rows = (
@@ -135,7 +143,7 @@ class TestDSATransformIndex(CustomTestCase):
         topk_num_tokens = real_num_tokens + topk_padding
         output_num_tokens = topk_num_tokens + output_padding
         page_table = self._make_page_table(page_table_rows, context_length)
-        topk_indices = self._make_topk(topk_num_tokens, context_length)
+        topk_indices = self._make_topk(topk_num_tokens, context_length, topk)
         expected = self._expected(
             page_table,
             topk_indices,
@@ -234,6 +242,69 @@ class TestDSATransformIndex(CustomTestCase):
     def test_decode_fast_extreme_shapes(self):
         self._check_decode_case(8192, 4096)
         self._check_decode_case(2, 1_000_000)
+
+    def test_kpool_tail_extended_width(self):
+        # GLM-5.3 uses index_topk=2048 and index_kpool=4, so MTP IndexShare
+        # carries up to three live tail slots beyond the pooled top-k budget.
+        kpool_topk = TOPK + 3
+        self._check_decode_case(17, 8192, topk=kpool_topk)
+        self._check_case(
+            [2, 1],
+            8192,
+            page_table_is_expanded=False,
+            topk=kpool_topk,
+        )
+
+    def test_out_of_bounds_indices_are_replaced_with_minus_one(self):
+        context_length = 8192
+        extend_lens_cpu = [2, 1]
+
+        for topk in (TOPK, TOPK + 3):
+            with self.subTest(path="decode", topk=topk):
+                page_table = self._make_page_table(2, context_length)
+                topk_indices = self._make_topk(2, context_length, topk)
+                topk_indices[:, 2] = context_length
+                topk_indices[:, 3] = context_length + 17
+                expected = transform_index_page_table_decode_ref(
+                    page_table, topk_indices
+                )
+                actual = transform_index_page_table_decode_fast(
+                    page_table, topk_indices
+                )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+            for page_table_is_expanded in (False, True):
+                with self.subTest(
+                    path="prefill",
+                    topk=topk,
+                    page_table_is_expanded=page_table_is_expanded,
+                ):
+                    page_table_rows = (
+                        sum(extend_lens_cpu)
+                        if page_table_is_expanded
+                        else len(extend_lens_cpu)
+                    )
+                    page_table = self._make_page_table(page_table_rows, context_length)
+                    topk_indices = self._make_topk(
+                        sum(extend_lens_cpu), context_length, topk
+                    )
+                    topk_indices[:, 2] = context_length
+                    topk_indices[:, 3] = context_length + 17
+                    expected = transform_index_page_table_prefill_ref(
+                        page_table=page_table,
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=extend_lens_cpu,
+                        page_table_is_expanded=page_table_is_expanded,
+                    )
+                    actual = transform_index_page_table_prefill_fast(
+                        page_table=page_table,
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=extend_lens_cpu,
+                        page_table_is_expanded=page_table_is_expanded,
+                    )
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

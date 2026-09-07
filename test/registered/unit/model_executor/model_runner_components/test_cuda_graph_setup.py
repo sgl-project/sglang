@@ -117,5 +117,68 @@ def test_align_pipeline_layers_uses_absolute_indices():
         )
 
 
+@pytest.mark.parametrize("is_draft_worker", [False, True])
+def test_deep_gemm_budget_uses_runner_tp_group(monkeypatch, is_draft_worker):
+    from sglang.srt.layers.moe.moe_runner import deep_gemm
+
+    tp_cpu_group = object()
+    model_runner = SimpleNamespace(
+        device="cuda",
+        gpu_id=3,
+        is_draft_worker=is_draft_worker,
+        tp_group=SimpleNamespace(world_size=2, cpu_group=tp_cpu_group),
+    )
+    moe = SimpleNamespace(moe_runner_backend="deep_gemm", moe_a2a_backend="none")
+    spec = SimpleNamespace(
+        speculative_moe_runner_backend=None, speculative_moe_a2a_backend=None
+    )
+    monkeypatch.setattr(cuda_graph_setup, "get_exec", lambda: SimpleNamespace(moe=moe))
+    monkeypatch.setattr(cuda_graph_setup, "get_spec", lambda: spec)
+    monkeypatch.setattr(
+        cuda_graph_setup.envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT, "get", lambda: "auto"
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup, "_deep_gemm_layout_memory_budget_initialized", False
+    )
+    calls = []
+    budgets = []
+
+    def available_memory(device, gpu_id, *, distributed, cpu_group):
+        calls.append((device, gpu_id, distributed, cpu_group))
+        return 12.0
+
+    def set_budget(value):
+        budgets.append(value)
+        return 3 << 30
+
+    monkeypatch.setattr(cuda_graph_setup, "get_available_gpu_memory", available_memory)
+    monkeypatch.setattr(
+        deep_gemm, "set_masked_standard_layout_memory_budget", set_budget
+    )
+    # A post-startup refresh cannot initialize a previously unused backend.
+    cuda_graph_setup.refresh_deep_gemm_layout_memory_budget(
+        model_runner, only_if_initialized=True
+    )
+    assert calls == []
+    cuda_graph_setup.refresh_deep_gemm_layout_memory_budget(model_runner)
+    cuda_graph_setup.refresh_deep_gemm_layout_memory_budget(
+        model_runner, only_if_initialized=True
+    )
+    assert calls == [("cuda", 3, True, tp_cpu_group)] * 2
+    assert budgets == [12 << 30] * 2
+
+
+def test_deep_gemm_budget_only_tightens_across_coexisting_runners(monkeypatch):
+    from sglang.srt.layers.moe.moe_runner import deep_gemm
+
+    monkeypatch.setattr(
+        deep_gemm.envs.SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION, "get", lambda: 0.5
+    )
+    monkeypatch.setattr(deep_gemm, "_masked_standard_layout_memory_budget_bytes", None)
+    assert deep_gemm.set_masked_standard_layout_memory_budget(1000) == 500
+    assert deep_gemm.set_masked_standard_layout_memory_budget(1200) == 500
+    assert deep_gemm.set_masked_standard_layout_memory_budget(800) == 400
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

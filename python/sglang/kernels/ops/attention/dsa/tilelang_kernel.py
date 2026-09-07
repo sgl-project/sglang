@@ -71,6 +71,13 @@ def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
+@lru_cache(maxsize=1)
+def _cuda_sm_count() -> int:
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
 @lru_cache(maxsize=8)
 def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     """
@@ -1160,8 +1167,9 @@ def sparse_mla_fwd_decode_partial_fp8(
             kv_tile1 = T.alloc_shared([BI, group_size], fp8_dtype)
             kv_tile2 = T.alloc_shared([BI, group_size], fp8_dtype)
             kv_tile3 = T.alloc_shared([BI, group_size], fp8_dtype)
-            q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
-            k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
+            if d_tail > 0:
+                q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
+                k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
             s_fp8_shared = T.alloc_shared([h_per_block, BI], fp8_dtype)
             page_idx_shared = T.alloc_shared([BI], T.int32)
 
@@ -1188,7 +1196,8 @@ def sparse_mla_fwd_decode_partial_fp8(
             T.fill(sumexp, 0)
             T.fill(m_i, -(2**30))
 
-            T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
+            if d_tail > 0:
+                T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
             T.copy(q_fp8[b_i, s_i, H0:H1, 0 * group_size : 1 * group_size], q_tile0)
             T.copy(q_fp8[b_i, s_i, H0:H1, 1 * group_size : 2 * group_size], q_tile1)
             T.copy(q_fp8[b_i, s_i, H0:H1, 2 * group_size : 3 * group_size], q_tile2)
@@ -1210,9 +1219,12 @@ def sparse_mla_fwd_decode_partial_fp8(
                     kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
                     kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
 
-                for bi_i, j in T.Parallel(BI, d_tail):
-                    page = page_idx_shared[bi_i]
-                    k_tail_shared[bi_i, j] = kv_fp8[b_i, page, g_i, rope_offset_fp8 + j]
+                if d_tail > 0:
+                    for bi_i, j in T.Parallel(BI, d_tail):
+                        page = page_idx_shared[bi_i]
+                        k_tail_shared[bi_i, j] = kv_fp8[
+                            b_i, page, g_i, rope_offset_fp8 + j
+                        ]
 
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -1229,13 +1241,14 @@ def sparse_mla_fwd_decode_partial_fp8(
                 T.gemm(q_tile3, kv_tile3, acc_tile, transpose_B=True, clear_accum=True)
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
-                T.gemm(
-                    q_tail_buf,
-                    k_tail_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
+                if d_tail > 0:
+                    T.gemm(
+                        q_tail_buf,
+                        k_tail_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
 
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -1336,12 +1349,19 @@ def tilelang_sparse_fwd(
     topk = indices.shape[-1]
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
-    if _is_hip:
-        is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if _is_hip or is_fp8_kv:
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
-            if _is_gfx95_supported:
+            if not _is_hip:
+                # CUDA: the fp8 partial kernel is generic TileLang (no HIP
+                # intrinsics). Tiles sized for the ~100 KB dynamic-smem class
+                # (SM12x): fp8 K tiles are half the bytes of bf16, so
+                # block_I=32/threads=128 uses ~25 KB smem and block_I=64
+                # would use ~42 KB; 32/128 is the shape validated on GB10.
+                block_I, threads, block_per_cu, cu = 32, 128, 1, _cuda_sm_count()
+            elif _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304

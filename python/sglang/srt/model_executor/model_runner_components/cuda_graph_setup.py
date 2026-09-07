@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.distributed import get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -160,7 +159,7 @@ class CudaGraphsCapture(msgspec.Struct, frozen=True, kw_only=True):
 def refresh_deep_gemm_layout_memory_budget(
     model_runner: ModelRunner, *, only_if_initialized: bool = False
 ) -> None:
-    """Set the all-rank budget before capture, then refresh after startup."""
+    """Set the runner TP budget before capture, then refresh after startup."""
     global _deep_gemm_layout_memory_budget_initialized
     if (
         model_runner.device != "cuda"
@@ -169,9 +168,8 @@ def refresh_deep_gemm_layout_memory_budget(
         return
 
     if only_if_initialized:
-        # Target and draft share the budget. Its pre-capture initialization
-        # already used a world-wide collective, so this guard is rank-uniform
-        # and also covers a draft-only DeepGEMM backend outside draft context.
+        # Target and draft share the process-local budget. The runner TP ranks
+        # initialize together, including a draft hosted only on the last PP stage.
         if not _deep_gemm_layout_memory_budget_initialized:
             return
     else:
@@ -208,12 +206,14 @@ def refresh_deep_gemm_layout_memory_budget(
         set_masked_standard_layout_memory_budget,
     )
 
-    world_group = get_world_group()
+    # Only this runner's TP ranks participate in its initialization. A draft
+    # hosted on the last PP stage must not reduce over other pipeline stages.
+    tp_group = model_runner.tp_group
     available_memory_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=world_group.world_size > 1,
-        cpu_group=world_group.cpu_group,
+        distributed=tp_group.world_size > 1,
+        cpu_group=tp_group.cpu_group,
     )
     budget_bytes = set_masked_standard_layout_memory_budget(
         int(available_memory_gb * (1 << 30))

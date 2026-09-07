@@ -101,6 +101,13 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _req_slot_capacity(req_to_token_pool: ReqToTokenPool) -> int:
+    """Return the non-padding request-slot domain of a request table."""
+    capacity = int(req_to_token_pool.req_to_token.shape[0]) - 1
+    assert capacity >= 0, "req_to_token must include its padding row"
+    return capacity
+
+
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
     return (
@@ -1233,7 +1240,7 @@ class KVCacheConfigurator:
         elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
-                max_running_requests=sizes.max_running_requests,
+                req_to_token_pool=req_to_token_pool,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
@@ -1523,7 +1530,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_dsa_kv_pool(
-        self, *, max_total_num_tokens: int, max_running_requests: int
+        self, *, max_total_num_tokens: int, req_to_token_pool: ReqToTokenPool
     ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
@@ -1578,7 +1585,8 @@ class KVCacheConfigurator:
                 self.model_config.hf_config
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
-            max_running_requests=max_running_requests,
+            # Include in-transfer request slots; the pool adds padding row 0.
+            max_running_requests=_req_slot_capacity(req_to_token_pool),
             **pool_kwargs,
         )
         return token_to_kv_pool
@@ -1809,7 +1817,7 @@ class KVCacheConfigurator:
                 if dsa_index_kpool > 1:
                     extra_args.update(
                         tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
-                        max_running_requests=(req_to_token_pool.req_to_token.shape[0]),
+                        max_running_requests=_req_slot_capacity(req_to_token_pool),
                     )
         quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)
@@ -2491,10 +2499,20 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
+    # On CUDA, the TileLang DSA kernels likewise consume the raw MLA KV layout
+    # when the KV cache is fp8. Arg validation (_check_tilelang_dsa_fp8_kv)
+    # guarantees prefill == decode == tilelang whenever tilelang is combined
+    # with an fp8_e4m3 KV cache on CUDA, so no mixed-layout consumer exists.
+    if not _is_hip and (
+        get_exec().kernel.dsa_prefill_backend == "tilelang"
+        and get_exec().kernel.dsa_decode_backend == "tilelang"
+    ):
+        return kv_cache_dim
+
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
-    # (excluding TRTLLM and HIP raw-layout kernels).
+    # (excluding TRTLLM and raw-layout TileLang/AITER kernels).
     # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
     # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
     if kv_cache_dtype == torch.float8_e4m3fn:

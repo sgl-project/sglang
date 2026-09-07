@@ -24,6 +24,7 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
     validate_layernorm_sp(
         architecture=architectures[0] if architectures else None,
         tp_size=cfg.tp_size,
+        pp_size=cfg.pp_size,
         enable_dp_attention=cfg.enable_dp_attention,
         speculative_algorithm=cfg.speculative_algorithm,
     )
@@ -33,6 +34,7 @@ def validate_layernorm_sp(
     *,
     architecture: Optional[str],
     tp_size: int,
+    pp_size: int,
     enable_dp_attention: bool,
     speculative_algorithm: Optional[str],
 ) -> None:
@@ -48,6 +50,12 @@ def validate_layernorm_sp(
         raise ValueError(
             "--enable-layernorm-sp requires tp_size > 1: there is no sequence to "
             "shard across a single TP rank."
+        )
+    if pp_size > 1:
+        raise ValueError(
+            "--enable-layernorm-sp is not compatible with pipeline parallelism "
+            "(pp_size > 1): the sequence-parallel region does not cross PP "
+            "stage boundaries."
         )
     if enable_dp_attention:
         raise ValueError(
