@@ -1,6 +1,5 @@
-import sys
 import unittest
-from types import ModuleType
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -9,65 +8,58 @@ from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _validate_flashinfer_sparse_mla_backend,
     flashinfer_sparse_mla_forward,
 )
+from sglang.srt.mem_cache import kv_cache_configurator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestFlashInferSparseMLAAdapter(unittest.TestCase):
-    def _mock_flashinfer(self, op):
-        flashinfer = ModuleType("flashinfer")
-        flashinfer.__path__ = []
-        mla = ModuleType("flashinfer.mla")
-        mla.trtllm_batch_decode_with_kv_cache_mla = op
-        flashinfer.mla = mla
-        return patch.dict(
-            sys.modules,
-            {"flashinfer": flashinfer, "flashinfer.mla": mla},
-        )
-
-    def test_maps_sglang_layout_to_public_flashinfer_api(self):
+    def test_maps_glm53_nope_layout_to_persistent_flashinfer_runner(self):
         captured = {}
 
-        def fake_op(**kwargs):
-            captured.update(kwargs)
-            query = kwargs["query"]
-            return query.new_full((*query.shape[:-1], kwargs["kv_lora_rank"]), 2)
+        class FakeRunner:
+            def run(self, q, kv_cache, indices, output, sm_scale, **kwargs):
+                captured.update(
+                    q=q,
+                    kv_cache=kv_cache,
+                    indices=indices,
+                    output=output,
+                    sm_scale=sm_scale,
+                    **kwargs,
+                )
+                output.fill_(2)
 
-        with self._mock_flashinfer(fake_op):
-            output = flashinfer_sparse_mla_forward(
-                q=torch.zeros((2, 8, 576), dtype=torch.bfloat16),
-                kv_cache=torch.zeros((128, 1, 656), dtype=torch.uint8),
-                indices=torch.tensor(
-                    [[7, 9, -1, -1], [4, 6, 8, -1]], dtype=torch.int32
-                ),
-                seq_lens=torch.tensor([2, 3], dtype=torch.int32),
-                workspace_buffer=torch.zeros(1024, dtype=torch.uint8),
-                page_size=64,
-                kv_cache_dim=656,
-                qk_nope_head_dim=192,
-                kv_lora_rank=512,
-                qk_rope_head_dim=64,
-                sm_scale=0.125,
-                skip_softmax_threshold_scale_factor=0.25,
-            )
-
-        self.assertEqual(tuple(captured["query"].shape), (2, 1, 8, 576))
-        self.assertEqual(tuple(captured["kv_cache"].shape), (2, 1, 64, 656))
-        self.assertEqual(tuple(captured["block_tables"].shape), (2, 1, 4))
-        self.assertEqual(
-            captured["block_tables"].tolist(),
-            [[[7, 9, -1, -1]], [[4, 6, 8, -1]]],
+        indices = torch.full((2, 2051), -1, dtype=torch.int32)
+        indices[0, :2] = torch.tensor([7, 9], dtype=torch.int32)
+        indices[1, :3] = torch.tensor([4, 6, 8], dtype=torch.int32)
+        output = flashinfer_sparse_mla_forward(
+            q=torch.zeros((2, 8, 512), dtype=torch.bfloat16),
+            kv_cache=torch.zeros((128, 1, 528), dtype=torch.uint8),
+            indices=indices,
+            seq_lens=torch.tensor([2, 3], dtype=torch.int32),
+            workspace_buffer=torch.zeros(2 * 1024 * 1024, dtype=torch.uint8),
+            runner=FakeRunner(),
+            page_size=64,
+            kv_cache_dim=528,
+            # This is the checkpoint's pre-absorption dimension. The query
+            # reaching the native sparse-MLA kernel is 512 wide.
+            qk_nope_head_dim=256,
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+            sm_scale=0.125,
+            skip_softmax_threshold_scale_factor=None,
         )
-        self.assertEqual(captured["seq_lens"].tolist(), [2, 3])
-        self.assertEqual(captured["max_seq_len"], 4)
-        self.assertEqual(captured["sparse_mla_top_k"], 4)
-        self.assertEqual(captured["qk_nope_head_dim"], 192)
-        self.assertEqual(captured["bmm1_scale"], 0.125)
-        self.assertEqual(captured["bmm2_scale"], 1.0)
-        self.assertEqual(captured["kv_scale_format"], "arbitrary_fp32")
-        self.assertEqual(captured["skip_softmax_threshold_scale_factor"], 0.25)
-        self.assertNotIn("backend", captured)
+
+        self.assertEqual(tuple(captured["q"].shape), (2, 8, 512))
+        self.assertEqual(tuple(captured["kv_cache"].shape), (2, 64, 528))
+        self.assertEqual(tuple(captured["indices"].shape), (2, 2176))
+        self.assertEqual(captured["indices"][0, :4].tolist(), [7, 9, -1, -1])
+        self.assertTrue(torch.all(captured["indices"][:, 2051:] == -1))
+        self.assertEqual(captured["topk_length"].tolist(), [2, 3])
+        self.assertEqual(captured["sm_scale"], 0.125)
+        self.assertEqual(tuple(captured["mid_out"].shape), (2, 8, 34, 512))
+        self.assertEqual(tuple(captured["mid_lse"].shape), (2, 8, 34))
         self.assertEqual(tuple(output.shape), (2, 8, 512))
         self.assertTrue(torch.all(output == 2))
 
@@ -86,6 +78,8 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
         for model_arch in (
             "GlmMoeDsaForCausalLM",
             "GlmMoeDsaForCausalLMNextN",
+            "Glm5NextForConditionalGeneration",
+            "Glm5NextForConditionalGenerationNextN",
         ):
             with self.subTest(model_arch=model_arch):
                 self.assertTrue(
@@ -96,14 +90,14 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
                     )
                 )
 
-    def test_rejects_other_or_mixed_backends(self):
-        for prefill, decode in (
-            ("trtllm", "trtllm"),
-            ("flashinfer_sparse_mla", "trtllm"),
-        ):
+    def test_ignores_other_backends_when_flashinfer_is_not_selected(self):
+        for prefill, decode in (("tilelang", "tilelang"), ("trtllm", "trtllm")):
             with self.subTest(prefill=prefill, decode=decode):
-                with self.assertRaisesRegex(ValueError, "only flashinfer_sparse_mla"):
-                    self._validate(prefill, decode)
+                self.assertFalse(self._validate(prefill, decode))
+
+    def test_rejects_mixed_flashinfer_backend(self):
+        with self.assertRaisesRegex(ValueError, "only flashinfer_sparse_mla"):
+            self._validate("flashinfer_sparse_mla", "trtllm")
 
     def test_reports_unsupported_configuration(self):
         with self.assertRaises(ValueError) as error:
@@ -117,6 +111,33 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
         self.assertIn("model_arch='DeepseekV3ForCausalLM'", message)
         self.assertIn("sm_major=12", message)
         self.assertIn("kv_cache_dtype=torch.float8_e4m3fn", message)
+
+
+class TestFlashInferSparseMLAKVLayout(unittest.TestCase):
+    def test_glm53_nope_layout_follows_kernel_capability(self):
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(), kv_lora_rank=512, qk_rope_head_dim=0,
+        )
+        execution = SimpleNamespace(kernel=SimpleNamespace(
+            dsa_prefill_backend="flashinfer_sparse_mla",
+            dsa_decode_backend="flashinfer_sparse_mla",
+        ))
+        for capability, expected in [
+            (SimpleNamespace(), 656),
+            (SimpleNamespace(compact_bytes_per_token=None), 656),
+            (SimpleNamespace(compact_bytes_per_token=528), 528),
+        ]:
+            with (
+                self.subTest(expected=expected),
+                patch.object(kv_cache_configurator, "is_deepseek_dsa", return_value=True),
+                patch.object(kv_cache_configurator, "get_exec", return_value=execution),
+                patch.object(kv_cache_configurator, "get_disagg", return_value=SimpleNamespace(disaggregation_mode="null")),
+                patch.object(kv_cache_configurator, "_is_hip", False),
+                patch("flashinfer.mla.supported_sparse_mla_sm120_configs", return_value={"glm53_nope": capability}),
+            ):
+                self.assertEqual(kv_cache_configurator.calculate_mla_kv_cache_dim(
+                    model_config=model_config, kv_cache_dtype=torch.float8_e4m3fn,
+                ), expected)
 
 
 if __name__ == "__main__":
