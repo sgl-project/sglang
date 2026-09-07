@@ -81,6 +81,7 @@ def _make_model(visual, is_first_rank: bool = True):
         glm5_next.Glm5NextForConditionalGeneration
     )
     nn.Module.__init__(model)
+    model.encoder_only = True
     model.visual = visual
     model.pp_group = SimpleNamespace(is_first_rank=is_first_rank)
     return model
