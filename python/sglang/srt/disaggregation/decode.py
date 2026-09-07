@@ -27,10 +27,11 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
@@ -104,9 +105,12 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils.rank_consensus_checker import assert_same
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+
+_L2_ADMISSION_BACKOFF_TICKS = 32
 
 _is_npu = is_npu()
 
@@ -115,6 +119,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+
+
+class _L2StagingShortfall(Exception):
+    """Host staging could not be carved despite the admission gate passing."""
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -304,6 +312,14 @@ class DecodeRequest:
     hicache_restored_node: Any = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    hicache_l3_drained: bool = False
+    l2_host_lock_node: Optional[int] = None
+    l2_host_lock_params: Optional[Any] = None
+
+    l2_only_host_indices: Optional[torch.Tensor] = None
+    l2_only_delta_len: int = 0
+    l2_only_tail_used_len: int = 0
+    l2_only_tail_device_indices: Optional[torch.Tensor] = None
 
     @property
     def seqlen(self) -> int:
@@ -348,11 +364,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
+        self._l2_only = scheduler.server_args.disaggregation_decode_l2_only_radix_cache
         self.transfer_queue = transfer_queue
         self.tree_cache = tree_cache
         self.gloo_group = gloo_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
+        self._l2_admission_backoff = 0
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.dp_size = dp_size
@@ -387,6 +405,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise RuntimeError(
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
+            )
+        if self._l2_only and (
+            self.scheduler.tp_worker.is_hybrid_swa or self.tree_cache.supports_mamba()
+        ):
+            raise RuntimeError(
+                "--disaggregation-decode-l2-only-radix-cache is not supported "
+                "for hybrid SWA or Mamba models."
             )
         self.kv_manager = self._init_kv_manager()
         if self.enable_staging:
@@ -454,6 +479,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return self.token_to_kv_pool_allocator.full_available_size()
         return self.token_to_kv_pool_allocator.available_size()
 
+    def _l2_only_host_pool(self):
+        return self.tree_cache.cache_controller.mem_pool_host
+
+    def _l2_only_staging_len(self, delta_len: int) -> int:
+        granularity = self._l2_only_host_pool().logical_page_size
+        return ceil_align(max(delta_len, 0), granularity)
+
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
             return max(seq_len, 0)
@@ -515,19 +547,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
-        transfer_kv_pool = (
-            self.scheduler.hisparse_coordinator.mem_pool_host
-            if self.scheduler.enable_hisparse
-            else self.token_to_kv_pool
-        )
+        l2_only_radix_cache = self._l2_only
+        if l2_only_radix_cache:
+            transfer_kv_pool = self._l2_only_host_pool()
+        else:
+            transfer_kv_pool = (
+                self.scheduler.hisparse_coordinator.mem_pool_host
+                if self.scheduler.enable_hisparse
+                else self.token_to_kv_pool
+            )
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
-            if self.scheduler.enable_hisparse
+            if (self.scheduler.enable_hisparse or l2_only_radix_cache)
             else ["VRAM"] * len(kv_data_ptrs)
         )
+        if l2_only_radix_cache:
+            if transfer_kv_pool.page_size != self.token_to_kv_pool.page_size:
+                raise RuntimeError(
+                    "--disaggregation-decode-l2-only-radix-cache requires the "
+                    "host KV pool page size to match the device KV pool page "
+                    f"size, but got {transfer_kv_pool.page_size} and "
+                    f"{self.token_to_kv_pool.page_size}."
+                )
         if self.scheduler.enable_hisparse and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
@@ -576,6 +620,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
+
+        if l2_only_radix_cache and kv_args.state_types:
+            raise RuntimeError(
+                "--disaggregation-decode-l2-only-radix-cache is not supported "
+                f"for models with state_types={kv_args.state_types}."
+            )
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
@@ -766,6 +816,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
+        if self._l2_only:
+            host_pool = self._l2_only_host_pool()
+            staging_len = self._l2_only_staging_len(input_len)
+            host_capacity = getattr(host_pool, "logical_size", host_pool.size)
+            granularity = getattr(
+                host_pool,
+                "logical_page_size",
+                self.token_to_kv_pool_allocator.page_size,
+            )
+            if staging_len + 2 * granularity > host_capacity:
+                message = (
+                    f"Request {req.rid} requires too many host staging tokens "
+                    f"for decode preallocation: {staging_len} + 2x{granularity} "
+                    f"prefetch rounding > {host_capacity}"
+                )
+                logger.error(message)
+                prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                return True
         if self._uses_swa_tail_prealloc():
             _, swa_required = self._prealloc_required_tokens(req)
             swa_capacity = self.token_to_kv_pool_allocator.size_swa
@@ -836,7 +905,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
-            self._pre_alloc(req)
+            self._pre_alloc(req, use_l2_staging=False)
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:
                 swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
@@ -1118,6 +1187,41 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         reserved_restore_tokens = self._hicache_pending_restore_tokens()
         full_allocatable_tokens -= reserved_restore_tokens
+
+        admission_reservation = reserved_restore_tokens
+        l2_aligned_budget_mode = False
+        l2_aligned_req_pool_avail: Optional[int] = None
+        l2_aligned_meta_avail: Optional[int] = None
+        if self._l2_only:
+            l2_aligned_req_pool_avail = self.transfer_queue._l2_aligned_req_pool_avail
+            l2_aligned_meta_avail = self.transfer_queue._l2_aligned_meta_avail
+            if self.transfer_queue._l2_aligned_pending_restore is not None:
+                admission_reservation = self.transfer_queue._l2_aligned_pending_restore
+                full_allocatable_tokens += (
+                    reserved_restore_tokens - admission_reservation
+                )
+            if (
+                self.transfer_queue._l2_aligned_hbm_budget is not None
+                and not uses_swa_tail_prealloc
+            ):
+                full_allocatable_tokens = (
+                    self.transfer_queue._l2_aligned_hbm_budget - admission_reservation
+                )
+                l2_adm_prebuilt_reserve = 0
+                if (
+                    self.scheduler.last_batch
+                    and self.scheduler.last_batch.forward_mode.is_prebuilt()
+                ):
+                    l2_adm_prebuilt_reserve = self.num_reserved_decode_tokens * len(
+                        self.scheduler.last_batch.reqs
+                    )
+                full_allocatable_tokens -= l2_adm_prebuilt_reserve
+                l2_aligned_budget_mode = True
+                l2_adm_prealloc_costs: List[int] = []
+                l2_adm_locked_prefixes: List[int] = []
+                l2_adm_reservation_base = admission_reservation
+                l2_adm_uniform_consumed = 0
+
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
         if self.scheduler.enable_priority_scheduling:
@@ -1164,8 +1268,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 - len(self.transfer_queue.queue),
             )
 
+        l2_admission_backoff_active = False
+        if self._l2_only and rids_to_check is None and self._l2_admission_backoff > 0:
+            self._l2_admission_backoff -= 1
+            l2_admission_backoff_active = True
+        if self._l2_only:
+            backoff_t = torch.tensor(
+                [int(l2_admission_backoff_active)], dtype=torch.int64, device="cpu"
+            )
+            self.tree_cache._all_reduce_attn_groups(backoff_t, dist.ReduceOp.MIN)
+            l2_admission_backoff_active = bool(int(backoff_t.item()))
+
         # Then, preallocate the remaining requests if possible
-        for i, decode_req in enumerate(self.queue):
+        admission_iter: Iterable[Tuple[int, DecodeRequest]] = enumerate(self.queue)
+        if l2_admission_backoff_active:
+            admission_iter = iter(())
+        l2_broke_on_consensus_gate = False
+        l2_admitted_this_tick = 0
+        for i, decode_req in admission_iter:
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -1175,10 +1295,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not decode_req.waiting_for_input:
                 continue
 
-            if self.req_to_token_pool.available_size() <= 0:
+            if l2_aligned_req_pool_avail is not None:
+                req_pool_left = l2_aligned_req_pool_avail - l2_admitted_this_tick
+                meta_left = l2_aligned_meta_avail - l2_admitted_this_tick
+            else:
+                req_pool_left = self.req_to_token_pool.available_size()
+                meta_left = self.req_to_metadata_buffer_idx_allocator.available_size()
+            if req_pool_left <= 0:
                 break
 
-            if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+            if meta_left <= 0:
                 break
 
             if hisparse_req_budget <= 0:
@@ -1239,12 +1365,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
                 # decide whether this request still fits.
-                full_allocatable_tokens = self._allocatable_token_budgets(
-                    retractable_tokens=retractable_tokens,
-                    count_retracted=True,
-                    extra_reserved_reqs=len(preallocated_reqs),
-                    hicache_reserved_tokens=reserved_restore_tokens,
-                )
+                if l2_aligned_budget_mode:
+                    full_allocatable_tokens = (
+                        self.transfer_queue._l2_aligned_hbm_budget
+                        - l2_adm_reservation_base
+                        - l2_adm_prebuilt_reserve
+                        - l2_adm_uniform_consumed
+                    )
+                else:
+                    full_allocatable_tokens = self._allocatable_token_budgets(
+                        retractable_tokens=retractable_tokens,
+                        count_retracted=True,
+                        extra_reserved_reqs=len(preallocated_reqs),
+                        hicache_reserved_tokens=admission_reservation,
+                    )
                 if uses_swa_tail_prealloc:
                     swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
                         retractable_tokens=retractable_tokens,
@@ -1256,29 +1390,50 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_indices = None
                 prefix_len = 0
                 total_prefix_len = 0
-                required_alloc_tokens = self._pre_alloc_fill_len(decode_req.req)
+                fill_len = self._pre_alloc_fill_len(decode_req.req)
+                required_alloc_tokens = fill_len
 
+            l2_staged_relief = 0
+            if (
+                self._l2_only
+                and not uses_swa_tail_prealloc
+                and not self.scheduler.enable_hisparse
+            ):
+                l2_staged_relief = min(
+                    max(fill_len - total_prefix_len, 0), required_alloc_tokens
+                )
+                if (
+                    fill_len - prefix_len + self.num_reserved_decode_tokens
+                    > self.max_total_num_tokens
+                ):
+                    l2_staged_relief = 0
+            required_alloc_tokens -= l2_staged_relief
             required_tokens_for_request = (
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
 
-            if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
+            if l2_aligned_budget_mode:
+                l2_admission_blocked = (
+                    fill_len + self.num_reserved_decode_tokens > full_allocatable_tokens
                 )
-                > full_allocatable_tokens
-            ):
-                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                    self._release_matched_prefix_lock(decode_req.req)
-                break
-            if required_tokens_for_request > full_allocatable_tokens:
+            else:
+                l2_admission_blocked = (
+                    max(
+                        required_tokens_for_request,
+                        origin_input_len
+                        - prefix_len
+                        + min(
+                            decode_req.req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKEN,
+                        )
+                        - retractable_tokens
+                        - l2_staged_relief,
+                    )
+                    > full_allocatable_tokens
+                ) or (required_tokens_for_request > full_allocatable_tokens)
+            if l2_admission_blocked:
+                if l2_aligned_budget_mode:
+                    l2_broke_on_consensus_gate = True
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
                 break
@@ -1321,26 +1476,65 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
-            dst_kv_indices = self._pre_alloc(
-                decode_req.req,
-                prefix_indices,
-                prefix_len,
-                total_prefix_len,
-            )
+
+            try:
+                dst_kv_indices = self._pre_alloc(
+                    decode_req.req,
+                    prefix_indices,
+                    prefix_len,
+                    total_prefix_len,
+                )
+            except _L2StagingShortfall:
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                l2_broke_on_consensus_gate = True
+                break
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
+                l3_before_prefetch = (
+                    prefix_match.l3_storage_hit_length
+                    if prefix_match is not None
+                    else 0
+                )
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
+                if (
+                    self._l2_only
+                    and prefix_match is not None
+                    and l3_before_prefetch > 0
+                ):
+                    reg_t = torch.tensor(
+                        [int(prefix_match.prefetch_registered)],
+                        dtype=torch.int64,
+                        device="cpu",
+                    )
+                    self.tree_cache._all_reduce_attn_groups(reg_t, dist.ReduceOp.MIN)
+                    if int(reg_t.item()) == 0:
+                        prefix_match.l3_storage_hit_length = 0
+                        prefix_match.prefetch_registered = False
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
                 reserved_restore_tokens += prefix_match.restore_token_count
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                retractable_tokens=retractable_tokens,
-                count_retracted=True,
-                extra_reserved_reqs=len(preallocated_reqs) + 1,
-                hicache_reserved_tokens=reserved_restore_tokens,
-            )
+                if not l2_aligned_budget_mode:
+                    admission_reservation += prefix_match.restore_token_count
+            if l2_aligned_budget_mode:
+                l2_adm_prealloc_costs.append(required_alloc_tokens)
+                l2_adm_locked_prefixes.append(prefix_len)
+                l2_adm_uniform_consumed += fill_len + self.num_reserved_decode_tokens
+                full_allocatable_tokens = (
+                    self.transfer_queue._l2_aligned_hbm_budget
+                    - l2_adm_reservation_base
+                    - l2_adm_prebuilt_reserve
+                    - l2_adm_uniform_consumed
+                )
+            else:
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=True,
+                    extra_reserved_reqs=len(preallocated_reqs) + 1,
+                    hicache_reserved_tokens=admission_reservation,
+                )
             if uses_swa_tail_prealloc:
                 swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
                     retractable_tokens=retractable_tokens,
@@ -1361,6 +1555,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     page_size,
                 )
                 kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
+            elif self._l2_only:
+                decode_req.l2_only_host_indices = dst_kv_indices
+                decode_req.l2_only_delta_len = origin_input_len - total_prefix_len
+                kv_indices = dst_kv_indices[: origin_input_len - total_prefix_len]
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = self.req_to_token_pool.req_to_token[
@@ -1520,6 +1718,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             self._num_published_destinations += 1
             preallocated_reqs.append(decode_req)
+            l2_admitted_this_tick += 1
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
@@ -1528,6 +1727,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.pending_reqs = [
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
+
+        if self._l2_only and rids_to_check is None and not l2_admission_backoff_active:
+            if l2_admitted_this_tick == 0 and l2_broke_on_consensus_gate:
+                self._l2_admission_backoff = _L2_ADMISSION_BACKOFF_TICKS
+            elif l2_admitted_this_tick > 0:
+                self._l2_admission_backoff = 0
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -1750,6 +1955,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
         total_prefix_len: Optional[int] = None,
+        use_l2_staging: bool = True,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
@@ -1789,6 +1995,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Evict cached entries if the pool doesn't have enough free pages.
         if (
             self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and not (self._l2_only and use_l2_staging)
             and self._radix_full_available() < required_alloc_tokens
         ):
             num_to_evict = required_alloc_tokens - self._radix_full_available()
@@ -1834,6 +2041,53 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 0,
                 coordinator.host_token_len(fill_len),
             )
+        elif self._l2_only and use_l2_staging:
+            staging_len = self._l2_only_staging_len(delta_len)
+            host_staging_indices: Optional[torch.Tensor] = None
+            pair_t = torch.tensor(
+                [staging_len, -staging_len], dtype=torch.int64, device="cpu"
+            )
+            self.tree_cache._all_reduce_attn_groups(pair_t, dist.ReduceOp.MIN)
+            min_staging_len = int(pair_t[0].item())
+            max_staging_len = -int(pair_t[1].item())
+            if min_staging_len <= 0 < max_staging_len:
+                req.kv.kv_committed_len = 0
+                self.req_to_token_pool.free(req)
+                req.kv.mark_kv_released()
+                raise _L2StagingShortfall(
+                    f"rank-divergent staging demand: min={min_staging_len} "
+                    f"max={max_staging_len} req={req.rid}"
+                )
+            if min_staging_len > 0:
+                host_pool = self._l2_only_host_pool()
+                host_staging_indices = host_pool.alloc(staging_len)
+                if host_staging_indices is None:
+                    shortfall = staging_len - host_pool.available_size()
+                    self.tree_cache.evict_host(shortfall)
+                    self.tree_cache.evict(EvictParams(num_tokens=shortfall))
+                    self.tree_cache.evict_host(shortfall)
+                    host_staging_indices = host_pool.alloc(staging_len)
+                ok_t = torch.tensor(
+                    [int(host_staging_indices is not None)],
+                    dtype=torch.int64,
+                    device="cpu",
+                )
+                self.tree_cache._all_reduce_attn_groups(ok_t, dist.ReduceOp.MIN)
+                if int(ok_t.item()) == 0 and host_staging_indices is not None:
+                    host_pool.free(host_staging_indices)
+                    host_staging_indices = None
+                if host_staging_indices is None:
+                    req.kv.kv_committed_len = 0
+                    self.req_to_token_pool.free(req)
+                    req.kv.mark_kv_released()
+                    raise _L2StagingShortfall(
+                        f"need={staging_len} avail={host_pool.available_size()} "
+                        f"req={req.rid}"
+                    )
+            else:
+                host_staging_indices = torch.empty((0,), dtype=torch.int64)
+            req.kv.kv_allocated_len = fill_len
+            kv_loc = None
         else:
             kv_loc = alloc_for_decode_prealloc(
                 allocator,
@@ -1847,7 +2101,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 swa_tail_len=swa_tail_len,
                 req_to_token_pool=self.req_to_token_pool,
             )
-        assert kv_loc is not None, (
+        assert kv_loc is not None or (self._l2_only and use_l2_staging), (
             f"KV cache is full! Bug in memory estimation. "
             f"available={self._radix_full_available()}, "
             f"evictable={self._radix_full_evictable()}, "
@@ -1858,13 +2112,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"req={req.rid}"
         )
 
-        self.req_to_token_pool.write(
-            (
-                req.kv.req_pool_idx,
-                slice(total_prefix_len, total_prefix_len + len(kv_loc)),
-            ),
-            kv_loc,
-        )
+        if kv_loc is not None:
+            self.req_to_token_pool.write(
+                (
+                    req.kv.req_pool_idx,
+                    slice(total_prefix_len, total_prefix_len + len(kv_loc)),
+                ),
+                kv_loc,
+            )
 
         # Truncate fill_len to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token
@@ -1882,6 +2137,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
             return host_indices
+        if self._l2_only and use_l2_staging:
+            return host_staging_indices
         return kv_loc
 
 
@@ -2040,6 +2297,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.tp_rank = tp_rank
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
+        self._l2_only = scheduler.server_args.disaggregation_decode_l2_only_radix_cache
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -2053,6 +2311,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
+
+        self.l2_only_pending_frees: List[Tuple[int, torch.Tensor]] = []
+        self._l2_aligned_pending_restore: Optional[int] = None
+        self._l2_aligned_hbm_budget: Optional[int] = None
+        self._l2_aligned_req_pool_avail: Optional[int] = None
+        self._l2_aligned_meta_avail: Optional[int] = None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2254,7 +2518,46 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
+    def _l2_sync_admission_inputs(self) -> None:
+        """MIN-align the rank-local L2-Only admission inputs across ranks."""
+        if not self._l2_only:
+            return
+        prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
+        retractable_tokens = sum(
+            len(r.origin_input_ids) + len(r.output_ids)
+            for r in self.scheduler.running_batch.reqs
+        )
+        req_pool_avail = int(prealloc_queue.req_to_token_pool.available_size())
+        meta_avail = int(
+            prealloc_queue.req_to_metadata_buffer_idx_allocator.available_size()
+        )
+        sync_t = torch.tensor(
+            [
+                -int(prealloc_queue._hicache_pending_restore_tokens()),
+                int(
+                    prealloc_queue._allocatable_token_budgets(
+                        retractable_tokens=retractable_tokens,
+                        count_retracted=True,
+                    )
+                ),
+                req_pool_avail,
+                meta_avail,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self.tree_cache._all_reduce_attn_groups(sync_t, dist.ReduceOp.MIN)
+        self._l2_aligned_pending_restore = -int(sync_t[0].item())
+        self._l2_aligned_hbm_budget = int(sync_t[1].item())
+        self._l2_aligned_req_pool_avail = int(sync_t[2].item())
+        self._l2_aligned_meta_avail = int(sync_t[3].item())
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+        if self._l2_only:
+            self._drain_l2_only_pending_frees()
+            assert_same("decode transfer queue len=%d", len(self.queue))
+            self._l2_sync_admission_inputs()
+
         if not self.queue:
             return []
 
@@ -2277,15 +2580,40 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Queue-removed but held for deferred release; excluded from the metadata
         # teardown below.
         deferred_indices = set()
+
+        l2_only_mode = self._l2_only
+        uniform_hicache_failure = (
+            l2_only_mode or envs.SGLANG_DISAGGREGATION_UNIFORM_HICACHE_FAILURE.get()
+        )
+        hicache_failed_rids = set()
+        if uniform_hicache_failure and self.scheduler.enable_decode_hicache:
+            failed_bits = torch.tensor(
+                [
+                    int(
+                        decode_req.hicache_restore_status == HiCacheRestoreResult.FAILED
+                    )
+                    for decode_req in self.queue
+                ],
+                dtype=torch.int64,
+                device="cpu",
+            )
+            self.tree_cache._all_reduce_attn_groups(failed_bits, dist.ReduceOp.MAX)
+            hicache_failed_rids = {
+                decode_req.req.rid
+                for decode_req, failed in zip(self.queue, failed_bits.tolist())
+                if failed
+            }
+
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
             hicache_restore_status = decode_req.hicache_restore_status
-            if (
-                poll == KVPoll.Failed
-                or hicache_restore_status == HiCacheRestoreResult.FAILED
-            ):
+            if uniform_hicache_failure:
+                hicache_failed = decode_req.req.rid in hicache_failed_rids
+            else:
+                hicache_failed = hicache_restore_status == HiCacheRestoreResult.FAILED
+            if poll == KVPoll.Failed or hicache_failed:
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -2326,8 +2654,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
                 else:
-                    # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    if self._shrink_l2_only_kv_lens_for_release(decode_req):
+                        release_kv_cache(
+                            decode_req.req, self.tree_cache, is_insert=False
+                        )
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
                     indices_to_remove.add(i)
@@ -2448,6 +2778,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        if self._l2_only:
+            for decode_req in self.queue:
+                self._clean_hicache_prefetch_resources(decode_req)
+            self.l2_only_pending_frees.clear()
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()
@@ -2679,6 +3013,8 @@ class SchedulerDisaggregationDecodeMixin:
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
+            if self.server_args.disaggregation_decode_l2_only_radix_cache:
+                self.disagg_decode_transfer_queue._drain_l2_only_pending_frees()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()

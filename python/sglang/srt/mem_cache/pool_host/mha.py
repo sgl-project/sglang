@@ -150,6 +150,23 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.host_kv_data_refs = self.k_data_refs + self.v_data_refs
         self._init_write_back_staging_buffers()
 
+    def get_contiguous_buf_infos(self):
+        """Per-layer host buffer (ptrs, lens, item_lens) for RDMA registration."""
+        if self.layout != "layer_first":
+            raise ValueError(
+                f"host layout {self.layout!r} has no per-layer contiguous "
+                "regions; KV transfer registration requires "
+                "layout='layer_first'."
+            )
+        k_ptrs = [int(self.k_data_ptrs[i].item()) for i in range(self.layer_num)]
+        v_ptrs = [int(self.v_data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_ptrs = k_ptrs + v_ptrs
+        data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)] + [
+            self.v_buffer[i].nbytes for i in range(self.layer_num)
+        ]
+        item_lens = [self.token_stride_size * self.page_size] * (2 * self.layer_num)
+        return data_ptrs, data_lens, item_lens
+
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim

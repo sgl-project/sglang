@@ -3219,6 +3219,11 @@ class ServerArgs:
         ),
         NS("disagg"),
     ] = None
+    disaggregation_decode_l2_only_radix_cache: A[
+        bool,
+        "Enable L2-Only radix cache on decode server (PD mode). Stages the transferred KV delta in the HiCache host pool instead of HBM. Requires --enable-hierarchical-cache and --disaggregation-decode-enable-radix-cache.",
+        NS("disagg"),
+    ] = False
     num_reserved_decode_tokens: A[
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",

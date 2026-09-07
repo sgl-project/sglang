@@ -2710,6 +2710,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     and self.buffer_pipeline.try_finish_load_back(ack_id)
                 ):
                     continue
+                if self.buffer_pipeline is None and ack_id == -1:
+                    continue
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
@@ -2889,6 +2891,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.loading_check()
         return True
+
+    def is_load_back_event_done_pure(self, consumer_index: int) -> bool:
+        """Pure-query variant of ``is_load_back_event_done`` (no loading_check)."""
+        if consumer_index < 0 or self.cache_controller is None:
+            return True
+
+        return self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event.query()
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.

@@ -186,6 +186,25 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
+    if cfg.disaggregation_decode_l2_only_radix_cache:
+        if cfg.disaggregation_mode != "decode":
+            raise ValueError(
+                "--disaggregation-decode-l2-only-radix-cache is only supported for decode side."
+            )
+        if not cfg.disaggregation_decode_enable_radix_cache:
+            raise ValueError(
+                "--disaggregation-decode-l2-only-radix-cache requires --disaggregation-decode-enable-radix-cache."
+            )
+        if not cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--disaggregation-decode-l2-only-radix-cache requires --enable-hierarchical-cache."
+            )
+        if cfg.hicache_mem_layout != "layer_first":
+            raise ValueError(
+                "--disaggregation-decode-l2-only-radix-cache requires "
+                f"--hicache-mem-layout layer_first, but got {cfg.hicache_mem_layout!r}."
+            )
+
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
