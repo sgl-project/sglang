@@ -136,8 +136,9 @@ def are_linear_prefixes_unquantized(
     checkpoints routinely quantize the experts and leave attention in BF16.
     Callers that swap in a hand-fused module the quant methods cannot feed must
     therefore ask per layer instead of testing ``quant_config is None``, so
-    resolve each prefix the way the real layer would and accept only
-    ``None`` / ``UnquantizedLinearMethod``.
+    resolve each prefix and require an explicit ``UnquantizedLinearMethod``.
+    ``None`` can mean the weightless probe did not match a concrete linear
+    class; it does not prove that the real projection would be unquantized.
     """
     if quant_config is None:
         return True
@@ -159,9 +160,7 @@ def are_linear_prefixes_unquantized(
             # optimization, so answering "not provably unquantized" costs a few
             # GEMM launches, while letting the probe raise costs the model.
             return False
-        if quant_method is not None and not isinstance(
-            quant_method, UnquantizedLinearMethod
-        ):
+        if not isinstance(quant_method, UnquantizedLinearMethod):
             return False
     return True
 

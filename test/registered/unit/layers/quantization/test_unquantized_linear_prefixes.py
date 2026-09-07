@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import Mock
 
-from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.linear import LinearBase, QKVParallelLinear
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import are_linear_prefixes_unquantized
@@ -39,10 +39,17 @@ class TestUnquantizedLinearPrefixes(unittest.TestCase):
             are_linear_prefixes_unquantized(config, ["attn.qkv_proj", "attn.f_b_proj"])
         )
 
-    def test_none_method_is_unquantized(self):
+    def test_none_method_does_not_prove_unquantized(self):
         config = Mock()
         config.get_quant_method.return_value = None
-        self.assertTrue(are_linear_prefixes_unquantized(config, ["attn.qkv_proj"]))
+        self.assertFalse(are_linear_prefixes_unquantized(config, ["attn.qkv_proj"]))
+
+    def test_unmatched_concrete_linear_class_falls_back(self):
+        config = Mock()
+        config.get_quant_method.side_effect = lambda layer, prefix: (
+            object() if isinstance(layer, QKVParallelLinear) else None
+        )
+        self.assertFalse(are_linear_prefixes_unquantized(config, ["attn.qkv_proj"]))
 
     def test_unknown_quantization_config_falls_back(self):
         config = Mock()
