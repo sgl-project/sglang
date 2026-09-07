@@ -458,6 +458,16 @@ def _is_qwen3(ctx):
     )
 
 
+def _is_ling3(ctx):
+    return (
+        ctx.has_text("<role>SYSTEM</role>")
+        and ctx.has_text("<role>ASSISTANT</role>")
+        and ctx.has_text("<|role_end|>")
+        and ctx.has_text("<arg_key>")
+        and ctx.has_text("<arg_value>")
+    )
+
+
 def _is_deepseek_v3(ctx):
     return ctx.reasoning_config == ReasoningToggleConfig(
         toggle_param="thinking", default_enabled=False
@@ -494,6 +504,7 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="minimax", value="minimax", predicate=_is_minimax),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
+    DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
     DetectionRule(name="qwen3", value="qwen3", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v4", value="deepseek-v4", predicate=_is_deepseek_v4),
     DetectionRule(name="deepseek_v3", value="deepseek-v3", predicate=_is_deepseek_v3),
@@ -532,6 +543,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
+    DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
     DetectionRule(
         name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
     ),
@@ -727,6 +739,11 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
     if "KimiK3" in arch or model_type == "kimi_k3":
         reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif arch in (
+        "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
+    ) or model_type in ("bailing_hybrid", "bailing_moe_v3_vl"):
+        reasoning_parser, tool_call_parser = "ling3", "ling3"
     elif "DeepseekV4" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v4", "deepseekv4"
     elif "DeepseekV3" in arch:
