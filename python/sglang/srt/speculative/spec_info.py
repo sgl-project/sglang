@@ -206,10 +206,10 @@ class SpeculativeAlgorithm(Enum):
             )
         if self.is_dflash():
             from sglang.srt.speculative.dflash_disaggregation import (
-                build_dflash_family_disagg_draft_input,
+                build_dflash_disagg_draft_input,
             )
 
-            return build_dflash_family_disagg_draft_input(
+            return build_dflash_disagg_draft_input(
                 batch, last_tokens_tensor, future_map
             )
         return None

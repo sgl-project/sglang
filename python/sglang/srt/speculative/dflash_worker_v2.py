@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
@@ -1051,8 +1052,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         Handles VocabParallelEmbedding TP sharding: each rank only updates the row if
         the mask token falls within its local shard range.
         """
-        self._per_position_mask_embeddings = None
-
         draft_model_path = self.server_args.speculative_draft_model_path
         if draft_model_path is None:
             return
@@ -1076,16 +1075,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         embed_module = target_model.get_input_embeddings()
 
         if saved.get("per_position"):
-            self._per_position_mask_embeddings = embedding_tensor.to(
-                embed_module.weight.dtype
+            raise NotImplementedError(
+                "DFLASH per-position mask embeddings are not supported in "
+                "inference yet (mask_embedding.pt per_position=True)."
             )
-            if self.ps.tp_rank == 0:
-                logger.info(
-                    "Loaded per-position mask embeddings (shape=%s, source=%s)",
-                    list(self._per_position_mask_embeddings.shape),
-                    mask_emb_path,
-                )
-            return
 
         token_id = self._mask_token_id
         shard_indices = getattr(embed_module, "shard_indices", None)
@@ -1137,16 +1130,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         num_org = int(shard.num_org_elements) if shard else local_w.shape[0]
         vocab_size = int(self._target_worker.model_runner.model_config.vocab_size)
 
-        import torch.distributed as dist
-
-        parts = []
-        for r in range(tp_size):
-            if r == self.ps.tp_rank:
-                buf = local_w[:num_org].contiguous()
-            else:
-                buf = torch.empty_like(local_w[:num_org])
-            dist.broadcast(buf, src=tp_group.ranks[r], group=tp_group.device_group)
-            parts.append(buf.clone())
+        shard_t = local_w[:num_org].contiguous()
+        parts = [torch.empty_like(shard_t) for _ in range(tp_size)]
+        dist.all_gather(parts, shard_t, group=tp_group.device_group)
         self._full_embed_gpu = torch.cat(parts, dim=0)[:vocab_size]
         if self.ps.tp_rank == 0:
             logger.info(
@@ -2465,6 +2451,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             and verify_forward_batch.original_global_num_tokens_cpu is not None
             and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
         ):
+            verify_forward_batch.can_run_decode_cuda_graph = False
+
+        # Mixed-round guard: when any DP rank runs prefill/extend this round
+        # (is_extend_in_batch is aggregated across DP ranks), the verify
+        # batch's spec-scaled global_num_tokens disagree with the extend
+        # rank's raw scheduler counts on the DP-gather layout. Replay is
+        # disabled so verify runs eager, symmetric with the idle guard above.
+        if get_parallel().enable_dp_attention and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
         target_out = self.target_worker.forward_batch_generation(

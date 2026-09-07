@@ -45,6 +45,9 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    build_replay_fb_view,
+)
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -303,10 +306,6 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             # The pre-planned path skipped init_forward_metadata_out_graph,
             # so block_tables/seq_lens/swa_mask stayed at capture-time values
             # during replay. Refresh them so attention reads correct KV pages.
-            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-                build_replay_fb_view,
-            )
-
             self.buffers.seq_lens[: self.raw_bs].copy_(
                 forward_batch.seq_lens_cpu[: self.raw_bs]
             )
