@@ -293,11 +293,49 @@ def handle_a2a_moe(server_args: Any):
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
             "deep_gemm",
+            "triton",
         ], (
             "FlashInfer MoE A2A is supported with flashinfer_cutlass, "
             "flashinfer_cutedsl, flashinfer_trtllm, "
-            "flashinfer_trtllm_routed, or deep_gemm."
+            "flashinfer_trtllm_routed, deep_gemm, or triton."
         )
+        if resolved_view(server_args).moe_runner_backend == "triton":
+            view = resolved_view(server_args)
+            assert view.quantization is None, (
+                "FlashInfer MoE A2A with the Triton runner currently supports "
+                "only BF16/unquantized MoE layers."
+            )
+            assert view.ep_size == view.tp_size, (
+                "FlashInfer MoE A2A with the Triton runner requires "
+                "ep_size == tp_size."
+            )
+            assert view.moe_dp_size == 1, (
+                "FlashInfer MoE A2A with the Triton runner does not support "
+                "moe_dp_size > 1."
+            )
+            assert view.ep_num_redundant_experts == 0, (
+                "FlashInfer MoE A2A with the Triton runner does not support "
+                "redundant experts."
+            )
+            assert view.init_expert_location == "trivial", (
+                "FlashInfer MoE A2A with the Triton runner requires the "
+                "trivial contiguous expert layout."
+            )
+            assert view.ep_dispatch_algorithm is None, (
+                "FlashInfer MoE A2A with the Triton runner does not support "
+                "expert-location dispatch algorithms."
+            )
+            assert (
+                not view.enable_eplb
+            ), "FlashInfer MoE A2A with the Triton runner does not support EPLB."
+            assert view.elastic_ep_backend is None, (
+                "FlashInfer MoE A2A with the Triton runner does not support "
+                "elastic EP."
+            )
+            assert not view.enable_elastic_expert_backup, (
+                "FlashInfer MoE A2A with the Triton runner does not support "
+                "elastic expert backup."
+            )
 
     if a2a_backend == "mori":
         if cfg.deepep_mode == "auto":
