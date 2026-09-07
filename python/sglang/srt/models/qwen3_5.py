@@ -68,6 +68,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -101,6 +102,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_platform,
     get_stream,
 )
 
@@ -121,6 +123,10 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
+from sglang.srt.utils.skinny_gemm_pad import (
+    apply_with_padded_rows,
+    skinny_gemm_pad_rows,
+)
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -381,6 +387,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
+        # Narrow-N in_proj_ba hits an SM120 cuBLAS cliff at small M (the spec
+        # verify shape); padding rows keeps shapes static, so it is CUDA-graph safe.
+        self._ba_pad_to = 0
+        if (
+            envs.SGLANG_ENABLE_GDN_BA_PAD.get()
+            and get_platform().is_sm120
+            and isinstance(self.in_proj_ba.quant_method, UnquantizedLinearMethod)
+        ):
+            self._ba_pad_to = skinny_gemm_pad_rows(
+                m=2,
+                n=self.in_proj_ba.output_size_per_partition,
+                k=self.in_proj_ba.input_size,
+            )
 
         # Override weight loaders for packed checkpoint format.
         # Important: for FP8, this must cover not only `.weight` but also
@@ -645,6 +664,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
+    def _ba_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._ba_pad_to:
+            return apply_with_padded_rows(
+                lambda x: self.in_proj_ba(x)[0], hidden_states, pad_to=self._ba_pad_to
+            )
+        return self.in_proj_ba(hidden_states)[0]
+
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
         # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
@@ -674,7 +700,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba = self._ba_proj(hidden_states)
             current_stream.wait_stream(self.alt_stream)
         elif self._fused_input_proj_cpu_enabled.value:
             projected_states_qkvz, projected_states_ba = (
@@ -687,7 +713,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_ba = self._ba_proj(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):
