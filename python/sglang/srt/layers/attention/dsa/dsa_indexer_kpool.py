@@ -232,6 +232,14 @@ class IndexerKPool(MultiPlatformOp):
         metadata,
     ):
         batch = key.shape[0]
+        seq_lens = metadata.get_seqlens_int32()
+        real_batch = seq_lens.shape[0]
+        assert real_batch <= batch, (
+            "DSA KPool metadata has more request rows than token rows: "
+            f"real={real_batch}, physical={batch}"
+        )
+        # MLP-sync padding participates in collectives but owns no request state.
+        batch = real_batch
         if batch == 0:
             return
 
@@ -241,13 +249,13 @@ class IndexerKPool(MultiPlatformOp):
 
         pool.kpool_decode_update_index_cache(
             layer_id=layer_id,
-            key=key,
-            slot_score=gate_score,
+            key=key[:batch],
+            slot_score=gate_score[:batch],
             ape=self.index_kpool_compress_ape,
             block_tables=metadata.get_page_table_64(),
             req_pool_indices=forward_batch.req_pool_indices[:batch],
             positions=positions[:batch],
-            seq_lens=metadata.get_seqlens_int32()[:batch],
+            seq_lens=seq_lens,
             out_cache_loc=forward_batch.out_cache_loc[:batch],
             round_scale=self.scale_fmt is not None,
         )
@@ -686,6 +694,10 @@ class IndexerKPool(MultiPlatformOp):
                 block_tables, self.index_kpool
             ).contiguous()
             pool_schedule_metadata = plan.pool_schedule_metadata
+            if pool_seqlens.shape[0] != plan.pool_seqlens_per_q.shape[0]:
+                # The cached schedule covers the full plan, including padding.
+                # Keep the capture buffer intact and build a schedule for this view.
+                pool_schedule_metadata = None
             if pool_schedule_metadata is None and build_schedule_metadata:
                 pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     pool_context_lens.clamp(min=1), blocksize, self.sm_count
@@ -783,8 +795,6 @@ class IndexerKPool(MultiPlatformOp):
 
         block_tables = metadata.get_page_table_64()
 
-        kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
-
         blocksize = page_size
         if (
             forward_batch.forward_mode.is_target_verify()
@@ -796,10 +806,35 @@ class IndexerKPool(MultiPlatformOp):
         assert len(q_fp8.shape) == 3
         num_q_padded = q_fp8.shape[0]
         n_real = seqlens_32.shape[0]
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+            if real_num_tokens is not None:
+                assert 0 <= real_num_tokens <= n_real, (
+                    "DSA KPool real token count is outside its metadata rows: "
+                    f"real={real_num_tokens}, metadata={n_real}"
+                )
+                n_real = real_num_tokens
+                seqlens_32 = seqlens_32[:n_real]
+                block_tables = block_tables[:n_real]
+        assert n_real <= num_q_padded, (
+            "DSA KPool metadata has more real rows than query rows: "
+            f"real={n_real}, physical={num_q_padded}"
+        )
+        if n_real == 0:
+            return torch.full(
+                (num_q_padded, self.index_topk + self.index_kpool - 1),
+                -1,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            )
         if n_real < num_q_padded:
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
+        kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 64
         num_heads_kv = 1
@@ -821,6 +856,14 @@ class IndexerKPool(MultiPlatformOp):
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
+        assert pool_context_lens.shape[0] == q_fp8.shape[0], (
+            pool_context_lens.shape,
+            q_fp8.shape,
+        )
+        assert pool_block_tables.shape[0] == q_fp8.shape[0], (
+            pool_block_tables.shape,
+            q_fp8.shape,
+        )
         if use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits,
@@ -1308,22 +1351,55 @@ class IndexerKPool(MultiPlatformOp):
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
         def _compress_write() -> None:
+            score = self._compute_gate_score_if_missing(x, gate_score_maybe)
+            real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+            if real_num_tokens is None:
+                real_num_tokens = key.shape[0]
+            assert 0 <= real_num_tokens <= key.shape[0], (
+                "DSA KPool target-verify real token count is outside the "
+                f"physical input: real={real_num_tokens}, physical={key.shape[0]}"
+            )
+            ragged_verify_layout = getattr(
+                getattr(forward_batch, "spec_info", None),
+                "ragged_verify_layout",
+                None,
+            )
+            assert ragged_verify_layout is None, (
+                "DSA KPool target-verify fixed-width write plan cannot consume "
+                "ragged EAGLE groups"
+            )
+            assert real_num_tokens % num_draft_tokens == 0, (
+                "DSA KPool target-verify real token count must contain complete "
+                f"draft groups: real={real_num_tokens}, draft={num_draft_tokens}"
+            )
+            real_batch = real_num_tokens // num_draft_tokens
+            assert real_batch <= plan.req.shape[0], (
+                "DSA KPool target-verify real request count is outside the "
+                f"write plan: real={real_batch}, physical={plan.req.shape[0]}"
+            )
+            # MLP sync can append physical token rows after DSA metadata and its
+            # write plan have been built. Trim both token-domain inputs [B*N, ...]
+            # and request-domain plan inputs [B, ...] to the logical verify batch.
             kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
-                key=key,
-                score=self._compute_gate_score_if_missing(x, gate_score_maybe),
+                key=key[:real_num_tokens],
+                score=score[:real_num_tokens],
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 ape=self.index_kpool_compress_ape,
-                req_pool_indices=plan.req,
-                write_start=plan.write_start,
-                tail_logical_start=plan.tail_logical_start,
-                write_loc=plan.write_loc,
-                out_cache_loc=forward_batch.out_cache_loc,
+                req_pool_indices=plan.req[:real_batch],
+                write_start=plan.write_start[:real_batch],
+                tail_logical_start=plan.tail_logical_start[:real_batch],
+                write_loc=plan.write_loc[:real_batch],
+                out_cache_loc=forward_batch.out_cache_loc[:real_num_tokens],
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
-                effective_n_per_batch=plan.effective_n_per_batch,
+                effective_n_per_batch=(
+                    plan.effective_n_per_batch[:real_batch]
+                    if plan.effective_n_per_batch is not None
+                    else None
+                ),
             )
 
         if enable_dual_stream:
