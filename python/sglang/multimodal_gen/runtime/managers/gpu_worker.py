@@ -1367,13 +1367,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         merge batched output
         """
-        if parts.output_file_paths:
-            merged.output_file_paths = parts.output_file_paths
         if any(metrics is not None for metrics in parts.metrics_list):
             merged.metrics_list = parts.metrics_list
             merged.metrics = next(
                 metrics for metrics in parts.metrics_list if metrics is not None
             )
+        if merged.error is not None:
+            return
+        if parts.output_file_paths:
+            merged.output_file_paths = parts.output_file_paths
         if parts.tensor_outputs:
             merged.output = torch.cat(parts.tensor_outputs, dim=0)
         elif parts.list_outputs:

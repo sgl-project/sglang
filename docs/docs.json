@@ -1511,6 +1511,13 @@
                     ]
                   },
                   {
+                    "group": "SenseNova",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT"
+                    ]
+                  },
+                  {
                     "group": "LongCat-Image",
                     "tag": "NEW",
                     "pages": [
