@@ -17,6 +17,8 @@ CPU-only: these exercise the builder's pure-torch reference path, not the
 Triton kernel.
 """
 
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -115,6 +117,12 @@ def _reference_table(req_to_token, req_pool_indices, seq_lens, v2p, mult, ps, wi
 
 
 class TestPassthrough(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_non_unified_returns_same_objects(self):
         """Strict passthrough: no copy, no branch. Any tensor op on the
         non-unified path breaks byte-identity for every static-pool server."""
@@ -160,6 +168,12 @@ def _alloc_and_fill(allocator, ps, lens):
 
 
 class TestReadTableBuild(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_read_table_matches_reference_across_multipliers(self):
         """Both read tables must equal the independent per-element derivation,
         across page sizes and both multiplier regimes (MLA=1, MHA=2L); the swa
@@ -274,6 +288,12 @@ class TestBuildInto(unittest.TestCase):
     FULL-side read-table entries -- the trtllm_mla / flashmla consumption route
     (their rows ARE the read table's rows)."""
 
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_prefix_filled_tail_sentinel_preserved_width_capped(self):
         """The -1 tail sentinel belongs to the backend, and a table padded
         WIDER than the req_to_token page span (trtllm's LCM alignment) must be
@@ -338,6 +358,12 @@ class TestPoolOwnership(unittest.TestCase):
     composite's kernel-facing space (ids up to num_pages * multiplier) and used
     to address a buffer with only num_slots rows.
     """
+
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def test_real_factory_bundle_satisfies_the_ownership_identity(self):
         """The guard rests on `allocator.get_kvcache() is token_to_kv_pool`, so
@@ -420,6 +446,12 @@ class TestPoolOwnership(unittest.TestCase):
 
 
 class TestCaptureContract(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_caller_owned_table_is_returned_whole_and_filled_prefix_only(self):
         ps = 4
         allocator = _build_composite(ps)
@@ -503,6 +535,12 @@ class TestViewMemo(unittest.TestCase):
     identity, so per-batch state stays out of the ForwardBatch while one
     metadata build's many consumers still share one table build."""
 
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _fb(self, allocator, ps, lens):
         req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=lens)
         fb = _FakeForwardBatch(
@@ -561,6 +599,12 @@ class TestWriteLoc(unittest.TestCase):
     once at ForwardBatch construction, and the sliding-window write loc derives
     POINTWISE from the full-side values -- pads, slices, and fresh copies
     included -- with no handover and no stored per-forward state."""
+
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _built(self, ps=1, n=4):
         allocator = _build_composite(ps)

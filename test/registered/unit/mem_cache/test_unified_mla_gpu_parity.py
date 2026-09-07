@@ -26,6 +26,8 @@ import unittest
 
 import torch
 
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
@@ -107,6 +109,12 @@ def _rand_locs(max_tokens: int, ps: int, n: int) -> torch.Tensor:
 
 @unittest.skipUnless(_HAS_CUDA, "requires CUDA")
 class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _assert_parity(self, unified, ref, locs, ps, layers=range(_L)):
         for l in layers:
             got = unified.get_key_buffer(l)[_kernel_id(locs, ps)]

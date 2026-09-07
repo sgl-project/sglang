@@ -39,16 +39,15 @@ annotation is equivalent to ``Arg(help=that_string)``.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import types
+from collections.abc import Callable
 from typing import (
     Annotated,
     Any,
-    Callable,
-    List,
     Literal,
-    Optional,
     Union,
     get_args,
     get_origin,
@@ -58,20 +57,34 @@ from typing import (
 A = Annotated
 
 
+class _NoFallback:
+    """Sentinel for ``Arg.fallback``: this field declares none.
+
+    ``None`` cannot serve, because ``None`` is what a field *holds* when the
+    operator did not type it -- the state a fallback answers for.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<no fallback>"
+
+
+NO_FALLBACK = _NoFallback()
+
+
 @dataclasses.dataclass(frozen=True)
 class Arg:
     """CLI argument metadata attached to a dataclass field via ``Annotated``."""
 
     help: str = ""
-    choices: Optional[list] = None
-    aliases: Optional[List[str]] = None
-    cli_name: Optional[str] = None
-    type_parser: Optional[Callable] = None
-    nargs: Optional[str] = None
-    required: Optional[bool] = None
-    action: Optional[Any] = None
-    action_kwargs: Optional[dict] = None
-    const: Optional[Any] = None
+    choices: list | None = None
+    aliases: list[str] | None = None
+    cli_name: str | None = None
+    type_parser: Callable | None = None
+    nargs: str | None = None
+    required: bool | None = None
+    action: Any | None = None
+    action_kwargs: dict | None = None
+    const: Any | None = None
     # When True, this field is skipped by add_cli_args_from_dataclass.
     # Use for fields that have no CLI surface (e.g. injected via Python only).
     no_cli: bool = False
@@ -80,6 +93,47 @@ class Arg:
     # `resolution_result` and the config bags answer with the decision. The
     # field keeps what the operator passed.
     resolvable: bool = False
+    # What the field means when nobody said anything: the operator did not type
+    # it and resolution did not decide it. Not the dataclass default -- that
+    # stays `None`, because `None` is how the record spells "not typed" and the
+    # record is the wire format. This is the bottom of the read chain instead:
+    # override, then decision, then input, then this. A model family that
+    # declares the field still wins, because a decision sits above it.
+    #
+    # Only a value fixed for the life of the configuration belongs here. A
+    # default that depends on the machine (`get_device()`), on another field
+    # (`tokenizer_path` following `model_path`), or on anything impure
+    # (`random.randint`) is a decision, and decisions stay in a hook where
+    # their order is visible.
+    fallback: Any = NO_FALLBACK
+
+
+@dataclasses.dataclass(frozen=True)
+class Derived:
+    """Metadata for a field the configuration implies, not one anyone types.
+
+    The other half of a namespace. An ``Arg`` field is the operator's input and
+    is collected into ``ServerArgs``; a ``Derived`` field carries no annotation,
+    so it is not a dataclass field and never reaches the record -- which is
+    right, because it has no input to preserve and the record is what crosses a
+    process boundary.
+
+    ``fn`` names what computes it, as a dotted path resolved lazily so that a
+    declaration module stays free of runtime imports. Such a field is a pure
+    function of the published configuration, so it is computed once at
+    ``publish`` and stored as an ordinary bag leaf -- a plain attribute load,
+    which is what a read inside compiled model code needs.
+
+    Every declaration carries ``fn`` today, the parallel quotients included:
+    they are a function of the configured leaves, so they are computed at
+    publish like the rest. What is special about them is not how they are
+    computed but that a stamp can move one afterwards -- an elastic scale-up
+    restamps ``attn_dp_size`` -- which ``ParallelContext`` answers above the
+    published leaf.
+    """
+
+    doc: str = ""
+    fn: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,26 +144,50 @@ class NS:
         field: A[int, "help", NS("parallel")] = 1
         field: A[str, Arg(help="…"), NS("exec.moe")] = "auto"
 
-    Kept separate from ``Arg`` (CLI metadata) so the ~400 existing bare-string /
-    multiline field annotations gain a namespace by *appending* one element,
-    without rewriting each ``Arg(...)`` call. ``namespace_of`` reads it to build
-    the RuntimeContext config-bag tree."""
+    ``ServerArgs`` no longer uses it: its fields are declared in the
+    ``arg_groups/fields/`` classes, each of which carries the ``_NS_PATH`` it
+    stands for, so the module a declaration lives in *is* its namespace. What
+    is left for this marker is the case a class cannot express -- one ad-hoc
+    dataclass whose fields span several namespaces, which is what the
+    config-bag tests build."""
 
     path: str
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def namespace_of(cls) -> dict:
-    """``{field_name: dotted namespace path}`` from the ``NS`` marker in each
-    field's ``Annotated`` metadata.
+    """``{field_name: dotted namespace path}``, read from the declaring class.
 
-    Fields without an ``NS`` marker are absent from the map (the coverage lint
-    flags them). Non-dataclass types yield an empty map."""
+    A field's namespace is where it is declared: each class in
+    ``arg_groups/fields/`` carries the ``_NS_PATH`` it stands for, and
+    ``ServerArgs`` composes them. Walking the MRO therefore answers "which
+    namespace owns this field" without a per-field marker -- the file the
+    declaration sits in is the marker.
+
+    A class that is not built that way -- an ad-hoc dataclass spanning several
+    namespaces, which is what the config-bag tests construct -- falls back to
+    the per-field ``NS`` marker. A field with neither is absent from the map
+    (the coverage lint flags them). Non-dataclass types yield an empty map.
+    """
     if not dataclasses.is_dataclass(cls):
         return {}
+    # An assembled record: the collector recorded who declared each field,
+    # because there are no base classes left to ask.
+    out = dict(getattr(cls, "_NS_BY_FIELD", None) or {})
+    # A class that still inherits its namespaces: nearest declaration wins, so
+    # walk the MRO front to back and keep the first answer.
+    for base in cls.__mro__:
+        path = base.__dict__.get("_NS_PATH")
+        if path is None:
+            continue
+        for name in getattr(base, "__annotations__", {}):
+            out.setdefault(name, path)
+    if len(out) == len(dataclasses.fields(cls)):
+        return out
     hints = get_type_hints(cls, include_extras=True)
-    out = {}
     for field in dataclasses.fields(cls):
+        if field.name in out:
+            continue
         tp = hints.get(field.name, field.type)
         if get_origin(tp) is Annotated:
             for a in get_args(tp)[1:]:
@@ -119,7 +197,7 @@ def namespace_of(cls) -> dict:
     return out
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def field_names(cls) -> frozenset:
     """Names of ``cls`` dataclass fields — what a declaration may name."""
     if not dataclasses.is_dataclass(cls):
@@ -127,7 +205,7 @@ def field_names(cls) -> frozenset:
     return frozenset(field.name for field in dataclasses.fields(cls))
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def resolvable_fields(cls) -> frozenset:
     """Names of ``cls`` dataclass fields whose ``Arg`` metadata declares
     ``resolvable=True`` — the whitelist for config resolution.
@@ -143,6 +221,52 @@ def resolvable_fields(cls) -> frozenset:
         if arg is not None and arg.resolvable:
             names.add(field.name)
     return frozenset(names)
+
+
+@functools.cache
+def fallbacks_of(cls) -> dict:
+    """``{field_name: value}`` for every field of ``cls`` that declares one.
+
+    Read the same way `resolvable_fields` reads its flag, so a fallback lives
+    beside the help text of the field it belongs to rather than in whatever
+    hook used to fill it in.
+    """
+    if not dataclasses.is_dataclass(cls):
+        return {}
+    hints = get_type_hints(cls, include_extras=True)
+    out = {}
+    for field in dataclasses.fields(cls):
+        _, arg = _unwrap_annotated(hints.get(field.name, field.type))
+        if arg is not None and arg.fallback is not NO_FALLBACK:
+            out[field.name] = arg.fallback
+    return out
+
+
+def with_fallback(cls, name: str, value: Any) -> Any:
+    """``value``, or the declared fallback when nothing has answered.
+
+    `resolution_result` calls this as its last step -- the effective surface,
+    which the config bags and `/server_info` read through.
+
+    Deliberately not the views a resolution pass is handed. Those answer with
+    what has been decided over what the operator typed, and a pass reads them
+    *while deciding*: `model_overrides/inkling.py` branches on
+    `if cfg.swa_full_tokens_ratio is None`, and a fallback answering there
+    would make that branch dead and replace the family's value with the
+    generic one. `test_declared_fallbacks.py` pins both halves.
+
+    A container fallback is copied, so a reader that mutates what it got does
+    not edit the declaration for every other reader -- the reason a dataclass
+    spells this `default_factory`.
+    """
+    if value is not None:
+        return value
+    fallback = fallbacks_of(cls).get(name, NO_FALLBACK)
+    if fallback is NO_FALLBACK:
+        return value
+    if isinstance(fallback, (list, dict, set)):
+        return copy.deepcopy(fallback)
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +347,7 @@ def _field_to_cli_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = None):
+def add_cli_args_from_dataclass(parser, cls, *, fields: list[str] | None = None):
     """Add argparse arguments for every ``A[T, "help"]`` or ``A[T, Arg(...)]`` field.
 
     Fields without an ``Arg`` or bare-string annotation are silently skipped —
@@ -298,7 +422,7 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: Optional[List[str]] = No
         # Check for List[X] — but skip if type_parser is set (the parser
         # handles the whole value as a single string, e.g. json_list_type).
         origin = get_origin(inner_type)
-        if (origin is list or origin is List) and arg_meta.type_parser is None:
+        if origin is list and arg_meta.type_parser is None:
             elem_args = get_args(inner_type)
             elem_type = elem_args[0] if elem_args else str
             type_func = _infer_type_func(elem_type)

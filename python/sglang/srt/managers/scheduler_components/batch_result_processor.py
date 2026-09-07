@@ -34,9 +34,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_observability,
-    mamba_extra_buffer_lazy_enabled,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
@@ -1131,7 +1131,7 @@ class SchedulerBatchResultProcessor:
         i: int,
         logits_output: LogitsProcessorOutput,
     ):
-        lazy = mamba_extra_buffer_lazy_enabled()
+        lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         known_mamba_boundary = None
         completed_mamba_boundary = None
         lookahead = 0
@@ -1206,7 +1206,7 @@ class SchedulerBatchResultProcessor:
                     prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
-                    if mamba_extra_buffer_lazy_enabled()
+                    if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
@@ -1256,7 +1256,7 @@ class SchedulerBatchResultProcessor:
         if req.kv.mamba_ping_pong_track_buffer is None:
             return
 
-        lazy = mamba_extra_buffer_lazy_enabled()
+        lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
             track_seqlen = req.kv.kv_committed_len

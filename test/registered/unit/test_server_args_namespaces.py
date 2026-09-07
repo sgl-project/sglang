@@ -1,9 +1,14 @@
 """Coverage lint for the ServerArgs -> RuntimeContext namespace split.
 
-Every ServerArgs field must carry an ``NS("<path>")`` marker in its ``Annotated``
-metadata, and every path must be one of the known domains. This is the guardrail
-that fails when an upstream PR adds a ServerArgs field without assigning it a
-namespace (the property that retires the old hand-maintained mirror file).
+Every ServerArgs field must resolve to a namespace, and every path must be one of
+the known domains. A field gets its namespace from the ``arg_groups/fields/``
+class that declares it -- each carries the ``_NS_PATH`` it stands for, so the
+module a declaration lives in *is* the answer, and there is no per-field marker
+to forget. (``NS("<path>")`` survives for the one shape a class cannot express:
+an ad-hoc dataclass spanning namespaces, which the config-bag tests build.)
+
+This is the guardrail that fails when an upstream PR adds a field to a namespace
+class that has no ``_NS_PATH``, or adds one outside the taxonomy below.
 """
 
 import dataclasses

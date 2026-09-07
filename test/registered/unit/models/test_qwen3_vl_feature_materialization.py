@@ -12,6 +12,7 @@ from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,6 +34,15 @@ class _RecordingVisual:
 
 
 class TestQwen3VLFeatureMaterialization(CustomTestCase):
+    def setUp(self):
+        # The transport decision is read from the `mm` bag.
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
+
     @staticmethod
     def _model(visual, *, use_data_parallel):
         model = Qwen3VLForConditionalGeneration.__new__(Qwen3VLForConditionalGeneration)
@@ -43,10 +53,15 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
 
     def test_processor_defers_gpu_transport_for_encoder_dp(self):
         for transport in ("cuda_ipc", "cuda_vmm"):
-            with self.subTest(transport=transport):
+            # `mm_enable_dp_encoder` is read through `get_mm()` now, so stating
+            # it on the processor's own `server_args` no longer reaches the
+            # code under test.
+            with (
+                self.subTest(transport=transport),
+                get_context().override_server_args(mm_enable_dp_encoder=True),
+            ):
                 processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
                 processor.mm_feature_transport = transport
-                processor.server_args = SimpleNamespace(mm_enable_dp_encoder=True)
                 processor.model_type = "qwen3_vl"
                 items = [
                     MultimodalDataItem(modality=Modality.IMAGE),

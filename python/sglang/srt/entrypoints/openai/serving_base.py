@@ -14,6 +14,7 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -29,11 +30,9 @@ class OpenAIServingBase(ABC):
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
         self.allowed_custom_labels = (
-            set(
-                self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
-            )
+            set(get_observability().tokenizer_metrics_allowed_custom_labels)
             if isinstance(self.tokenizer_manager.server_args, ServerArgs)
-            and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
+            and get_observability().tokenizer_metrics_allowed_custom_labels
             else None
         )
 
@@ -230,14 +229,12 @@ class OpenAIServingBase(ABC):
     def extract_custom_labels(self, raw_request):
         if (
             not self.allowed_custom_labels
-            or not self.tokenizer_manager.server_args.tokenizer_metrics_custom_labels_header
+            or not get_observability().tokenizer_metrics_custom_labels_header
         ):
             return None
 
         custom_labels = None
-        header = (
-            self.tokenizer_manager.server_args.tokenizer_metrics_custom_labels_header
-        )
+        header = get_observability().tokenizer_metrics_custom_labels_header
         try:
             raw_labels = (
                 orjson.loads(raw_request.headers.get(header))
