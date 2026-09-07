@@ -110,7 +110,6 @@ def apply_cuda_graph_compatibility(server_args: Any):
     prefill backend (this folds in the old
     --enforce-piecewise-cuda-graph contract).
     """
-
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
         return
@@ -143,9 +142,9 @@ def apply_cuda_graph_compatibility(server_args: Any):
         and not model_config_of(
             server_args
         ).is_multimodal_breakable_cuda_graph_supported
-        # Keep trtllm_mla on the preferred breakable path, which now serves
-        # MLA by falling back to the flashinfer MLA impl for extend.
-        and attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla"
+        # Only trtllm_mla configs that still need the FlashInfer paged-MLA
+        # fallback (see trtllm_mla_backend.py) stay excluded.
+        and trtllm_mla_has_varlen_absorbed(server_args)
     ):
         logger.info(
             "Using tc_piecewise CUDA graph for validated multimodal decoder prefill."
@@ -164,6 +163,18 @@ def apply_cuda_graph_compatibility(server_args: Any):
         disable_breakable_cudagraph_if_incompatible(server_args)
     elif cfg.cuda_graph_config.prefill.backend == Backend.FULL:
         disable_full_prefill_cudagraph_if_incompatible(server_args)
+
+
+def trtllm_mla_has_varlen_absorbed(server_args: Any) -> bool:
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
+    if attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla":
+        return True
+    from sglang.srt.layers.attention.trtllm_mla_backend import (
+        varlen_absorbed_mla_supported,
+    )
+
+    return varlen_absorbed_mla_supported(server_args.kv_cache_dtype)
 
 
 def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):

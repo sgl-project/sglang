@@ -66,7 +66,12 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
+from sglang.srt.utils import (
+    is_flashinfer_available,
+    is_float4_e2m1fn_x2,
+    is_fp4_dtype,
+    is_sm100_supported,
+)
 
 if is_flashinfer_available():
     import flashinfer
@@ -155,6 +160,39 @@ def _quantize_fp8_qkv(q, k, v, layer):
 global_cute_dsl_workspace_buffer = None
 
 
+def varlen_absorbed_mla_supported(kv_cache_dtype: Union[str, torch.dtype]) -> bool:
+    """Whether trtllm_mla can serve a captured-graph extend with absorbed MLA
+    over a ragged query, instead of the slower FlashInfer paged-MLA fallback.
+
+    Shared by the backend (torch dtype) and ServerArgs (--kv-cache-dtype
+    string) so config and kernel can't disagree.
+
+    - Arch: flashinfer's backend="auto" resolves to XQA off SM100, and XQA
+      raises on cum_seq_lens_q.
+    - FP4 KV: already dequantized to bf16 by MLATokenToKVPoolFP4, and the
+      packed dtype isn't accepted by trtllm-gen anyway.
+    """
+    if not is_sm100_supported():
+        return False
+    return not is_fp4_dtype(kv_cache_dtype)
+
+
+def varlen_absorbed_mla_shape_ok(num_heads_q: int, page_size: int) -> bool:
+    """Whether flashinfer's trtllm-gen MLA decode kernel accepts this
+    (num_heads_q, page_size) shape, or silently redirects to cute-dsl.
+
+    Mirrors flashinfer 0.6.17 mla/_core.py,
+    trtllm_batch_decode_with_kv_cache_mla() (~line 3330-3339). Re-check
+    against that dispatch logic if the flashinfer pin in pyproject.toml
+    moves.
+    """
+    if 64 < num_heads_q < 128:
+        return False
+    if page_size not in (32, 64):
+        return False
+    return True
+
+
 @dataclass
 class TRTLLMMLAPrefillMetadata:
     """Metadata for TRTLLM MLA prefill operations."""
@@ -163,6 +201,9 @@ class TRTLLMMLAPrefillMetadata:
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
+    block_kv_indices: Optional[torch.Tensor] = None
+    seq_lens_k: Optional[torch.Tensor] = None
+    max_seq_len_k: Optional[int] = None
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -196,6 +237,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # Ragged verify: the packed query is front-aligned into the dense
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
+
+    # Opt out when this backend cannot run absorbed MLA with a ragged query under
+    # a piecewise prefill CUDA graph.
+    supports_varlen_absorbed_mla: bool = True
 
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
         pass
@@ -236,9 +281,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Runtime parameters
         self.backend = backend
         self.data_type = model_runner.kv_cache_dtype
+        # Static hw/dtype eligibility -- ServerArgs reads the same predicate.
+        self._varlen_absorbed_arch_dtype_ok = varlen_absorbed_mla_supported(
+            self.data_type
+        )
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+
+        # Per-instance shape eligibility: wide-EP DP-attention can push
+        # num_local_heads out of flashinfer's supported range (e.g. Kimi-K3's
+        # 96 heads). Fixed for this instance, so computed once.
+        self._varlen_absorbed_shape_ok = varlen_absorbed_mla_shape_ok(
+            self.num_local_heads, self.page_size
+        )
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
@@ -821,10 +877,30 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
             # when chunked prefix cache is disabled.
-            # Also fallback to flashinfer MLA backend under a captured prefill graph
             has_prefix = any(forward_batch.extend_prefix_lens_cpu)
-            fallback_to_flashinfer_impl = (
-                (self.disable_chunked_prefix_cache and has_prefix)
+            need_flashinfer_ragged = self.disable_chunked_prefix_cache and has_prefix
+
+            # A captured graph forces MLA on a genuine extend; absorbed MLA over a
+            # ragged q avoids the FlashInfer fallback's whole-KV-pool conversion.
+            #
+            # Excluded: spec-decode (needs a rectangular q), DCP (needs rank-local
+            # seq_lens/block tables we don't build), and any shape/arch/dtype
+            # varlen_absorbed_mla_supported()/varlen_absorbed_mla_shape_ok() reject
+            # -- those shapes have no cute-dsl fallback and would crash inside the
+            # flashinfer call otherwise.
+            use_varlen_absorbed = (
+                (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+                and self.supports_varlen_absorbed_mla
+                and self.backend == "trtllm-gen"
+                and self._varlen_absorbed_arch_dtype_ok
+                and self._varlen_absorbed_shape_ok
+                and forward_batch.spec_info is None
+                and not get_parallel().dcp_enabled
+            )
+            # Otherwise keep the paged fallback: forward_extend would run the MHA
+            # ragged path on latent-shaped tensors.
+            fallback_to_flashinfer_impl = not use_varlen_absorbed and (
+                need_flashinfer_ragged
                 or is_in_tc_piecewise_cuda_graph()
                 or is_in_breakable_cuda_graph()
             )
@@ -847,6 +923,28 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens,
                 fallback_to_flashinfer_impl,
             )
+
+            if use_varlen_absorbed:
+                # Paged KV spans prefix + extend. seq_lens_cpu is a host tensor, so
+                # .max() is not a device sync.
+                bs = forward_batch.batch_size
+                if forward_batch.seq_lens_cpu is not None:
+                    max_seq_k = int(forward_batch.seq_lens_cpu.max().item())
+                else:
+                    max_seq_k = self.max_context_len
+                seq_lens_k = forward_batch.seq_lens
+                max_seqlen_pad = self._calc_padded_blocks(max_seq_k)
+                self.forward_prefill_metadata.block_kv_indices = (
+                    self._create_block_kv_indices(
+                        bs,
+                        max_seqlen_pad,
+                        forward_batch.req_pool_indices,
+                        seq_lens_k,
+                        seq_lens_k.device,
+                    )
+                )
+                self.forward_prefill_metadata.seq_lens_k = seq_lens_k.to(torch.int32)
+                self.forward_prefill_metadata.max_seq_len_k = max_seq_k
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
@@ -864,7 +962,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Never read max_seq from the GPU tensor (.max().item() blocks the
             # host on the stream backlog); max_seq only sizes the block table /
             # scheduling hint, so the static context bound is a safe fallback.
-            if getattr(forward_batch, "seq_lens_cpu", None) is not None:
+            if forward_batch.seq_lens_cpu is not None:
                 max_seq = forward_batch.seq_lens_cpu.max().item()
             else:
                 max_seq = self.max_context_len
@@ -1053,7 +1151,77 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 "target-verify / draft-extend); select cutedsl_mla or "
                 "tokenspeed_mla for a DCP speculative run"
             )
+        return self._call_trtllm_batch_decode_mla(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            layer=layer,
+        )
 
+    def _run_varlen_absorbed_kernel(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        layer: RadixAttention,
+        *,
+        cum_seq_lens_q: torch.Tensor,
+        max_q_len: int,
+    ) -> torch.Tensor:
+        """Absorbed MLA over a ragged query, for a captured tc_piecewise or
+        breakable prefill graph.
+
+        Separate from _run_decode_kernel(): that hook serves the dense
+        [bs, draft_token_num] verify layout, while `query` here is the ragged
+        [total_q, num_heads, head_dim_qk] layout."""
+        assert self.backend == "trtllm-gen", "varlen absorbed MLA is trtllm-gen only"
+        # Defense-in-depth behind use_varlen_absorbed's gate: fail loudly here,
+        # not with a flashinfer kwarg-mismatch error several frames deeper.
+        assert self._varlen_absorbed_shape_ok, (
+            f"_run_varlen_absorbed_kernel called with num_local_heads="
+            f"{self.num_local_heads}, page_size={self.page_size}, which "
+            "varlen_absorbed_mla_shape_ok() says flashinfer's trtllm-gen MLA "
+            "decode kernel does not support -- use_varlen_absorbed should have "
+            "excluded this shape already"
+        )
+        return self._call_trtllm_batch_decode_mla(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            layer=layer,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+            strict_trtllm_gen=True,
+        )
+
+    def _call_trtllm_batch_decode_mla(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        layer: RadixAttention,
+        *,
+        cum_seq_lens_q: Optional[torch.Tensor] = None,
+        max_q_len: Optional[int] = None,
+        strict_trtllm_gen: bool = False,
+    ) -> torch.Tensor:
+        """Wrapper around flashinfer trtllm_batch_decode_with_kv_cache_mla.
+
+        max_q_len must accompany cum_seq_lens_q, or flashinfer's
+        cum_seq_lens_q.cpu() validation D2H-syncs, illegal under capture.
+
+        strict_trtllm_gen: set by _run_varlen_absorbed_kernel as a shape-gate
+        defense-in-depth -- turns a gate bug into a loud error, not a silent
+        cute-dsl redirect.
+        """
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
         # Scale components:
@@ -1066,11 +1234,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
-        extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
+        if self.backend != "trtllm-gen":
+            extra_kwargs = {"backend": self.backend}
+        elif strict_trtllm_gen:
+            extra_kwargs = {"backend": "trtllm-gen"}
+        else:
+            extra_kwargs = {}
         if self.backend == "trtllm-gen":
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
                 self._multi_ctas_kv_counter_buffer
             )
+        if cum_seq_lens_q is not None:
+            assert max_q_len is not None, "max_q_len must accompany cum_seq_lens_q"
+            extra_kwargs["cum_seq_lens_q"] = cum_seq_lens_q
+            extra_kwargs["max_q_len"] = max_q_len
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
@@ -1541,6 +1718,31 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if llama_4_scaling is not None:
             q = q.to(self.q_data_type) * llama_4_scaling
             q = q.to(self.data_type)
+
+        # q is already the ragged layout the varlen kernel wants.
+        _pm = self.forward_prefill_metadata
+        if (
+            _pm is not None
+            and _pm.block_kv_indices is not None
+            and self.supports_varlen_absorbed_mla
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            # absorbed (attn_mqa) only -- never the MHA companion layer
+            and layer.head_dim == self.kv_lora_rank + self.qk_rope_head_dim
+        ):
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+            raw_out = self._run_varlen_absorbed_kernel(
+                query=q.to(self.data_type),
+                kv_cache=kv_cache,
+                block_tables=_pm.block_kv_indices,
+                seq_lens=_pm.seq_lens_k,
+                max_seq_len=_pm.max_seq_len_k,
+                layer=layer,
+                cum_seq_lens_q=_pm.cum_seq_lens,
+                max_q_len=_pm.max_seq_len,
+            )
+            return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         if (
             forward_batch.forward_mode.is_target_verify()
