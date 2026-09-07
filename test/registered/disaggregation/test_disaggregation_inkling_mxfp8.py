@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=447, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = os.environ.get(
     "INKLING_SMALL_TEST_MODEL_PATH", "thinkingmachines/Inkling-Small-NVFP4"
