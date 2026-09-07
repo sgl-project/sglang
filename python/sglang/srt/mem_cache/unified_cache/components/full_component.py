@@ -106,8 +106,8 @@ class FullComponent(TreeComponent):
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         if match_device_only:
-            return (
-                lambda node: node.component_data[self.component_type].value is not None
+            return lambda node: (
+                node.component_data[self.component_type].value is not None
             )
 
         # HiCache: evicted + backuped nodes are valid match boundaries.
@@ -290,9 +290,9 @@ class FullComponent(TreeComponent):
         delta = 0
         while cur is not root:
             cd = cur.component_data[ct]
-            assert (
-                cd.value is not None
-            ), f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
+            assert cd.value is not None, (
+                f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
+            )
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
                 self.tree_core.component_evictable_size_[ct] -= key_len
@@ -487,7 +487,10 @@ class FullComponent(TreeComponent):
         if phase == ExternalLinkerLoadPhase.ABORT:
             self._full_allocator().free(transfer.device_indices)
             return None
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            return transfer
 
+        assert phase == ExternalLinkerLoadPhase.COMMIT
         return transfer
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
@@ -500,10 +503,11 @@ class FullComponent(TreeComponent):
         if isinstance(action, FreeComponentDeviceSlot):
             alloc = self.cache.token_to_kv_pool_allocator
             for indices in action.indices:
+                # tree values are page-aligned copies of a kv row: page-exact segments
                 if self.cache.is_swa_enabled:
-                    alloc.full_attn_allocator.free(indices)
+                    alloc.full_attn_allocator.free_segment(indices, start_pos=0)
                 else:
-                    alloc.free(indices)
+                    alloc.free_segment(indices, start_pos=0)
             return
         raise AssertionError(
             f"FullComponent: unhandled ComponentAction {type(action).__name__}"

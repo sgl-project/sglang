@@ -29,7 +29,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 
@@ -592,6 +592,22 @@ class TestResolutionDeclarations(CustomTestCase):
             "does not write back",
         )
 
+    def test_pre_engine_late_resolution_reaches_the_projection(self):
+        """A launcher declaration survives the engine's first resolution pass."""
+        from sglang.srt.arg_groups.overrides import declare_late_resolution
+
+        server_args = ServerArgs(model_path="dummy")
+        declare_late_resolution(
+            server_args,
+            "launcher",
+            enable_forward_pass_metrics=True,
+        )
+
+        server_args.resolve_once()
+
+        self.assertTrue(resolution_result(server_args, "enable_forward_pass_metrics"))
+        self.assertFalse(server_args.enable_forward_pass_metrics)
+
     def test_validation_can_still_resolve_before_the_record_is_published(self):
         """The LoRA checks resolve, so they must precede publish.
 
@@ -698,8 +714,7 @@ class TestResolutionDeclarations(CustomTestCase):
                 current = getattr(server_args, name, None)
                 if current != raw_input[name]:
                     moved.append(
-                        f"{shape} -> {name}: raw={raw_input[name]!r} "
-                        f"field={current!r}"
+                        f"{shape} -> {name}: raw={raw_input[name]!r} field={current!r}"
                     )
         self.assertEqual(
             moved,

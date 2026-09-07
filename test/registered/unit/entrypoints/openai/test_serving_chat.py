@@ -39,11 +39,17 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.jinja_template_utils import (
+    jinja_template_may_reorder_tool_results,
+)
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.sampling.sampling_params import (
+    REQUEST_REASONING_END_TOKEN_IDS_KEY,
+)
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 # Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
 _ALL_CHAT_ENCODING_SPECS = ("dsv4", "dsv32", "inkling", "kimi_k3")
@@ -80,6 +86,24 @@ _DSV4_OFFICIAL_ENCODER = (
     'DEFAULT_REASONING_EFFORT = "low"\n'
 )
 
+_TOOL_RESULT_REORDER_TEMPLATE = """
+{%- for assistant in messages
+    if assistant.role == 'assistant' and assistant.tool_calls -%}
+    {%- for tool_call in assistant.tool_calls -%}
+        {%- for result in messages
+            if result.role == 'tool' and result.tool_call_id == tool_call.id -%}
+            {%- for part in result.content -%}
+                {%- if part.type == 'text' -%}
+                    {{- part.text -}}
+                {%- else -%}
+                    {{- '<' + part.type + '>' -}}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endfor -%}
+    {%- endfor -%}
+{%- endfor -%}
+"""
+
 
 def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
     model_dir = tempfile.TemporaryDirectory()
@@ -103,6 +127,9 @@ class _MockTokenizerManager:
             reasoning_parser=None,
             stream_response_default_include_usage=False,
             default_chat_template_kwargs=None,
+            return_input_ids=False,
+            return_output_ids=False,
+            incremental_streaming_output=False,
         )
         self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
@@ -163,6 +190,7 @@ class _MockTemplateManager:
         self.completion_template_name: Optional[str] = None
         self.reasoning_config = None
         self.force_reasoning = False
+        self.jinja_template_may_reorder_tool_results = False
 
 
 class ServingChatTestCase(unittest.TestCase):
@@ -191,6 +219,166 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    @staticmethod
+    def _render_tool_results_in_call_order(messages, **kwargs):
+        """Block-level tool_call_id association, like the GLM chat templates."""
+        del kwargs
+        rendered = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            index += 1
+            tool_calls = message.get("tool_calls") or []
+            if message.get("role") != "assistant" or not tool_calls:
+                continue
+            run = []
+            while index < len(messages) and messages[index].get("role") == "tool":
+                run.append(messages[index])
+                index += 1
+            by_id = {result.get("tool_call_id"): result for result in run}
+            for tool_call in tool_calls:
+                result = by_id.get(tool_call.get("id"))
+                if result is None:
+                    continue
+                for part in result.get("content") or []:
+                    if part.get("type") == "text":
+                        rendered.append(part.get("text", ""))
+                    else:
+                        rendered.append(f"<{part.get('type')}>")
+        return "".join(rendered)
+
+    @staticmethod
+    def _tool_round(call_ids, result_ids, part_type="image_url"):
+        assistant = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": call_id, "function": {"name": call_id, "arguments": {}}}
+                for call_id in call_ids
+            ],
+        }
+        part_key = {"image_url": "image_url", "video_url": "video_url"}[part_type]
+        results = [
+            {
+                "role": "tool",
+                "tool_call_id": result_id,
+                "content": [{"type": part_type, part_key: {"url": result_id}}],
+            }
+            for result_id in result_ids
+        ]
+        return [assistant] + results
+
+    def test_canonicalize_tool_message_order_sorts_media_runs(self):
+        messages = self._tool_round(
+            ["call-a", "call-b"], ["call-b", "call-a"]
+        ) + self._tool_round(["call-c", "call-d"], ["call-d", "call-c"], "video_url")
+
+        canonical = self.chat._canonicalize_tool_message_order(messages)
+
+        self.assertEqual(
+            [
+                message["tool_call_id"]
+                for message in canonical
+                if message.get("role") == "tool"
+            ],
+            ["call-a", "call-b", "call-c", "call-d"],
+        )
+
+    def test_canonicalize_tool_message_order_keeps_unassociable_runs(self):
+        cases = {
+            "unknown_id": (["call-a", "call-b"], ["call-b", "call-z"]),
+            "duplicate_result_id": (["call-a", "call-b"], ["call-b", "call-b"]),
+            "missing_call_id": ([None, "call-b"], ["call-b", None]),
+        }
+        for name, (call_ids, result_ids) in cases.items():
+            with self.subTest(name=name):
+                messages = self._tool_round(call_ids, result_ids)
+                canonical = self.chat._canonicalize_tool_message_order(messages)
+                self.assertEqual(canonical, messages)
+
+    def test_canonicalize_tool_message_order_keeps_text_only_runs(self):
+        messages = self._tool_round(["call-a", "call-b"], ["call-b", "call-a"])
+        for message in messages[1:]:
+            message["content"] = [{"type": "text", "text": "done"}]
+
+        canonical = self.chat._canonicalize_tool_message_order(messages)
+
+        self.assertEqual(canonical, messages)
+
+    def test_jinja_path_recovers_tool_result_images_only_when_template_needs_it(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "openai"
+        self.template_manager.jinja_template_may_reorder_tool_results = (
+            jinja_template_may_reorder_tool_results(_TOOL_RESULT_REORDER_TEMPLATE)
+        )
+        self.assertTrue(self.template_manager.jinja_template_may_reorder_tool_results)
+        self.tm.tokenizer.apply_chat_template.side_effect = (
+            self._render_tool_results_in_call_order
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "inspect"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-a",
+                            "type": "function",
+                            "function": {"name": "a", "arguments": {}},
+                        },
+                        {
+                            "id": "call-b",
+                            "type": "function",
+                            "function": {"name": "b", "arguments": {}},
+                        },
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-b",
+                    "content": [{"type": "image_url", "image_url": {"url": "image-b"}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-a",
+                    "content": [{"type": "image_url", "image_url": {"url": "image-a"}}],
+                },
+            ],
+        )
+
+        result = self.chat._apply_jinja_template(request, None, is_multimodal=True)
+
+        self.assertEqual(
+            [item.url for item in result.image_data], ["image-a", "image-b"]
+        )
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
+        rendered_messages = self.tm.tokenizer.apply_chat_template.call_args[0][0]
+        self.assertEqual(
+            [m.get("tool_call_id") for m in rendered_messages if "tool_call_id" in m],
+            ["call-a", "call-b"],
+        )
+
+        # An already-ordered request must produce the exact same render input.
+        ordered_request = ChatCompletionRequest(
+            model="x",
+            messages=request.messages[:2] + request.messages[2:][::-1],
+        )
+        self.tm.tokenizer.apply_chat_template.reset_mock()
+        self.chat._apply_jinja_template(ordered_request, None, is_multimodal=True)
+        self.assertEqual(
+            rendered_messages, self.tm.tokenizer.apply_chat_template.call_args[0][0]
+        )
+
+        self.template_manager.jinja_template_may_reorder_tool_results = False
+        self.tm.tokenizer.apply_chat_template.reset_mock()
+        result = self.chat._apply_jinja_template(request, None, is_multimodal=True)
+        self.assertEqual(
+            [item.url for item in result.image_data], ["image-b", "image-a"]
+        )
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
 
     def test_parsers_follow_the_control_plane_overlay(self):
         """Template detection records the parsers through `override`, so they
@@ -611,6 +799,114 @@ class ServingChatTestCase(unittest.TestCase):
         self.chat._process_messages(req, is_multimodal=False)
 
         self.assertEqual(req.reasoning_effort, "high")
+
+    def test_hunyuan_default_reasoning_effort_is_normalized_for_template(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="hunyuan_effort"
+        )
+        self.chat.reasoning_parser = "hunyuan"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        cases = [
+            ("none", None, "no_think"),
+            ("none", "xhigh", "high"),
+        ]
+        for default_effort, request_effort, normalized_effort in cases:
+            with self.subTest(
+                default_effort=default_effort, request_effort=request_effort
+            ):
+                self.chat.default_chat_template_kwargs = {
+                    "reasoning_effort": default_effort
+                }
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "What is 2+2?"}],
+                    reasoning_effort=request_effort,
+                )
+
+                self.chat._process_messages(req, is_multimodal=False)
+
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(req.reasoning_effort, normalized_effort)
+                self.assertEqual(kwargs["reasoning_effort"], normalized_effort)
+                self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+
+    def test_hunyuan_reasoning_effort_precedence_survives_conversion(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="hunyuan_effort"
+        )
+        self.chat.reasoning_parser = "hunyuan"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        cases = [
+            ("xhigh", "none", "high"),
+            (None, "no_think", "no_think"),
+        ]
+        for request_effort, template_effort, normalized_effort in cases:
+            with self.subTest(
+                request_effort=request_effort, template_effort=template_effort
+            ):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "What is 2+2?"}],
+                    reasoning_effort=request_effort,
+                    chat_template_kwargs={"reasoning_effort": template_effort},
+                )
+
+                self.chat._convert_to_internal_request(req)
+
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(req.reasoning_effort, normalized_effort)
+                self.assertEqual(kwargs["reasoning_effort"], normalized_effort)
+                self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+
+    def test_non_hunyuan_default_reasoning_effort_is_unchanged(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "medium"}
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(req.reasoning_effort, "medium")
+        self.assertEqual(kwargs["reasoning_effort"], "medium")
+        self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "medium")
+
+    def test_k2_selected_terminator_reaches_sampling_params(self):
+        self.tm._config_overrides["reasoning_parser"] = "k2_horizon"
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.tm.tokenizer.encode.side_effect = lambda text, **_: (
+            [8, 9] if text == "</ifm|think_fast>" else [1, 2, 3]
+        )
+        req = ChatCompletionRequest(
+            model="IFM/K2-Horizon-7B",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"reasoning_effort": "medium"},
+        )
+
+        processed = self.chat._process_messages(req, is_multimodal=False)
+        self.assertEqual(processed.reasoning_end_token_ids, [8, 9])
+
+        with patch.object(self.chat, "_process_messages", return_value=processed):
+            adapted, _ = self.chat._convert_to_internal_request(req)
+        self.assertEqual(
+            adapted.sampling_params["custom_params"][
+                REQUEST_REASONING_END_TOKEN_IDS_KEY
+            ],
+            [8, 9],
+        )
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None
@@ -2313,6 +2609,162 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def test_streaming_abort_with_ids_enabled(self):
+        """Test that a terminal abort with input/output ids enabled yields only an error and [DONE]."""
+        err_msg = "Aborted by scheduler"
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+
+        async def _mock_generate_abort():
+            yield {
+                "text": "Partial ",
+                "prompt_token_ids": [4, 5, 6],
+                "output_ids": [1, 2, 3],
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": err_msg,
+                    },
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_abort()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            temperature=0.7,
+            max_tokens=100,
+            stream=True,
+            return_input_ids_in_sglext=True,
+            return_output_ids_in_sglext=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+            async def run_stream():
+                chunks = []
+                try:
+                    async for chunk in self.chat._generate_chat_stream(
+                        adapted_request, req, self.fastapi_request
+                    ):
+                        chunks.append(chunk)
+                except Exception as e:
+                    print(f"Error during stream iteration: {e}")
+                return chunks
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(run_stream())
+
+        # Exactly one error chunk followed by [DONE]; no sglext ids leak.
+        self.assertIn("error", chunks[0])
+        self.assertEqual(chunks[1], "data: [DONE]\n\n")
+        self.assertFalse(
+            any("input_ids" in c or "output_ids" in c for c in chunks),
+            "sglext ids event leaked after abort error",
+        )
+
+        error_chunk_data = json.loads(chunks[0][len("data: ") :])
+        self.assertEqual(error_chunk_data["error"]["message"], err_msg)
+        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+
+    def test_streaming_error_abort_still_finalizes_other_choices(self):
+        """An error abort ends generation but still runs finalization, so a
+        sibling choice's finish chunk and the usage chunk follow the error."""
+        err_code = HTTPStatus.SERVICE_UNAVAILABLE
+
+        async def _mock_generate():
+            yield {
+                "text": "hello",
+                "prompt_token_ids": [4, 5, 6],
+                "output_ids": [1, 2],
+                "meta_info": {
+                    "id": "chatcmpl-multi-abort",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop"},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "partial",
+                "prompt_token_ids": [4, 5, 6],
+                "output_ids": [7],
+                "meta_info": {
+                    "id": "chatcmpl-multi-abort",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": "Aborted by scheduler",
+                    },
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 1,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            stream=True,
+            stream_options={"include_usage": True},
+            return_input_ids_in_sglext=True,
+            return_output_ids_in_sglext=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            chunks = self._run_chat_stream(adapted_request, req)
+
+        error_idx = next(i for i, c in enumerate(chunks) if "error" in c)
+        after_error = self._parse_chunks(chunks[error_idx + 1 :])
+
+        finish_reasons = [
+            choice["finish_reason"]
+            for c in after_error
+            for choice in c.get("choices", [])
+            if choice.get("finish_reason") is not None
+        ]
+        self.assertEqual(finish_reasons, ["stop"])
+        self.assertTrue(
+            any(c.get("usage") is not None for c in after_error),
+            "usage chunk dropped after error abort",
+        )
+
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():
             chunks = []
@@ -2795,6 +3247,331 @@ class ServingChatTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+
+    def _output_ids_ret(self, *output_ids_by_choice):
+        return [
+            {
+                "text": "Answer",
+                "prompt_token_ids": [1, 2, 3],
+                "output_ids": list(output_ids),
+                "meta_info": {
+                    "id": "chatcmpl-output-ids",
+                    "prompt_tokens": 3,
+                    "completion_tokens": len(output_ids),
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+            for output_ids in output_ids_by_choice
+        ]
+
+    def test_non_streaming_ids_emit_sglext(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            n=2,
+            return_input_ids_in_sglext=True,
+            return_output_ids_in_sglext=True,
+        )
+
+        response = self.chat._build_chat_response(
+            req, self._output_ids_ret([5, 6, 7], [8, 9]), 123
+        )
+
+        self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.input_ids, [1, 2, 3])
+        self.assertEqual(response.sglext.output_ids, [[5, 6, 7], [8, 9]])
+        dumped = json.loads(response.model_dump_json())
+        self.assertEqual(dumped["sglext"]["input_ids"], [1, 2, 3])
+        self.assertEqual(dumped["sglext"]["output_ids"], [[5, 6, 7], [8, 9]])
+        # None sglext fields stay stripped from the serialized response.
+        self.assertNotIn("routed_experts", dumped["sglext"])
+
+    def test_non_streaming_ids_not_returned_by_default(self):
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+
+        response = self.chat._build_chat_response(
+            req, self._output_ids_ret([5, 6, 7]), 123
+        )
+
+        self.assertIsNone(response.sglext)
+
+    def test_non_streaming_ids_server_default_enables_flag(self):
+        self.tm.server_args.return_input_ids = True
+        self.tm.server_args.return_output_ids = True
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+
+        response = self.chat._build_chat_response(
+            req, self._output_ids_ret([5, 6, 7]), 123
+        )
+
+        self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.input_ids, [1, 2, 3])
+        self.assertEqual(response.sglext.output_ids, [[5, 6, 7]])
+
+    def test_ids_headers_enable_flags(self):
+        self.fastapi_request.headers = {
+            "x-sglext-return-input-ids": "1",
+            "x-sglext-return-output-ids": "1",
+        }
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+        processed_messages = MessageProcessingResult(
+            "Test prompt",
+            [1, 2, 3],
+            None,
+            None,
+            [],
+            ["</s>"],
+            None,
+        )
+
+        with patch.object(
+            self.chat, "_process_messages", return_value=processed_messages
+        ):
+            _, processed_request = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+        self.assertTrue(processed_request.return_input_ids_in_sglext)
+        self.assertTrue(processed_request.return_output_ids_in_sglext)
+
+    def _run_output_ids_stream(
+        self,
+        chunk_output_ids,
+        incremental,
+        framed=False,
+        return_raw=False,
+        cached_tokens_details=None,
+    ):
+        """Stream chunks with incremental or cumulative output_ids;
+        return parsed sglext chunks, or raw SSE strings when return_raw."""
+        self.tm.server_args.incremental_streaming_output = incremental
+        if framed:
+            self.fastapi_request.headers["x-sglext-ids-framed"] = "1"
+
+        async def _mock_generate():
+            for i, ids in enumerate(chunk_output_ids):
+                finished = i == len(chunk_output_ids) - 1
+                yield {
+                    "text": "chunk",
+                    "prompt_token_ids": [1, 2, 3],
+                    "output_ids": list(ids),
+                    "meta_info": {
+                        "id": "chatcmpl-output-ids-stream",
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1 + i,
+                        "cached_tokens": 0,
+                        "cached_tokens_details": cached_tokens_details,
+                        "finish_reason": (
+                            {"type": "stop", "matched": None} if finished else None
+                        ),
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": 0,
+                }
+
+        self.tm.generate_request.return_value = _mock_generate()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            stream=True,
+            return_input_ids_in_sglext=True,
+            return_output_ids_in_sglext=True,
+            return_cached_tokens_details=cached_tokens_details is not None,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            chunks = self._run_chat_stream(adapted_request, req)
+
+        if return_raw:
+            return chunks
+        return [c for c in self._parse_chunks(chunks) if "sglext" in c]
+
+    def test_streaming_output_ids_incremental_accumulates_deltas(self):
+        sglext_chunks = self._run_output_ids_stream([[5, 6], [7]], incremental=True)
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["choices"], [])
+        # input_ids is captured once as a flat shared prompt, not accumulated.
+        self.assertEqual(sglext_chunks[0]["sglext"]["input_ids"], [1, 2, 3])
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
+
+    def test_streaming_output_ids_non_incremental_keeps_latest_full_list(self):
+        sglext_chunks = self._run_output_ids_stream(
+            [[5, 6], [5, 6, 7]], incremental=False
+        )
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["sglext"]["input_ids"], [1, 2, 3])
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
+
+    _SGLEXT_IDS_EVENT_PREFIX = "event: sglext_ids\ndata: "
+
+    def test_streaming_framed_ids_emits_named_event(self):
+        raw = self._run_output_ids_stream(
+            [[5, 6], [5, 6, 7]], incremental=False, framed=True, return_raw=True
+        )
+
+        named = [c for c in raw if c.startswith(self._SGLEXT_IDS_EVENT_PREFIX)]
+        self.assertEqual(len(named), 1)
+        payload = json.loads(named[0][len(self._SGLEXT_IDS_EVENT_PREFIX) :])
+        self.assertEqual(payload["choices"], [])
+        # The named event carries ONLY the id fields.
+        self.assertEqual(set(payload["sglext"]), {"input_ids", "output_ids"})
+        self.assertEqual(payload["sglext"]["input_ids"], [1, 2, 3])
+        self.assertEqual(payload["sglext"]["output_ids"], [[5, 6, 7]])
+        # All requested sglext fields were ids, so no plain sglext chunk.
+        self.assertEqual([c for c in self._parse_chunks(raw) if "sglext" in c], [])
+
+    def test_streaming_framed_splits_non_id_fields_into_plain_chunk(self):
+        raw = self._run_output_ids_stream(
+            [[5, 6], [5, 6, 7]],
+            incremental=False,
+            framed=True,
+            return_raw=True,
+            cached_tokens_details={"device": 2, "host": 1},
+        )
+
+        named = [c for c in raw if c.startswith(self._SGLEXT_IDS_EVENT_PREFIX)]
+        self.assertEqual(len(named), 1)
+        named_payload = json.loads(named[0][len(self._SGLEXT_IDS_EVENT_PREFIX) :])
+        self.assertEqual(set(named_payload["sglext"]), {"input_ids", "output_ids"})
+
+        plain_sglext = [c for c in self._parse_chunks(raw) if "sglext" in c]
+        self.assertEqual(len(plain_sglext), 1)
+        self.assertEqual(
+            plain_sglext[0]["sglext"]["cached_tokens_details"],
+            {"device": 2, "host": 1},
+        )
+        self.assertNotIn("input_ids", plain_sglext[0]["sglext"])
+        self.assertNotIn("output_ids", plain_sglext[0]["sglext"])
+        # The plain non-id chunk precedes the named ids event.
+        plain_raw_idx = next(
+            i
+            for i, c in enumerate(raw)
+            if c.startswith("data: ") and "cached_tokens_details" in c
+        )
+        self.assertLess(plain_raw_idx, raw.index(named[0]))
+
+    def _run_output_ids_stream_with_graceful_abort(
+        self, normal_chunks, abort_output_ids, incremental, abort_completion_tokens
+    ):
+        """Stream normal chunks then a graceful-abort chunk; return parsed sglext chunks."""
+        self.tm.server_args.incremental_streaming_output = incremental
+
+        async def _mock_generate():
+            generated = 0
+            for ids in normal_chunks:
+                generated = generated + len(ids) if incremental else len(ids)
+                yield {
+                    "text": "chunk",
+                    "output_ids": list(ids),
+                    "meta_info": {
+                        "id": "chatcmpl-abort-ids-stream",
+                        "prompt_tokens": 3,
+                        "completion_tokens": generated,
+                        "cached_tokens": 0,
+                        "finish_reason": None,
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": 0,
+                }
+            # Graceful abort terminal chunk (no status_code): falls through to
+            # the normal finalization path.
+            yield {
+                "text": "chunk",
+                "output_ids": list(abort_output_ids),
+                "meta_info": {
+                    "id": "chatcmpl-abort-ids-stream",
+                    "prompt_tokens": 3,
+                    "completion_tokens": abort_completion_tokens,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "abort", "message": "Aborted."},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            stream=True,
+            return_output_ids_in_sglext=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            chunks = self._run_chat_stream(adapted_request, req)
+
+        return [c for c in self._parse_chunks(chunks) if "sglext" in c]
+
+    def test_streaming_output_ids_incremental_ignores_abort_chunk(self):
+        # Abort re-sends the last token; it must not be appended again.
+        sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
+            normal_chunks=[[5, 6], [7]],
+            abort_output_ids=[7],
+            incremental=True,
+            abort_completion_tokens=3,
+        )
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
+
+    def test_streaming_output_ids_incremental_keeps_coalesced_abort_deltas(self):
+        # Coalesced abort chunk: keep real deltas, drop the repeated last token.
+        sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
+            normal_chunks=[[5, 6]],
+            abort_output_ids=[7, 8, 8],
+            incremental=True,
+            abort_completion_tokens=4,
+        )
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7, 8]])
+
+    def test_streaming_output_ids_non_incremental_abort_supersedes_earlier(self):
+        sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
+            normal_chunks=[[5, 6]],
+            abort_output_ids=[5, 6, 7],
+            incremental=False,
+            abort_completion_tokens=3,
+        )
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
 
     def test_streaming_parallel_sampling_orders_spec_details_by_choice(self):
         async def mock_generate():

@@ -480,9 +480,12 @@ class MiniCPMSparseBackend(AttentionBackend):
                         _gather_compressed_keys(full_compressed_k, level, sparse_bs)
                     )
 
-            (compressed_k, compressed_cu_seqlens), (
-                compressed_k2,
-                compressed_cu_seqlens2,
+            (
+                (compressed_k, compressed_cu_seqlens),
+                (
+                    compressed_k2,
+                    compressed_cu_seqlens2,
+                ),
             ) = compressed
 
             ret = self.sparse_get_topk_impl(

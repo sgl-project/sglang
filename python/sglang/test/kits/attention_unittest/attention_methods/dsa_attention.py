@@ -404,6 +404,7 @@ class DSAMockModelRunner(ModelRunner):
             kv_cache_dim=pool_kv_cache_dim,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -1455,8 +1456,7 @@ def run_dsa_sparse_cuda_graph_decode_impl_variant_case(
         )
     if not case.forward_mode.is_decode():
         raise ValueError(
-            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a "
-            "DECODE case."
+            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a DECODE case."
         )
     from ..runner_modes.cuda_graph_decode_runner import (
         run_dsa_sparse_cuda_graph_decode_case,
@@ -1629,7 +1629,7 @@ def run_dsa_forward(
     input_hidden = inputs["input_hidden"]
     # `input_hidden` may have trailing padding for split-op static-token
     # contracts; project only the live token rows for QKV. The kernel
-    # respects `num_token_non_padded_cpu` via the metadata.
+    # respects `global_num_token_non_padded_cpu` via the metadata.
     live_input_hidden = input_hidden[: case.num_input_tokens]
     input_parts = _split_by_lens(live_input_hidden, case.input_lens)
     kv_hidden = torch.cat(
@@ -1668,7 +1668,7 @@ def expected_dsa_output_from_inputs(
 def dsa_attention_layers(fixture: DSAAttentionFixture) -> list:
     """Return the RadixAttention layers the backend forwards through. The
     split-op runner uses this to install per-layer
-    `num_token_non_padded_cpu` metadata before forward."""
+    `global_num_token_non_padded_cpu` metadata before forward."""
     return [fixture.actual_module.attn]
 
 

@@ -181,9 +181,9 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert (
-        dim_quant == 656
-    ), f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
+    assert dim_quant == 656, (
+        f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
+    )
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)

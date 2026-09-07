@@ -600,6 +600,9 @@ class LoRAPipeline(ComposedPipelineBase):
         if merge_mode == "dynamic":
             return False
         uses_dtensor_weights = self._uses_dtensor_weights(lora_layers)
+        has_unmergeable_weights = any(
+            not layer.can_merge_base_weight for layer in lora_layers.values()
+        )
         if merge_mode == "auto":
             if uses_dtensor_weights:
                 logger.info(
@@ -607,7 +610,18 @@ class LoRAPipeline(ComposedPipelineBase):
                     module_name,
                 )
                 return False
+            if has_unmergeable_weights:
+                logger.info(
+                    "Using dynamic LoRA for %s because its quantized weights cannot be merged in place.",
+                    module_name,
+                )
+                return False
             return True
+        if has_unmergeable_weights:
+            raise ValueError(
+                f"LoRA merge mode is unavailable for {module_name} because its "
+                "quantized weights cannot be updated in place; use merge mode 'dynamic'"
+            )
         if uses_dtensor_weights:
             logger.warning(
                 "Merging LoRA for %s with FSDP-sharded weights may require full-gather and can OOM.",
