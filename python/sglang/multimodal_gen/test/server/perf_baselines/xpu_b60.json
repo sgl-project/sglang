@@ -1,0 +1,222 @@
+{
+    "metadata": {
+        "model": "Diffusion Server",
+        "hardware": "CI Intel Arc Pro B60 (24 GiB) pool: bmg-multigen-models",
+        "description": "Reference numbers seeded from XPU multimodal_gen CI run 32736878259 job 97461821112 (PR #36100).",
+        "last_updated": "2026-08-24"
+    },
+    "tolerances": {
+        "long_term": {
+            "e2e": 0.30,
+            "denoise_stage": 0.20,
+            "non_denoise_stage": 0.60,
+            "denoise_step": 0.35,
+            "denoise_agg": 0.25,
+            "load_peak_vram": 0.05,
+            "runtime_peak_vram": 0.05
+        },
+        "pr_test": {
+            "e2e": 0.40,
+            "denoise_stage": 0.35,
+            "non_denoise_stage": 0.90,
+            "denoise_step": 0.45,
+            "denoise_agg": 0.30,
+            "load_peak_vram": 0.05,
+            "runtime_peak_vram": 0.05
+        }
+    },
+    "improvement_reporting": {
+        "threshold": 0.2
+    },
+    "sampling": {
+        "step_fractions": [
+            0.0,
+            0.2,
+            0.4,
+            0.6,
+            0.8,
+            1.0
+        ]
+    },
+    "scenarios": {
+        "zimage_image_t2i": {
+            "estimated_full_test_time_s": 65.1,
+            "stages_ms": {
+                "InputValidationStage": 0.03,
+                "TextEncodingStage": 87.64,
+                "LatentPreparationStage": 0.21,
+                "TimestepPreparationStage": 136.9,
+                "DenoisingStage": 8361.1,
+                "DecodingStage": 8.39
+            },
+            "denoise_step_ms": {
+                "0": 99.57,
+                "1": 927.61,
+                "2": 926.72,
+                "3": 928.32,
+                "4": 929.29,
+                "5": 928.8,
+                "6": 925.2,
+                "7": 927.22,
+                "8": 931.28
+            },
+            "expected_e2e_ms": 9312.75,
+            "expected_avg_denoise_ms": 836.0,
+            "expected_median_denoise_ms": 927.61
+        },
+        "flux_2_klein_image_t2i": {
+            "estimated_full_test_time_s": 106.8,
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 37.83,
+                "ImageVAEEncodingStage": 0.0,
+                "LatentPreparationStage": 0.33,
+                "TimestepPreparationStage": 351.26,
+                "DenoisingStage": 2518.52,
+                "DecodingStage": 9.13
+            },
+            "denoise_step_ms": {
+                "0": 83.44,
+                "1": 16.73,
+                "2": 18.04,
+                "3": 17.11
+            },
+            "expected_e2e_ms": 3509.48,
+            "expected_avg_denoise_ms": 33.83,
+            "expected_median_denoise_ms": 17.58
+        },
+        "flux_2_klein_base_image_t2i": {
+            "stages_ms": {
+                "InputValidationStage": 0.03,
+                "TextEncodingStage": 36.3,
+                "ImageVAEEncodingStage": 0.0,
+                "LatentPreparationStage": 0.28,
+                "TimestepPreparationStage": 355.5,
+                "DenoisingStage": 55237.43,
+                "DecodingStage": 11.09
+            },
+            "denoise_step_ms": {
+                "0": 106.73,
+                "1": 34.25,
+                "2": 34.59,
+                "3": 34.59,
+                "4": 35.08,
+                "5": 34.24,
+                "6": 34.03,
+                "7": 34.47,
+                "8": 34.17,
+                "9": 44.04,
+                "10": 34.83,
+                "11": 34.64,
+                "12": 35.38,
+                "13": 34.32,
+                "14": 35.51,
+                "15": 36.16,
+                "16": 35.32,
+                "17": 34.75,
+                "18": 35.28,
+                "19": 50.88,
+                "20": 35.41,
+                "21": 35.36,
+                "22": 34.53,
+                "23": 35.42,
+                "24": 34.75,
+                "25": 34.78,
+                "26": 34.95,
+                "27": 34.84,
+                "28": 35.38,
+                "29": 34.7,
+                "30": 34.42,
+                "31": 35.01,
+                "32": 34.98,
+                "33": 34.61,
+                "34": 34.78,
+                "35": 34.76,
+                "36": 34.61,
+                "37": 37.59,
+                "38": 35.0,
+                "39": 34.6,
+                "40": 35.52,
+                "41": 35.14,
+                "42": 34.84,
+                "43": 35.16,
+                "44": 33.86,
+                "45": 34.52,
+                "46": 34.94,
+                "47": 33.84,
+                "48": 35.14,
+                "49": 34.75
+            },
+            "expected_e2e_ms": 56248.35,
+            "expected_avg_denoise_ms": 36.83,
+            "expected_median_denoise_ms": 34.84
+        },
+        "wan2_1_t2v_1.3b": {
+            "estimated_full_test_time_s": 331.5,
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 704.97,
+                "LatentPreparationStage": 0.89,
+                "TimestepPreparationStage": 2.71,
+                "DenoisingStage": 114601.91,
+                "DecodingStage": 73.74,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 208.34,
+                "1": 80.0,
+                "2": 84.33,
+                "3": 85.37,
+                "4": 92.98,
+                "5": 85.51,
+                "6": 84.71,
+                "7": 85.0,
+                "8": 84.82,
+                "9": 85.45,
+                "10": 85.89,
+                "11": 86.33,
+                "12": 85.68,
+                "13": 86.51,
+                "14": 94.06,
+                "15": 86.65,
+                "16": 86.39,
+                "17": 86.15,
+                "18": 86.54,
+                "19": 86.88,
+                "20": 87.36,
+                "21": 85.66,
+                "22": 86.22,
+                "23": 85.45,
+                "24": 94.66,
+                "25": 86.44,
+                "26": 86.3,
+                "27": 86.35,
+                "28": 85.29,
+                "29": 86.31,
+                "30": 85.8,
+                "31": 86.12,
+                "32": 86.03,
+                "33": 86.42,
+                "34": 91.27,
+                "35": 85.84,
+                "36": 86.3,
+                "37": 85.04,
+                "38": 84.99,
+                "39": 85.46,
+                "40": 85.72,
+                "41": 84.76,
+                "42": 88.92,
+                "43": 85.58,
+                "44": 86.57,
+                "45": 85.42,
+                "46": 87.03,
+                "47": 85.65,
+                "48": 86.77,
+                "49": 84.42
+            },
+            "expected_e2e_ms": 116299.31,
+            "expected_avg_denoise_ms": 88.83,
+            "expected_median_denoise_ms": 86.07
+        }
+    }
+}

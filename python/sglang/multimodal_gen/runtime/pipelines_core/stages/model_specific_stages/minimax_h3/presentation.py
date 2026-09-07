@@ -24,7 +24,7 @@ IMAGE_PAD = "<|image_pad|>"
 VIDEO_PAD = "<|video_pad|>"
 
 _TEXT_TAG = 1
-_VIDEO_TAG = 0
+_VISUAL_TAG = 0
 
 
 def _text_ids(tokenizer: Any, text: str) -> list[int]:
@@ -40,25 +40,45 @@ def _vision_block_ids(tokenizer: Any, pad_token: str, count: int) -> list[int]:
 
 
 class _Presentation:
-    """Accumulates aligned (ids, token_tags) presentation segments."""
+    """Accumulates aligned ids, modality tags, and video-query metadata."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, track_video_mask: bool = False) -> None:
         self.ids: list[int] = []
         self.tags: list[int] = []
+        self.video_mask: list[bool] | None = [] if track_video_mask else None
 
     def text(self, token_ids: list[int]) -> None:
         self.ids += token_ids
         self.tags += [_TEXT_TAG] * len(token_ids)
+        if self.video_mask is not None:
+            self.video_mask += [False] * len(token_ids)
 
-    def vision(self, token_ids: list[int]) -> None:
+    def vision(
+        self, token_ids: list[int], *, video_token_id: int | None = None
+    ) -> None:
         self.ids += token_ids
-        self.tags += [_VIDEO_TAG] * len(token_ids)
+        self.tags += [_VISUAL_TAG] * len(token_ids)
+        if self.video_mask is not None:
+            self.video_mask += [
+                video_token_id is not None and token_id == video_token_id
+                for token_id in token_ids
+            ]
 
-    def build(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
+    def build(
+        self, *, return_video_mask: bool = False
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
+        result = (
             torch.tensor(self.ids, dtype=torch.long),
             torch.tensor(self.tags, dtype=torch.long),
         )
+        if not return_video_mask:
+            return result
+        if self.video_mask is None:
+            raise ValueError("video mask was not tracked for this presentation")
+        return (*result, torch.tensor(self.video_mask, dtype=torch.bool))
 
 
 def _timestamped_video_blocks(
@@ -68,6 +88,7 @@ def _timestamped_video_blocks(
     counts: Sequence[int],
     timestamps: Sequence[float],
     context: str,
+    video_token_id: int | None,
 ) -> None:
     """Emit per-temporal-block ``<{t:.1f} seconds>`` text + VIDEO vision."""
 
@@ -79,7 +100,10 @@ def _timestamped_video_blocks(
         if count <= 0:
             raise ValueError(f"{context}video block token count must be positive")
         presentation.text(_text_ids(tokenizer, f"<{timestamp:.1f} seconds>"))
-        presentation.vision(_vision_block_ids(tokenizer, VIDEO_PAD, count))
+        presentation.vision(
+            _vision_block_ids(tokenizer, VIDEO_PAD, count),
+            video_token_id=video_token_id,
+        )
 
 
 def minimax_h3_text_only_ids(tokenizer: Any, prompt: str) -> torch.Tensor:
@@ -118,8 +142,8 @@ def minimax_h3_ref2va_presentation(
 
     per condition in request order — image i: ``<Picture i>: `` label followed
     by the vision block; audio j: ``<Audio j>: `` label only (audio content
-    never enters Qwen) — then the verbatim prompt. Returns (ids, token_tags)
-    with the vision block tagged VIDEO(0) and everything else TEXT(1).
+    never enters Qwen) — then the verbatim prompt. Returns ``(ids, token_tags)``
+    with the vision block tagged visual(0) and everything else text(1).
 
     condition_labels: [("image", 1), ("audio", 1), ...] with 1-based ordinals
     per type.
@@ -196,7 +220,10 @@ def minimax_h3_ref2va_video_presentation(
     image_token_count: int | list[int] | None,
     video_block_token_counts: list[int] | list[list[int]] | None,
     video_block_timestamps: list[float] | list[list[float]] | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_video_mask: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """ref2va (optionally with video refs) positive presentation:
 
     per condition in request order —
@@ -209,12 +236,16 @@ def minimax_h3_ref2va_video_presentation(
       counts repeat the last frame), emitting the
       ``<0.2 seconds>`` ..
       ``<4.0 seconds>`` sequence — note Python bankers-rounding at .1f.
-    then the verbatim prompt. Vision blocks are tagged VIDEO(0), everything
-    else TEXT(1).
+    then the verbatim prompt. Image and video blocks both retain visual
+    modality tag 0. When requested, the third return marks only VIDEO_PAD
+    content tokens; vision delimiters remain dense.
     """
     if not prompt:
         raise ValueError("prompt must be non-empty")
-    presentation = _Presentation()
+    presentation = _Presentation(track_video_mask=return_video_mask)
+    video_token_id = (
+        tokenizer.convert_tokens_to_ids(VIDEO_PAD) if return_video_mask else None
+    )
     image_token_counts = _as_int_list(image_token_count, name="image_token_count")
     video_counts_by_ref = _as_nested_int_list(
         video_block_token_counts,
@@ -259,6 +290,7 @@ def minimax_h3_ref2va_video_presentation(
                 counts=counts,
                 timestamps=timestamps,
                 context="",
+                video_token_id=video_token_id,
             )
         else:
             raise ValueError(f"unsupported ref2va condition type {cond_type!r}")
@@ -267,7 +299,7 @@ def minimax_h3_ref2va_video_presentation(
     if video_seen != len(video_counts_by_ref):
         raise ValueError("unused video block token count entries")
     presentation.text(_text_ids(tokenizer, prompt))
-    return presentation.build()
+    return presentation.build(return_video_mask=return_video_mask)
 
 
 __all__ = [

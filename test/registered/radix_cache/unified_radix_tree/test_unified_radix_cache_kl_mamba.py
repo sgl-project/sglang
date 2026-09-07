@@ -3,10 +3,11 @@ import shutil
 import tempfile
 import unittest
 
-from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
-
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from sglang.test.kits.unified_radix_cache_kit import (
+    AccuracyTwoPassMixin,
+    UnifiedRadixTreeTestMixin,
+)
 from sglang.test.kl_multiturn_utils import (
     get_input_ids,
     make_mamba_decode_assert,
@@ -20,7 +21,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=742, stage="extra-b", runner_config="4-gpu-h100")
 
 MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64

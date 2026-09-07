@@ -13,7 +13,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestLocalVerifyTierNumTokens(CustomTestCase):
@@ -67,7 +67,7 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         batch = SimpleNamespace(
             global_num_tokens=[1, 3, 0, 2],
             global_num_tokens_for_logprob=[1, 3, 0, 2],
-            can_run_dp_cuda_graph=True,
+            can_run_decode_cuda_graph=True,
         )
 
         with patch(
@@ -81,10 +81,12 @@ class TestDraftDpSyncMetadata(CustomTestCase):
             [1, 3, 0, 2],
         )
         self.assertEqual(forward_batch.global_num_tokens_cpu, [6, 18, 0, 12])
-        self.assertEqual(forward_batch.num_token_non_padded.item(), 6)
-        self.assertEqual(forward_batch.num_token_non_padded.dtype, torch.int32)
-        self.assertEqual(forward_batch.num_token_non_padded_cpu, 6)
-        self.assertTrue(forward_batch.can_run_dp_cuda_graph)
+        # Metadata fill sets only the invariant GLOBAL count; the LOCAL
+        # num_token_non_padded is derived later when the draft forward localizes.
+        self.assertEqual(forward_batch.global_num_token_non_padded.item(), 6)
+        self.assertEqual(forward_batch.global_num_token_non_padded.dtype, torch.int32)
+        self.assertEqual(forward_batch.global_num_token_non_padded_cpu, 6)
+        self.assertTrue(forward_batch.can_run_decode_cuda_graph)
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):

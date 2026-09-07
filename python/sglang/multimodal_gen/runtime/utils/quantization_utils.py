@@ -6,13 +6,22 @@ import struct
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+import torch
 from safetensors import safe_open
+from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
+    ComfyNvfp4Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
@@ -23,13 +32,75 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
     KitchenW4A8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedEmbeddingMethod as SrtUnquantizedEmbeddingMethod,
+)
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod as SrtUnquantizedLinearMethod,
+)
+from sglang.srt.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding as SrtVocabParallelEmbedding,
+)
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
+from sglang.srt.model_loader.post_load import stage_module_for_post_load
+from sglang.srt.utils import is_npu
 
 logger = init_logger(__name__)
+
+
+def process_model_weights_after_loading(
+    model: nn.Module,
+    process_device: torch.device | None = None,
+    *,
+    quantized_only: bool = False,
+) -> int:
+    """Process native and SRT layers once, optionally staging one layer at a time."""
+    processed_layers = 0
+    for module in model.modules():
+        if not isinstance(
+            module,
+            (
+                LinearBase,
+                SrtLinearBase,
+                VocabParallelEmbedding,
+                SrtVocabParallelEmbedding,
+            ),
+        ):
+            continue
+        method = module.quant_method
+        if method is None:
+            continue
+        unquantized = isinstance(
+            method,
+            (
+                UnquantizedLinearMethod,
+                SrtUnquantizedLinearMethod,
+                UnquantizedEmbeddingMethod,
+                SrtUnquantizedEmbeddingMethod,
+            ),
+        )
+        if quantized_only and unquantized:
+            continue
+        if is_npu() and not unquantized:
+            torch.npu.config.allow_internal_format = True
+        if process_device is None:
+            method.process_weights_after_loading(module)
+        else:
+            with stage_module_for_post_load(module, process_device):
+                method.process_weights_after_loading(module)
+        if is_npu():
+            torch.npu.empty_cache()
+        processed_layers += 1
+    return processed_layers
 
 
 def inspect_comfy_quant_markers(
@@ -84,6 +155,7 @@ def inspect_comfy_quant_markers(
                 if key.endswith(".weight") and tensor_slice.get_dtype() in (
                     "F8_E4M3",
                     "I8",
+                    "U8",
                 ):
                     marked_dtype_weight_prefixes.add(key.removesuffix(".weight"))
                 if not key.endswith(".comfy_quant"):
@@ -139,11 +211,14 @@ def inspect_comfy_quant_markers(
                 f"{prefix}.weight_s_rel",
                 f"{prefix}.weight_s_channel",
             }
+        if marker_format == "nvfp4":
+            required.add(f"{prefix}.weight_scale_2")
         if marker_format not in (
             "float8_e4m3fn",
             "int8_tensorwise",
             "asym_w4a8_int8",
             "convrot_w4a4",
+            "nvfp4",
         ):
             continue
         missing = required - checkpoint_meta.keys()
@@ -240,6 +315,44 @@ def inspect_comfy_quant_markers(
                     f"and convrot_groupsize={convrot_group_size}"
                 )
             continue
+        if marker_format == "nvfp4":
+            weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
+            scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_scale"]
+            scale_2_dtype, scale_2_shape = checkpoint_meta[f"{prefix}.weight_scale_2"]
+            if weight_dtype != "U8" or scale_dtype != "F8_E4M3":
+                raise ValueError(
+                    f"Comfy NVFP4 layer {prefix!r} needs U8 packed weights and "
+                    f"FP8 block scales, got {weight_dtype} and {scale_dtype}"
+                )
+            if scale_2_dtype != "F32" or scale_2_shape not in ((), (1,)):
+                raise ValueError(
+                    f"Comfy NVFP4 layer {prefix!r} needs a scalar F32 "
+                    f"weight_scale_2, got {scale_2_dtype}{scale_2_shape}"
+                )
+            if len(weight_shape) != 2:
+                raise ValueError(
+                    f"Comfy NVFP4 layer {prefix!r} needs a 2D packed weight, "
+                    f"got {weight_shape}"
+                )
+            logical_input_size = weight_shape[1] * 2
+            expected_scale_shape = (weight_shape[0], logical_input_size // 16)
+            if logical_input_size % 16 or scale_shape != expected_scale_shape:
+                raise ValueError(
+                    f"Comfy NVFP4 layer {prefix!r} has incompatible weight/scale "
+                    f"shapes: {weight_shape} and {scale_shape}"
+                )
+            pre_quant_scale_key = f"{prefix}.pre_quant_scale"
+            marker["_has_pre_quant_scale"] = pre_quant_scale_key in checkpoint_meta
+            if marker["_has_pre_quant_scale"]:
+                pre_scale_dtype, pre_scale_shape = checkpoint_meta[pre_quant_scale_key]
+                if pre_scale_dtype not in ("BF16", "F16", "F32") or (
+                    pre_scale_shape != (logical_input_size,)
+                ):
+                    raise ValueError(
+                        f"Comfy NVFP4 layer {prefix!r} has an incompatible "
+                        f"pre_quant_scale: {pre_scale_dtype}{pre_scale_shape}"
+                    )
+            continue
         if marker_format != "int8_tensorwise":
             continue
         weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
@@ -262,6 +375,7 @@ def inspect_comfy_quant_markers(
                 f"Comfy INT8 layer {prefix!r} has incompatible weight/scale "
                 f"shapes: {weight_shape} and {scale_shape}"
             )
+        marker["_is_rowwise"] = True
 
     mapped_markers: dict[str, dict[str, Any]] = {}
     for prefix, marker in raw_markers.items():
@@ -292,6 +406,8 @@ def resolve_comfy_checkpoint_quantization(
         return KitchenW4A4Config(layer_markers)
     if formats == ["float8_e4m3fn"]:
         return ComfyFp8Config(layer_markers)
+    if formats in (["nvfp4"], ["int8_tensorwise", "nvfp4"]):
+        return ComfyNvfp4Config(layer_markers)
     if formats == ["mxfp8"]:
         return MXFP8Config(
             is_checkpoint_fp8_serialized=True,

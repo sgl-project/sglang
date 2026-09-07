@@ -5,7 +5,7 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
 from typing import Any
@@ -15,6 +15,10 @@ import torch
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
+    CubeSparseAttentionMetadata,
+    CubeSparseAttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
@@ -35,7 +39,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -335,6 +342,46 @@ def _resolve_denoise_model(
     return model.to(device).eval()
 
 
+def _build_cube_attn_metadata(
+    server_args: ServerArgs,
+    *,
+    packed: dict[str, Any],
+    num_steps: int,
+    device: torch.device,
+) -> CubeSparseAttentionMetadata | None:
+    """Build cube sparse attention metadata when that backend is selected."""
+    transformer_backend = (server_args.component_attention_backends or {}).get(
+        "transformer", server_args.attention_backend
+    )
+    if str(transformer_backend).lower() != "cube_sparse_attn":
+        return None
+
+    config = server_args.attention_backend_config or {}
+    local_cube_size = config.get("local_cube_size")
+    topk_ratio_list = config.get("topk_ratio_list")
+    if not local_cube_size or not topk_ratio_list:
+        raise ValueError(
+            "cube_sparse_attn requires --attention-backend-config with "
+            "local_cube_size and topk_ratio_list"
+        )
+    metadata = CubeSparseAttentionMetadataBuilder().build(
+        packed=packed,
+        local_cube_size=local_cube_size,
+        topk_ratio_list=topk_ratio_list,
+        num_steps=num_steps,
+        device=device,
+    )
+    logger.debug(
+        "cube sparse attention enabled: local_cube_size=%s "
+        "topk_ratio_list(len=%d, min=%.4f, max=%.4f)",
+        list(local_cube_size),
+        len(metadata.topk_ratio_list),
+        min(metadata.topk_ratio_list),
+        max(metadata.topk_ratio_list),
+    )
+    return metadata
+
+
 def _precompute_refined_prompt_embeds(
     model: Any,
     positive: Any,
@@ -396,6 +443,12 @@ def _precompute_rope_cache(
 
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        # one denoise per sigma interval: steps - 1
+        return max(1, num_inference_steps - 1)
+
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
             transformer=transformer,
@@ -615,13 +668,21 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         """
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
             MiniMaxH3DenoiseBranch,
+            _minimax_h3_subblock_video_query_indices,
             minimax_h3_denoise_loop,
         )
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not (current_platform.is_cuda() or current_platform.is_mps()):
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or MPS")
+        if not (
+            current_platform.is_cuda()
+            or current_platform.is_mps()
+            or current_platform.is_npu()
+        ):
+            raise RuntimeError(
+                "MiniMax H3 full-loop denoise requires CUDA, MPS, or Ascend NPU"
+            )
+
         device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
@@ -632,11 +693,28 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         _assemble_condition_rows(ctx)
 
         emb = ctx.embeddings["positive"]
-        packed = _build_packed_layout(ctx, emb)
+        subblock_enabled = server_args.pipeline_config.uses_subblock_attention(
+            server_args
+        )
+        packed = _build_packed_layout(
+            ctx,
+            emb,
+            include_video_pos=subblock_enabled,
+        )
         tags = packed["token_tags"]
         tags[packed["text_pos"].view(-1)] = (
             emb["text_token_tags"].view(-1).to(torch.long)
         )
+        video_query_indices = None
+        if subblock_enabled:
+            text_video_token_mask = emb.get("text_video_token_mask")
+            # Legacy/precomputed presentations may lack this optional
+            # provenance. The helper then keeps their Qwen rows dense while
+            # retaining packed reference/target video rows as sparse.
+            video_query_indices = _minimax_h3_subblock_video_query_indices(
+                packed,
+                text_video_token_mask,
+            )
 
         sampling = batch.sampling_params
         imgvid_noise_aug, audio_noise_aug = minimax_h3_condition_noise_aug(sampling)
@@ -645,6 +723,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             sampling=sampling,
             imgvid_noise_aug=imgvid_noise_aug,
             audio_noise_aug=audio_noise_aug,
+        )
+        attn_metadata = _build_cube_attn_metadata(
+            server_args,
+            packed=packed,
+            num_steps=len(sigmas_video) - 1,
+            device=device,
         )
 
         placement_managed = self._component_residency_manager is not None
@@ -656,10 +740,18 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device,
                 placement_managed=placement_managed,
             )
+            build_vsa_h3_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
+                model=model,
+                packed=packed,
+                ctx=ctx,
+                server_args=server_args,
+                device=device,
+            )
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],
                 token_tags=tags,
+                video_query_indices=video_query_indices,
                 device=device,
             )
             _precompute_refined_prompt_embeds(
@@ -690,7 +782,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     model=model,
-                    model_forward=partial(self._forward_dit, batch=batch),
+                    model_forward=partial(
+                        self._forward_dit,
+                        batch=batch,
+                        attn_metadata=attn_metadata,
+                        build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
+                    ),
                     positive=positive,
                     initial_video_rows=initial_video,
                     initial_audio_rows=initial_audio,
@@ -701,6 +798,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     device=device,
                     imgvid_cond_noise_aug_for_inference=float(imgvid_noise_aug),
                     audio_cond_noise_aug_for_inference=float(audio_noise_aug),
+                    attn_metadata=attn_metadata,
                     on_step=on_step,
                     step_profiler=partial(
                         self._profile_denoising_step,
@@ -741,6 +839,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
+        attn_metadata: CubeSparseAttentionMetadata | None = None,
+        build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""
 
@@ -750,7 +850,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         with set_forward_context(
             current_timestep=step_index,
-            attn_metadata=None,
+            attn_metadata=(
+                build_vsa_h3_step_metadata(step_index)
+                if build_vsa_h3_step_metadata is not None
+                else attn_metadata
+            ),
             forward_batch=batch,
         ):
             runner = self._maybe_get_bcg_runner(model)
@@ -882,9 +986,78 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
         ctx.keyframe_frame_count = int(ctx.keyframe["frame_count"])
 
 
+def _maybe_prepare_vsa_h3_step_metadata(
+    *,
+    model: Any,
+    packed: Mapping[str, torch.Tensor],
+    ctx: _FullLoopContext,
+    server_args: ServerArgs,
+    device: torch.device,
+) -> Callable[[int], Any] | None:
+    """Per-step VSA-H3 metadata builder over the request-static packed layout,
+    or None off the VSA path."""
+    model._resolve_attention_backend_once()
+    if (
+        model._resolved_attention_backend
+        is not AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+    ):
+        return None
+    if ctx.is_ref2va:
+        raise NotImplementedError(
+            "VSA-H3 supports the t2va/fl2va packed layout; the ref2va "
+            "reference-block layout is not tiled yet. Use --attention-backend "
+            "fa for ref2va."
+        )
+
+    config = server_args.attention_backend_config or {}
+    tile_size = int(config.get("vsa_tile_size", 64))
+    if tile_size != 64:
+        raise ValueError(
+            "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
+            f"geometry; got vsa_tile_size={tile_size}."
+        )
+    sparsity = float(config.get("VSA_sparsity", config.get("sparsity", 0.9)))
+    if not 0.0 <= sparsity < 1.0:
+        raise ValueError(f"VSA sparsity must be in [0, 1), got {sparsity}")
+    mode = str(config.get("vsa_mode", "exempt"))
+    if mode not in ("exempt", "compete"):
+        raise ValueError(f"vsa_mode must be 'exempt' or 'compete', got {mode!r}")
+    dense_first_n_steps = int(config.get("vsa_dense_first_n_steps", 0))
+    dense_layers = tuple(int(layer) for layer in config.get("vsa_dense_layers", ()))
+
+    text_len = int(packed["text_pos"].numel())
+    video_rows = int(packed["update_mask"].sum())
+    cond_rows = int(packed["img_pos"].numel()) - video_rows
+    audio_rows = int(packed["audio_pos"].numel())
+    patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+        VideoSparseAttentionH3MetadataBuilder,
+    )
+
+    builder = VideoSparseAttentionH3MetadataBuilder()
+
+    def build(step_index: int):
+        return builder.build(
+            current_timestep=step_index,
+            raw_latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+            patch_size=patch_size,
+            VSA_sparsity=sparsity,
+            prefix_segments=(text_len, cond_rows, audio_rows),
+            device=device,
+            exempt=mode == "exempt",
+            dense_layers=dense_layers,
+            dense_first_n_steps=dense_first_n_steps,
+        )
+
+    return build
+
+
 def _build_packed_layout(
     ctx: _FullLoopContext,
     emb: Mapping[str, Any],
+    *,
+    include_video_pos: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build the per-task packed layout for the positive branch."""
 
@@ -905,6 +1078,7 @@ def _build_packed_layout(
             ref_blocks=ctx.ref2va_positive_blocks,
             keyframe_frame_indices=ctx.keyframe_frame_indices,
             frame_count=ctx.keyframe_frame_count,
+            include_video_pos=include_video_pos,
         )
     else:
         packed = minimax_h3_packed_sequence(
@@ -918,6 +1092,7 @@ def _build_packed_layout(
                 ctx.keyframe_frame_indices if ctx.include_cond else None
             ),
             frame_count=ctx.keyframe_frame_count,
+            include_video_pos=include_video_pos,
         )
     return packed
 

@@ -535,7 +535,6 @@ class BestConfigTrace:
 
 
 class BenchmarkWorker:
-
     def __init__(self, seed: int, server_args: ServerArgs) -> None:
         torch.set_default_device("cuda")
         torch.cuda.manual_seed_all(0)
@@ -729,8 +728,7 @@ class BenchmarkWorker:
                 down_use_tma_map[block_m] = time_cost_all[2] > time_cost_all[3]
 
             print(
-                f"Round 1 done. Down TMA decisions per BLOCK_SIZE_M: "
-                f"{down_use_tma_map}"
+                f"Round 1 done. Down TMA decisions per BLOCK_SIZE_M: {down_use_tma_map}"
             )
 
             # === Round 2: Up with c_sorted from round 1 ===

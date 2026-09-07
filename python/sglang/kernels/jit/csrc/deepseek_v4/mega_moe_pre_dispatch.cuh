@@ -28,10 +28,11 @@ struct MegaMoEPreDispatchParams {
   const float* __restrict__ topk_weights;  // [num_tokens, top_k]
 
   fp8_e4m3_t* __restrict__ buf_x;        // [padded_max, hidden]
-  int32_t* __restrict__ buf_x_sf;        // contiguous int32 [P, G/4]; see layout comment
+  int32_t* __restrict__ buf_x_sf;        // row-major int32 [P, G/4]
   int64_t* __restrict__ buf_topk_idx;    // [padded_max, top_k]
   float* __restrict__ buf_topk_weights;  // [padded_max, top_k]
 
+  uint64_t buf_x_sf_stride_bytes;
   uint32_t num_tokens;
   uint32_t padded_max;
   uint32_t hidden;
@@ -96,13 +97,12 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
       }
       out_vec.store(token_out, chunk);
 
-      // One thread per group writes its UE8M0 byte into the contiguous
-      // row-major int32-packed layout: byte address = t*num_groups + g
-      // (see layout comment at the top of the file).
+      // One thread per group writes its UE8M0 byte into the row-major int32-
+      // packed layout. DeepGEMM may pad each row to preserve TMA alignment.
       const uint32_t group_id = chunk / kThreadsPerGroup;
       const uint32_t within_group_id = chunk % kThreadsPerGroup;
       if (within_group_id == 0 && group_id < params.num_groups) {
-        const uint32_t byte_off = token_id * params.num_groups + group_id;
+        const uint64_t byte_off = static_cast<uint64_t>(token_id) * params.buf_x_sf_stride_bytes + group_id;
         reinterpret_cast<uint8_t*>(params.buf_x_sf)[byte_off] = static_cast<uint8_t>(ue8m0_exp);
       }
     };
@@ -188,11 +188,10 @@ struct MegaMoEPreDispatchKernel {
         .with_dtype<int8_t, fp8_e4m3_t>()
         .with_device(device)
         .verify(buf_x);
-    // buf.x_sf is the contiguous row-major int32 view from DeepGEMM's mega
-    // symm buffer (DeepGEMM/csrc/apis/mega.hpp): shape (P, G/4), strides
-    // (G/4, 1). No explicit strides required -> TensorMatcher enforces
-    // is_contiguous().
+    // DeepGEMM exposes only the logical G scale bytes but may pad its physical
+    // row stride to 16 bytes for TMA (for example, H=2304 is 72B -> 80B).
     TensorMatcher({P, G4})  // buf_x_sf
+        .with_strides({-1, 1})
         .with_dtype<int32_t>()
         .with_device(device)
         .verify(buf_x_sf);
@@ -215,6 +214,13 @@ struct MegaMoEPreDispatchKernel {
     RuntimeCheck(hidden % kGroupSize == 0, "hidden must be a multiple of group_size");
     const auto num_groups = hidden / static_cast<uint32_t>(kGroupSize);
     RuntimeCheck(num_groups == num_groups_div_4 * 4u, "num_groups must be a multiple of 4");
+    RuntimeCheck(
+        buf_x_sf.stride(0) >= static_cast<int64_t>(num_groups_div_4),
+        "buf_x_sf row stride is smaller than its logical row width");
+    const auto buf_x_sf_stride_bytes = static_cast<uint64_t>(buf_x_sf.stride(0)) * sizeof(int32_t);
+    RuntimeCheck(buf_x_sf_stride_bytes % 16u == 0, "buf_x_sf row stride must be 16B-aligned");
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(buf_x_sf.data_ptr()) % 16u == 0, "buf_x_sf base address must be 16B-aligned");
     RuntimeCheck(hidden % 8u == 0, "hidden must be a multiple of 8 (16B bf16 loads)");
     const auto num_chunks = hidden / 8u;
     const auto block_size = std::min(num_chunks, kMaxBlockThreads);
@@ -238,6 +244,7 @@ struct MegaMoEPreDispatchKernel {
         .buf_x_sf = static_cast<int32_t*>(buf_x_sf.data_ptr()),
         .buf_topk_idx = static_cast<int64_t*>(buf_topk_idx.data_ptr()),
         .buf_topk_weights = static_cast<float*>(buf_topk_weights.data_ptr()),
+        .buf_x_sf_stride_bytes = buf_x_sf_stride_bytes,
         .num_tokens = num_tokens,
         .padded_max = padded_max,
         .hidden = hidden,

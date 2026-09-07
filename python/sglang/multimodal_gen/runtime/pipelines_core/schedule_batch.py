@@ -108,6 +108,10 @@ class Req:
     pooled_embeds: list[torch.Tensor] = field(default_factory=list)
     neg_pooled_embeds: list[torch.Tensor] = field(default_factory=list)
 
+    # GLM-Image autoregressive prior tokens
+    prior_token_id: torch.Tensor | None = None
+    prior_token_image_ids: torch.Tensor | list[torch.Tensor] | None = None
+
     # Additional text-related parameters
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
@@ -337,12 +341,41 @@ class Req:
         self.suppress_logs = True
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
+        self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
         self.num_inference_steps = warmup_steps
 
     def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
         req = deepcopy(self)
         req.set_as_warmup(warmup_steps)
         return req
+
+    def record_stage_iterations(
+        self,
+        measured_iterations: int,
+        target_iterations: int | None = None,
+    ) -> None:
+        """Record a stage loop against its full default-request work.
+
+        Most stages declare the count as a formula of the step count
+        (``PipelineStage.default_workload_iterations``) and never call this.
+        It is for loops whose length is only known inside them (chunked or
+        block-wise schedules); ``target_iterations`` defaults to scaling the
+        measured count from the probe's steps to the default workload's.
+        """
+        if not self.is_warmup or self.metrics is None:
+            return
+        measured = max(1, int(measured_iterations))
+        if target_iterations is None:
+            measured_request_steps = max(1, int(self.num_inference_steps))
+            target_request_steps = int(
+                self.extra.get(
+                    "warmup_target_num_inference_steps", measured_request_steps
+                )
+            )
+            target_iterations = (
+                measured * max(1, target_request_steps) + measured_request_steps - 1
+            ) // measured_request_steps
+        self.metrics.record_stage_iterations(measured, target_iterations)
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""

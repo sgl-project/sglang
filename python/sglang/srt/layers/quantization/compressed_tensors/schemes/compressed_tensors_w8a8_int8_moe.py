@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
-
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
         self.input_quant = input_quant

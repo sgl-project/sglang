@@ -27,6 +27,11 @@ _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
+TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
+PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
+PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
+CHANGED_TESTS_FLAG = "--changed"
+CHANGED_TESTS_SHORT_FLAG = "-c"
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
@@ -349,17 +354,36 @@ def handle_tag_run_ci(
     return True
 
 
+def _latest_run_per_workflow(runs):
+    """
+    Collapse a head_sha's workflow runs to the newest run per workflow.
+
+    GitHub can have several runs of the *same* workflow at one commit — a
+    `synchronize` run superseded by a `labeled` run, or a run cancelled by
+    `cancel-in-progress` (pr-test.yml sets it) while its replacement is
+    already in flight. Only the newest one reflects current state; rerunning
+    the older ones spawns duplicates that fight the live run for runners.
+    """
+    latest = {}
+    for run in runs:
+        current = latest.get(run.workflow_id)
+        if current is None or run.id > current.id:
+            latest[run.workflow_id] = run
+    return list(latest.values())
+
+
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
-    Reruns workflows with 'failure' or 'skipped' conclusions.
+    Reruns workflows that ended in 'failure', 'skipped', 'cancelled' or
+    'timed_out', restarting only the jobs that didn't succeed.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
-    print("Permission granted. Triggering rerun of failed or skipped workflows.")
+    print("Permission granted. Triggering rerun of unsuccessful workflows.")
 
     # Check if PR has sgl-kernel changes - if so, we may need full reruns
     # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
@@ -405,7 +429,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 f"Failed to check kernel wheel status: {e} - falling back to full rerun"
             )
 
-    # Rerun workflows with conclusion=failure or conclusion=skipped.
+    # Rerun workflows that ended in failure, skipped, cancelled or timed_out.
     #
     # - failure: use rerun_failed_jobs() which reruns failed jobs *and their
     #   dependent jobs* (GitHub API). Fast-fail cascades call
@@ -420,17 +444,27 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   label-gated workflow, add the missing label (the `labeled` event
     #   dispatches a fresh run with the current label set); this function
     #   cannot recover those by rerun alone.
+    # - cancelled / timed_out: rerun_failed_jobs() as well. GitHub restarts
+    #   every job that didn't succeed — cancelled ones included — plus their
+    #   dependents, and carries the passing jobs over untouched. A full
+    #   rerun here would re-execute dozens of already-green GPU jobs to
+    #   recover one cancelled partition.
+    #   A run cancelled before any job failed has nothing for the endpoint to
+    #   target, so fall back to run.rerun() when it rejects the request.
     # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
     #   rerun_failed_jobs() is scoped to a single workflow run.
-    runs = gh_repo.get_workflow_runs(head_sha=head_sha)
+    runs = _latest_run_per_workflow(gh_repo.get_workflow_runs(head_sha=head_sha))
 
     rerun_count = 0
     for run in runs:
         if run.status != "completed":
+            # A newer attempt is still in flight - nothing to recover.
             continue
-        if run.conclusion not in ("failure", "skipped"):
+        if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
+            # action_required (fork PR awaiting approval) is deliberately left
+            # out: it needs an approval, not a rerun.
             continue
 
         print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
@@ -441,8 +475,12 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 print("  Full rerun")
                 run.rerun()
             else:
-                print("  rerun_failed_jobs")
-                run.rerun_failed_jobs()
+                try:
+                    print("  rerun_failed_jobs")
+                    run.rerun_failed_jobs()
+                except Exception as e:
+                    print(f"  rerun_failed_jobs rejected ({e}) - full rerun")
+                    run.rerun()
             rerun_count += 1
         except Exception as e:
             print(f"Failed to rerun workflow {run.id}: {e}")
@@ -453,7 +491,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             comment.create_reaction("+1")
         return True
     else:
-        print("No failed or skipped workflows found to rerun.")
+        print("No failed, skipped, cancelled or timed-out workflows found to rerun.")
         return False
 
 
@@ -467,11 +505,16 @@ MULTIMODAL_PATH_TO_RUNNER = {
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
 
 
+def _load_test_groups():
+    with open(TEST_GROUPS_FILE_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _known_test_groups():
-    groups = []
+    groups = set(_load_test_groups())
     for group_dir in glob.glob("test/registered/*"):
         if os.path.isdir(group_dir):
-            groups.append(os.path.basename(group_dir))
+            groups.add(os.path.basename(group_dir))
     return sorted(groups)
 
 
@@ -479,8 +522,9 @@ def resolve_test_group_specs(group_name):
     """
     Resolve a test group name into /rerun-test specs.
 
-    A group maps to a directory under test/registered/. For example,
-    "hicache" maps to all test_*.py files under test/registered/hicache/.
+    A group maps to either a named cross-directory file set or a directory
+    under test/registered/. For example, "hicache" maps to all test_*.py
+    files under test/registered/hicache/.
 
     Returns (test_specs, error_message). On success error_message is None.
     """
@@ -492,6 +536,25 @@ def resolve_test_group_specs(group_name):
         or ".." in group_name.split("/")
     ):
         return [], f"Invalid test group `{group_name}`."
+
+    test_groups = _load_test_groups()
+    if group_name in test_groups:
+        test_specs = test_groups[group_name]
+        if not isinstance(test_specs, list) or not all(
+            isinstance(test_spec, str) for test_spec in test_specs
+        ):
+            return [], f"Invalid definition for test group `{group_name}`."
+        missing = [
+            test_spec
+            for test_spec in test_specs
+            if not os.path.isfile(os.path.join("test", test_spec))
+        ]
+        if missing:
+            return [], (
+                f"Named test group `{group_name}` references missing files: "
+                + ", ".join(f"`test/{path}`" for path in missing)
+            )
+        return test_specs, None
 
     group_dir = os.path.join("test", "registered", group_name)
     if not os.path.isdir(group_dir):
@@ -527,8 +590,8 @@ def expand_glob_spec(file_part):
     Globs are matched against the same locations resolve_test_file() searches
     — test/registered/ and the multimodal_gen test dir — so e.g.
     `test_*backend*.py` reruns every backend test without hand-enumerating
-    each file. Two constraints keep a broad pattern from pulling in non-tests:
-    a match must live under a known test root and be named `test_*.py`.
+    each file. `_is_rerunnable_test_path` keeps a broad pattern from pulling in
+    non-tests.
 
     glob's `*` matches path separators only via `**`, so a bare pattern is
     searched recursively under each root; a path-ful pattern is anchored.
@@ -567,19 +630,11 @@ def expand_glob_spec(file_part):
             expanded.add(p)
     matches = expanded
 
-    def _under_test_root(path):
-        return path.startswith("test/registered/") or path.startswith(
-            MULTIMODAL_TEST_DIR + "/"
-        )
-
     files = sorted(
         {
             os.path.normpath(p)
             for p in matches
-            if os.path.isfile(p)
-            and os.path.basename(p).startswith("test_")
-            and p.endswith(".py")
-            and _under_test_root(os.path.normpath(p))
+            if os.path.isfile(p) and _is_rerunnable_test_path(os.path.normpath(p))
         }
     )
     if not files:
@@ -589,6 +644,76 @@ def expand_glob_spec(file_part):
             f"(patterns only match files named `test_*.py`)."
         )
     return files, None
+
+
+def _collects_pytest_tests(path):
+    """Whether a test file defines anything pytest would collect."""
+    if not os.path.isfile(path):
+        # Fork-added file, absent from the handler's main checkout; leave it for
+        # resolve_test_file() to report as `File not found`.
+        return True
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    return (
+        re.search(r"^\s*((async )?def test_|class Test)", content, re.MULTILINE)
+        is not None
+    )
+
+
+def _is_rerunnable_test_path(path):
+    """A repo-relative test file /rerun-test may select on its own (glob or --changed)."""
+    under_test_root = path.startswith("test/registered/") or path.startswith(
+        MULTIMODAL_TEST_DIR + "/"
+    )
+    if (
+        not under_test_root
+        or not os.path.basename(path).startswith("test_")
+        or not path.endswith(".py")
+    ):
+        return False
+    if not path.startswith(MULTIMODAL_TEST_DIR + "/"):
+        # detect_suite() rejects an unregistered file, and a registered one may
+        # expose its cases through load_tests() rather than `def test_`.
+        return True
+    # Nothing downstream rejects a multimodal path, so a `test_*.py` helper that
+    # collects nothing reaches `pytest -x` and exits 5. manual/ is hand-run.
+    return "manual" not in path.split("/") and _collects_pytest_tests(path)
+
+
+def _move_changes_dispatch(previous_filename, filename):
+    """Whether a content-free move still changes how `filename` dispatches."""
+    previous_filename = previous_filename or ""
+    is_mm = filename.startswith(MULTIMODAL_TEST_DIR + "/")
+    if is_mm != previous_filename.startswith(MULTIMODAL_TEST_DIR + "/"):
+        return True
+    if not _is_rerunnable_test_path(previous_filename):
+        return True
+    return is_mm and (
+        detect_multimodal_suite(previous_filename)[0]
+        != detect_multimodal_suite(filename)[0]
+    )
+
+
+def changed_test_files(pr):
+    """Rerunnable test files the PR adds or edits, as repo-relative paths.
+
+    A pure move reports `renamed` with an empty diff and is dropped, unless the
+    move itself changes dispatch: into a CI root, across the multimodal
+    boundary, or onto a different multimodal pool.
+    """
+    return sorted(
+        f.filename
+        for f in pr.get_files()
+        if f.status != "removed"
+        and _is_rerunnable_test_path(f.filename)
+        and (
+            f.changes > 0
+            or (
+                f.status == "renamed"
+                and _move_changes_dispatch(f.previous_filename, f.filename)
+            )
+        )
+    )
 
 
 def resolve_test_file(file_part):
@@ -614,7 +739,7 @@ def resolve_test_file(file_part):
             full_path = (
                 file_part
                 if file_part.startswith("python/")
-                else f"python/sglang/multimodal_gen/test/{file_part[len(prefix):]}"
+                else f"python/sglang/multimodal_gen/test/{file_part[len(prefix) :]}"
             )
             if not os.path.isfile(full_path):
                 return None, False, f"File not found: `{full_path}`"
@@ -701,17 +826,44 @@ def _extract_runner_configs(content):
     return out
 
 
-def _extract_legacy_suites(content):
-    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)`
-    calls. Used only to report why such a file is not dispatchable."""
+def _extract_suites(content, register_fn):
+    """Pull every single-string `suite=` from `<register_fn>(...)` calls."""
     out = []
     for args in re.finditer(
-        r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
+        rf"^[^#\n]*{register_fn}\s*\(([^)]*)\)", content, re.MULTILINE
     ):
         m = re.search(r'suite\s*=\s*["\']([^"\']+)["\']', args.group(1))
         if m:
             out.append(m.group(1))
     return out
+
+
+def _extract_legacy_suites(content):
+    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)`
+    calls. Used only to report why such a file is not dispatchable."""
+    return _extract_suites(content, "register_cuda_ci")
+
+
+# Backends with no job in rerun-test.yml (cuda / multimodal_gen / cpu only) and
+# no runner_config in runner_configs.yml, so no dispatch can be built for them.
+# Mirrors `REGISTER_MAPPING` in python/sglang/test/ci/ci_register.py.
+_OTHER_BACKEND_REGISTERS = {
+    "register_amd_ci": "AMD",
+    "register_npu_ci": "NPU",
+    "register_xpu_ci": "XPU",
+    "register_musa_ci": "MUSA",
+    "register_mlx_ci": "MLX",
+}
+
+
+def _extract_other_backends(content):
+    """Return (backend labels, suite names) for every non-CUDA/CPU registration."""
+    labels, suites = [], []
+    for register_fn, label in _OTHER_BACKEND_REGISTERS.items():
+        if re.search(rf"^[^#\n]*{register_fn}\s*\(", content, re.MULTILINE):
+            labels.append(label)
+            suites.extend(_extract_suites(content, register_fn))
+    return labels, sorted(set(suites))
 
 
 def _dispatch_err(suite, msg):
@@ -829,6 +981,20 @@ def detect_suite(file_path_from_test):
             )
         ]
 
+    labels, suites = _extract_other_backends(content)
+    if labels:
+        backends = ", ".join(labels)
+        where = f" (suite `{suites[0]}`)" if suites else ""
+        return [
+            _dispatch_err(
+                suites[0] if suites else None,
+                f"`{full_path}` is registered for {backends}{where}, not for "
+                f"CUDA or CPU; rerun-test.yml has no {backends} job. Rerun it "
+                f"with /rerun-failed-ci, or dispatch the {backends} workflow "
+                f"manually.",
+            )
+        ]
+
     return [
         _dispatch_err(
             None,
@@ -921,7 +1087,15 @@ def _resolve_test_spec(test_spec):
     return out
 
 
-def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
+def _dispatch_batch(
+    gh_repo,
+    pr,
+    batch,
+    token,
+    reply_comment_id="",
+    reply_marker="",
+    refresh_precision_baseline=False,
+):
     """
     Dispatch a single workflow run for a batch of resolved test specs that
     share the same dispatch shape (mode + runs_on + install_script +
@@ -969,6 +1143,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "rdma_devices": rdma_devices,
             "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
             "reply_marker": reply_marker,
+            "refresh_precision_baseline": str(refresh_precision_baseline).lower(),
         }
         if is_fork:
             ref = "main"
@@ -1054,6 +1229,27 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
     return False
 
 
+def _check_precision_baseline_refresh_permissions(gh_repo, pr, comment):
+    commenter = comment.user.login
+    is_fork = pr.head.repo is None or pr.head.repo.full_name != gh_repo.full_name
+    if is_fork:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "⛔ Precision baseline refresh is only available on PR branches in "
+            "this repository. Fork PR code cannot receive the baseline write token."
+        )
+        return False
+
+    perm = gh_repo.get_collaborator_permission(commenter)
+    if perm not in ("admin", "maintain", "write"):
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "⛔ Precision baseline refresh requires write permission on the repo."
+        )
+        return False
+    return True
+
+
 def handle_rerun_test(
     gh_repo,
     pr,
@@ -1063,6 +1259,8 @@ def handle_rerun_test(
     token,
     skip_permission_check=False,
     command_label=None,
+    refresh_precision_baseline=False,
+    include_changed_tests=False,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
@@ -1074,7 +1272,12 @@ def handle_rerun_test(
     ):
         return False
 
-    if not test_specs:
+    if refresh_precision_baseline and not _check_precision_baseline_refresh_permissions(
+        gh_repo, pr, comment
+    ):
+        return False
+
+    if not test_specs and not include_changed_tests:
         comment.create_reaction("confused")
         pr.create_issue_comment(
             "⛔ Please specify a test: `/rerun-test <file>::<TestClass.test_method>`\n\n"
@@ -1084,7 +1287,9 @@ def handle_rerun_test(
             "- `/rerun-test test_srt_endpoint.py`\n"
             "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)\n"
             "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching "
-            "file; wrap the pattern in backticks so GitHub keeps the `*` literal)"
+            "file; wrap the pattern in backticks so GitHub keeps the `*` literal)\n"
+            f"- `/rerun-test {CHANGED_TESTS_FLAG}` (or `{CHANGED_TESTS_SHORT_FLAG}`; "
+            "every test file this PR adds or modifies)"
         )
         return False
 
@@ -1093,6 +1298,17 @@ def handle_rerun_test(
         comment.create_reaction("confused")
         pr.create_issue_comment(gate_msg)
         return False
+
+    if include_changed_tests:
+        changed = changed_test_files(pr)
+        if not changed and not test_specs:
+            comment.create_reaction("confused")
+            pr.create_issue_comment(
+                f"⛔ `{CHANGED_TESTS_FLAG}`: this PR adds or modifies no runnable test files "
+                f"under `test/registered/` or `{MULTIMODAL_TEST_DIR}/`."
+            )
+            return False
+        test_specs = list(test_specs or []) + changed
 
     # Phase 0: Expand wildcard specs into concrete test files. A spec whose
     # file part contains a glob metacharacter (* ? [) expands to every
@@ -1154,6 +1370,20 @@ def handle_rerun_test(
             seen_commands.add(key)
             resolved.append(r)
 
+    if refresh_precision_baseline:
+        is_exact_precision_test = (
+            not resolve_failures
+            and len(resolved) == 1
+            and resolved[0]["test_command"] == PRECISION_BASELINE_TEST
+        )
+        if not is_exact_precision_test:
+            comment.create_reaction("confused")
+            pr.create_issue_comment(
+                "⛔ `--refresh-precision-baseline` must be used alone with "
+                f"`test/{PRECISION_BASELINE_TEST}`."
+            )
+            return False
+
     # Phase 2: Group by dispatch shape.
     groups = {}
     for r in resolved:
@@ -1186,6 +1416,7 @@ def handle_rerun_test(
                 token,
                 reply_comment_id=reply_comment.id,
                 reply_marker=marker,
+                refresh_precision_baseline=refresh_precision_baseline,
             )
         )
 
@@ -1387,7 +1618,12 @@ def main():
         )
 
     elif first_line.startswith("/rerun-test"):
-        test_specs = first_line.split()[1:]
+        rerun_args = first_line.split()[1:]
+        refresh_precision_baseline = PRECISION_BASELINE_REFRESH_FLAG in rerun_args
+        changed_flags = {CHANGED_TESTS_FLAG, CHANGED_TESTS_SHORT_FLAG}
+        include_changed_tests = bool(changed_flags & set(rerun_args))
+        flags = changed_flags | {PRECISION_BASELINE_REFRESH_FLAG}
+        test_specs = [arg for arg in rerun_args if arg not in flags]
         handle_rerun_test(
             repo,
             pr,
@@ -1396,6 +1632,8 @@ def main():
             test_specs or None,
             token,
             command_label=first_line,
+            refresh_precision_baseline=refresh_precision_baseline,
+            include_changed_tests=include_changed_tests,
         )
 
     else:
