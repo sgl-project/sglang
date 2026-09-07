@@ -311,6 +311,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_context_sizes = self._resolve_context_buckets(
             model_runner, prefill_config.context_buckets
         )
+        if (
+            self.prefill_backend_name == Backend.TC_PIECEWISE
+            and self.capture_context_sizes
+        ):
+            # TODO: Teach TcPiecewise capture/replay to use context_size in its
+            # ShapeKey before enabling context buckets for this backend.
+            self._ignore_context_buckets("tc_piecewise prefill CUDA graph")
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
@@ -519,6 +526,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.backend, BreakableCudaGraphBackend
         ) and should_enable_cp_v2_bcg_capture(server_args)
         if self.enable_cp_v2_bcg_capture:
+            if self.capture_context_sizes:
+                # TODO: Thread the full ShapeKey through execute_prefill_cp_bcg
+                # before enabling context buckets for the CP-v2 BCG path.
+                self._ignore_context_buckets("CP-v2 breakable prefill CUDA graph")
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
@@ -912,6 +923,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             aligned,
         )
         return aligned
+
+    def _ignore_context_buckets(self, execution_path: str) -> None:
+        """Drop configured context buckets for a path that cannot key them yet."""
+        if not self.capture_context_sizes:
+            return
+        logger.warning(
+            "Ignoring prefill CUDA graph context buckets %s for %s; this path "
+            "currently captures and replays token-only ShapeKeys.",
+            self.capture_context_sizes,
+            execution_path,
+        )
+        self.capture_context_sizes = ()
 
     @staticmethod
     def _max_context_len(forward_batch: ForwardBatch) -> Optional[int]:
@@ -1982,6 +2005,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         raw_num_tokens: int,
         **kwargs,
     ):
+        assert not self.capture_context_sizes, (
+            "tc_piecewise replay only supports token-only ShapeKeys"
+        )
         with self._prefill_forward_context(
             static_forward_batch,
             num_tokens=static_num_tokens,
@@ -2059,6 +2085,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
             if self.enable_cp_v2_bcg_capture:
+                assert not self.capture_context_sizes, (
+                    "CP-v2 BCG replay only supports token-only ShapeKeys"
+                )
                 output = execute_prefill_cp_bcg(
                     self,
                     forward_batch,
