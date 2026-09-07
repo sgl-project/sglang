@@ -113,7 +113,9 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
             speculative_num_draft_tokens=2,
             topk=1,
             draft_worker=draft_worker,
-            _build_idle_verify_input=MagicMock(return_value=object()),
+            _build_idle_verify_input=MagicMock(
+                return_value=SimpleNamespace(is_verify_input=lambda: True)
+            ),
             verify=MagicMock(return_value=output),
             _prepare_pp_next_draft_batch=MagicMock(),
         )
