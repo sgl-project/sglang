@@ -1071,9 +1071,9 @@ class MiniMaxM3Attention(nn.Module):
     ):
         """NPU qkv projection + fused norm/RoPE/split; returns (None, fb, inner_state)."""
         if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return hidden_states, forward_batch, None
 
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1612,9 +1612,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         if is_shared_experts_fusion_disabled():
             return
         self.num_fused_shared_experts = self.config.n_shared_experts
-        assert (
-            self.num_fused_shared_experts == 1
-        ), "Only 1 fused shared expert is supported for MiniMax-M3"
+        assert self.num_fused_shared_experts == 1, (
+            "Only 1 fused shared expert is supported for MiniMax-M3"
+        )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):

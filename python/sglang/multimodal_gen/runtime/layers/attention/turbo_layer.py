@@ -49,9 +49,9 @@ def single_all_to_all(input, local_seq_2_local_head, group, async_op=False):
     # b, s, n, h
     if local_seq_2_local_head:
         bs, local_seq_len, num_total_head, head_dim = input.shape
-        assert (
-            num_total_head % seq_world_size == 0
-        ), f"Number of heads ({num_total_head}) must be divisible by the sequence parallel size ({seq_world_size})!"
+        assert num_total_head % seq_world_size == 0, (
+            f"Number of heads ({num_total_head}) must be divisible by the sequence parallel size ({seq_world_size})!"
+        )
         input_t = rearrange(
             input,
             "bs seq_len (w h) d -> w bs seq_len h d",

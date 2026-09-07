@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1770, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1770, stage="weekly", runner_config="4-gpu-b200")
 
 
 class FlashinferTrtllmGenMoeBackendFP8Base:

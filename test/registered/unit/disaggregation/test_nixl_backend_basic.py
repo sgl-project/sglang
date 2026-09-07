@@ -27,7 +27,7 @@ from sglang.srt.disaggregation.nixl.conn import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class NotificationFakeAgent:
@@ -1032,8 +1032,8 @@ class TestNixlStaging(CustomTestCase):
             staging_total_size=4096,
         )
         calls = []
-        mgr.send_kvcache_staged = (
-            lambda *args, **kwargs: calls.append((args, kwargs)) or "handle"
+        mgr.send_kvcache_staged = lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or "handle"
         )
 
         handle, deferred = mgr._do_staging_transfer(

@@ -17,8 +17,7 @@ def load_prompt() -> str:
     # https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-1M/test-data/1m.txt
 
     with urlopen(
-        "https://qianwen-res.oss-cn-beijing.aliyuncs.com"
-        "/Qwen2.5-1M/test-data/64k.txt",
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-1M/test-data/64k.txt",
         timeout=5,
     ) as response:
         prompt = response.read().decode("utf-8")
@@ -41,9 +40,7 @@ def process_requests(llm: sgl.Engine, prompts: list[str]) -> None:
     for output in outputs:
         prompt_token_ids = output["meta_info"]["prompt_tokens"]
         generated_text = output["text"]
-        print(
-            f"Prompt length: {prompt_token_ids}, " f"Generated text: {generated_text!r}"
-        )
+        print(f"Prompt length: {prompt_token_ids}, Generated text: {generated_text!r}")
 
 
 # Create an LLM.

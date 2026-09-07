@@ -24,8 +24,8 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(
@@ -115,6 +115,22 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                 page_size=16,
                 prefix_lens=(3, 5),
                 extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_dflash_verify_swa_window_edges",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                # Straddle the window: one request below, one at, one above.
+                prefix_lens=(1, 4, 9),
+                extend_lens=(3, 3, 3),
                 sliding_window_size=4,
             ),
             1,

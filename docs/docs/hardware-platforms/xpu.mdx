@@ -41,6 +41,9 @@ A list of LLMs have been optimized on Intel GPU, and more are on the way:
 **Note:** The model identifiers listed in the table above
 have been verified on [Intel® Arc™ B580 Graphics](https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html).
 
+Quantized MoE models are covered separately in
+[MXFP4 MoE Quantization](#mxfp4-moe-quantization) below.
+
 ## Installation
 
 ### Install From Source
@@ -48,14 +51,24 @@ have been verified on [Intel® Arc™ B580 Graphics](https://www.intel.com/conte
 Currently SGLang XPU only supports installation from source. Please refer to ["Getting Started on Intel GPU"](https://docs.pytorch.org/docs/stable/notes/get_start_xpu.html) to install XPU dependency.
 
 ```bash Command
+# Below commands shows Ubuntu/Debian OS as example, other OS requires similar command change
+# add sudo if required to install below packages
+# Install curl and protobuf compiler
+
+apt-get update && apt-get install -y curl protobuf-compiler
+
+# Install Rust (non-interactive)
+curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Make cargo available in the current shell
+source "$HOME/.cargo/env"
+
 # Create and activate a conda environment
 conda create -n sgl-xpu python=3.12 -y
 conda activate sgl-xpu
 
 # Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
 pip3 install torch==2.13.0+xpu torchvision==0.28.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
-pip3 install xgrammar --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
-pip3 install apache-tvm-ffi # xgrammar requires apache-tvm-ffi
+pip3 install xgrammar==0.1.33 --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
 
 # Clone the SGLang code
 git clone https://github.com/sgl-project/sglang.git
@@ -115,6 +128,40 @@ sglang serve                         \
     --attention-backend intel_xpu    \   # using intel optimized XPU attention backend
     --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
 ```
+
+## MXFP4 MoE Quantization
+
+Native MXFP4 MoE checkpoints (OCP microscaling FP4: packed `e2m1` weights plus
+per-32-element `ue8m0` block scales) run on Intel GPUs through the
+`sgl-kernel-xpu` W4A16 grouped GEMM. The expert weights stay in the checkpoint's
+packed layout end to end — there is no dequantization to BF16 — so GPT-OSS-20B
+loads in roughly 13 GB rather than the ~42 GB a BF16 upcast would need, which is
+what lets it fit on a single 24 GB card.
+
+The `mxfp4` method is registered automatically on `--device xpu`, which already
+requires `sgl-kernel-xpu` — no extra flag is needed:
+
+```bash
+sglang serve                        \
+    --model-path openai/gpt-oss-20b \
+    --device xpu                    \
+    --attention-backend intel_xpu
+```
+
+**Tested models:**
+
+| Model | Notes |
+|:---|:---|
+| [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) | 32 experts, top-k 4, hidden 2880, intermediate 2880; clamped-swiglu activation (`gemm1_alpha` 1.702, limit 7.0) with expert biases |
+
+**Requirements and limitations:**
+
+| Item | Status |
+|---|---|
+| GPU architecture | Xe2 / BMG only (Intel® Arc™ B-Series and Arc™ Pro B-Series) |
+| Quantized layers | Fused MoE experts only; attention, router, embeddings and LM head stay BF16 (per the checkpoint's `modules_to_not_convert`) |
+| Activations | BF16 (W4A16). Clamped swiglu (GPT-OSS) and plain SiLU are supported |
+| Expert parallelism | Not yet validated on this path |
 
 ## Benchmarking with Requests
 

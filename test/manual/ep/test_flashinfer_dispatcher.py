@@ -16,7 +16,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestFlashinferDispatcher(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         server_args = ServerArgs(model_path="dummy")
@@ -125,8 +124,7 @@ class TestFlashinferDispatcher(CustomTestCase):
         self.assertTrue(
             torch.all(
                 received_hidden_states[
-                    expected_source_rank
-                    * num_tokens : (expected_source_rank + 1)
+                    expected_source_rank * num_tokens : (expected_source_rank + 1)
                     * num_tokens
                 ]
                 == 100.0 + expected_source_rank
@@ -229,8 +227,7 @@ class TestFlashinferDispatcher(CustomTestCase):
             self.assertTrue(
                 torch.all(
                     received_hidden_states[
-                        expected_source_rank
-                        * num_tokens : (expected_source_rank + 1)
+                        expected_source_rank * num_tokens : (expected_source_rank + 1)
                         * num_tokens
                     ]
                     == 100.0 + expected_source_rank

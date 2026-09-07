@@ -8,7 +8,7 @@ cover that gate and the digest it decides on.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=50, suite="base-a-test-cpu")
+register_cpu_ci(est_time=52, suite="base-a-test-cpu")
 
 import json
 import multiprocessing

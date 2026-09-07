@@ -202,9 +202,9 @@ class ViTPatchGenerator(nn.Module):
 
     def forward_video(self, x: torch.Tensor, temporal_patch_size: int) -> torch.Tensor:
         """Embed video frames with temporal compression via tubelet grouping."""
-        assert (
-            self.video_embedder is not None
-        ), "video_embedder is required for temporal compression"
+        assert self.video_embedder is not None, (
+            "video_embedder is required for temporal compression"
+        )
         T = temporal_patch_size
         num_frames = x.shape[0]
 
@@ -258,9 +258,9 @@ class ViTPatchGenerator(nn.Module):
         if src_embed.shape != targ_embed.shape:
             src_size = int(math.sqrt(src_embed.shape[1]))
 
-            assert (
-                src_size**2 == src_embed.shape[1]
-            ), "Unable to interpolate non-square embedding"
+            assert src_size**2 == src_embed.shape[1], (
+                "Unable to interpolate non-square embedding"
+            )
 
             src_embed = rearrange(
                 src_embed, "b (h w) c -> b c h w", h=src_size, w=src_size
@@ -281,9 +281,9 @@ class ViTPatchGenerator(nn.Module):
         if src_proj_weight.shape != targ_proj_weight.shape:
             src_patch_size = int(math.sqrt(src_proj_weight.shape[1] // 3))
 
-            assert (src_patch_size**2) * 3 == src_proj_weight.shape[
-                1
-            ], "Unable to interpolate non-square patch size"
+            assert (src_patch_size**2) * 3 == src_proj_weight.shape[1], (
+                "Unable to interpolate non-square patch size"
+            )
 
             src_proj_weight = rearrange(
                 src_proj_weight,

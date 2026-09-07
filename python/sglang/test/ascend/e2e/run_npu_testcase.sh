@@ -110,6 +110,9 @@ fi
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
 . /usr/local/Ascend/nnal/atb/set_env.sh
+# Adapt Deepseek-V4-Flash test cases with additional environment variables.
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash || true
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
 
 echo "Running test case ${test_case}"
 tc_name=${test_case##*/}
@@ -143,9 +146,9 @@ fi
 source_plog_path="/root/ascend/log/debug/plog"
 if [ -d "$source_plog_path" ];then
     echo "Plog files found. Begin to backup them."
-    target_plog_path="/root/sglang/debug/logs/plog/${tc_name}/${HOSTNAME}"
+    target_plog_path="/root/sglang/debug/logs/plog/${run_label}/${tc_name}/${HOSTNAME}"
     if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
-        target_plog_path="/root/.cache/tests/logs/plog/${tc_name}/${HOSTNAME}"
+        target_plog_path="/root/.cache/tests/logs/plog/${run_label}/${tc_name}/${HOSTNAME}"
     fi
     rm -rf "${target_plog_path}"
     mkdir -p "${target_plog_path}"

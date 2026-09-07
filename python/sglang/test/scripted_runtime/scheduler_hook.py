@@ -117,7 +117,6 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
 
 
 class ScriptedSchedulerHook:
-
     def __init__(
         self,
         *,

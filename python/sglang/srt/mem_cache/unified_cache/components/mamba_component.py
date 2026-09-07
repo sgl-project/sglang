@@ -62,13 +62,13 @@ class MambaComponent(TreeComponent):
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
-        assert isinstance(
-            params.req_to_token_pool, HybridReqToTokenPool
-        ), f"MambaComponent requires HybridReqToTokenPool, got {type(params.req_to_token_pool)}"
+        assert isinstance(params.req_to_token_pool, HybridReqToTokenPool), (
+            f"MambaComponent requires HybridReqToTokenPool, got {type(params.req_to_token_pool)}"
+        )
         if not params.enable_mamba_extra_buffer:
-            assert (
-                params.page_size == 1
-            ), f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
+            assert params.page_size == 1, (
+                f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
+            )
         super().__init__(cache, params)
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         # params.page_size is the tree page the allocator actually uses, already

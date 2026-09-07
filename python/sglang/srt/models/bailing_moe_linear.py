@@ -164,7 +164,6 @@ def weight_loader_with_alias(alias: str):
 
 
 class BailingMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -233,7 +232,6 @@ class BailingMoEGate(nn.Module):
 
 
 class BailingMoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -296,7 +294,9 @@ class BailingMoE(nn.Module):
                 self.score_function == "softmax" and self.correction_bias is None
             ) or (
                 self.score_function == "sigmoid" and self.correction_bias is not None
-            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            ), (
+                "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            )
 
         self.topk = TopK(
             top_k=self.top_k,
@@ -503,12 +503,12 @@ class BailingMoELinearAttention(nn.Module):
 
         self.group_norm_size = getattr(config, "group_norm_size", 1)
         self.rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
-        assert (
-            self.tp_size <= self.group_norm_size
-        ), "tp_size must be less than or equal to group_norm_size that can use local rms norm"
-        assert (
-            self.group_norm_size % self.tp_size == 0
-        ), "group_norm_size must be divisible by tp_size"
+        assert self.tp_size <= self.group_norm_size, (
+            "tp_size must be less than or equal to group_norm_size that can use local rms norm"
+        )
+        assert self.group_norm_size % self.tp_size == 0, (
+            "group_norm_size must be divisible by tp_size"
+        )
         self.g_norm = BailingGroupRMSNormGate(
             hidden_size=self.hidden_inner_size // self.tp_size,
             eps=self.rms_norm_eps,
@@ -622,7 +622,6 @@ class BailingMoELinearAttention(nn.Module):
 
 
 class BailingMoEAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -731,7 +730,6 @@ class BailingMoEAttention(nn.Module):
 
 
 class BailingMoELinearDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -918,7 +916,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
 
 class BailingMoELinearModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -943,9 +940,9 @@ class BailingMoELinearModel(nn.Module):
             f"Layer config: {num_linear} linear attention layers, {num_full} full attention layers"
         )
 
-        assert (
-            self.num_layers % self.layer_group_size == 0
-        ), f"num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}"
+        assert self.num_layers % self.layer_group_size == 0, (
+            f"num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}"
+        )
 
         if self.pp_group.is_first_rank:
             self.word_embeddings = VocabParallelEmbedding(
@@ -1041,7 +1038,6 @@ class BailingMoELinearModel(nn.Module):
 
 
 class BailingMoELinearForCausalLM(nn.Module):
-
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1492,7 +1488,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
@@ -1514,7 +1509,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                     )
                     break
                 else:
-
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     if "slope" in name:
@@ -1571,7 +1565,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                             cached_a_proj.pop(q_a_proj_name)
                             cached_a_proj.pop(kv_a_proj_name)
                     else:
-
                         if name not in params_dict:
                             name = name.replace(".dense.", ".o_proj.")
                             if name not in params_dict:

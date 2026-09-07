@@ -352,7 +352,7 @@ class GPTQMarlinConfig(QuantizationConfig):
 
         if (weight_bits, is_sym) not in self.TYPE_MAP:
             raise ValueError(
-                "Unsupported quantization config: " f"bits={weight_bits}, sym={is_sym}"
+                f"Unsupported quantization config: bits={weight_bits}, sym={is_sym}"
             )
 
         # (num_bits, is_sym) -> quant_type
@@ -527,7 +527,6 @@ class GPTQLinearMethod(LinearMethodBase):
 
 
 class GPTQMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quant_config: GPTQConfig):
         super().__init__()
         self.quant_config = quant_config

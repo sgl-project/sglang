@@ -14,6 +14,9 @@ mod completions;
 mod models;
 mod reasoning;
 mod template;
+mod template_builtins;
+mod template_legacy;
+mod template_loader;
 mod tools;
 
 pub(super) use template::ChatFormatter;

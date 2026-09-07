@@ -32,7 +32,6 @@ DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 10
 
 
 class TestMemoryConsumptionAscend(CustomTestCase):
-
     def test_memory_consumption(self):
 
         model = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B-w8a8"

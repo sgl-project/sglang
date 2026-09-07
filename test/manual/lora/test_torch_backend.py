@@ -9,7 +9,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestTorchNativeLoRABackend(CustomTestCase):
-
     device = "cpu"
 
     # set duplicate weights to test merging during prepare_lora_batch

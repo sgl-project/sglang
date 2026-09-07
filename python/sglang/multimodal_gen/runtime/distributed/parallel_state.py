@@ -164,19 +164,45 @@ def _clear_srt_world_group() -> None:
 
 
 def _sync_srt_tp_group() -> None:
+    """Lend this package's TP group to `srt`, and state the widths it implies.
+
+    Shared `srt` layers run in this package and ask `get_parallel()` for how to
+    shard -- `srt/layers/attention/vision.py` reads `attn_tp_size`. The
+    published `srt` config cannot answer: `gpu_worker.py` publishes a dummy
+    carrying *this* package's `tp_size`, which a sequence-parallel launch sets
+    to 1 while the group lent here is as wide as the world. So the widths are
+    stamped alongside the group, as `srt.initialize_model_parallel` does.
+
+    Only tensor parallelism folds this way, so every other dimension is one.
+    """
     import sglang.srt.distributed.parallel_state as srt_parallel_state
+    from sglang.srt.runtime_context import derive_parallel_widths, get_parallel
 
     if srt_parallel_state._TP is None:
         srt_parallel_state._TP = _TP
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
+    if srt_parallel_state._ATTN_TP is _TP:
+        get_parallel().stamp_derived_widths(
+            **derive_parallel_widths(
+                tp_size=_TP.world_size,
+                attn_cp_size=1,
+                attn_dp_size=1,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                dcp_size=1,
+                dcp_enabled=False,
+            )
+        )
 
 
 def _clear_srt_tp_group() -> None:
     import sglang.srt.distributed.parallel_state as srt_parallel_state
+    from sglang.srt.runtime_context import get_parallel
 
     if srt_parallel_state._ATTN_TP is _TP:
         srt_parallel_state._ATTN_TP = None
+        get_parallel().clear_derived_widths()
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
 
@@ -298,7 +324,6 @@ def init_distributed_environment(
         )
 
         if timeout is not None:
-
             extra_args["timeout"] = datetime.timedelta(seconds=timeout)
             logger.info(f"Setting distributed timeout to {timeout} seconds")
 
@@ -325,9 +350,9 @@ def init_distributed_environment(
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(ranks, local_rank, backend)
     else:
-        assert (
-            _WORLD.world_size == torch.distributed.get_world_size()
-        ), "world group already initialized with a different world size"
+        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+            "world group already initialized with a different world size"
+        )
     _sync_srt_world_group()
 
 
@@ -648,12 +673,12 @@ def maybe_init_distributed_environment_and_model_parallel(
 
     if _WORLD is not None and model_parallel_is_initialized():
         # make sure the tp and sp sizes are correct
-        assert (
-            get_tp_world_size() == tp_size
-        ), f"You are trying to initialize model parallel groups with size {tp_size}, but they are already initialized with size {get_tp_world_size()}"
-        assert (
-            get_sp_world_size() == sp_size
-        ), f"You are trying to initialize model parallel groups with size {sp_size}, but they are already initialized with size {get_sp_world_size()}"
+        assert get_tp_world_size() == tp_size, (
+            f"You are trying to initialize model parallel groups with size {tp_size}, but they are already initialized with size {get_tp_world_size()}"
+        )
+        assert get_sp_world_size() == sp_size, (
+            f"You are trying to initialize model parallel groups with size {sp_size}, but they are already initialized with size {get_sp_world_size()}"
+        )
         return
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -705,11 +730,17 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
 
     The scope replaces the module globals that ``get_tp_group()`` and srt's
     ``get_tp_group()`` / ``get_attention_tp_group()`` read, and — like srt's
-    ``patch_tensor_parallel_group`` — the three members the runtime context
-    answers with, so that a size read from the published bag cannot disagree
-    with a rank read from the swapped group.
+    ``patch_tensor_parallel_group`` — the members the runtime context answers
+    with, so that a size read from the published bag cannot disagree with a rank
+    read from the swapped group.
+
+    The parallel quotients are part of that set: the published config describes
+    the launch (`tp=1` for a sequence-parallel run), not the group folded in
+    here. Left out, an encoder built in this scope keeps its heads whole on
+    `attn_tp_size == 1` while the `QKVParallelLinear` beside it shards on
+    `tp_size == 2`, and the weight loader narrows past the end of the tensor.
     """
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import derive_parallel_widths, get_parallel
 
     old_tp_group = get_tp_group()
     import sglang.srt.distributed.parallel_state as srt_parallel_state
@@ -725,6 +756,17 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
             tp_size=tp_group.world_size,
             tp_rank=tp_group.rank_in_group,
             tp_group=tp_group,
+            # Only tensor parallelism folds here, so every other dimension is
+            # one and the quotients come out of the shared derivation.
+            **derive_parallel_widths(
+                tp_size=tp_group.world_size,
+                attn_cp_size=1,
+                attn_dp_size=1,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                dcp_size=1,
+                dcp_enabled=False,
+            ),
         ):
             yield
     finally:
@@ -773,9 +815,9 @@ def is_the_same_node_as(
     memory system (shared access to shared memory).
     """
     if isinstance(pg, ProcessGroup):
-        assert (
-            torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
-        ), "in_the_same_node_as should be tested with a non-NCCL group."
+        assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
+            "in_the_same_node_as should be tested with a non-NCCL group."
+        )
         # local rank inside the group
         rank = torch.distributed.get_rank(group=pg)
         world_size = torch.distributed.get_world_size(group=pg)
@@ -933,9 +975,9 @@ def is_pipeline_last_stage() -> bool:
 
 # CFG
 def get_cfg_group() -> GroupCoordinator:
-    assert (
-        _CFG is not None
-    ), "classifier_free_guidance parallel group is not initialized"
+    assert _CFG is not None, (
+        "classifier_free_guidance parallel group is not initialized"
+    )
     return _CFG
 
 

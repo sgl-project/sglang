@@ -36,6 +36,7 @@ import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
 import sglang.multimodal_gen.runtime.models.dits.glm_image as glm_image
 import sglang.multimodal_gen.runtime.models.dits.longcat_image as longcat_image
 import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
+import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
 from sglang.kernels.ops.diffusion import (
     can_use_fused_layernorm_modulate,
@@ -47,11 +48,15 @@ from sglang.kernels.ops.diffusion import (
     mark_fused_ln_modulate_site,
     mark_hunyuan_qknorm_site,
     mark_ltx2_rms_norm_modulate_site,
+    mark_qwen_image_added_qkv_site,
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
     mount_ltx2_rms_norm_modulate,
+    mount_qwen_image_added_qkv,
+    try_flux2_token_cat_nvfp4,
     unmount_hunyuan_qknorm,
     unmount_ltx2_rms_norm_modulate,
+    unmount_qwen_image_added_qkv,
     wan_rmsnorm_silu,
 )
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
@@ -77,6 +82,7 @@ from sglang.multimodal_gen.runtime.models.dits.flux import (
     _flux_norm_modulate,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
+    _can_use_nvfp4_swiglu_quant_fusion,
     _flux2_norm_modulate,
     _flux2_swiglu,
 )
@@ -96,8 +102,11 @@ from sglang.multimodal_gen.runtime.models.dits.longcat_image import (
 )
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import _ltx2_rms_norm_modulate
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageCrossAttention,
     QwenImageTransformerBlock,
     _qwen_modulation_cache_key,
+    _qwen_norm_out,
+    _split_unquantized_merged_linear,
 )
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     _eager_ln_modulate as _sana_eager_ln_modulate,
@@ -105,14 +114,22 @@ from sglang.multimodal_gen.runtime.models.dits.sana import (
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     sana_ln_modulate,
 )
+from sglang.multimodal_gen.runtime.models.vaes import (
+    autoencoder_kl_qwenimage as qwen_vae,
+)
 from sglang.multimodal_gen.runtime.models.vaes import flux2_vae_cuda_opt as vae_opt
+from sglang.multimodal_gen.runtime.models.vaes import (
+    wan_vae_cuda_opt,
+)
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
     FusedWanRMSNormSiLU,
+    GatedChannelsLastUpsample,
     VaeFastPathGate,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -149,6 +166,81 @@ def test_bitexact_norm_guards_follow_platform():
     assert can_use_fused_layernorm_modulate(x, row, row) is is_cuda()
     assert can_use_fused_qk_head_layernorm(q, q) is is_cuda()
     assert can_use_fused_rmsnorm_scale_shift(x, weight, vec, vec) is is_cuda()
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image -- final LayerNorm + adaLN scale/shift
+# -------------------------------------------------------------------------
+
+
+@requires_inline_ptx
+def test_qwen_norm_out_matches_adaln_reference():
+    qwen_image._QWEN_NORM_OUT.disabled = False
+    qwen_image._QWEN_NORM_OUT.verified = False
+    qwen_image._QWEN_NORM_OUT_SIGS.clear()
+    torch.manual_seed(0)
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(
+            3072, 3072, elementwise_affine=False, eps=1e-6
+        )
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 257, 3072, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
+
+    expected = norm_out(hidden_states, conditioning)
+    actual = _qwen_norm_out(norm_out, hidden_states, conditioning)
+
+    assert torch.equal(actual, expected)
+    assert qwen_image._QWEN_NORM_OUT.verified
+    assert not qwen_image._QWEN_NORM_OUT.disabled
+
+
+def test_qwen_norm_out_preserves_compile_path(monkeypatch):
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(16, 16, elementwise_affine=False, eps=1e-6)
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 3, 16, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 16, device="cuda", dtype=torch.bfloat16)
+    expected = norm_out(hidden_states, conditioning)
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        qwen_image,
+        "fused_layernorm_modulate_raw",
+        lambda *args, **kwargs: pytest.fail("compile path must not dispatch kernel"),
+    )
+
+    assert torch.equal(_qwen_norm_out(norm_out, hidden_states, conditioning), expected)
+
+
+def test_qwen_norm_out_does_not_verify_during_graph_capture(monkeypatch):
+    qwen_image._QWEN_NORM_OUT.disabled = False
+    qwen_image._QWEN_NORM_OUT.verified = False
+    qwen_image._QWEN_NORM_OUT_SIGS.clear()
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(
+            3072, 3072, elementwise_affine=False, eps=1e-6
+        )
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 17, 3072, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
+    expected = norm_out(hidden_states, conditioning)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        qwen_image,
+        "fused_layernorm_modulate_raw",
+        lambda *args, **kwargs: pytest.fail("capture must not verify a new layout"),
+    )
+
+    assert torch.equal(_qwen_norm_out(norm_out, hidden_states, conditioning), expected)
+    assert not qwen_image._QWEN_NORM_OUT_SIGS
 
 
 # -------------------------------------------------------------------------
@@ -259,6 +351,11 @@ class TestFlux2EagerFusions(CustomTestCase):
         self.assertFalse(flux2._FLUX2_SWIGLU.disabled)
         self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 2)
 
+    def test_nvfp4_swiglu_quant_fusion_is_sm103_only(self):
+        self.assertFalse(_can_use_nvfp4_swiglu_quant_fusion(DeviceCapability(10, 0)))
+        self.assertTrue(_can_use_nvfp4_swiglu_quant_fusion(DeviceCapability(10, 3)))
+        self.assertFalse(_can_use_nvfp4_swiglu_quant_fusion(DeviceCapability(12, 0)))
+
     def test_fp16_preserves_reference_path(self):
         x = torch.randn(1, 17, 512, device="cuda", dtype=torch.float16)
         expected = F.silu(x[..., :256]) * x[..., 256:]
@@ -294,10 +391,102 @@ class TestFlux2EagerFusions(CustomTestCase):
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 1)
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+        reason="FLUX.2 token-cat NVFP4 requires Blackwell SM103",
+    )
+    def test_token_cat_nvfp4_matches_flashinfer(self):
+        import flashinfer
+
+        torch.manual_seed(20260830)
+        attention = torch.randn(1, 17, 6144, device="cuda", dtype=torch.bfloat16)
+        mlp = torch.randn(1, 17, 18432, device="cuda", dtype=torch.bfloat16)
+        global_scale = torch.tensor(0.625, device="cuda", dtype=torch.float32)
+
+        expected_fp4, expected_scales = flashinfer.fp4_quantize(
+            torch.cat([attention, mlp], dim=-1).view(-1, 24576), global_scale
+        )
+        actual = try_flux2_token_cat_nvfp4(attention, mlp, global_scale)
+
+        self.assertIsNotNone(actual)
+        actual_fp4, actual_scales = actual
+        self.assertTrue(torch.equal(actual_fp4, expected_fp4))
+        self.assertTrue(
+            torch.equal(
+                actual_scales.view(torch.uint8), expected_scales.view(torch.uint8)
+            )
+        )
+
+    def test_token_cat_nvfp4_falls_back_while_compiling(self):
+        attention = torch.empty(1, 1, 6144, device="cuda", dtype=torch.bfloat16)
+        mlp = torch.empty(1, 1, 18432, device="cuda", dtype=torch.bfloat16)
+        global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+
+        with patch("torch.compiler.is_compiling", return_value=True):
+            self.assertIsNone(try_flux2_token_cat_nvfp4(attention, mlp, global_scale))
+
 
 # -------------------------------------------------------------------------
 # Qwen-Image -- reuse timestep-only modulation across serial CFG branches
 # -------------------------------------------------------------------------
+
+
+class _PackedAddedQKV(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.output_partition_sizes = [dim, dim, dim]
+        self.quant_config = None
+        self.weight = nn.Parameter(
+            torch.randn(3 * dim, dim, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.bias = nn.Parameter(
+            torch.randn(3 * dim, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return F.linear(x, self.weight, self.bias), None
+
+
+def test_qwen_added_qkv_lossless_uses_three_reference_gemms():
+    torch.manual_seed(20260831)
+    dim = 64
+    x = torch.randn(1, 17, dim, device="cuda", dtype=torch.bfloat16)
+    packed = _PackedAddedQKV(dim)
+
+    attention = QwenImageCrossAttention.__new__(QwenImageCrossAttention)
+    nn.Module.__init__(attention)
+    attention.use_fused_added_qkv = True
+    attention._unquantized_added_qkv_is_packed = True
+    attention.to_added_qkv = packed
+    mark_qwen_image_added_qkv_site(attention)
+
+    expected_lossless = _split_unquantized_merged_linear(packed, x)
+    actual_lossless = attention._get_added_qkv_projections(x)
+    assert packed.calls == 0
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(actual_lossless, expected_lossless)
+    )
+
+    assert mount_qwen_image_added_qkv(attention)
+    actual_high = attention._get_added_qkv_projections(x)
+    expected_high = tuple(
+        tensor.contiguous()
+        for tensor in F.linear(x, packed.weight, packed.bias).chunk(3, dim=-1)
+    )
+    assert packed.calls == 1
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(actual_high, expected_high)
+    )
+
+    unmount_qwen_image_added_qkv(attention)
+    attention._get_added_qkv_projections(x)
+    assert packed.calls == 1
 
 
 class _CountingProjection(nn.Module):
@@ -869,6 +1058,154 @@ def test_wan_vae_rejects_empty_input() -> None:
     )
     gamma = torch.ones(96, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
     assert not can_use_wan_rmsnorm_silu(x, gamma, None)
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image VAE (Wan 2.1 VAE) -- lossless causal-conv data movement and the
+# quality-gated RMSNorm+SiLU / channels_last upsample fast path
+# -------------------------------------------------------------------------
+
+
+def _qwen_causal_conv(cin, cout, channels_last=True):
+    conv = qwen_vae.QwenImageCausalConv3d(cin, cout, 3, padding=1).to(
+        "cuda", torch.bfloat16
+    )
+    if channels_last:
+        conv.weight.data = conv.weight.data.to(memory_format=torch.channels_last_3d)
+    return conv
+
+
+@torch.no_grad()
+def test_qwen_vae_causal_conv_cat_pad_is_bit_exact() -> None:
+    # Fused cat + pad + relayout must reproduce the aten chain for no cache,
+    # a one-frame cache (partial zero fill) and a full two-frame cache.
+    torch.manual_seed(0)
+    conv = _qwen_causal_conv(8, 16)
+    ref = _qwen_causal_conv(8, 16, channels_last=False)
+    ref.load_state_dict(conv.state_dict())
+    x = _wan_cl3d((1, 8, 1, 12, 10), torch.bfloat16)
+    for cache_t in (0, 1, 2):
+        cache = _wan_cl3d((1, 8, cache_t, 12, 10), torch.bfloat16) if cache_t else None
+        # The reference is the eager chain on the same (channels_last) weights.
+        expected = nn.Conv3d.forward(
+            conv,
+            qwen_vae.causal_conv3d_cat_pad(x, cache, list(conv._padding)).contiguous(
+                memory_format=torch.channels_last_3d
+            ),
+        )
+        assert qwen_vae._fused_conv_cache_supported(conv, x)
+        assert torch.equal(conv(x, cache), expected)
+    # Contiguous weights take the original path unchanged.
+    assert not qwen_vae._fused_conv_cache_supported(ref, x)
+
+
+@torch.no_grad()
+def test_qwen_vae_run_cached_causal_conv_matches_eager_bookkeeping() -> None:
+    # Stream three single-frame chunks (the image decode shape, and the first
+    # chunks of a clip) through one conv slot on the fused and the eager path;
+    # outputs and cache contents must agree, including the "Rep" slot.
+    torch.manual_seed(0)
+    fused = _qwen_causal_conv(8, 8)
+    eager = _qwen_causal_conv(8, 8, channels_last=False)
+    eager.load_state_dict(fused.state_dict())
+    chunks = [_wan_cl3d((1, 8, 1, 6, 6), torch.bfloat16) for _ in range(3)]
+    for first in (None, "Rep"):
+        fused_cache, eager_cache = [first], [first]
+        for x in chunks:
+            out_f = qwen_vae._run_cached_causal_conv(fused, x, fused_cache, 0)
+            out_e = qwen_vae._run_cached_causal_conv(eager, x, eager_cache, 0)
+            assert torch.equal(out_f, out_e)
+            # The fused path only ever stores tensors that the eager path would
+            # also consume: same values, possibly wider (never narrower).
+            fc, ec = fused_cache[0], eager_cache[0]
+            assert fc.shape[2] >= ec.shape[2]
+            assert torch.equal(fc[:, :, -ec.shape[2] :], ec)
+
+
+@torch.no_grad()
+def test_qwen_vae_upsample_skips_fp32_round_trip_bit_exactly() -> None:
+    up = qwen_vae.QwenImageUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact")
+    x = torch.randn(1, 8, 12, 10, device="cuda", dtype=torch.bfloat16).contiguous(
+        memory_format=torch.channels_last
+    )
+    assert torch.equal(up(x), nn.Upsample.forward(up, x.float()).type_as(x))
+
+
+@torch.no_grad()
+def test_qwen_vae_gate_dispatch() -> None:
+    torch.cuda.manual_seed(0)
+    norm = qwen_vae.QwenImageRMS_norm(96, images=False).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    norm.gamma.add_(torch.randn_like(norm.gamma))
+    gate = VaeFastPathGate()
+    fused = FusedWanRMSNormSiLU(norm, gate)
+    assert [n for n, _ in fused.named_parameters()] == ["gamma"]
+    x = _wan_cl3d((1, 96, 1, 10, 14), torch.bfloat16)
+    assert torch.equal(fused(x), nn.SiLU()(norm(x)))
+    gate.enabled = True
+    expected = wan_rmsnorm_silu(x, norm.gamma, rms_scale=float(norm.scale))
+    assert torch.equal(fused(x), expected)
+
+
+@torch.no_grad()
+def test_qwen_vae_channels_last_upsample_keeps_layout() -> None:
+    gate = VaeFastPathGate()
+    up = GatedChannelsLastUpsample(
+        qwen_vae.QwenImageUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+        gate,
+    )
+    x5 = _wan_cl3d((1, 8, 1, 6, 6), torch.bfloat16)
+    x = x5.permute(0, 2, 1, 3, 4).reshape(1, 8, 6, 6)  # degenerate batch stride
+    ref = nn.Upsample(scale_factor=(2.0, 2.0), mode="nearest-exact")(x)
+    off = up(x)
+    assert torch.equal(off, ref) and off.is_contiguous()  # NCHW, as today
+    gate.enabled = True
+    on = up(x)
+    assert torch.equal(on, ref)
+    assert on.is_contiguous(memory_format=torch.channels_last)
+    assert on.stride() == (12 * 12 * 8, 1, 12 * 8, 8)
+
+
+@torch.no_grad()
+def test_qwen_vae_decoder_install_is_gated_and_close() -> None:
+    torch.manual_seed(0)
+    dec = qwen_vae.QwenImageDecoder3d(
+        dim=16, z_dim=4, dim_mult=[1, 1], num_res_blocks=1, temperal_upsample=[False]
+    ).to("cuda", torch.bfloat16)
+    for m in dec.modules():
+        if isinstance(m, nn.Conv3d):
+            m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
+    for p in dec.parameters():
+        p.add_(0.1 * torch.randn_like(p))
+    keys = set(dec.state_dict())
+    z = _wan_cl3d((1, 4, 1, 6, 6), torch.bfloat16)
+    ref = dec(z, feat_cache=[None] * 64, feat_idx=[0])
+
+    gate = VaeFastPathGate()
+    n_norm = wan_vae_cuda_opt._install_norm_silu(
+        dec,
+        gate,
+        residual_block_cls=qwen_vae.QwenImageResidualBlock,
+        rms_norm_cls=qwen_vae.QwenImageRMS_norm,
+        label="test",
+    )
+    n_up = wan_vae_cuda_opt._install_channels_last_upsample(
+        dec, gate, qwen_vae.QwenImageUpsample
+    )
+    # mid block (2 resnets) + 2 up blocks x (num_res_blocks + 1) resnets
+    # -> 6 resnets x 2 norms + norm_out; only the first up block upsamples.
+    assert n_norm == 13 and n_up == 1
+    assert set(dec.state_dict()) == keys
+    assert torch.equal(dec(z, feat_cache=[None] * 64, feat_idx=[0]), ref)
+    gate.enabled = True
+    out = dec(z, feat_cache=[None] * 64, feat_idx=[0])
+    assert out.shape == ref.shape
+    # Not bit-exact (fp32 statistics in the fused norm), but a bf16-rounding
+    # level perturbation: bound the relative error energy over the whole
+    # output rather than per element (random weights, unnormalised scale).
+    rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 2e-2, rel
 
 
 # -------------------------------------------------------------------------

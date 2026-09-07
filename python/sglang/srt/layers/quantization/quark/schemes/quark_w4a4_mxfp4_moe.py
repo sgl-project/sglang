@@ -78,7 +78,6 @@ OCP_MX_BLOCK_SIZE = 32
 
 
 class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
-
     def __init__(
         self,
         weight_config: dict[str, Any],
@@ -594,9 +593,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             else:
                 raise ValueError("Expected w13 or w2.")
 
-            assert (
-                current_loaded <= target_loaded_numel
-            ), f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
+            assert current_loaded <= target_loaded_numel, (
+                f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
+            )
 
             # Delay online quantization until all tensor shards (e.g. w1 and w3) are loaded, to avoid having to re-quantize later on.
             if is_w13 and layer._w13_loaded_numel == target_loaded_numel:
@@ -634,7 +633,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
             # Materialize FP8 parameters on first load from meta device. Adds a small but manageable overhead compared to materializing one by one - but weights are loaded in order layer by layer so it is fine.
             with layer._fp8_loading_lock:
-
                 if not layer._fp8_materialized:
                     # w13_weight
                     assert layer.w13_weight.device.type == "meta"

@@ -119,6 +119,55 @@ def make_indices(indices):
 
 
 class TestUMBPStore(unittest.TestCase):
+    def test_standalone_process_configuration(self):
+        from sglang.srt.mem_cache.storage.umbp import umbp_store
+
+        imported = list(umbp_store._import_umbp_client())
+        captured = []
+
+        def make_client(config):
+            captured.append(config)
+            client = MagicMock()
+            client.flush.return_value = True
+            return client
+
+        imported[0] = make_client
+        config = MockStorageConfig(
+            extra_config={
+                "standalone_address": "unix:///tmp/umbp-test.sock",
+                "standalone_auto_start": False,
+                "standalone_startup_timeout_ms": 1234,
+                "ssd_enabled": False,
+                "extra_backend_tag": "tenant-a",
+            }
+        )
+        with patch.object(
+            umbp_store, "_import_umbp_client", return_value=tuple(imported)
+        ):
+            store = umbp_store.UMBPStore(config, mem_pool_host=None)
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsNone(captured[0].distributed)
+        self.assertEqual(
+            captured[0].standalone_process.address, "unix:///tmp/umbp-test.sock"
+        )
+        self.assertFalse(captured[0].standalone_process.auto_start)
+        self.assertEqual(captured[0].standalone_process.startup_timeout_ms, 1234)
+        self.assertEqual(store.config_prefix, "tenant-a_test-model")
+        store.close()
+
+    def test_standalone_and_distributed_addresses_are_mutually_exclusive(self):
+        from sglang.srt.mem_cache.storage.umbp import umbp_store
+
+        config = MockStorageConfig(
+            extra_config={
+                "master_address": "127.0.0.1:1234",
+                "standalone_address": "unix:///tmp/umbp-test.sock",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            umbp_store.UMBPStore(config, mem_pool_host=None)
+
     def test_basic_set_get(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
@@ -326,6 +375,7 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
         store.is_mla_backend = True
         store.mla_suffix = ""
         store.mha_suffix = "0"
+        store.config_prefix = None
         store.register_mem_host_pool_v2(MockHybridSidePool(), PoolName.DEEPSEEK_V4_C4)
         return store
 
@@ -345,6 +395,7 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
                     spdk_proxy_tenant_quota_bytes=0,
                 )
                 self.distributed = None
+                self.standalone_process = None
 
             @classmethod
             def from_environment(cls):
@@ -363,6 +414,8 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
             FakeUMBPClient,
             FakeUMBPConfig,
             fake_role,
+            None,
+            None,
             None,
             None,
             None,

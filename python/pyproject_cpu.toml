@@ -109,6 +109,7 @@ test = [
   "pandas",
   "peft>=0.18.0",
   "sentence_transformers",
+  "sgl-eval==0.1.0",
 ]
 all = []
 dev = ["sglang[test]"]

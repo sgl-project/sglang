@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     RESIDENT,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -204,6 +206,22 @@ def test_loaded_weight_partition_admits_only_its_declared_tasks(partition, tasks
         metadata.canonical_task(rejected)
 
 
+def test_synthetic_warmup_target_honors_warmup_flags():
+    def target(num_frames=None, resolution=None):
+        width, height = map(int, (resolution or "896x512").split("x"))
+        req = SimpleNamespace(num_frames=17, width=width, height=height)
+        server_args = SimpleNamespace(
+            warmup_num_frames=num_frames,
+            warmup_resolutions=None if resolution is None else [resolution],
+        )
+        return MiniMaxH3SamplingParams._synthetic_warmup_target(req, server_args)
+
+    assert target() == TARGET
+    assert target(num_frames=345) == {**TARGET, "duration_seconds": 345 / 24.0}
+    assert target(resolution="768x1344") == {**TARGET, "aspect_ratio": "9:16"}
+    assert target(resolution="832x464") == TARGET
+
+
 def test_duration_admission_accepts_released_4_to_15_second_range():
     for duration in (4.0, 15.0):
         target = {**TARGET, "duration_seconds": duration}
@@ -296,6 +314,7 @@ def _quality_server_args():
         enable_breakable_cuda_graph=False,
         enable_torch_compile=False,
         is_dit_layerwise_offload_selected=False,
+        minimax_h3_adaln_online=False,
         performance_mode="speed",
         quantization=None,
         transformer_weights_path=None,
@@ -349,6 +368,61 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
         "Cache-DiT was requested but is disabled because breakable CUDA graphs "
         "are enabled."
     )
+
+
+def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va", "fl2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(metadata)
+    server_args = _quality_server_args()
+    server_args.minimax_h3_adaln_online = True
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(task="t2va", quality="lossless"),
+        num_inference_steps=50,
+        is_warmup=False,
+    )
+    with patch.dict(os.environ, {"SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": "8"}):
+        with pytest.raises(
+            ValueError, match="SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS"
+        ):
+            stage.forward(batch, server_args)
+
+        batch.num_inference_steps = 9
+        assert stage.forward(batch, server_args) is batch
+
+
+def test_extra_high_quality_does_not_enable_h3_cache_dit():
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
+    stage._cache_dit_enabled = False
+    stage._minimax_h3_cache_mode = None
+    stage._minimax_h3_quality = "lossless"
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            quality="extra-high",
+            _explicit_fields={"quality"},
+            enable_cache_dit=None,
+            cache_dit_params=None,
+        )
+    )
+
+    # Even a server-wide generic Cache-DiT default must not turn an explicit
+    # fusion-only quality tier into an approximate H3 request.
+    with patch.object(DenoisingStage, "_cache_dit_requested", return_value=True):
+        stage._maybe_enable_cache_dit(50, batch)
+
+    assert stage._minimax_h3_quality == "extra-high"
+    assert stage._minimax_h3_cache_mode is None
+    assert not stage._cache_dit_enabled
 
 
 def test_quality_admission_fails_closed_outside_validated_request():
@@ -405,6 +479,9 @@ def test_quality_admission_fails_closed_outside_validated_request():
     server_args.attention_backend = "sage_attn"
     assert stage.forward(batch, server_args) is batch
 
+    batch.sampling_params.quality = "extra-high"
+    assert stage.forward(batch, server_args) is batch
+
     batch.sampling_params.quality = "ultra"
     server_args.attention_backend = None
     with pytest.raises(ValueError, match="quality must be one of"):
@@ -435,6 +512,15 @@ def test_validate_server_args_requires_packed_varlen_backend():
     ):
         with pytest.raises(ValueError, match="does not implement packed varlen"):
             MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+    server_args.component_attention_backends = {"transformer": "cube_sparse_attn"}
+    server_args.resolve_component_attention_backend = lambda *_names: (
+        AttentionBackendEnum.CUBE_SPARSE_ATTN,
+        "transformer",
+    )
+    server_args.ring_degree = 2
+    with pytest.raises(ValueError, match="ring parallelism requires"):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 
 def test_validate_server_args_accepts_transformer_backend_override():

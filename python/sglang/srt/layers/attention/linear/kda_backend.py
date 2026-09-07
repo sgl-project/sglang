@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.linear.utils import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -151,7 +151,7 @@ class KDAKernelDispatcher:
             )
 
             cutedsl_kernel = CuteDSLKDAKernel()
-            if getattr(cutedsl_kernel, "supports_prefill", False):
+            if cutedsl_kernel.supports_prefill:
                 # SM100 chunk prefill pipeline.
                 self.extend_kernel = cutedsl_kernel
             else:
@@ -255,14 +255,17 @@ class KDAKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
-        kernel = self.decode_kernel
-        if kwargs.get("lower_bound") is not None and not getattr(
-            kernel, "supports_safe_gate", True
+        if lower_bound is not None and not isinstance(
+            self.decode_kernel, TritonKDAKernel
         ):
-            kernel = self.triton_kernel
-        return kernel.decode(
+            raise NotImplementedError(
+                f"lower_bound (safe gate) is only supported by TritonKDAKernel; "
+                f"got {self.decode_kernel.__class__.__name__}."
+            )
+        return self.decode_kernel.decode(
             q,
             k,
             v,
@@ -273,6 +276,7 @@ class KDAKernelDispatcher:
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            lower_bound=lower_bound,
             **kwargs,
         )
 
@@ -292,13 +296,20 @@ class KDAKernelDispatcher:
         intermediate_states_buffer: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
-        retrieve_parent_token: torch.Tensor,
+        retrieve_parent_token: Optional[torch.Tensor],
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         """MTP / speculative-decode verify, routed to ``self.verify_kernel``
         (FlashInfer decode -> recurrent_kda; Triton / CuTe DSL decode -> the Triton
         fused KDA verify)."""
+        if lower_bound is not None and not isinstance(
+            self.verify_kernel, TritonKDAKernel
+        ):
+            raise NotImplementedError(
+                "lower_bound (safe gate) target verify is only supported by "
+                f"TritonKDAKernel; got {self.verify_kernel.__class__.__name__}."
+            )
         return self.verify_kernel.target_verify(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -380,10 +391,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
 
-    # Read by decide_needs_cpu_seq_lens. Decode/verify metadata is GPU-only
-    # (graph replay already passes seq_lens_cpu=None), extend reads
-    # extend_seq_lens_cpu from schedule, mamba track indices rebuild from req
-    # objects, and the replayssm seq_lens_cpu force-flush is GDN-only.
+    # KDA gets graph padding explicitly and never uses ReplaySSM's host-seqlen
+    # force-flush path.
     needs_cpu_seq_lens: bool = False
 
     def __init__(self, model_runner: ModelRunner):
@@ -555,6 +564,92 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
 
+        deferred_f_b = bool(getattr(layer, "_k3_deferred_f_b", False))
+        if replayssm_d is None and deferred_f_b and is_gfx95_supported():
+            fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
+            fused_backend = getattr(layer, "_k3_hip_fused_decode_backend", "")
+            onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+            if fused_static is not None and onorm_gate is not None:
+                f_b_weight, norm_weight, norm_eps, a_log = fused_static
+                conv_state_view = conv_states.transpose(-1, -2)
+                output_gate = onorm_gate.view(
+                    onorm_gate.shape[0], layer.num_v_heads, layer.head_v_dim
+                )
+                out = mixed_qkv.new_empty(
+                    (1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim)
+                )
+                if fused_backend == "aiter" and kda_fused_decode_aiter_hip.covered(
+                    a,
+                    f_b_weight,
+                    mixed_qkv,
+                    b,
+                    conv_state_view,
+                    ssm_states,
+                    cache_indices,
+                    output_gate,
+                    norm_weight,
+                ):
+                    core_attn_out = kda_fused_decode_aiter_hip.run(
+                        f_a=a,
+                        f_b_weight=f_b_weight,
+                        mixed_qkv=mixed_qkv,
+                        conv_weight=layer.conv_weights,
+                        conv_state=conv_state_view,
+                        raw_beta=b,
+                        A_log=a_log,
+                        dt_bias=layer.dt_bias,
+                        lower_bound=float(layer.lower_bound),
+                        state=ssm_states,
+                        state_indices=cache_indices,
+                        output_gate=output_gate,
+                        norm_weight=norm_weight,
+                        norm_eps=norm_eps,
+                        out=out,
+                    )
+                else:
+                    core_attn_out = None
+                    if not getattr(KDAAttnBackend, "_hip_fused_reject_logged", False):
+                        KDAAttnBackend._hip_fused_reject_logged = True
+                        rank0_log(
+                            "K3 HIP fused KDA rejected: "
+                            f"backend={fused_backend}, "
+                            f"f_a={tuple(a.shape)}/{a.dtype}/{a.stride()}, "
+                            f"mixed={tuple(mixed_qkv.shape)}/{mixed_qkv.dtype}/"
+                            f"{mixed_qkv.stride()}, beta={tuple(b.shape)}/{b.dtype}/"
+                            f"{b.stride()}, conv={tuple(conv_state_view.shape)}/"
+                            f"{conv_state_view.dtype}/{conv_state_view.stride()}, "
+                            f"state={tuple(ssm_states.shape)}/{ssm_states.dtype}/"
+                            f"{ssm_states.stride()}, indices={cache_indices.dtype}/"
+                            f"{cache_indices.stride()}, gate={tuple(output_gate.shape)}/"
+                            f"{output_gate.dtype}/{output_gate.stride()}, "
+                            f"norm={norm_weight.dtype}/{norm_weight.stride()}"
+                        )
+
+                if core_attn_out is not None:
+                    layer._k3_onorm_consumed = True
+                    self._track_mamba_state_decode(
+                        forward_batch,
+                        conv_states,
+                        ssm_states,
+                        cache_indices,
+                        layer.layer_id,
+                    )
+                    return core_attn_out
+
+            # The model deferred f_b only after publishing static fallback
+            # weights. Materialize the original gate before entering the
+            # unchanged conv + packed-KDA fallback chain.
+            from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm
+
+            if fused_static is None:
+                raise RuntimeError("K3 deferred f_b is missing fallback weights")
+            a = kimi_k3_tiny_gemm(
+                a,
+                fused_static[0].view(
+                    layer.num_v_heads * layer.head_v_dim, layer.head_v_dim
+                ),
+            )
+
         # Fully fused decode step: conv1d update + delta-rule recurrence +
         # gated RMSNorm in one kernel. Engages only when the model handed off
         # the output-norm gate for this forward (attempt-and-verify stash,
@@ -635,9 +730,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             conv_state_indices=cache_indices,
         )
 
-        # The packed kernel assumes one token per request. Assert the dispatch
-        # invariant before taking the fused path.
-        if self.kernel_dispatcher.supports_packed_decode:
+        # The packed kernel assumes one token per request.
+        if (
+            self.kernel_dispatcher.supports_packed_decode
+            and getattr(layer, "lower_bound", None) is None
+        ):
             assert qkv.shape[0] == cache_indices.shape[0], (
                 "KDA packed decode requires one token per sequence (T=1): "
                 f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."
@@ -719,6 +816,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
+        physical_num_tokens = mixed_qkv.shape[0]
+        logical_num_tokens = int(query_start_loc[-1])
+        if logical_num_tokens < physical_num_tokens:
+            mixed_qkv = mixed_qkv[:logical_num_tokens]
+            a = a[:, :logical_num_tokens]
+            b = b[:, :logical_num_tokens]
+
         if self.forward_metadata.has_mamba_track_mask:
             # Snapshot the conv sliding window at the last track-aligned chunk
             # boundary into the ping-pong track slots (the prefix-cache restore
@@ -729,54 +833,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
-        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
-            splits, dim=0
-        )
-        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
-        if layer.bias is not None:
-            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
-        else:
-            q_bias, k_bias, v_bias = None, None, None
-
-        q = causal_conv1d_fn(
-            q,
-            q_conv_weight,
-            q_bias,
+        # Depthwise conv is channel-independent, so one packed call over the
+        # full qkv width matches the decode path and saves two kernel launches.
+        qkv = causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
             activation="silu",
-            conv_states=q_conv_state,
+            conv_states=conv_states,
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
-        k = causal_conv1d_fn(
-            k,
-            k_conv_weight,
-            k_bias,
-            activation="silu",
-            conv_states=k_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        v = causal_conv1d_fn(
-            v,
-            v_conv_weight,
-            v_bias,
-            activation="silu",
-            conv_states=v_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+
+        gate_was_flat = a.ndim == 3
+        if gate_was_flat:
+            a = a.unflatten(-1, (-1, layer.head_k_dim))
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
         core_attn_out = self.kernel_dispatcher.extend(
@@ -791,6 +869,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
+            beta_is_raw=gate_was_flat,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
@@ -811,6 +890,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, self.forward_metadata
             )
+
+        if logical_num_tokens < physical_num_tokens:
+            pad = core_attn_out.new_zeros(
+                (1, physical_num_tokens - logical_num_tokens)
+                + tuple(core_attn_out.shape[2:])
+            )
+            core_attn_out = torch.cat((core_attn_out, pad), dim=1)
 
         if (
             self.accept_lens_pool is not None

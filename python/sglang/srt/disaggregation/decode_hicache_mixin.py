@@ -71,13 +71,15 @@ class DecodeHiCachePreallocMixin:
         l3_storage_hit_length = 0
         last_host_node = None
         if self.scheduler.enable_decode_hicache:
-            last_host_node = self.tree_cache.resolve_node_handle(result.last_host_node)
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+            last_host_node = result.last_host_node
+            if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
+                last_host_node
+            ):
                 matched_len = l1_prefix_len + l2_host_hit_length
                 suffix_tokens = req.origin_input_ids[matched_len:]
-                last_hash = last_host_node.get_last_hash_value()
+                last_hash = self.tree_cache.get_last_hash_value(last_host_node)
                 prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
+                    self.tree_cache.get_prefix_hash_values(last_host_node)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
@@ -112,14 +114,13 @@ class DecodeHiCachePreallocMixin:
         ):
             return
         try:
-            node = self.tree_cache.resolve_node_handle(prefix_match.last_host_node)
             matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
             suffix = req.origin_input_ids[
                 matched_len : matched_len + prefix_match.l3_storage_hit_length
             ]
-            last_hash = node.get_last_hash_value()
+            last_hash = self.tree_cache.get_last_hash_value(prefix_match.last_host_node)
             prefix_keys = (
-                node.get_prefix_hash_values(node.parent)
+                self.tree_cache.get_prefix_hash_values(prefix_match.last_host_node)
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )

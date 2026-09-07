@@ -160,7 +160,6 @@ class GPTQMarlinLinearKernel:
             layer: torch.nn.Module, name: Optional[str], fn: Callable
         ) -> None:
             if name is not None and getattr(layer, name, None) is not None:
-
                 old_param = getattr(layer, name)
                 new_param = fn(old_param)
                 # replace the parameter with torch.nn.Parameter for TorchDynamo

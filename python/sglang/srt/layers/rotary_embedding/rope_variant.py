@@ -235,9 +235,9 @@ class FourierRotaryEmbedding(nn.Module):
                 / self.rotary_dim
             )
         )
-        assert (
-            inv_freq[:-1] > inv_freq[1:]
-        ).all(), "Expected inv_freq to be in decreasing order"
+        assert (inv_freq[:-1] > inv_freq[1:]).all(), (
+            "Expected inv_freq to be in decreasing order"
+        )
         inv_freq_idx_selected = torch.ones_like(inv_freq, dtype=torch.bool)
         if self.num_inv_freq is not None:
             inv_freq_idx_selected[self.num_inv_freq :] = False
@@ -302,9 +302,9 @@ class FourierRotaryEmbedding(nn.Module):
             dtype=query.dtype
         )
         cos, sin = cos_sin.chunk(2, dim=-1)
-        assert (
-            query.dim() == key.dim() == 3
-        ), "Expected query key (seq_len, heads, head_dim)"
+        assert query.dim() == key.dim() == 3, (
+            "Expected query key (seq_len, heads, head_dim)"
+        )
         assert cos.dim() <= 3 and sin.dim() <= 3
         need_reshape = False
         if cos.dim() == 3:
@@ -535,7 +535,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,
@@ -581,7 +580,6 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 
 
 class Llama4VisionRotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,

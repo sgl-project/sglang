@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=400, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=446, stage="extra-b", runner_config="4-gpu-h100")
 
 # FP8 variant of Qwen3-30B-A3B: required because DeepEP normal/LL fast paths in
 # ep_moe/layer.py only run for {Fp8Config (via deep_gemm), W4AFp8Config, aiter,
@@ -160,14 +160,14 @@ class TestReturnRoutedExperts(CustomTestCase):
             captured_baseline_experts, captured_reference_experts
         )
         logger.info(
-            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
+            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches / num_baseline_topks:.4%})"
         )
         print(
-            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
+            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches / num_baseline_topks:.4%})"
         )
-        assert (
-            num_mismatches / num_baseline_topks < 0.10
-        ), f"Too many mismatches: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
+        assert num_mismatches / num_baseline_topks < 0.10, (
+            f"Too many mismatches: {num_mismatches} out of {num_baseline_topks} ({num_mismatches / num_baseline_topks:.4%})"
+        )
 
     @classmethod
     def _collect_results(

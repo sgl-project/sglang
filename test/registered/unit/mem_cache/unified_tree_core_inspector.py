@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType, EvictLa
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
     UnifiedLRUList,
     UnifiedTreeCore,
+    _InsertPhase,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
@@ -194,6 +195,15 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
     def update_duplicate_tracking(self, node_id: NodeId) -> None:
         """Refresh duplicate-host tracking for the node."""
         self._update_duplicate_tracking(self.node_by_id(node_id))
+
+    def advance_insert_walk_once(self) -> None:
+        """Advance one suspended insert walk step without flushing its actions."""
+        state = self._ongoing_insert_walk_state
+        if state is None:
+            raise RuntimeError("no in-flight insert")
+        if state.phase is not _InsertPhase.WALK:
+            raise RuntimeError("in-flight insert is not in walk phase")
+        self._insert_walk_step(state)
 
     def evict_component(
         self,

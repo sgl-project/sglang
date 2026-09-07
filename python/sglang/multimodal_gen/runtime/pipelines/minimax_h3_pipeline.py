@@ -170,4 +170,17 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
 
-EntryClass = MiniMaxH3Pipeline
+class FastH3Pipeline(MiniMaxH3Pipeline):
+    """FastH3: 4-step DMD2-distilled MiniMax-H3 (t2va only).
+
+    The flat single-partition repo is materialized into the base-H3 layout by
+    the bundled model overlay (see model_overlays/), so every stage, loader,
+    and admission path below is exactly the MiniMax-H3 one. There is no
+    FL2VA/Ref2VA partition layout to default into.
+    """
+
+    pipeline_name = "FastH3Pipeline"
+    default_model_subfolder = None
+
+
+EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline]

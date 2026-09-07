@@ -180,6 +180,27 @@ def mla_quantize_and_rope_for_fp8(
     return q_out, k_nope_out, k_rope_out
 
 
+def mla_quantize_for_fp8_no_rope(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    attn_dtype = torch.float8_e4m3fn
+    q_len, num_heads = q_rope.shape[:2]
+    q_out = q_rope.new_empty(
+        q_len,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=attn_dtype,
+    )
+    q_out[..., :kv_lora_rank] = q_nope.to(attn_dtype)
+    q_out[..., kv_lora_rank:] = q_rope.to(attn_dtype)
+    return q_out, k_nope.to(attn_dtype), k_rope.to(attn_dtype)
+
+
 def mla_quantize_without_rope_for_fp8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,

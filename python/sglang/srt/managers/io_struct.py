@@ -105,6 +105,12 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
         return msgspec_struct_pydantic_core_schema(cls, handler)
 
 
+class MMInputsProcessError(msgspec.Struct, frozen=True):
+    """Request-local multimodal input failure produced after tokenizer fanout."""
+
+    message: str
+
+
 class BeamSearchOutput(BaseBatchReq, kw_only=True):
     sequences: List[BeamSearchSequence]
 
@@ -2045,6 +2051,13 @@ class AbortReq(BaseReq, kw_only=True):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+
+class EncoderDispatchErrorReq(BaseReq, kw_only=True):
+    """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
+
+    error_msg: str
+    error_code: int
 
 
 class ActiveRanksOutput(BaseReq, kw_only=True):

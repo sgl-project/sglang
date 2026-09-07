@@ -60,9 +60,9 @@ def _metadata_out(
         )
     for name, shape, dtype in spec:
         t = out[name]
-        assert (
-            tuple(t.shape) == shape and t.dtype == dtype and t.is_contiguous()
-        ), f"{name}: got {tuple(t.shape)}/{t.dtype}, want {shape}/{dtype} contiguous"
+        assert tuple(t.shape) == shape and t.dtype == dtype and t.is_contiguous(), (
+            f"{name}: got {tuple(t.shape)}/{t.dtype}, want {shape}/{dtype} contiguous"
+        )
     return out
 
 
@@ -1173,9 +1173,9 @@ def save_intermediate_conv_windows(
 
     if hidden_states.dim() == 2:
         hidden_states = hidden_states.view(batch_size, -1, hidden_states.shape[-1])
-    assert (
-        hidden_states.dim() == 3
-    ), f"unexpected hidden_states shape {hidden_states.shape}"
+    assert hidden_states.dim() == 3, (
+        f"unexpected hidden_states shape {hidden_states.shape}"
+    )
     assert hidden_states.shape[0] == batch_size
     assert hidden_states.shape[2] == D
     assert intermediate_out.shape[1] == draft_token_num

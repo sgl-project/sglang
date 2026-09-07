@@ -223,9 +223,9 @@ class CompressorHip(_CompressorBase):
             assert kv_compressed.dtype == torch.float32
 
             freqs_cis = self.freqs_cis[beg_idx : end_idx : self.ratio]
-            assert freqs_cis.size(0) == kv_compressed.size(
-                0
-            ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
+            assert freqs_cis.size(0) == kv_compressed.size(0), (
+                f"{freqs_cis.shape=} {kv_compressed.shape=}"
+            )
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
             )

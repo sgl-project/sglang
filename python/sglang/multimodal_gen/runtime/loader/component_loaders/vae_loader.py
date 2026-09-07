@@ -5,9 +5,11 @@ import os
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
+from safetensors.torch import safe_open
 from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -15,16 +17,18 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
-    ComponentLoader,
     NativeComponentLoaderRequired,
+    WeightOverrideComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     _normalize_component_type,
+    adopt_plain_weight_norm_state,
     checkpoint_bytes,
+    initialize_model,
     keep_checkpoint_mapped,
+    load_model_state_dict,
     set_default_torch_dtype,
-    skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -43,8 +47,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_decode_precision,
 )
 from sglang.multimodal_gen.runtime.weights.source import (
-    materialize_weight,
-    resolve_weight,
+    filter_duplicate_precision_variant_safetensors,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.model_loader.checkpoint_quantization import (
@@ -53,6 +56,7 @@ from sglang.srt.model_loader.checkpoint_quantization import (
 
 logger = init_logger(__name__)
 VAE_CHANNELS_LAST_3D_ENV = "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D"
+_VAE_CHECKPOINT_ARCH_METADATA = ("latents_mean", "latents_std")
 
 
 def _require_native_loader_for_quantized_vae(
@@ -279,19 +283,64 @@ def _hold_decoder_weights_in_decode_dtype(
         )
 
 
-def _match_checkpoint_dtypes(loaded: dict, target_state: dict) -> dict:
-    """Convert checkpoint tensors whose dtype differs from their parameter's.
+def _vae_checkpoint_arch_metadata_names(
+    vae_config: VAEConfig,
+    target_state: dict[str, torch.Tensor],
+) -> tuple[str, ...]:
+    arch_values = vars(vae_config.arch_config)
+    return tuple(
+        name
+        for name in _VAE_CHECKPOINT_ARCH_METADATA
+        if name not in target_state and name in arch_values
+    )
 
-    Assignment replaces the parameter rather than writing through it, so a
-    mismatched dtype would silently change the module's. Converting makes a
-    copy, which is the point: only the tensors that already match can stay on
-    the mapping.
-    """
-    for name, tensor in list(loaded.items()):
-        param = target_state.get(name)
-        if param is not None and param.dtype != tensor.dtype:
-            loaded[name] = tensor.to(dtype=param.dtype)
-    return loaded
+
+def _consume_vae_checkpoint_arch_metadata(
+    loaded: dict[str, torch.Tensor],
+    vae_config: VAEConfig,
+    target_state: dict[str, torch.Tensor],
+) -> tuple[str, ...]:
+    """Move checkpoint-carried latent statistics into the VAE config."""
+    arch_values = vars(vae_config.arch_config)
+    consumed = []
+    for name in _vae_checkpoint_arch_metadata_names(vae_config, target_state):
+        tensor = loaded.get(name)
+        if tensor is None:
+            continue
+        if tensor.ndim != 1:
+            raise ValueError(
+                f"VAE checkpoint metadata {name!r} must be one-dimensional, "
+                f"got shape {tuple(tensor.shape)}"
+            )
+        arch_values[name] = tensor.tolist()
+        del loaded[name]
+        consumed.append(name)
+    if consumed:
+        vae_config.post_init()
+    return tuple(consumed)
+
+
+def _vae_checkpoint_tensor_names(weight_files: list[str]) -> set[str]:
+    names: set[str] = set()
+    for path in weight_files:
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            names.update(checkpoint.keys())
+    return names
+
+
+def _log_vae_checkpoint_adaptations(
+    num_deparameterized: int, consumed_metadata: tuple[str, ...]
+) -> None:
+    if num_deparameterized:
+        logger.info(
+            "VAE: adopted %d deparameterized weight-normalized layers",
+            num_deparameterized,
+        )
+    if consumed_metadata:
+        logger.info(
+            "VAE: loaded architecture metadata from checkpoint: %s",
+            ", ".join(consumed_metadata),
+        )
 
 
 def _direct_gpu_vae_state_slots(
@@ -342,15 +391,24 @@ def _assign_direct_gpu_vae_state(
     *,
     component_name: str,
     device: torch.device,
-) -> None:
+    vae_config: VAEConfig,
+) -> tuple[int, tuple[str, ...]]:
     """Stream a complete standard VAE state directly onto its target device."""
+    num_deparameterized = adopt_plain_weight_norm_state(
+        vae, _vae_checkpoint_tensor_names(weight_files)
+    )
     target_state, slots = _direct_gpu_vae_state_slots(vae, component_name)
+    metadata_names = _vae_checkpoint_arch_metadata_names(vae_config, target_state)
     loaded_names: set[str] = set()
+    metadata: dict[str, torch.Tensor] = {}
     with torch.no_grad():
         for raw_name, tensor in safetensors_weights_iterator(
             weight_files, to_cpu=device.type == "cpu"
         ):
             name = raw_name
+            if name in metadata_names:
+                metadata[name] = tensor
+                continue
             if name in loaded_names:
                 raise ComponentCheckpointUnsupportedError(
                     f"Direct GPU VAE checkpoint maps multiple tensors to {name!r}"
@@ -379,6 +437,9 @@ def _assign_direct_gpu_vae_state(
                 module._buffers[local_name] = tensor
             loaded_names.add(name)
 
+    consumed_metadata = _consume_vae_checkpoint_arch_metadata(
+        metadata, vae_config, target_state
+    )
     missing = sorted(set(slots) - loaded_names)
     if missing:
         raise ComponentCheckpointUnsupportedError(
@@ -391,19 +452,24 @@ def _assign_direct_gpu_vae_state(
         raise RuntimeError(
             f"Direct GPU VAE loading left meta tensors: {remaining_meta}"
         )
+    return num_deparameterized, consumed_metadata
 
 
-class VAELoader(ComponentLoader):
+class VAELoader(WeightOverrideComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
-    supports_direct_gpu_weight_loading = True
 
-    def supports_direct_gpu_weight_loading_for_component(
-        self, component_name: str
+    def resolve_component_direct_gpu_loading(
+        self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        return component_name in ("vae", "video_vae")
+        requested = server_args.should_direct_gpu_weight_load_component(component_name)
+        if requested and component_name not in ("vae", "video_vae"):
+            raise ComponentCheckpointUnsupportedError(
+                f"Direct GPU loading is not implemented for {component_name!r}"
+            )
+        return requested
 
     def select_weight_files(
         self,
@@ -424,25 +490,6 @@ class VAELoader(ComponentLoader):
         self, server_args: ServerArgs, component_name: str
     ) -> str | None:
         return server_args.component_precisions.get(component_name)
-
-    @staticmethod
-    def resolve_model_weights_path(
-        component_model_path: str,
-        server_args: ServerArgs,
-        component_name: str,
-    ) -> str:
-        weights_override = getattr(server_args, "component_weights_paths", {}).get(
-            component_name
-        )
-        if weights_override is None:
-            return component_model_path
-        model_weights_path = materialize_weight(resolve_weight(weights_override))
-        logger.info(
-            "Using weight-file override for %s: %s",
-            component_name,
-            model_weights_path,
-        )
-        return model_weights_path
 
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
@@ -467,14 +514,10 @@ class VAELoader(ComponentLoader):
         cpu_offload_flag: bool = False,
     ):
         """Load the VAE based on the model path, and inference args."""
-        direct_gpu_weight_loading = server_args.should_direct_gpu_weight_load_component(
-            component_name
+        direct_gpu_weight_loading = self.resolve_component_direct_gpu_loading(
+            server_args, component_name
         )
-        if direct_gpu_weight_loading and component_name not in ("vae", "video_vae"):
-            raise ComponentCheckpointUnsupportedError(
-                f"Direct GPU loading is not implemented for {component_name!r}"
-            )
-        component_weights_path = self.resolve_model_weights_path(
+        component_weights_path = self.resolve_component_weights_path(
             component_model_path,
             server_args,
             component_name,
@@ -490,9 +533,9 @@ class VAELoader(ComponentLoader):
         )
 
         class_name = config.pop("_class_name", None)
-        assert (
-            class_name is not None
-        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        assert class_name is not None, (
+            "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        )
 
         component_type = self.structural_component_type(component_name)
         if component_type in ("vae", "video_vae"):
@@ -526,12 +569,16 @@ class VAELoader(ComponentLoader):
 
         auto_map = config.get("auto_map", {})
         auto_model_map = auto_map.get("AutoModel")
-        if direct_gpu_weight_loading and auto_model_map:
+        if direct_gpu_weight_loading and auto_model_map and not native_only:
             raise ComponentCheckpointUnsupportedError(
                 f"Direct GPU loading for {component_name!r} requires a native "
                 "ModelRegistry VAE; custom Diffusers auto_map code is unsupported"
             )
-        if auto_model_map and component_weights_path != component_model_path:
+        if (
+            auto_model_map
+            and not native_only
+            and component_weights_path != component_model_path
+        ):
             raise ComponentCheckpointUnsupportedError(
                 f"{component_name!r} uses a custom Diffusers class that cannot "
                 "consume a weights-only override"
@@ -567,21 +614,15 @@ class VAELoader(ComponentLoader):
             return vae
 
         # Load from ModelRegistry (standard VAE classes)
-        if direct_gpu_weight_loading:
-            with (
-                set_default_torch_dtype(vae_dtype),
-                skip_init_modules(),
-                torch.device("meta"),
-            ):
-                vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-                vae = vae_cls(vae_config)
-        else:
-            with (
-                set_default_torch_dtype(vae_dtype),
-                skip_init_modules(),
-            ):
-                vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-                vae = vae_cls(vae_config).to(target_device)
+        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        vae = initialize_model(
+            vae_cls,
+            {"config": vae_config},
+            vae_dtype,
+            torch.device("meta") if direct_gpu_weight_loading else None,
+        )
+        if not direct_gpu_weight_loading:
+            vae = vae.to(target_device)
 
         if os.path.isfile(component_weights_path):
             if not component_weights_path.endswith(".safetensors"):
@@ -591,7 +632,11 @@ class VAELoader(ComponentLoader):
                 )
             safetensors_list = [component_weights_path]
         else:
-            safetensors_list = _list_safetensors_files(component_weights_path)
+            # VAE configs may explicitly choose a precision variant, so their
+            # selector must run before the canonical fallback.
+            safetensors_list = _list_safetensors_files(
+                component_weights_path, raw_candidates=True
+            )
             safetensors_list = self.select_weight_files(
                 safetensors_list,
                 component_weights_path,
@@ -599,17 +644,22 @@ class VAELoader(ComponentLoader):
                 component_name,
                 vae_precision,
             )
+            safetensors_list = filter_duplicate_precision_variant_safetensors(
+                safetensors_list
+            )
 
-        assert (
-            len(safetensors_list) >= 1
-        ), f"Found no safetensors files in {component_weights_path}"
+        assert len(safetensors_list) >= 1, (
+            f"Found no safetensors files in {component_weights_path}"
+        )
         if direct_gpu_weight_loading:
-            _assign_direct_gpu_vae_state(
+            adaptations = _assign_direct_gpu_vae_state(
                 vae,
                 safetensors_list,
                 component_name=component_name,
                 device=target_device,
+                vae_config=vae_config,
             )
+            _log_vae_checkpoint_adaptations(*adaptations)
             if _should_use_channels_last_3d(server_args, component_name):
                 n = _convert_conv3d_weights_to_channels_last_3d(vae)
                 if n > 0:
@@ -623,6 +673,12 @@ class VAELoader(ComponentLoader):
         for sf_path in safetensors_list:
             loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
+        num_deparameterized = adopt_plain_weight_norm_state(vae, loaded)
+        target_state = vae.state_dict()
+        consumed_metadata = _consume_vae_checkpoint_arch_metadata(
+            loaded, vae_config, target_state
+        )
+        _log_vae_checkpoint_adaptations(num_deparameterized, consumed_metadata)
         strict_load = native_only
         # `loaded` holds views into the safetensors mapping. When the component
         # starts on the CPU and the host cannot afford copies of the whole
@@ -647,9 +703,8 @@ class VAELoader(ComponentLoader):
                 component=f"{component_name or 'vae'} (VAE)",
             )
         )
-        if keep_mapping:
-            _match_checkpoint_dtypes(loaded, vae.state_dict())
-        vae.load_state_dict(
+        load_model_state_dict(
+            vae,
             loaded,
             strict=strict_load,
             assign=keep_mapping,

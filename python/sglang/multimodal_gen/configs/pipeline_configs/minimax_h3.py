@@ -260,6 +260,21 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             )
         if selected_backend is None:
             return
+        if selected_backend is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+            if server_args.ring_degree > 1:
+                raise ValueError(
+                    "VSA-H3 does not support --ring-degree > 1; use Ulysses "
+                    "sequence parallelism."
+                )
+            if (
+                server_args.enable_torch_compile
+                or server_args.enable_breakable_cuda_graph
+            ):
+                raise ValueError(
+                    "VSA-H3 builds per-step tile metadata eagerly and is not "
+                    "validated under torch.compile or the breakable CUDA "
+                    "graph; disable them or use --attention-backend fa."
+                )
         get_attn_backend(
             self.dit_config.arch_config.attention_head_dim,
             torch.bfloat16,
@@ -279,4 +294,28 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return safetensors_list
 
 
-__all__ = ["MiniMaxH3PipelineConfig"]
+@dataclass
+class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
+    """FastH3: 4-step VSA-distilled MiniMax-H3, t2va only."""
+
+    def __post_init__(self) -> None:
+        self.dit_config.arch_config.has_gate_compress = True
+
+    def validate_quality_deployment(self, server_args) -> None:
+        raise ValueError(
+            'quality="high" is audited only for the base MiniMax-H3 50-step '
+            "4xH200 deployment; the FastH3 4-step distilled checkpoint has no "
+            'audited high-quality deployment. Use quality="lossless".'
+        )
+
+    def validate_server_args(self, server_args) -> None:
+        if server_args.model_variant is not None:
+            raise ValueError(
+                "FastH3 ships one t2va-distilled weight partition; "
+                "--model-variant does not apply. FL2VA and Ref2VA tasks were "
+                "not distilled; use MiniMaxAI/MiniMax-H3 for those."
+            )
+        super().validate_server_args(server_args)
+
+
+__all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]

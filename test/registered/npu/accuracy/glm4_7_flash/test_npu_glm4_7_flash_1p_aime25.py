@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=6500,
-    suite="nightly-acc-2-npu-a3",
+    suite="full-acc-2-npu-a3",
     nightly=True,
 )
 
@@ -57,7 +57,6 @@ OTHER_ARGS = [
 
 
 class TestNPUGLM_4_7_FLASH_1P_AIME25(TestNpuAccuracyTestCaseBase):
-
     model = GLM_4_7_FLASH_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
