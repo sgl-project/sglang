@@ -925,6 +925,12 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def supports_draft_extend_cuda_graph(self) -> bool:
+        # FlashAttentionBackend declares support, but the musa draft-extend
+        # graph path has not been validated; keep the pre-capability behavior
+        # (eager draft-extend).
+        return False
+
 
 class MusaFlashAttentionMultiStepBackend(FlashAttentionMultiStepBackend):
     def __init__(

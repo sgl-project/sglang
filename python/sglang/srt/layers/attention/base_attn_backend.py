@@ -136,6 +136,16 @@ class AttentionBackend(ABC):
         :py:meth:`init_forward_metadata_out_graph` call."""
         return False
 
+    def supports_draft_extend_cuda_graph(self) -> bool:
+        """True when this backend supports capture under the EAGLE worker's
+        draft-extend (DRAFT_EXTEND_V2) CUDA graph runner.
+
+        Metadata is still rebuilt eagerly via
+        :py:meth:`init_forward_metadata_out_graph` before every replay, so this
+        only requires the backend's DRAFT_EXTEND_V2 kernels to be capturable
+        against the static buffers from :py:meth:`init_cuda_graph_state`."""
+        return False
+
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
