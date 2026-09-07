@@ -56,10 +56,6 @@ def _make_model_nextn(vocab_size: int, hidden_size: int):
     model.rot_weight = None
     model.alt_stream = None
     model.quant_config = None
-    model.cp_rank = None
-    model.cp_size = None
-    model.dsa_enable_prefill_cp = False
-    model.mla_enable_prefill_cp = False
     model.mtp_block = MagicMock(side_effect=lambda **kw: (kw["hidden_states"], None))
     return model
 
@@ -96,9 +92,6 @@ class TestDeepseekNextNMmEmbed(CustomTestCase):
         object.__setattr__(model, "embed_tokens", mock_embed)
 
         with (
-            patch(
-                "sglang.srt.models.deepseek_nextn.is_cp_v2_active", return_value=False
-            ),
             patch(
                 "sglang.srt.models.deepseek_nextn.dsa_use_prefill_cp",
                 return_value=False,
@@ -164,9 +157,6 @@ class TestDeepseekNextNMmEmbed(CustomTestCase):
         embed_calls = mock_embed.call_args_list
 
         with (
-            patch(
-                "sglang.srt.models.deepseek_nextn.is_cp_v2_active", return_value=False
-            ),
             patch(
                 "sglang.srt.models.deepseek_nextn.dsa_use_prefill_cp",
                 return_value=False,
