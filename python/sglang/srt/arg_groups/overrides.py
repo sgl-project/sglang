@@ -1667,6 +1667,49 @@ def _speculative_moe_runner_default(view: Any) -> dict:
 
 
 @register_post_process
+def _nvfp4_speculative_attention_mode(view: Any) -> dict:
+    """Route NVFP4 speculative attention through the native FP4 decode path.
+
+    FlashInfer prefill reads NVFP4 through a host-prepared FP8 dequant workspace.
+    TARGET_VERIFY and DRAFT_EXTEND_V2 intentionally do not carry the CPU prefix
+    metadata that workspace needs, and the host preparation cannot be replayed
+    by a CUDA graph. TRTLLM MHA already supports these fixed-width multi-token
+    forwards as decode, so make that routing part of the resolved configuration.
+    """
+    if (
+        getattr(view, "kv_cache_dtype", None) != "nvfp4"
+        or getattr(view, "speculative_algorithm", None) is None
+    ):
+        return {}
+
+    prefill_backend, decode_backend = attention_backends_of(view)
+    if prefill_backend != "flashinfer" or decode_backend != "trtllm_mha":
+        raise ValueError(
+            "NVFP4 KV cache with speculative decoding requires "
+            "--prefill-attention-backend flashinfer and "
+            "--decode-attention-backend trtllm_mha; got "
+            f"prefill={prefill_backend!r}, decode={decode_backend!r}."
+        )
+
+    draft_backend = getattr(view, "speculative_draft_attention_backend", None)
+    draft_kv_dtype = getattr(view, "speculative_draft_kv_cache_dtype", None)
+    if draft_kv_dtype is None and draft_backend not in (None, "trtllm_mha"):
+        raise ValueError(
+            "A speculative draft inheriting the target NVFP4 KV cache requires "
+            "--speculative-draft-attention-backend trtllm_mha when explicitly "
+            f"set; got draft={draft_backend!r}."
+        )
+
+    if view.speculative_attention_mode != "decode":
+        logger.info(
+            "NVFP4 KV cache routes speculative verify and draft-extend through "
+            "the TRTLLM MHA native FP4 decode path "
+            "(speculative_attention_mode=decode)."
+        )
+    return {"speculative_attention_mode": "decode"}
+
+
+@register_post_process
 def _gguf_quantization(view: Any) -> dict:
     from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 

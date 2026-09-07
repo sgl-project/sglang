@@ -2695,6 +2695,17 @@ class MHATokenToKVPool(KVCache):
         k_fp4, v_fp4, k_scales, v_scales = self.get_raw_kv_buffer(layer_id)
         dq_k, dq_v = self.get_dequant_workspace()
 
+        if (
+            req_pool_indices_cpu is None
+            or extend_prefix_lens_cpu is None
+            or extend_seq_lens_cpu is None
+        ):
+            raise RuntimeError(
+                "FlashInfer FP4 extend dequantization requires CPU request, "
+                "prefix-length, and extend-length metadata. Speculative verify "
+                "and draft-extend must use a native FP4 decode backend instead."
+            )
+
         cur_batch_start_loc_cpu = 0
         cur_token_idx_dq = page_size
 

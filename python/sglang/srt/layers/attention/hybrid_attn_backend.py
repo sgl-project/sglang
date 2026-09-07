@@ -72,19 +72,17 @@ class HybridAttnBackend(AttentionBackend):
 
         Note:
             - decode_or_idle: Always uses decode backend
-            - target_verify: Uses decode backend if speculative_attention_mode is "decode", otherwise prefill backend
+            - target_verify/draft_extend_v2: Use decode backend if
+              speculative_attention_mode is "decode", otherwise prefill backend
             - prefill: Always uses prefill backend
         """
         if forward_mode.is_decode_or_idle():
             return self.decode_backend
-        elif forward_mode.is_target_verify():
-            return (
-                self.decode_backend
-                if self.spec_attn_is_decode
-                else self.prefill_backend
-            )
-        else:
-            return self.prefill_backend
+        if self.spec_attn_is_decode and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+        ):
+            return self.decode_backend
+        return self.prefill_backend
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return self._select_backend(fm).shared_read_ends(fm)
