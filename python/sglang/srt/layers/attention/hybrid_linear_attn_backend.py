@@ -244,6 +244,11 @@ class MambaAttnBackendBase(AttentionBackend):
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
+                # extend_start_loc / extend_seq_lens are the device cumsum and
+                # H2D copy of the host list that forward_batch.extend_seq_lens_cpu
+                # mirrors (ForwardBatch.init_new, compute_position), so this
+                # query_start_loc and that list describe the same boundaries;
+                # the KDA blocked extend relies on that without a device sync.
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
                 )
