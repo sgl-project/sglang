@@ -23,6 +23,11 @@ export const benchmarks = [
   },
   { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
+  {
+    match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+    sglang_version: "dev @ fec770ad42",
+    accuracy: { mmmu_pro_pct: 76.71 },
+    notes: "4×H200, TP=4. Accuracy: MMMU-Pro (sgl-eval, 1730 examples, single-shot, thinking on), stop rate 99.19%, truncated 0.81%, error 0%. Also validated on this cell: GSM8K 97.35% (stop rate 100%), eager mode (--disable-cuda-graph), streaming reasoning split, structured output, auto parser resolution (reasoning + tool-call → ling3). Speed numbers pending.",
+  },
   { match: { hw: "h100", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
 ];

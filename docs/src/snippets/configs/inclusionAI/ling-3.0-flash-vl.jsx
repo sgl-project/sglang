@@ -131,7 +131,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
