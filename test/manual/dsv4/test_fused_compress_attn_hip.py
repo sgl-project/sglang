@@ -264,7 +264,6 @@ def _ref_compress(
 
 
 class TestFusedCompressAttn(unittest.TestCase):
-
     def _run_test(
         self,
         ratio: int,
@@ -397,7 +396,6 @@ class TestFusedCompressAttn(unittest.TestCase):
 
 
 class TestStateOrdering(unittest.TestCase):
-
     def test_write_then_compress(self):
         """Verify write-first, compress-second matches reference."""
         device = torch.device("cuda")

@@ -229,7 +229,9 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
         ab_stages=(
             _MIN_AB_STAGES
             if k <= 2 * _CTA_K and m > 8
-            else min(max_stages, 6) if k <= 4 * _CTA_K else max_stages
+            else min(max_stages, 6)
+            if k <= 4 * _CTA_K
+            else max_stages
         ),
     )
     validate_tactic(tactic, m, n, k)

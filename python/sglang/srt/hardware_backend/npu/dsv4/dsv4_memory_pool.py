@@ -549,9 +549,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         if from_indexer:
             assert ratio == 4, f"indexer only on c4 layers, got ratio={ratio}"
             if device_type == "npu":
-                assert (
-                    self.c4_indexer_kv_pool.has_npu_storage
-                ), "NPU index buffers not allocated — pool was init'd on CUDA?"
+                assert self.c4_indexer_kv_pool.has_npu_storage, (
+                    "NPU index buffers not allocated — pool was init'd on CUDA?"
+                )
                 self.c4_indexer_kv_pool.set_index_k_scale(
                     compress_layer_id, loc, kv, kv_scale
                 )

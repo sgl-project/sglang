@@ -72,9 +72,9 @@ class EVSEmbeddingResult(EmbeddingResult):
             input_ids, filler_token_id
         )
         input_ids = input_ids[extend_prefix_len : extend_prefix_len + extend_seq_len]
-        assert (
-            len(input_ids) == extend_seq_len
-        ), f"Input ids length changed after redistribution, got {len(input_ids)} != {extend_seq_len}"
+        assert len(input_ids) == extend_seq_len, (
+            f"Input ids length changed after redistribution, got {len(input_ids)} != {extend_seq_len}"
+        )
         return input_ids, offsets
 
 
@@ -84,9 +84,9 @@ class EVSConfig:
     spatial_merge_size: int = 1
 
     def __post_init__(self):
-        assert (
-            self.video_pruning_rate >= 0.0 and self.video_pruning_rate < 1.0
-        ), f"Video pruning rate must be between 0.0 and 1.0, got {self.video_pruning_rate=}"
+        assert self.video_pruning_rate >= 0.0 and self.video_pruning_rate < 1.0, (
+            f"Video pruning rate must be between 0.0 and 1.0, got {self.video_pruning_rate=}"
+        )
 
 
 class EVS(torch.nn.Module, ABC):

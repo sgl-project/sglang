@@ -256,9 +256,7 @@ class InductorAdaptor(CompilerInterface):
                             break
                 return inductor_compiled_graph
 
-            hijacked_compile_fx_inner = (
-                torch._inductor.compile_fx.compile_fx_inner
-            )  # noqa
+            hijacked_compile_fx_inner = torch._inductor.compile_fx.compile_fx_inner  # noqa
         elif torch_release >= (2, 6):
             # function renamed in 2.6
             original_load_name = None

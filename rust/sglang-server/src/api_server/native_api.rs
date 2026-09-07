@@ -196,7 +196,7 @@ async fn generate(
     State(state): State<Arc<AppState>>,
     body: Result<Json<GenerateBody>, JsonRejection>,
 ) -> Response {
-    let body = match body {
+    let mut body = match body {
         Ok(Json(body)) => body,
         // A body that fails to parse has no readable `stream` flag, so this one
         // can only answer unary — as Python's does (FastAPI rejects before its
@@ -206,6 +206,15 @@ async fn generate(
         }
     };
     let stream = body.stream;
+    if let Some(preferred) = &state.server_args.preferred_sampling_params
+        && let Err(error) = body.apply_preferred_sampling(&preferred.0)
+    {
+        return native_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error.to_string(),
+            stream,
+        );
+    }
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
     let (mut payloads, is_batch) = match body.into_requests() {
@@ -223,7 +232,10 @@ async fn generate(
     let timing = RequestTiming::new();
     // Media I/O (URL downloads, file reads) happens here, on the API runtime
     // — never on the MM worker pool (see `prefetch`).
-    if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
+    if let Err(e) =
+        super::prefetch::prefetch_all(&mut payloads, &state.server_args.limit_mm_data_per_request)
+            .await
+    {
         return native_error(StatusCode::BAD_REQUEST, &e, stream);
     }
     if !is_batch {

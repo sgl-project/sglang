@@ -82,13 +82,23 @@ def create_mla_kv_page_table_for_dcp(
     req_pool_indices_ptr,
     local_seq_lens_ptr,
     block_kv_indices_ptr,
+    v2p_ptr,  # in: [num_pages + 1] int64 -- virtual->physical page table
     req_to_token_stride: tl.constexpr,
     block_table_stride: tl.constexpr,
+    mult,  # runtime: kernel_page_multiplier of the target sub-pool
     PHYSICAL_PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
+    HAS_V2P: tl.constexpr,
 ):
+    """This rank's cyclic slice of each request, as a page table.
+
+    ``HAS_V2P`` picks the id space the emitted page number is in: the
+    DCP-collapsed page IS physical on a static pool, and still VIRTUAL under
+    the unified memory pool, where it takes one more gather through ``v2p_ptr``
+    and a ``mult`` scale to reach the per-layer views.
+    """
     req = tl.program_id(0)
     page_block = tl.program_id(1)
     page_offsets = page_block * PAGES_PER_BLOCK + tl.arange(0, PAGES_PER_BLOCK)
@@ -102,10 +112,16 @@ def create_mla_kv_page_table_for_dcp(
         mask=mask,
         other=0,
     )
-    physical_pages = virtual_locs // DCP_SIZE // PHYSICAL_PAGE_SIZE
+    pages = virtual_locs // DCP_SIZE // PHYSICAL_PAGE_SIZE
+    if HAS_V2P:
+        # A `-1` in req_to_token and a freed (`-1`) v2p row both clamp to entry
+        # 0, the reserved padding page.
+        pages = tl.where(virtual_locs < 0, 0, pages)
+        physical = tl.load(v2p_ptr + pages, mask=mask, other=0)
+        pages = tl.maximum(physical * mult, 0)
     tl.store(
         block_kv_indices_ptr + req * block_table_stride + page_offsets,
-        physical_pages,
+        pages.to(tl.int32),
         mask=mask,
     )
 

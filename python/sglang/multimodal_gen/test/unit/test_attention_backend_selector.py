@@ -227,15 +227,25 @@ class TestAttentionBackendFallback(unittest.TestCase):
 
         self.assertIs(backend, _FakeFABackend)
 
-    def test_explicit_dense_mismatch_fails_closed(self):
-        with self.assertRaisesRegex(
-            ValueError, "not supported by this attention layer"
-        ):
+    def test_explicit_backend_is_not_rejected_by_automatic_selection_set(self):
+        backend = self._resolve(
+            AttentionBackendEnum.AITER,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+        )
+
+        self.assertIs(backend, _FakeAITERBackend)
+        self.assertEqual(_FakePlatform.selected_backend, AttentionBackendEnum.AITER)
+
+    def test_explicit_backend_still_fails_missing_capability(self):
+        with self.assertRaisesRegex(ValueError, "packed varlen attention"):
             self._resolve(
                 AttentionBackendEnum.AITER,
                 explicit=True,
                 is_cross_attention=False,
                 supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+                attention_requirements=AttentionRequirements(packed_varlen=True),
             )
 
     def test_explicit_global_backend_uses_component_default(self):
@@ -244,6 +254,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
             explicit=True,
             is_cross_attention=False,
             supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            attention_requirements=AttentionRequirements(packed_varlen=True),
             default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
         )
 
@@ -258,24 +269,24 @@ class TestAttentionBackendFallback(unittest.TestCase):
             explicit=True,
             is_cross_attention=False,
             supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            attention_requirements=AttentionRequirements(packed_varlen=True),
             allow_global_backend_fallback=True,
         )
 
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
-    def test_explicit_component_backend_remains_strict(self):
-        with self.assertRaisesRegex(
-            ValueError, "not supported by this attention layer"
-        ):
-            self._resolve(
-                AttentionBackendEnum.FA,
-                explicit=True,
-                is_cross_attention=False,
-                supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
-                component_backend=AttentionBackendEnum.AITER,
-                allow_global_backend_fallback=True,
-            )
+    def test_explicit_component_backend_ignores_automatic_selection_set(self):
+        backend = self._resolve(
+            AttentionBackendEnum.FA,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            component_backend=AttentionBackendEnum.AITER,
+            allow_global_backend_fallback=True,
+        )
+
+        self.assertIs(backend, _FakeAITERBackend)
 
     def test_explicit_component_backend_is_consumed(self):
         backend = self._resolve(
@@ -310,16 +321,15 @@ class TestAttentionBackendFallback(unittest.TestCase):
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
-    def test_sparse_backend_mismatch_fails_for_self_attention(self):
-        with self.assertRaisesRegex(
-            ValueError, "not supported by this attention layer"
-        ):
-            self._resolve(
-                AttentionBackendEnum.LASER_ATTN,
-                explicit=True,
-                is_cross_attention=False,
-                supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
-            )
+    def test_explicit_sparse_backend_is_admitted_for_self_attention(self):
+        backend = self._resolve(
+            AttentionBackendEnum.LASER_ATTN,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+        )
+
+        self.assertIs(backend, _FakeSparseBackend)
 
 
 class TestComponentAttentionBackendScope(unittest.TestCase):

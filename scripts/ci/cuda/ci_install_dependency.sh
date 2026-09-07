@@ -8,6 +8,9 @@ set -euxo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
+# shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
+source "${SCRIPT_DIR}/../utils/git_clone_with_retry.sh"
+
 # ---------------------------------------------------------------------------
 # Timing helper
 # ---------------------------------------------------------------------------
@@ -133,6 +136,18 @@ cleanup_stale_shm() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+is_apt_package_installed() {
+    local name
+    # Ubuntu 24.04 renamed time64 libraries (librdmacm1 -> librdmacm1t64);
+    # apt-get follows the Provides alias, dpkg -l does not.
+    for name in "$1" "${1}t64"; do
+        if dpkg -l "$name" 2>/dev/null | grep -q "^ii"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 install_apt_packages() {
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
@@ -149,7 +164,7 @@ install_apt_packages() {
     local pkg
     local -a MISSING_APT_PACKAGES=()
     for pkg in "${CI_APT_PACKAGES[@]}"; do
-        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || MISSING_APT_PACKAGES+=("$pkg")
+        is_apt_package_installed "$pkg" || MISSING_APT_PACKAGES+=("$pkg")
     done
 
     if [ ${#MISSING_APT_PACKAGES[@]} -eq 0 ]; then
@@ -207,9 +222,7 @@ install_gdrcopy() {
         done
     }
 
-    rm -rf "${gdrcopy_root}"
-    git clone --branch "v${gdrcopy_version}" --depth 1 \
-        https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}"
+    git_clone_with_retry https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}" "--branch v${gdrcopy_version}"
     (
         cd "${gdrcopy_root}/packages"
         CUDA=/usr/local/cuda ./build-deb-packages.sh
@@ -726,8 +739,6 @@ stabilize_flashinfer_jit_paths() {
 install_extra_deps() {
     MOONCAKE_VERSION="0.3.13"
     NIXL_VERSION="1.3.0"
-    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
-    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -763,12 +774,9 @@ install_extra_deps() {
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
-    $PIP_CMD install "$SGL_EVAL_SPEC" $PIP_INSTALL_SUFFIX
-
     if [ "$IS_BLACKWELL" != "1" ]; then
-        git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-        $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
-        # lmms-eval v0.5 pulls antlr4-python3-runtime==4.7.2, clobbering the
+        $PIP_CMD install "lmms_eval==0.5.0" $PIP_INSTALL_SUFFIX
+        # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
         $PIP_CMD install "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
@@ -785,14 +793,6 @@ install_test_tools() {
     [ -e "${HOME}/.cache/sglang" ] && [ ! -d "${HOME}/.cache/sglang" ] && rm -f "${HOME}/.cache/sglang"
     mkdir -p "${HOME}/.cache/sglang/"
     mv python/kernels.lock "${HOME}/.cache/sglang/" || true
-
-    # Install human-eval (subshell keeps cd local)
-    $PIP_CMD install "setuptools==70.0.0" $PIP_INSTALL_SUFFIX
-    [ -d human-eval ] || git clone https://github.com/merrymercy/human-eval.git
-    (
-        cd human-eval
-        $PIP_CMD install -e . --no-build-isolation $PIP_INSTALL_SUFFIX
-    )
 
     mark_step_done "${FUNCNAME[0]}"
 }
