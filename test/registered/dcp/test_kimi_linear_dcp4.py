@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=240, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=105, stage="extra-b", runner_config="4-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 CUDA_GRAPH_MAX_BS_DECODE = 256

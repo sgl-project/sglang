@@ -82,7 +82,7 @@ class MlxTpModelWorker(TpModelWorker):
             MlxModelRunnerStub,
         )
 
-        MlxModelRunnerStub.validate_startup_weight_load_mode(self.server_args)
+        MlxModelRunnerStub.validate_startup_weight_load_mode()
 
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 

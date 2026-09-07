@@ -1021,7 +1021,7 @@ def _prefetch_all_checkpoints(
     succeeded_event = threading.Event()
     errors: List[Tuple[str, Exception]] = []
 
-    logger.info(
+    logger.debug(
         "Rank %d: prefetching %d/%d checkpoint shards into page cache "
         "(background, %d local ranks sharing the work, %d threads per rank)...",
         local_rank,
@@ -1042,7 +1042,7 @@ def _prefetch_all_checkpoints(
             if total_for_rank > 0 and next_log_pct <= 100:
                 pct = 100 * completed / total_for_rank
                 while pct >= next_log_pct and next_log_pct <= 100:
-                    logger.info(
+                    logger.debug(
                         "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
                         local_rank,
                         next_log_pct,
@@ -1093,7 +1093,7 @@ def _prefetch_all_checkpoints(
         start = time.perf_counter()
         _prefetch_all()
         succeeded_event.set()
-        logger.info(
+        logger.debug(
             "Rank %d: prefetching checkpoint files into page cache finished in %.2fs",
             local_rank,
             time.perf_counter() - start,
@@ -1571,11 +1571,18 @@ def row_parallel_weight_loader(
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
+def sharded_weight_loader(
+    shard_axis: int,
+    tp_rank_getter=None,
+) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_parallel().attn_tp_rank
+        tp_rank = (
+            tp_rank_getter()
+            if tp_rank_getter is not None
+            else get_parallel().attn_tp_rank
+        )
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
