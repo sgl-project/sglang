@@ -1098,6 +1098,30 @@ class TestContextParallelServerArgs(CustomTestCase):
 
 
 class TestPortArgs(unittest.TestCase):
+    # These cases are about how names and ports are *derived*. Two things in
+    # `init_new` reach the host's port table instead, and neither is what is
+    # under test:
+    #
+    # * `nccl_port=None` sends it to `get_free_port()`, which binds an
+    #   ephemeral socket;
+    # * the DP-attention path calls `wait_port_available()` on each derived
+    #   port -- fixed numbers like 30000 + ZMQ_TCP_PORT_DELTA -- and that binds
+    #   to check and waits up to SGLANG_WAIT_PORT_TIMEOUT (30s) before raising.
+    #
+    # So anything holding one of those ports, a leftover server from another
+    # test run included, fails a test that never meant to ask. Both are pinned
+    # here; `network.py` is where their real behaviour is covered.
+    FREE_PORT = 41234
+
+    def setUp(self):
+        for target, kwargs in (
+            ("sglang.srt.server_args.get_free_port", {"return_value": self.FREE_PORT}),
+            ("sglang.srt.server_args.wait_port_available", {"return_value": True}),
+        ):
+            patcher = patch(target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):
         mock_temp_file.return_value.name = "temp_file"
@@ -1176,7 +1200,7 @@ class TestPortArgs(unittest.TestCase):
             port_args.scheduler_input_ipc_name.startswith("tcp://127.0.0.1:")
         )
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://127.0.0.1:"))
-        self.assertIsInstance(port_args.nccl_port, int)
+        self.assertEqual(port_args.nccl_port, self.FREE_PORT)
 
     def test_init_new_with_dp_rank(self):
         server_args = ServerArgs(model_path="dummy")
