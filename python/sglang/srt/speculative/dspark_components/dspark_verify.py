@@ -211,8 +211,7 @@ class TargetVerifyExecutor:
                 (num_dummy_tokens,), dtype=torch.int64, device=device
             ),
             draft_token_num=self.verify_num_draft_tokens,
-            # DSPARK verify is always the linear gamma+1 chain (it asserts eagle_topk in
-            # {None, 1}); only DFLASH's selector tree widens this.
+            # DSPARK verify is always a chain.
             topk=1,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -260,7 +259,7 @@ class TargetVerifyExecutor:
             draft_token=verify_ids_2d.reshape(-1),
             positions=positions_2d.reshape(-1),
             draft_token_num=verify_w,
-            # DSPARK verify is always the linear gamma+1 chain; see the idle-dummy note above.
+            # DSPARK verify is always a chain.
             topk=1,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -374,7 +373,7 @@ class TargetVerifyExecutor:
             draft_token=ragged_window.verify_ids,
             positions=ragged_window.positions,
             draft_token_num=self.verify_num_draft_tokens,
-            # DSPARK verify is always the linear gamma+1 chain; see the idle-dummy note above.
+            # DSPARK verify is always a chain.
             topk=1,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,

@@ -32,7 +32,10 @@ _GET_SPEC = "sglang.srt.runtime_context.get_spec"
 def _spec(*, tree_width):
     return mock.patch(
         _GET_SPEC,
-        return_value=SimpleNamespace(speculative_dflash_tree_width=tree_width),
+        return_value=SimpleNamespace(
+            speculative_algorithm="DFLASH",
+            speculative_dflash_tree_width=tree_width,
+        ),
     )
 
 

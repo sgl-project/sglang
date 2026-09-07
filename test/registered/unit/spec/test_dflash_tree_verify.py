@@ -1,14 +1,4 @@
-"""Wiring checks for DFLASH tree verify, one layer below the server.
-
-The gate this file exists to hold is the width-1 equivalence: a width-1 beam *is*
-the chain DFLASH has always drafted, so the tree accept must return the same
-tokens as the chain accept for the same inputs. The end-to-end version of that
-check needs two server launches; this one runs on tensors and can stay in CI.
-
-The rest covers what width 1 structurally cannot: the two places where the tree's
-"r-th accepted token" and "node r" diverge, both of which fail silently (wrong
-mamba state, wrong draft KV) rather than raising.
-"""
+"""Test DFLASH tree verification wiring and chain equivalence."""
 
 import sys
 
@@ -28,15 +18,13 @@ from sglang.srt.speculative.dflash_worker_v2 import _commit_accept
 from sglang.srt.speculative.spec_utils import verify_commit_step_indices
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# `verify_tree_greedy` and the tree-meta kernel are CUDA-only in this build, and the
-# equivalence claim is about the shipped kernels, not a reimplementation of them.
+# These tests cover CUDA-only verification kernels.
 register_cuda_ci(est_time=2, stage="base-b", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the verify kernels need a device"
 )
 
-# block_size 8 is what the DFlash 2 checkpoint resolves to.
 BLOCK_SIZE = 8
 PREFIX_LENS = torch.tensor([13, 5], dtype=torch.int64)
 
@@ -48,12 +36,7 @@ def _chain_parents(*, bs, block_size):
 
 
 def _mask_scratch(*, prefix_lens, num_nodes):
-    """The buffers `build_tree_verify_input` writes the flat mask into.
-
-    Production passes the attention backend's own captured buffer so verify reads the
-    mask in place; a test only needs something at least as large, because the row
-    offsets are computed on device from `prefix_lens` either way.
-    """
+    """Return test buffers for the device-side full mask writer."""
     return {
         "mask_buffer": torch.zeros(
             num_nodes * int((prefix_lens + num_nodes).sum()),
@@ -75,11 +58,7 @@ def _logits_from_predictions(target_predict):
 
 
 def _equivalence_case():
-    """Three requests covering the accept-length boundaries: partial, none, all.
-
-    The chain rule is `candidates[:, 1:] == target_predict[:, :-1]` consecutively,
-    so each row is built by choosing where that equality first breaks.
-    """
+    """Return partial, empty, and full acceptance cases."""
     candidates = torch.tensor(
         [
             [100, 101, 102, 103, 999, 105, 106, 107],
@@ -100,10 +79,7 @@ def _equivalence_case():
 
 
 def test_width_one_tree_accept_matches_the_chain():
-    """The gate. A width-1 beam is the chain, so both accepts must commit the same
-    run: same length, same tokens, same bonus (the next block's anchor). Breaks on a
-    transposed mask, an off-by-one in the link derivation, a wrong `out_tokens`
-    stride, or a bonus read at the wrong offset."""
+    """Width-one tree acceptance must match chain acceptance."""
     candidates, target_predict = _equivalence_case()
     bs = candidates.shape[0]
     prefix_lens = torch.tensor([13, 5, 21], dtype=torch.int64)
@@ -112,8 +88,6 @@ def test_width_one_tree_accept_matches_the_chain():
         candidates=candidates.cuda(), target_predict=target_predict.cuda()
     )
     chain_out, chain_commit = _commit_accept(candidates.cuda(), chain_len, chain_bonus)
-    # Guards the fixture itself: if every row accepted the same amount the
-    # comparison below would pass without discriminating anything.
     assert chain_commit.cpu().tolist() == [4, 1, 8]
 
     verify_input = build_tree_verify_input(
@@ -142,10 +116,7 @@ def test_width_one_tree_accept_matches_the_chain():
 
 
 def test_width_one_accept_index_is_the_identity_chain():
-    """The first diagnostic to reach for when the gate above goes red: on a chain the
-    accepted nodes must be node 0, 1, 2, ... of each request's own block, so
-    `accept_index` is `bs_idx * N + arange`. A tree-shaped bug shows up here before it
-    shows up in the tokens."""
+    """Width-one accept indices must be the identity chain."""
     candidates, target_predict = _equivalence_case()
     bs = candidates.shape[0]
     prefix_lens = torch.tensor([13, 5, 21], dtype=torch.int64)
@@ -172,12 +143,7 @@ def test_width_one_accept_index_is_the_identity_chain():
 
 
 def test_predict_stays_in_vocabulary_where_accept_index_pads():
-    """`compute_spec_logprobs` gathers through the whole `accept_index`, pad included,
-    and -1 resolves to `predict[-1]` instead of raising. So every slot of `predict`
-    must hold a valid token id even where no node was accepted -- an uninitialized
-    buffer here is a device-side assert in the logprob gather, and only for requests
-    that accept fewer tokens than the tree is deep. Turns red if `predict` goes back
-    to `torch.empty`."""
+    """Padded accept indices must gather valid prediction tokens."""
     candidates, target_predict = _equivalence_case()
     bs = candidates.shape[0]
     prefix_lens = torch.tensor([13, 5, 21], dtype=torch.int64)
@@ -195,20 +161,15 @@ def test_predict_stays_in_vocabulary_where_accept_index_pads():
         verify_input=verify_input, next_token_logits=logits, bs=bs
     )
 
-    # The fixture's second request accepts 1 of 8, so the pad is populated.
     assert (accepted.accept_index == -1).any()
     padded_reads = accepted.predict[accepted.accept_index.to(torch.int64).reshape(-1)]
     assert int(padded_reads.min()) >= 0
     assert int(padded_reads.max()) < logits.shape[-1]
 
 
-# --- What width 1 cannot cover: the two places node index != accepted depth. ---
-
-# A width-2 beam over block_size 8: 15 nodes, depth d holds nodes 2d-1 and 2d.
+# An off-spine accepted path exercises node/depth differences.
 TREE_WIDTH = 2
 VERIFY_WIDTH = 1 + (BLOCK_SIZE - 1) * TREE_WIDTH
-# root -> node 2 -> node 4: an accepted path that leaves the spine, so no node index
-# equals its depth. -1 pads the depths past the accepted run.
 OFF_SPINE_ACCEPT = [0, 2, 4] + [-1] * (BLOCK_SIZE - 3)
 
 
@@ -220,9 +181,7 @@ def _off_spine_accept_index(*, bs):
 
 
 def _fixed_width_parents(*, block_size, tree_width):
-    """A valid fixed-width tree: depth 1 hangs off the root, and each deeper depth
-    spreads its `tree_width` nodes over the previous depth's nodes round-robin. BFS
-    ordered, so `node_parents[i] < i`, which is what the beam walk promises."""
+    """Build a valid BFS-ordered fixed-width tree."""
     parents = [-1]
     for depth in range(1, block_size):
         prev_first = 1 + (depth - 2) * tree_width if depth >= 2 else 0
@@ -232,8 +191,7 @@ def _fixed_width_parents(*, block_size, tree_width):
 
 
 class _StubBatch:
-    """The two fields `verify_commit_step_indices` reads. A real ScheduleBatch would
-    drag a memory pool and an allocator into a test about index arithmetic."""
+    """Minimal batch stub for verify commit-index arithmetic."""
 
     def __init__(self, seq_lens):
         self.seq_lens = seq_lens
@@ -241,10 +199,7 @@ class _StubBatch:
 
 
 def test_mamba_step_index_follows_the_node_not_the_depth():
-    """`intermediate_ssm` is keyed by node index over the verify window, so the state
-    to commit is the last accepted *node* -- 4 here, not 2. Turns red if the tree path
-    ever falls back to the chain's `commit_lens - 1`, which is the shape of this bug
-    that neither a width-1 run nor a crash would reveal."""
+    """Mamba commit index must follow the last accepted node."""
     bs = 2
     accept_index = _off_spine_accept_index(bs=bs).cuda()
     commit_lens = torch.full((bs,), 3, dtype=torch.int32, device="cuda")
@@ -257,20 +212,14 @@ def test_mamba_step_index_follows_the_node_not_the_depth():
     )
 
     assert last_step.cpu().tolist() == [4, 4]
-    # The chain formula would have said 2; that it disagrees is the whole point.
     assert last_step.cpu().tolist() != (commit_lens.cpu() - 1).tolist()
     assert track_step is None  # tracking off -> no interval-crossing step
 
 
 def test_commit_layout_gathers_source_rows_and_chain_positions():
-    """The draft-KV writeback commits row r into `cache_loc_2d[i, r]` and never looks
-    at `accept_index`, so the gather has to happen on the *rows*: after compaction row
-    r must be the node accepted at depth r. Positions follow the compacted layout, so
-    they are `prefix + r` -- the per-node depths verify ran with would mis-rope every
-    off-spine node."""
+    """Compaction must map accepted nodes to chain slots and positions."""
     bs = 2
     accept_index = _off_spine_accept_index(bs=bs).cuda()
-    # Row content encodes its own flat node id, so a wrong gather is readable.
     hidden = (
         torch.arange(bs * VERIFY_WIDTH, dtype=torch.float32)
         .unsqueeze(1)
@@ -305,10 +254,7 @@ def test_commit_layout_gathers_source_rows_and_chain_positions():
 
 
 def test_tree_meta_links_match_the_beam_parents():
-    """Cross-check that the links the accept walks come from the parents the beam
-    emitted, at a width the gate above cannot reach. `test_dflash_tree.py` pins the
-    mask algebra; this pins that `build_tree_verify_input` hands the kernel the same
-    tree rather than a transposed or stale one."""
+    """Tree metadata links must match beam parents."""
     bs = 2
     node_parents = (
         _fixed_width_parents(block_size=BLOCK_SIZE, tree_width=TREE_WIDTH)

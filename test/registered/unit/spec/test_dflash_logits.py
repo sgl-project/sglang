@@ -7,6 +7,7 @@ import torch
 from sglang.srt.models.dflash import (
     CandidateSelector,
     DFlash2DraftModel,
+    _validate_max_num_nodes,
     _beam_walk_torch,
     _grouped_conv,
 )
@@ -15,7 +16,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=38, suite="base-a-test-cpu")
 # The triton beam walk needs a device; the rest of this file needs no kernel.
-register_cuda_ci(est_time=3, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=4, stage="base-b", runner_config="1-gpu-small")
 
 
 def test_dflash_unary_logit_transform():
@@ -76,8 +77,7 @@ def test_selector_greedy_row_walk_is_deterministic_in_a_mixed_batch():
 
 
 def test_selector_rejects_a_quantized_target_lm_head():
-    """The candidate matmuls read the lm_head weight directly, so a packed or
-    absent weight would be read as if it were dense."""
+    """Candidate scoring requires a dense target lm_head."""
     model = SimpleNamespace(
         lm_head=SimpleNamespace(weight=torch.empty(8, 4, dtype=torch.int8)),
         candidate_selector=SimpleNamespace(top_k=4),
@@ -254,6 +254,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         ps=SimpleNamespace(tp_rank=0),
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
+        _use_tree_verify=False,
         _selector_sampling_enabled=True,
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
@@ -283,6 +284,7 @@ def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch):
     )
     worker = SimpleNamespace(
         selector=object(),
+        _use_tree_verify=False,
         _selector_sampling_enabled=False,
         _warned_sampling_fallback=False,
         ps=SimpleNamespace(tp_rank=0),
@@ -407,19 +409,11 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
 
 
 def _lattice(*, bs, slots, top_k, seed=0, spread=8.0):
-    """A lattice whose scores are well separated, so index selection is stable.
-
-    Beam picks compare fp32 sums across a flattened axis; the triton kernel and the
-    torch reference normalize with different reduction orders and differ by ~1e-7.
-    Integer-valued scores keep every comparison gap far above that, which is what
-    makes elementwise equality a non-flaky assertion.
-    """
+    """Build a lattice with score gaps large enough for exact comparisons."""
     generator = torch.Generator().manual_seed(seed)
     scores = torch.randint(
         -5, 6, (bs, slots, top_k, top_k), generator=generator
     ).float()
-    # Distinct ids per slot, so "same-parent siblings differ" is about the walk
-    # rather than about the candidate set happening to repeat a token.
     candidate_ids = (
         torch.arange(slots * top_k).view(1, slots, top_k).expand(bs, slots, top_k)
     )
@@ -429,8 +423,7 @@ def _lattice(*, bs, slots, top_k, seed=0, spread=8.0):
 
 @pytest.mark.parametrize("slots,top_k", [(3, 4), (7, 16)])
 def test_beam_width_one_reproduces_the_greedy_chain(slots, top_k):
-    """Width 1 is the regression gate for every later phase: the tree must degenerate
-    to the chain `sample_path` already produces, root included at index 0."""
+    """Width 1 must reproduce the existing greedy chain."""
     bs = 3
     candidate_ids, scores, anchor = _lattice(bs=bs, slots=slots, top_k=top_k)
     selector = CandidateSelector(
@@ -460,9 +453,7 @@ def test_beam_width_one_reproduces_the_greedy_chain(slots, top_k):
 @pytest.mark.parametrize("beam_width", [1, 2, 3, 4])
 @pytest.mark.parametrize("slots,top_k", [(3, 4), (7, 16)])
 def test_tree_is_fixed_width_and_bfs_ordered(beam_width, slots, top_k):
-    """`parent < index` is the precondition for the single-pass ancestor closure and
-    for `reconstruct_indices_from_tree_mask`; the fixed node count is what keeps the
-    verify window a constant length. Width 3 also covers the padded-lane path."""
+    """Tree nodes are fixed-width and BFS ordered."""
     bs = 2
     candidate_ids, scores, anchor = _lattice(bs=bs, slots=slots, top_k=top_k)
     tokens, parents = _beam_walk_torch(
@@ -477,7 +468,6 @@ def test_tree_is_fixed_width_and_bfs_ordered(beam_width, slots, top_k):
     assert parents.shape == (bs, num_nodes)
     assert torch.equal(parents[:, 0], torch.full((bs,), -1))
     assert (parents[:, 1:] < torch.arange(1, num_nodes)).all()
-    # Every parent lives on the depth immediately above.
     for slot in range(slots):
         base = 1 + slot * beam_width
         block = parents[:, base : base + beam_width]
@@ -487,10 +477,7 @@ def test_tree_is_fixed_width_and_bfs_ordered(beam_width, slots, top_k):
 
 
 def test_spine_is_independent_of_the_beam_width():
-    """The spine is beam 0's own argmax chain and never reads the accumulated score,
-    so one lattice must yield one spine at every width. Miscomputing `cum`,
-    normalizing on the wrong axis, or shuffling the beam order all break this while
-    leaving the shape invariants intact."""
+    """The greedy spine must be independent of beam width."""
     slots, top_k = 7, 16
     candidate_ids, scores, anchor = _lattice(bs=2, slots=slots, top_k=top_k, seed=3)
 
@@ -509,12 +496,7 @@ def test_spine_is_independent_of_the_beam_width():
 
 
 def test_same_parent_siblings_carry_distinct_tokens():
-    """`verify_tree_greedy` sweeps a sibling chain and takes the first match, so a
-    repeated token under one parent could send the walk into another subtree and stop
-    earlier -- which would break "tree acceptance >= chain acceptance". Distinctness
-    holds structurally because the width picks are distinct (beam, candidate) pairs;
-    switching to per-state dedup, or letting predecessors share candidate numbering,
-    loses it."""
+    """Siblings selected under one parent must carry distinct tokens."""
     slots, top_k, beam_width = 7, 16, 4
     candidate_ids, scores, anchor = _lattice(bs=3, slots=slots, top_k=top_k, seed=5)
     tokens, parents = _beam_walk_torch(
@@ -536,11 +518,7 @@ def test_same_parent_siblings_carry_distinct_tokens():
 
 
 def test_rows_are_normalized_before_the_scores_accumulate():
-    """Two predecessors with identical conditional distributions but rows offset by a
-    constant must compete equally: a logit row is only defined up to a per-row
-    additive constant, so accumulating raw scores lets the offset alone decide which
-    subtree eats the budget. Here the +10 row would take both free slots and starve
-    node 2 into a dead end."""
+    """Row offsets must not affect beam competition."""
     beam_width = top_k = 3
     scores = torch.zeros(1, 2, top_k, top_k)
     scores[0, 1, 0] = torch.tensor([0.0, -1.0, -2.0])
@@ -560,10 +538,7 @@ def test_rows_are_normalized_before_the_scores_accumulate():
 
 
 def test_exact_ties_break_beam_major():
-    """Flattening the pool as `beam * top_k + candidate` is a convention the torch
-    reference and the triton kernel have to share; c-major would pick a different
-    parent on a tie. Within-row ties are reproducible in both (equal inputs give equal
-    `log_softmax` outputs), so this pins the flattening without relying on luck."""
+    """Exact ties must use beam-major flattening."""
     beam_width = top_k = 2
     scores = torch.zeros(1, 2, top_k, top_k)
     candidate_ids = torch.arange(2 * top_k).view(1, 2, top_k)
@@ -582,9 +557,7 @@ def test_exact_ties_break_beam_major():
 
 
 def test_beam_walk_rejects_a_width_above_the_candidate_count():
-    """Depth 1 only has top_k candidates, so a wider beam cannot fill a fixed width;
-    the resolved server args promise this never happens, and the walk says so rather
-    than silently emitting duplicates."""
+    """Reject a beam wider than the candidate axis."""
     selector = CandidateSelector(hidden_size=4, vocab_size=64, state_rank=2, top_k=4)
     candidate_ids, scores, anchor = _lattice(bs=1, slots=3, top_k=4)
     with pytest.raises(ValueError, match="selector_top_k"):
@@ -599,9 +572,7 @@ def test_beam_walk_rejects_a_width_above_the_candidate_count():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="triton needs a GPU")
 @pytest.mark.parametrize("beam_width", [1, 2, 3, 4, 8])
 def test_triton_beam_walk_matches_the_reference(beam_width):
-    """The kernel's first-max and register reductions are new code with no other
-    oracle. Separated scores keep every comparison gap far above fp32 noise, so
-    elementwise equality is meaningful; cross-row ties are explicitly not promised."""
+    """The Triton walk must match the device-agnostic reference."""
     slots, top_k = 7, 16
     candidate_ids, scores, anchor = _lattice(bs=4, slots=slots, top_k=top_k, seed=11)
     selector = CandidateSelector(
@@ -623,6 +594,198 @@ def test_triton_beam_walk_matches_the_reference(beam_width):
 
     assert torch.equal(actual[0].cpu(), expected[0])
     assert torch.equal(actual[1].cpu(), expected[1])
+
+
+def _root_path(*, tokens, parents, node):
+    """Token sequence from the root down to `node`, root first."""
+    path = []
+    while node != -1:
+        path.append(int(tokens[node]))
+        node = int(parents[node])
+    return path[::-1]
+
+
+# scores drawn from {0, -SPLIT}: fp32 log_softmax returns exactly 0.0 and -SPLIT
+# there (the other candidate's mass underflows fp32 eps), so every `cum` is an exact
+# multiple of -SPLIT and both the ranking and its ties are hand-derivable.
+_SPLIT = 40.0
+
+
+def _two_slot_lattice():
+    """slots=2, top_k=2; at beam_width=2 the walk builds 5 nodes with known `cum`.
+
+    Hand-derived: node 1 and node 3 have cum 0, node 2 and node 4 have cum -SPLIT, so
+    ranking by (-cum, index) over the non-anchor nodes gives 1, 3, 2, 4.
+    """
+    scores = torch.tensor(
+        [[[0.0, -_SPLIT], [0.0, -_SPLIT]], [[0.0, -_SPLIT], [0.0, -_SPLIT]]]
+    )[None]
+    return torch.arange(4).view(1, 2, 2), scores, torch.tensor([9001])
+
+
+@pytest.mark.parametrize(
+    "max_num_nodes,tokens,parents",
+    [
+        (2, [9001, 0], [-1, 0]),
+        (3, [9001, 0, 2], [-1, 0, 1]),
+        (4, [9001, 0, 1, 2], [-1, 0, 0, 1]),
+    ],
+)
+def test_prune_keeps_the_best_cum_nodes(max_num_nodes, tokens, parents):
+    """Keep the expected cumulative-score nodes and remap their parents."""
+    candidate_ids, scores, anchor = _two_slot_lattice()
+    actual = _beam_walk_torch(
+        candidate_ids=candidate_ids,
+        scores=scores,
+        anchor_token_ids=anchor,
+        beam_width=2,
+        max_num_nodes=max_num_nodes,
+    )
+    assert actual[0][0].tolist() == tokens
+    assert actual[1][0].tolist() == parents
+
+
+_CAPS = [1, 2, 8, 15, 30]
+
+
+def _caps_for(built):
+    """The sweep at one built size: fixed points plus both sides of the boundary."""
+    return sorted({cap for cap in _CAPS if cap <= built} | {built - 1, built})
+
+
+@pytest.mark.parametrize("beam_width", [1, 2, 4, 8])
+def test_prune_emits_a_bfs_ordered_tree_at_every_cap(beam_width):
+    """Pruned trees must remain BFS ordered."""
+    slots, top_k = 7, 16
+    built = 1 + slots * beam_width
+    candidate_ids, scores, anchor = _lattice(bs=3, slots=slots, top_k=top_k, seed=5)
+    for max_num_nodes in _caps_for(built):
+        tokens, parents = _beam_walk_torch(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            anchor_token_ids=anchor,
+            beam_width=beam_width,
+            max_num_nodes=max_num_nodes,
+        )
+        assert tokens.shape == (3, max_num_nodes)
+        assert parents.shape == (3, max_num_nodes)
+        assert (parents[:, 0] == -1).all()
+        ceiling = torch.arange(1, max_num_nodes)
+        assert (parents[:, 1:] < ceiling).all()
+        assert (parents[:, 1:] >= 0).all()
+
+
+@pytest.mark.parametrize("beam_width", [2, 4, 8])
+def test_prune_preserves_every_surviving_root_path(beam_width):
+    """Pruning may remove paths but must not rewrite survivors."""
+    slots, top_k = 7, 16
+    built = 1 + slots * beam_width
+    candidate_ids, scores, anchor = _lattice(bs=2, slots=slots, top_k=top_k, seed=7)
+    full_tokens, full_parents = _beam_walk_torch(
+        candidate_ids=candidate_ids,
+        scores=scores,
+        anchor_token_ids=anchor,
+        beam_width=beam_width,
+    )
+    paths = [
+        {
+            tuple(
+                _root_path(
+                    tokens=full_tokens[row], parents=full_parents[row], node=node
+                )
+            )
+            for node in range(built)
+        }
+        for row in range(full_tokens.shape[0])
+    ]
+    for max_num_nodes in _caps_for(built):
+        tokens, parents = _beam_walk_torch(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            anchor_token_ids=anchor,
+            beam_width=beam_width,
+            max_num_nodes=max_num_nodes,
+        )
+        for row in range(tokens.shape[0]):
+            for node in range(max_num_nodes):
+                path = tuple(
+                    _root_path(tokens=tokens[row], parents=parents[row], node=node)
+                )
+                assert path in paths[row]
+
+
+def test_prune_breaks_cum_ties_towards_the_lower_node_index():
+    """Equal cumulative scores must break ties by lower node index."""
+    slots, top_k, bs = 7, 16, 2
+    candidate_ids, _, anchor = _lattice(bs=bs, slots=slots, top_k=top_k)
+    uniform = torch.zeros(bs, slots, top_k, top_k)
+    for beam_width in (2, 4, 8):
+        built = 1 + slots * beam_width
+        full = _beam_walk_torch(
+            candidate_ids=candidate_ids,
+            scores=uniform,
+            anchor_token_ids=anchor,
+            beam_width=beam_width,
+        )
+        for max_num_nodes in (5, 15, 30):
+            if max_num_nodes >= built:
+                continue
+            actual = _beam_walk_torch(
+                candidate_ids=candidate_ids,
+                scores=uniform,
+                anchor_token_ids=anchor,
+                beam_width=beam_width,
+                max_num_nodes=max_num_nodes,
+            )
+            assert torch.equal(actual[0], full[0][:, :max_num_nodes])
+            assert torch.equal(actual[1], full[1][:, :max_num_nodes])
+
+
+def test_prune_rejects_a_cap_outside_the_built_node_count():
+    """Reject caps that do not describe a subset of the built tree."""
+    candidate_ids, scores, anchor = _lattice(bs=1, slots=7, top_k=16)
+    for bad in (0, 1 + 7 * 4 + 1):
+        with pytest.raises(ValueError, match="max_num_nodes"):
+            _beam_walk_torch(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                anchor_token_ids=anchor,
+                beam_width=4,
+                max_num_nodes=bad,
+            )
+
+
+def test_prune_allows_an_uncapped_tree_above_kernel_limit():
+    _validate_max_num_nodes(max_num_nodes=257, num_nodes=257)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="triton needs a GPU")
+@pytest.mark.parametrize("beam_width", [1, 2, 4, 8])
+def test_triton_prune_matches_the_reference(beam_width):
+    """The Triton prune must match the independent torch reference."""
+    slots, top_k = 7, 16
+    built = 1 + slots * beam_width
+    candidate_ids, scores, anchor = _lattice(bs=4, slots=slots, top_k=top_k, seed=11)
+    selector = CandidateSelector(
+        hidden_size=4, vocab_size=slots * top_k, state_rank=2, top_k=top_k
+    )
+    for max_num_nodes in _caps_for(built):
+        expected = _beam_walk_torch(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            anchor_token_ids=anchor,
+            beam_width=beam_width,
+            max_num_nodes=max_num_nodes,
+        )
+        actual = selector.beam_walk(
+            candidate_ids=candidate_ids.cuda(),
+            scores=scores.cuda(),
+            anchor_token_ids=anchor.cuda(),
+            beam_width=beam_width,
+            max_num_nodes=max_num_nodes,
+        )
+        assert torch.equal(actual[0].cpu(), expected[0])
+        assert torch.equal(actual[1].cpu(), expected[1])
 
 
 def test_grouped_conv_supports_runtime_block_sizes():
@@ -654,6 +817,59 @@ def test_grouped_conv_supports_runtime_block_sizes():
                     value += coefficient * hidden_3d[batch, position - tap]
                 expected[batch * block_size + position] = value.flatten()
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="triton needs a GPU")
+def test_prune_kernel_bounds_its_writes_on_non_finite_cums():
+    """A NaN `cum` compares false against everything, so without the normalization
+    every node ranks 0, `keep` is all-true, and the compaction pushes up to `num_nodes`
+    elements into a `max_num_nodes`-wide row -- an out-of-bounds write, silent memory
+    corruption rather than a wrong answer. Mapping NaN to -inf instead makes
+    `better[i, j]` reduce to `j < i`, so exactly `max_num_nodes` nodes survive.
+
+    Driven at the kernel rather than through `beam_walk`, because the walk cannot
+    produce a tree at all from a NaN lattice: `_first_max_index` returns its
+    out-of-range sentinel there.
+
+    The output buffers are flat with `guard` sentinel elements past the end, because
+    the kernel derives each row's offset from `max_num_nodes` itself -- padding the
+    rows instead would put row `r + 1`'s legitimate writes inside row `r`'s padding
+    and detect nothing."""
+    import triton
+
+    from sglang.kernels.ops.speculative.dflash import _dflash_tree_prune_by_cum_kernel
+
+    bs, num_nodes, cap, guard = 3, 57, 15, 8
+    sentinel = -12345
+    tokens = torch.arange(bs * num_nodes, device="cuda").view(bs, num_nodes)
+    parents = torch.zeros(bs, num_nodes, dtype=torch.int64, device="cuda")
+    parents[:, 0] = -1
+    cums = torch.full((bs, num_nodes), float("nan"), device="cuda")
+    out_tokens = torch.full(
+        (bs * cap + guard,), sentinel, dtype=torch.int64, device="cuda"
+    )
+    out_parents = torch.full_like(out_tokens, sentinel)
+
+    _dflash_tree_prune_by_cum_kernel[(bs,)](
+        tokens,
+        parents,
+        cums,
+        out_tokens,
+        out_parents,
+        num_nodes=num_nodes,
+        max_num_nodes=cap,
+        NODES=triton.next_power_of_2(num_nodes),
+        num_warps=4,
+    )
+
+    assert (out_tokens[bs * cap :] == sentinel).all()
+    assert (out_parents[bs * cap :] == sentinel).all()
+    # All-equal cum degenerates to the BFS prefix, exactly `cap` nodes per row.
+    assert torch.equal(out_tokens[: bs * cap].view(bs, cap), tokens[:, :cap])
+    for row in range(bs):
+        assert out_parents[row * cap : (row + 1) * cap].tolist() == [-1] + [0] * (
+            cap - 1
+        )
 
 
 if __name__ == "__main__":

@@ -174,6 +174,33 @@ class TestDflashTreeWidthDerivation(CustomTestCase):
 
         self.assertEqual(args.speculative_num_steps, 1)
 
+    def test_node_cap_becomes_the_verify_width(self):
+        # The cap reaches serving only by landing in speculative_num_draft_tokens: every
+        # captured shape, KV reservation and mask allocation downstream is sized off that
+        # field. Parked anywhere else it would resolve fine and then verify the unpruned
+        # node count, i.e. the prune would silently not happen.
+        for tree_width, verify_width in ((2, 15), (4, 15), (8, 15), (16, 15)):
+            with self.subTest(tree_width=tree_width):
+                with envs.SGLANG_DFLASH_MAX_NUM_NODES.override(15):
+                    args = _resolve(_tree_args(tree_width=tree_width))
+
+                self.assertEqual(args.speculative_num_draft_tokens, verify_width)
+                # The cap narrows the verify window, not the beam: the tree is still built
+                # at tree_width per depth and only then pruned.
+                self.assertEqual(args.speculative_eagle_topk, tree_width)
+                self.assertEqual(args.speculative_dflash_block_size, 8)
+
+    def test_node_cap_at_or_above_the_full_beam_is_a_no_op(self):
+        # Sweeping one cap across several widths relies on this: at 1 + gamma * W <= cap the
+        # run has to be the unpruned run, not an error. 29 is exactly the full beam at W=4,
+        # so it also pins the boundary rather than only the interior.
+        for tree_width, cap, verify_width in ((2, 30, 15), (4, 29, 29), (4, 60, 29)):
+            with self.subTest(tree_width=tree_width, cap=cap):
+                with envs.SGLANG_DFLASH_MAX_NUM_NODES.override(cap):
+                    args = _resolve(_tree_args(tree_width=tree_width))
+
+                self.assertEqual(args.speculative_num_draft_tokens, verify_width)
+
 
 class TestDflashTreeWidthRejections(CustomTestCase):
     def test_eagle_topk_is_rejected(self):
@@ -191,6 +218,20 @@ class TestDflashTreeWidthRejections(CustomTestCase):
     def test_zero_tree_width_rejected(self):
         with self.assertRaisesRegex(ValueError, "must be >= 1"):
             _resolve(_tree_args(tree_width=0))
+
+    def test_node_cap_below_the_block_size_rejected(self):
+        # The draft forward writes the block-wide prefix of the same
+        # [prefix, prefix + verify_width) region the tree occupies, so a cap under the spine
+        # length under-sizes that region -- an out-of-bounds write at first decode rather
+        # than a smaller tree. Caught at startup because the shapes are captured before any
+        # step runs.
+        for cap in (1, 7):
+            with self.subTest(cap=cap):
+                with envs.SGLANG_DFLASH_MAX_NUM_NODES.override(cap):
+                    with self.assertRaisesRegex(
+                        ValueError, "SGLANG_DFLASH_MAX_NUM_NODES"
+                    ):
+                        _resolve(_tree_args(tree_width=4))
 
     def test_tree_width_above_selector_top_k_rejected(self):
         with self.assertRaisesRegex(ValueError, "selector_top_k"):

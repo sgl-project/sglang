@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import (
+    _validate_max_num_nodes,
     selector_beam_walk_triton,
     selector_walk_triton,
 )
@@ -944,17 +945,32 @@ def _follow_maps(maps, initial_indices, edges: int):
 
 
 def _first_max_index(values: torch.Tensor) -> torch.Tensor:
-    """Index of the first maximum along the last axis.
-
-    `torch.argmax` does not promise the first occurrence and the triton walk
-    deliberately does (`tl.min(tl.where(scores == best, offsets, limit))`). Beam
-    selection compares across a flattened axis where exact ties are constructible,
-    so the reference has to spell out the same rule.
-    """
+    """Return the first maximum along the last axis."""
     limit = values.shape[-1]
     best = values.max(dim=-1, keepdim=True).values
     offsets = torch.arange(limit, device=values.device)
     return torch.where(values == best, offsets, limit).min(dim=-1).values
+
+
+def _prune_by_cum_torch(
+    *,
+    node_tokens: torch.Tensor,
+    node_parents: torch.Tensor,
+    node_cums: torch.Tensor,
+    max_num_nodes: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference implementation for cumulative-score pruning."""
+    bs, num_nodes = node_cums.shape
+    cap = int(max_num_nodes)
+    order = node_cums.sort(dim=1, descending=True, stable=True).indices
+    kept = order[:, :cap].sort(dim=1).values
+    tokens = node_tokens.gather(1, kept)
+
+    renumber = torch.zeros((bs, num_nodes), dtype=torch.int64, device=kept.device)
+    renumber.scatter_(1, kept, torch.arange(cap, device=kept.device).expand(bs, cap))
+    parents = renumber.gather(1, node_parents.gather(1, kept).clamp(min=0))
+    parents[:, 0] = -1
+    return tokens, parents
 
 
 def _beam_walk_torch(
@@ -963,32 +979,28 @@ def _beam_walk_torch(
     scores: torch.Tensor,
     anchor_token_ids: torch.Tensor,
     beam_width: int,
+    max_num_nodes: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Device-agnostic reference for the fixed-width draft tree; see `beam_walk`.
-
-    Mirrors the triton kernel step for step -- beam_width-1 rounds of masked argmax
-    rather than `torch.topk`, and the same `flat = m * top_k + c` flattening -- so
-    the two resolve ties identically and can be compared elementwise.
-    """
+    """Device-agnostic reference for the fixed-width draft tree."""
     bs, slots, top_k = candidate_ids.shape
     width = int(beam_width)
     device = candidate_ids.device
-    node_tokens = torch.empty((bs, 1 + slots * width), dtype=torch.int64, device=device)
+    num_nodes = 1 + slots * width
+    _validate_max_num_nodes(max_num_nodes=max_num_nodes, num_nodes=num_nodes)
+    node_tokens = torch.empty((bs, num_nodes), dtype=torch.int64, device=device)
     node_parents = torch.empty_like(node_tokens)
     node_tokens[:, 0] = anchor_token_ids
     node_parents[:, 0] = -1
+    prune = max_num_nodes is not None and num_nodes > int(max_num_nodes)
+    node_cums = (
+        torch.zeros((bs, num_nodes), dtype=torch.float32, device=device)
+        if prune
+        else None
+    )
 
-    # Per-row over the successor axis: a row is the conditional distribution given
-    # its predecessor, and only that normalization makes the depth-wise sums
-    # comparable across rows. Rows are independent, so normalizing all top_k of them
-    # here and gathering width of them below matches the kernel's gather-then-
-    # normalize order elementwise.
     log_probs = torch.log_softmax(scores.float(), dim=-1)
 
     rows = torch.arange(bs, device=device)
-    # cum = -inf everywhere but beam 0 folds the first depth into the same loop
-    # body: only beam 0 can score, so the top-width is taken over that one row's
-    # top_k candidates and every parent is the root.
     state = torch.zeros((bs, width), dtype=torch.int64, device=device)
     cum = torch.full((bs, width), float("-inf"), dtype=torch.float32, device=device)
     cum[:, 0] = 0.0
@@ -1003,17 +1015,11 @@ def _beam_walk_torch(
 
         beam_index = torch.zeros((bs, width), dtype=torch.int64, device=device)
         candidate_index = torch.empty((bs, width), dtype=torch.int64, device=device)
-        # The spine: beam 0's own best child, parent pinned to beam 0 (`beam_index`
-        # keeps its zero init). Reads `transitions[:, 0]` where the kernel reads its
-        # `cum`-added row; the two argmaxes agree because `cum[:, 0]` is a constant
-        # across the row, and staying independent of the accumulated score is what
-        # keeps the spine chain equal to `sample_path`'s greedy walk.
+        # Keep beam 0 on the greedy spine so width 1 remains the chain.
         candidate_index[:, 0] = _first_max_index(transitions[:, 0, :])
 
         remaining = flat.clone()
-        # Struck from the pool, so the width picks are distinct (beam, candidate)
-        # pairs -- which is what makes same-parent sibling tokens distinct. The
-        # spine's flat index is just its candidate index, since its beam is 0.
+        # Remove each pick so sibling pairs remain distinct.
         remaining[rows, candidate_index[:, 0]] = float("-inf")
         for beam in range(1, width):
             picked = _first_max_index(remaining)
@@ -1024,16 +1030,23 @@ def _beam_walk_torch(
         node_tokens[:, base : base + width] = candidate_ids[:, slot].gather(
             1, candidate_index
         )
-        # Parents come from the previous depth, so they are always < base: the BFS
-        # order every downstream ancestor-closure scan relies on.
+        # BFS numbering keeps every parent before its children.
         node_parents[:, base : base + width] = node.gather(1, beam_index)
 
-        # Read `flat`, not `remaining`, whose picks have been overwritten with -inf.
         cum = flat.gather(1, beam_index * top_k + candidate_index)
+        if node_cums is not None:
+            node_cums[:, base : base + width] = cum
         state = candidate_index
         node = torch.arange(base, base + width, device=device).expand(bs, width)
 
-    return node_tokens, node_parents
+    if node_cums is None:
+        return node_tokens, node_parents
+    return _prune_by_cum_torch(
+        node_tokens=node_tokens,
+        node_parents=node_parents,
+        node_cums=node_cums,
+        max_num_nodes=int(max_num_nodes),
+    )
 
 
 class CandidateSelector(nn.Module):
@@ -1164,6 +1177,7 @@ class CandidateSelector(nn.Module):
         scores: torch.Tensor,
         anchor_token_ids: torch.Tensor,
         beam_width: int,
+        max_num_nodes: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Expand the lattice into a fixed-width tree: [bs, 1 + slots * beam_width]
         BFS-ordered `(node_tokens, node_parents)`, root inclusive at index 0.
@@ -1177,6 +1191,13 @@ class CandidateSelector(nn.Module):
         `beam_width == 1` reproduces `sample_path`'s greedy output, but the worker
         keeps calling `sample_path` there -- this path is the tree's regression gate,
         not its chain implementation.
+
+        `max_num_nodes` caps the emitted node count: the walk still builds
+        `1 + slots * beam_width` nodes, then the anchor plus the best
+        `max_num_nodes - 1` by `cum` are kept and renumbered, so the return is
+        `[bs, min(max_num_nodes, 1 + slots * beam_width)]`. `None` is today's
+        behaviour, unpruned. The cap is a config-time constant rather than anything
+        read off a device tensor, which is what keeps the emitted shape static.
         """
         if beam_width > self.top_k:
             raise ValueError(
@@ -1190,12 +1211,14 @@ class CandidateSelector(nn.Module):
                 scores=scores,
                 anchor_token_ids=anchor_token_ids,
                 beam_width=beam_width,
+                max_num_nodes=max_num_nodes,
             )
         return _beam_walk_torch(
             candidate_ids=candidate_ids,
             scores=scores,
             anchor_token_ids=anchor_token_ids,
             beam_width=beam_width,
+            max_num_nodes=max_num_nodes,
         )
 
 

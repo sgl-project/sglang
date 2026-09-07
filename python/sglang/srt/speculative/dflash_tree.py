@@ -1,26 +1,17 @@
-"""Verify metadata for a DFLASH beam tree.
+"""Build target-verify metadata for a DFLASH beam tree.
 
-The beam walk (`models/dflash.py::_beam_walk_torch` and its triton twin) emits the
-minimal representation of the tree: `node_tokens` and `node_parents`, both
-`[bs, num_nodes]`, in BFS order so that `node_parents[i] < i`. Target verify needs
-more than that, and this module derives all of it.
-
-Two different masks are involved and they must not be confused:
+Two masks are involved:
 
 - the **QLEN** mask, `[bs, N, N]` bool, is the ancestor closure over draft nodes
   alone. `reconstruct_indices_from_tree_mask` consumes exactly this; the committed
   prefix reaches it only through `prefix_lens`, which the kernel adds to the
   per-node depth to produce absolute positions.
 - the **FULL_MASK**, a flat bool buffer, is what the attention backends consume.
-  Its trailing `N x N` block per request *is* the QLEN mask, preceded by the
-  request's committed prefix columns. It is written on device, straight into the
-  backend's own buffer, by `write_dflash_tree_full_mask` -- the row widths depend
-  on the committed prefix, and reading that on the host would cost a sync per step.
+  Its trailing `N x N` block per request is the QLEN mask, preceded by the
+  request's committed-prefix columns.
 
-Spelling: the sgl_kernel op schema says `retrive_*`. This module keeps that
-spelling on values that go straight into the op, matching the boundary
-`eagle_utils.py::verify_tree_greedy_func` already draws, while
-`DFlashVerifyInput` keeps the correct `retrieve_*` on its fields.
+The sgl_kernel op schema spells its link arguments `retrive_*`; values passed to
+that op keep the spelling while `DFlashVerifyInput` uses `retrieve_*`.
 """
 
 from __future__ import annotations
@@ -30,17 +21,7 @@ from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 
 def build_ancestor_mask(*, node_parents: torch.Tensor, max_depth: int) -> torch.Tensor:
-    """`[bs, N, N]` bool ancestor closure, `mask[b, i, j] = j is an ancestor of i`.
-
-    The diagonal is set (a node counts as its own ancestor) and column 0 is set on
-    every row, because the root is an ancestor of everything.
-
-    Walks parent pointers `max_depth` times rather than scanning the `N` nodes in
-    order. `max_depth` is the deepest layer index -- `gamma = block_size - 1` -- so
-    the iteration count is independent of the beam width, and a width sweep does
-    not pay a growing number of kernel launches. Clamping a spent chain to node 0
-    is harmless precisely because the root bit is already set on every row.
-    """
+    """Return `[bs, N, N]` ancestor closure for BFS-ordered parent links."""
     batch_size, num_nodes = node_parents.shape
     device = node_parents.device
 
@@ -63,16 +44,7 @@ def build_ancestor_mask(*, node_parents: torch.Tensor, max_depth: int) -> torch.
 def build_dflash_tree_meta(
     *, ancestor_mask: torch.Tensor, prefix_lens: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """`(positions, retrive_index, retrive_next_token, retrive_next_sibling)`.
-
-    Derived from the mask rather than from `node_parents` directly, so a
-    mis-built mask shows up as links that disagree with the parents instead of
-    staying invisible until attention silently reads the wrong keys.
-
-    Returned in the kernel's own argument order. `positions` is flat `[bs * N]`;
-    the three link tensors are `[bs, N]`. All four are int64, which the CUDA
-    kernel requires -- it casts the pointers without checking.
-    """
+    """Derive kernel links and positions from an ancestor mask."""
     batch_size, num_nodes, _ = ancestor_mask.shape
     device = ancestor_mask.device
     if prefix_lens.dtype != torch.int64:
@@ -82,7 +54,6 @@ def build_dflash_tree_meta(
         )
 
     positions = torch.empty((batch_size * num_nodes,), dtype=torch.int64, device=device)
-    # -1 is the "no such link" sentinel; the kernel leaves absent links untouched.
     links = torch.full((3, batch_size, num_nodes), -1, dtype=torch.int64, device=device)
     retrive_index, retrive_next_token, retrive_next_sibling = links
 

@@ -343,10 +343,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
-        # ServerArgs (_resolve_dflash_widths) resolves three widths and guarantees all are
-        # set: block_size is the draft block width and the longest root-to-leaf chain,
-        # verify_width = 1 + (block_size - 1) * tree_width is what the target verifies in one
-        # forward, and tree_width is the per-depth beam width (1 = today's chain).
         self.block_size = int(get_spec().speculative_dflash_block_size)
         self.tree_width = int(get_spec().speculative_eagle_topk)
         self.verify_width = int(get_spec().speculative_num_draft_tokens)
@@ -361,10 +357,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_config.block_size,
             )
         self.draft_model.set_block_size(self.block_size)
-        # Tree verify is the path for a wider beam; width 1 keeps the chain path it has
-        # always used. The env override routes width 1 through the tree too, which is
-        # how the two are shown to agree -- a width-1 beam is the chain, so the tokens
-        # must match. It is a debug switch, not a serving mode.
+        # The env override also routes width 1 through tree verification.
         self._use_tree_verify = dflash_tree_verify_active()
         if self._use_tree_verify and self.selector is None:
             raise ValueError(
@@ -375,16 +368,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "without SGLANG_DFLASH_FORCE_TREE_VERIFY."
             )
         if self._use_tree_verify and SIMULATE_ACC_LEN > 0:
-            # Both simulate modes rewrite chain-shaped accept bookkeeping in place; on a
-            # tree they would address nodes as if they were depths.
+            # Simulated acceptance uses chain-shaped bookkeeping.
             raise ValueError(
                 "SGLANG_SIMULATE_ACC_LEN cannot be combined with DFLASH tree verify "
                 f"(got {SIMULATE_ACC_LEN}): the forced accept path is a linear chain and "
                 "cannot address tree nodes. Unset it, or run chain verify."
             )
-        # The per-request output stride the scheduler slices results with. Stays block_size,
-        # not verify_width: the committed block is the accepted chain plus its bonus, which is
-        # at most block_size long however wide the tree is.
+        # Scheduler output remains the accepted chain plus its bonus.
         self.speculative_num_draft_tokens = int(self.block_size)
 
         self._mask_token = draft_config.mask_token
@@ -432,8 +422,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
-        # Tree verify only: scratch for the flat mask's per-request row offsets, and
-        # the mask itself for the case where the backend owns no captured buffer.
+        # Tree verify mask scratch and fallback buffer.
         self._tree_mask_indptr: Optional[torch.Tensor] = None  # [cap_bs + 1]
         self._tree_mask_buf: Optional[torch.Tensor] = None
         self._draft_block_spec_info = make_draft_block_spec_info(
@@ -457,9 +446,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
-        # The legacy compact-rebuild path host-syncs twice per step (masked
-        # gather's implicit nonzero D2H + lengths.max().item()); keep it only
-        # for platforms without GPU triton.
+        # Keep the host-syncing path for platforms without GPU Triton.
         self._use_triton_compact_rebuild = supports_gpu_triton
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
@@ -471,15 +458,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     @property
     def draft_worker(self):
-        # DFLASH drives the draft model through a plain TpModelWorker: the
-        # draft KV is materialized from target hidden states, so there is no
-        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
         return self._draft_worker
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
-        # Every attn backend a spec_v2 forward touches; consumed by
-        # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -491,11 +473,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        # Without draft windowing, the draft worker aliases the target
-        # request->token mapping and allocation state. With draft windowing
-        # enabled, the draft worker keeps a private compact req->token table
-        # over the same global KV index space, so radix-cache/prefix-hit KV
-        # remains reusable while draft attention sees only the recent window.
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=(
@@ -532,7 +509,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     available_mem,
                 )
         if capture_decode_cuda_graph:
-            # Must run before capture so the draft graph folds the head in.
             self._draft_sampler = self._maybe_build_draft_sampler()
             assert not (self._use_tree_verify and self._draft_sampler is not None), (
                 "DFLASH tree verify reads the selector's transition lattice, which the "
@@ -668,8 +644,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
         if self._use_tree_verify:
-            # The folded head samples one path; the beam needs the [bs, gamma, K, K]
-            # transition lattice, which only the eager selector returns.
             return _eager("tree verify")
         if self.block_size <= 1:
             return _eager("block_size<=1")
@@ -710,7 +684,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
-                # No shard metadata to recover per-rank vocab offsets from.
                 return _eager("tp>1 without shard_indices")
             num_org = int(lm_head.weight.shape[0])
             org_vocab_start = 0
@@ -866,31 +839,9 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _tree_mask_buffer(
         self, *, bs: int, target_kv_bound: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        """Where this step's flat verify mask goes.
-
-        Preferably the target backend's own buffer, so verify reads the mask in place
-        and nothing is copied. Two conditions before we may write into it: it has to be
-        a FULL_MASK buffer (a QLEN_ONLY one is `N * N` per request while this writer
-        needs `N * (prefix + N)`) and it has to be sized for this batch at this verify
-        width. Both are checked because neither implies the other and neither raises on
-        its own -- the kernel would write past the buffer and corrupt what follows.
-        `FlashInferAttnBackend` allocates no such buffer at all, and
-        `FlashAttentionBackend` allocates a QLEN_ONLY one at topk 1, so this is a live
-        path rather than a rare fallback.
-
-        Otherwise keep our own and grow it. `target_kv_bound` must be a host-side upper
-        bound on the *committed target* lengths (None = use the context-length bound):
-        over-sizing is harmless, since the row offsets are computed exactly on device
-        and the tail is never read, but under-sizing is an out-of-bounds write. A
-        draft-local view of the lengths does not qualify -- under a compact draft cache
-        it is the window size, which does not dominate the target prefix.
-        """
+        """Return a backend-owned or fallback full-mask buffer."""
         width = int(self.verify_width)
         model_runner = self._target_worker.model_runner
-        # The bound on any committed prefix, and therefore on the row width this writes.
-        # Read from the model rather than from `attn_backend.max_context_len` (which the
-        # hybrid wrapper leaves None when its child has none): what matters is what the
-        # prefixes can actually reach, not what the buffer was sized against.
         max_context_len = int(model_runner.model_config.context_len)
         verify_mask = model_runner.attn_backend.verify_mask
         if (
@@ -909,9 +860,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         held = 0 if self._tree_mask_buf is None else self._tree_mask_buf.numel()
         if held < need:
-            # Doubling, like the draft block buffers above: the bound grows by the accept
-            # length every step, so an exactly-sized allocation would reallocate a
-            # possibly-huge buffer on every step of the hot path.
             self._tree_mask_buf = torch.empty(
                 (max(need, 2 * held),), dtype=torch.bool, device=self.device
             )
@@ -1268,6 +1216,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             scores=scores,
             anchor_token_ids=anchor_token_ids,
             beam_width=self.tree_width,
+            max_num_nodes=self.verify_width,
         )
 
     def _selector_sampling_accept(
@@ -2014,11 +1963,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             # path derives gamma from block_size and reads chain-shaped retrieve_* links, so
             # on a tree it miscomputes silently instead of failing. Callers that build
             # batches directly (tests, bench scripts) bypass request admission and land here.
-            raise ValueError(
-                "DFLASH tree verify supports greedy sampling only, but this batch has "
-                "non-greedy requests (top_k > 1). Serve with "
-                "--speculative-dflash-tree-width 1 for sampling, or send temperature 0."
-            )
+            #
+            # An already-rejected request still reaches this forward: set_finish_with_abort
+            # truncates origin_input_ids to one token to skip the long prefill rather than
+            # dropping the request, and leaves sampling_params non-greedy. Raising on it
+            # would turn a request-level 400 into SIGQUIT for the whole scheduler, so only
+            # a live non-greedy request should trigger this guard.
+            live_sampling = [
+                req
+                for req in batch.reqs
+                if req.sampling_params.top_k > 1
+                and req.to_finish is None
+                and not req.finished()
+            ]
+            if live_sampling:
+                raise ValueError(
+                    "DFLASH tree verify supports greedy sampling only, but this batch has "
+                    "non-greedy requests (top_k > 1). Serve with "
+                    "--speculative-dflash-tree-width 1 for sampling, or send temperature 0."
+                )
         if sampling_info is None or sampling_info.is_all_greedy:
             return
 

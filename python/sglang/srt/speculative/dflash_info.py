@@ -34,23 +34,14 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
-    # Beam width kept per draft depth: 1 = linear chain, > 1 = tree verify. Required (no
-    # default) so every construction site states which shape it is building -- attention
-    # backends gate tree metadata on `topk > 1` and a forgotten site would silently verify a
-    # tree as a chain. DSPARK reuses this class and always passes 1.
+    # 1 is a chain; values greater than 1 select tree verification. DSPARK passes 1.
     topk: int
-    # Longest root-to-leaf chain, i.e. the DFLASH draft block width. Bounds `accept_index`,
-    # whose outer accept loop silently truncates the accepted path if it is too narrow.
-    # Defaults to `draft_token_num`, which is exact for any chain (topk == 1); tree callers
-    # must pass it, since there the verify width 1 + (block_size - 1) * topk is wider.
+    # Longest root-to-leaf chain, used to size accept bookkeeping.
     block_size: Optional[int] = None
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
-    # Left-child / right-sibling encoding of the draft tree, plus the flat node index, in the
-    # layout `reconstruct_indices_from_tree_mask` writes and `verify_tree_greedy` walks. None
-    # for chain verify. Declared here rather than alongside their producer because the GDN
-    # backend reads `spec_info.retrieve_next_token` as a bare attribute as soon as topk > 1.
+    # Left-child/right-sibling links and flat node indices for tree verification.
     retrieve_index: Optional[torch.Tensor] = None
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None

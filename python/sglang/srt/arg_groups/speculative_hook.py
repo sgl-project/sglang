@@ -420,30 +420,17 @@ def _handle_uno(server_args: ServerArgs) -> None:
         )
 
 
-# Target attention backends that can express a *tree*-shaped TARGET_VERIFY: they either
-# consume `spec_info.custom_mask` + `mask_indptr` directly (triton, flashinfer) or rebuild a
-# compacted page table from it (fa3 cascade attention). Deliberately a positive list, not the
-# complement of `_DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS` -- that set means "can express a
-# *linear* verify with its built-in causal path, so skip building a mask", and it contains
-# exactly the mask-capable backends, so complementing it would reject triton (the SM100
-# default for hybrid-GDN models).
+# Backends that support tree-shaped TARGET_VERIFY.
 _DFLASH_TREE_VERIFY_BACKENDS = ("flashinfer", "triton", "fa3")
 
-# Backends that silently compute a causal chain over a tree layout instead of raising: their
-# metadata is scalar-uniform with no per-node visibility, so a wrong answer is the failure mode.
+# Backends that would silently treat a tree as a causal chain.
 _DFLASH_TREE_SILENTLY_WRONG_BACKENDS = ("trtllm_mha",)
 
 _DFLASH_TREE_WIDTH_FLAG = "--speculative-dflash-tree-width"
 
 
 def _load_dflash_draft_config(server_args: ServerArgs, *, required: bool):
-    """Parse `dflash_config` out of the draft checkpoint, or return None if unreadable.
-
-    `required=True` raises instead of returning None: tree-width admission validates
-    `tree_width <= selector_top_k` and "checkpoint has a selector" from this config and
-    lives only here (the worker does not re-check), so a swallowed read would turn both
-    checks into silent passes.
-    """
+    """Parse `dflash_config`; raise when tree admission requires it."""
     from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
     from sglang.srt.utils.hf_transformers_utils import get_config
 
@@ -473,7 +460,7 @@ def _load_dflash_draft_config(server_args: ServerArgs, *, required: bool):
 
 
 def _resolve_dflash_tree_width(server_args: ServerArgs) -> int:
-    """The beam width kept per draft depth. 1 reproduces today's single-path chain."""
+    """Return the beam width kept at each draft depth."""
     cfg = resolving_view(server_args)
     if cfg.speculative_eagle_topk is not None:
         raise ValueError(
@@ -501,9 +488,7 @@ _DFLASH_DEFAULT_BLOCK_SIZE = 16
 def _resolve_dflash_block_size(
     server_args: ServerArgs, *, tree_width: int, draft_config
 ) -> int:
-    """The draft block width, from (in order) the explicit flag, the
-    --speculative-num-draft-tokens alias, the draft checkpoint, or a hardcoded default.
-    """
+    """Resolve the draft block width from flags, checkpoint config, or the default."""
     cfg = resolving_view(server_args)
     explicit = cfg.speculative_dflash_block_size
     alias = cfg.speculative_num_draft_tokens
@@ -550,25 +535,10 @@ def _resolve_dflash_block_size(
 
 
 def _resolve_dflash_widths(server_args: ServerArgs) -> None:
-    """Split the one width DFLASH used to carry into three, and declare them.
-
-    Post-conditions, relied on by the worker and by generic KV / scheduler accounting:
-
-      speculative_dflash_block_size  = block_size  (draft block width, never None)
-      speculative_num_draft_tokens   = 1 + (block_size - 1) * tree_width  (verify width)
-      speculative_eagle_topk         = tree_width
-
-    `speculative_eagle_topk` is not a user-facing knob for DFLASH (it is rejected above); it
-    is reused as the carrier for "is this verify a tree" because two correctness-critical
-    gates already read it -- `conv_window_dedup_enabled` (dense conv windows, which tree
-    ancestors need) and the GDN backend's tree-kernel dispatch.
-    """
+    """Resolve and publish DFLASH block, verify, and tree widths."""
     cfg = resolving_view(server_args)
     tree_width = _resolve_dflash_tree_width(server_args)
 
-    # W > 1 must read the draft config to validate the beam against selector_top_k; W == 1
-    # only needs it when block_size has no explicit source, so the common single-path launch
-    # keeps its current (config-free) startup path.
     needs_config = tree_width > 1 or (
         cfg.speculative_dflash_block_size is None
         and cfg.speculative_num_draft_tokens is None
@@ -588,27 +558,40 @@ def _resolve_dflash_widths(server_args: ServerArgs) -> None:
             draft_config=draft_config, tree_width=tree_width, block_size=block_size
         )
 
+    verify_width = _resolve_dflash_verify_width(
+        tree_width=tree_width, block_size=block_size
+    )
     declare_resolution(
         server_args,
         "_handle_dflash",
         speculative_dflash_block_size=block_size,
-        speculative_num_draft_tokens=1 + (block_size - 1) * tree_width,
+        speculative_num_draft_tokens=verify_width,
         speculative_eagle_topk=tree_width,
     )
 
-    _log_dflash_widths(tree_width=tree_width, block_size=block_size)
+    _log_dflash_widths(
+        tree_width=tree_width, block_size=block_size, verify_width=verify_width
+    )
 
 
-def _log_dflash_widths(*, tree_width: int, block_size: int) -> None:
-    """Record the resolved verify shape so a run can be reconstructed from its log.
+def _resolve_dflash_verify_width(*, tree_width: int, block_size: int) -> int:
+    """Resolve the target verify node count after applying the optional cap."""
+    from sglang.srt.environ import envs
 
-    Only for tree runs; at width 1 these are the values every DFLASH launch has always
-    had, so logging them would be noise. `SGLANG_DFLASH_FORCE_TREE_VERIFY` has to be
-    part of the condition rather than the width alone: it is the one switch that
-    decouples the verify *shape* from the resolved widths (it sends a width-1 run down
-    the tree path, leaving tree_width at 1), so gating on `tree_width > 1` would leave
-    that configuration indistinguishable from a plain chain run in the log.
-    """
+    full_width = 1 + (block_size - 1) * tree_width
+    max_num_nodes = int(envs.SGLANG_DFLASH_MAX_NUM_NODES.get())
+    if max_num_nodes == 0:
+        return full_width
+    if max_num_nodes < block_size:
+        raise ValueError(
+            "SGLANG_DFLASH_MAX_NUM_NODES must be at least the DFLASH block size "
+            f"({block_size}), got {max_num_nodes}."
+        )
+    return min(full_width, max_num_nodes)
+
+
+def _log_dflash_widths(*, tree_width: int, block_size: int, verify_width: int) -> None:
+    """Log resolved widths for tree verification runs."""
     from sglang.srt.environ import envs
 
     force_tree_verify = envs.SGLANG_DFLASH_FORCE_TREE_VERIFY.get()
@@ -617,9 +600,10 @@ def _log_dflash_widths(*, tree_width: int, block_size: int) -> None:
 
     logger.info(
         "DFLASH tree verify: tree_width=%d, block_size=%d, verify_width=%d, "
-        "force_tree_verify=%s",
+        "full_width=%d, force_tree_verify=%s",
         tree_width,
         block_size,
+        verify_width,
         1 + (block_size - 1) * tree_width,
         force_tree_verify,
     )
@@ -628,9 +612,7 @@ def _log_dflash_widths(*, tree_width: int, block_size: int) -> None:
 def _validate_dflash_tree_selector(
     *, draft_config, tree_width: int, block_size: int
 ) -> None:
-    """The tree is a beam over the candidate selector's transition lattice, so the checkpoint
-    must have a selector and the beam cannot be wider than the lattice's candidate axis.
-    """
+    """Validate the selector and dimensions needed by tree drafting."""
     if not draft_config.selector_rank or not draft_config.selector_top_k:
         raise ValueError(
             f"{_DFLASH_TREE_WIDTH_FLAG} > 1 requires a DFlash 2 draft checkpoint with a "

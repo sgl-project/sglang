@@ -1,22 +1,4 @@
-"""Who gets turned away when DFLASH verifies a tree instead of a chain.
-
-The tree is built by a beam walk over the candidate selector's transition lattice, and
-that walk emits no per-edge `q`. Every rejection-sampling accept in the repo needs one,
-so a tree run can only serve greedy requests. Two independent checks enforce that, and
-this file covers both plus the cases they must *not* catch:
-
-- `validate_dflash_request` (request admission, `dflash_utils.py`) -- the user-facing
-  arm. Rejecting here aborts one request with a readable message and leaves the server
-  serving.
-- `DFlashWorkerV2._validate_phase1_sampling_support` (batch entry) -- the backstop for
-  callers that build batches directly (unit tests, bench scripts) and never pass through
-  admission. Raising here is loud by design: the accept dispatch downstream derives gamma
-  from `block_size` and reads chain-shaped retrieve links, so on a tree it would
-  miscompute silently rather than fail.
-
-Both read one predicate, `dflash_tree_verify_active()`, so a request cannot be admitted
-on the chain's terms and then verified as a tree.
-"""
+"""Test DFLASH tree sampling admission."""
 
 import unittest
 from types import SimpleNamespace
@@ -41,17 +23,33 @@ _GREEDY_TOP_K = 1
 _SAMPLING_TOP_K = 1 << 30
 
 
-def _req(*, top_k: int):
+def _req(*, top_k: int, aborted: bool = False):
     return SimpleNamespace(
         sampling_params=SimpleNamespace(top_k=top_k),
         return_hidden_states=False,
+        # What `set_finish_with_abort` leaves behind: a rejected request still carries its
+        # original sampling_params into one forward pass.
+        to_finish=object() if aborted else None,
+        finished=lambda: False,
     )
 
 
-def _spec(*, tree_width):
+def _batch(*reqs):
+    return SimpleNamespace(
+        reqs=list(reqs),
+        sampling_info=SimpleNamespace(
+            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs)
+        ),
+    )
+
+
+def _spec(*, tree_width, algorithm="DFLASH"):
     return mock.patch(
         _GET_SPEC,
-        return_value=SimpleNamespace(speculative_dflash_tree_width=tree_width),
+        return_value=SimpleNamespace(
+            speculative_algorithm=algorithm,
+            speculative_dflash_tree_width=tree_width,
+        ),
     )
 
 
@@ -63,39 +61,58 @@ class TestDflashTreeRejectsSampling(CustomTestCase):
             )
 
         self.assertIsNotNone(error)
-        # Both escapes must be stated: one for the caller who wants this request served,
-        # one for the operator who wants the whole server to sample.
         self.assertIn("temperature 0", error)
         self.assertIn("--speculative-dflash-tree-width 1", error)
 
     def test_batch_entry_backstops_a_non_greedy_batch(self):
-        # Reached only by callers that bypass request admission. Without this the batch
-        # would flow into an accept path that reads chain-shaped links off a tree.
         worker = SimpleNamespace(_use_tree_verify=True)
-        batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
+        batch = _batch(_req(top_k=_SAMPLING_TOP_K))
 
         with self.assertRaises(ValueError) as caught:
             DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
 
         self.assertIn("greedy", str(caught.exception))
 
+    def test_an_aborted_sampling_request_does_not_kill_the_worker(self):
+        """A rejected request must not take the scheduler down with it.
+
+        `validate_dflash_request` rejects a sampling request, but `set_finish_with_abort`
+        keeps it runnable -- it shortens origin_input_ids to one token instead of dropping
+        the request, and its sampling_params stay non-greedy. Raising here runs inside
+        `run_batch`, so it would turn a request-level 400 into a scheduler SIGQUIT.
+        """
+        # A tree worker always has a selector (tree width > 1 requires a DFlash 2
+        # checkpoint). The selector-enabled path handles the batch after the aborted
+        # request is exempted from the tree admission backstop.
+        worker = SimpleNamespace(
+            _use_tree_verify=True, selector=object(), _selector_sampling_enabled=True
+        )
+        batch = _batch(_req(top_k=_SAMPLING_TOP_K, aborted=True))
+
+        DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
+
+    def test_a_live_sampling_request_beside_an_aborted_one_still_raises(self):
+        # The abort exemption is per request, not "any abort disarms the check".
+        worker = SimpleNamespace(_use_tree_verify=True)
+        batch = _batch(
+            _req(top_k=_SAMPLING_TOP_K, aborted=True),
+            _req(top_k=_SAMPLING_TOP_K),
+        )
+
+        with self.assertRaises(ValueError):
+            DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
+
 
 class TestDflashTreeAdmitsWhatItMust(CustomTestCase):
-    """The three shapes the rejection must not swallow."""
+    """Cases that tree admission must not reject."""
 
     def test_greedy_request_admitted_on_a_tree(self):
-        # Guards the choice of `top_k` as the judgement: keyed on temperature instead,
-        # a temperature-0 request (normalized to temperature 1.0, top_k 1) reads as
-        # sampling and every greedy request on a tree run would be rejected.
         with _spec(tree_width=4):
             self.assertIsNone(
                 validate_dflash_request(_req(top_k=_GREEDY_TOP_K), enable_overlap=False)
             )
 
     def test_sampling_request_admitted_on_the_chain(self):
-        # DFLASH has always served sampling requests through `_selector_sampling_accept`.
-        # Only the tree lacks the per-edge q, so a predicate broadened to "is this
-        # DFLASH" would silently drop a capability that exists today.
         with _spec(tree_width=1):
             self.assertIsNone(
                 validate_dflash_request(
@@ -104,10 +121,6 @@ class TestDflashTreeAdmitsWhatItMust(CustomTestCase):
             )
 
     def test_forced_tree_verify_rejects_sampling_at_width_one(self):
-        # SGLANG_DFLASH_FORCE_TREE_VERIFY is the one way the verify *shape* decouples
-        # from the resolved widths: tree_width stays 1 while the run verifies a tree. If
-        # the env drops out of the predicate, this configuration serves sampling requests
-        # through the greedy tree accept and silently ignores temperature and top_p.
         with _spec(tree_width=1):
             with envs.SGLANG_DFLASH_FORCE_TREE_VERIFY.override(True):
                 error = validate_dflash_request(
@@ -115,6 +128,15 @@ class TestDflashTreeAdmitsWhatItMust(CustomTestCase):
                 )
 
         self.assertIsNotNone(error)
+
+    def test_force_tree_verify_is_ignored_by_dspark(self):
+        with _spec(tree_width=1, algorithm="DSPARK"):
+            with envs.SGLANG_DFLASH_FORCE_TREE_VERIFY.override(True):
+                self.assertIsNone(
+                    validate_dflash_request(
+                        _req(top_k=_SAMPLING_TOP_K), enable_overlap=False
+                    )
+                )
 
 
 if __name__ == "__main__":

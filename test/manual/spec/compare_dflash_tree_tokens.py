@@ -1,9 +1,4 @@
-"""Does DFLASH tree verify emit the same tokens as the chain it degenerates to?
-
-At tree width 1 the beam keeps one node per depth, which is the chain DFLASH has
-always drafted, so the two paths must produce identical token ids. That equality is
-the gate for the whole tree wiring: positions, the custom mask, the tree links and
-the accept all have a width-1 answer that is already known to be right.
+"""Compare DFLASH chain and width-one tree verification.
 
 Run the server twice and diff the dumps:
 
@@ -14,30 +9,8 @@ Run the server twice and diff the dumps:
     python3 test/manual/spec/compare_dflash_tree_tokens.py \
         --compare /tmp/chain.json /tmp/tree.json
 
-Requests go out one at a time so the batch is always size 1: batch composition
-changes matmul reduction order, and that difference alone would swamp the signal.
-
-`--temperature > 0` repurposes the same comparison for a second question: whether the
-*chain* path's sampling accept (`_selector_sampling_accept`, a different kernel from
-the greedy `accept_tree_greedy`) still behaves after the tree wiring landed. There the
-two dumps come from two *commits* at width 1, not from two paths of one build. Token
-equality is only meaningful if both servers ran with the same `--random-seed`: DFLASH
-draws its accept coins with `torch.rand` on the default generator and never reads a
-request's `sampling_seed`, so the request-level seed does nothing here. A whole-suffix
-mismatch starting at one token is more likely RNG-stream misalignment than a numerical
-bug -- read the accept lengths at that step before concluding anything.
-
-`--concurrency 4` exists but is **not** a gate. Measured 2026-08-24: the same server
-compared against itself at concurrency 4 diverges on 2 of 8 prompts, at the same
-token indices and the same logprob magnitudes (~1e-2) as a chain-vs-tree comparison
-does. Which requests share a step depends on arrival timing, so the batch differs
-between runs and nothing about the tree can be concluded from it. Keep it for smoke
-value only.
-
-Asserts nothing. It prints, and a divergence needs reading rather than a red mark:
-attaching a custom mask switches the attention kernel to its masked path, so a
-handful of near-tie argmax flips is a different finding from a wiring bug. The
-logprob diff separates them -- structural errors are not subtle.
+Requests default to batch size 1 because batch composition changes reduction order.
+The script prints diagnostics rather than asserting equality.
 """
 
 import argparse
@@ -46,8 +19,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-# Deterministic, varied enough to reach different accept lengths, short enough that
-# a full pass is a couple of minutes on one GPU.
 PROMPTS = [
     "Explain in three sentences why speculative decoding speeds up inference.",
     "Write a Python function that returns the n-th Fibonacci number.",
@@ -71,8 +42,6 @@ def _generate(
                 "temperature": temperature,
                 "max_new_tokens": max_new_tokens,
             },
-            # The only way to get token ids back; also gives the logprobs the
-            # divergence triage needs.
             "return_logprob": True,
         },
         timeout=900,
@@ -115,8 +84,6 @@ def compare(chain: list, tree: list) -> bool:
             (i for i in range(shared) if ids_a[i] != ids_b[i]),
             None if len(ids_a) == len(ids_b) else shared,
         )
-        # Over the shared prefix only: past a divergence the sequences are different
-        # continuations and the logprob gap stops meaning anything.
         compared = shared if first_diff is None else first_diff
         max_logprob_diff = max(
             (

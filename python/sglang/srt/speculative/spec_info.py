@@ -283,11 +283,7 @@ class SpeculativeAlgorithm(Enum):
         if self.is_dspark() and is_draft_worker:
             return num_draft_tokens - 1
         if self.is_dflash() and is_draft_worker:
-            # DFLASH drafts one block-wide chain however wide the verify tree is: the beam
-            # expands the draft's transition lattice, it does not widen the draft forward. So
-            # the draft worker's fixed-length forward stays block_size, while
-            # `num_draft_tokens` (the target's verify width) grows to
-            # 1 + (block_size - 1) * tree_width.
+            # Draft forward width stays block_size; verify width may be larger.
             return int(get_spec_config().speculative_dflash_block_size)
         return num_draft_tokens
 
@@ -494,8 +490,7 @@ def create_dummy_verify_input(
             draft_token=None,
             positions=None,
             draft_token_num=spec.speculative_num_draft_tokens,
-            # Must mirror the live verify input: the GDN backend picks its tree kernel from
-            # topk, so a dummy pinned to 1 while server_args says W would diverge silently.
+            # Match live topk so graph capture selects the same verify kernel.
             topk=spec.speculative_eagle_topk or 1,
             block_size=spec.speculative_dflash_block_size,
             custom_mask=None,

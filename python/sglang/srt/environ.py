@@ -1254,6 +1254,13 @@ class Envs:
     # is the equivalence gate for the tree wiring: same prompts, same tokens. No
     # effect at width > 1, which always takes the tree path.
     SGLANG_DFLASH_FORCE_TREE_VERIFY = EnvBool(False)
+    # Cap on the DFLASH draft-tree node count: the beam is still built at
+    # tree_width per depth, then pruned to the best `max_num_nodes` nodes by
+    # cumulative log-prob, and the target verifies that many. 0 = no cap, i.e.
+    # verify_width stays 1 + (block_size - 1) * tree_width. Must be >= block_size
+    # (the spine is what the draft forward writes) and <= 256 (the prune kernel
+    # ranks all nodes in registers).
+    SGLANG_DFLASH_MAX_NUM_NODES = EnvInt(0)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
