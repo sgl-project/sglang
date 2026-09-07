@@ -8,6 +8,12 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+)
+from sglang.srt.layers.cp.utils import (
+    is_cp_active,
+)
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     get_global_dp_buffer_len,
@@ -19,6 +25,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -160,6 +167,28 @@ class DeepseekV4ModelNextN(nn.Module):
         else:
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
+        use_prefill_cp = dsa_use_prefill_cp(forward_batch)
+        if use_prefill_cp and is_cp_active(forward_batch):
+            # CP-v2 shards input_ids/positions/embeds at the runner boundary
+            # (cp_shard_model_inputs) and sets forward_batch.input_ids_global, so
+            # the draft already receives rank-local tensors aligned with its
+            # rank-local hidden_states. Re-sharding input_ids here would split
+            # them a second time while hidden stays rank-local, tripping the
+            # hash-topk input_ids vs hidden_states row-count assert. Only the
+            # DSV4-specific CP-local metadata (physical-length positions) still
+            # needs building here, mirroring the model body.
+            attn_backend = get_attn_backend()
+            if hasattr(attn_backend, "prepare_dsv4_cp_metadata"):
+                attn_backend.prepare_dsv4_cp_metadata(forward_batch)
+                local_positions = getattr(
+                    forward_batch, "dsv4_cp_local_positions", None
+                )
+                if (
+                    local_positions is not None
+                    and positions.shape[0] == local_positions.shape[0]
+                ):
+                    forward_batch.positions = positions
+
         if _is_npu:
             # Same per-forward rope prime as DeepseekV4Model.forward: the
             # decoder layer reads the memoized gather instead of re-gathering.
@@ -220,7 +249,6 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids,

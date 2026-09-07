@@ -132,20 +132,24 @@ def fused_hc_head(
 
     hc_mult_pow2 = max(1, triton.next_power_of_2(hc_mult))
 
-    grid = (T,)
-    _hc_head_kernel[grid](
-        x,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        y,
-        hidden_size=hidden_size,
-        HC_MULT=hc_mult_pow2,
-        K_TOTAL=hc_mult * hidden_size,
-        BLOCK_K=BLOCK_K,
-        BLOCK_D=BLOCK_D,
-        norm_eps=norm_eps,
-        hc_eps=hc_eps,
-        num_warps=4,
-    )
+    # Ascend caps grid dim-0 at 65535; CP all-gather can exceed it, so tile.
+    # Slices stay contiguous views, so per-token pointer arithmetic is unchanged.
+    MAX_GRID_DIM = 65535
+    for start in range(0, T, MAX_GRID_DIM):
+        n_rows = min(MAX_GRID_DIM, T - start)
+        _hc_head_kernel[(n_rows,)](
+            x[start : start + n_rows],
+            hc_fn,
+            hc_scale,
+            hc_base,
+            y[start : start + n_rows],
+            hidden_size=hidden_size,
+            HC_MULT=hc_mult_pow2,
+            K_TOTAL=hc_mult * hidden_size,
+            BLOCK_K=BLOCK_K,
+            BLOCK_D=BLOCK_D,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+            num_warps=4,
+        )
     return y

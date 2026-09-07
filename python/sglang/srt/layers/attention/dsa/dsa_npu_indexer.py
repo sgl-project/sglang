@@ -7,7 +7,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -206,9 +206,8 @@ class DSANPUIndexerMixin:
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
-            k = cp_all_gather_rerange_output(
+            k = cp_gather_full_sequence_states(
                 k.contiguous().view(-1, self.head_dim),
-                self.cp_size,
                 forward_batch,
                 torch.npu.current_stream(),
             )
