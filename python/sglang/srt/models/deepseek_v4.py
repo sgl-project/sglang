@@ -103,6 +103,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.engram import (
     Engram,
+    EngramEmbedding,
     EngramHasher,
     EngramLayout,
     build_engram_layout,
@@ -4074,6 +4075,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
+        for module in self.modules():
+            if isinstance(module, EngramEmbedding):
+                # Host-offloaded engram tables: flush the pinned staging
+                # chunks into the acc_offload GVA pool now that loading is done.
+                module.finalize_offload()
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn

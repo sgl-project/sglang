@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
@@ -632,10 +633,24 @@ class DataParallelController:
                 tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
             )
 
+        # Dense node-local numbering over every scheduler this node's
+        # controller spawns (dp groups x this node's pp/tp slices); node-wide
+        # shared resources such as the engram offload pool shard over it.
+        # Plain dp launches call this once per dp group with that group
+        # ordinal; the dp-attention path calls it once with dp_rank=None.
+        spawn_group = 0 if dp_rank is None else dp_rank
+        pp_local_size = len(pp_rank_range)
+        tp_local_size = len(tp_rank_range)
+        node_local_world = (
+            (get_parallel().dp_size if dp_rank is not None else 1)
+            * pp_local_size
+            * tp_local_size
+        )
+
         attn_cp_rank = 0
         moe_dp_rank = 0
-        for pp_rank in pp_rank_range:
-            for tp_rank in tp_rank_range:
+        for pp_local, pp_rank in enumerate(pp_rank_range):
+            for tp_local, tp_rank in enumerate(tp_rank_range):
                 rank_port_args = port_args
 
                 if get_parallel().enable_dp_attention:
@@ -703,30 +718,46 @@ class DataParallelController:
                 display_moe_ep_rank = moe_ep_rank + offset
                 display_dp_rank = dp_rank + offset if dp_rank is not None else None
 
+                node_local_rank = (
+                    spawn_group * pp_local_size * tp_local_size
+                    + pp_local * tp_local_size
+                    + tp_local
+                )
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
-                    proc = mp.Process(
-                        target=self.run_scheduler_process_func,
-                        args=(
-                            server_args,
-                            rank_port_args,
-                            gpu_id,
-                            tp_rank,
-                            attn_cp_rank,
-                            moe_dp_rank,
-                            moe_ep_rank,
-                            pp_rank,
-                            dp_rank,
-                            writer,
-                            display_tp_rank,
-                            display_dp_rank,
-                            display_moe_ep_rank,
-                        ),
-                    )
-                    with (
-                        memory_saver_adapter.configure_subprocess(),
-                        numa_utils.configure_subprocess(server_args, gpu_id),
-                    ):
-                        proc.start()
+                    # The node-local index is consumed by node-wide shared
+                    # resources (the engram offload pool); set under env_lock
+                    # so concurrent dp launch threads never interleave
+                    # values. Children snapshot the environment at spawn, so
+                    # popping after start() only cleans the controller's copy.
+                    os.environ["SGLANG_NODE_LOCAL_RANK"] = str(node_local_rank)
+                    os.environ["SGLANG_NODE_LOCAL_WORLD"] = str(node_local_world)
+                    try:
+                        proc = mp.Process(
+                            target=self.run_scheduler_process_func,
+                            args=(
+                                server_args,
+                                rank_port_args,
+                                gpu_id,
+                                tp_rank,
+                                attn_cp_rank,
+                                moe_dp_rank,
+                                moe_ep_rank,
+                                pp_rank,
+                                dp_rank,
+                                writer,
+                                display_tp_rank,
+                                display_dp_rank,
+                                display_moe_ep_rank,
+                            ),
+                        )
+                        with (
+                            memory_saver_adapter.configure_subprocess(),
+                            numa_utils.configure_subprocess(server_args, gpu_id),
+                        ):
+                            proc.start()
+                    finally:
+                        os.environ.pop("SGLANG_NODE_LOCAL_RANK", None)
+                        os.environ.pop("SGLANG_NODE_LOCAL_WORLD", None)
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 

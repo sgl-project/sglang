@@ -44,8 +44,12 @@ class NgramEmbeddingManager:
         if use_ngram_embedding:
             from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 
-            # Sized to mirror req_to_token (indexed by req_pool_idx).
-            token_table = torch.empty(
+            # Sized to mirror req_to_token (indexed by req_pool_idx). Zero-init:
+            # row 0 is the pool's reserved dummy slot (never allocated to a
+            # request), and DP-attention padded rows hash from it — empty()
+            # garbage there would gather the compressed vocab table out of
+            # bounds in the engram hasher.
+            token_table = torch.zeros(
                 req_to_token_pool.req_to_token.shape[0],
                 model_config.context_len,
                 dtype=torch.int32,

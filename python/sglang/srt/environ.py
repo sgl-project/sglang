@@ -1404,6 +1404,13 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # Offload the DeepSeek-V4.1 engram hash tables (fp8 weight + e8m0 scale) to
+    # host memory through memfabric_hybrid acc_offload SHARED mode: table rows
+    # are sharded across the ranks of one node (never across machines), and the
+    # forward pass sparse-copies the selected rows from the GVA pool into a
+    # device staging buffer. NPU only; requires the acc_offload wheel and
+    # MEMFABRIC_HYBRID_EXTEND_LIB_PATH.
+    SGLANG_OPT_ENGRAM_HOST_OFFLOAD = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
