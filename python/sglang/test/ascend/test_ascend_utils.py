@@ -73,6 +73,9 @@ DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH = os.path.join(
 DEEPSEEK_CODER_1_3_B_BASE_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-coder-1.3b-base"
 )
+DEEPSEEK_V4_FLASH_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-V4-Flash"
+)
 DOTS_OCR_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "rednote-hilab/dots.ocr")
 ECO_TECH_QWEN3_32B_W4A4_LAOS_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-32B-w4a4-LAOS"
@@ -218,6 +221,7 @@ QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "aleoyang/Qwen3-32B-w8a8-MindIE"
 )
 QWQ_32B_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "vllm-ascend/QWQ-32B-W8A8")
+QWEN3_6_35B_A3B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-6-35B-A3B")
 SMOLLM_1_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "HuggingFaceTB/SmolLM-1.7B")
 SOLAR_10_7B_INSTRUCT_V1_0_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "upstage/SOLAR-10.7B-Instruct-v1.0"
