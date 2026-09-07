@@ -1376,12 +1376,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Larger prefills fall back to eager and keep the memory-efficient
         # SUM_LEN. global_num_tokens is identical across ranks (all-gathered),
         # so the decision is consistent cluster-wide.
+        # `> 0`: when require_mlp_tp_gather() is false global_num_tokens holds only
+        # this rank's count, so an idle rank would take MAX_LEN with a maximum of 0
+        # and get rewritten into a 0-token EXTEND batch, whose extend_seq_lens of
+        # [0] indexes an empty hidden_states at -1.
         prefill_cg = get_exec().graph.cuda_graph_config.prefill
         if (
             self.can_run_dp_prefill_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
-            and max(global_num_tokens) <= max(prefill_cg.bs)
+            and 0 < max(global_num_tokens) <= max(prefill_cg.bs)
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
