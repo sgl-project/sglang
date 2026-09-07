@@ -270,7 +270,15 @@ def _invoke_moe_lora_shrink_splitk(
     num_n_blocks = triton.cdiv(N, BLOCK_SIZE_N)
     base_grid = num_m_blocks * num_n_blocks
     max_split_k = max(1, K // BLOCK_SIZE_K)
-    SPLIT_K = min(max_split_k, max(1, 128 // base_grid)) if base_grid < 128 else 1
+    # Force SPLIT_K=1: the split-K path accumulates partial sums with
+    # tl.atomic_add(sem="relaxed"), whose accumulation order is nondeterministic
+    # run-to-run. This produces measurable logprob drift (up to ~0.7 nats at
+    # near-tied tokens) and greedy argmax flips on identical inputs for small
+    # decode batches (base_grid < 128, e.g. single-request decode with
+    # num_m_blocks x num_n_blocks = 1x2 previously picked SPLIT_K up to 64).
+    # Batches with base_grid >= 128 already used SPLIT_K=1, so
+    # high-concurrency serving throughput is unaffected.
+    SPLIT_K = 1
 
     grid = (SPLIT_K * base_grid,)
 
