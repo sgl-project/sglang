@@ -1843,6 +1843,7 @@ class ServerArgs:
         Arg(
             help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
             choices=["sgl-kernel", "torch", "flashinfer"],
+            resolvable=True,
         ),
         NS("exec.kernel"),
     ] = "sgl-kernel"
