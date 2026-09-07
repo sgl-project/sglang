@@ -1441,7 +1441,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
         self.latents_mean = list(config.latents_mean)
         self.latents_std = list(config.latents_std)
-        self.shift_factor = config.shift_factor
+        self.shift_factor = getattr(config, "shift_factor", None)
         self.use_parallel_encode = getattr(config, "use_parallel_encode", False)
         self.use_parallel_decode = getattr(config, "use_parallel_decode", False)
 
@@ -1475,7 +1475,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 use_parallel_decode=should_use_spatial_shard_parallel_decode(config),
             )
 
-        self.use_feature_cache = config.use_feature_cache
+        self.use_feature_cache = getattr(config, "use_feature_cache", False)
         self._causal_decode_initialized = False
 
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
