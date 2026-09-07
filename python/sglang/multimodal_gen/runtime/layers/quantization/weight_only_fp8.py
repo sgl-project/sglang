@@ -477,7 +477,10 @@ def _maybe_promote_fp8_weight(module: nn.Module, x_dtype: torch.dtype) -> None:
             )
             _dequant_low_memory_logged = True
         return
-    dequant = dequantize_rowwise_fp8_weight(weight, module.weight_scale, dtype)
+    # Server warmup commonly runs under inference_mode. A cached inference
+    # tensor has no version counter, so Dynamo cannot later guard it.
+    with torch.inference_mode(False), torch.no_grad():
+        dequant = dequantize_rowwise_fp8_weight(weight, module.weight_scale, dtype)
     module.weight = nn.Parameter(dequant, requires_grad=False)
     if not _dequant_cache_logged:
         logger.info(

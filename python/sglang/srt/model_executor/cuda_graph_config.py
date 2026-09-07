@@ -23,8 +23,10 @@ inside the function body to preserve that invariant.
 import argparse
 import dataclasses
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
+
+from sglang.srt.runtime_context import get_exec
 
 
 class Phase:
@@ -119,6 +121,25 @@ def default_prefill_backend() -> str:
     return Backend.BREAKABLE if is_cuda() else Backend.TC_PIECEWISE
 
 
+def with_phase(config: "CudaGraphConfig", phase: str, **changes) -> "CudaGraphConfig":
+    """A copy of ``config`` with ``changes`` applied to one phase.
+
+    Resolution declares values, so a handler that decides a graph setting hands
+    the stash a new config instead of editing the one an earlier handler
+    declared.
+    """
+    if phase not in Phase.ALL:
+        raise KeyError(phase)
+    # Not a deep copy: `dataclasses.replace` copies field references, so a
+    # list-valued `bs` is shared. Rebind `bs`, never mutate it in place.
+    return CudaGraphConfig(
+        **{
+            name: replace(getattr(config, name), **(changes if name == phase else {}))
+            for name in Phase.ALL
+        }
+    )
+
+
 @dataclass
 class CudaGraphConfig:
     """Top-level CUDA graph config: one PhaseConfig per phase."""
@@ -182,7 +203,6 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
     """True if cuda_graph_config[phase].backend == backend on the
     published config. Returns False if the config has not been published
     yet (e.g. unit tests, early startup)."""
-    from sglang.srt.runtime_context import get_exec
 
     try:
         cfg = get_exec().graph.cuda_graph_config

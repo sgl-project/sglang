@@ -92,18 +92,59 @@ class GlmAsrForConditionalGeneration(nn.Module):
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # Extract audio features from input items
-        input_features = torch.cat([item.feature for item in items], dim=0).type(
-            self.audio_tower.dtype
-        )
+        # The processor emits mel features as a batch of fixed-size 30s windows
+        # (``(num_chunks, num_mel_bins, 3000)``) plus an ``input_features_mask``
+        # marking the valid frames per window; long clips span several windows.
+        # The projector stacks ``merge_factor`` encoder frames into one
+        # embedding, so we reshape per-window to
+        # ``(num_chunks, -1, intermediate_size)`` and then keep only the valid
+        # embeddings per window (derived from the mask via the encoder's
+        # conv-subsampling + merge downsampling). This keeps the emitted count
+        # aligned with the audio placeholder tokens the processor inserted,
+        # mirroring the HF ``CohereAsr``/``GlmAsr`` ``get_audio_features`` path.
+        audio_config = self.config.audio_config
+        merge_factor = audio_config.intermediate_size // audio_config.hidden_size
 
-        audio_embeds = self.audio_tower(input_features).last_hidden_state
-        audio_embeds = audio_embeds.reshape(
-            -1, self.config.audio_config.intermediate_size
-        )
-        audio_embeds = self.multi_modal_projector(audio_embeds)
+        audio_embeds_list = []
+        for item in items:
+            input_features = item.feature.type(self.audio_tower.dtype)
+            input_features_mask = item.input_features_mask
+            if input_features_mask.dim() == 1:
+                input_features_mask = input_features_mask.unsqueeze(0)
+            input_features_mask = input_features_mask.to(input_features.device)
 
-        return audio_embeds
+            hidden_states = self.audio_tower(input_features).last_hidden_state
+
+            # The frame axis is not guaranteed to be a multiple of
+            # ``merge_factor`` (e.g. a short unpadded clip yields an odd frame
+            # count), so right-pad it before stacking ``merge_factor`` frames
+            # per embedding. Padded rows are trimmed back per-window below via
+            # ``post_lengths``, so the extra frames never reach the LM.
+            num_frames = hidden_states.shape[1]
+            pad = (-num_frames) % merge_factor
+            if pad:
+                hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad))
+            hidden_states = hidden_states.reshape(
+                input_features.shape[0], -1, audio_config.intermediate_size
+            )
+            embeds = self.multi_modal_projector(hidden_states)
+
+            # Valid embeddings per window: mel frames -> conv subsampling
+            # (stride 1 then stride 2) -> merge_factor downsampling.
+            audio_lengths = input_features_mask.sum(-1)
+            for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
+                audio_lengths = (
+                    audio_lengths + 2 * padding - (kernel_size - 1) - 1
+                ) // stride + 1
+            post_lengths = (audio_lengths - merge_factor) // merge_factor + 1
+
+            valid = (
+                torch.arange(embeds.shape[1], device=post_lengths.device)[None, :]
+                < post_lengths[:, None]
+            )
+            audio_embeds_list.append(embeds[valid.to(embeds.device)])
+
+        return torch.cat(audio_embeds_list, dim=0)
 
     def forward(
         self,

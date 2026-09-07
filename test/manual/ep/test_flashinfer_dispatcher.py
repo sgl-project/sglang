@@ -10,19 +10,20 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.dp_attention import set_dp_buffer_len
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.utils import initialize_moe_config
+from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestFlashinferDispatcher(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         server_args = ServerArgs(model_path="dummy")
         server_args.moe_runner_backend = "flashinfer_cutlass"
         server_args.moe_a2a_backend = "flashinfer"
         set_global_server_args_for_scheduler(server_args)
-        initialize_moe_config(server_args)
+        publish(server_args, role="scheduler")
+        initialize_moe_config()
 
         init_distributed_environment(
             world_size=-1,  # Auto-detect from environment
@@ -123,8 +124,7 @@ class TestFlashinferDispatcher(CustomTestCase):
         self.assertTrue(
             torch.all(
                 received_hidden_states[
-                    expected_source_rank
-                    * num_tokens : (expected_source_rank + 1)
+                    expected_source_rank * num_tokens : (expected_source_rank + 1)
                     * num_tokens
                 ]
                 == 100.0 + expected_source_rank
@@ -227,8 +227,7 @@ class TestFlashinferDispatcher(CustomTestCase):
             self.assertTrue(
                 torch.all(
                     received_hidden_states[
-                        expected_source_rank
-                        * num_tokens : (expected_source_rank + 1)
+                        expected_source_rank * num_tokens : (expected_source_rank + 1)
                         * num_tokens
                     ]
                     == 100.0 + expected_source_rank

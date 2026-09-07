@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     import torch
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
@@ -48,11 +49,25 @@ register_kernel(
         op="moe.topk_softmax",
         backend=KernelBackend.AOT,
         target="sgl_kernel:topk_softmax",
+        capabilities=_HIP,
         format_signature=FormatSignature(
             in_place=True,
             description="top-k softmax routing weights/ids",
         ),
-        description="MoE top-k softmax (sgl_kernel wheel).",
+        description="MoE top-k softmax (sgl_kernel ROCm wheel).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.topk_softmax",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True,
+            description="top-k softmax routing weights/ids",
+        ),
+        description="MoE top-k softmax (sglang.kernels.jit).",
     )
 )
 
@@ -103,7 +118,7 @@ def topk_softmax(
     correction_bias: Optional[torch.Tensor] = None,
 ) -> None:
     """Compute top-k softmax routing weights/ids for MoE."""
-    return get_kernel("moe.topk_softmax", KernelBackend.AOT)(
+    return get_kernel("moe.topk_softmax")(
         topk_weights,
         topk_ids,
         gating_output,
@@ -184,5 +199,18 @@ register_kernel(
             description="align/sort expert token ids into block-padded buffers",
         ),
         description="MoE align-block-size, single-launch triton variant.",
+    )
+)
+
+# One gather for a quantized activation and its group scales: replaces the pair
+# of shuffle_rows launches the cutlass fp8 blockwise MoE used to walk the same
+# dst2src map with. Byte-identical to those calls.
+register_kernel(
+    KernelSpec(
+        op="moe.shuffle_rows_with_scales",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.shuffle_rows_with_scales:shuffle_rows_with_scales",
+        capabilities=_CUDA,
+        description="Row gather of quantized values plus their scales, one launch.",
     )
 )

@@ -25,6 +25,10 @@ pip install uv
 uv pip install --prerelease=allow sglang
 ```
 
+<Note>
+Some of SGLang's dependencies only publish pre-releases on PyPI, so without `--prerelease=allow` uv older than 0.12.0 silently installs SGLang 0.5.9. On [uv 0.12.0](https://github.com/astral-sh/uv/releases/tag/0.12.0) and newer the flag is a harmless no-op.
+</Note>
+
 The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
 ```bash Command
 pip install --upgrade pip
@@ -61,7 +65,7 @@ uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-ind
 
 ```bash Command
 # Use the last release branch
-git clone -b v0.5.16 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.18 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
@@ -79,7 +83,7 @@ The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.d
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
 <Note>
-`latest` and `dev` are **mutable** tags: `latest` always points at the newest stable release, while `dev` is rebuilt daily from the latest `main` and includes build/development tools. Because they are overwritten over time, pin an immutable version tag for reproducible deployments — e.g. `lmsysorg/sglang:v0.5.16`. Browse all released versions on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang/tags).
+`latest` and `dev` are **mutable** tags: `latest` always points at the newest stable release, while `dev` is rebuilt daily from the latest `main` and includes build/development tools. Because they are overwritten over time, pin an immutable version tag for reproducible deployments — e.g. `lmsysorg/sglang:v0.5.18`. Browse all released versions on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang/tags).
 </Note>
 
 ```bash Command

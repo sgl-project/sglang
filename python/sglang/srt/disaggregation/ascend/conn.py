@@ -21,15 +21,9 @@ logger = logging.getLogger(__name__)
 
 
 class AscendStateType(str, enum.Enum):
-    """DSV4-on-NPU per-pool PD components, kept out of the cross-hardware
-    StateType enum. Sent via the same page-indexed path as SWA."""
+    """DSV4-on-NPU PD components without a cross-hardware equivalent."""
 
-    DSV4_SWA = "dsv4_swa"
-    DSV4_C4 = "dsv4_c4"
     DSV4_C128 = "dsv4_c128"
-    DSV4_INDEXER = "dsv4_indexer"
-    DSV4_C4_STATE = "dsv4_c4_state"
-    DSV4_C128_STATE = "dsv4_c128_state"
 
 
 _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
@@ -71,6 +65,32 @@ class AscendKVManager(MooncakeKVManager):
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
     ) -> Tuple[List[int], List[int], int]:
+        mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
+        if mla_ratios:
+            if len(src_kv_ptrs) == len(dst_kv_ptrs):
+                return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
+
+            start_layer = self.kv_args.prefill_start_layer
+            end_layer = self.kv_args.prefill_end_layer
+            c4_full = sum(ratio == 4 for ratio in mla_ratios)
+            c4_start = sum(ratio == 4 for ratio in mla_ratios[:start_layer])
+            c4_end = sum(ratio == 4 for ratio in mla_ratios[:end_layer])
+            c128_start = sum(ratio == 128 for ratio in mla_ratios[:start_layer])
+            c128_end = sum(ratio == 128 for ratio in mla_ratios[:end_layer])
+
+            if state_type == AscendStateType.DSV4_C128:
+                dst = dst_kv_ptrs[c128_start:c128_end]
+                return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+            # NPU main KV layout: [C4 KV, index K, index scale].
+            if state_type is None and len(dst_kv_ptrs) == 3 * c4_full:
+                dst = []
+                for offset in (0, c4_full, 2 * c4_full):
+                    dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
+                return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+            return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
+
         # src_kv_ptrs: k_data, v_data, index_k_data(optional)
         # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
         # state_type is accepted for parity with the common disaggregation path;

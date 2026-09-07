@@ -1,13 +1,27 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::config::{PolicyKind, SessionAffinityMode};
 use crate::discovery::{ModelId, WorkerMode};
+use crate::policies::admission::{
+    resolve_cache_candidates, resolve_decode, resolve_prefill, resolve_prefill_admitted,
+    CandidateDomain, CandidateRange, DecisionReason,
+};
+use crate::policies::buckets::BucketRequest;
+use crate::policies::decode::{
+    build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
+};
+use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
+use crate::policies::{
+    request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
+    SelectionContext,
+};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+    MetricsRegistry, PolicySelectionFailureReason, RequestOutcome, StaleRequestOutcome,
+    WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -16,11 +30,12 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Observability header carrying the decode-pool URL selected via host
-/// affinity for a PD-disaggregated request. The router fans the
+/// Observability header carrying the final decode-pool URL for a
+/// PD-disaggregated request. The router fans the
 /// bootstrap-injected request body to BOTH the prefill and the decode
 /// worker concurrently; this header lets the prefill log the chosen
 /// peer, and is mirrored onto the response so sidecars / tests can
@@ -28,6 +43,10 @@ use std::sync::Arc;
 /// prefix matches `x-sgl-router-error-code` so router-emitted metadata
 /// stays grouped.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
+/// Optional caller requirement consumed only when a static P Bucket config is enabled.
+const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
+/// Optional caller TPS requirement consumed only when a static D Bucket config is enabled.
+const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
 /// Coarse char-count → token-count divisor used to estimate prefill load
 /// from the request body when no real tokenizer count is available. Four
@@ -38,6 +57,55 @@ const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url")
 /// workers — not absolute accuracy — so the estimate is fit for
 /// purpose.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+/// Return the low-cardinality reason for the final Prefill decision.
+fn prefill_policy_reason(
+    policy: PolicyKind,
+    proposal: ProposalKind,
+    decision: DecisionReason,
+    has_session_id: bool,
+    affinity_lookup_enabled: bool,
+) -> &'static str {
+    match policy {
+        PolicyKind::SessionAware => match (proposal, decision) {
+            (ProposalKind::SessionAffinity, DecisionReason::Primary) => "session_primary",
+            (ProposalKind::SessionAffinity, DecisionReason::BackupPrimaryAdmission) => {
+                "session_admission_backup"
+            }
+            (ProposalKind::SessionAffinity, DecisionReason::BackupPressureGuard) => {
+                "session_pressure_backup"
+            }
+            (ProposalKind::SessionAffinity, DecisionReason::RangeFallback) => {
+                "session_range_fallback"
+            }
+            (_, DecisionReason::CapacityFallbackPowerOfTwo) => "capacity_fallback_power_of_two",
+            (_, DecisionReason::RangeFallback) => "range_fallback",
+            (_, _) if !affinity_lookup_enabled => "range_fallback",
+            (_, _) if !has_session_id => "no_session",
+            (ProposalKind::PowerOfTwo, _) => "assigned",
+            _ => "primary",
+        },
+        PolicyKind::CacheAware => match (proposal, decision) {
+            (_, DecisionReason::CacheCandidate)
+            | (ProposalKind::CacheAffinity, DecisionReason::Primary) => "cache_candidate",
+            (_, DecisionReason::Primary) => "no_cache_candidate",
+            (_, DecisionReason::BackupPrimaryAdmission) => "no_cache_candidate_admission_backup",
+            (_, DecisionReason::BackupPressureGuard) => "no_cache_candidate_pressure_backup",
+            (_, DecisionReason::RangeFallback) => "no_cache_candidate_range_fallback",
+            (_, DecisionReason::CapacityFallbackPowerOfTwo) => {
+                "no_cache_candidate_capacity_fallback_power_of_two"
+            }
+        },
+        _ => match decision {
+            DecisionReason::Primary => "primary",
+            DecisionReason::CacheCandidate => "cache_candidate",
+            DecisionReason::BackupPrimaryAdmission => "admission_backup",
+            DecisionReason::BackupPressureGuard => "pressure_backup",
+            DecisionReason::RangeFallback => "range_fallback",
+            DecisionReason::CapacityFallbackPowerOfTwo => "capacity_fallback_power_of_two",
+        },
+    }
+}
 
 /// Per-route body-size cap on `/v1/chat/completions`. 5 MiB accommodates a
 /// long context — a ~1 M-token context tokenized as JSON fits under this —
@@ -66,6 +134,24 @@ struct RequestProbe {
     stream: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    /// Explicit output budget used by Decode Bucket routing.
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    #[serde(default)]
+    max_completion_tokens: Option<u64>,
+}
+
+impl RequestProbe {
+    fn requested_max_output_tokens(&self) -> Option<u64> {
+        self.max_completion_tokens.or(self.max_tokens)
+    }
+}
+
+/// Project the peak sequence length without integer wraparound.
+fn projected_decode_kv_tokens(input_tokens: u64, max_output_tokens: Option<u64>) -> u64 {
+    max_output_tokens.map_or(input_tokens, |output_tokens| {
+        input_tokens.saturating_add(output_tokens)
+    })
 }
 
 /// RAII guard that records `sgl_router_request_duration_seconds` when
@@ -89,6 +175,24 @@ impl Drop for RecordDurationOnDrop {
     }
 }
 
+fn policy_selection_failed(
+    ctx: &AppContext,
+    model: &str,
+    reason: PolicySelectionFailureReason,
+) -> ApiError {
+    ctx.metrics
+        .record_policy_selection_failure(ctx.config.model.policy, reason);
+    tracing::warn!(
+        policy = %ctx.config.model.policy,
+        reason = reason.as_str(),
+        model,
+        "prefill policy selection failed"
+    );
+    ApiError::PolicySelectionFailed {
+        model: model.to_owned(),
+    }
+}
+
 /// POST /v1/chat/completions — parse model from body, select a healthy
 /// worker via the per-model policy, then proxy the request. If the
 /// request opts into streaming (`stream: true`), we pipe SSE bytes back;
@@ -101,6 +205,7 @@ pub async fn chat_completions(
     let start = std::time::Instant::now();
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
+    let requested_max_output_tokens = probe.requested_max_output_tokens();
     let model_str = probe
         .model
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
@@ -145,12 +250,18 @@ pub async fn chat_completions(
     //     chat encoder (`/v1/completions` / `text`), which the first gate
     //     alone wouldn't trigger.
     //
-    // When neither holds, `parse_probe`'s minimal probe is enough, so we keep
+    //   * Bucket routing also needs the prompt token count.
+    //
+    // When none holds, `parse_probe`'s minimal probe is enough, so we keep
     // avoiding the full `serde_json::Value` allocation over a (up to 1 MiB)
     // body. When parsed, this single value is reused for the routing
     // tokenization and the outgoing-body injection below (and PD bootstrap
     // injection). `parse_probe` already validated the object shape.
-    let want_tokens = ctx.tokenizers.has_chat_encoder(&model_str) || policy.needs_request_tokens();
+    let want_tokens = should_tokenize_request(
+        ctx.tokenizers.has_chat_encoder(&model_str),
+        policy.needs_request_tokens(),
+        ctx.bucket_selector.is_enabled(),
+    );
     let request_value: Option<serde_json::Value> = if want_tokens {
         Some(serde_json::from_slice(&body).map_err(|_| {
             ApiError::BadRequest("invalid request: body must be a JSON object".into())
@@ -167,6 +278,56 @@ pub async fn chat_completions(
     let request_tokens = request_value
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
+    let external_prefix = match (
+        ctx.prefix_index.as_ref(),
+        request_tokens.as_ref(),
+        ctx.block_size_oracle.get(),
+    ) {
+        (Some(index), Some(tokens), Some(block_size)) => {
+            let hashes = if ctx.block_size_oracle.is_bigram() {
+                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
+            } else {
+                compute_block_hashes(&tokens.ids, block_size as usize)
+            };
+            let query_blocks = hashes.len();
+            let outcome = if hashes.is_empty() {
+                sgl_kv_indexer::PrefixOutcome::Empty
+            } else {
+                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
+            };
+            Some(ExternalPrefixSignal {
+                outcome,
+                query_blocks,
+            })
+        }
+        _ => ctx
+            .radix_tree_prefix_provider
+            .as_ref()
+            .zip(request_tokens.as_ref())
+            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
+    };
+
+    // Prefer exact ingress tokens; otherwise use the conservative estimate.
+    let prefill_load = request_tokens
+        .as_ref()
+        .map(|tokens| tokens.ids.len().max(1))
+        .unwrap_or_else(|| estimate_prefill_tokens(&body));
+    let request_input_tokens = prefill_load as u64;
+    let needs_load_snapshot = policy.needs_load_snapshot()
+        || workers
+            .iter()
+            .any(|worker| worker.mode() == WorkerMode::Prefill);
+    let load_snapshot =
+        needs_load_snapshot.then(|| ctx.engine_load.capture_snapshot(std::time::Instant::now()));
+    let needs_dispatch_timestamps = policy.needs_dispatch_timestamps();
+    let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
+        (
+            parse_optional_positive_u64_header(&headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?,
+            parse_optional_positive_f64_header(&headers, &X_SGL_TPS_SLO, "TPS SLO")?,
+        )
+    } else {
+        (None, None)
+    };
 
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
@@ -180,47 +341,348 @@ pub async fn chat_completions(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
-    let worker =
-        policy
-            .select(&workers, &selection_ctx)
-            .ok_or_else(|| ApiError::PolicySelectionFailed {
-                model: model_str.clone(),
-            })?;
+    let session_id = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| headers.get(config.session_id_header.as_str()))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
+    let prefill_bucket_request = BucketRequest {
+        input_tokens: request_input_tokens,
+        expected_peak_sequence_tokens: None,
+        ttft_slo_ms,
+        tps_slo,
+    };
+    let configured_session_affinity_mode = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .map(|config| config.session_affinity_mode)
+        .unwrap_or(SessionAffinityMode::Bucket);
+    // Without Bucket partitioning all modes reduce to the single global domain.
+    let session_affinity_mode = if ctx.bucket_selector.is_enabled() {
+        configured_session_affinity_mode
+    } else {
+        SessionAffinityMode::Bucket
+    };
+    let use_global_affinity_probe = ctx.bucket_selector.is_enabled()
+        && policy.is_bucket_affinity_policy()
+        && session_affinity_mode != SessionAffinityMode::Bucket;
+    let worker = {
+        let selection_failure_reason = Cell::new(PolicySelectionFailureReason::ProposalEmpty);
+        let select_prefill_in_domain = |domain: &CandidateDomain,
+                                        affinity_lookup_enabled: bool,
+                                        affinity_assignment_enabled: bool,
+                                        allow_capacity_fallback: bool|
+         -> Option<Arc<Worker>> {
+            let candidate_range = domain.prefill_range()?;
+            let mut selection_ctx =
+                SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+                    .with_session_id(session_id)
+                    .with_candidate_range_id(candidate_range.id)
+                    .with_input_tokens(request_input_tokens)
+                    .with_request_tokens(
+                        request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+                    )
+                    .with_external_prefix(external_prefix.as_ref());
+            if let Some(snapshot) = load_snapshot.as_ref() {
+                selection_ctx = selection_ctx.with_load_snapshot(snapshot);
+            }
+            let selection_ctx = if !affinity_lookup_enabled {
+                selection_ctx.without_affinity_lookup()
+            } else if !affinity_assignment_enabled {
+                selection_ctx.without_affinity_assignment()
+            } else {
+                selection_ctx
+            };
+            let Some(PrefillProposal::Pair(proposal)) =
+                policy.propose_prefill(candidate_range.workers, &selection_ctx)
+            else {
+                // Domain retries are ordinary pair proposals.
+                return None;
+            };
+            if policy.uses_shared_prefill_admission() {
+                let snapshot = load_snapshot
+                    .as_ref()
+                    .expect("shared prefill admission requires a load snapshot");
+                let decision = if allow_capacity_fallback {
+                    resolve_prefill(&candidate_range, &proposal, request_input_tokens, snapshot)
+                } else {
+                    resolve_prefill_admitted(
+                        &candidate_range,
+                        &proposal,
+                        request_input_tokens,
+                        snapshot,
+                    )
+                };
+                let Some(decision) = decision else {
+                    selection_failure_reason
+                        .set(PolicySelectionFailureReason::PrefillAdmissionExhausted);
+                    return None;
+                };
+                let reason = prefill_policy_reason(
+                    ctx.config.model.policy,
+                    proposal.kind,
+                    decision.reason,
+                    session_id.is_some_and(|value| !value.is_empty()),
+                    affinity_lookup_enabled,
+                );
+                policy.commit_prefill_selection(&selection_ctx, proposal.kind, &decision.selected);
+                ctx.metrics
+                    .record_policy_decision(&ctx.config.model.policy.to_string(), reason);
+                tracing::debug!(
+                    model = %model_str,
+                    policy = ?proposal.kind,
+                    range = %decision.candidate_range_id,
+                    primary = %decision.primary.url,
+                    backup = ?decision.backup.as_ref().map(|worker| worker.url.as_str()),
+                    selected = %decision.selected.url,
+                    reason = ?decision.reason,
+                    load_snapshot_version = decision.load_snapshot_version,
+                    "prefill policy decision",
+                );
+                Some(decision.selected)
+            } else {
+                tracing::debug!(
+                    model = %model_str,
+                    policy = ?proposal.kind,
+                    range = %candidate_range.id,
+                    selected = %proposal.primary.url,
+                    "prefill policy decision without shared admission",
+                );
+                Some(proposal.primary)
+            }
+        };
+        let select_prefill_domains =
+            |domains: &[CandidateDomain],
+             affinity_lookup_enabled: bool,
+             affinity_assignment_enabled: bool| {
+                domains
+                    .iter()
+                    .find_map(|domain| {
+                        select_prefill_in_domain(
+                            domain,
+                            affinity_lookup_enabled,
+                            affinity_assignment_enabled,
+                            false,
+                        )
+                    })
+                    .or_else(|| {
+                        domains.iter().find_map(|domain| {
+                            select_prefill_in_domain(
+                                domain,
+                                affinity_lookup_enabled,
+                                affinity_assignment_enabled,
+                                true,
+                            )
+                        })
+                    })
+            };
 
-    // PD-mode decoder affinity. When the selected prefill worker is
-    // part of a PD-disagg deployment, also resolve the matching decode
-    // peer (same host where possible, falling back to min-load via
-    // `select_decode_with_affinity`). Both workers receive the SAME
-    // request body — augmented with the three flat `bootstrap_*`
-    // fields below — so the SGLang engine can match incoming KV
-    // transfers via `bootstrap_room`.
+        // Cache-Aware resolves one bounded global candidate set and returns a final winner.
+        let cache_winner = (ctx.config.model.policy == PolicyKind::CacheAware)
+            .then(|| {
+                let snapshot = load_snapshot.as_ref()?;
+                let global_range = CandidateRange::global(&workers);
+                let cache_ctx =
+                    SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+                        .with_session_id(session_id)
+                        .with_candidate_range_id(global_range.id)
+                        .with_input_tokens(request_input_tokens)
+                        .with_request_tokens(
+                            request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+                        )
+                        .with_external_prefix(external_prefix.as_ref())
+                        .with_load_snapshot(snapshot)
+                        .with_prefill_cache_bucket(&ctx.bucket_selector, prefill_bucket_request);
+                let PrefillProposal::CacheCandidates(proposal) =
+                    policy.propose_prefill(global_range.workers, &cache_ctx)?
+                else {
+                    return None;
+                };
+                let bounded_candidate_count = proposal.candidates.len();
+                let cache_decision =
+                    resolve_cache_candidates(&proposal, request_input_tokens, snapshot);
+                ctx.metrics.record_cache_admission_evaluations(
+                    cache_decision.admission_evaluated_candidates,
+                );
+                ctx.metrics.record_cache_admission_rejections(
+                    cache_decision.admission_rejected_candidates,
+                );
+                ctx.metrics.record_cache_pressure_guard(
+                    cache_decision.pressure_guard_compared_pairs,
+                    cache_decision.pressure_guard_overrides,
+                );
+                ctx.metrics
+                    .record_cache_monitor_decision(cache_decision.prefill_pressure_source);
+                let Some(decision) = cache_decision.decision else {
+                    selection_failure_reason
+                        .set(PolicySelectionFailureReason::CacheCandidatesExhausted);
+                    return None;
+                };
+                let selected_candidate = proposal
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.worker.id == decision.selected.id)?;
+                tracing::debug!(
+                    model = %model_str,
+                    policy = ?ProposalKind::CacheAffinity,
+                    range = %decision.candidate_range_id,
+                    selected = %decision.selected.url,
+                    cache_candidates = bounded_candidate_count,
+                    input_tokens = request_input_tokens,
+                    matched_prefix_tokens = selected_candidate.matched_prefix_tokens,
+                    uncached_tokens = selected_candidate.uncached_tokens,
+                    reason = ?decision.reason,
+                    load_snapshot_version = decision.load_snapshot_version,
+                    prefill_pressure_source = cache_decision.prefill_pressure_source,
+                    "cache candidate winner",
+                );
+                ctx.metrics
+                    .record_policy_decision("cache_aware", "cache_candidate");
+                Some(decision.selected)
+            })
+            .flatten();
+
+        let global_affinity_probe = use_global_affinity_probe
+            .then(|| {
+                let snapshot = load_snapshot.as_ref()?;
+                let global_range = CandidateRange::global(&workers);
+                let probe_ctx =
+                    SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+                        .with_session_id(session_id)
+                        .with_candidate_range_id(global_range.id)
+                        .with_input_tokens(request_input_tokens)
+                        .with_request_tokens(
+                            request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+                        )
+                        .with_external_prefix(external_prefix.as_ref())
+                        .with_load_snapshot(snapshot)
+                        .without_affinity_assignment();
+                policy.propose(global_range.workers, &probe_ctx)
+            })
+            .flatten();
+        // A new or stale session may create its first assignment in the target Bucket.
+        let global_affinity_missed = global_affinity_probe
+            .as_ref()
+            .is_some_and(|proposal| !matches!(proposal.kind, ProposalKind::SessionAffinity));
+        let global_affinity_worker = global_affinity_probe
+            .and_then(|proposal| {
+                matches!(proposal.kind, ProposalKind::SessionAffinity).then_some(proposal.primary)
+            })
+            .and_then(|primary| {
+                ctx.bucket_selector.prefill_affinity_domain(
+                    &workers,
+                    &primary,
+                    prefill_bucket_request,
+                )
+            })
+            // Rebuild the backup inside the primary's own Bucket.
+            .and_then(|domain| select_prefill_in_domain(&domain, true, false, false));
+        cache_winner
+            .or_else(|| {
+                // Materialize normal domains only when Cache-Aware has no winner.
+                let prefill_domains = ctx
+                    .bucket_selector
+                    .prefill_domains(&workers, prefill_bucket_request);
+                if ctx.config.model.policy == PolicyKind::CacheAware {
+                    // Cache miss or failure retries ordered domains with ordinary P2.
+                    return select_prefill_domains(&prefill_domains, false, false);
+                }
+                global_affinity_worker.or_else(|| match session_affinity_mode {
+                    SessionAffinityMode::GlobalPreserve if global_affinity_missed => {
+                        select_prefill_domains(&prefill_domains, true, true)
+                    }
+                    SessionAffinityMode::GlobalPreserve => {
+                        select_prefill_domains(&prefill_domains, false, false)
+                    }
+                    SessionAffinityMode::Bucket | SessionAffinityMode::GlobalRebind => {
+                        select_prefill_domains(&prefill_domains, true, true)
+                    }
+                })
+            })
+            .ok_or_else(|| {
+                policy_selection_failed(&ctx, &model_str, selection_failure_reason.get())
+            })?
+    };
+
+    // Decode selection starts after Final P.
     //
     // Plain-mode workers skip the decode resolution entirely (no
     // decode peer to find). PD-mode requests that fail to resolve a
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
     let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
-        Some(
-            resolver
-                .decode_with_affinity(&model_id, &worker.url)
-                .map_err(|e| match e {
-                    PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
-                        model: model_str.clone(),
-                    },
-                    PdResolveError::NoDecodeWorkersAvailable => {
-                        ApiError::NoDecodeWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                    PdResolveError::NoPrefillWorkersAvailable => {
-                        ApiError::NoPrefillWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                })?,
-        )
+        let decode_workers = resolver.decode_candidates(&model_id).map_err(|e| match e {
+            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+                model: model_str.clone(),
+            },
+        })?;
+        let request_kv_tokens =
+            projected_decode_kv_tokens(request_input_tokens, requested_max_output_tokens);
+        let expected_peak_sequence_tokens = requested_max_output_tokens.map(|_| request_kv_tokens);
+        let decode_domains = ctx.bucket_selector.decode_domains(
+            &decode_workers,
+            BucketRequest {
+                input_tokens: request_input_tokens,
+                expected_peak_sequence_tokens,
+                ttft_slo_ms,
+                tps_slo,
+            },
+        );
+        let decode_policy = build_decode_policy(ctx.config.model.decode_policy);
+        let select_decode_in_domain =
+            |decode_domain: &CandidateDomain, allow_capacity_fallback: bool| {
+                let snapshot = load_snapshot.as_ref()?;
+                let decode_ctx = DecodeSelectionContext::new()
+                    .with_load_snapshot(snapshot)
+                    .with_prefill_url(&worker.url);
+                let decode_proposal = decode_policy.propose(decode_domain, &decode_ctx)?;
+                let decode_decision = if allow_capacity_fallback {
+                    resolve_decode_with_capacity_fallback(
+                        decode_domain,
+                        &decode_proposal,
+                        request_kv_tokens,
+                        snapshot,
+                    )
+                } else {
+                    resolve_decode(decode_domain, &decode_proposal, request_kv_tokens, snapshot)
+                }?;
+                tracing::debug!(
+                    model = %model_str,
+                    policy = ?ctx.config.model.decode_policy,
+                    range = %decode_decision.candidate_range_id,
+                    primary = %decode_decision.primary.url,
+                    backup = ?decode_decision.backup.as_ref().map(|worker| worker.url.as_str()),
+                    selected = %decode_decision.selected.url,
+                    reason = ?decode_decision.reason,
+                    load_snapshot_version = decode_decision.load_snapshot_version,
+                    "decode policy decision",
+                );
+                Some(decode_decision.selected)
+            };
+        decode_domains
+            .iter()
+            .find_map(|domain| select_decode_in_domain(domain, false))
+            .or_else(|| {
+                decode_domains
+                    .iter()
+                    .find_map(|domain| select_decode_in_domain(domain, true))
+            })
+            .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            })
+            .map(Some)?
     } else {
         None
     };
@@ -256,19 +718,12 @@ pub async fn chat_completions(
     // ends, the client disconnects, or the handler returns an error. In
     // PD mode the pair moves into the spawned prefill task so prefill
     // load is tracked for the full duration of the KV transfer; in plain
-    // mode the pair stays in this handler. Decode-load contribution is
-    // 0 here: the active-load registry's decode axis is reserved for a
-    // future decode-side scheduler — current decode selection is
-    // host-affinity only.
-    let guard = worker.load_guard();
-    // Use the exact token count from the ingress tokenization when available;
-    // fall back to the byte-count heuristic for load-only policies that don't
-    // tokenize. The exact count makes the cache-aware load-imbalance fast-path
-    // accurate rather than off by the char/token ratio.
-    let prefill_load = request_tokens
-        .as_ref()
-        .map(|t| t.ids.len().max(1))
-        .unwrap_or_else(|| estimate_prefill_tokens(&body));
+    // mode the pair stays in this handler. Decode load is tracked on Final D.
+    let guard = if needs_dispatch_timestamps {
+        worker.timestamped_load_guard()
+    } else {
+        worker.load_guard()
+    };
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
@@ -438,12 +893,14 @@ pub async fn chat_completions(
 
         // Synchronously await the decode worker. Its response is what
         // the client sees. The decode side gets its own LoadGuard so
-        // per-worker `active_requests` reflects decode-pool load for
-        // cache-aware-zmq decisions on the decode side.
+        // per-worker `active_requests` reflects load on Final D.
         let decode_guard = decode_worker.load_guard();
+        let decode_active_guard =
+            ctx.active_load
+                .register(decode_worker.id.clone(), decode_worker.url.clone(), 0, 1);
         if streaming {
             let stream_guards: Box<dyn Send + 'static> =
-                Box::new((decode_guard, make_duration_guard()));
+                Box::new((decode_guard, decode_active_guard, make_duration_guard()));
             let fetch = ctx.proxy.forward_streaming_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
@@ -459,7 +916,7 @@ pub async fn chat_completions(
                 _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
             }
         } else {
-            let _decode_hold = decode_guard;
+            let _decode_hold = (decode_guard, decode_active_guard);
             let fetch = ctx.proxy.forward_json_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
@@ -592,7 +1049,7 @@ pub async fn chat_completions(
     );
 
     // Mirror the upstream `x-sgl-decode-url` hint onto the response so
-    // external tests / sidecars can observe PD decode affinity without
+    // external tests / sidecars can observe the final PD Decode selection without
     // sniffing the proxy hop. The request-side header was set above for
     // the prefill worker; copying it here makes the affinity observable
     // end-to-end. Plain-mode requests skip this (no decode peer was
@@ -620,17 +1077,101 @@ pub async fn chat_completions(
     }
 }
 
+fn resolve_prefix_query(
+    result: Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
+    model: &str,
+) -> Result<sgl_kv_indexer::PrefixOutcome, ApiError> {
+    use sgl_kv_indexer::PrefixIndexError;
+    match result {
+        Ok(outcome) => Ok(outcome),
+        // The prefix hit only improves worker choice, so an indexer that is
+        // shedding, slow, or down costs cache affinity — not availability.
+        Err(
+            error @ (PrefixIndexError::Overloaded
+            | PrefixIndexError::Timeout
+            | PrefixIndexError::Unreachable),
+        ) => {
+            tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
+            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
+        }
+        // A prompt too long to fit one gRPC message is still a prompt a worker
+        // can serve, so it costs cache affinity like the cases above. Logged
+        // separately because the remedy is operational — raise the indexer's
+        // message limit — rather than waiting for the indexer to recover.
+        Err(error @ PrefixIndexError::QueryTooLarge) => {
+            tracing::warn!(%model, error = %error, "prompt exceeds the KV Indexer query size limit; falling back to min-load routing");
+            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
+        }
+        // A rejection means the router and the indexer disagree on the request
+        // contract; degrading would hide that from every request.
+        Err(error) => {
+            tracing::warn!(%model, error = %error, "KV Indexer rejected the query");
+            Err(ApiError::PolicySelectionFailed {
+                model: model.to_string(),
+            })
+        }
+    }
+}
+
+fn parse_optional_positive_u64_header(
+    headers: &HeaderMap,
+    name: &HeaderName,
+    label: &str,
+) -> Result<Option<u64>, ApiError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be ASCII")))?;
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be a positive integer")))?;
+    if parsed == 0 {
+        return Err(ApiError::BadRequest(format!(
+            "{label} header must be a positive integer"
+        )));
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_optional_positive_f64_header(
+    headers: &HeaderMap,
+    name: &HeaderName,
+    label: &str,
+) -> Result<Option<f64>, ApiError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be ASCII")))?;
+    let parsed = raw
+        .parse::<f64>()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be a positive number")))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(ApiError::BadRequest(format!(
+            "{label} header must be a finite positive number"
+        )));
+    }
+    Ok(Some(parsed))
+}
+
+fn should_tokenize_request(
+    has_chat_encoder: bool,
+    policy_needs_request_tokens: bool,
+    bucket_enabled: bool,
+) -> bool {
+    has_chat_encoder || policy_needs_request_tokens || bucket_enabled
+}
+
 /// Estimate prefill-token count from the raw request body for use as
 /// the active-load `prefill_load` counter. Returns 1 at minimum so
 /// a registered request always shows up as "load > 0" — under-counting
 /// to zero would hide the request from the cache-aware policy's
 /// load-imbalance fast-path.
 ///
-/// This is a coarse approximation: we count the body length in bytes
-/// and divide by [`CHARS_PER_TOKEN_ESTIMATE`]. A future improvement is
-/// to thread the tokenizer's actual token count through (the
-/// cache-aware-zmq policy already tokenizes the prompt for tree
-/// matching — that count could be reused here).
+/// Exact ingress tokens are preferred when available.
 fn estimate_prefill_tokens(body: &Bytes) -> usize {
     (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
 }
@@ -707,7 +1248,7 @@ fn build_outgoing_body(
         _ => {
             return Err(ApiError::BadRequest(
                 "invalid request: body must be a JSON object".to_string(),
-            ))
+            ));
         }
     };
     if let Some(ids) = input_ids {
@@ -911,6 +1452,125 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
 mod tests {
     use super::*;
 
+    /// An unavailable indexer must never fail a request that min-load routing
+    /// can still serve. `QueryTooLarge` belongs here too: a prompt that outgrows
+    /// the query's message limit loses cache affinity, not availability.
+    #[test]
+    fn unavailable_indexer_degrades_to_empty_prefix_signal() {
+        for error in [
+            sgl_kv_indexer::PrefixIndexError::Overloaded,
+            sgl_kv_indexer::PrefixIndexError::Timeout,
+            sgl_kv_indexer::PrefixIndexError::Unreachable,
+            sgl_kv_indexer::PrefixIndexError::QueryTooLarge,
+        ] {
+            assert_eq!(
+                resolve_prefix_query(Err(error.clone()), "tiny").unwrap(),
+                sgl_kv_indexer::PrefixOutcome::Empty,
+                "{error} should degrade"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_indexer_query_still_fails_selection() {
+        assert!(matches!(
+            resolve_prefix_query(
+                Err(sgl_kv_indexer::PrefixIndexError::Rejected(
+                    sgl_kv_indexer::RpcCode::InvalidArgument
+                )),
+                "tiny"
+            ),
+            Err(ApiError::PolicySelectionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {
+        assert!(should_tokenize_request(false, false, true));
+        assert!(!should_tokenize_request(false, false, false));
+    }
+
+    #[test]
+    fn session_reason_distinguishes_hit_assignment_and_keyless_fallback() {
+        assert_eq!(
+            prefill_policy_reason(
+                PolicyKind::SessionAware,
+                ProposalKind::SessionAffinity,
+                DecisionReason::Primary,
+                true,
+                true,
+            ),
+            "session_primary"
+        );
+        assert_eq!(
+            prefill_policy_reason(
+                PolicyKind::SessionAware,
+                ProposalKind::PowerOfTwo,
+                DecisionReason::Primary,
+                true,
+                true,
+            ),
+            "assigned"
+        );
+        assert_eq!(
+            prefill_policy_reason(
+                PolicyKind::SessionAware,
+                ProposalKind::PowerOfTwo,
+                DecisionReason::Primary,
+                false,
+                true,
+            ),
+            "no_session"
+        );
+    }
+
+    #[test]
+    fn session_reason_preserves_admission_and_pressure_escapes() {
+        assert_eq!(
+            prefill_policy_reason(
+                PolicyKind::SessionAware,
+                ProposalKind::SessionAffinity,
+                DecisionReason::BackupPrimaryAdmission,
+                true,
+                true,
+            ),
+            "session_admission_backup"
+        );
+        assert_eq!(
+            prefill_policy_reason(
+                PolicyKind::SessionAware,
+                ProposalKind::SessionAffinity,
+                DecisionReason::BackupPressureGuard,
+                true,
+                true,
+            ),
+            "session_pressure_backup"
+        );
+    }
+
+    #[test]
+    fn cache_no_winner_p2_is_distinct_from_cache_candidate() {
+        assert_eq!(
+            prefill_policy_reason(
+                PolicyKind::CacheAware,
+                ProposalKind::PowerOfTwo,
+                DecisionReason::Primary,
+                false,
+                false,
+            ),
+            "no_cache_candidate"
+        );
+        assert_eq!(
+            prefill_policy_reason(
+                PolicyKind::CacheAware,
+                ProposalKind::CacheAffinity,
+                DecisionReason::Primary,
+                false,
+                true,
+            ),
+            "cache_candidate"
+        );
+    }
     /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The
     /// SGLang prefill stores `bootstrap_room` as `torch.int64`; a u64
     /// with the top bit set would wrap negative on the engine side.
@@ -1177,6 +1837,33 @@ mod tests {
         let p = parse_probe(&b).unwrap();
         assert_eq!(p.stream, None);
         assert_eq!(p.model.as_deref(), Some("tiny"));
+    }
+
+    #[test]
+    fn parse_probe_accepts_modern_openai_completion_budget() {
+        let body =
+            Bytes::from_static(br#"{"model":"tiny","messages":[],"max_completion_tokens":256}"#);
+        assert_eq!(
+            parse_probe(&body).unwrap().requested_max_output_tokens(),
+            Some(256)
+        );
+    }
+
+    #[test]
+    fn modern_completion_budget_takes_precedence_when_both_fields_are_present() {
+        let body =
+            Bytes::from_static(br#"{"model":"tiny","max_tokens":128,"max_completion_tokens":256}"#);
+        assert_eq!(
+            parse_probe(&body).unwrap().requested_max_output_tokens(),
+            Some(256)
+        );
+    }
+
+    #[test]
+    fn decode_kv_projection_includes_the_explicit_output_budget() {
+        assert_eq!(projected_decode_kv_tokens(1_024, Some(512)), 1_536);
+        assert_eq!(projected_decode_kv_tokens(1_024, None), 1_024);
+        assert_eq!(projected_decode_kv_tokens(u64::MAX - 1, Some(8)), u64::MAX);
     }
 
     #[test]

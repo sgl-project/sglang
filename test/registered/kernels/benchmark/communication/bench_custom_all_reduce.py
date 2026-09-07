@@ -246,7 +246,7 @@ def benchmark(message_KB: int, provider: str):
         )
     if provider == "aot" and world_size not in AOT_SUPPORTED_WORLD_SIZES:
         marker.skip(
-            f"AOT custom_all_reduce needs world_size in " f"{AOT_SUPPORTED_WORLD_SIZES}"
+            f"AOT custom_all_reduce needs world_size in {AOT_SUPPORTED_WORLD_SIZES}"
         )
     _init_all_backends()
     backend = BACKEND_FACTORY[provider]()

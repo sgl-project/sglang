@@ -1,5 +1,5 @@
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
@@ -135,9 +135,15 @@ def forward_mha_core_npu(
     k: torch.Tensor,
     v: torch.Tensor,
     forward_batch: "ForwardBatch",
+    # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
+    # to inner_state, so every *_core dispatched from forward_core takes it as
+    # a trailing arg. None everywhere else.
+    gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
+    if gate is not None:
+        attn_output = m._apply_gated(attn_output, gate)
     output, _ = m.o_proj(attn_output)
     return output
 
@@ -203,8 +209,10 @@ def forward_mla_prepare_npu(
                 k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
                 k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
             else:
-                if qkv_latent.shape[0] < 65536 and not dsa_use_prefill_cp(
-                    forward_batch
+                if (
+                    qkv_latent.shape[0] < 65536
+                    and not dsa_use_prefill_cp(forward_batch)
+                    and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
                 ):
                     q, k_nope, k_pe = fused_split_qk_norm(
                         qkv_latent,
@@ -216,6 +224,8 @@ def forward_mla_prepare_npu(
                         eps=m.q_a_layernorm.variance_epsilon,
                     )
                 else:
+                    # The fused split+RMSNorm kernel is not numerically equivalent
+                    # on Ascend. Keep the unfused path for models that opt out.
                     q, latent_cache = qkv_latent.split(
                         [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim],
                         dim=-1,
@@ -245,7 +255,8 @@ def forward_mla_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        if m.rotary_emb is not None:
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -284,6 +295,10 @@ def forward_mla_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
     topk_indices: torch.Tensor,
+    # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
+    # to inner_state, so every *_core dispatched from forward_core takes it as
+    # a trailing arg. None everywhere else.
+    gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     attn_output = m.attn_mqa(
         q_nope_out,
@@ -297,16 +312,32 @@ def forward_mla_core_npu(
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
-    attn_bmm_output = torch.empty(
-        (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-        dtype=attn_output.dtype,
-        device=attn_output.device,
-    )
-
     attn_output = attn_output.contiguous()
-    torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    if (
+        attn_output.shape[0] >= 65536
+        or attn_output.shape[-1] * attn_output.shape[-2] >= 65536
+        or m.w_vc.shape[-1] >= 65536
+    ):
+        # npu_transpose_batchmatmul does not support dimensions >= 65536.
+        attn_bmm_output = torch.empty(
+            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
+            dtype=attn_output.dtype,
+            device=attn_output.device,
+        )
+        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    else:
+        # Use the numerically validated torch_npu implementation when supported.
+        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+            attn_output,
+            m.w_vc,
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+        )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
+    if gate is not None:
+        attn_bmm_output = m._apply_gated(attn_bmm_output, gate)
     output, _ = m.o_proj(attn_bmm_output)
 
     return output
@@ -380,8 +411,10 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if fused_qkv_a_proj_out.shape[0] < 65535 and not dsa_use_prefill_cp(
-                forward_batch
+            if (
+                fused_qkv_a_proj_out.shape[0] < 65535
+                and not dsa_use_prefill_cp(forward_batch)
+                and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
             ):
                 q_lora, k_nope, k_pe = fused_split_qk_norm(
                     fused_qkv_a_proj_out,
@@ -393,6 +426,8 @@ def forward_dsa_prepare_npu(
                     eps=m.q_a_layernorm.variance_epsilon,
                 )
             else:
+                # Keep the numerically validated unfused path for models that
+                # explicitly opt out of the fused split and RMSNorm kernel.
                 q, latent_cache = fused_qkv_a_proj_out.split(
                     [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
                 )
@@ -460,6 +495,10 @@ def forward_dsa_core_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
+    # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
+    # to inner_state, so every *_core dispatched from forward_core takes it as
+    # a trailing arg. None everywhere else.
+    gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     attn_output = m.attn_mqa(
         q_nope_out.contiguous(),
@@ -498,6 +537,8 @@ def forward_dsa_core_npu(
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
+    if gate is not None:
+        attn_bmm_output = m._apply_gated(attn_bmm_output, gate)
     output, _ = m.o_proj(attn_bmm_output)
     if not m.next_skip_topk:
         return output, None
