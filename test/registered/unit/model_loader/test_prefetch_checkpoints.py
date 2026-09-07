@@ -11,7 +11,7 @@ import threading
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import safetensors.torch
 import torch
@@ -20,10 +20,12 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
+    _get_fs_type,
     _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
+    should_auto_prefetch_checkpoints,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -698,6 +700,132 @@ class TestPrefetchDispatch(CustomTestCase):
             self._make_loader(
                 {"enable_gds": "false"}, load_format=LoadFormat.FASTSAFETENSORS
             )
+
+
+class TestAutoPrefetchDetection(CustomTestCase):
+    """Verify the filesystem detection behind the ``auto`` prefetch default.
+
+    Prefetch turns the loader's scattered mmap faults into sequential reads,
+    which only pays off when a fault costs a network round trip and the
+    checkpoint can stay resident in the page cache.
+    """
+
+    _MOUNTS = (
+        "rootfs / ext4 rw 0 0\n"
+        "10.0.0.1:/vol /data lustre rw 0 0\n"
+        "/dev/nvme0n1 /data/local ext4 rw 0 0\n"
+    )
+
+    def _patch_mounts(self, contents=None):
+        return patch("builtins.open", mock_open(read_data=contents or self._MOUNTS))
+
+    def test_fs_type_picks_longest_matching_mount(self):
+        """Nested mounts must resolve like the kernel does: longest prefix
+        wins, so /data/local is ext4 even though /data is lustre."""
+        with self._patch_mounts():
+            self.assertEqual(_get_fs_type(["/data/model/f.safetensors"]), "lustre")
+        with self._patch_mounts():
+            self.assertEqual(_get_fs_type(["/data/local/model/f.safetensors"]), "ext4")
+        with self._patch_mounts():
+            self.assertEqual(_get_fs_type(["/opt/model/f.safetensors"]), "ext4")
+
+    def test_fs_type_does_not_match_sibling_prefix(self):
+        """/database must not match the /data mount by string prefix alone."""
+        with self._patch_mounts():
+            self.assertEqual(_get_fs_type(["/database/f.safetensors"]), "ext4")
+
+    def test_fs_type_returns_empty_without_proc_mounts(self):
+        """/proc/mounts is Linux-only; an unreadable file means "unknown"."""
+        with patch("builtins.open", side_effect=OSError):
+            self.assertEqual(_get_fs_type(["/data/f.safetensors"]), "")
+        self.assertEqual(_get_fs_type([]), "")
+
+    def _patch_sizing(self, total_bytes, avail_bytes):
+        return (
+            patch("os.path.getsize", return_value=total_bytes),
+            patch(
+                "psutil.virtual_memory",
+                return_value=SimpleNamespace(available=avail_bytes),
+            ),
+        )
+
+    def test_auto_enables_on_network_fs_that_fits_in_ram(self):
+        p_size, p_mem = self._patch_sizing(10 * 1024**3, 100 * 1024**3)
+        with self._patch_mounts(), p_size, p_mem:
+            self.assertTrue(
+                should_auto_prefetch_checkpoints(["/data/model/f.safetensors"])
+            )
+
+    def test_auto_stays_off_on_local_fs(self):
+        """Local storage has no round-trip cost to amortize."""
+        p_size, p_mem = self._patch_sizing(10 * 1024**3, 100 * 1024**3)
+        with self._patch_mounts(), p_size, p_mem:
+            self.assertFalse(
+                should_auto_prefetch_checkpoints(["/data/local/model/f.safetensors"])
+            )
+
+    def test_auto_stays_off_when_checkpoint_exceeds_ram(self):
+        """Prefetching a checkpoint larger than RAM would evict its own
+        earlier pages, so the read is paid for twice."""
+        p_size, p_mem = self._patch_sizing(95 * 1024**3, 100 * 1024**3)
+        with self._patch_mounts(), p_size, p_mem:
+            self.assertFalse(
+                should_auto_prefetch_checkpoints(["/data/model/f.safetensors"])
+            )
+
+    def test_auto_stays_off_when_sizing_fails(self):
+        with self._patch_mounts(), patch("os.path.getsize", side_effect=OSError):
+            self.assertFalse(
+                should_auto_prefetch_checkpoints(["/data/model/f.safetensors"])
+            )
+
+    def test_auto_requires_files(self):
+        self.assertFalse(should_auto_prefetch_checkpoints([]))
+
+
+class TestAutoPrefetchDispatch(TestPrefetchDispatch):
+    """The ``auto`` default must consult detection only when left unset."""
+
+    def test_unset_prefetch_consults_auto_detection(self):
+        loader = self._make_loader({})
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=None
+        )
+        with (
+            p_prep,
+            p_model,
+            p_buffered as mock_buffered,
+            p_single as mock_single,
+            p_warn,
+            patch(
+                "sglang.srt.model_loader.loader.should_auto_prefetch_checkpoints",
+                return_value=True,
+            ) as mock_auto,
+        ):
+            self._run(loader)
+        mock_auto.assert_called_once_with(["f.safetensors"])
+        mock_single.assert_called_once()
+        mock_buffered.assert_not_called()
+
+    def test_explicit_prefetch_skips_auto_detection(self):
+        """An explicit True/False from the user is authoritative."""
+        for explicit in (True, False):
+            loader = self._make_loader({})
+            p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+                prefetch=explicit
+            )
+            with (
+                p_prep,
+                p_model,
+                p_buffered,
+                p_single,
+                p_warn,
+                patch(
+                    "sglang.srt.model_loader.loader.should_auto_prefetch_checkpoints",
+                ) as mock_auto,
+            ):
+                self._run(loader)
+            mock_auto.assert_not_called()
 
 
 if __name__ == "__main__":
