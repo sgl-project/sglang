@@ -231,16 +231,29 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         apart; master-side memory-watermark eviction in that window expires
         replicas and would fail the layer-wise load fatally. Re-checking here
         lets the caller degrade the request to a plain cache miss instead.
+
+        Failures inside the revalidation itself never propagate: this hook
+        guards a hot scheduling path, so an unexpected error falls back to
+        "validated" and the async load path retains its own semantics.
         """
-        key_strs: list[str] = []
-        for transfer in transfers:
-            component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                list(transfer.keys), transfer
+        try:
+            resolved = self.pool_group.resolve_transfers(
+                transfers, allow_partial=True, allow_missing_kv=True
             )
-            key_strs.extend(self.storage._tag_keys(component_keys))
-        if not key_strs:
+            if not resolved:
+                return True
+            key_strs: list[str] = []
+            for transfer in resolved:
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
+                key_strs.extend(self.storage._tag_keys(component_keys))
+            if not key_strs:
+                return True
+            exist = self.storage._batch_exist(key_strs)
+        except BaseException:
+            logger.exception("Mooncake direct linker load revalidation error")
             return True
-        exist = self.storage._batch_exist(key_strs)
         missing = [key for key, state in zip(key_strs, exist) if state != 1]
         if missing:
             logger.warning(
