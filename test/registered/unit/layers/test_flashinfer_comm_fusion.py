@@ -1,5 +1,6 @@
 import contextlib
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -76,6 +77,43 @@ class _FakeFlashInferComm:
         norm_out.copy_(expected_norm)
 
 
+class _FakePureMoeAllReduceAPI:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(
+        self,
+        world_size,
+        world_rank,
+        token_num,
+        hidden_dim,
+        workspace_ptrs,
+        launch_with_pdl,
+        residual_in,
+        rms_gamma,
+        rms_eps,
+        scale_factor,
+        moe_reduction_device_num_experts,
+        moe_reduction_scale_input,
+        moe_reduction_active_experts_token_input,
+        moe_reduction_token_input,
+        layout_code,
+        moe_allreduce_out,
+        residual_out,
+        norm_out,
+        quant_out,
+        scale_out,
+        weight_bias=None,
+        *,
+        backend="trtllm",
+    ):
+        call = locals().copy()
+        call.pop("self")
+        self.calls.append(call)
+        residual_out.copy_(residual_in + 1)
+        norm_out.copy_(residual_in + 2)
+
+
 def _torch_allreduce_residual_rmsnorm_baseline(
     input_tensor, residual, weight, world_size, eps
 ):
@@ -88,6 +126,175 @@ def _torch_allreduce_residual_rmsnorm_baseline(
         * weight.to(torch.float32)
     ).to(input_tensor.dtype)
     return norm_out, residual_out
+
+
+class TestFlashInferTrtllmMoeAllReduce(CustomTestCase):
+    def test_resolver_requires_the_exact_22_parameter_api(self):
+        api = _FakePureMoeAllReduceAPI()
+
+        class PureOnlyComm:
+            trtllm_moe_allreduce_fusion = api
+
+            def __getattr__(self, name):
+                raise AssertionError(f"the pure resolver inspected unexpected {name}")
+
+        self.assertIs(
+            fusion._get_flashinfer_trtllm_moe_allreduce_api(PureOnlyComm()), api
+        )
+
+        def missing_backend(*args, **kwargs):
+            return None
+
+        self.assertIsNone(
+            fusion._get_flashinfer_trtllm_moe_allreduce_api(
+                SimpleNamespace(trtllm_moe_allreduce_fusion=missing_backend)
+            )
+        )
+
+    def test_payload_admission_uses_lamport_workspace_byte_limit(self):
+        for world_size, max_tokens in ((2, 74825), (4, 37412), (8, 18706)):
+            with self.subTest(world_size=world_size):
+                self.assertTrue(
+                    fusion._cake_moe_allreduce_lamport_workspace_supported(
+                        2049, 7168, world_size
+                    )
+                )
+                self.assertTrue(
+                    fusion._cake_moe_allreduce_lamport_workspace_supported(
+                        max_tokens, 7168, world_size
+                    )
+                )
+                self.assertFalse(
+                    fusion._cake_moe_allreduce_lamport_workspace_supported(
+                        max_tokens + 1, 7168, world_size
+                    )
+                )
+
+        self.assertFalse(
+            fusion._cake_moe_allreduce_lamport_workspace_supported(0, 7168, 8)
+        )
+
+    def test_layout_adapter_produces_expert_major_inputs(self):
+        gemm2_out = torch.arange(15, dtype=torch.bfloat16).reshape(5, 3)
+        expert_weights = torch.tensor(
+            [[0.1, 0.2], [0.3, 0.4]], dtype=torch.bfloat16
+        )
+        expanded_idx = torch.tensor([[2, 0], [4, 1]], dtype=torch.int32)
+
+        active, scales = fusion.materialize_flashinfer_trtllm_moe_allreduce_layout(
+            gemm2_out, expert_weights, expanded_idx
+        )
+
+        expected_active = torch.stack(
+            (
+                torch.stack((gemm2_out[2], gemm2_out[4])),
+                torch.stack((gemm2_out[0], gemm2_out[1])),
+            )
+        )
+        torch.testing.assert_close(active, expected_active)
+        torch.testing.assert_close(
+            scales, expert_weights.transpose(0, 1).to(torch.float32)
+        )
+        self.assertEqual(active.shape, (2, 2, 3))
+        self.assertEqual(scales.dtype, torch.float32)
+        self.assertTrue(active.is_contiguous())
+        self.assertTrue(scales.is_contiguous())
+
+    def test_dispatch_passes_exact_api_and_cake_backend(self):
+        api = _FakePureMoeAllReduceAPI()
+        payload = fusion.FlashInferTrtllmMoeAllReducePayload(
+            active_experts_token_input=torch.randn(2, 3, 4),
+            scale_input=torch.randn(2, 3, dtype=torch.float32),
+            token_input=torch.randn(3, 4),
+            workspace_ptrs=torch.zeros(13, dtype=torch.int64),
+            world_rank=1,
+            world_size=4,
+            launch_with_pdl=True,
+        )
+        residual = torch.randn(3, 4)
+        norm_weight = torch.randn(4)
+
+        with patch.object(fusion, "_flashinfer_trtllm_moe_allreduce", api):
+            norm_out, residual_out = fusion.run_flashinfer_trtllm_moe_allreduce(
+                payload, residual, norm_weight, 1e-6
+            )
+
+        self.assertEqual(len(api.calls), 1)
+        call = api.calls[0]
+        self.assertEqual(tuple(call), fusion._TRTLLM_MOE_ALLREDUCE_REQUIRED_PARAMS)
+        self.assertEqual(call["backend"], "cake")
+        self.assertIs(call["moe_reduction_token_input"], payload.token_input)
+        self.assertIsNone(call["moe_allreduce_out"])
+        self.assertIsNone(call["quant_out"])
+        self.assertIsNone(call["scale_out"])
+        torch.testing.assert_close(residual_out, residual + 1)
+        torch.testing.assert_close(norm_out, residual + 2)
+
+    def test_missing_pure_api_falls_back_before_layout_materialization(self):
+        materialize = MagicMock()
+        with (
+            patch.object(fusion, "_flashinfer_trtllm_moe_allreduce", None),
+            patch.object(
+                fusion,
+                "materialize_flashinfer_trtllm_moe_allreduce_layout",
+                materialize,
+            ),
+        ):
+            result = fusion.prepare_flashinfer_trtllm_moe_allreduce_payload(
+                gemm2_out=torch.empty(16, 8),
+                expert_weights=torch.empty(2, 8),
+                expanded_idx_to_permuted_idx=torch.empty(2, 8, dtype=torch.int32),
+                shared_expert_output=torch.empty(2, 8),
+                top_k=8,
+                launch_with_pdl=True,
+            )
+
+        self.assertIsNone(result)
+        materialize.assert_not_called()
+
+    def test_decoder_consumes_payload_only_once(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer
+
+        layer = object.__new__(DeepseekV2DecoderLayer)
+        object.__setattr__(
+            layer,
+            "input_layernorm",
+            SimpleNamespace(weight=torch.randn(4), variance_epsilon=1e-6),
+        )
+        payload = fusion.FlashInferTrtllmMoeAllReducePayload(
+            active_experts_token_input=torch.randn(2, 3, 4),
+            scale_input=torch.randn(2, 3, dtype=torch.float32),
+            token_input=torch.randn(3, 4),
+            workspace_ptrs=torch.zeros(13, dtype=torch.int64),
+            world_rank=0,
+            world_size=4,
+            launch_with_pdl=True,
+        )
+        residual = torch.randn(3, 4)
+        norm_out = torch.randn(3, 4)
+        residual_out = torch.randn(3, 4)
+
+        with patch.object(
+            fusion,
+            "run_flashinfer_trtllm_moe_allreduce",
+            return_value=(norm_out, residual_out),
+        ) as run:
+            first_hidden, first_residual, consumed = (
+                layer._consume_flashinfer_trtllm_moe_allreduce(payload, residual)
+            )
+            second_hidden, second_residual, consumed_again = (
+                layer._consume_flashinfer_trtllm_moe_allreduce(
+                    first_hidden, first_residual
+                )
+            )
+
+        self.assertTrue(consumed)
+        self.assertFalse(consumed_again)
+        self.assertIs(first_hidden, norm_out)
+        self.assertIs(first_residual, residual_out)
+        self.assertIs(second_hidden, norm_out)
+        self.assertIs(second_residual, residual_out)
+        run.assert_called_once()
 
 
 class TestFlashInferCommFusion(CustomTestCase):
