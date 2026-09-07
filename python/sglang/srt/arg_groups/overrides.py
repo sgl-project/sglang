@@ -1425,6 +1425,13 @@ def _dcp_comm_backend_default(view: Any) -> dict:
         return {}
     if view.dcp_comm_backend != "ag_rs":
         return {}
+    logger.info(
+        "Ascend NPU selects the DCP communication backend: 'ag_rs' -> 'a2a'. "
+        "Note this promotes an explicitly passed --dcp-comm-backend ag_rs as "
+        "well: 'ag_rs' is the field's own default, and the resolution pipeline "
+        "cannot tell the two apart. To hold ag_rs as a correctness reference, "
+        "drop this pass rather than passing the flag."
+    )
     return {"dcp_comm_backend": "a2a"}
 
 
