@@ -284,6 +284,22 @@ class UnifiedCacheLinkerWrapper:
                 return empty_indices, req.last_node
             component_transfers.append((component, transfer))
 
+        # Keys can be evicted remotely (master memory-watermark eviction)
+        # between the match-time lookup and this load-back; a stale hit would
+        # then fail the async layer-wise session fatally. Re-check existence
+        # here so the request degrades to a plain cache miss instead.
+        revalidate = getattr(self.cache_linker, "revalidate_load", None)
+        if revalidate is not None and not revalidate(
+            [transfer for _, transfer in component_transfers]
+        ):
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+            return empty_indices, req.last_node
+
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
         self._update_load(
