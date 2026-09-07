@@ -8,7 +8,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 def _view_with_pointer_mod(
@@ -62,7 +62,7 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
 
         with mock.patch(
             "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
-            side_effect=lambda tensor: tensor,
+            side_effect=lambda tensor, eps: tensor,
         ):
             result, _, checkpoints = kernel.extend(
                 q,

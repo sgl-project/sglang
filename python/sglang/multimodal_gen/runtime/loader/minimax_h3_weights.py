@@ -85,13 +85,14 @@ def validate_minimax_h3_checkpoint_variant(
     checkpoint_paths: list[str], selected_variant: str
 ) -> None:
     names = " ".join(path.lower() for path in checkpoint_paths)
-    checkpoint_variant = next(
-        (variant for variant in ("fl2va", "ref2va") if variant in names), None
-    )
+    checkpoint_variants = {
+        variant for variant in ("fl2va", "ref2va") if variant in names
+    }
     if (
-        checkpoint_variant is not None
-        and checkpoint_variant != selected_variant.lower()
+        len(checkpoint_variants) == 1
+        and selected_variant.lower() not in checkpoint_variants
     ):
+        (checkpoint_variant,) = checkpoint_variants
         raise ValueError(
             f"MiniMax-H3 checkpoint variant {checkpoint_variant!r} does not match "
             f"--model-variant {selected_variant!r}"
