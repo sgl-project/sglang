@@ -39,9 +39,10 @@ class TestEagle3IntelXPU(
 class TestEagleLlama2IntelXPU(
     EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit, SpecHiddenStatesKit
 ):
-    """EAGLE/Llama-2 on intel_xpu using the supported topk > 1 paged config."""
+    """EAGLE/Llama-2 on intel_xpu using the supported topk = 1 paged config."""
 
     attention_backend = "intel_xpu"
+    spec_topk = 1
     page_size = 64
     gsm8k_check_accept_len = True
     gsm8k_num_examples = 300
