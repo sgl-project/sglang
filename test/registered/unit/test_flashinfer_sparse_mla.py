@@ -9,11 +9,11 @@ from sglang.kernels.ops.attention.flash_mla_sm120 import (
     create_flashinfer_sparse_mla_runner,
     flashinfer_sparse_mla_forward,
 )
-from sglang.srt.mem_cache import kv_cache_configurator
-from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
 )
+from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+from sglang.srt.mem_cache import kv_cache_configurator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
