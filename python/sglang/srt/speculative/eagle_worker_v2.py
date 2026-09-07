@@ -143,6 +143,11 @@ _EAGLE_CUDA_SYNC_DEBUG_CHECKPOINTS = frozenset(
     {
         "after_verify",
         "after_draft_extend",
+        "after_draft_prepare",
+        "after_draft_metadata",
+        "after_draft_forward",
+        "after_draft_topk",
+        "after_draft_pp_tree",
         "after_draft",
     }
 )
@@ -170,16 +175,31 @@ def _resolve_eagle_cuda_sync_debug_checkpoints(device: str) -> frozenset[str]:
     return selected
 
 
-def _sync_eagle_cuda_debug(checkpoint: str, device: str) -> None:
+def _sync_eagle_cuda_debug(
+    checkpoint: str, device: str, *, detail: Optional[str] = None
+) -> None:
     """Synchronize the current compute stream at one EAGLE debug boundary."""
-    logger.warning("EAGLE CUDA sync debug begin: checkpoint=%s", checkpoint)
+    context = f" checkpoint={checkpoint}"
+    if detail is not None:
+        context += f" detail={detail}"
+    logger.warning("EAGLE CUDA sync debug begin:%s", context)
     try:
         torch.cuda.current_stream(device=device).synchronize()
     except RuntimeError as exc:
-        raise RuntimeError(
-            f"EAGLE CUDA sync debug failed: checkpoint={checkpoint}"
-        ) from exc
-    logger.warning("EAGLE CUDA sync debug end: checkpoint=%s", checkpoint)
+        raise RuntimeError(f"EAGLE CUDA sync debug failed:{context}") from exc
+    logger.warning("EAGLE CUDA sync debug end:%s", context)
+
+
+def _maybe_sync_eagle_cuda_debug(
+    selected: frozenset[str],
+    checkpoint: str,
+    device: str,
+    *,
+    detail: Optional[str] = None,
+) -> None:
+    """Synchronize only when a validated EAGLE debug boundary is selected."""
+    if checkpoint in selected:
+        _sync_eagle_cuda_debug(checkpoint, device, detail=detail)
 
 
 def _slice_draft_output_to_local_tokens(
@@ -215,6 +235,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
+        cuda_sync_debug_checkpoints: frozenset[str] = frozenset(),
     ):
         super().__init__()
 
@@ -224,6 +245,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
+        self._eagle_cuda_sync_debug_checkpoints = cuda_sync_debug_checkpoints
 
         # Args for easy access
         self.device = get_device().device
@@ -618,6 +640,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        _maybe_sync_eagle_cuda_debug(
+            self._eagle_cuda_sync_debug_checkpoints,
+            "after_draft_prepare",
+            self.device,
+        )
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
@@ -642,6 +669,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
+                _maybe_sync_eagle_cuda_debug(
+                    self._eagle_cuda_sync_debug_checkpoints,
+                    "after_draft_forward",
+                    self.device,
+                    detail="graph",
+                )
             else:
                 if (
                     not forward_batch.forward_mode.is_idle()
@@ -651,6 +684,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
+                    _maybe_sync_eagle_cuda_debug(
+                        self._eagle_cuda_sync_debug_checkpoints,
+                        "after_draft_metadata",
+                        self.device,
+                    )
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
@@ -678,6 +716,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_tokens = torch.cat(
                 (draft_input.bonus_tokens.unsqueeze(1), draft_tokens), dim=1
             ).flatten()
+            _maybe_sync_eagle_cuda_debug(
+                self._eagle_cuda_sync_debug_checkpoints,
+                "after_draft_pp_tree",
+                self.device,
+            )
             return draft_tokens, parent_list, top_scores_index
 
         return build_eagle_verify_input(
@@ -801,6 +844,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output = self.draft_runner.forward(
                         forward_batch
                     ).logits_output
+                _maybe_sync_eagle_cuda_debug(
+                    self._eagle_cuda_sync_debug_checkpoints,
+                    "after_draft_forward",
+                    self.device,
+                    detail=f"step={i}",
+                )
                 next_token_logits, next_hidden_states, local_positions = (
                     _slice_draft_output_to_local_tokens(
                         logits_output.next_token_logits,
@@ -840,6 +889,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     local_positions.add_(1)
+                _maybe_sync_eagle_cuda_debug(
+                    self._eagle_cuda_sync_debug_checkpoints,
+                    "after_draft_topk",
+                    self.device,
+                    detail=f"step={i}",
+                )
                 maybe_detect_oob(
                     topk_index,
                     0,
@@ -905,6 +960,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 canary_index_ctx,
             ):
                 self.draft_runner.forward(forward_batch)
+            _maybe_sync_eagle_cuda_debug(
+                self._eagle_cuda_sync_debug_checkpoints,
+                "after_draft_forward",
+                self.device,
+                detail=f"idle_step={i}",
+            )
 
         return None, None, None, None
 
@@ -1231,6 +1292,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ps,
                 nccl_port,
                 target_worker,
+                cuda_sync_debug_checkpoints=self._eagle_cuda_sync_debug_checkpoints,
             )
             if self._hosts_draft
             else None

@@ -16,6 +16,7 @@ from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import (
     EagleDraftWorker,
     EAGLEWorkerV2,
+    _maybe_sync_eagle_cuda_debug,
     _resolve_eagle_cuda_sync_debug_checkpoints,
     _sync_eagle_cuda_debug,
 )
@@ -150,6 +151,44 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
         current_stream.assert_called_once_with(device="cuda:1")
         current_stream.return_value.synchronize.assert_called_once_with()
 
+    def test_internal_draft_checkpoints_are_selectable(self):
+        from sglang.srt.environ import envs
+
+        expected = frozenset(
+            {
+                "after_draft_prepare",
+                "after_draft_metadata",
+                "after_draft_forward",
+                "after_draft_topk",
+                "after_draft_pp_tree",
+            }
+        )
+        with (
+            envs.SGLANG_EAGLE_CUDA_SYNC_DEBUG.override(",".join(expected)),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2._is_cuda",
+                True,
+            ),
+        ):
+            selected = _resolve_eagle_cuda_sync_debug_checkpoints("cuda:1")
+
+        self.assertEqual(selected, expected)
+
+    @patch("sglang.srt.speculative.eagle_worker_v2._sync_eagle_cuda_debug")
+    def test_maybe_sync_forwards_step_detail_only_when_selected(self, sync_debug):
+        selected = frozenset({"after_draft_forward"})
+
+        _maybe_sync_eagle_cuda_debug(
+            selected, "after_draft_forward", "cuda:1", detail="step=0"
+        )
+        _maybe_sync_eagle_cuda_debug(
+            selected, "after_draft_topk", "cuda:1", detail="step=0"
+        )
+
+        sync_debug.assert_called_once_with(
+            "after_draft_forward", "cuda:1", detail="step=0"
+        )
+
     def test_unknown_checkpoint_fails_closed(self):
         from sglang.srt.environ import envs
 
@@ -182,6 +221,17 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
             "EAGLE CUDA sync debug failed: checkpoint=after_draft_extend",
         ):
             _sync_eagle_cuda_debug("after_draft_extend", "cuda:0")
+
+    @patch("sglang.srt.speculative.eagle_worker_v2.torch.cuda.current_stream")
+    def test_sync_error_identifies_draft_step(self, current_stream):
+        current_stream.return_value.synchronize.side_effect = RuntimeError(
+            "illegal memory access"
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "checkpoint=after_draft_topk detail=step=1",
+        ):
+            _sync_eagle_cuda_debug("after_draft_topk", "cuda:0", detail="step=1")
 
     @patch("sglang.srt.speculative.eagle_worker_v2._sync_eagle_cuda_debug")
     def test_pp_non_last_syncs_after_verify_before_return(self, sync_debug):
