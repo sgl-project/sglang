@@ -487,3 +487,9 @@ At WebSocket `init` the realtime adapter fills SANA-WM defaults that differ from
 <Note>
 `guidance_scale` applies to the dense path (§4) only; the distilled streaming path uses `streaming_cfg_scale` (default `1.0`, i.e. no CFG) so a `guidance_scale` override never accidentally enables CFG on the streaming stage. `denoising_step_list = (1000, 960, 889, 727, 0)` is the official 4-step streaming schedule (it must end in 0).
 </Note>
+
+## 10. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />
