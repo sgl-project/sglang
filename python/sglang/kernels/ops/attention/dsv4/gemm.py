@@ -112,8 +112,42 @@ def hpc_bf16xfp32_gemm_enabled() -> bool:
     return _linear_bf16_fp32_algo == "hpc" and _hpc_gemm_bf16xfp32_available()
 
 
+@functools.cache
+def _mm_out_dtype_supported(device_type: str) -> bool:
+    """Whether ``torch.mm(bf16, bf16, out_dtype=fp32)`` is registered here.
+
+    ``aten::mm.dtype`` is a per-backend overload, so naming a device is not the
+    same as having the kernel, and asking for it without one raises rather than
+    falling back to the plain overload. Which backends carry it is a property of
+    the torch build, so probe once and let a build without it keep the working
+    fp32 fallback.
+
+    Resolving this lazily is safe even though the caller sits in the forward
+    pass. Every decode graph backend runs two warmup forwards before capture,
+    so the probe and its one small allocation are paid outside the graph, and
+    the answer depends only on the torch build, so every rank agrees.
+    """
+    if device_type == "cuda":
+        return True
+    if device_type != "xpu":
+        return False
+    try:
+        probe = torch.ones(1, 1, dtype=torch.bfloat16, device=device_type)
+        return torch.mm(probe, probe, out_dtype=torch.float32).dtype == torch.float32
+    except (RuntimeError, NotImplementedError, TypeError):
+        return False
+
+
 def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16:
+    # Without the fused branch the fallback re-materializes the bf16 weight in
+    # fp32 on every call. For the DSv4 compressor wkv_gate (bf16 2048x4096 in
+    # CSA layers) that is a 32 MiB fp32 copy plus a 4x larger weight read, per
+    # layer, per decode step.
+    if (
+        x.dtype == torch.bfloat16
+        and y.dtype == torch.bfloat16
+        and _mm_out_dtype_supported(x.device.type)
+    ):
         return torch.mm(x, y.t(), out_dtype=torch.float32)
     return torch.mm(x.float(), y.float().t())
 
