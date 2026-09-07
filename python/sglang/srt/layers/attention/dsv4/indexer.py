@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
-    plan_topk_v2,
     topk_transform_paged,
     topk_transform_paged_v2,
 )
@@ -439,6 +438,59 @@ def topk_transform_flashinfer_fused(
     )
 
 
+def _run_c4_topk_transform(
+    *,
+    dsa_topk_backend: DSATopKBackend,
+    flashinfer_topk_transform: Callable[..., None],
+    logits: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    c4_sparse_page_indices: torch.Tensor,
+    page_size: int,
+    topk_metadata: torch.Tensor,
+    raw_indices: Optional[torch.Tensor],
+) -> None:
+    if dsa_topk_backend.is_torch():
+        topk_transform_pytorch_vectorized(
+            logits,
+            c4_seq_lens,
+            page_table,
+            c4_sparse_page_indices,
+            page_size,
+            raw_indices,
+        )
+    elif dsa_topk_backend.is_flashinfer():
+        flashinfer_topk_transform(
+            logits,
+            c4_seq_lens,
+            page_table,
+            c4_sparse_page_indices,
+            page_size,
+            raw_indices,
+        )
+    elif dsa_topk_backend.should_use_topk_v2():
+        # Sparse prefill consumes request-local C4 positions while attention
+        # consumes KV-pool slots; v2 emits both from one selection.
+        topk_transform_paged_v2(
+            logits,
+            c4_seq_lens,
+            page_table,
+            c4_sparse_page_indices,
+            page_size,
+            topk_metadata,
+            raw_indices,
+        )
+    else:
+        topk_transform_paged(
+            logits,
+            c4_seq_lens,
+            page_table,
+            c4_sparse_page_indices,
+            page_size,
+            raw_indices,
+        )
+
+
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
@@ -850,48 +902,27 @@ class C4IndexerBackendMixin:
 
         def run_topk_transform(rows: slice, logits: torch.Tensor) -> None:
             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
-            if self.dsa_topk_backend.is_torch():
-                topk_transform_pytorch_vectorized(
-                    logits,
-                    c4_seq_lens[rows],
-                    page_table[rows],
-                    c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
-                    row_raw_indices,
-                )
-            elif self.dsa_topk_backend.is_flashinfer():
-                self.flashinfer_topk_transform(
-                    logits,
-                    c4_seq_lens[rows],
-                    page_table[rows],
-                    c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
-                    row_raw_indices,
-                )
-            elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
-                topk_transform_paged_v2(
-                    logits,
-                    c4_seq_lens[rows],
-                    page_table[rows],
-                    c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
-                    # The cached plan routes rows by their index in the full
-                    # range, so a chunk needs one built over its own rows.
-                    (
-                        indexer_metadata.topk_metadata
-                        if rows == all_rows or not is_hip()
-                        else plan_topk_v2(c4_seq_lens[rows])
-                    ),
-                )
-            else:
-                topk_transform_paged(
-                    logits,
-                    c4_seq_lens[rows],
-                    page_table[rows],
-                    c4_sparse_page_indices[rows],
-                    indexer_metadata.c4_page_size,
-                    row_raw_indices,
-                )
+            topk_metadata = indexer_metadata.topk_metadata
+            if (
+                self.dsa_topk_backend.should_use_topk_v2()
+                and rows != all_rows
+                and is_hip()
+            ):
+                # ROCm compiles out the cluster path and only validates the
+                # [num_rows + 1, 2] plan shape. Reuse a correctly sized view
+                # instead of allocating a no-op plan for every layer/chunk.
+                topk_metadata = topk_metadata[: logits.shape[0] + 1]
+            _run_c4_topk_transform(
+                dsa_topk_backend=self.dsa_topk_backend,
+                flashinfer_topk_transform=self.flashinfer_topk_transform,
+                logits=logits,
+                c4_seq_lens=c4_seq_lens[rows],
+                page_table=page_table[rows],
+                c4_sparse_page_indices=c4_sparse_page_indices[rows],
+                page_size=indexer_metadata.c4_page_size,
+                topk_metadata=topk_metadata,
+                raw_indices=row_raw_indices,
+            )
 
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
