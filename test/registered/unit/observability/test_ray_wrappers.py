@@ -16,12 +16,14 @@ from functools import partial
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.observability.fake_ray import (
     clear_fake_ray_modules,
     load_ray_wrappers_with_fake_ray,
     load_ray_wrappers_without_ray,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -297,7 +299,7 @@ class TestAsciiDocumentation(TestRayWrapperBase):
                 self.assertEqual(metric.description, "load - seconds")
 
 
-class TestInterTokenLatencyEquivalence(unittest.TestCase):
+class TestInterTokenLatencyEquivalence(CustomTestCase):
     """``observe_inter_token_latency`` writes histogram internals directly for
     the default backend but replays ``observe()`` for an injected one; both must
     record identical sums and bucket counts, or ITL diverges between the default
@@ -306,9 +308,14 @@ class TestInterTokenLatencyEquivalence(unittest.TestCase):
     _BUCKETS = [0.05, 0.1, 0.5, 1.0]
     _LABELS = {"model_name": "m"}
 
-    class _StubServerArgs:
-        prompt_tokens_buckets = None
-        generation_tokens_buckets = None
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            prompt_tokens_buckets=None,
+            generation_tokens_buckets=None,
+        )
+        self.server_args = override.install()
+        self.addCleanup(override.restore)
 
     def _build_collector(self, *, force_fallback: bool):
         # A private registry per collector avoids duplicate ``sglang:`` names.
@@ -320,7 +327,7 @@ class TestInterTokenLatencyEquivalence(unittest.TestCase):
             _histogram_cls = partial(Histogram, registry=registry)
 
         collector = _Collector(
-            server_args=self._StubServerArgs(),
+            server_args=self.server_args,
             labels=self._LABELS,
             bucket_time_to_first_token=[0.1, 1.0],
             bucket_inter_token_latency=self._BUCKETS,
