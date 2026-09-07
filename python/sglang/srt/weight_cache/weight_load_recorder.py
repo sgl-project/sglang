@@ -3,13 +3,12 @@
 
 The recorder treats ``model.load_weights`` as the source of truth.  Source
 daemons record the real load while allowing writes to execute.  Target daemons
-replay the same checkpoint metadata with meta tensors and suppress registered
-tensor writes.  In both modes the result is a model-independent set of logical
-tensor boxes backed by final registered parameter or buffer storage.
+replay the same metadata with meta tensors and exact scalar values, suppressing
+registered tensor writes.  Both modes produce model-independent logical boxes
+backed by final registered parameter or buffer storage.
 
-Only byte-preserving layout operations are supported.  Anything that cannot be
-lowered to a contiguous destination range fails explicitly instead of falling
-back to model-specific semantics.
+Supported loader operations must leave logical regions representable as
+contiguous destination ranges. Unsupported mappings fail explicitly.
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ import contextvars
 import inspect
 import re
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
@@ -38,6 +37,7 @@ class LogicalWeightMetadata:
     shape: tuple[int, ...]
     dtype: str
     itemsize: int
+    scalar_value: bool | int | float | None = None
 
 
 @dataclass(frozen=True)
@@ -576,11 +576,24 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
         output = next(iter(_iter_tensors(result)))
         output_shape = tuple(int(value) for value in output.shape)
         if name in self._TRANSPARENT_OPS:
+            pieces = provenance.pieces
             if name == "aten::_to_copy" and output.dtype != input_tensor.dtype:
-                return provenance.unsupported("dtype-changing aten::_to_copy")
+                pieces = tuple(
+                    replace(
+                        piece,
+                        provenance=_replace_provenance_shape(
+                            piece.provenance,
+                            layout_op=(
+                                f"cast({_dtype_name(input_tensor.dtype)}"
+                                f"->{_dtype_name(output.dtype)})"
+                            ),
+                        ),
+                    )
+                    for piece in pieces
+                )
             return _CompositeProvenance(
                 tensor_shape=output_shape,
-                pieces=provenance.pieces,
+                pieces=pieces,
             )
 
         if name not in ("aten::slice", "aten::narrow"):
@@ -606,8 +619,11 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
             start = int(args[2])
             end = start + int(args[3])
         size = provenance.tensor_shape[dim]
-        start = min(max(start, 0), size)
-        end = min(max(end, start), size)
+        if name == "aten::slice":
+            start, end, _ = slice(start, end).indices(size)
+        elif start < 0:
+            start += size
+            end += size
 
         pieces = []
         for piece in provenance.pieces:
@@ -697,12 +713,11 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
             if step != 1:
                 return (provenance.unsupported("slice step is not one"),)
             size = provenance.local_shape[dim]
-            start = min(max(start, 0), size)
-            end = min(max(end, start), size)
+            start, end, _ = slice(start, end).indices(size)
             offset = list(provenance.global_offset)
             shape = list(provenance.local_shape)
             offset[dim] += start
-            shape[dim] = end - start
+            shape[dim] = max(0, end - start)
             return (
                 _replace_provenance_shape(
                     provenance,
@@ -838,6 +853,8 @@ class _WeightLoadDispatchMode(TorchDispatchMode):
                 )
             if dim < 0:
                 dim += ndim
+            if start < 0:
+                start += provenance.local_shape[dim]
             offset = list(provenance.global_offset)
             shape = list(provenance.local_shape)
             offset[dim] += start
@@ -861,6 +878,7 @@ class WeightLoadRecorder:
             int, tuple[weakref.ReferenceType[torch.Tensor], _TensorProvenance]
         ] = {}
         self._destinations: dict[int, tuple[_Destination, ...]] = {}
+        self._destination_aliases: dict[int, torch.Tensor] = {}
         self._unsupported_destinations: dict[int, tuple[str, ...]] = {}
         self._unsupported_destination_ids: dict[int, str] = {}
         self._model: Any | None = None
@@ -933,17 +951,28 @@ class WeightLoadRecorder:
                 raise WeightLoadRecordingError(
                     "weight loaders must consume (str, Tensor) entries"
                 )
+            scalar_value = None
+            if (
+                tensor.numel() == 1
+                and tensor.device.type != "meta"
+                and not tensor.is_complex()
+            ):
+                scalar_value = tensor.item()
             metadata = LogicalWeightMetadata(
                 tensor_id=name,
                 shape=tuple(int(value) for value in tensor.shape),
                 dtype=_dtype_name(tensor.dtype),
                 itemsize=int(tensor.element_size()),
+                scalar_value=scalar_value,
             )
-            previous = self._metadata.setdefault(name, metadata)
-            if previous != metadata:
+            previous = self._metadata.get(name)
+            if previous is not None and (
+                replace(previous, scalar_value=scalar_value) != metadata
+            ):
                 raise WeightLoadRecordingError(
                     f"checkpoint tensor metadata changed during loading: {name}"
                 )
+            self._metadata[name] = metadata
             provenance = _LogicalProvenance(
                 metadata=metadata,
                 global_shape=metadata.shape,
@@ -959,6 +988,7 @@ class WeightLoadRecorder:
 
     def _index_destinations(self, model: Any) -> None:
         grouped: dict[tuple[Any, ...], tuple[Any, list[str]]] = {}
+        aliases: dict[int, torch.Tensor] = {}
         unsupported_by_storage: dict[int, list[str]] = {}
         unsupported_by_id: dict[int, str] = {}
 
@@ -1013,6 +1043,7 @@ class WeightLoadRecorder:
             if key not in grouped:
                 grouped[key] = (tensor, [])
             grouped[key][1].append(name)
+            aliases[id(tensor)] = grouped[key][0]
 
         by_storage: dict[int, list[_Destination]] = {}
         for parameter, names in grouped.values():
@@ -1031,6 +1062,7 @@ class WeightLoadRecorder:
             key: tuple(sorted(value, key=lambda item: (item.end - item.begin, item.names)))
             for key, value in by_storage.items()
         }
+        self._destination_aliases = aliases
         self._unsupported_destinations = {
             key: tuple(sorted(set(value)))
             for key, value in unsupported_by_storage.items()
@@ -1278,23 +1310,10 @@ class WeightLoadRecorder:
             )
 
         self._reject_unsupported_destination(destination)
-        storage_id = _storage_id(destination)
-        candidates = self._destinations.get(storage_id, ())
-        begin = _tensor_address(destination)
-        end = begin + int(destination.numel()) * int(destination.element_size())
-        owner = next(
-            (
-                candidate
-                for candidate in candidates
-                if candidate.dtype == destination.dtype
-                and candidate.begin <= begin
-                and end <= candidate.end
-            ),
-            None,
-        )
+        owner = self._owner_for(destination)
         if owner is None:
-            self._reject_unsupported_destination(destination, storage_id)
             return
+        begin = _tensor_address(destination)
 
         for piece in provenance.pieces:
             element_offset = _contiguous_region_element_offset(
@@ -1391,9 +1410,8 @@ class WeightLoadRecorder:
                 event.local_shape,
             )
             deduplicated.setdefault(key, event)
-        used_ids = {event.tensor_id for event in deduplicated.values()}
         metadata = tuple(
-            self._metadata[tensor_id] for tensor_id in sorted(used_ids)
+            self._metadata[tensor_id] for tensor_id in sorted(self._metadata)
         )
         views = tuple(
             sorted(
@@ -1426,7 +1444,12 @@ class WeightLoadRecorder:
         for name, tensor, is_parameter in _iter_registered_tensors(self._model):
             if id(tensor) in self._unsupported_destination_ids:
                 continue
-            intervals = covered.get(id(tensor))
+            canonical = self._destination_aliases.get(id(tensor), tensor)
+            intervals = covered.get(id(canonical))
+            if canonical is not tensor and (
+                _tensor_geometry(tensor) != _tensor_geometry(canonical)
+            ):
+                intervals = None
             kind = "parameter" if is_parameter else "buffer"
             if not intervals:
                 if not is_parameter:
@@ -1557,7 +1580,14 @@ def record_target_weight_load_plan(
                 raise WeightLoadRecordingError(
                     f"unsupported checkpoint dtype: {metadata.dtype}"
                 )
-            tensor = torch.empty(metadata.shape, dtype=dtype, device="meta")
+            # Scalar loaders may call item() or branch on the checkpoint value.
+            # Replay that exact value while continuing to suppress runtime writes.
+            if metadata.scalar_value is None:
+                tensor = torch.empty(metadata.shape, dtype=dtype, device="meta")
+            else:
+                tensor = torch.tensor(
+                    metadata.scalar_value, dtype=dtype, device="cpu"
+                ).reshape(metadata.shape)
             yield metadata.tensor_id, tensor
 
     runtime_tensor_state = {
@@ -1609,6 +1639,7 @@ def logical_weight_metadata_from_runtime_manifests(
                     shape=tuple(int(value) for value in item["shape"]),
                     dtype=str(item["dtype"]),
                     itemsize=int(item["itemsize"]),
+                    scalar_value=item.get("scalar_value"),
                 )
             else:
                 current = LogicalWeightMetadata(
@@ -1616,6 +1647,7 @@ def logical_weight_metadata_from_runtime_manifests(
                     shape=tuple(int(value) for value in item.shape),
                     dtype=str(item.dtype),
                     itemsize=int(item.itemsize),
+                    scalar_value=getattr(item, "scalar_value", None),
                 )
             previous = metadata.setdefault(current.tensor_id, current)
             if previous != current:

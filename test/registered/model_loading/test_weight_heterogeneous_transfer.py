@@ -1,4 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Unit and contract tests for weight-cache heterogeneous transfer.
+
+Cover recorder placement, manifests, Mooncake planning, the TCP registry, and
+daemon/IPC coordination using small Torch modules and mocked transfer calls.
+"""
 
 import argparse
 import threading
@@ -149,6 +154,265 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             client, "layer.use_deep_gemm_bmm", True
         )
         self.assertTrue(client.layer.use_deep_gemm_bmm)
+
+    def test_scalar_checkpoint_values_survive_manifest_replay(self):
+        import msgspec
+
+        from sglang.srt.weight_cache.weight_load_recorder import (
+            logical_weight_metadata_from_runtime_manifests,
+        )
+
+        class ScalarModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.zeros(1))
+                self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+                self.transpose = False
+
+            def load_weights(self, weights):
+                for name, loaded in weights:
+                    if name == "scale":
+                        self.transpose = loaded.item() > 0
+                        self.scale.data.fill_(loaded.item())
+                    else:
+                        self.weight.data.copy_(loaded.t() if self.transpose else loaded)
+
+        for value in (-2.5, 0.0, 3.0):
+            with self.subTest(value=value):
+                source = ScalarModel()
+                recorder = WeightLoadRecorder()
+                recorder.record_model_load(
+                    source,
+                    (("scale", torch.tensor(value)), ("weight", torch.arange(4).reshape(2, 2).float())),
+                    execute_writes=True,
+                )
+                source_plan = recorder.build_plan()
+                manifest = ImmutableWeightRuntimeManifestBuilder(
+                    model=source,
+                    load_plan=source_plan,
+                    topology=WeightParallelTopology(),
+                    allowed_devices=("cpu",),
+                ).build(
+                    model_id="scalar-model",
+                    revision="test",
+                    instance_id="source",
+                    worker_id="source",
+                    endpoint="127.0.0.1:1",
+                )
+                placement, _ = build_mooncake_placement_and_bindings(
+                    (manifest,), placement_set_id="scalar-source",
+                    tp_size=1, pp_size=1, ep_size=1,
+                )
+                scalar_descriptor = next(
+                    tensor for tensor in placement.parts[0].tensors
+                    if tensor.tensor_id == "scale"
+                )
+                self.assertEqual(scalar_descriptor.global_shape, (1,))
+                metadata = logical_weight_metadata_from_runtime_manifests(
+                    (msgspec.to_builtins(manifest),)
+                )
+                target = ScalarModel()
+                plan = record_target_weight_load_plan(target, metadata)
+                self.assertEqual(target.transpose, source.transpose)
+                self.assertEqual(source.scale.item(), value)
+                self.assertTrue(torch.equal(target.scale, torch.zeros(1)))
+                self.assertTrue(torch.equal(target.weight, torch.zeros(2, 2)))
+                self.assertEqual(
+                    [(v.tensor_id, v.global_offset, v.local_shape, v.layout_fingerprint) for v in plan.views],
+                    [(v.tensor_id, v.global_offset, v.local_shape, v.layout_fingerprint) for v in source_plan.views],
+                )
+
+    def test_recorder_allows_reloading_scalar_checkpoint_values(self):
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.zeros(1))
+
+            def load_weights(self, weights):
+                for _, loaded in weights:
+                    self.scale.data.copy_(loaded)
+
+        source = Model()
+        recorder = WeightLoadRecorder()
+        for value in (2.0, 3.0):
+            recorder.record_model_load(
+                source, (("scale", torch.tensor([value])),), execute_writes=True
+            )
+        plan = recorder.build_plan()
+        self.assertEqual(source.scale.item(), 3.0)
+        self.assertEqual(plan.logical_weights[0].scalar_value, 3.0)
+        target = Model()
+        replay = record_target_weight_load_plan(target, plan.logical_weights)
+        self.assertEqual(len(replay.views), 1)
+        self.assertEqual(target.scale.item(), 0.0)
+
+    def test_recorder_negative_slice_bounds_match_checkpoint_bytes(self):
+        class SliceModel(torch.nn.Module):
+            def __init__(self, selection, concatenate):
+                super().__init__()
+                self.selection = selection
+                self.concatenate = concatenate
+                self.weight = torch.nn.Parameter(torch.zeros_like(torch.empty(6, 2)[selection]))
+
+            def load_weights(self, weights):
+                parts = dict(weights)
+                loaded = torch.cat((parts["a"], parts["b"])) if self.concatenate else parts["weight"]
+                self.weight.data.copy_(loaded[self.selection])
+
+        full = torch.arange(12).reshape(6, 2).float()
+        for concatenate in (False, True):
+            weights = {"a": full[:3], "b": full[3:]} if concatenate else {"weight": full}
+            for selection in (slice(-2, None), slice(None, -2), slice(-4, -1)):
+                with self.subTest(concatenate=concatenate, selection=selection):
+                    source = SliceModel(selection, concatenate)
+                    recorder = WeightLoadRecorder()
+                    recorder.record_model_load(source, weights.items(), execute_writes=True)
+                    source_plan = recorder.build_plan()
+                    reconstructed = torch.empty_like(source.weight).flatten()
+                    for view in source_plan.views:
+                        box = tuple(slice(offset, offset + extent) for offset, extent in zip(view.global_offset, view.local_shape))
+                        values = weights[view.tensor_id][box].flatten()
+                        begin = view.byte_offset // source.weight.element_size()
+                        reconstructed[begin:begin + values.numel()].copy_(values)
+                    self.assertTrue(torch.equal(reconstructed.reshape_as(source.weight), full[selection]))
+                    target = SliceModel(selection, concatenate)
+                    target_plan = record_target_weight_load_plan(target, source_plan.logical_weights)
+                    self.assertTrue(torch.equal(target.weight, torch.zeros_like(target.weight)))
+                    self.assertEqual(
+                        [(v.tensor_id, v.global_offset, v.local_shape, v.byte_offset) for v in target_plan.views],
+                        [(v.tensor_id, v.global_offset, v.local_shape, v.byte_offset) for v in source_plan.views],
+                    )
+
+    def test_state_compare_checks_plain_derived_values(self):
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[2] / "manual/test_weight_cache_state_compare.py"
+        spec = importlib.util.spec_from_file_location("weight_cache_state_compare", path)
+        comparison = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(comparison)
+        tensor = torch.ones(2)
+        entries = {
+            "weight": {"shape": (2,), "dtype": "float32", "is_param": True, "tensor": tensor},
+            "use_deep_gemm_bmm": {"is_plain_value": True, "value": False},
+            "w_scale": {"is_plain_value": True, "value": 1.0},
+        }
+        backend = MagicMock()
+        backend.import_tensor.side_effect = lambda entry: entry["tensor"]
+        with patch.object(comparison, "fetch_state", return_value=(entries, backend)):
+            self.assertEqual(comparison.compare_rank(0, 1, 0), (3, 8))
+        self.assertEqual(backend.import_tensor.call_count, 2)
+        for changed in (True, 0):
+            right = {**entries, "use_deep_gemm_bmm": {"is_plain_value": True, "value": changed}}
+            with (
+                self.subTest(changed=changed),
+                patch.object(comparison, "fetch_state", side_effect=((entries, backend), (right, backend))),
+                self.assertRaisesRegex(AssertionError, "derived values differ"),
+            ):
+                comparison.compare_rank(0, 1, 0)
+
+
+    def test_recorder_covers_distinct_parameters_sharing_storage(self):
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+                self.alias = torch.nn.Parameter(self.weight.data)
+
+            def load_weights(self, weights):
+                for _, loaded in weights:
+                    self.weight.data.copy_(loaded)
+
+        source = Model()
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            source, (("weight", torch.ones(2, 2)),), execute_writes=True
+        )
+        plan = recorder.build_plan()
+        self.assertEqual(len(plan.views), 1)
+        self.assertEqual(plan.views[0].parameter_names, ("alias", "weight"))
+        target = Model()
+        target_plan = record_target_weight_load_plan(target, plan.logical_weights)
+        self.assertEqual(len(target_plan.views), 1)
+        self.assertTrue(torch.equal(target.alias, torch.zeros(2, 2)))
+        manifest = ImmutableWeightRuntimeManifestBuilder(
+            model=source, load_plan=plan, topology=WeightParallelTopology(),
+            allowed_devices=("cpu",),
+        ).build(
+            model_id="alias-model", revision="test", instance_id="source",
+            worker_id="source", endpoint="127.0.0.1:1",
+        )
+        self.assertEqual(len(manifest.tensors), 1)
+        source.alias.data = source.alias.data.clone()
+        with self.assertRaisesRegex(WeightLoadRecordingError, "no recorded write"):
+            recorder.build_plan()
+
+    def test_recorder_concat_cast_matches_implicit_copy_cast(self):
+        class Model(torch.nn.Module):
+            def __init__(self, explicit_cast):
+                super().__init__()
+                self.explicit_cast = explicit_cast
+                self.weight = torch.nn.Parameter(torch.zeros(4, 2, dtype=torch.float16))
+
+            def load_weights(self, weights):
+                parts = dict(weights)
+                fused = torch.cat((parts["a"], parts["b"]))
+                if self.explicit_cast:
+                    fused = fused.to(torch.float16)
+                self.weight.data.copy_(fused)
+
+        weights = {"a": torch.full((2, 2), 1.25), "b": torch.full((2, 2), -2.5)}
+        signatures = []
+        for explicit_cast in (False, True):
+            with self.subTest(explicit_cast=explicit_cast):
+                source = Model(explicit_cast)
+                recorder = WeightLoadRecorder()
+                recorder.record_model_load(source, weights.items(), execute_writes=True)
+                plan = recorder.build_plan()
+                self.assertTrue(torch.equal(
+                    source.weight, torch.cat(tuple(weights.values())).half()
+                ))
+                target = Model(explicit_cast)
+                replay = record_target_weight_load_plan(target, plan.logical_weights)
+                self.assertTrue(torch.equal(target.weight, torch.zeros_like(target.weight)))
+                signature = [(v.tensor_id, v.byte_offset, v.layout_fingerprint) for v in plan.views]
+                self.assertEqual(signature, [(v.tensor_id, v.byte_offset, v.layout_fingerprint) for v in replay.views])
+                signatures.append(signature)
+                manifest = ImmutableWeightRuntimeManifestBuilder(
+                    model=source, load_plan=plan, topology=WeightParallelTopology(),
+                    allowed_devices=("cpu",),
+                ).build(
+                    model_id="cast-model", revision="test", instance_id="source",
+                    worker_id="source", endpoint="127.0.0.1:1",
+                )
+                self.assertEqual(sum(t.nbytes for t in manifest.tensors), 16)
+                self.assertEqual({t.dtype for t in manifest.tensors}, {"float16"})
+        self.assertEqual(*signatures)
+
+
+    def test_recorder_preserves_empty_slice_copy_as_noop(self):
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(6, 2))
+
+            def load_weights(self, weights):
+                for _, loaded in weights:
+                    self.weight.data[:0].copy_(loaded[-1:-4])
+                    self.weight.data.copy_(loaded)
+
+        source = Model()
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            source, (("weight", torch.ones(6, 2)),), execute_writes=True
+        )
+        plan = recorder.build_plan()
+        self.assertEqual(len(plan.views), 1)
+        target = Model()
+        replay = record_target_weight_load_plan(target, plan.logical_weights)
+        self.assertEqual(len(replay.views), 1)
+        self.assertTrue(torch.equal(source.weight, torch.ones(6, 2)))
+        self.assertTrue(torch.equal(target.weight, torch.zeros(6, 2)))
 
     def test_source_capture_isolated_to_daemon_loader_instance(self):
         class Model(torch.nn.Module):

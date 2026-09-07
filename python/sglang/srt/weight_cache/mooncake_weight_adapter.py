@@ -411,9 +411,8 @@ def _build_participant_part(
 ) -> _ParticipantPart:
     """Translate one rank's manifest into placement and runtime fragments.
 
-    Three passes are required and cannot be merged: aliases must be known before
-    fragments are emitted, and a storage's full extent is only known once every
-    fragment sharing it has been seen.
+    Collect aliases and storage extents before emitting each fragment's logical
+    placement and runtime binding together.
     """
     from mooncake.reshard.weight import (
         PlacementFragment,
@@ -429,22 +428,21 @@ def _build_participant_part(
     participant_id = f"dp{rank.dp}:pp{rank.pp}:ep{rank.ep}:tp{rank.tp}"
 
     aliases_by_storage: dict[tuple[Any, ...], set[str]] = {}
+    storage_ends: dict[int, int] = {}
     for tensor in tensors:
         aliases_by_storage.setdefault(_alias_key(tensor), set()).add(
             tensor["tensor_id"]
         )
-
-    descriptors: dict[str, Any] = {}
-    placement_fragments = []
-    placement_id_by_runtime_fragment = {}
-    storage_ends: dict[int, int] = {}
-    for tensor in tensors:
         storage_address, storage_offset_bytes = _storage_base(tensor)
         storage_ends[storage_address] = max(
             storage_ends.get(storage_address, 0),
             storage_offset_bytes + int(tensor["nbytes"]),
         )
 
+    descriptors: dict[str, Any] = {}
+    placement_fragments = []
+    runtime_fragments = []
+    for tensor in tensors:
         tensor_id = tensor["tensor_id"]
         parallel_axes = _parallel_axes(
             tensor,
@@ -493,18 +491,10 @@ def _build_participant_part(
             aliases=aliases if len(aliases) > 1 else (),
         )
         placement_fragments.append(fragment)
-        placement_id_by_runtime_fragment[tensor["fragment_id"]] = (
-            fragment.placement_fragment_id
-        )
-
-    runtime_fragments = []
-    for tensor in tensors:
         storage_address, storage_offset_bytes = _storage_base(tensor)
         runtime_fragments.append(
             RuntimeBindingFragment(
-                placement_fragment_id=placement_id_by_runtime_fragment[
-                    tensor["fragment_id"]
-                ],
+                placement_fragment_id=fragment.placement_fragment_id,
                 fragment_id=tensor["fragment_id"],
                 address=int(tensor["address"]),
                 nbytes=int(tensor["nbytes"]),

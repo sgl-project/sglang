@@ -35,8 +35,8 @@ from .mooncake_weight_adapter import (
 )
 from .protocol import recv_msg, send_msg
 from .weight_runtime_manifest import (
+    ImmutableWeightRuntimeManifestBuilder,
     WeightParallelTopology,
-    create_weight_runtime_manifest_builder,
     model_identity_from_config,
 )
 
@@ -299,7 +299,7 @@ def _build_weight_runtime_manifest(
             "distributed parallel topology differs from daemon arguments: "
             f"expected={expected_topology}, actual={actual_topology}"
         )
-    manifest_builder = create_weight_runtime_manifest_builder(
+    manifest_builder = ImmutableWeightRuntimeManifestBuilder(
         model=model,
         load_plan=load_plan,
         topology=parallel_topology,

@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 from math import prod
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import msgspec
+
+if TYPE_CHECKING:
+    from .weight_load_recorder import RecordedWeightView
 
 # Mooncake's placement and runtime-binding contracts require a weight generation.
 # Weight-cache daemon tensors are immutable after publication, so they always
@@ -61,19 +64,6 @@ class WeightParallelTopology(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-class LogicalTensorView(msgspec.Struct, frozen=True, kw_only=True):
-    tensor_id: str
-    global_shape: tuple[int, ...]
-    global_offset: tuple[int, ...]
-    local_shape: tuple[int, ...]
-    partition_dim: int | None
-    byte_offset: int
-    layer_id: int | None
-    expert_id: int | None
-    layout_fingerprint: str
-    shard_dims: tuple[int, ...] | None = None
-
-
 class RuntimeWeightTensor(msgspec.Struct, frozen=True, kw_only=True):
     fragment_id: str
     tensor_id: str
@@ -103,6 +93,7 @@ class WeightLoadTensorMetadata(msgspec.Struct, frozen=True, kw_only=True):
     shape: tuple[int, ...]
     dtype: str
     itemsize: int
+    scalar_value: bool | int | float | None = None
 
 
 class WeightRuntimeManifest(msgspec.Struct, frozen=True, kw_only=True):
@@ -229,25 +220,7 @@ def _inspect_parameter(
     )
 
 
-def _view_shard_dims(view: LogicalTensorView) -> tuple[int, ...]:
-    if view.shard_dims is None:
-        return () if view.partition_dim is None else (view.partition_dim,)
-    shard_dims = view.shard_dims
-    if (
-        not isinstance(shard_dims, tuple)
-        or any(type(dim) is not int for dim in shard_dims)
-        or tuple(sorted(shard_dims)) != shard_dims
-        or len(set(shard_dims)) != len(shard_dims)
-    ):
-        raise WeightManifestError(f"invalid shard axes for {view.tensor_id}")
-    if view.partition_dim is not None and shard_dims != (view.partition_dim,):
-        raise WeightManifestError(
-            f"partition axis conflicts with shard axes for {view.tensor_id}"
-        )
-    return shard_dims
-
-
-def _validate_view(view: LogicalTensorView, physical: _PhysicalParameter) -> int:
+def _validate_view(view: RecordedWeightView, physical: _PhysicalParameter) -> int:
     ndim = len(view.global_shape)
     if (
         not view.tensor_id
@@ -258,11 +231,14 @@ def _validate_view(view: LogicalTensorView, physical: _PhysicalParameter) -> int
         raise WeightManifestError(
             f"invalid logical view for {physical.names[0]}: {view.tensor_id}"
         )
-    if view.partition_dim is not None and (
-        type(view.partition_dim) is not int or not 0 <= view.partition_dim < ndim
+    shard_dims = view.shard_dims
+    if (
+        not isinstance(shard_dims, tuple)
+        or any(type(dim) is not int for dim in shard_dims)
+        or tuple(sorted(shard_dims)) != shard_dims
+        or len(set(shard_dims)) != len(shard_dims)
     ):
-        raise WeightManifestError(f"invalid partition axis for {view.tensor_id}")
-    shard_dims = _view_shard_dims(view)
+        raise WeightManifestError(f"invalid shard axes for {view.tensor_id}")
     if any(dim < 0 or dim >= ndim for dim in shard_dims):
         raise WeightManifestError(f"invalid shard axes for {view.tensor_id}")
     for offset, extent, total in zip(
@@ -356,6 +332,7 @@ class ImmutableWeightRuntimeManifestBuilder:
                     shape=item.shape,
                     dtype=item.dtype,
                     itemsize=item.itemsize,
+                    scalar_value=item.scalar_value,
                 )
                 for item in self._load_plan.logical_weights
             ),
@@ -456,24 +433,7 @@ class ImmutableWeightRuntimeManifestBuilder:
         tensors = []
         logical_keys = set()
         for item in physical:
-            recorded_views = self._load_plan.views_for_parameters(item.parameters)
-            views = tuple(
-                LogicalTensorView(
-                    tensor_id=view.tensor_id,
-                    global_shape=view.global_shape,
-                    global_offset=view.global_offset,
-                    local_shape=view.local_shape,
-                    partition_dim=(
-                        view.shard_dims[0] if len(view.shard_dims) == 1 else None
-                    ),
-                    byte_offset=view.byte_offset,
-                    layer_id=None,
-                    expert_id=view.expert_id,
-                    layout_fingerprint=view.layout_fingerprint,
-                    shard_dims=view.shard_dims,
-                )
-                for view in recorded_views
-            )
+            views = self._load_plan.views_for_parameters(item.parameters)
             if not views:
                 raise WeightManifestError(
                     "native weight-load recorder did not cover parameter: "
@@ -504,10 +464,14 @@ class ImmutableWeightRuntimeManifestBuilder:
                 )
             for view in views:
                 nbytes = _validate_view(view, item)
+                # Mooncake boxes need an axis; checkpoint metadata retains ().
+                global_shape = view.global_shape or (1,)
+                global_offset = view.global_offset or (0,)
+                local_shape = view.local_shape or (1,)
                 logical_key = (
                     view.tensor_id,
-                    view.global_offset,
-                    view.local_shape,
+                    global_offset,
+                    local_shape,
                 )
                 if logical_key in logical_keys:
                     raise WeightManifestError(
@@ -520,25 +484,25 @@ class ImmutableWeightRuntimeManifestBuilder:
                             instance_id=instance_id,
                             worker_id=worker_id,
                             tensor_id=view.tensor_id,
-                            global_offset=view.global_offset,
-                            local_shape=view.local_shape,
+                            global_offset=global_offset,
+                            local_shape=local_shape,
                             byte_offset=view.byte_offset,
                         ),
                         tensor_id=view.tensor_id,
                         runtime_name=item.names[0],
-                        global_shape=view.global_shape,
-                        global_offset=view.global_offset,
-                        local_shape=view.local_shape,
+                        global_shape=global_shape,
+                        global_offset=global_offset,
+                        local_shape=local_shape,
                         dtype=item.dtype,
                         itemsize=item.itemsize,
-                        shard_dims=_view_shard_dims(view),
-                        layer_id=view.layer_id,
+                        shard_dims=view.shard_dims,
+                        layer_id=None,
                         expert_id=view.expert_id,
                         layout_fingerprint=view.layout_fingerprint,
                         address=item.address + view.byte_offset,
                         nbytes=nbytes,
                         byte_offset=view.byte_offset,
-                        stride=_contiguous_stride(view.local_shape),
+                        stride=_contiguous_stride(local_shape),
                         storage_offset=(
                             item.storage_offset + view.byte_offset // item.itemsize
                         ),
@@ -558,18 +522,3 @@ class ImmutableWeightRuntimeManifestBuilder:
                 ),
             )
         )
-
-
-def create_weight_runtime_manifest_builder(
-    *,
-    model: Any,
-    load_plan: Any,
-    topology: WeightParallelTopology,
-    allowed_devices: Sequence[str] = ("cuda",),
-):
-    return ImmutableWeightRuntimeManifestBuilder(
-        model=model,
-        load_plan=load_plan,
-        topology=topology,
-        allowed_devices=allowed_devices,
-    )

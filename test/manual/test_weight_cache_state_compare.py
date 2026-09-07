@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compare two same-TP weight-cache daemon groups tensor by tensor.
+"""Compare exported state from two weight-cache daemon groups.
 
-This is intended to validate a resharded generation against a disk-loaded
-generation without starting an inference engine.
+Pair corresponding ranks with the same parallel layout to validate transferred
+weights against an independently disk-loaded reference. Both groups must be ready.
 """
 
 import argparse
@@ -66,6 +66,14 @@ def compare_rank(left_gpu_id: int, right_gpu_id: int, rank: int) -> tuple[int, i
     for name in sorted(left):
         left_entry = left[name]
         right_entry = right[name]
+        for field in ("is_plain_value", "is_plain_tensor"):
+            if left_entry.get(field, False) != right_entry.get(field, False):
+                raise AssertionError(f"rank {rank} {name} metadata {field} differs")
+        if left_entry.get("is_plain_value", False):
+            left_value, right_value = left_entry["value"], right_entry["value"]
+            if type(left_value) is not type(right_value) or left_value != right_value:
+                raise AssertionError(f"rank {rank} {name} derived values differ")
+            continue
         for field in ("shape", "dtype", "is_param"):
             if left_entry[field] != right_entry[field]:
                 raise AssertionError(
@@ -91,20 +99,25 @@ def main():
     parser.add_argument("--left-base-gpu-id", type=int, required=True)
     parser.add_argument("--right-base-gpu-id", type=int, required=True)
     parser.add_argument("--gpu-id-step", type=int, default=1)
-    parser.add_argument("--tp-size", type=int, required=True)
+    parser.add_argument(
+        "--num-ranks",
+        type=int,
+        required=True,
+        help="Number of paired daemon ranks (TP * PP).",
+    )
     args = parser.parse_args()
 
-    total_tensors = total_bytes = 0
-    for rank in range(args.tp_size):
-        tensors, nbytes = compare_rank(
+    total_entries = total_bytes = 0
+    for rank in range(args.num_ranks):
+        entries, nbytes = compare_rank(
             args.left_base_gpu_id + rank * args.gpu_id_step,
             args.right_base_gpu_id + rank * args.gpu_id_step,
             rank,
         )
-        total_tensors += tensors
+        total_entries += entries
         total_bytes += nbytes
-        print(f"rank {rank}: exactly matched {tensors} tensors ({nbytes} bytes)")
-    print(f"PASS: exactly matched {total_tensors} rank-tensors ({total_bytes} bytes)")
+        print(f"rank {rank}: exactly matched {entries} state entries ({nbytes} bytes)")
+    print(f"PASS: exactly matched {total_entries} rank-state entries ({total_bytes} bytes)")
 
 
 if __name__ == "__main__":
