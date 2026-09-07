@@ -159,9 +159,9 @@ def test_dp_flattened_page_table(nkv, bs, seq_len):
             row = b * nkv + h
             # effective KV length = sum of valid tokens over selected blocks
             exp_kv = sum(min(block, seq_len - c * block) for c in blocks)
-            assert (
-                int(cache[row]) == exp_kv
-            ), f"row {row}: {int(cache[row])} != {exp_kv}"
+            assert int(cache[row]) == exp_kv, (
+                f"row {row}: {int(cache[row])} != {exp_kv}"
+            )
             # page table: each block -> ppb pages via req_to_token, head-minor encoded
             for e in range(len(blocks) * ppb):
                 c = blocks[e // ppb]
@@ -169,9 +169,9 @@ def test_dp_flattened_page_table(nkv, bs, seq_len):
                 if tok >= max_kv:
                     tok = max_kv - 1
                 exp = int(r2t_cpu[b, tok]) // ps * nkv + h
-                assert (
-                    int(pt[row, e]) == exp
-                ), f"row {row} e {e}: {int(pt[row,e])} != {exp}"
+                assert int(pt[row, e]) == exp, (
+                    f"row {row} e {e}: {int(pt[row, e])} != {exp}"
+                )
 
 
 if __name__ == "__main__":

@@ -173,8 +173,7 @@ def _log_component_attn_backend_summary(
             backend_parts.append(backend_name)
 
     logger.info_once(
-        f"Attention backends for {context.component_name}: "
-        f"{', '.join(backend_parts)}"
+        f"Attention backends for {context.component_name}: {', '.join(backend_parts)}"
     )
 
 

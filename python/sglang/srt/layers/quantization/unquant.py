@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -55,7 +56,6 @@ if TYPE_CHECKING:
         DispatchOutput,
         StandardDispatchOutput,
     )
-    from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
@@ -151,7 +151,7 @@ def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
     return backend.is_optimized() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
 
 
-def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
     global _flashinfer_pr4266_splitk_tactic
@@ -161,7 +161,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _flashinfer_pr4266_run_direct_dense
     global _enable_bf16_splitk_gemm
 
-    backend_str = server_args.bf16_gemm_backend
+    backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
         backend_str = (
             "torch"
@@ -191,8 +191,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
             )
         if not get_platform().is_sm100:
             raise ValueError(
-                f"--bf16-gemm-backend {backend.value} requires "
-                "SM100/SM103 (Blackwell)"
+                f"--bf16-gemm-backend {backend.value} requires SM100/SM103 (Blackwell)"
             )
 
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
@@ -256,28 +255,41 @@ def _flashinfer_pr4266_bf16_gemm(
 
 
 def _bf16_gemm_dispatch_impl(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
     if _enable_bf16_splitk_gemm and use_flashinfer_pr4266_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
-        return _flashinfer_pr4266_bf16_gemm(x, weight, bias)
-    if (
+        output = _flashinfer_pr4266_bf16_gemm(x, weight, bias)
+    elif (
         _use_hopper_bf16_gemv is not None
         and bias is None
         and _use_hopper_bf16_gemv(m, weight.shape[0], weight.shape[1])
     ):
-        return _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
+        output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
-    if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
+    elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
-        return _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
+        output = _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
             *x.shape[:-1], -1
         )
-    return F.linear(x, weight, bias)
+    elif addend is not None:
+        # cuBLAS folds the addend in through the GEMM beta input;
+        # a bias would need a third operand, so callers must exclude it.
+        assert bias is None
+        return torch.addmm(addend, x, weight.t(), out=addend)
+    else:
+        return F.linear(x, weight, bias)
+
+    if addend is not None:
+        output.add_(addend)
+    return output
 
 
 @register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
@@ -285,6 +297,32 @@ def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     return _bf16_gemm_dispatch_impl(x, weight, bias)
+
+
+def _can_accumulate_into_addend(
+    *,
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    addend: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> bool:
+    if not _is_cuda or torch.compiler.is_compiling():
+        return False
+    # Batch-invariant mode overrides aten::mm and aten::addmm,
+    # but not aten::addmm.out, so deterministic inference keeps a separate add.
+    if is_batch_invariant_mode_enabled():
+        return False
+    # x.is_cuda also keeps the CPU AMX route in apply().
+    if bias is not None or x.ndim != 2 or not x.is_cuda:
+        return False
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return False
+    return (
+        addend.dtype == torch.bfloat16
+        and addend.is_contiguous()
+        and addend.shape == (x.shape[0], weight.shape[0])
+        and not (x.requires_grad or addend.requires_grad or weight.requires_grad)
+    )
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -402,6 +440,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
+
+    def apply_with_addend(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        addend: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run an inference-only BF16 linear and add ``addend`` to the result.
+
+        Only the cuBLAS route accumulates through the GEMM beta input,
+        returning ``addend`` itself; the other routes add separately,
+        leaving it untouched. Callers must treat it as consumed either way.
+        """
+        if _can_accumulate_into_addend(
+            weight=layer.weight, x=x, addend=addend, bias=bias
+        ):
+            return _bf16_gemm_dispatch_impl(x, layer.weight, bias, addend=addend)
+        return self.apply(layer, x, bias).add_(addend)
 
     def apply_into(
         self,
@@ -1079,11 +1136,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             return StandardCombineInput(hidden_states=output)
         else:
             assert backend.is_triton()
-            assert (
-                moe_runner_config.activation == "silu"
-            ), f"activation = {moe_runner_config.activation} is not supported \
+            assert moe_runner_config.activation == "silu", (
+                f"activation = {moe_runner_config.activation} is not supported \
             for Triton PATH, please drop --moe-runner-backend triton to use \
             the sgl-kernel-xpu path, which supports more activations."
+            )
 
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
