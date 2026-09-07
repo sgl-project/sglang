@@ -40,7 +40,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware to generate the launch command. The checkpoint ships in BF16 only, and each GPU family carries one **Balanced** recipe sized so the ~250 GB of weights fit with KV-cache headroom: `--tp 2` on 288 GB-class GPUs (GB300, B300), `--tp 4` on B200 / H200, and `--tp 8` on H100.
+Pick your hardware to generate the launch command. The checkpoint ships in BF16 with an FP8 variant, and each GPU family carries one **Balanced** recipe sized so the ~250 GB of BF16 weights fit with KV-cache headroom: `--tp 4` on 288 GB-class (GB300, B300) and 141 GB-class (B200, H200) GPUs, and `--tp 8` on H100.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/inclusionAI/ling-3.0-flash-vl.jsx";
