@@ -14,7 +14,7 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestCheckTreeCacheGate(CustomTestCase):
@@ -42,6 +42,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             pool_stats_observer=MagicMock(),
             get_last_batch=lambda: None,
             get_running_batch=lambda: None,
+            scheduler_stage_metrics=None,
         )
 
     def test_disabled_by_default(self):

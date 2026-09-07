@@ -182,7 +182,6 @@ class DeepSeekV4SingleKVPool(KVCache):
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
-
     def __init__(
         self,
         size: int,
@@ -257,10 +256,12 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().set_key_buffer_fused(layer_id, loc, cache_k)
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError("HiSparseC4DevicePool does not support load_cpu_copy")
 
 
@@ -509,7 +510,6 @@ class DeepSeekV4UnifiedKVPool:
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
-
     def __init__(
         self,
         max_num_reqs: int,
@@ -1028,9 +1028,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         compress_state_pool = self.compress_state_pools[layer_id]
-        assert (
-            compress_state_pool is not None
-        ), "Only c4/c128 layers have attention states."
+        assert compress_state_pool is not None, (
+            "Only c4/c128 layers have attention states."
+        )
         return compress_state_pool
 
     def get_online_c128_mtp_state_slot_offset(self) -> int:
@@ -1099,9 +1099,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
-        assert (
-            indexer_compress_state_pool is not None
-        ), "Only c4 layers have indexer states."
+        assert indexer_compress_state_pool is not None, (
+            "Only c4 layers have indexer states."
+        )
         return indexer_compress_state_pool
 
     def _swa_local_layer_id(self, layer_id: int) -> int:

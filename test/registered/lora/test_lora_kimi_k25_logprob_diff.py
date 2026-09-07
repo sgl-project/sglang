@@ -67,7 +67,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
 
 
 class TestLoRAKimiK25LogprobDiff(CustomTestCase):
-
     def test_lora_kimi_k25_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,

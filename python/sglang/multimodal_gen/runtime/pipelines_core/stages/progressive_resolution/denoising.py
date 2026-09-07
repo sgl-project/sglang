@@ -88,7 +88,7 @@ def _activation_time(P: float, delta: float) -> float:
     denom = P * (1.0 + P - delta)
     if denom <= 0 or delta >= 1.0 + P:
         raise ValueError(
-            f"delta={delta} >= 1+P={1+P:.4f}; criterion trivially satisfied."
+            f"delta={delta} >= 1+P={1 + P:.4f}; criterion trivially satisfied."
         )
     return 1.0 / (1.0 + math.sqrt(delta / denom))
 

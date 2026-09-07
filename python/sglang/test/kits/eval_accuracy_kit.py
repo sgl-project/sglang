@@ -60,9 +60,9 @@ def _run_accuracy_eval(
     ``None``, so the common case stays identical to ``run_eval``'s defaults.
     Returns the metrics dict.
     """
-    assert (
-        score_threshold == score_threshold
-    ), f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    assert score_threshold == score_threshold, (
+        f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    )
 
     model = eval_overrides.pop("model", getattr(test_case, "model", None))
     kwargs = dict(
@@ -113,9 +113,9 @@ def _run_sgl_eval(
     True}`` so the server separates reasoning from the final answer. Skips the test
     if sgl-eval is not installed. Returns the RunResult.
     """
-    assert (
-        score_threshold == score_threshold
-    ), f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    assert score_threshold == score_threshold, (
+        f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    )
 
     try:
         from sgl_eval.registry import get as get_eval_spec
@@ -299,7 +299,7 @@ class MMMUProMixin:
 
     def test_mmmu_pro(self):
         assert self.mmmu_pro_load_preset_from_model_id, (
-            f"{type(self).__name__} must set " "mmmu_pro_load_preset_from_model_id"
+            f"{type(self).__name__} must set mmmu_pro_load_preset_from_model_id"
         )
         _run_accuracy_eval(
             self,

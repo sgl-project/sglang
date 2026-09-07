@@ -56,7 +56,6 @@ class GrammarRow(NamedTuple):
 
 
 class BaseGrammarObject:
-
     def __init__(self):
         self._finished = False
         self.grammar_stats = None

@@ -10,10 +10,14 @@ _git_with_github_auth() {
 
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-  # Persisted by actions/checkout; absent under persist-credentials: false, and
-  # the clone then stays anonymous by design.
+  # Persisted by actions/checkout; absent under persist-credentials: false, where
+  # a workflow may instead hand over a public-read-only token via GH_TOKEN.
   local header
   header="$(git -C "$repo_root" config --local --get http.https://github.com/.extraheader 2>/dev/null || true)"
+  local token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  if [ -z "$header" ] && [ -n "$token" ]; then
+    header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
+  fi
 
   local rc=0
   if [ -z "$header" ]; then
