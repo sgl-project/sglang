@@ -220,9 +220,9 @@ def _build_tbo_child_replay_fb_view(
     capture-time buffers are sliced per child, spec_info is split, and
     seq_lens_sum is recomputed from the sliced ``seq_lens_cpu``.
     """
-    assert (
-        getattr(fb_view, "encoder_lens", None) is None
-    ), "TBO replay split does not support encoder_lens yet"
+    assert getattr(fb_view, "encoder_lens", None) is None, (
+        "TBO replay split does not support encoder_lens yet"
+    )
     spec_info = getattr(fb_view, "spec_info", None)
     if spec_info is not None:
         start_seq = seq_slice.start or 0

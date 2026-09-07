@@ -13,7 +13,7 @@ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator  # noqa
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _make_req(req_pool_idx, origin_input_ids, output_ids):

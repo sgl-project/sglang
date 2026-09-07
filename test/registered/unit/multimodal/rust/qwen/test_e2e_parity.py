@@ -1,7 +1,7 @@
 """End-to-end parity at the scheduler-input boundary.
 
 `test_preprocess.py` pins the `preprocess` binding; this drives the whole native
-path — the `process_mm` driver, then `RustMmProcessor.build_output` — and
+path — the `process_mm` driver, then `RustMmProcessor.wrap_encoded` — and
 compares every field the scheduler reads against the Python `mm_processor`.
 Bitwise, for both HF backends: the Rust resize clones PIL's fixed-point bicubic
 and ATen's uint8 antialias kernel, so whichever one a server is configured with
@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _fixtures import make_processor, snapshot  # noqa: E402
 from _mm_rust_utils import PROCESSOR_CONFIGS, image_bytes, load_core  # noqa: E402
 
-register_cpu_ci(est_time=40, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 CORE = load_core()
 DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_mm", None)
@@ -82,9 +82,9 @@ class TestQwenE2eParity(CustomTestCase):
         ids, features, grids, hashes, offsets, mrope, delta = DRIVER(
             PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json()
         )
-        # The shape of Rust's MmEncodeResult, inline transport (test_build_output
-        # pins the shm shape).
-        handoff = SimpleNamespace(
+        # The shape of Rust's MmEncodedResult, inline transport
+        # (test_wrap_encoded pins the shm shape).
+        encoded = SimpleNamespace(
             features=features,
             shm_names=None,
             grids=grids,
@@ -93,7 +93,7 @@ class TestQwenE2eParity(CustomTestCase):
             mrope=mrope,
             mrope_delta=delta,
         )
-        return snapshot(ids, RustMmProcessor.build_output(spec, handoff))
+        return snapshot(ids, RustMmProcessor.wrap_encoded(spec, encoded))
 
     def run_python(self, sources):
         """The reference path: the Python `mm_processor` the scheduler would use."""

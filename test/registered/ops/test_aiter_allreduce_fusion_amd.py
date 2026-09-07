@@ -158,7 +158,6 @@ def _run_residual_accuracy_check():
 
 
 class TestAiterAllreduceFusionAmd(unittest.TestCase):
-
     @staticmethod
     def _gpu_count():
         return torch.cuda.device_count() if torch.cuda.is_available() else 0
