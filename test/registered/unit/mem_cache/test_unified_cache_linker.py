@@ -1,10 +1,22 @@
+from array import array
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import (
+    InsertParams,
+    InsertResult,
+    MatchPrefixParams,
+    MatchResult,
+)
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
@@ -20,6 +32,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -29,6 +42,7 @@ class _FakeLinker(UnifiedCacheLinker):
     def __init__(self):
         self.layer_done_counter = object()
         self.restorable = []
+        self.lookup_calls = []
         self.queued_loads = {}
         self.queued_offloads = []
         self.completed_loads = []
@@ -37,6 +51,7 @@ class _FakeLinker(UnifiedCacheLinker):
         self.closed = False
 
     def lookup(self, rid, transfers):
+        self.lookup_calls.append((rid, list(transfers)))
         return list(self.restorable)
 
     def load(self, rid, transfers):
@@ -88,6 +103,7 @@ def _cache_for_wrapper(**kwargs):
         "tree_core": SimpleNamespace(enable_external_cache_linker=False),
         "write_through_threshold": 256,
         "pp_size": 1,
+        "pp_rank": 0,
         "pp_group": None,
     }
     defaults.update(kwargs)
@@ -124,6 +140,162 @@ def test_restorable_prefix_intersects_sparse_rank_results():
     hit_pages = wrapper._sync_restorable_prefix([2, 4], num_pages=4, device_hit_pages=0)
 
     assert hit_pages == 2
+
+
+@pytest.mark.parametrize("hit_pages", [0, 1, 2])
+@pytest.mark.parametrize("device_hit_len", [0, 2, 4])
+def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_len):
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOOKUP
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+    def make_cache(pp_rank):
+        return _cache_for_wrapper(
+            page_size=2,
+            pp_size=2,
+            pp_rank=pp_rank,
+            _components_tuple=(_Component(),),
+            _all_reduce_attn_groups=lambda tensor, op: None,
+            get_last_hash_value=lambda node: "ab" * 32,
+        )
+
+    key = RadixKey(array("q", [1, 2, 3, 4]))
+    empty_match = MatchResult(
+        device_indices=torch.empty(0, dtype=torch.int64),
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+
+    pp0_backend = _FakeLinker()
+    pp0_backend.restorable = [hit_pages] if hit_pages else []
+    pp0 = UnifiedCacheLinkerWrapper(make_cache(pp_rank=0), pp0_backend)
+    pp0_req = SimpleNamespace(rid="rid", external_cache_hit_length=None)
+    pp0_result = pp0.match(key, pp0_req, empty_match)
+
+    assert pp0_req.external_cache_hit_length == hit_pages * 2
+    assert pp0_result.host_hit_length == hit_pages * 2
+    assert len(pp0_backend.lookup_calls) == 1
+
+    pp1_backend = _FakeLinker()
+    pp1 = UnifiedCacheLinkerWrapper(make_cache(pp_rank=1), pp1_backend)
+    pp1_req = SimpleNamespace(
+        rid="rid", external_cache_hit_length=pp0_req.external_cache_hit_length
+    )
+    local_match = empty_match._replace(device_indices=torch.arange(device_hit_len))
+    pp1_result = pp1.match(key, pp1_req, local_match)
+
+    assert pp1_result.host_hit_length == max(0, hit_pages * 2 - device_hit_len)
+    assert pp1_backend.lookup_calls == []
+
+    # Repeated matching on PP0 also reuses its query, including a cached miss.
+    assert pp0.match(key, pp0_req, local_match).host_hit_length == (
+        pp1_result.host_hit_length
+    )
+    assert len(pp0_backend.lookup_calls) == 1
+    assert pp0.has_hit("rid") == (hit_pages * 2 > device_hit_len)
+
+
+@pytest.fixture
+def pp_cache():
+    pool = SWAKVPool(
+        size=32,
+        size_swa=32,
+        page_size=1,
+        dtype=torch.float32,
+        head_num=1,
+        head_dim=1,
+        swa_attention_layer_ids=[0],
+        full_attention_layer_ids=[1],
+        device="cpu",
+    )
+    allocator = SWATokenToKVPoolAllocator(
+        32, 32, 1, torch.float32, "cpu", pool, need_sort=False
+    )
+    req_pool = ReqToTokenPool(2, 16, "cpu", enable_memory_saver=False)
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            pp_size=2,
+            sliding_window_size=4,
+            tree_components=(ComponentType.FULL, ComponentType.SWA),
+        )
+    )
+    backend = _FakeLinker()
+    backend.restorable = [4]
+    cache.init_cache_linker(backend)
+    req = Req(
+        rid="rid",
+        origin_input_text="",
+        origin_input_ids=array("q", [1, 2, 3, 4, 5]),
+        sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+    )
+    req_pool.alloc([req])
+    req.init_next_round_input(cache)
+    return cache, allocator, req, backend
+
+
+@pytest.mark.parametrize("overlap", [0, 2, 4])
+@pytest.mark.parametrize("outcome", ["finished", "unfinished", "abort"])
+def test_pp_load_uses_normal_request_insert_and_release(pp_cache, overlap, outcome):
+    cache, allocator, req, backend = pp_cache
+    key = RadixKey(req.origin_input_ids)
+    loaded, last_node = cache.linker.load_back(req)
+
+    assert len(loaded) == 4
+    assert last_node == req.last_node == cache.root_node_handle()
+    assert req.kv.cache_protected_len == 0
+    assert cache.match_prefix(MatchPrefixParams(key=key)).device_indices.numel() == 0
+
+    # A different microbatch may publish overlapping KV before this PP result returns.
+    existing = allocator.alloc(overlap)
+    if overlap:
+        cache.insert(InsertParams(key=key[:overlap], value=existing))
+    req.prefix_indices = loaded
+    req.set_extend_range(4, 5)
+    values = torch.cat([loaded, allocator.alloc(1)])
+    cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), values)
+    backend.completed_loads.append([req.rid])
+    cache.linker.drain_loads(1)
+    assert allocator.full_available_size() == 32 - 5 - overlap
+
+    if outcome == "unfinished":
+        cache.cache_unfinished_req(req)
+    else:
+        cache.cache_finished_req(
+            req, is_insert=outcome == "finished", kv_len_to_handle=5
+        )
+
+    matched = cache.match_prefix(MatchPrefixParams(key=key)).device_indices
+    expected = (
+        existing if outcome == "abort" else torch.cat([existing, values[overlap:]])
+    )
+    assert torch.equal(matched, expected)
+    assert allocator.full_available_size() == 32 - len(expected)
+    assert allocator.swa_available_size() == 32 - len(expected)
+    if outcome != "abort":
+        assert torch.all(allocator.translate_loc_from_full_to_swa(matched) > 0)
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_pp_load_queue_failure_releases_full_and_swa_slots(pp_cache, raises):
+    cache, allocator, req, backend = pp_cache
+
+    def fail_load(*args):
+        if raises:
+            raise RuntimeError("load failed")
+        return False
+
+    backend.load = fail_load
+    with pytest.raises(RuntimeError):
+        cache.linker.load_back(req)
+    assert allocator.full_available_size() == allocator.swa_available_size() == 32
+    assert not cache.linker.pending_loads
+    assert not cache.tree_core.root_node.children
 
 
 def test_async_offload_pins_node_until_completion():

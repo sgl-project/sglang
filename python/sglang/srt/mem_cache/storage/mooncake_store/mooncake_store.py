@@ -833,6 +833,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        *,
+        query_all_pp: bool = False,
     ) -> PoolTransferResult:
         if self.mem_pool_host.kv_buffer is None:
             # Logical anchor: no physical KV object exists in Mooncake, so the
@@ -854,6 +856,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
+            if query_all_pp and self.pp_size > 1:
+                # Direct-linker keys carry an explicit _pp{rank}_ suffix.
+                # Keep all PP shards within each page's group so both full
+                # prefixes and trailing windows require every stage to hit.
+                component_keys = [
+                    key.replace(f"_pp{self.pp_rank}_", f"_pp{pp_rank}_")
+                    for key in component_keys
+                    for pp_rank in range(self.pp_size)
+                ]
+                key_multiplier *= self.pp_size
             component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
             if key_multiplier > 0:
