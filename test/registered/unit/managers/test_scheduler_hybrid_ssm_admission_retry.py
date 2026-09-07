@@ -101,12 +101,16 @@ class TestHybridSsmAdmissionRetry(CustomTestCase):
     def _rounds(self, s, n):
         running_batch = SimpleNamespace(batch_is_full=False, reqs=[])
         _RefusingAdder.calls = 0
-        with patch("sglang.srt.managers.scheduler.PrefillAdder", _RefusingAdder), patch(
-            "sglang.srt.managers.scheduler.get_memory",
-            return_value=SimpleNamespace(enable_flexkv=False),
-        ), patch(
-            "sglang.srt.managers.scheduler.get_schedule",
-            return_value=SimpleNamespace(prefill_max_requests=None),
+        with (
+            patch("sglang.srt.managers.scheduler.PrefillAdder", _RefusingAdder),
+            patch(
+                "sglang.srt.managers.scheduler.get_memory",
+                return_value=SimpleNamespace(enable_flexkv=False),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_schedule",
+                return_value=SimpleNamespace(prefill_max_requests=None),
+            ),
         ):
             for _ in range(n):
                 ret, running_batch = Scheduler._get_new_batch_prefill_raw(
