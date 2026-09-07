@@ -6,6 +6,7 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
+    LingBotWorldV2CausalDMDConfig,
 )
 from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
@@ -35,6 +36,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.realtime.states import RealtimeCausalDiTState
 
 LINGBOT_INTERACTIVE_KV_WINDOW_ENV = "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW"
+
+
+def test_lingbot_quality_high_uses_bf16_vae_decode_only():
+    for config in (LingBotWorldCausalDMDConfig(), LingBotWorldV2CausalDMDConfig()):
+        assert config.vae_decode_precision == "fp32"
+        assert config.vae_decode_precision_high == "bf16"
 
 
 def test_lingbot_denoising_stage_does_not_own_realtime_cache_refs():

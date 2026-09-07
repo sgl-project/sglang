@@ -6,6 +6,9 @@ tasks (t2va / fl2va / ref2va). One row per task; stages and the request
 projector consume rows instead of branching on task names.
 
 Design summary: keyframes bind target geometry; references remain independent.
+Ref2VA also admits keyframes for hybrid checkpoints, matching the released
+Comfy workflow where reference presentation is encoded before guide latents
+are appended.
 """
 
 from __future__ import annotations
@@ -185,6 +188,13 @@ MINIMAX_H3_TASK_PROFILES: dict[str, MiniMaxH3TaskProfile] = {
         conditions_required=True,
         condition_rules=(
             MiniMaxH3ConditionRule(
+                role=MINIMAX_H3_CONDITION_ROLE_KEYFRAME,
+                condition_type="image",
+                material_chain="image.target_canvas",
+                requires_frame_index=True,
+                visual_tokenizer_encode=True,
+            ),
+            MiniMaxH3ConditionRule(
                 role=MINIMAX_H3_CONDITION_ROLE_REFERENCE,
                 condition_type="image",
                 material_chain="image.reference_preserve",
@@ -246,11 +256,11 @@ def _validate_profiles() -> None:
     for task, profile in MINIMAX_H3_TASK_PROFILES.items():
         if profile.task != task:
             raise ValueError(f"profile key/task mismatch: {task} vs {profile.task}")
-        roles = {rule.role for rule in profile.condition_rules}
-        if len(roles) > 1:
-            raise ValueError(
-                f"task {task}: condition roles must not mix, got {sorted(roles)}"
-            )
+        rule_keys = [
+            (rule.role, rule.condition_type) for rule in profile.condition_rules
+        ]
+        if len(rule_keys) != len(set(rule_keys)):
+            raise ValueError(f"task {task}: condition rules must be unique")
         if profile.min_condition_count is not None and profile.min_condition_count <= 0:
             raise ValueError(f"task {task}: min_condition_count must be positive")
         if profile.max_condition_count is not None and profile.max_condition_count <= 0:

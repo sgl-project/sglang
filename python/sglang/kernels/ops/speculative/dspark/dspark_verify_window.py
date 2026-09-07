@@ -9,6 +9,11 @@ from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_f
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils import (
+    is_npu,
+)
+
+_is_npu = is_npu()
 
 
 class RaggedVerifyWindow(msgspec.Struct, frozen=True):
@@ -385,9 +390,9 @@ def compact_row_index_triton(
     verify_lens = verify_lens.to(device=device, dtype=torch.int64).contiguous()
     bs = verify_lens.shape[0]
     # The search converges only for bs <= 2**(NBITS-1); beyond it silently mismaps.
-    assert bs <= 1 << (
-        _SEARCH_NBITS - 1
-    ), f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
+    assert bs <= 1 << (_SEARCH_NBITS - 1), (
+        f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
+    )
     incl = torch.cumsum(verify_lens, dim=0).contiguous()
     req = torch.empty(padded_total, dtype=torch.int64, device=device)
     within = torch.empty(padded_total, dtype=torch.int64, device=device)
@@ -797,7 +802,7 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_cuda(*args, **kwargs) and not _is_npu:
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
