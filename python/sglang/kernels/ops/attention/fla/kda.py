@@ -29,7 +29,6 @@ from sglang.kernels.ops.attention.fla.utils import (
     check_shared_mem,
     is_intel,
     is_nvidia,
-    is_tf32_supported,
 )
 
 if is_intel:
@@ -742,7 +741,7 @@ def recompute_w_u_fwd(
         BT=BT,
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
-        DOT_PRECISION="tf32" if is_tf32_supported else "ieee",
+        DOT_PRECISION="ieee",
         **(static_config or {}),
     )
     return w, u, kg
@@ -751,8 +750,8 @@ def recompute_w_u_fwd(
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [64]
-        for BV in [64]
+        for BK in [32, 64]
+        for BV in [64, 128]
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
@@ -863,7 +862,7 @@ def chunk_gla_fwd_kernel_o(
     # [BT, BT]
     b_A = tl.load(p_A, boundary_check=(0, 1))
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
-    b_o += tl.dot(b_A, b_v)
+    b_o += tl.dot(b_A, b_v, allow_tf32=False)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
