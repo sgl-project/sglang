@@ -25,6 +25,7 @@ def _scheduler(
     s.grammar_manager.has_waiting_grammars.return_value = False
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
+    s.enable_unified_cache_external_linker = False
     s.enable_priority_preemption = False
     s.is_hybrid_swa = is_hybrid_swa
     s.is_hybrid_ssm = is_hybrid_ssm
