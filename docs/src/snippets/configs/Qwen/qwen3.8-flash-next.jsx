@@ -843,13 +843,14 @@ export const config = {
     // >= 4 GB free after graph capture (>= 2.3 GB at the measured peak) and
     // were driven through a 1024-in/256-out random benchmark and a ShareGPT
     // chat sweep at every concurrency up to the pin.
-    // Verified 2026-09-06 on the dev-qwen38-next-local image (qwen4-main-squashed
-    // 9b2aee2283), the image the Docker tab uses for this card. Full GSM8K,
-    // 1,319 questions: 97.0% / 97.1% (low latency / high throughput) with
-    // the Spark rows' chat protocol (thinking off, 8k budget), 97.95% / 97.79% with
-    // sglang.test.run_eval --eval-name gsm8k (5-shot, thinking on, 16k budget).
-    // 1024-in/256-out random prompts: 6.2 ms TPOT at 1 request and 613 output
-    // tok/s at 16 with MTP, 885 output tok/s at 64 without; 2.8 GB / 4.0 GB
+    // Verified 2026-09-07 on the dev-qwen38-next-local image (qwen4-main-squashed
+    // 4ccff141db, with the #36811 and #38290 router fixes), the image the Docker tab uses for this
+    // card. Full GSM8K, 1,319 questions: 96.9% / 96.9% (low latency / high
+    // throughput) with the Spark rows' chat protocol (thinking off, 8k budget),
+    // 97.72% / 97.79% with sglang.test.run_eval --eval-name gsm8k (5-shot,
+    // thinking on, 16k budget). 1024-in/256-out random prompts: 6.0 ms TPOT at 1
+    // request and 685 output tok/s at 16 with MTP, 909 output tok/s at 64
+    // without; 2.8 GB / 4.0 GB
     // left at peak. The cells first passed on the qwen38flashnext image
     // (593134d17a) on 2026-09-05 with the same pools and latencies.
     //
@@ -1129,12 +1130,12 @@ export const config = {
     //     (--speculative-draft-model-path) measured the same on this card
     //     (accept 3.33 vs 3.31, TPOT 18.5 vs 19.1 ms at 16), so the
     //     single-checkpoint command stays.
-    // Verified 2026-09-06 on the dev-qwen38-next-local image (9b2aee2283),
-    // TP=1, 1024-in/256-out random prompts. With MTP: 5.9 ms TPOT at 1
-    // request, 18.7 ms / 634 output tok/s at 16, accept length 3.4 of 4, full
-    // GSM8K 97.3% (chat, thinking off, 8k budget) / 97.72% (run_eval, thinking on),
-    // 2.7 GB left at peak. Without: 11.5 ms at 1, 25.1 ms at 16, 55.7 ms / 871
-    // output tok/s at 64, GSM8K 97.1% / 97.72%, 4.0 GB left at peak.
+    // Verified 2026-09-07 on the dev-qwen38-next-local image (4ccff141db, #36811 and
+    // #38290 router fixes), TP=1, 1024-in/256-out random prompts. With MTP: 6.02 ms TPOT
+    // at 1 request, 18.62 ms / 675 output tok/s at 16, accept length 3.15 of 4,
+    // full GSM8K 97.3% (chat, thinking off, 8k budget) / 97.41% (run_eval,
+    // thinking on), 2.7 GB left at peak. Without: 11.47 ms at 1, 24.97 ms at 16,
+    // 54.4 ms / 906 output tok/s at 64, GSM8K 97.0% / 97.72%, 4.0 GB left at peak.
     // The smaller fp8 draft leaves a
     // ~170k-token KV pool with MTP (vs ~78k for the RDXA cell).
     {
