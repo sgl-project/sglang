@@ -597,35 +597,11 @@ class ServerArgs:
             help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
-            "--enable-nsa-prefill-context-parallel",
-            dest="enable_dsa_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
             "--enable-gdn-replayssm-spec",
             dest="enable_linear_replayssm_spec",
             action=DeprecatedStoreTrueAction,
             new_flag="--enable-linear-replayssm-spec",
             help="[Deprecated] Use --enable-linear-replayssm-spec instead.",
-        )
-        parser.add_argument(
-            "--enable-prefill-context-parallel",
-            dest="enable_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
-            "--nsa-prefill-cp-mode",
-            dest="dsa_prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=argparse.SUPPRESS,
-            choices=["in-seq-split", "round-robin-split"],
-            help="[Deprecated] Use --cp-strategy instead.",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",

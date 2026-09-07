@@ -249,6 +249,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "not translate speculative verify indices to the unified "
             "pool's kernel-facing space yet."
         )
+    assert not cfg.enable_two_batch_overlap, (
+        "--enable-unified-memory does not support --enable-two-batch-overlap: "
+        "TBO's replay split hands each child a view without the pre-translate "
+        "write loc, so a captured decode replay raises. "
+        "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
+    )
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "
         "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
