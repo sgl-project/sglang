@@ -1635,7 +1635,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ) -> Optional[torch.Tensor]:
         if _is_hip:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
-        elif not _is_npu:
+        else:
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:

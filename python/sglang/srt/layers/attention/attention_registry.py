@@ -396,11 +396,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
         from sglang.srt.utils import (
             is_blackwell,
-            is_npu,
             is_xpu,
         )
 
-        if not is_npu():
+        if not _is_npu:
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
                 HybridLinearAttnBackend,
                 Mamba2AttnBackend,
@@ -427,7 +426,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
         check_environments()
         prefill_default = None
-        if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
+        if hybrid_gdn_config(runner.model_config) is not None and not _is_npu:
             prefill_default = flashinfer_gdn_prefill_default(runner)
         runner.linear_attn_backends = resolve_linear_attn_backends(
             prefill_default=prefill_default
@@ -445,7 +444,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
                     f"Got prefill={prefill_be}, decode={decode_be}."
                 )
-            elif is_npu():
+            elif _is_npu:
                 assert (
                     runner.prefill_attention_backend_str == "ascend"
                     and runner.decode_attention_backend_str == "ascend"
@@ -471,7 +470,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 Lfm2VlConfig,
             )
             if isinstance(mamba2_config(runner.model_config), short_conv_cfgs):
-                if is_npu():
+                if _is_npu:
                     # The model conv layers call
                     # get_attn_backend().conv_state_metadata() unconditionally,
                     # but the Ascend hybrid/mamba backend has no such method.
