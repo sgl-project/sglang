@@ -225,12 +225,6 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
             return
-        if self._uses_auto_residency_planner():
-            # Keep the load-safe placement until the post-load static planner
-            # replaces model/card thresholds with component sizes and the
-            # default workload. A server warmup may refine that estimate.
-            return
-
         # Explicit placement is component-scoped; unmatched components still
         # receive automatic defaults.
 
@@ -646,9 +640,6 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
             return components
-        if self._uses_auto_residency_planner():
-            return components
-
         deployment_config = self._deployment_config()
         threshold_gb = self._resolve_keep_resident_min_available_gb(deployment_config)
         if threshold_gb is None:
