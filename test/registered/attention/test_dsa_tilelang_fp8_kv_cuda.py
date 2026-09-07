@@ -115,3 +115,69 @@ def test_fp8_spread_within_budget_and_negative_control_fails():
         "scrambled indices still matched the reference — the comparator is "
         f"not discriminating (rel err {rel_bad:.5f})"
     )
+
+
+@requires_fp8_cuda
+@pytest.mark.parametrize("tokens", [7999, 8000, 8192])
+def test_sm90_large_fp8_tile_preserves_runner_contract(tokens, monkeypatch):
+    from sglang.srt.environ import envs
+
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("the experimental prefill tile is SM90-only")
+    heads = 16
+    generator = torch.Generator(device="cuda").manual_seed(1729)
+    q = (torch.randn(tokens, heads, DV, device="cuda", generator=generator) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    kv = (torch.randn(POOL, 1, DV, device="cuda", generator=generator) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    indices = torch.randint(
+        1,
+        POOL,
+        (tokens, 1, TOPK),
+        device="cuda",
+        generator=generator,
+        dtype=torch.int32,
+    )
+    indices[:, :, -37:] = -1
+    indices[0] = -1
+    indices[1] = -1
+    indices[1, 0, 0] = 7
+    blocks = []
+    factory = tilelang_kernel.sparse_mla_fwd_decode_partial_fp8
+
+    def record_tile(*args, **kwargs):
+        blocks.append(kwargs["block_I"])
+        return factory(*args, **kwargs)
+
+    monkeypatch.setattr(
+        tilelang_kernel, "sparse_mla_fwd_decode_partial_fp8", record_tile
+    )
+    with envs.SGLANG_OPT_DSA_SM90_LARGE_FP8_TILE.override(False):
+        baseline = tilelang_kernel.tilelang_sparse_fwd(q, kv, indices, SM_SCALE)
+    with envs.SGLANG_OPT_DSA_SM90_LARGE_FP8_TILE.override(True):
+        actual = tilelang_kernel.tilelang_sparse_fwd(q, kv, indices, SM_SCALE)
+    assert blocks == [32, 64 if tokens >= 8000 else 32]
+    actual = actual.reshape(tokens, heads, DV)
+    baseline = baseline.reshape_as(actual)
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[0]) == 0
+    assert _rel_err(actual[1], kv[7, 0].float().expand(heads, DV)) < 1e-3
+    assert _rel_err(actual, baseline) < 0.04
+    # A float32 reference from the same quantized inputs checks attention,
+    # masking, and normalization independently of either tile choice.
+    expected = []
+    for row in range(2, 6):
+        ids = indices[row, 0].long()
+        values = kv.float().squeeze(1)[ids.clamp(min=0)]
+        logits = q[row].float() @ values.T * SM_SCALE
+        logits[:, ids < 0] = float("-inf")
+        expected.append(logits.softmax(-1) @ values)
+    expected = torch.stack(expected)
+    assert _rel_err(actual[2:6], expected) < 0.04
+    bad = indices.clone()
+    bad[2:6, :, :1024] = indices[2:6, :, 1024:2048].flip(-1)
+    with envs.SGLANG_OPT_DSA_SM90_LARGE_FP8_TILE.override(True):
+        wrong = tilelang_kernel.tilelang_sparse_fwd(q, kv, bad, SM_SCALE)
+    assert _rel_err(wrong.reshape_as(actual)[2:6], expected) > 0.04
