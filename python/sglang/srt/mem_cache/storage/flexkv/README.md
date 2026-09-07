@@ -244,16 +244,29 @@ Either flag also sets `FLEXKV_CONFIG_PATH` so you can omit
   `put_match` + `launch` and gets an independent tracking key, so a short request
   cannot overwrite an in-flight prefill store from the same request. The
   source-node lock is held until
-  `check_completed_stores` (called from `check_hicache_events` /
-  `evict`) signals completion.
+  `check_completed_stores` (called from `check_hicache_events`) signals
+  completion. Local allocator pressure can make `evict` asymmetric across
+  ranks, so it must not enter the cross-rank Store protocols.
 
 This is the path you'll use under any non-trivial deployment topology
 (DP > 1, multi-instance, multi-node, ...).
 
 ### IP / layerwise (`FLEXKV_ENABLE_LAYERWISE_TRANSFER=1`)
 
-* `match_prefix` allocates the uncached slots and fires
-  `start_load_kv_layerwise` immediately.
+* `match_prefix` only looks up the host prefix. After admission checks pass,
+  `init_load_back` allocates the uncached slots and calls
+  `start_load_kv_layerwise`.
+* Fresh restore slots are registered as request-owned before launch. Waiting,
+  chunked-request and priority matching defer rematches until normal cache
+  completion commits the restore. Direct duplicate restores and ownership
+  mismatches fail before mutating cache state.
+* Abort notification preserves the restore's ownership and tree-owned boundary
+  until request cleanup. An uncertain launch or an unexpected positive
+  layerwise length retains the entire allocation and raises an error; it does
+  not automatically retry prefill. Reset drains staged Store mapping copies and
+  connector transfers before releasing uncommitted slots. If draining fails,
+  ownership remains intact. These rules apply to standard and hybrid caches;
+  a zero-length launch failure has no writer and can release its allocation.
 * A `FlexKVLayerDoneCounter` is registered onto sglang's KV pool via
   `register_layer_transfer_counter`; the per-layer hook blocks each
   forward layer on its own eventfd until the FlexKV transfer worker

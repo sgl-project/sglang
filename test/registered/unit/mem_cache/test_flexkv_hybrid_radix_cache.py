@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import threading
 from array import array
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -173,18 +174,20 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
 
     # Direct callers are guarded too, even though the scheduler normally
     # defers the request before reaching a second prefix match.
-    duplicate_match = cache.match_prefix(params)
-    assert duplicate_match is inner_match
+    with pytest.raises(RuntimeError, match="prefix rematch before restore commit"):
+        cache.match_prefix(params)
+    inner.match_prefix.assert_called_once_with(params)
     connector.lookup_kv.assert_called_once()
 
-    duplicate_indices, _ = cache.init_load_back(
-        InitLoadBackParams(
-            best_match_node=first_match.best_match_node,
-            host_hit_length=first_match.host_hit_length,
-            req=req,
+    with pytest.raises(RuntimeError, match="load-back before restore commit"):
+        cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=first_match.best_match_node,
+                host_hit_length=first_match.host_hit_length,
+                req=req,
+            )
         )
-    )
-    assert duplicate_indices.numel() == 0
+    connector.release_pending.assert_not_called()
     cache._alloc_restore_slots.assert_called_once()
     connector.retrieve_kv.assert_called_once()
 
@@ -196,7 +199,7 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
     assert req.pending_restore_slots is None
 
 
-def test_partial_restore_is_freed_in_full():
+def test_partial_synchronous_restore_is_freed_in_full():
     restored = torch.tensor([20, 21, 22, 23], dtype=torch.int64)
     allocator = MagicMock()
     connector = MagicMock()
@@ -314,6 +317,7 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
     cache._node_lock = threading.Lock()
     cache._store_generation = 0
     cache._inflight_store_nodes = {}
+    cache._restore_leases = {}
 
     req = SimpleNamespace(
         rid="request",
@@ -322,8 +326,12 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
         get_fill_ids=lambda: array("q", [1, 2, 3, 4]),
     )
 
-    cache.cache_unfinished_req(req)
-    cache._store_prefix(req, [1, 2, 3, 4])
+    with (
+        patch("torch.cuda.current_stream", return_value=MagicMock()),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+    ):
+        cache.cache_unfinished_req(req)
+        cache._store_prefix(req, [1, 2, 3, 4])
 
     inner.cache_unfinished_req.assert_called_once_with(req)
     first_store, second_store = connector.store_kv.call_args_list
@@ -423,3 +431,137 @@ def test_page_size_one_restore_requests_swa_for_the_full_hit():
 
     assert result is restored_slots
     evict_from_tree_cache.assert_called_once_with(cache, 8, swa_num_tokens=8)
+
+
+def _make_layerwise_restore(loaded=4):
+    cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache._inner_cache = MagicMock()
+    cache.token_to_kv_pool_allocator = MagicMock()
+    cache.flexkv_connector = MagicMock()
+    cache.flexkv_connector.enable_layerwise = True
+    cache.flexkv_connector.start_load_kv_layerwise.return_value = (loaded, 0)
+    cache.device = torch.device("cpu")
+    cache.disable = False
+    cache.page_size = 4
+    cache.supports_swa = lambda: False
+    cache._load_markers = {"request": SimpleNamespace(device_length=0)}
+    cache._restore_leases = {}
+    cache._restore_generation = 0
+    cache._node_lock = threading.Lock()
+    cache._inflight_store_nodes = {}
+    cache._pending_store_launches = {}
+    cache._pending_store_copies = {}
+    restored = torch.arange(20, 24, dtype=torch.int64)
+    cache._alloc_restore_slots = MagicMock(return_value=restored)
+    req = SimpleNamespace(
+        rid="request",
+        last_node=object(),
+        prefix_indices=torch.empty(0, dtype=torch.int64),
+        kv=SimpleNamespace(
+            cache_protected_len=0, kv_committed_len=4, swa_evicted_seqlen=0
+        ),
+        origin_input_ids=array("q", range(4)),
+        output_ids=array("q"),
+    )
+    params = InitLoadBackParams(
+        best_match_node=req.last_node, host_hit_length=4, req=req
+    )
+    return cache, req, params, restored
+
+
+@pytest.mark.parametrize("loaded", [2, 5])
+def test_unexpected_layerwise_length_retains_every_slot_until_drained_reset(loaded):
+    cache, req, params, restored = _make_layerwise_restore(loaded)
+    with pytest.raises(RuntimeError, match="Unexpected layerwise restore length"):
+        cache.init_load_back(params)
+    cache.token_to_kv_pool_allocator.free.assert_not_called()
+    assert req.pending_restore_slots is restored
+    assert cache.has_uncommitted_restore(req)
+    order = []
+    cache.flexkv_connector.reset.side_effect = lambda: order.append("drain")
+    cache.token_to_kv_pool_allocator.free.side_effect = lambda _s: order.append("free")
+    cache._inner_cache.reset.side_effect = lambda: order.append("tree")
+    cache.reset()
+    assert order == ["drain", "free", "tree"]
+    cache.token_to_kv_pool_allocator.free.assert_called_once_with(restored)
+    assert not cache.has_uncommitted_restore(req)
+
+
+def test_zero_layerwise_return_releases_prelaunch_allocation():
+    cache, req, params, restored = _make_layerwise_restore(0)
+    loaded, _ = cache.init_load_back(params)
+    assert loaded.numel() == 0
+    cache.token_to_kv_pool_allocator.free.assert_called_once_with(restored)
+    assert not cache.has_uncommitted_restore(req)
+
+
+@pytest.mark.parametrize("method", ["cache_finished_req", "cache_unfinished_req"])
+@pytest.mark.parametrize("mismatch", ["identity", "generation", "slots"])
+def test_hybrid_lease_mismatch_fails_before_inner_cache_mutation(method, mismatch):
+    cache, req, params, _ = _make_layerwise_restore()
+    cache.init_load_back(params)
+    if mismatch == "identity":
+        req = SimpleNamespace(**vars(req))
+    elif mismatch == "generation":
+        req.pending_restore_generation += 1
+    else:
+        req.pending_restore_slots = req.pending_restore_slots.clone()
+    # This boundary is another mutation that must not precede validation.
+    req._flexkv_swa_evicted_seqlen = 8
+    with pytest.raises(RuntimeError, match="restore lease mismatch"):
+        if method == "cache_finished_req":
+            cache.cache_finished_req(req, is_insert=False)
+        else:
+            cache.cache_unfinished_req(req, chunked=True)
+    assert req._flexkv_swa_evicted_seqlen == 8
+    assert cache._inner_cache.mock_calls == []
+    cache.token_to_kv_pool_allocator.free.assert_not_called()
+    assert cache.has_uncommitted_restore(req)
+
+
+def test_hybrid_abort_retains_lease_until_inner_cache_releases_request():
+    cache, req, params, restored = _make_layerwise_restore()
+    cache.init_load_back(params)
+    cache.release_aborted_request(req.rid)
+    assert cache.has_uncommitted_restore(req)
+    assert req._flexkv_uncached_restore
+    assert req.pending_restore_slots is restored
+    cache.token_to_kv_pool_allocator.free.assert_not_called()
+    cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
+    cache._inner_cache.cache_finished_req.assert_called_once_with(
+        req, is_insert=False, kv_len_to_handle=4
+    )
+    assert not cache.has_uncommitted_restore(req)
+
+
+@pytest.mark.parametrize("failure", [None, "copy", "connector"])
+def test_hybrid_reset_waits_for_staged_copy_and_connector_before_free(failure):
+    cache, req, params, _ = _make_layerwise_restore()
+    cache.init_load_back(params)
+    event = MagicMock()
+    pending = SimpleNamespace(ready_event=event, cpu_indices=object())
+    cache._pending_store_copies["store"] = pending
+    order = []
+
+    def drain(stage):
+        order.append(stage)
+        if stage == failure:
+            raise RuntimeError("transfer still active")
+
+    event.synchronize.side_effect = lambda: drain("copy")
+    cache.flexkv_connector.reset.side_effect = lambda: drain("connector")
+    cache.token_to_kv_pool_allocator.free.side_effect = lambda _s: order.append("free")
+    cache._inner_cache.reset.side_effect = lambda: order.append("tree")
+    if failure is None:
+        cache.reset()
+        assert order == ["copy", "connector", "free", "tree"]
+        assert not cache.has_uncommitted_restore(req)
+        assert cache._pending_store_copies == {}
+    else:
+        with pytest.raises(RuntimeError, match="transfer still active"):
+            cache.reset()
+        assert order == (["copy"] if failure == "copy" else ["copy", "connector"])
+        assert cache.has_uncommitted_restore(req)
+        assert cache._pending_store_copies["store"] is pending
+        cache.token_to_kv_pool_allocator.free.assert_not_called()
+        cache._inner_cache.reset.assert_not_called()

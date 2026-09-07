@@ -252,6 +252,8 @@ class SchedulePolicy:
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
+                if self.tree_cache.has_uncommitted_restore(r):
+                    continue
                 match_prefix_for_req(self.tree_cache, r, include_req=True)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
@@ -332,6 +334,10 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
+            # Priority matching precedes admission and also rewrites prefix_indices.
+            # Preserve request-owned restore slots until normal cache completion.
+            if self.tree_cache.has_uncommitted_restore(r):
+                continue
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt

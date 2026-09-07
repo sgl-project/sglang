@@ -7,9 +7,14 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InitLoadBackParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -60,6 +65,7 @@ def _make_cache(page_size=4):
         page_size=page_size,
     )
     cache.__class__ = FlexKVRadixCache
+    cache._mode = FlexKVRadixCache.match_prefix.__globals__["FlexKVMode"].IP
     cache.flexkv_connector = MagicMock()
     cache.store_stream = MagicMock()
     cache._load_markers = {}
@@ -210,19 +216,6 @@ def test_mp_restore_never_takes_a_lease():
     assert cache.has_uncommitted_restore(ip_req) is True
 
 
-def test_aborted_ip_restore_does_not_stay_uncommitted_forever():
-    """An abort must clear the lease. Otherwise a requeued rid would be
-    skipped on every scheduling pass and never run again."""
-    cache, _allocator = _make_cache()
-    req, _ = _ip_restore(cache, rid="aborted")
-    assert cache.has_uncommitted_restore(req) is True
-
-    cache.release_aborted_request("aborted")
-
-    assert cache.has_uncommitted_restore(req) is False
-    assert req._flexkv_uncached_restore is False
-
-
 def test_lease_covers_only_freshly_allocated_slots_not_the_reused_prefix():
     """Freeing a lease must never free tree-owned slots."""
     cache, _allocator = _make_cache()
@@ -249,50 +242,15 @@ def test_reset_drains_flexkv_before_freeing_leased_restore_slots():
     cache, allocator = _make_cache()
     _ip_restore(cache, rid="in-flight")
     order = []
+    cache.store_stream.synchronize.side_effect = lambda: order.append("store_stream")
     cache.flexkv_connector.reset.side_effect = lambda: order.append("connector_reset")
     allocator.free.side_effect = lambda *_a, **_k: order.append("free_slots")
 
     with patch.object(RadixCache, "reset", lambda _self: order.append("base_reset")):
         cache.reset()
 
-    assert order == ["connector_reset", "free_slots", "base_reset"]
+    assert order == ["store_stream", "connector_reset", "free_slots", "base_reset"]
     assert cache._restore_leases == {}
-
-
-def test_short_layerwise_restore_is_discarded_whole_not_truncated():
-    """IP load_fn only *launches*, against the full slot mapping.
-
-    Freeing just the tail would release slots the H2D engine is still writing
-    into, corrupting whoever allocates them next. A short layerwise restore is
-    therefore all-or-nothing, matching FlexKVHybridRadixCache.
-    """
-    cache, allocator = _make_cache()
-    req = SimpleNamespace(
-        rid="short-ip",
-        kv=SimpleNamespace(cache_protected_len=0),
-        _flexkv_uncached_restore=False,
-        pending_restore_generation=None,
-        pending_restore_slots=None,
-    )
-
-    result = cache._allocate_and_load(
-        key=RadixKey(array("q", range(8))),
-        value_numel=0,
-        uncached_len=8,
-        last_node=cache.root_node,
-        tracking_rid="short-ip",
-        sglang_req_id="short-ip",
-        load_fn=MagicMock(return_value=4),  # launched 8, reports only 4
-        request_owned_req=req,
-    )
-
-    assert result is None
-    # The whole allocation goes back, not just token_slots[4:].
-    freed = torch.cat([call.args[0] for call in allocator.free.call_args_list])
-    assert freed.numel() == 8
-    # No lease, and the request must not think it owns a restore.
-    assert cache._restore_leases == {}
-    assert req._flexkv_uncached_restore is False
 
 
 def test_short_mp_restore_keeps_the_loaded_prefix():
@@ -387,6 +345,7 @@ def test_request_owned_restore_is_not_attached_before_cache_completion():
     cache, _allocator = _make_cache()
     key = RadixKey(array("q", range(4)))
     req = SimpleNamespace(
+        rid="ip-request",
         kv=SimpleNamespace(cache_protected_len=0),
         _flexkv_uncached_restore=False,
     )
@@ -545,3 +504,212 @@ def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
     assert cache._pending_store_copies == {}
     assert "async-store" in cache._inflight_store_nodes
     cache.store_stream.wait_stream.assert_not_called()
+
+
+def _restore_request(cache, *, rid="ip-request", length=4, load_fn=None):
+    req = SimpleNamespace(
+        rid=rid,
+        origin_input_ids=array("q", range(length)),
+        output_ids=array("q"),
+        kv=SimpleNamespace(
+            kv_committed_len=length, cache_protected_len=0, req_pool_idx=0
+        ),
+        _flexkv_uncached_restore=False,
+        req_pool_idx=0,
+        extra_key=None,
+        cache_salt=None,
+        last_node=cache.root_node,
+        get_fill_ids=lambda: array("q", range(length)),
+    )
+    result = cache._allocate_and_load(
+        key=RadixKey(array("q", range(length))),
+        value_numel=0,
+        uncached_len=length,
+        last_node=cache.root_node,
+        tracking_rid=rid,
+        sglang_req_id=rid,
+        load_fn=load_fn or (lambda slots: int(slots.numel())),
+        request_owned_req=req,
+    )
+    if result is not None:
+        req.prefix_indices, req.last_node = result
+        req.kv.cache_protected_len = len(req.prefix_indices)
+        row = req.prefix_indices.unsqueeze(0).clone()
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=row,
+            write=lambda index, value: row.__setitem__(index, value),
+        )
+    return req
+
+
+@pytest.mark.parametrize("completion", ["insert", "discard", "chunk"])
+def test_ip_restore_lease_ends_after_real_cache_completion(completion):
+    cache, allocator = _make_cache()
+    req = _restore_request(cache)
+    assert cache.has_uncommitted_restore(req)
+    with (
+        patch.dict(
+            FlexKVRadixCache.cache_finished_req.__globals__,
+            {"get_spec": lambda: SimpleNamespace(speculative_eagle_topk=None)},
+        ),
+        patch.object(cache, "_launch_store", return_value=-1),
+    ):
+        if completion == "chunk":
+            cache.cache_unfinished_req(req, chunked=True)
+        else:
+            cache.cache_finished_req(
+                req, is_insert=completion == "insert", kv_len_to_handle=4
+            )
+    assert not cache.has_uncommitted_restore(req)
+    assert req.pending_restore_slots is None
+    assert req.pending_restore_generation is None
+    assert not req._flexkv_uncached_restore
+    if completion == "discard":
+        assert allocator.free_segments.call_args.args[0][0][0].numel() == 4
+    else:
+        match = RadixCache.match_prefix(
+            cache, MatchPrefixParams(key=RadixKey(array("q", range(4))))
+        )
+        assert torch.equal(match.device_indices, req.prefix_indices)
+
+
+def test_abort_retains_restore_boundary_until_request_cleanup():
+    cache, allocator = _make_cache()
+    req = _restore_request(cache)
+    restored = req.pending_restore_slots
+    cache.release_aborted_request(req.rid)
+    # Abort notification is not completion of the asynchronous H2D writer.
+    assert cache.has_uncommitted_restore(req)
+    assert req._flexkv_uncached_restore
+    allocator.free.assert_not_called()
+    cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
+    released, start = allocator.free_segments.call_args.args[0][0]
+    assert start == 0
+    assert torch.equal(released, restored)
+    assert not cache.has_uncommitted_restore(req)
+
+
+def test_mp_restore_is_tree_owned_and_ip_lease_excludes_reused_prefix():
+    cache, allocator = _make_cache()
+    (reused, _), _ = _load(cache, RadixKey(array("q", range(4))), 0, 4, "mp")
+    assert not cache.has_uncommitted_restore(SimpleNamespace(rid="mp"))
+    cache.flexkv_connector.lookup_kv.return_value = (17, 4)
+    req = _restore_request(cache, length=8)
+    lease = cache._restore_leases[req.rid]
+    assert req.prefix_indices.numel() == 8
+    assert torch.equal(req.prefix_indices[:4], reused)
+    assert torch.equal(lease.device_indices, req.prefix_indices[4:])
+    allocator.free.reset_mock()
+    cache.reset()
+    assert torch.equal(allocator.free.call_args.args[0], lease.device_indices)
+    assert not cache.has_uncommitted_restore(req)
+
+
+@pytest.mark.parametrize("mismatch", ["identity", "generation", "slots"])
+@pytest.mark.parametrize("method", ["cache_finished_req", "cache_unfinished_req"])
+def test_restore_lease_mismatch_fails_before_mutating_cache(mismatch, method):
+    cache, allocator = _make_cache()
+    req = _restore_request(cache)
+    if mismatch == "identity":
+        req = SimpleNamespace(**vars(req))
+    elif mismatch == "generation":
+        req.pending_restore_generation += 1
+    else:
+        req.pending_restore_slots = req.pending_restore_slots.clone()
+    with patch.object(RadixCache, method) as base:
+        with pytest.raises(RuntimeError, match="restore lease mismatch"):
+            if method == "cache_finished_req":
+                cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
+            else:
+                cache.cache_unfinished_req(req)
+        base.assert_not_called()
+    allocator.free.assert_not_called()
+    assert cache.has_uncommitted_restore(req)
+
+
+@pytest.mark.parametrize("entry", ["match", "init", "allocate"])
+def test_duplicate_restore_cannot_replace_active_lease(entry):
+    cache, allocator = _make_cache()
+    req = _restore_request(cache)
+    lease = cache._restore_leases[req.rid]
+    allocator.alloc.reset_mock()
+    cache.flexkv_connector.reset_mock()
+    cache.flexkv_connector.lookup_kv.return_value = (17, 4)
+    with pytest.raises(RuntimeError, match="before restore commit|duplicate load-back"):
+        if entry == "match":
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", range(4))), req=req)
+            )
+        elif entry == "init":
+            cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=req.last_node, host_hit_length=4, req=req
+                )
+            )
+        else:
+            _restore_request(cache)
+    assert cache._restore_leases[req.rid] is lease
+    allocator.alloc.assert_not_called()
+    assert cache.flexkv_connector.mock_calls == []
+
+
+@pytest.mark.parametrize("drain_fails", [False, True])
+def test_restore_reset_preserves_ownership_until_transfers_drain(drain_fails):
+    cache, allocator = _make_cache()
+    req = _restore_request(cache)
+    original_root = cache.root_node
+    order = []
+    cache.store_stream.synchronize.side_effect = lambda: order.append("stream")
+
+    def drain():
+        order.append("connector")
+        if drain_fails:
+            raise RuntimeError("H2D still active")
+
+    cache.flexkv_connector.reset.side_effect = drain
+    allocator.free.side_effect = lambda *_args: order.append("free")
+    if drain_fails:
+        with pytest.raises(RuntimeError, match="H2D still active"):
+            cache.reset()
+        assert order == ["stream", "connector"]
+        assert cache.root_node is original_root
+        assert cache.has_uncommitted_restore(req)
+    else:
+        with patch.object(
+            RadixCache, "reset", side_effect=lambda: order.append("tree")
+        ):
+            cache.reset()
+        assert order == ["stream", "connector", "free", "tree"]
+        assert not cache.has_uncommitted_restore(req)
+
+
+def test_failed_launch_keeps_allocated_slots_for_reset():
+    cache, allocator = _make_cache()
+    with pytest.raises(RuntimeError, match="unknown launch status"):
+        _restore_request(
+            cache, load_fn=MagicMock(side_effect=RuntimeError("unknown launch status"))
+        )
+    assert "ip-request" in cache._restore_leases
+    lease = cache._restore_leases["ip-request"]
+    allocator.free.assert_not_called()
+    cache.reset()
+    assert torch.equal(allocator.free.call_args.args[0], lease.device_indices)
+
+
+def test_zero_length_restore_releases_allocation_and_lease():
+    cache, allocator = _make_cache()
+    req = _restore_request(cache, load_fn=lambda _slots: 0)
+    assert not cache.has_uncommitted_restore(req)
+    assert allocator.free.call_args.args[0].numel() == 4
+
+
+def test_short_layerwise_restore_retains_the_full_allocation_until_reset():
+    cache, allocator = _make_cache()
+    with pytest.raises(RuntimeError, match="Unexpected layerwise restore length"):
+        _restore_request(cache, length=8, load_fn=lambda _slots: 4)
+    lease = cache._restore_leases["ip-request"]
+    assert lease.device_indices.numel() == 8
+    allocator.free.assert_not_called()
+    cache.reset()
+    assert torch.equal(allocator.free.call_args.args[0], lease.device_indices)
+    assert cache._restore_leases == {}
