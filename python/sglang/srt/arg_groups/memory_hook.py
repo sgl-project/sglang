@@ -25,32 +25,84 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
-def generate_dllm_prefill_cuda_graph_batch_sizes(
-    server_args: Any, max_bs: int
-) -> Optional[list[int]]:
-    """Generate exact aggregate-token buckets for multi-block dLLM prefill."""
+# Above this many captured buckets, capture time and graph memory stop being
+# a rounding error on startup and deserve saying out loud.
+_DLLM_PREFILL_BUCKET_COUNT_WARN_THRESHOLD = 64
+
+# DeepEP a2a can hang capturing a breakable prefill bucket that is not a
+# multiple of this (see cuda_graph_hook.apply_deepep_adjustments, which rounds
+# the generic schedule up to it).
+_DEEPEP_PREFILL_BUCKET_MULTIPLE = 8
+
+
+def dllm_prefill_graph_alignment(
+    server_args: Any, *, dllm_config: Any = None
+) -> Optional[int]:
+    """Bucket granularity to capture the pure dLLM prefill graph at.
+
+    The scheduler emits totals that are multiples of the block size:
+    ``PrefillAdder._get_dllm_extend_len`` aligns to ``lcm(page_size,
+    block_size)`` and ``overrides._dllm_page_size`` keeps the page size a
+    divisor of the block, so that lcm *is* the block size. That is what lets
+    this run at memory sizing, where the page size is not settled yet.
+
+    Under DeepEP the capture steps by ``lcm(block_size, 8)`` instead, because
+    a2a can hang capturing a bucket that is not a multiple of 8. Coarser than
+    what the scheduler emits, so this is the one case where a total can miss
+    every bucket and fall back to eager -- still better than capturing none of
+    them. ``--enable-waterfill`` resolves to deepep too, but only at
+    ``handle_a2a_moe``, after this read (and after
+    ``cuda_graph_hook.apply_deepep_adjustments``, which reads it just as early).
+
+    ``None`` when the run has no dLLM prefill graph. ``dllm_config`` lets a
+    caller that already built one pass it in; ``DllmConfig.from_server_args``
+    loads the HF config.
+    """
     cfg = resolving_view(server_args)
     if cfg.dllm_algorithm is None:
         return None
     if cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
         return None
 
-    from sglang.srt.arg_groups.overrides import (
-        resolve_default_page_size,
-        resolve_dllm_page_size,
-    )
+    from sglang.srt.dllm.config import DllmConfig
+
+    if dllm_config is None:
+        dllm_config = DllmConfig.from_server_args(server_args)
+    if resolved_view(server_args).moe_a2a_backend == "deepep":
+        return math.lcm(dllm_config.block_size, _DEEPEP_PREFILL_BUCKET_MULTIPLE)
+    return dllm_config.block_size
+
+
+def generate_dllm_prefill_cuda_graph_batch_sizes(
+    server_args: Any, max_bs: int
+) -> Optional[list[int]]:
+    """Generate exact aggregate-token buckets for pure dLLM prefill.
+
+    Bidirectional block attention cannot be padded up to a captured bucket, so
+    ``can_replay_locally`` requires an exact match (see
+    ``PrefillCudaGraphRunner``) and the generic geometric schedule would miss
+    most legal totals. Single-block runs included: the exact-bucket gate does
+    not distinguish them.
+    """
+    cfg = resolving_view(server_args)
+    # The guards `dllm_prefill_graph_alignment` applies, repeated to keep the
+    # HF config load off runs with no dLLM prefill graph to size.
+    if cfg.dllm_algorithm is None:
+        return None
+    if cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
+        return None
+
     from sglang.srt.dllm.config import DllmConfig
 
     dllm_config = DllmConfig.from_server_args(server_args)
-    if dllm_config.prefill_block_size <= dllm_config.block_size:
+    alignment = dllm_prefill_graph_alignment(server_args, dllm_config=dllm_config)
+    if alignment is None:
         return None
 
-    page_size = resolve_dllm_page_size(
-        page_size=resolve_default_page_size(cfg),
-        block_size=dllm_config.block_size,
-        disable_radix_cache=cfg.disable_radix_cache,
-    )
-    alignment = math.lcm(page_size, dllm_config.block_size)
+    # Read while max_running_requests is typically still unset, so DllmConfig
+    # reports 1. Neither later writer reaches a dLLM run: the speculative
+    # handlers (check_dllm_speculative_decoding rejects the combination) and
+    # apply_deepseek_v4_defaults (arch-gated).
     max_tokens = dllm_config.prefill_block_size * dllm_config.max_running_requests
     if cfg.max_prefill_tokens is not None:
         max_tokens = min(max_tokens, cfg.max_prefill_tokens)
@@ -59,13 +111,46 @@ def generate_dllm_prefill_cuda_graph_batch_sizes(
     capture_bs = (
         list(range(alignment, max_tokens + 1, alignment)) if max_tokens > 0 else []
     )
-    logger.info(
-        "Configured %d exact multi-block dLLM prefill CUDA graph buckets: "
-        "alignment=%d, max_tokens=%d",
-        len(capture_bs),
-        alignment,
-        max_tokens,
-    )
+    if not capture_bs:
+        # An empty list leaves the breakable prefill graph with nothing to
+        # capture, so every pure dLLM prefill stays eager.
+        logger.warning(
+            "No dLLM prefill CUDA graph bucket fits alignment=%d within "
+            "the prefill budget; pure dLLM prefill will run eager.",
+            alignment,
+        )
+    elif alignment != dllm_config.block_size:
+        # Coarser than the scheduler's own granularity (DeepEP), so this
+        # list deliberately does not cover every reachable total.
+        logger.info(
+            "Configured %d dLLM prefill CUDA graph buckets: alignment=%d, "
+            "coarsened from the %d-token block for DeepEP, max_tokens=%d. "
+            "Prefill totals that miss a bucket run eager.",
+            len(capture_bs),
+            alignment,
+            dllm_config.block_size,
+            max_tokens,
+        )
+    else:
+        logger.info(
+            "Configured %d exact dLLM prefill CUDA graph buckets: "
+            "alignment=%d, max_tokens=%d",
+            len(capture_bs),
+            alignment,
+            max_tokens,
+        )
+    if len(capture_bs) > _DLLM_PREFILL_BUCKET_COUNT_WARN_THRESHOLD:
+        # Every reachable aligned total gets its own graph, so a small
+        # block size over a large prefill budget captures a lot of them.
+        logger.warning(
+            "%d dLLM prefill CUDA graphs will be captured (alignment=%d, "
+            "max_tokens=%d). Lower --max-running-requests, "
+            "--max-prefill-tokens or --cuda-graph-max-bs-prefill to cut "
+            "startup time and graph memory.",
+            len(capture_bs),
+            alignment,
+            max_tokens,
+        )
     return capture_bs
 
 

@@ -89,6 +89,7 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
             return_logprob=False,
             extend_prefix_lens_cpu=None,
             input_ids=list(range(4)),
+            dllm_config=None,
         )
 
     def test_stronger_graph_is_reused_for_weaker_modes(self):

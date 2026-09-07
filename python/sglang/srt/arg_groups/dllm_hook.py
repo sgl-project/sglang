@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 
 
 def handle_dllm_cuda_graph_compatibility(server_args: Any):
-    """Disable CUDA graphs before memory sizing for dLLM on HIP."""
+    """Disable CUDA graphs before memory sizing for dLLM on HIP.
+
+    The slot matters: a phase disabled here contributes nothing to the graph
+    reserve, and memory sizing generates the prefill bucket list too.
+    """
     cfg = resolving_view(server_args)
     if cfg.dllm_algorithm is None or not get_platform().is_hip:
         return

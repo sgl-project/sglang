@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -496,37 +495,28 @@ class SchedulerDllmMixin:
         ):
             self.tree_cache.release_aborted_request(req.rid)
 
-        kv = getattr(req, "kv", None)
-        req_pool_idx = getattr(kv, "req_pool_idx", None)
-        mamba_pool_idx = getattr(kv, "mamba_pool_idx", None)
-        if req_pool_idx is not None or mamba_pool_idx is not None:
+        # `Req.kv` is always a ReqKvInfo, so every field below is present.
+        kv = req.kv
+        if kv.holds_kv or kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, is_insert=False)
             return
-        if kv is None:
-            return
 
-        cache_protected_len = getattr(
-            kv, "cache_protected_len", getattr(req, "cache_protected_len", 0)
-        )
-        uncached = req.prefix_indices[cache_protected_len:]
+        uncached = req.prefix_indices[kv.cache_protected_len :]
         if len(uncached):
             self.token_to_kv_pool_allocator.free(uncached)
         if req.last_node is not None:
             self.tree_cache.dec_lock_ref(req.last_node)
             req.last_node = None
-        mark_released = getattr(kv, "mark_kv_released", None)
-        if callable(mark_released):
-            mark_released()
-        else:
-            if hasattr(kv, "kv_allocated_len"):
-                kv.kv_allocated_len = 0
-            if hasattr(kv, "swa_evicted_seqlen"):
-                kv.swa_evicted_seqlen = 0
+        kv.mark_kv_released()
 
     def _abort_dllm_req_exact(self: Scheduler, req: Req) -> None:
+        # Same abort payload as every other abort path: `_make_abort_req`
+        # attaches the weight-version spans the tokenizer manager accounts for.
+        from sglang.srt.managers.scheduler import _make_abort_req
+
         self._cleanup_dllm_req(req)
         self.dllm_manager.pop_aborted_reqs(False, req.rid, exact=True)
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
 
 
 class DllmManager:

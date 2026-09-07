@@ -481,12 +481,19 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
-        # FlashInfer 0.6.12 resolves backend="auto" only on the first plan and
-        # then keeps that backend. On SM90, an unmasked first plan selects FA3,
-        # which does not support a later custom mask. Keep a dedicated FA2
-        # wrapper so masked and unmasked plans cannot poison each other's state.
-        self.prefill_wrapper_ragged_custom_mask = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend="fa2"
+        # Only pure dLLM prefill plans a ragged custom mask, and it needs its
+        # own wrapper for two cross-plan reasons: FlashInfer pins
+        # backend="auto" on the first plan (unmasked picks FA3 on SM90, which
+        # rejects a later custom mask -- hence "fa2"), and ragged plan() only
+        # assigns `_custom_mask_buf`, never clearing it as paged plan() does,
+        # so one masked plan would leak its mask into later unmasked plans.
+        # Non-dLLM runs allocate nothing.
+        self.prefill_wrapper_ragged_custom_mask = (
+            BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD", backend="fa2"
+            )
+            if self.is_dllm_model
+            else None
         )
 
         # Two wrappers: one for sliding window attention and one for full attention.
@@ -705,11 +712,12 @@ class FlashInferAttnBackend(AttentionBackend):
     def _select_prefill_ragged_wrapper(
         self, custom_mask: Optional[torch.Tensor]
     ) -> BatchPrefillWithRaggedKVCacheWrapper:
-        return (
-            self.prefill_wrapper_ragged_custom_mask
-            if custom_mask is not None
-            else self.prefill_wrapper_ragged
-        )
+        # A ragged custom mask is only ever built for pure dLLM prefill, which
+        # is exactly when the dedicated wrapper exists.
+        if custom_mask is None:
+            return self.prefill_wrapper_ragged
+        assert self.prefill_wrapper_ragged_custom_mask is not None
+        return self.prefill_wrapper_ragged_custom_mask
 
     def init_forward_metadata_out_graph(
         self,
