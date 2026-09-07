@@ -1,7 +1,7 @@
 import inspect
 import sys
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, create_autospec, patch
 
 import torch
 
@@ -63,6 +63,63 @@ def _runner_config(num_fused_shared_experts=2):
 
 
 class TestDeepEPLowLatencySharedSlots(CustomTestCase):
+    def test_dots3_direct_dispatcher_declares_routed_only_layout(self):
+        from sglang.srt.models.dots3_common import modeling
+
+        config = SimpleNamespace(
+            routed_scaling_factor=1.0,
+            n_shared_experts=None,
+            n_routed_experts=4,
+            hidden_act="silu",
+            num_experts_per_tok=2,
+            hidden_size=128,
+            moe_intermediate_size=64,
+            norm_topk_prob=True,
+            n_group=1,
+            topk_group=1,
+            torch_dtype=torch.bfloat16,
+        )
+        gate = torch.nn.Module()
+        gate.e_score_correction_bias = None
+        experts = torch.nn.Module()
+        experts.should_fuse_routed_scaling_factor_in_topk = False
+        dispatcher = create_autospec(DeepEPDispatcher)
+        with (
+            patch.object(
+                modeling,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_size=1, moe_ep_size=1),
+            ),
+            patch.object(
+                modeling,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(ep_num_redundant_experts=0)
+                ),
+            ),
+            patch.object(
+                modeling, "is_shared_experts_fusion_disabled", return_value=True
+            ),
+            patch.object(modeling, "Dots3MoEGate", return_value=gate),
+            patch.object(
+                modeling, "get_moe_impl_class", return_value=Mock(return_value=experts)
+            ),
+            patch.object(modeling, "TopK"),
+            patch.object(
+                modeling, "get_moe_a2a_backend", return_value=_Backend("deepep")
+            ),
+            patch.object(
+                modeling.parallel_state,
+                "get_tp_group",
+                return_value=SimpleNamespace(device_group=object()),
+            ),
+            patch.object(modeling, "get_deepep_mode", return_value=object()),
+            patch.object(modeling, "MaybeTboDeepEPDispatcher", dispatcher),
+        ):
+            modeling.Dots3MoE(config, layer_id=0)
+
+        self.assertEqual(dispatcher.call_args.kwargs["num_trailing_shared_slots"], 0)
+
     def test_recorder_drops_trailing_shared_slots(self):
         gatherer = _gatherer(2)
 
