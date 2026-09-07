@@ -247,9 +247,24 @@ checkpoint's calibration scales automatically.
   `--speculative-algorithm DFLASH --speculative-draft-model-path
   incoai/Qwen3.8-27B-DFlash2 --speculative-num-draft-tokens 8` (8 is the
   draft's block size, and it is the `D` term in the ratio, same value as
-  DSpark's). The selector projects candidates through the target `lm_head`,
+  DSpark's). Runs on Ascend NPUs as well
+  ([#35629](https://github.com/sgl-project/sglang/pull/35629)): the selector
+  verify falls back to argmax there, matching what EAGLE and first-generation
+  DFlash drafts (such as `z-lab/Qwen3-8B-DFlash-b16`) already do on NPU.
+  Therefore, NPU currently guarantees lossless verification only for greedy
+  requests; use `temperature=0` and `top_k=1`. Non-greedy requests log a warning;
+  both draft proposal and target verification fall back to greedy, so their
+  requested sampling distribution is not preserved. The selector projects
+  candidates through the target `lm_head`,
   including quantized heads, so it runs on the NVFP4 checkpoint (whose head
   is NVFP4-packed; the BF16 and FP8 checkpoints keep a dense head).
+  The Ascend comparison in #35629 used a 910C with BF16 target weights,
+  `--tp-size 2 --attention-backend ascend --mamba-ssm-dtype bfloat16
+  --mamba-scheduler-strategy extra_buffer`, and disabled RadixCache for both
+  baseline and DFlash2 to exclude cache warm-up and prefix reuse. The DFlash2
+  run added the three flags shown above.
+  Accuracy used zero-shot GSM8K with greedy sampling, `max_new_tokens=2048`,
+  128 examples, and concurrency levels 1, 2, 4, 8, and 16.
   Validation: NVFP4 measured end-to-end on RTX PRO 6000 and RTX 5090; the
   RTX PRO 6000 BF16/FP8 cells boot and serve; all 12 DGX Spark DFLASH2 cells
   boot and serve on `1cf2b8c` with the selector folded into the draft CUDA

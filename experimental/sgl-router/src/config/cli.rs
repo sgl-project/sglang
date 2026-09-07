@@ -12,10 +12,10 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
-    CircuitBreakerConfig, Config, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
-    StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    CachePrefixProvider, CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend,
+    EligibilityConfig, FilterKind, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig,
+    LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig,
+    SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -53,6 +53,12 @@ pub struct Cli {
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
+    /// Policy used to select decode workers for PD requests.
+    #[arg(long, value_enum, default_value = "power_of_two")]
+    pub decode_policy: DecodePolicyKind,
+    /// Static P/D bucket configuration. Omit to use the global candidate domain.
+    #[arg(long)]
+    pub bucket_config: Option<String>,
 
     // ---- circuit breaker (opt-in via --cb-threshold) ----
     /// Consecutive upstream failures before the circuit breaker opens.
@@ -64,16 +70,6 @@ pub struct Cli {
     #[arg(long)]
     pub cb_cool_down_secs: Option<u64>,
 
-    // ---- legacy cache-aware-zmq tuning ----
-    /// Min `matched_blocks / total_blocks` for a cache match to win.
-    #[arg(long)]
-    pub cache_threshold: Option<f32>,
-    /// Absolute load spread above which the cache check is skipped.
-    #[arg(long)]
-    pub balance_abs_threshold: Option<usize>,
-    /// Multiplicative load spread gating the absolute balance check.
-    #[arg(long)]
-    pub balance_rel_threshold: Option<f32>,
     /// External KV indexer gRPC endpoint used as the authoritative cache signal.
     /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
     #[arg(long)]
@@ -86,6 +82,9 @@ pub struct Cli {
     /// `--kv-indexer-endpoint`; defaults to 32.
     #[arg(long)]
     pub kv_indexer_query_max_inflight: Option<usize>,
+    /// Prefix-match source for native Cache-Aware.
+    #[arg(long, value_enum)]
+    pub cache_prefix_provider: Option<CachePrefixProvider>,
 
     // ---- session-affinity tuning ----
     /// Header carrying the session ID for `--policy session_aware`.
@@ -106,6 +105,18 @@ pub struct Cli {
     /// Session-affinity primary lookup and fallback behavior.
     #[arg(long, value_enum)]
     pub session_affinity_mode: Option<SessionAffinityMode>,
+    /// Disables the Session/Cache-Aware pressure guard.
+    #[arg(long)]
+    pub disable_pressure_guard: bool,
+    /// Absolute waiting-uncached-token gap required by the pressure guard.
+    #[arg(long)]
+    pub pressure_abs_threshold_tokens: Option<u64>,
+    /// Absolute millisecond gap when a Prefill queue estimate is available.
+    #[arg(long)]
+    pub pressure_abs_threshold_ms: Option<f64>,
+    /// Relative waiting-uncached-token multiplier required by the pressure guard.
+    #[arg(long)]
+    pub pressure_rel_threshold: Option<f64>,
     /// Minimum cache-hit tokens for a cache-aware candidate.
     #[arg(long)]
     pub cache_affinity_min_matched_tokens: Option<u64>,
@@ -218,6 +229,11 @@ impl Cli {
     /// (model id, static worker URLs).
     pub fn into_config(self) -> Result<Config> {
         let discovery = self.build_discovery()?;
+        let bucket_config = self
+            .bucket_config
+            .as_deref()
+            .map(load_bucket_config)
+            .transpose()?;
 
         // Reject knobs that only take effect alongside another flag, rather
         // than silently dropping them — mirrors the discovery mutual-exclusion
@@ -229,12 +245,16 @@ impl Cli {
                  enabled by --cb-threshold)"
             ));
         }
-        let tuned_legacy_cache_aware = self.cache_threshold.is_some()
-            || self.balance_abs_threshold.is_some()
-            || self.balance_rel_threshold.is_some();
-        if tuned_legacy_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
+        let cache_prefix_provider = self.cache_prefix_provider.unwrap_or_else(|| {
+            if self.kv_indexer_endpoint.is_some() {
+                CachePrefixProvider::Indexer
+            } else {
+                CachePrefixProvider::RadixTree
+            }
+        });
+        if self.cache_prefix_provider.is_some() && self.policy != PolicyKind::CacheAware {
             return Err(anyhow!(
-                "cache-aware tuning flags require --policy cache_aware_zmq"
+                "--cache-prefix-provider requires --policy cache_aware"
             ));
         }
         if self.kv_indexer_query_timeout_ms == Some(0) {
@@ -257,22 +277,24 @@ impl Cli {
                 "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
             ));
         }
-        if self.kv_indexer_endpoint.is_some()
-            && !matches!(
-                self.policy,
-                PolicyKind::CacheAware | PolicyKind::CacheAwareZmq
-            )
-        {
+        let cache_aware_uses_indexer = self.policy == PolicyKind::CacheAware
+            && cache_prefix_provider == CachePrefixProvider::Indexer;
+        if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
+            if self.policy == PolicyKind::CacheAware {
+                return Err(anyhow!(
+                    "--kv-indexer-endpoint requires --cache-prefix-provider indexer"
+                ));
+            }
             return Err(anyhow!(
-                "--kv-indexer-endpoint requires --policy cache_aware or cache_aware_zmq"
+                "--kv-indexer-endpoint requires --policy cache_aware"
             ));
         }
-        if self.policy == PolicyKind::CacheAware && self.kv_indexer_endpoint.is_none() {
+        if cache_aware_uses_indexer && self.kv_indexer_endpoint.is_none() {
             return Err(anyhow!(
-                "--policy cache_aware requires --kv-indexer-endpoint"
+                "--cache-prefix-provider indexer requires --kv-indexer-endpoint"
             ));
         }
-        let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
+        let tuned_cache_aware = self.policy == PolicyKind::CacheAware;
         let affinity_policy = matches!(
             self.policy,
             PolicyKind::SessionAware | PolicyKind::CacheAware
@@ -289,6 +311,11 @@ impl Cli {
                  --session-affinity-mode require --policy session_aware"
             ));
         }
+        if self.disable_pressure_guard && !affinity_policy {
+            return Err(anyhow!(
+                "--disable-pressure-guard requires --policy session_aware or cache_aware"
+            ));
+        }
         let tuned_cache_candidates = self.cache_affinity_min_matched_tokens.is_some()
             || self.cache_affinity_min_match_ratio.is_some()
             || self.cache_candidate_min_workers.is_some()
@@ -298,6 +325,15 @@ impl Cli {
         if tuned_cache_candidates && self.policy != PolicyKind::CacheAware {
             return Err(anyhow!(
                 "cache candidate tuning flags require --policy cache_aware"
+            ));
+        }
+        if (self.pressure_abs_threshold_tokens.is_some()
+            || self.pressure_abs_threshold_ms.is_some()
+            || self.pressure_rel_threshold.is_some())
+            && !affinity_policy
+        {
+            return Err(anyhow!(
+                "pressure guard tuning requires --policy session_aware or cache_aware"
             ));
         }
         let is_score_composition = matches!(
@@ -417,8 +453,26 @@ impl Cli {
             let d = AffinityConfig::default();
             let session_id_header = self.session_id_header.unwrap_or(d.session_id_header);
             axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
-                anyhow!("--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}")
+                anyhow!(
+                    "--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}"
+                )
             })?;
+            let pressure_rel_threshold = self
+                .pressure_rel_threshold
+                .unwrap_or(d.pressure_rel_threshold);
+            if !pressure_rel_threshold.is_finite() || pressure_rel_threshold <= 1.0 {
+                return Err(anyhow!(
+                    "--pressure-rel-threshold must be finite and greater than 1"
+                ));
+            }
+            if self
+                .pressure_abs_threshold_ms
+                .is_some_and(|threshold| !threshold.is_finite() || threshold < 0.0)
+            {
+                return Err(anyhow!(
+                    "--pressure-abs-threshold-ms must be finite and non-negative"
+                ));
+            }
             let cache_affinity_min_match_ratio = self
                 .cache_affinity_min_match_ratio
                 .or(d.cache_affinity_min_match_ratio);
@@ -473,6 +527,14 @@ impl Cli {
                 session_affinity_mode: self
                     .session_affinity_mode
                     .unwrap_or(d.session_affinity_mode),
+                pressure_guard: !self.disable_pressure_guard && d.pressure_guard,
+                pressure_abs_threshold_tokens: self
+                    .pressure_abs_threshold_tokens
+                    .unwrap_or(d.pressure_abs_threshold_tokens),
+                pressure_abs_threshold_ms: self
+                    .pressure_abs_threshold_ms
+                    .or(d.pressure_abs_threshold_ms),
+                pressure_rel_threshold,
                 cache_affinity_min_matched_tokens: self
                     .cache_affinity_min_matched_tokens
                     .or(d.cache_affinity_min_matched_tokens),
@@ -493,28 +555,22 @@ impl Cli {
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
         });
 
-        // Only build a CacheAwareConfig when the operator tuned at least
-        // one knob; otherwise leave it None so the policy uses its own
-        // defaults. Unset knobs fall back to the per-field defaults.
+        // Keep the selected prefix provider and optional Indexer settings
+        // together with the native Cache-Aware policy.
+        let kv_indexer_query_timeout_ms = self
+            .kv_indexer_query_timeout_ms
+            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS);
+        let kv_indexer_query_max_inflight = self
+            .kv_indexer_query_max_inflight
+            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT);
         let cache_aware = if tuned_cache_aware {
-            let d = CacheAwareConfig::default();
             let kv_indexer_endpoint = self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
                 url,
-                query_timeout_ms: self
-                    .kv_indexer_query_timeout_ms
-                    .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS),
-                query_max_inflight: self
-                    .kv_indexer_query_max_inflight
-                    .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT),
+                query_timeout_ms: kv_indexer_query_timeout_ms,
+                query_max_inflight: kv_indexer_query_max_inflight,
             });
             Some(CacheAwareConfig {
-                cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
-                balance_abs_threshold: self
-                    .balance_abs_threshold
-                    .unwrap_or(d.balance_abs_threshold),
-                balance_rel_threshold: self
-                    .balance_rel_threshold
-                    .unwrap_or(d.balance_rel_threshold),
+                prefix_provider: cache_prefix_provider,
                 kv_indexer_endpoint,
             })
         } else {
@@ -536,6 +592,8 @@ impl Cli {
                 tokenizer_path: self.tokenizer_path.unwrap_or_else(|| self.model_id.clone()),
                 id: self.model_id,
                 policy: self.policy,
+                decode_policy: self.decode_policy,
+                bucket_config,
                 circuit_breaker,
                 cache_aware,
                 sticky,
@@ -570,13 +628,13 @@ impl Cli {
             (true, true) => {
                 return Err(anyhow!(
                     "--worker-urls and --service-discovery are mutually exclusive; pass exactly one"
-                ))
+                ));
             }
             (false, false) => {
                 return Err(anyhow!(
                     "no discovery backend selected; pass --worker-urls <URL...> (static) \
                      or --service-discovery (kubernetes)"
-                ))
+                ));
             }
             (true, false) => {
                 if self.service_discovery_namespace.is_some()
@@ -611,6 +669,13 @@ impl Cli {
         };
         Ok(backend)
     }
+}
+
+fn load_bucket_config(path: &str) -> Result<crate::config::BucketConfig> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| anyhow!("--bucket-config cannot read {path:?}: {error}"))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| anyhow!("--bucket-config {path:?} is not valid JSON: {error}"))
 }
 
 /// Join space/repeated `key=value` selector terms into the single
@@ -931,6 +996,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_removed_cache_aware_zmq_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cache_aware_zmq"), "got: {err}");
+    }
+
+    #[test]
     fn policy_accepts_only_routing_strategies() {
         for value in ["prefix_cache", "overloaded"] {
             let err = into_config_owned(with_model(&[
@@ -1037,23 +1115,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_aware_knob_builds_partial_config() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--cache-threshold",
-            "0.7",
-        ]))
-        .unwrap();
-        let ca = c.model.cache_aware.expect("cache_aware set");
-        assert_eq!(ca.cache_threshold, 0.7);
-        // Untouched knobs fall back to defaults.
-        assert_eq!(ca.balance_abs_threshold, 32);
-    }
-
-    #[test]
     fn kv_indexer_reuses_cache_aware_policy_config() {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
@@ -1097,26 +1158,6 @@ mod tests {
             DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
         );
         assert_eq!(indexer.query_max_inflight, 32);
-    }
-
-    #[test]
-    fn kv_indexer_is_accepted_by_cache_aware_zmq() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-        ]))
-        .unwrap();
-        let indexer = c
-            .model
-            .cache_aware
-            .expect("cache-aware config")
-            .kv_indexer_endpoint
-            .expect("Indexer config");
-        assert_eq!(indexer.url, "http://indexer:50051");
     }
 
     #[test]
@@ -1177,36 +1218,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn no_cache_aware_flags_leaves_none() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-        ]))
-        .unwrap();
-        assert!(c.model.cache_aware.is_none());
-    }
-
-    #[test]
-    fn rejects_cache_aware_knob_without_cache_aware_policy() {
-        // Default policy is round_robin, so a cache knob has no effect —
-        // reject rather than silently ignore it.
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--cache-threshold",
-            "0.7",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("require --policy cache_aware_zmq"),
-            "got: {err}"
-        );
     }
 
     #[test]
@@ -1275,7 +1286,13 @@ mod tests {
         for value in ["round_robin", "random", "power_of_two", "load_based"] {
             assert!(choices.contains(value), "missing {value}: {choices}");
         }
-        for value in ["fused_score", "cache_aware_zmq", "sticky"] {
+        for value in [
+            "fused_score",
+            "score_policy",
+            "session_aware",
+            "cache_aware",
+            "sticky",
+        ] {
             assert!(!choices.contains(value), "unexpected {value}: {choices}");
         }
     }
@@ -1424,14 +1441,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cache_aware_zmq_as_sticky_fallback() {
+    fn rejects_cache_aware_as_sticky_fallback() {
         let err = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
             "--policy",
             "sticky",
             "--sticky-fallback-policy",
-            "cache_aware_zmq",
+            "cache_aware",
         ]))
         .unwrap_err()
         .to_string();
@@ -1630,17 +1647,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_removed_token_pressure_flags() {
-        for flag in [
-            "--disable-pressure-guard",
-            "--pressure-abs-threshold-tokens 2048",
-            "--pressure-rel-threshold 2.0",
-        ] {
-            let error = cfg_of(&format!("--policy session_aware {flag}"))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("unexpected argument"), "{flag}: {error}");
-        }
+    fn native_cache_pressure_flags_build_the_guard_contract() {
+        let config = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --disable-pressure-guard --pressure-abs-threshold-tokens 2048 \
+             --pressure-abs-threshold-ms 3.5 --pressure-rel-threshold 2.0",
+        )
+        .unwrap();
+        let affinity = config
+            .model
+            .affinity
+            .expect("cache-aware needs affinity config");
+        assert!(!affinity.pressure_guard);
+        assert_eq!(affinity.pressure_abs_threshold_tokens, 2_048);
+        assert_eq!(affinity.pressure_abs_threshold_ms, Some(3.5));
+        assert_eq!(affinity.pressure_rel_threshold, 2.0);
     }
 
     #[test]
@@ -1792,13 +1813,76 @@ mod tests {
     }
 
     #[test]
-    fn rejects_affinity_options_that_cannot_affect_the_selected_policy() {
-        let missing_indexer = cfg_of("--policy cache_aware")
-            .expect_err("cache_aware without an indexer can only behave like P2")
-            .to_string();
-        assert!(
-            missing_indexer.contains("--kv-indexer-endpoint"),
-            "got: {missing_indexer}"
+    fn cache_aware_defaults_to_router_radix_tree() {
+        let config = cfg_of("--policy cache_aware")
+            .expect("native cache-aware should not require an Indexer endpoint");
+        let cache = config
+            .model
+            .cache_aware
+            .expect("native cache-aware needs its default configuration");
+        assert_eq!(cache.prefix_provider, CachePrefixProvider::RadixTree);
+        assert!(cache.kv_indexer_endpoint.is_none());
+    }
+
+    #[test]
+    fn decode_policy_defaults_to_p2_and_accepts_legacy_compatibility_mode() {
+        let default_config = cfg_of("--policy power_of_two").unwrap();
+        assert_eq!(
+            default_config.model.decode_policy,
+            DecodePolicyKind::PowerOfTwo
+        );
+
+        let legacy_config = cfg_of("--decode-policy legacy_host_affinity").unwrap();
+        assert_eq!(
+            legacy_config.model.decode_policy,
+            DecodePolicyKind::LegacyHostAffinity
+        );
+    }
+
+    #[test]
+    fn bucket_config_json_is_loaded_and_validated_at_startup() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{
+                "ttft_slo_policy": "slo_first",
+                "tps_slo_policy": "best_effort",
+                "buckets": [
+                    {
+                        "id": "p-fast",
+                        "stage": "prefill",
+                        "rank": 10,
+                        "worker_ids": ["http://worker:30000"],
+                        "max_extend_tokens": 4096,
+                        "max_context_tokens": 8192,
+                        "ttft_p95_at_capacity_ms": 120
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        let config = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://worker:30000",
+            "--bucket-config",
+            &path,
+        ]))
+        .unwrap();
+
+        let buckets = config
+            .model
+            .bucket_config
+            .expect("Bucket config must be retained");
+        assert_eq!(buckets.buckets.len(), 1);
+        assert_eq!(buckets.buckets[0].id, "p-fast");
+        assert_eq!(
+            buckets.ttft_slo_policy,
+            crate::config::SloBucketPolicy::SloFirst
+        );
+        assert_eq!(
+            buckets.tps_slo_policy,
+            crate::config::SloBucketPolicy::BestEffort
         );
     }
 }
