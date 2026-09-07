@@ -189,7 +189,9 @@ class TestDeepSeekV4UnwrapWrapper(CustomTestCase):
         detector._buffer = ""
         name, args = None, ""
         for i in range(0, len(text), chunks):
-            result = detector.parse_streaming_increment(text[i : i + chunks], self.tools)
+            result = detector.parse_streaming_increment(
+                text[i : i + chunks], self.tools
+            )
             for c in result.calls:
                 if c.name:
                     name = c.name
@@ -214,9 +216,7 @@ class TestDeepSeekV4UnwrapWrapper(CustomTestCase):
 
     def test_direct_json_object_wrapper(self):
         body = '{"arguments": {"command": "ls -la /x"}}'
-        self._assert_repaired(
-            _wrapped(_invoke("bash", body)), {"command": "ls -la /x"}
-        )
+        self._assert_repaired(_wrapped(_invoke("bash", body)), {"command": "ls -la /x"})
 
     def test_direct_json_input_wrapper(self):
         body = '{"input": {"command": "pwd"}}'
@@ -224,15 +224,11 @@ class TestDeepSeekV4UnwrapWrapper(CustomTestCase):
 
     def test_xml_param_object_wrapper(self):
         body = _param("arguments", "false", '{"command":"cd /tmp"}')
-        self._assert_repaired(
-            _wrapped(_invoke("bash", body)), {"command": "cd /tmp"}
-        )
+        self._assert_repaired(_wrapped(_invoke("bash", body)), {"command": "cd /tmp"})
 
     def test_xml_param_scalar_maps_to_single_field(self):
         body = _param("arguments", "true", "ls -la")
-        self._assert_repaired(
-            _wrapped(_invoke("bash", body)), {"command": "ls -la"}
-        )
+        self._assert_repaired(_wrapped(_invoke("bash", body)), {"command": "ls -la"})
 
     def test_json_string_inner_unwrapped_on_multi_field_tool(self):
         inner = '{"filePath": "/x", "offset": 300, "limit": 350}'
@@ -248,22 +244,20 @@ class TestDeepSeekV4UnwrapWrapper(CustomTestCase):
 
     def test_declared_arguments_param_not_unwrapped(self):
         # `weird` legitimately declares `arguments`; it must be preserved.
-        body = _param("arguments", "true", "x") + "\n" + _param(
-            "input", "false", '{"a": 1}'
+        body = (
+            _param("arguments", "true", "x")
+            + "\n"
+            + _param("input", "false", '{"a": 1}')
         )
         name, args = self._args_of(_wrapped(_invoke("weird", body)))
         self.assertEqual(name, "weird")
-        self.assertEqual(
-            json.loads(args), {"arguments": "x", "input": {"a": 1}}
-        )
+        self.assertEqual(json.loads(args), {"arguments": "x", "input": {"a": 1}})
 
     def test_unknown_inner_key_not_unwrapped(self):
         body = '{"arguments": {"command": "x", "nope": 1}}'
         name, args = self._args_of(_wrapped(_invoke("bash", body)))
         self.assertEqual(name, "bash")
-        self.assertEqual(
-            json.loads(args), {"arguments": {"command": "x", "nope": 1}}
-        )
+        self.assertEqual(json.loads(args), {"arguments": {"command": "x", "nope": 1}})
 
     def test_multi_field_scalar_wrapper_not_unwrapped(self):
         # `read` declares three fields; a bare-scalar wrapper has no safe mapping.
@@ -274,12 +268,10 @@ class TestDeepSeekV4UnwrapWrapper(CustomTestCase):
 
     def test_normal_flat_call_untouched_and_incremental(self):
         body = '{"command": "echo hi"}'
-        self._assert_repaired(
-            _wrapped(_invoke("bash", body)), {"command": "echo hi"}
-        )
+        self._assert_repaired(_wrapped(_invoke("bash", body)), {"command": "echo hi"})
 
     def test_zero_arg_self_close_kept(self):
-        text = f"<{DSML}tool_calls>\n<{DSML}invoke name=\"read\"/>\n</{DSML}tool_calls>"
+        text = f'<{DSML}tool_calls>\n<{DSML}invoke name="read"/>\n</{DSML}tool_calls>'
         for size in (None, 1, 100):
             name, args = self._args_of(text, size)
             self.assertEqual(name, "read", f"chunk={size}")

@@ -405,9 +405,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                             obj = json.loads(current_params)
                         except (json.JSONDecodeError, ValueError, MalformedJSON):
                             try:
-                                obj = _partial_json_loads(
-                                    current_params, Allow.ALL
-                                )[0]
+                                obj = _partial_json_loads(current_params, Allow.ALL)[0]
                             except (json.JSONDecodeError, ValueError, MalformedJSON):
                                 obj = None
                         if isinstance(obj, dict) and obj:
@@ -421,7 +419,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                                 None,
                             )
                             mode = "wrap" if wrapper is not None else "normal"
-                        # Empty dict / unparseable / partial fragments stay
+                        # Empty dict / unparsable / partial fragments stay
                         # undecided (None): they are only released at completion
                         # through the normal is_tool_end branch below.
                     if mode is not None:
@@ -451,9 +449,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                             )
                             if repaired is not None:
                                 final_obj = repaired
-                            final_params = json.dumps(
-                                final_obj, ensure_ascii=False
-                            )
+                            final_params = json.dumps(final_obj, ensure_ascii=False)
                         argument_diff = final_params[sent_len:]
                 elif mode == "normal" or is_tool_end:
                     # Ordinary incremental streaming. Undecided calls (no
