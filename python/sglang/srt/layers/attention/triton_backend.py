@@ -2596,7 +2596,10 @@ def update_sliding_window_buffer(
         total_tokens=window_kv_indices.numel(),
         out=window_kv_indices,
         kv_start_idx=window_kv_start_idx,
-        sliding_window=translator.reads_are_translated,
+        sliding_window=(
+            translator.reads_are_translated
+            and isinstance(token_to_kv_pool, BaseSWAKVPool)
+        ),
     )
     if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
         kv_last_index = window_kv_indptr[-1]
