@@ -54,6 +54,75 @@ These options are intended to preserve output quality. In practice, some paths (
 | **Attention Backend (lossless)** | `--attention-backend fa` | Selects a lossless attention kernel for SGLang-native pipelines: `fa` (FlashAttention 2/3/4 alias) or `torch_sdpa`. | FA is usually faster than SDPA on long sequences | FA requires compatible GPU (Ampere+). For `--backend diffusers`, valid backend names differ; use the names documented in `docs/docs/sglang-diffusion/attention_backends.mdx`. |
 | **Parallel Folding** | *(automatic when SP > 1)* | Reuses the SP process group as TP for the T5 text encoder, so text encoding is parallelized "for free". | Faster text encoding on multi-GPU | Automatic; no user action needed. Only applies to T5-based pipelines. |
 
+### Choosing what goes in `--layerwise-offload-components`
+
+Layerwise offload pays one H2D of a component's weights **per pass over that component**, overlapped with that pass's compute. So the question is not how big the component is, it is **how many passes per request it makes** — counted from the code, not from the pipeline diagram:
+
+| Component | Passes per request | Placement |
+|---|---|---|
+| DiT | one per denoising step | Stream it. The transfer amortizes over every step and hides behind attention/FFN. |
+| Video VAE | one per **temporal chunk**, not one | Declare it streamed and keep its blocks resident. |
+| Text / image encoder | one | Resident if it fits; otherwise streamed with its blocks resident. |
+| Vocab table | a gather, one row per token | Neither. Declare it in `host_resident_table_names` and leave it in host memory. |
+
+"One-shot" is a property of the code, not of the diagram. `_decode_temporal_streaming` in `runtime/models/vaes/minimax_h3_video_vae/klvae.py` calls the whole video decoder once per temporal chunk, so streaming its 36 blocks pays 36 block transfers per chunk. On MiniMax-H3 at 864x480 / 124 frames that is **150 s** of decode against **13 s** with the blocks held.
+
+**There are three placements, not two.** A component can be declared streamed and still hold its blocks:
+
+| Placement | How | Transfers |
+|---|---|---|
+| Resident | leave it out of the list | once at load; the VRAM is held for the whole process |
+| Streamed, blocks resident | in the list **plus** `--layerwise-resident-layers video_vae=36` | once, not per pass, and the VRAM comes back when the component finishes |
+| Streamed | in the list, resident layers 0 | every pass — worth it only for a component that makes many passes, i.e. the DiT |
+
+So do not read "drop it from the list" as the fix for a one-shot component: that keeps it resident for the whole process, which is exactly the VRAM a 12-24 GB budget does not have.
+
+Measured on MiniMax-H3, 1x RTX 4090 24 GB, 672x384, 4 steps, prefetch 1, **no resident VAE blocks** in either row:
+
+| `--layerwise-offload-components` | denoise | decode | peak |
+|---|---|---|---|
+| `dit,text_encoder,vae` | 15.51 s | **39.85 s** | 16.4 GB |
+| `dit,text_encoder` | 17.33 s | **5.32 s** | 22.2 GB |
+
+Those two rows are the first and third placements. Taking the VAE out of the stream cut decode 7.5x and the request 76 s -> 29 s, at the cost of 5.8 GB of peak and ~12% on denoise because the DiT's staging buffers have less room. The middle placement is what gets the decode without paying the peak.
+
+### Prefetch depth has a knee
+
+`--dit-offload-prefetch-size` is not monotonic. Deeper prefetch hides more of the copy but its staging buffers crowd out activations. Same H3 configuration, VAE resident:
+
+| prefetch | denoise | decode | peak |
+|---|---|---|---|
+| 1 (default) | 17.33 s | 5.32 s | 22.2 GB |
+| **2** | **15.29 s** | **4.89 s** | 22.1 GB |
+| 3 | 15.79 s | 5.25 s | 21.5 GB |
+| 4 | 16.73 s | 5.17 s | 23.5 GB (96% of the card) |
+
+Sweep it rather than assuming the default, and sweep it on the target configuration: the direction depends on model, resolution and card, so a value carried over from another model means nothing. `--dit-layerwise-residency-policy strided` is the other knob on the same bytes — same VRAM, same volume, spread over the step instead of crammed into its tail.
+
+### Host memory is part of the placement decision
+
+Per-component placement is not independent, for two reasons:
+
+- **One host budget.** Pinning a one-shot component's weights takes host RAM that the page cache needs to serve a streamed component's mapped weights. Pinning something that runs once can slow down the thing that runs every step.
+- **Pinned is asynchronous, mapped is not.** A pinned source overlaps its transfer with compute. An unpinned or mapped source is synchronous whatever the code requests, because the driver stages it through its own buffer. Same bytes, different wall clock.
+
+MiniMax-H3 fl2va, 1x RTX 4090, 864x480 / 124 frames / 20 NFE, identical DiT bytes per step, only the host-side source differs:
+
+| DiT weight source | denoise | per step | configuration |
+|---|---|---|---|
+| pinned host memory | **122.84 s** | 6.10 s | host uncapped, 116.7 GB pinned |
+| checkpoint mapping | 330.74 s | 17.4 s | host capped at 32 GiB, allocator at 23 GiB |
+| checkpoint mapping | 318.94 s - 356.37 s | 16.8 - 18.7 s | host capped at 32 GiB, allocator at 12 GiB |
+
+The last row is the same configuration measured twice; the 12% spread tracked host load, so treat differences smaller than that on a shared machine as unresolved. When a streamed run is inexplicably slow, check the host side before touching prefetch or residency: whether the weights are pinned or served from a mapping, and whether host memory pressure pushed them onto one.
+
+### When the transfer knobs do nothing
+
+Before tuning residency or prefetch, measure whether the transfer is exposed at all — and measure it, do not infer it from bytes. Bytes over bandwidth is an upper bound on what *could* be exposed, not what is; prefetch exists to hide exactly that.
+
+Wan2.1-1.3B on a 12 GB RTX 3060, `--dit-layerwise-resident-layers` 0/5/10/20: 1.10 / 1.04 / 1.05 / 1.06 s per step. Flat and non-monotonic, i.e. noise — even though at 65 MB a layer a step moves 2.64 GB, on the order of 100 ms of a 1.04 s step if none of it overlapped. It overlaps, so residency buys nothing. MiniMax-H3 is 1.36 GB a layer, 21x that, and a step moves about 66 GB; there the same flags decide whether the model runs at all. Same flags, opposite conclusion — so sweep two or three values and keep the measured winner instead of reasoning from the checkpoint size.
+
+Residency changes are lossless either way — across a residency sweep on Wan2.1-1.3B every output had the same SHA-256.
 ### Single-GPU large-VRAM notes (measured on 1x B300, 275 GB, SM103)
 
 A single large-VRAM card changes two common assumptions:
@@ -70,7 +139,6 @@ A single large-VRAM card changes two common assumptions:
   whole model fits in 275 GB, so the H2D/D2H round trip is pure overhead.
   Dropping it on LingBot-Video-MoE was 8% faster end to end (bit-identical).
   On a large-VRAM single GPU, re-test each `*-cpu-offload` flag before keeping it.
-
 ---
 
 ## Section 2: Lossy Optimizations
@@ -134,6 +202,26 @@ On B200/B300, the verified resident sweep uses 8 GPUs with Ulysses8. H3 also
 has a verified 4x B200 FSDP-capacity path, but FSDP all-gathers are a memory
 policy rather than the default latency choice. Benchmark the target topology
 with the H3 driver from `sglang-diffusion-benchmark-profile`.
+
+A single 24 GB consumer card also runs H3, below the 2x32 GB the deployment
+picker documents. Keep the video VAE out of the stream and prefetch two layers
+(see "Choosing what goes in `--layerwise-offload-components`"):
+
+```bash
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 1 \
+  --layerwise-offload-components dit,text_encoder \
+  --dit-offload-prefetch-size 2 \
+  --port 30010
+```
+
+Measured on 1x RTX 4090 24 GB at 672x384, 4 steps: 29 s per request, 22.1 GB
+peak. Cross-GPU is a separate matter on consumer cards -- 4090s have no P2P, so
+NCCL falls back to its SHM transport, and TP2 there segfaulted in
+`ncclShmAllocateShareableBuffer` during VAE decode at both 384 and 768. Single
+card avoids that path entirely.
 
 Use the FL2VA partition for both `t2va` and `fl2va`; use
 `--model-variant ref2va` for image/video/audio reference conditioning. The root

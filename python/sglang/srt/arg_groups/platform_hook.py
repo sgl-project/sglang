@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -64,6 +65,10 @@ def handle_amd_specifics(server_args: Any):
         declare_resolution(
             server_args, "_handle_amd_specifics", triton_attention_num_kv_splits=16
         )
+        # Above this the HIP runtime registers a pageable H2D source with the
+        # GPU rather than staging it, and the MMU notifier on that registration
+        # evicts our KFD queues once per tensor while weights load. In KB.
+        os.environ.setdefault("GPU_PINNED_MIN_XFER_SIZE", str(4 * 1024 * 1024))
 
 
 def handle_nccl_pre_warm(server_args: Any):

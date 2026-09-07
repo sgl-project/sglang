@@ -878,6 +878,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         at once, so re-check the JOINT gate instead of the per-side shortfall."""
         from sglang.srt.mem_cache.common import evict_from_tree_cache
 
+        # Arbitrary retry bound; a round that frees nothing ends the loop anyway.
         for _ in range(4):
             before = self.available_size()
             if before >= num_tokens:
