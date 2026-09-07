@@ -23,10 +23,7 @@ def _is_runtime_option_requested(value) -> bool:
 def _is_arg_explicitly_set(server_args, option: str) -> bool:
     is_explicit = getattr(server_args, "is_arg_explicitly_set", None)
     if callable(is_explicit):
-        if is_explicit(option):
-            return True
-        if getattr(server_args, "_explicit_arg_names", None):
-            return False
+        return is_explicit(option)
     return _is_runtime_option_requested(getattr(server_args, option, None))
 
 
