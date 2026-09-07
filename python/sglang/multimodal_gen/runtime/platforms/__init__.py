@@ -201,6 +201,7 @@ def resolve_current_platform_cls_qualname() -> str:
             "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
             "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
             "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
+            "xpu": "sglang.multimodal_gen.runtime.platforms.xpu.XpuPlatform",
         }
         qualname = forced_map.get(forced_platform.lower())
         if qualname is None:
