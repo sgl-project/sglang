@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import torch
@@ -48,6 +49,32 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _FP32_DTYPE = torch.float32
 _BF16_DTYPE = torch.bfloat16
+
+# How the two branches of one block overlap under Ulysses.
+#   none:    window softmax, then linear readout, then both heads->rows a2a
+#   reorder: the softmax output's a2a is issued before the linear readout runs,
+#            so that collective hides behind the readout instead of being exposed
+#   stream:  reorder, plus the linear readout and its a2a run on a high-priority
+#            side CUDA stream concurrently with the FA4 window passes (the
+#            readout is thousands of small latency-bound kernels that fill the
+#            SM slots FA4's persistent CTAs leave at their tails; FA4 is issued
+#            first so its CTAs are queued before the small kernels)
+_BRANCH_OVERLAP = os.environ.get("SGLANG_VDN_BRANCH_OVERLAP", "stream")
+if _BRANCH_OVERLAP not in ("none", "reorder", "stream"):
+    raise ValueError(
+        "SGLANG_VDN_BRANCH_OVERLAP must be none, reorder or stream, "
+        f"got {_BRANCH_OVERLAP!r}"
+    )
+_LINEAR_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _linear_branch_stream(device: torch.device) -> torch.cuda.Stream:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _LINEAR_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device, priority=-1)
+        _LINEAR_STREAMS[index] = stream
+    return stream
 
 
 class MiniMaxH3VDNHybridAttention(nn.Module):
@@ -472,11 +499,17 @@ def _vdn_ulysses_hybrid_core(
     beta = scalars[..., 0]
     if softmax_gate is not None:
         softmax_gate = scalars[..., 1]
-    softmax_out = softmax(
-        q, k, v, softmax_gate=softmax_gate, rope_cache=meta.rope_cache_full
+    softmax = functools.partial(
+        softmax, q, k, v, softmax_gate=softmax_gate, rope_cache=meta.rope_cache_full
     )
-    linear_out = None
-    if not meta.full_cover:
+    if meta.full_cover:
+        softmax_out = softmax()
+        frame_work.wait()
+        return _vdn_return_to_rows(
+            softmax_out, None, ulysses_ws=ulysses_ws, process_group=process_group
+        )
+
+    def linear_branch() -> torch.Tensor:
         frame_work.wait()
         readout = _vdn_linear_readout(
             attention,
@@ -494,12 +527,43 @@ def _vdn_ulysses_hybrid_core(
         linear_out[layout.video_start : layout.video_end] = readout.view(
             -1, local_heads, head_dim
         )
-        del readout
-    else:
-        frame_work.wait()
-    return _vdn_return_to_rows(
-        softmax_out, linear_out, ulysses_ws=ulysses_ws, process_group=process_group
+        return linear_out
+
+    if _BRANCH_OVERLAP == "none":
+        softmax_out = softmax()
+        return _vdn_return_to_rows(
+            softmax_out,
+            linear_branch(),
+            ulysses_ws=ulysses_ws,
+            process_group=process_group,
+        )
+
+    a2a_back = functools.partial(
+        _vdn_a2a_heads_to_rows, ulysses_ws=ulysses_ws, process_group=process_group
     )
+    if _BRANCH_OVERLAP == "reorder":
+        softmax_out = softmax()
+        # the softmax output leaves while the linear readout computes
+        softmax_work, softmax_recv = a2a_back(softmax_out, role="vdn_out0")
+        linear_work, linear_recv = a2a_back(linear_branch(), role="vdn_out1")
+    else:
+        # linear readout (and its a2a) on a side stream, FA4 on the current one;
+        # both read the exchanged q/k/v, frame sums and gate, so the side stream
+        # first waits for them, and the current stream joins before the merge
+        main_stream = torch.cuda.current_stream(q.device)
+        side_stream = _linear_branch_stream(q.device)
+        side_stream.wait_stream(main_stream)
+        softmax_out = softmax()
+        softmax_work, softmax_recv = a2a_back(softmax_out, role="vdn_out0")
+        with torch.cuda.stream(side_stream):
+            linear_out = linear_branch()
+            linear_work, linear_recv = a2a_back(linear_out, role="vdn_out1")
+        main_stream.wait_stream(side_stream)
+    softmax_work.wait()
+    linear_work.wait()
+    merged_softmax = _vdn_merge_heads(softmax_recv)
+    merged_linear = _vdn_merge_heads(linear_recv)
+    return merged_softmax, merged_linear.reshape(merged_linear.shape[0], -1)
 
 
 def _vdn_return_to_rows(
