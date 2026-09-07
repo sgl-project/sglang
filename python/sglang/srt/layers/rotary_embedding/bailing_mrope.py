@@ -6,7 +6,13 @@ from transformers.configuration_utils import PretrainedConfig
 from sglang.kernels.ops.attention.rotary_triton import (
     triton_ernie45_rope_fused_inplace,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.yarn import (
+    yarn_find_correction_range,
+    yarn_get_mscale_simple,
+    yarn_linear_ramp_mask,
+)
 
 
 class BailingMRotaryEmbedding(RotaryEmbedding):
@@ -22,11 +28,36 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
         dtype: torch.dtype,
         mrope_section: Optional[List[int]] = None,
         video_rope: bool = False,
+        scaling_factor: float = 1.0,
+        original_max_position_embeddings: Optional[int] = None,
+        extrapolation_factor: float = 1,
+        attn_factor: float = 1,
+        beta_fast: int = 32,
+        beta_slow: int = 1,
+        truncate: bool = True,
     ) -> None:
+        self.scaling_factor = scaling_factor
+        self.extrapolation_factor = extrapolation_factor
+        self.attn_factor = attn_factor
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.truncate = truncate
+        self.original_max_position_embeddings = (
+            original_max_position_embeddings or max_position_embeddings
+        )
+        self.mscale = (
+            float(yarn_get_mscale_simple(scaling_factor) * attn_factor)
+            if scaling_factor > 1
+            else 1.0
+        )
         # Bailing positions are bounded by the checkpoint context on both sides:
         # text/time grow positive while centered height/width can be negative.
+        # YaRN only stretches the positive side; the negative side holds small
+        # centered media coordinates and stays at the checkpoint bound.
         position_start = -max_position_embeddings if video_rope else 0
-        cache_length = max_position_embeddings * (2 if video_rope else 1)
+        cache_length = (max_position_embeddings if video_rope else 0) + int(
+            self.original_max_position_embeddings * scaling_factor
+        )
         super().__init__(
             head_size,
             rotary_dim,
@@ -47,6 +78,52 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
             # Ernie4.5 kernel consumes [height, width, time].
             mrope_section = [mrope_section[1], mrope_section[2], mrope_section[0]]
         self.mrope_section = mrope_section
+
+    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+        if self.scaling_factor <= 1:
+            return super()._compute_inv_freq(base)
+        # YaRN blend, same construction as YaRNScalingMRotaryEmbedding.
+        pos_freqs = self.base ** (
+            torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+        )
+        inv_freq_extrapolation = 1.0 / pos_freqs
+        inv_freq_interpolation = 1.0 / (self.scaling_factor * pos_freqs)
+        low, high = yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            self.rotary_dim,
+            self.base,
+            self.original_max_position_embeddings,
+            self.truncate,
+        )
+        inv_freq_mask = (
+            1
+            - yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float)
+        ) * self.extrapolation_factor
+        return (
+            inv_freq_interpolation * (1 - inv_freq_mask)
+            + inv_freq_extrapolation * inv_freq_mask
+        )
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        cache = super()._compute_cos_sin_cache()
+        if self.mscale != 1.0:
+            cache = cache * self.mscale
+        return cache
+
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        if self.mscale == 1.0:
+            return super()._ensure_cos_sin_cache_length(needed_max_pos)
+        cur_len = int(self.cos_sin_cache.shape[0])
+        if needed_max_pos < cur_len:
+            return
+        # The base incremental path skips mscale, so rebuild the cache in one
+        # shot to keep every row on the same scale.
+        align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+        self.max_position_embeddings = ((needed_max_pos + align) // align) * align
+        self.cos_sin_cache = self._compute_cos_sin_cache().to(
+            device=self.cos_sin_cache.device, dtype=self.cos_sin_cache.dtype
+        )
 
     def forward(
         self,
@@ -105,12 +182,20 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
         if positions.numel() == 0:
             return
         bound = text_config.max_position_embeddings
+        positive_bound = bound
+        rope_parameters = getattr(text_config, "rope_parameters", None) or {}
+        rope_type = rope_parameters.get("rope_type") or rope_parameters.get("type")
+        if rope_type in ("yarn", "deepseek_yarn"):
+            factor = float(rope_parameters.get("factor", 1.0))
+            original = rope_parameters.get("original_max_position_embeddings", bound)
+            positive_bound = max(bound, int(original * factor))
         min_position = int(positions.min().item())
         max_position = int(positions.max().item())
-        if min_position < -bound or max_position >= bound:
+        if min_position < -bound or max_position >= positive_bound:
             raise ValueError(
                 "Bailing mRoPE position exceeds the checkpoint bounds: "
-                f"min={min_position}, max={max_position}, allowed=[{-bound}, {bound})"
+                f"min={min_position}, max={max_position}, "
+                f"allowed=[{-bound}, {positive_bound})"
             )
 
     @classmethod

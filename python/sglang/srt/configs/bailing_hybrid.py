@@ -279,3 +279,19 @@ class BailingMoeV3VLConfig(PretrainedConfig):
             self.text_config.architectures = ["BailingMoeV3ForCausalLM"]
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+    @property
+    def rope_scaling(self):
+        """The language model's effective RoPE parameters (v5 backcompat alias)."""
+        return self.text_config.rope_parameters
+
+    @rope_scaling.setter
+    def rope_scaling(self, value):
+        # A top-level rope_scaling override (e.g. --json-model-override-args
+        # '{"rope_scaling": ...}') targets the language model's rope. Merge it
+        # into the text config's rope_parameters so the mrope_section and
+        # video_rope markers injected above survive the override.
+        if isinstance(value, dict) and hasattr(self, "text_config"):
+            self.text_config.rope_parameters.update(value)
+        else:
+            PretrainedConfig.rope_scaling.fset(self, value)
