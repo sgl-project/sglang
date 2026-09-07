@@ -7,18 +7,14 @@ export const config = {
   variants: [{ id: "default", label: "Ling-3.0-flash-VL" }],
   quantizations: [
     { id: "bf16", label: "BF16" },
-    { id: "fp8", label: "FP8 (official, upcoming)" },
-    { id: "fp8-online", label: "FP8 (online)" },
+    { id: "fp8", label: "FP8" },
   ],
   strategies: [{ id: "balanced", label: "Balanced" }],
   nodesOptions: [{ id: "single", label: "Single Node" }],
 
   modelNames: {
     "default|bf16": "inclusionAI/Ling-3.0-flash-VL",
-    // Official FP8 export, pending release; repo name follows the text model's
-    // inclusionAI/Ling-3.0-flash-fp8 convention.
-    "default|fp8": "inclusionAI/Ling-3.0-flash-VL-fp8",
-    "default|fp8-online": "inclusionAI/Ling-3.0-flash-VL",
+    "default|fp8": "inclusionAI/Ling-3.0-flash-VL-FP8",
   },
 
   placeholders: {
@@ -112,23 +108,9 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      // Official FP8 export is not released yet; recipe mirrors the BF16 cell
-      // (weights are already FP8, no --quantization flag). Unverified until the
-      // official checkpoint lands.
+      // Verified with online dynamic FP8 (--quantization fp8 on the BF16
+      // checkpoint); when serving the FP8 repo directly, drop --quantization.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: false,
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--mem-fraction-static 0.85",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb300", variant: "default", quant: "fp8-online", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
