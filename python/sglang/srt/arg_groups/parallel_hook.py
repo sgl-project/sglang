@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
+    _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
@@ -126,12 +127,23 @@ def handle_context_parallelism(server_args: Any):
 
 
 def handle_dcp_validation(server_args: Any):
+    run_post_process_pass(server_args, _dcp_comm_backend_default)
+
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
         raise ValueError(
             "Decode context parallel size (--dcp-size / "
             "--decode-context-parallel-size) must be >= 1, but got "
             f"dcp_size={cfg.dcp_size}."
+        )
+    if cfg.dcp_size > 1 and cfg.tp_size % cfg.dcp_size != 0:
+        raise ValueError(
+            "Decode context parallelism must nest inside one attention-TP "
+            "group: --tp-size / --tensor-parallel-size must be evenly "
+            "divisible by --dcp-size / --decode-context-parallel-size, but "
+            f"got tp_size={cfg.tp_size} and dcp_size={cfg.dcp_size} "
+            f"(tp_size % dcp_size = {cfg.tp_size % cfg.dcp_size}). A ragged "
+            "split would silently build a short final DCP group."
         )
     if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
         raise ValueError(

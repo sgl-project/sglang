@@ -1408,6 +1408,27 @@ def _data_parallelism_defaults(view: Any) -> dict:
 
 
 @register_post_process
+def _dcp_comm_backend_default(view: Any) -> dict:
+    """Default the DCP attention-reduction comm backend to the fused a2a
+    exchange on NPU.
+
+    ``ag_rs`` (all-gather LSE, reduce-scatter output) costs three collectives
+    per layer; ``a2a`` packs output and LSE into a single HCCL all-to-all and
+    is the backend with a direct vLLM-Ascend precedent. ``ag_rs`` stays
+    selectable (e.g. to localize a merge bug) -- this only replaces the
+    cross-platform default, the same way ``kv_cache_dtype``'s "auto" sentinel
+    is resolved per device elsewhere in this module.
+    """
+    if not get_platform().is_npu:
+        return {}
+    if view.dcp_size <= 1:
+        return {}
+    if view.dcp_comm_backend != "ag_rs":
+        return {}
+    return {"dcp_comm_backend": "a2a"}
+
+
+@register_post_process
 def _tp_lm_head_all_to_all_default(view: Any) -> dict:
     """Enable the TP LM-head all-to-all path only for pure-DP decode nodes.
 

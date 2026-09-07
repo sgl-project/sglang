@@ -92,8 +92,10 @@ def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
 
-    # Only create HCCL options for default group or MoE-related groups
-    if group_name is not None and "moe" not in group_name:
+    # Only create HCCL options for the default group, MoE-related groups, or
+    # the DCP group (decode context parallelism also needs a tuned HCCL
+    # buffer for its per-layer all-to-all/all-gather exchange).
+    if group_name is not None and "moe" not in group_name and "dcp" not in group_name:
         return None
 
     import torch_npu
