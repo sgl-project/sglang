@@ -47,6 +47,9 @@ from sglang.srt.lora.deepseek_mla_correction import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
@@ -141,6 +144,17 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
+def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
+    """Dequantize an absorbed MLA weight, skipping the pass when it is a no-op."""
+    if (
+        w.dtype == torch.bfloat16
+        and isinstance(w_scale, (int, float))
+        and w_scale == 1.0
+    ):
+        return w
+    return w.to(torch.bfloat16) * w_scale
+
+
 def rocm_absorb_q_bmm(
     attn: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
@@ -186,7 +200,7 @@ def rocm_absorb_q_bmm(
         else:
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
-                attn.w_kc.to(torch.bfloat16) * attn.w_scale,
+                _absorb_weight_bf16(attn.w_kc, attn.w_scale),
             )
     return q_nope_out
 
@@ -240,10 +254,26 @@ def rocm_absorb_v_bmm(
                 transpose_bm_in=True,
                 dtype=torch.bfloat16,
             )
+        elif not is_in_tc_piecewise_cuda_graph():
+            # Same (batch, heads, dim) layout as the quantized paths above, so the
+            # post-GEMM flatten is a view. Skipped under piecewise: torch dynamo
+            # rejects out= with a non-contiguous output tensor.
+            _bmm_buf = torch.empty(
+                attn_output.shape[0],
+                attn.num_local_heads,
+                attn.w_vc.shape[2],
+                device=attn_output.device,
+                dtype=torch.bfloat16,
+            )
+            torch.bmm(
+                attn_output.to(torch.bfloat16).transpose(0, 1),
+                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                out=_bmm_buf.transpose(0, 1),
+            )
         else:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
-                attn.w_vc.to(torch.bfloat16) * attn.w_scale,
+                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
             )
 
     if _bmm_buf is not None:
@@ -677,17 +707,16 @@ class DeepseekMLARocmForwardMixin:
                     forward_batch.out_cache_loc,
                 )
                 save_kv_cache = False
-                # On decode, pass q_cat directly to attn_mqa with q_rope=None so
-                # dsa_backend.forward_decode reuses q_cat as a zero-copy view
-                # (`q.contiguous().view(...)` fast-path) instead of running the
-                # redundant `concat_mla_absorb_q_general(q_nope_fused, q_pe_fused)`
-                # that would otherwise rebuild a tensor byte-identical to q_cat.
-                # On ROCm tilelang decode, this eliminates the
-                # `CatArrayBatchedCopy<OpaqueType<1u>, ...>` kernel that used to
-                # fire once per layer per decode step (~2.6 us / layer saved).
-                # Prefill keeps the split form because dsa_backend.forward_extend
-                # asserts `q_rope is not None`.
-                if forward_batch.forward_mode.is_decode_or_idle():
+                # Pass q_cat straight to attn_mqa with q_rope=None so the backend
+                # reuses it as a zero-copy view instead of rebuilding a tensor
+                # byte-identical to it -- one `CatArrayBatchedCopy` per layer per
+                # step. Target-verify is the same absorbed shape as decode, just
+                # more rows; real prefill keeps the split form because the Triton
+                # sparse-MLA kernel reads q_nope/q_rope separately.
+                if (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                ):
                     if llama_4_scaling is not None:
                         # llama_4_scaling applies only to the q_nope portion;
                         # mutate in place via the slice view of q_cat.
