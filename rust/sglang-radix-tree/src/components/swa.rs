@@ -159,24 +159,23 @@ impl SwaComponent {
         if !tree_core.has_swa_host_pool {
             return Vec::new();
         }
-        let mut covered = 0;
+        let mut covered_tokens = 0;
         let mut unbacked: Vec<NodeIdx_> = Vec::new();
         let mut cur_id = node_id;
-        while covered < self.sliding_window_size {
+        while covered_tokens < self.sliding_window_size {
             let cur = tree_core.arena.node(cur_id);
             if cur.is_root() || cur.write_through_pending_id.is_some() {
                 break;
             }
-            let on_device = cur.has_device_value(SWA);
-            let covered_len = if on_device {
+            let (on_device, on_host) = (cur.has_device_value(SWA), cur.has_host_value(SWA));
+            covered_tokens += if on_device {
                 cur.device_value_len(SWA)
-            } else if cur.has_host_value(SWA) {
+            } else if on_host {
                 cur.host_value_len(SWA)
             } else {
                 break;
             };
-            covered += covered_len;
-            if on_device && !cur.has_host_value(SWA) {
+            if on_device && !on_host {
                 unbacked.push(cur_id);
             }
             cur_id = cur.parent();
@@ -387,11 +386,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
     ) -> MatchResult {
         let swa_boundary_len = result.device_indices.size()[0] as usize + result.host_hit_length;
 
-        // Full KV may extend beyond the latest reusable SWA window. The branching
-        // point is the last page-aligned position within the Full-KV hit that lies
-        // beyond the current SWA boundary.
-        let aligned_seqlen = result.full_kv_hit_length / tree_core.page_size * tree_core.page_size;
-        result.swa_branching_seqlen = (aligned_seqlen > swa_boundary_len).then_some(aligned_seqlen);
+        // Branch at the last page-aligned Full-KV position past the SWA boundary.
+        let page_aligned_full_hit_len =
+            result.full_kv_hit_length / tree_core.page_size * tree_core.page_size;
+        result.swa_branching_seqlen =
+            (page_aligned_full_hit_len > swa_boundary_len).then_some(page_aligned_full_hit_len);
 
         // Sum the SWA tokens backing the match, walking up from the best match
         // until one sliding window is covered; host-resident chunks count
@@ -915,7 +914,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 // scatters it back in this order. Device values already hold
                 // SWA-pool indices (translated at insert time); host pool
                 // indexing wants int64.
-                let (device_indices, nodes_to_load): (Vec<Tensor>, Vec<NodeId>) = unbacked
+                let (device_indices, backup_node_ids): (Vec<Tensor>, Vec<NodeId>) = unbacked
                     .iter()
                     .rev()
                     .map(|&idx| {
@@ -926,7 +925,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 Some(vec![PoolTransfer {
                     name: PoolName::Swa,
                     device_indices: Some(Tensor::cat(&device_indices, 0)),
-                    nodes_to_load: Some(nodes_to_load),
+                    nodes_to_load: Some(backup_node_ids),
                     ..Default::default()
                 }])
             }
@@ -1025,10 +1024,12 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 let Some(host_indices) = &transfer.host_indices else {
                     return;
                 };
-                // A transfer this component did not build covers one node and
-                // carries no offsets to scatter by: attach the whole span, as the
-                // single-node backup always did.
-                let Some(target_ids) = transfer.nodes_to_load.clone() else {
+                // A missing or empty `nodes_to_load` means the span is this node's alone.
+                let target_ids = transfer
+                    .nodes_to_load
+                    .as_deref()
+                    .filter(|ids| !ids.is_empty());
+                let Some(target_ids) = target_ids else {
                     let node = tree_core.arena.node_mut(node_id);
                     if !node.has_host_value(SWA) {
                         node.set_host_value(SWA, host_indices.copy());
@@ -1036,17 +1037,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                     return;
                 };
                 let mut offset = 0i64;
-                for target_id in target_ids {
+                for &target_id in target_ids {
                     let target_idx = tree_core.arena.resolve(target_id);
-                    let size = {
-                        let target = tree_core.arena.node(target_idx);
-                        assert!(
-                            target.has_device_value(SWA) && !target.has_host_value(SWA),
-                            "SWA backup target {} is not device-only",
-                            target.id
-                        );
-                        target.device_value_len(SWA) as i64
-                    };
+                    let size = tree_core.arena.device_value_len(target_idx, SWA) as i64;
                     tree_core.arena.set_host_value(
                         target_idx,
                         SWA,

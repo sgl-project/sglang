@@ -5055,18 +5055,32 @@ fn backup_host_build_is_none_without_an_swa_host_pool() {
 #[test]
 fn backup_host_commit_scatters_the_host_span_across_the_covered_nodes() {
     let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
-    let [a, b, c] = chain::<3>(&mut tc);
-    for (node, value) in [(a, 10i64), (b, 11), (c, 12)] {
-        set_swa_device_value(&mut tc, node, value);
+    // Spans 1 / 2 / 1: the scatter has to advance by each node's own length.
+    let mut parent = tc.arena.root();
+    let mut nodes = Vec::new();
+    for key in [vec![1i64], vec![2, 3], vec![4]] {
+        parent = tc
+            .arena
+            .alloc_child(
+                parent, key, /* priority = */ 0, /* extra_key = */ None,
+            )
+            .unwrap();
+        nodes.push(parent);
     }
-    let (nodes, _) = backup_plan(&tc, /* window = */ 4, c);
-    commit_backup(&mut tc, c, &[100i64, 101, 102], Some(nodes));
+    let [a, b, c] = [nodes[0], nodes[1], nodes[2]];
+    for (node, value) in [(a, vec![10i64]), (b, vec![11, 12]), (c, vec![13])] {
+        tc.arena
+            .set_device_value(node, SWA, Tensor::from_slice(&value));
+    }
+    let (ids, device_indices) = backup_plan(&tc, /* window = */ 4, c);
+    assert_eq!(device_indices, vec![10, 11, 12, 13]);
+    commit_backup(&mut tc, c, &[100i64, 101, 102, 103], Some(ids));
 
-    for (node, host) in [(a, 100i64), (b, 101), (c, 102)] {
+    for (node, host) in [(a, vec![100i64]), (b, vec![101, 102]), (c, vec![103])] {
         assert!(
             tc.arena
                 .host_value(node, SWA)
-                .equal(&Tensor::from_slice(&[host]))
+                .equal(&Tensor::from_slice(&host))
         );
     }
 }
