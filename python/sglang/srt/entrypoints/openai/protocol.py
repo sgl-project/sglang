@@ -840,6 +840,29 @@ def _has_message_level_tools(messages: Any) -> bool:
     )
 
 
+# Chat templates read one of two keys for the reasoning toggle: "thinking"
+# (deepseek-v3, kimi_k2) or "enable_thinking" (qwen3, glm45, nemotron_3,
+# interns1). Clients that send only the other one -- sgl-eval's --thinking /
+# --no-thinking and its per-benchmark defaults send `thinking` -- otherwise
+# leave the template at its default (thinking on for Qwen3.5), so the request
+# silently runs in the wrong mode. Mirror the missing key, never overwrite.
+_THINKING_TOGGLE_KEYS = ("thinking", "enable_thinking")
+
+
+def mirror_thinking_toggle_keys(chat_template_kwargs):
+    if not isinstance(chat_template_kwargs, dict):
+        return chat_template_kwargs
+    present = [k for k in _THINKING_TOGGLE_KEYS if k in chat_template_kwargs]
+    if len(present) != 1:
+        return chat_template_kwargs
+    value = chat_template_kwargs[present[0]]
+    if not isinstance(value, bool):
+        return chat_template_kwargs
+    for key in _THINKING_TOGGLE_KEYS:
+        chat_template_kwargs.setdefault(key, value)
+    return chat_template_kwargs
+
+
 class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -1059,6 +1082,7 @@ class ChatCompletionRequest(BaseModel):
             ctk.setdefault("enable_thinking", thinking)
             values["chat_template_kwargs"] = ctk
 
+        mirror_thinking_toggle_keys(values.get("chat_template_kwargs"))
         return values
 
     @model_validator(mode="before")
@@ -1695,6 +1719,7 @@ class ResponsesRequest(BaseModel):
                 "enable_thinking": False,
                 **existing,
             }
+        mirror_thinking_toggle_keys(values.get("chat_template_kwargs"))
         return values
 
     @model_validator(mode="before")
