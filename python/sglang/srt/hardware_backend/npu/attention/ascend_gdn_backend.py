@@ -201,12 +201,12 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             num_token_padding = mixed_qkv.shape[0]
             if (
                 not self.graph_mode
-                and forward_batch.num_token_non_padded_cpu != num_token_padding
+                and forward_batch.global_num_token_non_padded_cpu != num_token_padding
             ):
-                mixed_qkv = mixed_qkv[: forward_batch.num_token_non_padded_cpu]
-                a = a[: forward_batch.num_token_non_padded_cpu]
-                b = b[: forward_batch.num_token_non_padded_cpu]
-                seq_len = forward_batch.num_token_non_padded_cpu
+                mixed_qkv = mixed_qkv[: forward_batch.global_num_token_non_padded_cpu]
+                a = a[: forward_batch.global_num_token_non_padded_cpu]
+                b = b[: forward_batch.global_num_token_non_padded_cpu]
+                seq_len = forward_batch.global_num_token_non_padded_cpu
 
             batch_size = cache_indices.shape[0]
             draft_token_num = forward_batch.spec_info.draft_token_num

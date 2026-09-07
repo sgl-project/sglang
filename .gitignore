@@ -171,6 +171,7 @@ benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
+!tools/sglang-simulator/examples/replay/trace.jsonl
 tmp*.txt
 /tmp/
 
