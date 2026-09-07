@@ -1046,11 +1046,12 @@ class Engine(EngineScoreMixin, EngineBase):
         port_args: Optional[PortArgs] = None,
         placement_group=None,
     ) -> Tuple[
-        TokenizerManager,
-        TemplateManager,
+        Optional[Union[TokenizerManager, MultiTokenizerRouter]],
+        Optional[TemplateManager],
         PortArgs,
         SchedulerInitResult,
         Optional[SubprocessWatchdog],
+        Optional[List],
     ]:
         """Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
 

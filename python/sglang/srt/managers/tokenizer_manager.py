@@ -170,7 +170,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
-from sglang.srt.utils.watchdog import Watchdog
+from sglang.srt.utils.watchdog import SubprocessWatchdog, Watchdog
 from sglang.srt.utils.weight_versions import add_weight_versions_to_meta_info
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -602,7 +602,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.session_futures = {}  # session_id -> asyncio event
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
-        self._subprocess_watchdog = None
+        self._subprocess_watchdog: Optional[SubprocessWatchdog] = None
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
