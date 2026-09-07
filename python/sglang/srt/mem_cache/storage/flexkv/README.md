@@ -260,13 +260,19 @@ This is the path you'll use under any non-trivial deployment topology
   chunked-request and priority matching defer rematches until normal cache
   completion commits the restore. Direct duplicate restores and ownership
   mismatches fail before mutating cache state.
-* Abort notification preserves the restore's ownership and tree-owned boundary
-  until request cleanup. An uncertain launch or an unexpected positive
-  layerwise length retains the entire allocation and raises an error; it does
-  not automatically retry prefill. Reset drains staged Store mapping copies and
-  connector transfers before releasing uncommitted slots. If draining fails,
-  ownership remains intact. These rules apply to standard and hybrid caches;
-  a zero-length launch failure has no writer and can release its allocation.
+* Abort notification removes the active rid guard but retains a separate
+  allocation ledger and the request's cleanup boundary. Scheduled requests
+  release through normal cache completion. A pre-admission abort without a KV
+  row retains its allocation until an explicit idle `flush_cache`; it does not
+  block a new request with the same rid or lose the slot record.
+* Reset fences all connector transfers before reclaiming active and aborted
+  allocations. Stale request fields do not prevent reclamation. Actual free
+  failures are retained and reported after attempting the other allocations.
+* An unexpected positive layerwise length cannot prove any slot idle. It remains
+  an engine-fatal contract violation, without automatic recovery or retry; a
+  later flush RPC is not a recovery mechanism for a terminated scheduler.
+  These rules apply to standard and hybrid caches. A zero-length launch has no
+  writer and can release its allocation.
 * A `FlexKVLayerDoneCounter` is registered onto sglang's KV pool via
   `register_layer_transfer_counter`; the per-layer hook blocks each
   forward layer on its own eventfd until the FlexKV transfer worker

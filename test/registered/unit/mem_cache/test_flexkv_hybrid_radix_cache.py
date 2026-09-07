@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -103,6 +103,7 @@ def test_restored_swa_tail_marks_older_prefix_as_evicted_before_cache_insert():
     cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
     cache._inner_cache = inner
     cache._restore_leases = {}
+    cache._aborted_restore_leases = {}
     req = SimpleNamespace(
         rid="request",
         kv=SimpleNamespace(swa_evicted_seqlen=0),
@@ -143,6 +144,7 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
     cache.device = torch.device("cpu")
     cache._load_markers = {}
     cache._restore_leases = {}
+    cache._aborted_restore_leases = {}
     cache._restore_generation = 0
     cache._alloc_restore_slots = MagicMock(return_value=restored)
     cache.supports_swa = MagicMock(return_value=False)
@@ -173,15 +175,10 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
     assert req.pending_restore_slots is restored
     lease = cache._restore_leases[req.rid]
 
-    # A second prefix match degrades to the inner cache's device-only result
-    # instead of raising: it is read-only, and the decode-disagg rematch sites
-    # are unguarded. What must still be blocked is the duplicate FlexKV lookup,
-    # which would overwrite the connector's rid-keyed pending task and strand
-    # the leased slots.
-    second_match = cache.match_prefix(params)
-    assert second_match is inner_match
-    assert second_match.host_hit_length == 0
-    assert inner.match_prefix.call_args_list == [call(params), call(params)]
+    # Even a device-only match could overwrite the caller's restored prefix.
+    with pytest.raises(RuntimeError, match="prefix rematch before restore commit"):
+        cache.match_prefix(params)
+    inner.match_prefix.assert_called_once_with(params)
     connector.lookup_kv.assert_called_once()
     assert req.rid not in cache._load_markers
 
@@ -225,6 +222,7 @@ def test_partial_synchronous_restore_is_freed_in_full():
         "request": SimpleNamespace(device_length=0),
     }
     cache._restore_leases = {}
+    cache._aborted_restore_leases = {}
     cache._restore_generation = 0
     cache._alloc_restore_slots = MagicMock(return_value=restored)
 
@@ -255,6 +253,7 @@ def test_restore_launch_exception_is_retained_until_safe_reset():
         "request": SimpleNamespace(device_length=0),
     }
     cache._restore_leases = {}
+    cache._aborted_restore_leases = {}
     cache._restore_generation = 0
     cache._alloc_restore_slots = MagicMock(return_value=restored)
 
@@ -287,9 +286,11 @@ def test_finished_release_commits_restore_lease_after_inner_cache():
     inner = MagicMock()
     cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
     cache._inner_cache = inner
+    cache._aborted_restore_leases = {}
     cache._restore_leases = {
         "request": SimpleNamespace(
             generation=3,
+            rid=req.rid,
             req=req,
             device_indices=restored,
         )
@@ -329,6 +330,7 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
     cache._store_generation = 0
     cache._inflight_store_nodes = {}
     cache._restore_leases = {}
+    cache._aborted_restore_leases = {}
 
     req = SimpleNamespace(
         rid="request",
@@ -368,6 +370,7 @@ def test_reset_drains_flexkv_before_releasing_inner_slots():
     cache._inner_cache = inner
     cache._load_markers = {}
     cache._restore_leases = {}
+    cache._aborted_restore_leases = {}
     cache._restore_generation = 0
     cache._node_lock = threading.Lock()
     cache._inflight_store_nodes = {}
@@ -401,9 +404,11 @@ def test_reset_frees_uncommitted_restore_after_connector_drain():
     cache.token_to_kv_pool_allocator = allocator
     cache._inner_cache = inner
     cache._load_markers = {}
+    cache._aborted_restore_leases = {}
     cache._restore_leases = {
         "request": SimpleNamespace(
             generation=0,
+            rid=req.rid,
             req=req,
             device_indices=restored,
         ),
@@ -457,6 +462,7 @@ def _make_layerwise_restore(loaded=4):
     cache.supports_swa = lambda: False
     cache._load_markers = {"request": SimpleNamespace(device_length=0)}
     cache._restore_leases = {}
+    cache._aborted_restore_leases = {}
     cache._restore_generation = 0
     cache._node_lock = threading.Lock()
     cache._inflight_store_nodes = {}
@@ -508,14 +514,7 @@ def test_zero_layerwise_return_releases_prelaunch_allocation():
 
 @pytest.mark.parametrize("method", ["cache_finished_req", "cache_unfinished_req"])
 @pytest.mark.parametrize("mismatch", ["identity", "generation", "slots"])
-def test_hybrid_lease_mismatch_does_not_release_slots(method, mismatch):
-    """A mismatch means we cannot prove who owns the slots, so leave them.
-
-    This runs on the normal request-completion path, so it degrades (log +
-    treat as "no lease") instead of failing the engine: the request still
-    completes through the inner cache. What must hold is that nothing is
-    freed and the lease stays registered so reset() can reclaim it.
-    """
+def test_hybrid_lease_mismatch_fails_before_inner_cache_mutation(method, mismatch):
     cache, req, params, restored = _make_layerwise_restore()
     cache.init_load_back(params)
     lease = cache._restore_leases[req.rid]
@@ -527,17 +526,14 @@ def test_hybrid_lease_mismatch_does_not_release_slots(method, mismatch):
         req.pending_restore_slots = req.pending_restore_slots.clone()
     req._flexkv_swa_evicted_seqlen = 8
 
-    if method == "cache_finished_req":
-        cache.cache_finished_req(req, is_insert=False)
-    else:
-        cache.cache_unfinished_req(req, chunked=True)
-
-    # Degrading means the completion itself is not blocked.
-    getattr(cache._inner_cache, method).assert_called_once()
-    assert req.kv.swa_evicted_seqlen == 8
-    # The leased slots are never handed back on a mismatch...
+    with pytest.raises(RuntimeError, match="restore lease mismatch"):
+        if method == "cache_finished_req":
+            cache.cache_finished_req(req, is_insert=False)
+        else:
+            cache.cache_unfinished_req(req, chunked=True)
+    getattr(cache._inner_cache, method).assert_not_called()
+    assert req.kv.swa_evicted_seqlen == 0
     cache.token_to_kv_pool_allocator.free.assert_not_called()
-    # ...and the lease survives untouched, so reset() can still reclaim them.
     assert cache.has_uncommitted_restore(req)
     assert cache._restore_leases[req.rid] is lease
     cache.reset()
@@ -545,25 +541,15 @@ def test_hybrid_lease_mismatch_does_not_release_slots(method, mismatch):
     assert cache._restore_leases == {}
 
 
-def test_hybrid_abort_clears_the_lease_without_freeing_live_slots():
-    """Abort must not leave has_uncommitted_restore() True.
-
-    Two scheduler abort paths (_abort_on_queued_limit,
-    _abort_on_waiting_timeout) pop a *waiting* request and never call
-    release_kv_cache. A retained lease would make every scheduler pass and both
-    SchedulePolicy match loops skip that rid forever.
-
-    The slots are deliberately NOT freed here: the launched layerwise H2D may
-    still be writing into them, so the request's own KV release path owns them.
-    """
+def test_hybrid_abort_unblocks_rid_but_keeps_slots_until_cleanup():
     cache, req, params, restored = _make_layerwise_restore()
     cache.init_load_back(params)
     cache.release_aborted_request(req.rid)
 
     assert not cache.has_uncommitted_restore(req)
-    assert req._flexkv_uncached_restore is False
-    assert req.pending_restore_generation is None
-    assert req.pending_restore_slots is None
+    assert req._flexkv_uncached_restore is True
+    assert cache._aborted_restore_leases[req.pending_restore_generation].req is req
+    assert req.pending_restore_slots is restored
     # Abort notification is not completion of the asynchronous H2D writer.
     cache.token_to_kv_pool_allocator.free.assert_not_called()
 
@@ -573,6 +559,7 @@ def test_hybrid_abort_clears_the_lease_without_freeing_live_slots():
         req, is_insert=False, kv_len_to_handle=4
     )
     assert not cache.has_uncommitted_restore(req)
+    assert cache._aborted_restore_leases == {}
     cache.token_to_kv_pool_allocator.free.assert_not_called()
 
     # And the aborted rid stays schedulable: a requeued restore is accepted.
@@ -580,6 +567,61 @@ def test_hybrid_abort_clears_the_lease_without_freeing_live_slots():
     cache.init_load_back(params)
     assert cache.has_uncommitted_restore(req)
     assert req.pending_restore_slots is restored
+
+
+def test_hybrid_old_abort_cleanup_preserves_reused_rid_with_real_inner_cache():
+    cache, old, params, old_slots = _make_layerwise_restore()
+    allocator = cache.token_to_kv_pool_allocator
+    inner = RadixCache.create_simulated(mock_allocator=allocator, page_size=4)
+    cache._inner_cache = inner
+    old.last_node = inner.root_node
+    old.kv.req_pool_idx = 0
+    old.extra_key = None
+    old.cache_salt = None
+    cache.init_load_back(params)
+    cache.release_aborted_request(old.rid)
+    new = SimpleNamespace(**vars(old))
+    new.kv = SimpleNamespace(**vars(old.kv))
+    new_slots = torch.arange(40, 44, dtype=torch.int64)
+    cache._alloc_restore_slots.return_value = new_slots
+    cache._load_markers[new.rid] = SimpleNamespace(device_length=0)
+    cache.init_load_back(
+        InitLoadBackParams(best_match_node=new.last_node, host_hit_length=4, req=new)
+    )
+    live = set(old_slots.tolist() + new_slots.tolist())
+
+    def free(slots):
+        for slot in slots.tolist():
+            assert slot in live, f"double free: {slot}"
+            live.remove(slot)
+
+    allocator.free.side_effect = free
+    allocator.free_segments.side_effect = lambda spans: [
+        free(slots[start:]) for slots, start in spans
+    ]
+    inner.req_to_token_pool = SimpleNamespace(req_to_token=old_slots.unsqueeze(0))
+    cache.cache_finished_req(old, is_insert=False, kv_len_to_handle=4)
+    assert live == set(new_slots.tolist())
+    assert cache._restore_leases[new.rid].req is new
+    assert cache._aborted_restore_leases == {}
+    inner.req_to_token_pool.req_to_token = new_slots.unsqueeze(0)
+    cache.cache_finished_req(new, is_insert=False, kv_len_to_handle=4)
+    cache.reset()
+    assert not live
+
+
+@pytest.mark.parametrize("stale", ["generation", "slots"])
+def test_hybrid_reset_reclaims_orphaned_abort_despite_stale_request_fields(stale):
+    cache, req, params, restored = _make_layerwise_restore()
+    cache.init_load_back(params)
+    cache.release_aborted_request(req.rid)
+    if stale == "generation":
+        req.pending_restore_generation += 100
+    else:
+        req.pending_restore_slots = req.pending_restore_slots.clone()
+    cache.reset()
+    cache.token_to_kv_pool_allocator.free.assert_called_once_with(restored)
+    assert cache._aborted_restore_leases == {}
 
 
 @pytest.mark.parametrize("failure", [None, "copy", "connector"])

@@ -1,3 +1,4 @@
+import ast
 import contextlib
 import importlib.util
 import sys
@@ -5,7 +6,7 @@ import threading
 from array import array
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -73,6 +74,7 @@ def _make_cache(page_size=4):
     cache._pending_store_launches = {}
     cache._pending_store_copies = {}
     cache._restore_leases = {}
+    cache._aborted_restore_leases = {}
     cache._restore_generation = 0
     cache._async_store_slot_mapping = False
     cache._profile_store_stages = False
@@ -506,8 +508,12 @@ def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
     cache.store_stream.wait_stream.assert_not_called()
 
 
+class _TestReq(SimpleNamespace):
+    __hash__ = object.__hash__
+
+
 def _restore_request(cache, *, rid="ip-request", length=4, load_fn=None):
-    req = SimpleNamespace(
+    req = _TestReq(
         rid=rid,
         origin_input_ids=array("q", range(length)),
         output_ids=array("q"),
@@ -573,41 +579,22 @@ def test_ip_restore_lease_ends_after_real_cache_completion(completion):
         assert torch.equal(match.device_indices, req.prefix_indices)
 
 
-def test_abort_clears_the_lease_without_freeing_live_slots():
-    """Abort must not leave has_uncommitted_restore() True.
-
-    Two abort paths (_abort_on_queued_limit, _abort_on_waiting_timeout) pop the
-    request and never call release_kv_cache, and the queue-pop path in
-    abort_request only does so for DECODE disagg or a mamba request. A retained
-    lease would make every scheduler pass and both SchedulePolicy match loops
-    skip that rid forever, and init_load_back would raise if it came back.
-
-    The slots are deliberately NOT freed here: the launched layerwise H2D may
-    still be writing into them.
-    """
+def test_abort_unblocks_rid_but_retains_slots_until_request_cleanup():
     cache, allocator = _make_cache()
     req = _restore_request(cache)
+    restored = req.pending_restore_slots
     cache.release_aborted_request(req.rid)
-
-    assert not cache.has_uncommitted_restore(req)
-    assert not req._flexkv_uncached_restore
-    assert req.pending_restore_slots is None
     # Abort notification is not completion of the asynchronous H2D writer.
-    allocator.free.assert_not_called()
-
-
-def test_abort_does_not_strand_a_requeued_request():
-    """The stall this guards: an aborted rid must stay schedulable."""
-    cache, _allocator = _make_cache()
-    req = _restore_request(cache)
-    cache.release_aborted_request(req.rid)
-
-    # The scheduler guard and both SchedulePolicy loops key off this.
     assert not cache.has_uncommitted_restore(req)
-    # And a fresh lookup for the same rid must not raise.
-    cache.flexkv_connector.lookup_kv.return_value = (17, 4)
-    requeued = _restore_request(cache, rid=req.rid)
-    assert cache.has_uncommitted_restore(requeued)
+    assert cache._aborted_restore_leases[req.pending_restore_generation].req is req
+    assert req._flexkv_uncached_restore
+    allocator.free.assert_not_called()
+    cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
+    released, start = allocator.free_segments.call_args.args[0][0]
+    assert start == 0
+    assert torch.equal(released, restored)
+    assert not cache.has_uncommitted_restore(req)
+    assert cache._aborted_restore_leases == {}
 
 
 def test_mp_restore_is_tree_owned_and_ip_lease_excludes_reused_prefix():
@@ -628,69 +615,55 @@ def test_mp_restore_is_tree_owned_and_ip_lease_excludes_reused_prefix():
 
 @pytest.mark.parametrize("mismatch", ["identity", "generation", "slots"])
 @pytest.mark.parametrize("method", ["cache_finished_req", "cache_unfinished_req"])
-def test_restore_lease_mismatch_does_not_release_slots(mismatch, method):
-    """A mismatch means we cannot prove who owns the slots, so leave them.
-
-    This runs on the normal request-completion path, so it degrades (log +
-    treat as "no lease") rather than failing the engine. What must hold is
-    that nothing is freed and the lease stays registered for reset().
-    """
+def test_restore_lease_mismatch_fails_before_mutating_cache(mismatch, method):
     cache, allocator = _make_cache()
     req = _restore_request(cache)
+    slots = req.pending_restore_slots
+    live = _assert_allocator_free_once(allocator, slots)
+    original_root = cache.root_node
     if mismatch == "identity":
         req = SimpleNamespace(**vars(req))
     elif mismatch == "generation":
         req.pending_restore_generation += 1
     else:
         req.pending_restore_slots = req.pending_restore_slots.clone()
-
-    with patch.object(RadixCache, method):
+    # Exercise the real base cache and track actual slot ownership: logging and
+    # continuing here would free/insert these slots, then reset would free again.
+    with pytest.raises(RuntimeError, match="restore lease mismatch"):
         if method == "cache_finished_req":
             cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
         else:
             cache.cache_unfinished_req(req)
-
-    # The leased slots are never handed back on a mismatch.
-    allocator.free.assert_not_called()
-    # And the lease survives, so reset() can still reclaim them.
+    assert live == set(slots.tolist())
+    assert cache.root_node is original_root
+    assert not cache.root_node.children
     assert cache.has_uncommitted_restore(req)
+    cache.reset()
+    assert not live
 
 
 @pytest.mark.parametrize("entry", ["match", "init", "allocate"])
 def test_duplicate_restore_cannot_replace_active_lease(entry):
-    """However each entry point reacts, the active lease must survive intact
-    and no second allocation may happen.
-
-    match_prefix degrades (read-only, and the decode-disagg rematch sites are
-    unguarded). init_load_back and _allocate_and_load fail loud: they allocate
-    and start a DMA, so proceeding would leave two writers on one region.
-    """
     cache, allocator = _make_cache()
     req = _restore_request(cache)
     lease = cache._restore_leases[req.rid]
     allocator.alloc.reset_mock()
     cache.flexkv_connector.reset_mock()
-    cache.flexkv_connector.lookup_kv.return_value = (17, 4)
-
-    if entry == "match":
-        # Degrades to a device-only match instead of raising.
-        cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", range(4))), req=req)
-        )
-    elif entry == "init":
-        with pytest.raises(RuntimeError, match="before restore commit"):
+    with pytest.raises(RuntimeError, match="before restore commit|duplicate load-back"):
+        if entry == "match":
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", range(4))), req=req)
+            )
+        elif entry == "init":
             cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.last_node, host_hit_length=4, req=req
                 )
             )
-    else:
-        with pytest.raises(RuntimeError, match="duplicate load-back"):
+        else:
             _restore_request(cache)
-
     assert cache._restore_leases[req.rid] is lease
     allocator.alloc.assert_not_called()
-    # No new FlexKV lookup/transfer was started for the duplicate.
     assert cache.flexkv_connector.mock_calls == []
 
 
@@ -730,7 +703,6 @@ def test_failed_launch_keeps_allocated_slots_for_reset():
         _restore_request(
             cache, load_fn=MagicMock(side_effect=RuntimeError("unknown launch status"))
         )
-    assert "ip-request" in cache._restore_leases
     lease = cache._restore_leases["ip-request"]
     allocator.free.assert_not_called()
     cache.reset()
@@ -754,3 +726,196 @@ def test_short_layerwise_restore_retains_the_full_allocation_until_reset():
     cache.reset()
     assert torch.equal(allocator.free.call_args.args[0], lease.device_indices)
     assert cache._restore_leases == {}
+
+
+def _scheduler_method(name, namespace):
+    path = (
+        Path(__file__).resolve().parents[4] / "python/sglang/srt/managers/scheduler.py"
+    )
+    cls = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "Scheduler"
+    )
+    method = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            method,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace[name]
+
+
+def _assert_allocator_free_once(allocator, slots):
+    live = set(slots.tolist())
+
+    def release(values, **_kwargs):
+        for slot in values.tolist():
+            assert slot in live, f"double free: {slot}"
+            live.remove(slot)
+
+    allocator.free.side_effect = release
+    allocator.free_segment.side_effect = release
+    allocator.free_segments.side_effect = lambda spans: [
+        release(values) for values, _ in spans
+    ]
+    return live
+
+
+@pytest.mark.parametrize("abort_path", ["limit", "timeout", "explicit"])
+def test_scheduler_queue_abort_without_kv_row_retains_reclaimable_allocation(
+    abort_path,
+):
+    cache, allocator = _make_cache()
+    req = _restore_request(cache)
+    slots = req.pending_restore_slots
+    live = _assert_allocator_free_once(allocator, slots)
+    # Layerwise allocation precedes prepare_for_extend's request-row assignment.
+    req.req_pool_idx = None
+    req.kv = SimpleNamespace(req_pool_idx=None, holds_kv=False, holds_mamba=False)
+    req.mamba_pool_idx = None
+    req.priority = 10
+    req.time_stats = SimpleNamespace(wait_queue_entry_time=1, trace_ctx=MagicMock())
+    scheduler = SimpleNamespace(
+        tree_cache=cache,
+        waiting_queue=[req],
+        enable_hicache_storage=True,
+        enable_hierarchical_cache=False,
+        enable_priority_scheduling=True,
+        schedule_low_priority_values_first=True,
+        max_queued_requests=1,
+        ipc_channels=SimpleNamespace(send_to_tokenizer=MagicMock()),
+        chunked_req=None,
+        dllm_config=None,
+        disaggregation_mode=None,
+        grammar_manager=MagicMock(),
+        ps=SimpleNamespace(pp_size=1),
+        running_batch=None,
+        last_batch=None,
+        is_fully_idle=lambda: True,
+        req_to_token_pool=MagicMock(),
+        token_to_kv_pool_allocator=allocator,
+        metrics_reporter=MagicMock(),
+        draft_worker=None,
+        beam_coordinator=MagicMock(),
+        mm_receiver=None,
+    )
+    release_kv = MagicMock(side_effect=AssertionError("no KV row exists"))
+    namespace = {
+        "AbortReq": lambda **kw: SimpleNamespace(**kw),
+        "_make_abort_req": lambda req, **kw: SimpleNamespace(rid=req.rid, **kw),
+        "HTTPStatus": SimpleNamespace(SERVICE_UNAVAILABLE=503),
+        "envs": SimpleNamespace(
+            SGLANG_REQ_WAITING_TIMEOUT=SimpleNamespace(get=lambda: 1)
+        ),
+        "time": SimpleNamespace(perf_counter=lambda: 10),
+        "logger": MagicMock(),
+        "logging": MagicMock(),
+        "DisaggregationMode": SimpleNamespace(DECODE="decode", PREFILL="prefill"),
+        "release_kv_cache": release_kv,
+    }
+    scheduler._release_aborted_request = lambda rid: _scheduler_method(
+        "_release_aborted_request", namespace
+    )(scheduler, rid)
+    scheduler.collect_inflight_reqs = lambda: _scheduler_method(
+        "collect_inflight_reqs", namespace
+    )(scheduler)
+    if abort_path == "limit":
+        _scheduler_method("_abort_on_queued_limit", namespace)(
+            scheduler, SimpleNamespace(rid="incoming", priority=0)
+        )
+    elif abort_path == "timeout":
+        _scheduler_method("_abort_on_waiting_timeout", namespace)(scheduler)
+    else:
+        _scheduler_method("abort_request", namespace)(
+            scheduler, SimpleNamespace(rid=req.rid, abort_all=False)
+        )
+    assert scheduler.waiting_queue == []
+    release_kv.assert_not_called()
+    assert not cache.has_uncommitted_restore(req)
+    assert live == set(slots.tolist())  # Nothing was freed while H2D may run.
+    assert (
+        cache._aborted_restore_leases[req.pending_restore_generation].device_indices
+        is slots
+    )
+
+    def fence():
+        assert live == set(slots.tolist())
+
+    cache.flexkv_connector.reset.side_effect = fence
+    assert _scheduler_method("flush_cache", namespace)(scheduler, empty_cache=False)
+    assert live == set()
+    assert cache._aborted_restore_leases == {}
+
+
+def test_aborted_request_cleanup_does_not_free_or_commit_reused_rid():
+    cache, allocator = _make_cache()
+    old = _restore_request(cache, rid="reused")
+    old_slots = old.pending_restore_slots
+    old_pool = cache.req_to_token_pool
+    cache.release_aborted_request(old.rid)
+    new = _restore_request(cache, rid="reused")
+    new_slots = new.pending_restore_slots
+    new_pool = cache.req_to_token_pool
+    live = _assert_allocator_free_once(allocator, torch.cat([old_slots, new_slots]))
+    cache.req_to_token_pool = old_pool
+    cache.cache_finished_req(old, is_insert=False, kv_len_to_handle=4)
+    assert live == set(new_slots.tolist())
+    assert cache._restore_leases[new.rid].req is new
+    assert cache._aborted_restore_leases == {}
+    cache.req_to_token_pool = new_pool
+    cache.cache_finished_req(new, is_insert=False, kv_len_to_handle=4)
+    cache.reset()
+    assert live == set()
+
+
+@pytest.mark.parametrize("stale", ["generation", "slots"])
+def test_reset_reclaims_ledger_even_when_request_metadata_is_stale(stale):
+    cache, allocator = _make_cache()
+    old = _restore_request(cache, rid="old")
+    old_slots = old.pending_restore_slots
+    cache.release_aborted_request(old.rid)
+    active = _restore_request(cache, rid="active")
+    active_slots = active.pending_restore_slots
+    live = _assert_allocator_free_once(allocator, torch.cat([old_slots, active_slots]))
+    for req in (old, active):
+        if stale == "generation":
+            req.pending_restore_generation += 100
+        else:
+            req.pending_restore_slots = req.pending_restore_slots.clone()
+    cache.reset()
+    assert live == set()
+    assert cache._restore_leases == {}
+    assert cache._aborted_restore_leases == {}
+
+
+def test_reset_attempts_other_allocations_and_retains_failed_free():
+    cache, allocator = _make_cache()
+    first = _restore_request(cache, rid="first")
+    second = _restore_request(cache, rid="second")
+    first_slots, second_slots = (
+        first.pending_restore_slots,
+        second.pending_restore_slots,
+    )
+
+    def release(slots):
+        if slots is first_slots:
+            raise RuntimeError("allocator failure")
+
+    allocator.free.side_effect = release
+    with patch.object(RadixCache, "reset") as reset_tree:
+        with pytest.raises(RuntimeError, match="failed to free restore allocations"):
+            cache.reset()
+        reset_tree.assert_not_called()
+    assert allocator.free.call_args_list == [call(first_slots), call(second_slots)]
+    assert set(cache._restore_leases) == {"first"}
+    allocator.free.reset_mock(side_effect=True)
+    cache.reset()
+    allocator.free.assert_called_once_with(first_slots)
