@@ -63,7 +63,6 @@ class GPTQMarlinState(Enum):
 
 
 class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
-
     def __init__(
         self,
         quant_config: CompressedTensorsConfig,
@@ -452,9 +451,9 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -556,16 +555,15 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 
 
 class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
-
     def __init__(self, quantization_config) -> None:
         self.pack_factor = 8  # weight dtype is int4,  but use int32 to create
         target = (

@@ -944,6 +944,9 @@ ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 
+# TODO(Jialin): Set SGLANG_RUST_BUILD_MODE=never after Rust TreeCore supports
+# the PyTorch 2.15 nightly used by this preview image.
+
 WORKDIR /sgl-workspace
 
 COPY --from=local_src /src /tmp/local_src

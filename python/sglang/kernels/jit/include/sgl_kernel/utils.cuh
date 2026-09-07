@@ -167,7 +167,10 @@ template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
 #if SGL_ARCH_HOPPER_OR_GREATER
   if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.launch_dependents;" :::);
+    // The "memory" clobber is load-bearing: without it the compiler may sink
+    // this kernel's stores past the trigger, and the dependent grid's
+    // griddepcontrol.wait only covers writes issued BEFORE launch_dependents.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   }
 #endif
 }

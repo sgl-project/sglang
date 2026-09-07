@@ -584,6 +584,20 @@ def mhc_pre_gemm_sqrsum_tilelang(
 
 
 @functools.cache
+def _mhc_pre_gemm_sqrsum_dispatch():
+    """SM120's TileLang pipeline cannot warp-specialize this kernel (the role
+    marker fails on tirx.Bind), so re-wrap it there with warp specialization
+    disabled. Other archs keep the original compiled form."""
+    from sglang.srt.utils import is_sm120_supported
+
+    if not is_sm120_supported():
+        return mhc_pre_gemm_sqrsum_tilelang
+    _tl = _load_tilelang()
+    cfg = {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+    return _tl.jit(pass_configs=cfg)(mhc_pre_gemm_sqrsum_tilelang.__wrapped__)
+
+
+@functools.cache
 def mhc_pre_gemm_sqrsum_splitk_kernel(
     hc_mult3: int,
     hc_hidden_size: int,
@@ -603,7 +617,18 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
     ENABLE_PDL = is_arch_support_pdl()
 
-    @tilelang.jit
+    from sglang.srt.utils import is_sm120_supported
+
+    _tl = _load_tilelang()
+    # See _mhc_pre_gemm_sqrsum_dispatch: SM120 cannot compile the
+    # warp-specialized form of these kernels.
+    _cfg = (
+        {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+        if is_sm120_supported()
+        else None
+    )
+
+    @tilelang.jit(pass_configs=_cfg)
     def mhc_pre_gemm_sqrsum_splitk_stage_0(
         x: T.Tensor[(num_tokens, hc_hidden_size), T.bfloat16],
         fn: T.Tensor[(hc_mult3, hc_hidden_size), T.float32],
@@ -1078,10 +1103,10 @@ def mhc_pre(
             gemm_out_sqrsum = torch.empty(
                 n_splits, num_tokens, dtype=torch.float32, device=residual.device
             )
-            assert (
-                n_splits == 1
-            ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
-            mhc_pre_gemm_sqrsum_tilelang(
+            assert n_splits == 1, (
+                "The simple TileLang version gemm_sqrsum doesn't support split-k"
+            )
+            _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_flat.view(num_tokens, hc_mult * hidden_size),
                 fn_flat,
                 gemm_out_mul.squeeze(0),
@@ -1094,9 +1119,9 @@ def mhc_pre(
 
     if norm_weight is not None:
         assert norm_eps is not None, "norm_eps required when norm_weight is provided"
-        assert norm_weight.shape == (
-            hidden_size,
-        ), f"norm_weight shape {tuple(norm_weight.shape)} != (hidden_size={hidden_size},)"
+        assert norm_weight.shape == (hidden_size,), (
+            f"norm_weight shape {tuple(norm_weight.shape)} != (hidden_size={hidden_size},)"
+        )
         norm_weight_bf = (
             norm_weight.bfloat16()
             if norm_weight.dtype != torch.bfloat16
@@ -1637,7 +1662,7 @@ def mhc_fused_post_pre(
             gemm_out_sqrsum_1d = torch.empty(
                 num_tokens, dtype=torch.float32, device=residual.device
             )
-            mhc_pre_gemm_sqrsum_tilelang(
+            _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_cur.view(num_tokens, hc_hidden_size),
                 fn,
                 gemm_out_mul_2d,
@@ -1734,6 +1759,190 @@ def mhc_fused_post_pre(
     )
 
 
+def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+    return x.repeat(1, n)
+
+
+def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
+    return x.unflatten(-1, (n, -1)).mean(dim=-2)
+
+
+def _mhc_pre_torch(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    import torch.nn.functional as F
+
+    s, n, h = residual.shape
+    dtype = residual.dtype
+
+    x_flat = residual.view(s, n * h).float()
+    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
+    mixes = F.linear(x_flat, fn) * rsqrt
+
+    pre_raw = mixes[:, :n]
+    post_raw = mixes[:, n : 2 * n]
+    comb_raw = mixes[:, 2 * n :].view(s, n, n)
+    pre_base = hc_base[:n]
+    post_base = hc_base[n : 2 * n]
+    comb_base = hc_base[2 * n :].view(n, n)
+
+    pre = torch.sigmoid(pre_raw * hc_scale[0] + pre_base) + hc_pre_eps
+    post = hc_post_mult_value * torch.sigmoid(post_raw * hc_scale[1] + post_base)
+    comb = comb_raw * hc_scale[2] + comb_base
+
+    comb = comb.softmax(-1) + hc_sinkhorn_eps
+    comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    for _ in range(sinkhorn_repeat - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + hc_sinkhorn_eps)
+        comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+
+    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(dim=1).to(dtype)
+    return post.unsqueeze(-1), comb, layer_input
+
+
+def _mhc_post_torch(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    out = post_layer_mix * x.unsqueeze(1) + (
+        comb_res_mix.unsqueeze(-1) * residual.unsqueeze(2)
+    ).sum(dim=1)
+    return out.type_as(x)
+
+
+@torch._dynamo.disable
+def _mhc_pre_dispatch(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
+    if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        post_mix, comb_mix, layer_input = _mhc_pre_torch(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+        return post_mix, comb_mix, layer_input, False
+
+    post_mix, comb_mix, layer_input = mhc_pre(
+        residual=residual,
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+    return post_mix, comb_mix, layer_input, norm_weight is not None
+
+
+@torch._dynamo.disable
+def _mhc_post_dispatch(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    assert x.dim() == 2 and residual.dim() == 3
+    assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
+    if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+    return mhc_post(x, residual, post_layer_mix, comb_res_mix)
+
+
+def hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    post_mult_value: float = 2.0,
+    hc_norm_weight: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_norm_eps: float | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    s, total = x.shape
+    hidden_size = total // hc_mult
+    if x.numel() == 0:
+        empty_layer_input = x.new_zeros((s, hidden_size))
+        empty_h_res = torch.zeros(
+            (s, hc_mult * hc_mult), device=x.device, dtype=torch.float32
+        )
+        empty_h_post = torch.zeros((s, hc_mult), device=x.device, dtype=torch.float32)
+        return empty_layer_input, empty_h_res, empty_h_post, False
+
+    fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
+    residual_3d = x.view(s, hc_mult, hidden_size)
+    post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
+        residual=residual_3d,
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_eps,
+        hc_sinkhorn_eps=hc_eps,
+        hc_post_mult_value=post_mult_value,
+        sinkhorn_repeat=sinkhorn_iters,
+        norm_weight=out_norm_weight,
+        norm_eps=out_norm_eps,
+    )
+    return (
+        layer_input,
+        comb_mix.reshape(s, hc_mult * hc_mult),
+        post_mix.reshape(s, hc_mult),
+        norm_fused,
+    )
+
+
+def hc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    h_post: torch.Tensor,
+    h_res: torch.Tensor,
+    hc_mult: int,
+) -> torch.Tensor:
+    s, hidden_size = x.shape
+    if s == 0:
+        return x.new_zeros((s, hc_mult * hidden_size))
+    residual = residual.view(s, hc_mult, hidden_size)
+    h_post = h_post.view(s, hc_mult, 1)
+    h_res = h_res.view(s, hc_mult, hc_mult)
+    out = _mhc_post_dispatch(x, residual, h_post, h_res)
+    return out.view(s, -1)
+
+
 def npu_hc_pre(
     x: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -1789,3 +1998,53 @@ def npu_hc_pre(
     # not fold input_layernorm. Return norm_fused=False so the caller
     # applies the layernorm itself, matching the deepgemm/torch paths.
     return y.to(dtype), post, comb, False
+
+
+@triton.jit
+def _hc_combine_kernel(
+    x_ptr,
+    pre_ptr,
+    y_ptr,
+    H,
+    x_stride_m,
+    pre_stride_m,
+    pre_stride_k,
+    y_stride_m,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs_h < H
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(HC):
+        pk = tl.load(pre_ptr + pid_m * pre_stride_m + k * pre_stride_k).to(tl.float32)
+        xv = tl.load(
+            x_ptr + pid_m * x_stride_m + k * H + offs_h, mask=mask, other=0.0
+        ).to(tl.float32)
+        acc += pk * xv
+    tl.store(y_ptr + pid_m * y_stride_m + offs_h, acc, mask=mask)
+
+
+def hc_combine(
+    x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
+    m = x_flat.shape[0]
+    h = x_flat.shape[1] // hc
+    y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
+    block_h = 1024
+    _hc_combine_kernel[(m, triton.cdiv(h, block_h))](
+        x_flat,
+        pre,
+        y,
+        h,
+        x_flat.stride(0),
+        pre.stride(0),
+        pre.stride(1),
+        y.stride(0),
+        HC=hc,
+        BLOCK_H=block_h,
+    )
+    return y
