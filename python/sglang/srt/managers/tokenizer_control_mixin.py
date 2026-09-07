@@ -79,6 +79,7 @@ from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import (
     get_lora,
     get_parallel,
+    get_serving,
     get_spec,
 )
 from sglang.srt.server_args import LoRARef
@@ -209,9 +210,7 @@ class TokenizerControlMixin:
                     iter_external_corpus_chunks,
                 )
 
-                max_tokens = (
-                    self.server_args.speculative_ngram_external_corpus_max_tokens
-                )
+                max_tokens = get_spec().speculative_ngram_external_corpus_max_tokens
                 obj.token_chunks = list(
                     iter_external_corpus_chunks(
                         obj.file_path, self.tokenizer, max_tokens
@@ -222,9 +221,7 @@ class TokenizerControlMixin:
                     SEPARATOR_TOKEN,
                 )
 
-                max_tokens = (
-                    self.server_args.speculative_ngram_external_corpus_max_tokens
-                )
+                max_tokens = get_spec().speculative_ngram_external_corpus_max_tokens
                 token_chunks = []
                 total_tokens = 0
                 has_prev = False
@@ -642,10 +639,10 @@ class TokenizerControlMixin:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
 
-                if self.server_args.max_loaded_loras is not None:
+                if get_lora().max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
-                        > self.server_args.max_loaded_loras
+                        > get_lora().max_loaded_loras
                     ):
                         lru_lora_name = await self.lora_registry.lru_lora_name(
                             exclude_pinned=True
@@ -659,7 +656,7 @@ class TokenizerControlMixin:
                         logger.info(
                             f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
                             f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {self.server_args.max_loaded_loras})"
+                            f"max allowed: {get_lora().max_loaded_loras})"
                         )
 
                         unload_result = await self._unload_lora_adapter_locked(
@@ -718,10 +715,10 @@ class TokenizerControlMixin:
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
-                if self.server_args.max_loaded_loras is not None:
+                if get_lora().max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
-                        > self.server_args.max_loaded_loras
+                        > get_lora().max_loaded_loras
                     ):
                         lru_lora_name = await self.lora_registry.lru_lora_name(
                             exclude_pinned=True
@@ -735,7 +732,7 @@ class TokenizerControlMixin:
                         logger.info(
                             f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
                             f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {self.server_args.max_loaded_loras})"
+                            f"max allowed: {get_lora().max_loaded_loras})"
                         )
 
                         unload_result = await self._unload_lora_adapter_locked(
@@ -905,7 +902,7 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         if obj.streaming:
-            if not self.server_args.enable_streaming_session:
+            if not get_serving().enable_streaming_session:
                 raise ValueError(
                     "Streaming sessions are disabled. "
                     "Please relaunch with --enable-streaming-session."
