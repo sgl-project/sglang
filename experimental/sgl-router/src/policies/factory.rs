@@ -6,7 +6,7 @@ use crate::config::{
 };
 use crate::discovery::ModelId;
 use crate::policies::{
-    cache_aware_zmq::CacheAwareZmqPolicy,
+    cache_aware::CacheAwarePolicy,
     kv_events::{BlockSizeOracle, HashTree},
     load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
@@ -14,12 +14,12 @@ use crate::policies::{
     round_robin::RoundRobinPolicy,
     scoring::{
         admission::Overloaded, prefix_cache, prefix_cache::PrefixCachePolicy, FusedScorePolicy,
-        Pipeline,
+        Pipeline, ScorePolicy,
     },
+    session_aware::SessionAwarePolicy,
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
-use crate::tokenizer::TokenizerRegistry;
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,10 +50,10 @@ fn build_sticky(model: &ModelConfig) -> Arc<dyn Policy> {
 pub fn build_policy(
     model: &ModelConfig,
     tree: Arc<HashTree>,
-    tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
 ) -> Result<Arc<dyn Policy>> {
-    let inner = build_kind(model.policy, model, &tree, &tokenizers, &block_size_oracle)?;
+    validate_eligibility(model)?;
+    let inner = build_kind(model.policy, model, &tree, &block_size_oracle)?;
     let Some(elig) = model.eligibility.as_ref().filter(|e| !e.filters.is_empty()) else {
         return Ok(inner);
     };
@@ -64,35 +64,48 @@ pub fn build_policy(
     Ok(Arc::new(Pipeline::new(filters, inner)?))
 }
 
+/// Reject configurations that can bypass CLI validation when constructed in code.
+fn validate_eligibility(model: &ModelConfig) -> Result<()> {
+    let Some(eligibility) = model.eligibility.as_ref().filter(|e| !e.filters.is_empty()) else {
+        return Ok(());
+    };
+
+    if model.policy == PolicyKind::Sticky {
+        return Err(anyhow!(
+            "eligibility filters cannot be combined with sticky policy"
+        ));
+    }
+    if eligibility.filters.contains(&FilterKind::Overloaded)
+        && eligibility.max_in_flight.unwrap_or(0) == 0
+    {
+        return Err(anyhow!("max_in_flight must be greater than 0"));
+    }
+
+    Ok(())
+}
+
 /// Build one policy kind with the shared model dependencies.
 fn build_kind(
     kind: PolicyKind,
     model: &ModelConfig,
     tree: &Arc<HashTree>,
-    tokenizers: &Arc<TokenizerRegistry>,
     block_size_oracle: &Arc<BlockSizeOracle>,
 ) -> Result<Arc<dyn Policy>> {
-    let (tree, tokenizers, block_size_oracle) = (
-        Arc::clone(tree),
-        Arc::clone(tokenizers),
-        Arc::clone(block_size_oracle),
-    );
+    let (tree, block_size_oracle) = (Arc::clone(tree), Arc::clone(block_size_oracle));
     Ok(match kind {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq => {
-            let cache_cfg = model.cache_aware.clone().unwrap_or_default();
-            Arc::new(CacheAwareZmqPolicy::new(
-                cache_cfg,
-                tree,
-                tokenizers,
-                block_size_oracle,
-            ))
-        }
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            model.affinity.clone().unwrap_or_default(),
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
+            model.affinity.clone().unwrap_or_default(),
+        )),
         PolicyKind::Sticky => build_sticky(model),
         PolicyKind::FusedScore => build_fused(model, &tree, &block_size_oracle)?,
+        PolicyKind::ScorePolicy => build_score_policy(model, &tree, &block_size_oracle)?,
     })
 }
 
@@ -162,6 +175,17 @@ fn build_fused(
     Ok(Arc::new(FusedScorePolicy::new(terms)?))
 }
 
+/// Builds the top-level `score_policy`.
+fn build_score_policy(
+    model: &ModelConfig,
+    tree: &Arc<HashTree>,
+    oracle: &Arc<BlockSizeOracle>,
+) -> Result<Arc<dyn Policy>> {
+    Ok(Arc::new(ScorePolicy::new(build_fused(
+        model, tree, oracle,
+    )?)))
+}
+
 /// Builds a policy with test defaults.
 #[cfg(test)]
 pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
@@ -170,11 +194,11 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq => Arc::new(CacheAwareZmqPolicy::new(
-            crate::config::CacheAwareConfig::default(),
-            Arc::new(HashTree::new()),
-            Arc::new(TokenizerRegistry::default()),
-            BlockSizeOracle::new(),
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            crate::config::AffinityConfig::default(),
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
+            crate::config::AffinityConfig::default(),
         )),
         PolicyKind::Sticky => {
             let s = crate::config::StickyConfig::default();
@@ -184,7 +208,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
                 build_sticky_fallback(s.fallback_policy),
             ))
         }
-        PolicyKind::FusedScore => {
+        PolicyKind::FusedScore | PolicyKind::ScorePolicy => {
             return Err(anyhow!("--policy {kind} needs --fuse terms from the model"))
         }
     })
@@ -193,31 +217,20 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
 pub fn build_registry(
     cfg: &Config,
     tree: Arc<HashTree>,
-    tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
 ) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
     let m = &cfg.model;
     reg.insert(
         ModelId(m.id.clone()),
-        build_policy(
-            m,
-            Arc::clone(&tree),
-            Arc::clone(&tokenizers),
-            Arc::clone(&block_size_oracle),
-        )?,
+        build_policy(m, Arc::clone(&tree), Arc::clone(&block_size_oracle))?,
     );
     Ok(reg)
 }
 
 /// Builds a registry with empty cache-aware dependencies.
 pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
-    build_registry(
-        cfg,
-        Arc::new(HashTree::new()),
-        Arc::new(TokenizerRegistry::default()),
-        BlockSizeOracle::new(),
-    )
+    build_registry(cfg, Arc::new(HashTree::new()), BlockSizeOracle::new())
 }
 
 #[cfg(test)]
@@ -324,9 +337,12 @@ mod tests {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 policy,
+                decode_policy: Default::default(),
+                bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
+                affinity: None,
                 fused: None,
                 eligibility: None,
             },
@@ -340,17 +356,29 @@ mod tests {
 
     #[test]
     fn build_policy_kind_only_covers_all_variants() {
-        for kind in [
-            PolicyKind::RoundRobin,
-            PolicyKind::Random,
-            PolicyKind::PowerOfTwo,
-            PolicyKind::LoadBased,
-            PolicyKind::CacheAwareZmq,
-            PolicyKind::Sticky,
+        for (kind, needs_load_snapshot, needs_dispatch_timestamps) in [
+            (PolicyKind::RoundRobin, false, false),
+            (PolicyKind::Random, false, false),
+            (PolicyKind::PowerOfTwo, true, false),
+            (PolicyKind::LoadBased, true, true),
+            (PolicyKind::SessionAware, true, false),
+            (PolicyKind::CacheAware, true, false),
+            (PolicyKind::Sticky, false, false),
         ] {
-            assert!(build_policy_kind_only(kind).is_ok(), "{kind:?}");
+            let policy = build_policy_kind_only(kind).unwrap();
+            assert_eq!(
+                policy.needs_load_snapshot(),
+                needs_load_snapshot,
+                "{kind:?}"
+            );
+            assert_eq!(
+                policy.needs_dispatch_timestamps(),
+                needs_dispatch_timestamps,
+                "{kind:?}"
+            );
         }
         assert!(build_policy_kind_only(PolicyKind::FusedScore).is_err());
+        assert!(build_policy_kind_only(PolicyKind::ScorePolicy).is_err());
     }
 
     #[test]
@@ -361,6 +389,7 @@ mod tests {
             &BlockSizeOracle::new(),
         );
         assert!(p.can_fuse(), "prefix_cache must be usable as a --fuse term");
+        assert!(!p.needs_load_snapshot());
     }
 
     #[test]
@@ -380,74 +409,114 @@ mod tests {
             .contains("at least one --fuse term"));
     }
 
+    /// `score_policy` uses its own top-level factory branch.
     #[test]
-    fn fused_score_accepts_an_outer_eligibility_pipeline() {
-        let mut cfg = cfg_with_model("modelA", PolicyKind::FusedScore);
+    fn score_policy_builds_via_its_own_factory_branch() {
+        let mut cfg = cfg_with_model("modelA", PolicyKind::ScorePolicy);
+        cfg.model.fused = Some(vec![crate::config::FusedTerm {
+            kind: ScoreTermKind::PrefixCache,
+            weight: Some(2.0),
+        }]);
+
+        let registry = build_registry_with_defaults(&cfg).expect("score policy builds");
+        let policy = registry
+            .get(&ModelId("modelA".into()))
+            .expect("configured model has a policy");
+        assert!(
+            policy.can_fuse(),
+            "the score policy exposes score semantics"
+        );
+        assert!(
+            policy.uses_shared_prefill_admission(),
+            "top-level score_policy participates in the shared hard admission layer"
+        );
+    }
+
+    #[test]
+    fn score_policy_with_filter_builds_one_outer_pipeline() {
+        let mut cfg = cfg_with_model("modelA", PolicyKind::ScorePolicy);
         cfg.model.fused = Some(vec![crate::config::FusedTerm {
             kind: ScoreTermKind::LoadBased,
-            weight: None,
+            weight: Some(1.0),
         }]);
         cfg.model.eligibility = Some(EligibilityConfig {
             filters: vec![FilterKind::Overloaded],
-            max_in_flight: Some(0),
+            max_in_flight: Some(2),
             min_prefix_share: None,
         });
 
-        let policy = build_registry_with_defaults(&cfg)
-            .expect("an outer filter must not make fused terms non-fusable")
+        let registry = build_registry_with_defaults(&cfg)
+            .expect("a score policy keeps eligibility outside its scoring terms");
+        let policy = registry
             .get(&ModelId("modelA".into()))
-            .unwrap();
-        let workers = vec![worker("w0"), worker("w1")];
-        let model = ModelId("modelA".into());
-        assert!(policy
-            .select(&workers, &SelectionContext::new(&model, None))
-            .is_none());
+            .expect("configured model has a policy");
+        assert!(policy.uses_shared_prefill_admission());
+    }
+
+    #[test]
+    fn factory_rejects_missing_or_zero_overloaded_capacity() {
+        for max_in_flight in [None, Some(0)] {
+            let mut cfg = cfg_with_model("modelA", PolicyKind::FusedScore);
+            cfg.model.fused = Some(vec![crate::config::FusedTerm {
+                kind: ScoreTermKind::LoadBased,
+                weight: None,
+            }]);
+            cfg.model.eligibility = Some(EligibilityConfig {
+                filters: vec![FilterKind::Overloaded],
+                max_in_flight,
+                min_prefix_share: None,
+            });
+
+            let error = build_registry_with_defaults(&cfg)
+                .expect_err("overloaded capacity must be positive at construction");
+            let message = error.to_string();
+            assert!(message.contains("max_in_flight must be greater than 0"));
+        }
+    }
+
+    #[test]
+    fn factory_rejects_sticky_eligibility_pipeline() {
+        let mut cfg = cfg_with_model("modelA", PolicyKind::Sticky);
+        cfg.model.eligibility = Some(EligibilityConfig {
+            filters: vec![FilterKind::Overloaded],
+            max_in_flight: Some(2),
+            min_prefix_share: None,
+        });
+
+        let error = build_registry_with_defaults(&cfg)
+            .expect_err("sticky assignments cannot be wrapped by eligibility filters");
+        let message = error.to_string();
+        assert!(message.contains("eligibility filters cannot be combined with sticky"));
     }
 
     #[test]
     fn registry_assigns_configured_model() {
         let cfg = cfg_with_model("qwen", PolicyKind::RoundRobin);
         let tree = Arc::new(HashTree::new());
-        let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(&cfg, tree, BlockSizeOracle::new()).unwrap();
         assert!(reg.get(&ModelId("qwen".into())).is_some());
         assert!(reg.get(&ModelId("missing".into())).is_none());
-    }
-
-    #[test]
-    fn cache_aware_zmq_builds_via_factory() {
-        let cfg = cfg_with_model("modelA", PolicyKind::CacheAwareZmq);
-        let tree = Arc::new(HashTree::new());
-        let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
-        let p = reg.get(&ModelId("modelA".into())).unwrap();
-        let dbg = format!("{p:?}");
-        assert!(
-            dbg.contains("CacheAwareZmqPolicy"),
-            "expected CacheAwareZmqPolicy debug repr, got: {dbg}",
-        );
     }
 
     #[test]
     fn load_based_builds_via_factory() {
         let cfg = cfg_with_model("modelA", PolicyKind::LoadBased);
         let tree = Arc::new(HashTree::new());
-        let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(&cfg, tree, BlockSizeOracle::new()).unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         let dbg = format!("{p:?}");
         assert!(
             dbg.contains("LoadBasedPolicy"),
             "expected LoadBasedPolicy debug repr, got: {dbg}",
         );
+        assert!(p.needs_load_snapshot());
     }
 
     #[test]
     fn sticky_builds_via_factory() {
         let cfg = cfg_with_model("modelA", PolicyKind::Sticky);
         let tree = Arc::new(HashTree::new());
-        let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(&cfg, tree, BlockSizeOracle::new()).unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         let dbg = format!("{p:?}");
         assert!(
