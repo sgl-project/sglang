@@ -1563,7 +1563,10 @@ class DeepseekSparseAttnBackend(
 
             if (is_cuda() or _is_hip) and (
                 self.dsa_index_kpool <= 1
-                or (not _is_hip and getattr(self, "experimental_kpool_metadata_fusion", False))
+                or (
+                    not _is_hip
+                    and getattr(self, "experimental_kpool_metadata_fusion", False)
+                )
             ):
                 fused_dsa_decode_metadata(
                     seq_lens=seq_lens,
@@ -1607,7 +1610,10 @@ class DeepseekSparseAttnBackend(
 
             if (is_cuda() or _is_hip) and (
                 self.dsa_index_kpool <= 1
-                or (not _is_hip and getattr(self, "experimental_kpool_metadata_fusion", False))
+                or (
+                    not _is_hip
+                    and getattr(self, "experimental_kpool_metadata_fusion", False)
+                )
             ):
                 paged_mqa_ctx_lens_2d = None
                 if (
@@ -1707,7 +1713,10 @@ class DeepseekSparseAttnBackend(
 
             if (is_cuda() or _is_hip) and (
                 self.dsa_index_kpool <= 1
-                or (not _is_hip and getattr(self, "experimental_kpool_metadata_fusion", False))
+                or (
+                    not _is_hip
+                    and getattr(self, "experimental_kpool_metadata_fusion", False)
+                )
             ):
                 fused_dsa_draft_extend_metadata(
                     seq_lens=seq_lens,

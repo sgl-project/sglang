@@ -124,7 +124,10 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
 
         if (_is_cuda or _is_hip) and (
             self.dsa_index_kpool <= 1
-            or (not _is_hip and getattr(self, "experimental_kpool_metadata_fusion", False))
+            or (
+                not _is_hip
+                and getattr(self, "experimental_kpool_metadata_fusion", False)
+            )
         ):
             from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_decode_metadata,
