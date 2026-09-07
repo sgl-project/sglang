@@ -770,11 +770,6 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa = self._resolve(warmup_mode="server")
         self.assertEqual(sa.warmup_mode, "server")
 
-    def test_defaulted_mode_applies_without_legacy_flags(self):
-        # Bare `sglang serve` defaults to server-based warmup.
-        sa = self._resolve(warmup_mode="server")
-        self.assertEqual(sa.warmup_mode, "server")
-
     def test_resolutions_force_warmup_on(self):
         sa = self._resolve(
             warmup_mode="off",
