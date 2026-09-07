@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -536,14 +535,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             self.use_marlin = (
                 envs.SGLANG_FORCE_FP8_MARLIN.get() or can_auto_enable_marlin_fp8()
             )
-        # SM120 decode fast path: cuBLAS serves M=1 fp8 GEMMs with SM89 tiles
-        # at 50-70% DRAM bandwidth for mid-sized N; a streaming GEMV recovers
-        # the gap. Kill switch: SGLANG_DISABLE_SM120_FP8_GEMV=1.
-        self.use_sm120_gemv = (
-            is_cuda()
-            and torch.cuda.get_device_capability()[0] == 12
-            and os.environ.get("SGLANG_DISABLE_SM120_FP8_GEMV", "0") != "1"
-        )
+        # The SM12x facade selects the best qualified small-M FP8 kernel.
+        cuda_capability = torch.cuda.get_device_capability() if is_cuda() else None
+        self.use_sm120_fp8 = cuda_capability is not None and cuda_capability[0] == 12
 
     def create_weights(
         self,
@@ -614,12 +608,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         if (
-            self.use_sm120_gemv
+            self.use_sm120_fp8
             and layer.weight_scale.numel() == 1
             and layer.input_scale.numel() == 1
         ):
-            # Combined GEMM epilogue scale for the SM120 M=1 GEMV fast path.
-            layer.sm120_gemv_alpha = (
+            # Precompute the combined epilogue scale for the SM12x facade.
+            layer.sm120_fp8_alpha = (
                 (layer.input_scale.float() * layer.weight_scale.float())
                 .reshape(1)
                 .contiguous()
@@ -646,26 +640,18 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
-        if (
-            self.use_sm120_gemv
-            and bias is None
-            and x.dim() == 2
-            and x.shape[0] == 1
-            and hasattr(layer, "sm120_gemv_alpha")
-        ):
-            from sglang.kernels.ops.gemm.sm120_fp8_gemv import (
-                sm120_fp8_gemv,
-                use_sm120_fp8_gemv,
+        if self.use_sm120_fp8:
+            from sglang.kernels.ops.gemm import try_sm120_fp8_linear
+
+            output = try_sm120_fp8_linear(
+                x,
+                layer.weight,
+                layer.input_scale,
+                getattr(layer, "sm120_fp8_alpha", None),
+                bias,
             )
-
-            # layer.weight is the [K, N] transposed view of an [N, K]-contiguous
-            # buffer, so .t() recovers the row-major weight the GEMV streams.
-            w = layer.weight.t()
-            if use_sm120_fp8_gemv(1, w.shape[0], w.shape[1]) and w.is_contiguous():
-                from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
-
-                qinput, _ = static_quant_fp8(x, layer.input_scale, repeat_scale=False)
-                return sm120_fp8_gemv(qinput, w, layer.sm120_gemv_alpha)
+            if output is not None:
+                return output
         if layer.use_flashinfer_bmm:
             return apply_fp8_linear_bmm_flashinfer(
                 input=x,
@@ -2900,7 +2886,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         # Note: dispatch_output may be a DeepEPLLDispatchOutput (no topk_output
         # attribute -- topk_ids/topk_weights live directly on the dispatch
         # tuple). Defer per-attribute access to the branches that actually

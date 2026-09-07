@@ -331,10 +331,13 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """Widened virtual WRITE loc -> kernel-facing id. DCP is rejected for this
         composite at argument validation, so it coincides with the read translate."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(loc, out=out)
+        return self.full_attn_allocator.translate_write_loc_for_kernel(
+            loc, out=out, out_width=out_width
+        )
 
     @property
     def swa_kernel_page_multiplier(self) -> int:
@@ -878,6 +881,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         at once, so re-check the JOINT gate instead of the per-side shortfall."""
         from sglang.srt.mem_cache.common import evict_from_tree_cache
 
+        # Arbitrary retry bound; a round that frees nothing ends the loop anyway.
         for _ in range(4):
             before = self.available_size()
             if before >= num_tokens:

@@ -1,6 +1,6 @@
 """Config-time override declarations for deepseek_v2.
 
-Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
+Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, Glm5NextForConditionalGeneration, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
 """
 
 import logging
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
     "MistralLarge3ForCausalLM",
     "PixtralForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
+    "Glm5NextForConditionalGeneration",
     "HYV4ForCausalLM",
     "HYV4ForCausalLMNextN",
     "LongcatFlashForCausalLM",
@@ -142,6 +143,9 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
             else:
                 overrides["page_size"] = 64
                 logger.warning("Setting page size to 64 for DeepSeek DSA.")
+        elif get_platform().is_xpu:
+            overrides["page_size"] = 128
+            logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")
     else:
         # DeepSeek V3/R1/V3.1
         if get_platform().is_sm100:
