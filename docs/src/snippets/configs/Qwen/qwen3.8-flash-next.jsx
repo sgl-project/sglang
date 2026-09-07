@@ -742,8 +742,8 @@ export const config = {
     // which appends --no-ple-offload-embedding: the FP8 table stays GPU-resident
     // and TP-sharded, since on unified memory the "offloaded" pinned-host copy
     // would come out of the same pool anyway. Verified 2026-09-04 on the qwen38flashnext image
-    // (SGLang 593134d17a): 100k-token prefill 2,400-2,840 tok/s. GSM8K on the
-    // full set pending.
+    // (SGLang 593134d17a): 100k-token prefill 2,400-2,840 tok/s. Full-set GSM8K
+    // in the benchmarks config.
     //
     // Low latency: in-checkpoint MTP head (NEXTN 3/1/4), 24 concurrent
     // requests (120 mamba slots), 1.48M-token KV pool, MTP accept length
@@ -933,7 +933,7 @@ export const config = {
     // 8 requests with MTP (5 slots each), 24 without on the lazy strategy (4
     // slots each). Verified 2026-09-06 on qwen4-main-squashed @ 9b2aee2283 (the
     // Python install path); boot ~10-11 min once the table file is fresh (see
-    // the chip hint). GSM8K on the full set pending.
+    // the chip hint). Full-set GSM8K in the benchmarks config.
     //
     // Low latency: MTP head, 8 concurrent requests (40 slots), 93k-token KV
     // pool (~11.6k per request), 27.5 tok/s single stream (TPOT 33.6 ms),
@@ -1008,7 +1008,7 @@ export const config = {
     //     multiple of the 128 block) and fault on the triton fp8 path under EP.
     // Measured 2026-09-05 on the qwen4-main-squashed tip 9b2aee2283 (#38121
     // merged), TP=2: bench (ISL 1024/OSL 256) ~48 tok/s single stream with MTP,
-    // 253 tok/s output at 96 concurrent without. GSM8K on the full set pending.
+    // 253 tok/s output at 96 concurrent without. Full-set GSM8K in the benchmarks config.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
@@ -1068,7 +1068,7 @@ export const config = {
     // experts need no sharding, so the RadixArk draft used by the 2-node cell
     // is not needed. Verified 2026-09-06 on the dev-qwen38-next-local image
     // (9b2aee2283): MTP accept 3.0-3.6; boot ~11-12 min with a fresh table
-    // file. GSM8K on the full set pending. The smaller fp8 draft leaves a
+    // file. Full-set GSM8K in the benchmarks config. The smaller fp8 draft leaves a
     // 174k-token KV pool with MTP (vs 93k for the RDXA cell) and 300k without.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
