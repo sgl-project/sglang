@@ -187,6 +187,20 @@ def build_replay_fb_view(
     )
 
 
+def _compose_graph_width_variant(
+    variant_label: Optional[str], width_label: Optional[str], width: Optional[int]
+) -> Optional[str]:
+    """Namespace a graph variant by the capture width a backend selected.
+
+    The label comes from the backend, so this stays free of any backend- or
+    model-specific naming.
+    """
+    if width is None or width_label is None:
+        return variant_label
+    width_variant = f"{width_label}={width}"
+    return f"{variant_label}|{width_variant}" if variant_label else width_variant
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -280,6 +294,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
+
+        # Optional: a backend may advertise narrower capture widths. Whether
+        # the surrounding configuration can serve them is validated with the
+        # server arguments, not here.
+        self.decode_graph_widths = getattr(
+            self.attn_backend, "decode_graph_widths", None
+        )
+        self._active_decode_graph_width: Optional[int] = None
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -492,11 +514,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(self, size, stream_idx=None, variant_label=None):
+        variant_label = _compose_graph_width_variant(
+            variant_label,
+            self.decode_graph_widths.label if self.decode_graph_widths else None,
+            self._active_decode_graph_width,
+        )
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
         )
+
+    def _activate_decode_graph_width(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[int]:
+        """Put the backend on the width this batch replays at, and return it."""
+        width = self.attn_backend.select_decode_graph_width(forward_batch)
+        # Without a usable width the batch runs eagerly; restore the widest
+        # advertised value so nothing narrower bounds that forward.
+        self.attn_backend.set_decode_graph_width(
+            width if width is not None else self.decode_graph_widths.widths[-1]
+        )
+        self._active_decode_graph_width = width
+        return width
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
@@ -608,10 +648,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
+        # Pure check: ask the backend whether any captured width fits, without
+        # putting it on one. load_batch does the single activation.
+        if (
+            self.decode_graph_widths is not None
+            and self.attn_backend.select_decode_graph_width(forward_batch) is None
+        ):
+            return False
+
         graph_key = self._make_graph_key(
             cuda_graph_bs,
-            stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
-            variant_label=self._resolve_lora_variant(forward_batch),
+            get_current_stream_idx() if self.enable_pdmux else None,
+            self._resolve_lora_variant(forward_batch),
         )
 
         is_bs_supported = (
@@ -940,6 +988,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if get_parallel().tp_rank == 0
             else reversed(self.capture_bs)
         )
+        capture_widths = (
+            self.decode_graph_widths.widths if self.decode_graph_widths else (None,)
+        )
         lora_variants = (
             [("lora", True), ("nolora", False)]
             if getattr(self, "record_nolora_graph", False)
@@ -956,15 +1007,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
-            for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
-                with torch_compile_decoration.patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.captured_req_width,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+            for capture_width in capture_widths:
+                # Capture each advertised width in turn, keeping the runner's
+                # existing descending batch order above.
+                self._active_decode_graph_width = capture_width
+                if capture_width is not None:
+                    self.attn_backend.set_decode_graph_width(capture_width)
+                for variant_label, _variant_has_lora in lora_variants:
+                    _set_capture_lora_variant(variant_label)
+                    with torch_compile_decoration.patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.captured_req_width,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        self.capture_one_shape(
+                            bs,
+                            forward,
+                            stream_idx,
+                            variant_label,
+                        )
 
     def capture_one_shape(
         self,
@@ -1097,6 +1159,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
         is_ragged = ragged_layout is not None
+        if self.decode_graph_widths is not None:
+            if self._activate_decode_graph_width(forward_batch) is None:
+                raise RuntimeError(
+                    "No captured decode graph width fits this batch; "
+                    "can_run_graph should have rejected it."
+                )
 
         self.deepep_adapter.replay()
 
@@ -1211,6 +1279,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
+        variant_label = self._resolve_lora_variant(forward_batch)
+        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        self._replay_graph_key = self._make_graph_key(
+            graph_size_key, stream_idx, variant_label
+        )
         attn_backend.init_forward_metadata_out_graph(fb_view)
 
         self.raw_bs = raw_bs
@@ -1221,12 +1294,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
-
-        variant_label = self._resolve_lora_variant(forward_batch)
-        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label
-        )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
         from sglang.srt.speculative.ragged_verify import round_up_grid
@@ -1248,10 +1315,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
-                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
+                    "Decode graph replay: worker=%s key_size=%s (%s) "
+                    "graph_width=%s variant=%s mode=%s raw_bs=%d%s",
                     "draft" if self.model_runner.is_draft_worker else "target",
                     self._replay_graph_key.size,
                     "num_tokens" if self.ragged_verify_mode else "bs",
+                    self._active_decode_graph_width,
+                    self._replay_graph_key.variant_label,
                     forward_batch.forward_mode.name,
                     forward_batch.batch_size,
                     (
