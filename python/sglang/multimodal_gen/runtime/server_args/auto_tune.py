@@ -130,10 +130,6 @@ class ServerArgsAutoTuner:
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
 
-    def _uses_warmup_calibrated_residency(self) -> bool:
-        """Whether warmup will replace coarse pre-load residency defaults."""
-        return auto_residency_args_skip_reason(self.server_args) is None
-
     def _resolve_keep_resident_min_available_gb(
         self, deployment_config: ModelDeploymentConfig
     ) -> float | None:
@@ -206,12 +202,6 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
             return
-        if self._uses_warmup_calibrated_residency():
-            # Keep the load-safe placement until warmup has measured the real
-            # workload. The post-warmup planner replaces model/card thresholds
-            # with component sizes and per-phase headroom.
-            return
-
         # Explicit placement is component-scoped; unmatched components still
         # receive automatic defaults.
 
@@ -607,9 +597,6 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
             return components
-        if self._uses_warmup_calibrated_residency():
-            return components
-
         deployment_config = self._deployment_config()
         threshold_gb = self._resolve_keep_resident_min_available_gb(deployment_config)
         if threshold_gb is None:
