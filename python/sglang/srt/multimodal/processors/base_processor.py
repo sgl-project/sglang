@@ -64,6 +64,11 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+# Shared empty mRoPE position delta for processors with 1-D-equivalent positions.
+# Shape (1, 1) so speculative decode stacks per-request deltas as (B, 1); a 1-D
+# (B,) mis-broadcasts against draft positions (B, num_draft_tokens).
+ZERO_MROPE_POSITION_DELTA = torch.zeros((1, 1), dtype=torch.long)
+
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
