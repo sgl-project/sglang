@@ -1511,14 +1511,14 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            # Passed explicitly even though it equals the default, because the
-            # indexer's extent is a separate decision from the latent KV's and
-            # the two diverge under DCP: the latent KV is sharded and stays at
-            # max_total, while the replicated indexer has to span the full
-            # virtual range. `_build_dsa_kv_pool` omits this argument on the
-            # CUDA path and so silently under-allocates the indexer by the DCP
-            # factor; naming it here keeps that bug off this path.
-            index_buf_size=max_total_num_tokens,
+            # The indexer's extent is a separate decision from the latent KV's,
+            # and under DCP they diverge: the latent KV is sharded, so this pool
+            # keeps max_total rows and translates writes into them, while the
+            # LightningIndexer is replicated, addresses every global position at
+            # a raw loc, and so spans the whole virtual range.
+            # `_build_dsa_kv_pool` omits this argument on the CUDA path and so
+            # silently under-allocates the indexer by exactly this factor.
+            index_buf_size=max_total_num_tokens * get_parallel().attn_dcp_size,
             skip_topk_layers=skip_topk_layers,
         )
         return token_to_kv_pool
@@ -1939,9 +1939,14 @@ class KVCacheConfigurator:
                         NPUPagedTokenToKVPoolAllocator,
                     )
 
+                    # Widened by attn_dcp_size on both axes, matching the CUDA
+                    # branch below. The allocator issues *virtual* locs over the
+                    # whole sequence; each pool then keeps or translates them.
+                    # attn_dcp_size is 1 without DCP, so this is inert off it.
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
-                        sizes.max_total_num_tokens,
-                        page_size=get_schedule().page_size,
+                        sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
+                        page_size=get_schedule().page_size
+                        * get_parallel().attn_dcp_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,

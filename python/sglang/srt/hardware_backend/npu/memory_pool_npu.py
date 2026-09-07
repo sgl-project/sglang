@@ -12,7 +12,9 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -760,6 +762,56 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_item_lens += [self._index_k_item_len(i) for i in range(self.layer_num)]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def _resolve_dcp_write(
+        self,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        """Select this rank's tokens out of a DCP-widened loc and compact them.
+
+        The allocator hands every rank the same *virtual* locations, spanning
+        the whole sequence. The latent KV is sharded, so a rank keeps only the
+        positions it owns and collapses them into its own rows. The contract is
+        CUDA's, from the Triton kernel at kernels/ops/kvcache/mla_buffer.py:42:
+
+            is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
+            loc      = loc // DCP_WORLD_SIZE
+
+        There the filter and the divide happen inside the store. Here they
+        cannot: `npu_scatter_nd_update_` is a fused vendor operator with no body
+        to edit, so both have to run as tensor ops before the call. That makes
+        the mask a real gather -- an allocation and a copy per buffer per layer
+        per write -- rather than a predicate folded into an existing load. It is
+        the price of this path, and it belongs in the decode-step budget rather
+        than being assumed free.
+
+        CUDA also passes a `reserved_skip_index` (slot 0, CUDA-graph padding).
+        No equivalent is needed here. The allocator seeds `free_pages` from 1
+        (allocator/paged.py:339-343), so no real token is ever issued a virtual
+        loc below one page; with the widened page of `page_size * dcp_size`, the
+        smallest real virtual loc divides down to `page_size`. Physical page 0
+        therefore stays the padding page on every rank, and a padding write at
+        virtual loc 0 either lands there (rank 0) or is filtered out (all
+        others). Both are harmless, which is why the filter alone suffices.
+        """
+        dcp_size = get_parallel().attn_dcp_size
+        # Bounds are checked against the WIDENED space, matching the CUDA
+        # pool's own widened check (memory_pool.py:4204). Checking the
+        # unscaled range here would reject every legitimate write above
+        # size/dcp_size the moment DCP came on.
+        maybe_detect_oob(
+            loc,
+            0,
+            (self.size + self.page_size) * dcp_size,
+            "set_kv_buffer (NPU MLA, widened loc)",
+        )
+        if dcp_size == 1:
+            return loc, cache_k, cache_v
+
+        owned = (loc % dcp_size) == get_parallel().attn_dcp_rank
+        return loc[owned] // dcp_size, cache_k[owned], cache_v[owned]
+
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
@@ -781,6 +833,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_k, cache_v = cache_k.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
+
+        loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
 
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),

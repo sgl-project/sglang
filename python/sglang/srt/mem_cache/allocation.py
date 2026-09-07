@@ -274,7 +274,14 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # DCP swaps in an allocator whose page_size is the configured page_size *
     # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
     # the real allocator's page_size there. Elsewhere the two are equal.
-    if (_is_hip or _is_cuda) and get_parallel().dcp_enabled:
+    #
+    # NPU belongs here for the same reason the other two do, and only since the
+    # ascend allocator started scaling (kv_cache_configurator, the
+    # NPUPagedTokenToKVPoolAllocator branch). Before that the two numbers agreed
+    # on this platform and falling through was correct; leaving NPU out now
+    # would allocate at page_size while the allocator pages at
+    # page_size * dcp_size.
+    if (_is_hip or _is_cuda or _is_npu) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
