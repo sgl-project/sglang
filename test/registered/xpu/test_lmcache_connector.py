@@ -18,6 +18,7 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_xpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 # Must be set before lmcache imports. Save prior values so tearDownModule can
 # restore them and avoid leaking into other tests in the same process.
@@ -60,7 +61,7 @@ register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
 
 
 @unittest.skipUnless(XPU_AVAILABLE, "Intel XPU not available")
-class TestLMCacheXPUConnector(unittest.TestCase):
+class TestLMCacheXPUConnector(CustomTestCase):
     """Test LMCache layerwise connector store/retrieve on XPU.
 
     All tests share a single connector instance to avoid the

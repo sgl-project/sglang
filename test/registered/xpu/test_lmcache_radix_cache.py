@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import LMCRadixCache
 from sglang.srt.runtime_context import get_context
+from sglang.test.test_utils import CustomTestCase
 
 XPU_AVAILABLE = hasattr(torch, "xpu") and torch.xpu.is_available()
 
@@ -85,7 +86,7 @@ def _make_req(rid, req_pool_idx, token_ids, tree):
 
 
 @unittest.skipUnless(XPU_AVAILABLE, "Intel XPU not available")
-class TestLMCRadixCacheXPU(unittest.TestCase):
+class TestLMCRadixCacheXPU(CustomTestCase):
     """Drive LMCRadixCache (IP mode) through match_prefix/cache_finished_req
     with a real KV pool, to cover the code path test_lmcache_connector.py
     (which talks to the connector directly) never exercises."""
