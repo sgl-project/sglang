@@ -297,6 +297,34 @@ values. SGLang rejects a request outside that coverage instead of silently
 changing conditioning. Cache mode supports the matching unquantized checkpoint
 only.
 
+### Advanced: online AdaLN rebuild with a host cache
+
+`--minimax-h3-adaln-online true` needs no prebuilt artifact: the server drops
+the 24.2 GiB of `adaln_proj` weights from the GPU and computes each request's
+AdaLN outputs from the checkpoint on demand, bit-exact with the resident-weight
+path. Because a rebuild pass streams the whole 24.2 GiB, the first request of
+every new `(task shape, num_inference_steps, flow_shift, audio_flow_shift)`
+combination pays several seconds; after that the plans are served from a
+64-slot GPU slab (LRU per plan) backed by a pinned host cache
+(`--minimax-h3-adaln-host-cache-gb`, LRU per schedule, default 8 GB per
+rank), so mixed-schedule serving does not re-read the checkpoint. Plan sets
+that exceed the host budget are simply recomputed on their next occurrence.
+Expert escape hatches live in environment variables:
+`SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS` resizes the GPU slab (needed
+only beyond 65 inference steps) and `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32`
+computes the one-time projections in fp32 (experimental; not bit-comparable
+to resident weights, validate end-to-end before production). LoRA adapters
+that modify `adaln_proj` are rejected in both cache modes rather than
+silently ignored.
+
+Both cache modes hold values derived from `adaln_proj`, so a runtime weight
+update is only accepted when the cache can follow it: online mode takes a disk
+update whose target directory carries native `adaln_proj` safetensors, and
+rejects everything else (tensor updates, and directories without those
+tensors) before a single weight is written. A sidecar is built offline and
+cannot be regenerated in the server, so weight updates are rejected outright;
+rebuild the sidecar against the new weights and restart.
+
 ### Serve MiniMax-H3 on Ascend NPUs
 
 For Ascend NPU, follow the
@@ -1412,6 +1440,15 @@ surface. The [builder at the top of this page](#1-quick-start) has consumer
 cards and a Host RAM selector: pick your budget and it emits this command with
 your tier's measured expectations attached as comments. The table below is the
 same data in one view.
+
+**Unified-memory machines are the exception**: on a DGX Spark (GB10, 128 GB
+shared between CPU and GPU) launch with **no flags at all**. The deployment
+still exceeds the pool, automatic offload engages on its own, and its placement
+beat the explicit recipe above by 2.1× on the denoise (12.1 vs 25.8 s/it
+measured on the same box) — the VRAM/host split that justifies every flag in
+this section does not exist there. Expect ~12 min of load, a ~5.5 min text
+encoding stage per request (steady-state compute on this chip, not a stall),
+and ~12 min per warm 480P request.
 
 **Two budgets, and what each one buys**
 

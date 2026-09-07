@@ -288,10 +288,10 @@ jobs:
           with open(snap_path) as f:
               snapshot = json.load(f)
 
-          # Only look at nightly-test-intel jobs
+          # Snapshot writer emits `workflow` (filename), not `workflow_path`.
           nightly = [
               j for j in snapshot.get("jobs", [])
-              if j.get("workflow_path", "").endswith("nightly-test-intel.yml")
+              if (j.get("workflow") or "").endswith("nightly-test-intel.yml")
           ]
 
           # status_summary style counts, per job name
