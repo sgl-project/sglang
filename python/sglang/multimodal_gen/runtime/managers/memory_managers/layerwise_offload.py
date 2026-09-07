@@ -94,6 +94,9 @@ def estimate_layer_weight_bytes(
     return totals
 
 
+HOST_PIN_RELEASE_MIN_BYTES = 1 << 30
+
+
 def release_unused_pinned_memory() -> None:
     """Return unreferenced cached HostPin blocks to the CUDA driver.
 
@@ -2471,12 +2474,19 @@ class LayerwiseOffloadableModuleMixin:
             raise RuntimeError(
                 "cannot finalize a resident placement while offload is enabled"
             )
+        released_pinned_bytes = sum(
+            manager.pinned_host_weight_bytes() for manager in managers
+        )
         for manager in managers:
             manager.release_host_stores()
         self.layerwise_offload_managers = []
         self._parked_non_layer_weights.clear()
         self._park_placeholders.clear()
-        release_unused_pinned_memory()
+        # Emptying the host cache also drops the pinned blocks component-offload
+        # modules recycle for their per-request D2H copies (re-pinning 14 GiB
+        # costs ~5 s), so only a sizeable release is worth that.
+        if released_pinned_bytes >= HOST_PIN_RELEASE_MIN_BYTES:
+            release_unused_pinned_memory()
 
 
 class LayerwiseUsageTracker:
