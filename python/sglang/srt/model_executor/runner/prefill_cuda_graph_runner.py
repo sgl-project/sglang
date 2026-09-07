@@ -1068,14 +1068,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         and stash the returned per-bucket metadata object; otherwise fall
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
         attn_backend = self.model_runner.attn_backend
-        if not self.use_captured_attn_metadata:
-            attn_backend.init_forward_metadata(forward_batch)
-            return
-        metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
-            forward_batch
-        )
-        assert self.attn_metadata_buffers is not None
-        self.attn_metadata_buffers[num_tokens] = metadata
+        with forward_context(ForwardContext(attn_backend=attn_backend)):
+            if not self.use_captured_attn_metadata:
+                attn_backend.init_forward_metadata(forward_batch)
+                return
+            metadata = (
+                attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+                    forward_batch
+                )
+            )
+            assert self.attn_metadata_buffers is not None
+            self.attn_metadata_buffers[num_tokens] = metadata
 
     def _prepare_forward_metadata_for_replay(
         self,

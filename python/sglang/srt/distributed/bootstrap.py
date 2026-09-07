@@ -93,7 +93,10 @@ def init_torch_distributed(
     if not is_draft_worker:
         if device == "cpu":
             _init_cpu_threads_env(
-                tp_size=ps.tp_size, tp_rank=ps.tp_rank, local_omp_cpuid=local_omp_cpuid
+                tp_size=ps.tp_size,
+                tp_rank=ps.tp_rank,
+                local_omp_cpuid=local_omp_cpuid,
+                dist_init_method=dist_init_method,
             )
 
         # Only initialize the distributed environment on the target model worker.
@@ -204,8 +207,25 @@ def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     )
 
 
+def _set_shm_master_env(dist_init_method: Optional[str]) -> None:
+    # setdefault so an explicit user-provided MASTER_ADDR/MASTER_PORT wins.
+    prefix = "tcp://"
+    if (
+        dist_init_method
+        and dist_init_method.startswith(prefix)
+        and ":" in dist_init_method[len(prefix) :]
+    ):
+        host, port = dist_init_method[len(prefix) :].rsplit(":", 1)
+        os.environ.setdefault("MASTER_ADDR", host)
+        os.environ.setdefault("MASTER_PORT", port)
+
+
 def _init_cpu_threads_env(
-    *, tp_size: int, tp_rank: int, local_omp_cpuid: Optional[List[int]]
+    *,
+    tp_size: int,
+    tp_rank: int,
+    local_omp_cpuid: Optional[List[int]],
+    dist_init_method: Optional[str] = None,
 ) -> None:
     if _is_cpu_amx_available or _is_cpu_arm64:
         # Bind OpenMP threads to CPU cores
@@ -213,6 +233,13 @@ def _init_cpu_threads_env(
 
         # Set local size to hint SGLang to use shared memory based AllReduce
         os.environ["LOCAL_SIZE"] = str(tp_size)
+
+        # shm.cpp names its /dev/shm segments from MASTER_ADDR/MASTER_PORT.
+        # Feed each engine's unique dist_init_method (tcp://host:port) into
+        # these env vars so co-located engines get distinct segment names and
+        # don't collide.
+        _set_shm_master_env(dist_init_method)
+
         torch.ops.sgl_kernel.initialize(tp_size, tp_rank)
 
     else:

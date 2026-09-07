@@ -259,7 +259,11 @@ def _get_quantization_config(
                 f"method {model_config.quantization}. Supported dtypes: "
                 f"{supported_dtypes}"
             )
-        hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
+        get_hf_to_sglang_mapper = getattr(model_class, "get_hf_to_sglang_mapper", None)
+        if get_hf_to_sglang_mapper is not None:
+            hf_to_sglang_mapper = get_hf_to_sglang_mapper(model_config.hf_config)
+        else:
+            hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
         # pass mappings by reference to quant_config
         if hf_to_sglang_mapper is not None and quant_config is not None:
             quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
@@ -640,7 +644,7 @@ class DefaultModelLoader(BaseModelLoader):
                     {"enable_multithread_load", "num_threads"} & extra_config.keys()
                 )
             ):
-                logger.warning(
+                logger.debug(
                     "Checkpoint prefetching is active; falling "
                     "back to single-threaded weight loading to avoid I/O "
                     "oversubscription with the prefetch threads. Set "

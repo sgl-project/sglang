@@ -959,6 +959,242 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
 
 @dataclass
+class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
+    """Payload for the SM100 (Blackwell) trtllm-gen MXFP4 MoE path."""
+
+    # Packed MXFP4 weights: uint8, e2m1 x 2.
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    w13_weight_scale: torch.Tensor
+    w2_weight_scale: torch.Tensor
+
+    # fp32 per expert. GPT-OSS sets these.
+    w13_weight_bias: torch.Tensor
+    w2_weight_bias: torch.Tensor
+    gemm1_alpha: torch.Tensor
+    gemm1_beta: torch.Tensor
+    gemm1_clamp_limit: torch.Tensor
+
+    global_num_experts: int
+    local_expert_offset: int
+    local_num_experts: int
+    intermediate_size_per_partition: int
+
+    hidden_size: int
+    flashinfer_mxfp4_moe_precision: str
+    routing_bias: Optional[torch.Tensor] = None
+
+
+def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    """SM100 (Blackwell) trtllm-gen MXFP4 fused experts."""
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    x = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+
+    origin_hidden_states_dim = x.shape[-1]
+    prepared_packed_topk = None
+    if quant_info.flashinfer_mxfp4_moe_precision == "bf16":
+        assert x.dtype == torch.bfloat16
+        x_quant = x
+        x_scale = None
+        if quant_info.hidden_size != origin_hidden_states_dim:
+            x_quant = torch.nn.functional.pad(
+                x_quant,
+                (0, quant_info.hidden_size - origin_hidden_states_dim),
+                mode="constant",
+                value=0.0,
+            )
+    elif quant_info.flashinfer_mxfp4_moe_precision == "default":
+        # Deferred import: mxfp4 dispatches into this module, and the helper
+        # stays there so its registered unit test keeps its import path.
+        from sglang.srt.layers.quantization.mxfp4 import (
+            _prepare_flashinfer_mxfp8_activations,
+        )
+
+        x, prepared_packed_topk, x_quant, x_scale = (
+            _prepare_flashinfer_mxfp8_activations(x, quant_info.hidden_size)
+        )
+    else:
+        raise NotImplementedError(
+            f"Unsupported flashinfer_mxfp4_moe_precision: "
+            f"{quant_info.flashinfer_mxfp4_moe_precision}"
+        )
+
+    assert x_quant.shape[-1] == quant_info.hidden_size
+    is_standard = TopKOutputChecker.format_is_standard(topk_output)
+    assert is_standard or TopKOutputChecker.format_is_bypassed(topk_output), (
+        f"unsupported topk format: {topk_output.format}"
+    )
+    if is_standard:
+        assert runner_config.activation == "situ", (
+            "standard topk output only wired for the situ path"
+        )
+        top_k = topk_output.topk_ids.shape[1]
+        router_logits = None
+    else:
+        top_k = topk_output.topk_config.top_k
+        router_logits = topk_output.router_logits
+
+    num_tokens = x_quant.shape[0]
+    from sglang.srt.layers import zero_copy_context
+
+    symm_output = zero_copy_context.get_moe_output_spec(
+        torch.Size((num_tokens, origin_hidden_states_dim)),
+        torch.bfloat16,
+        x_quant.device,
+    )
+    if symm_output is None:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            symm_output = torch.empty(
+                num_tokens,
+                origin_hidden_states_dim,
+                dtype=torch.bfloat16,
+                device=x_quant.device,
+            )
+
+    if runner_config.activation == "situ":
+        from flashinfer import trtllm_fp4_block_scale_moe
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+        from flashinfer.tllm_enums import ActivationType, RoutingMethodType
+
+        if is_standard:
+            if prepared_packed_topk is not None:
+                packed_topk = prepared_packed_topk
+            else:
+                packed_topk = PackTopkIds.execute(
+                    topk_output.topk_ids, topk_output.topk_weights
+                )
+
+            defer_finalize = _deferred_finalize_enabled.get()
+            result = trtllm_fp4_block_scale_routed_moe(
+                topk_ids=packed_topk,
+                routing_bias=None,
+                hidden_states=x_quant,
+                hidden_states_scale=x_scale,
+                gemm1_weights=quant_info.w13_weight,
+                gemm1_weights_scale=quant_info.w13_weight_scale,
+                gemm1_bias=None,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_clamp_limit,
+                gemm1_clamp_limit=None,
+                gemm2_weights=quant_info.w2_weight,
+                gemm2_weights_scale=quant_info.w2_weight_scale,
+                gemm2_bias=None,
+                output1_scale_scalar=None,
+                output1_scale_gate_scalar=None,
+                output2_scale_scalar=None,
+                num_experts=quant_info.global_num_experts,
+                top_k=packed_topk.shape[1],
+                n_group=None,
+                topk_group=None,
+                intermediate_size=quant_info.intermediate_size_per_partition,
+                local_expert_offset=quant_info.local_expert_offset,
+                local_num_experts=quant_info.local_num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=RoutingMethodType.TopK.value,
+                activation_type=ActivationType.Situ.value,
+                tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+                output=symm_output,
+                do_finalize=not defer_finalize,
+                enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+            )
+            if defer_finalize:
+                gemm2_out, topk_weights, expanded_idx = result
+                result = FlashInferTrtllmDeferredFinalizeOutput(
+                    gemm2_out=gemm2_out,
+                    expert_weights=topk_weights,
+                    expanded_idx_to_permuted_idx=expanded_idx,
+                    top_k=packed_topk.shape[1],
+                )
+                return StandardCombineInput(hidden_states=result)
+            # The finalized kernel writes to its explicit output argument. Do
+            # not propagate the FFI return tensor: some SiTU runner versions
+            # return a distinct wrapper/allocation even though symm_output
+            # contains the published result. Returning the destination makes
+            # the pointer contract explicit for K3's zero-copy latent buffer.
+            return StandardCombineInput(hidden_states=symm_output)
+
+        trtllm_fp4_block_scale_moe(
+            routing_logits=router_logits.to(torch.bfloat16).contiguous(),
+            routing_bias=quant_info.routing_bias,
+            hidden_states=x_quant,
+            hidden_states_scale=x_scale,
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_weights_scale=quant_info.w13_weight_scale,
+            gemm1_bias=None,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_clamp_limit,
+            gemm1_clamp_limit=None,
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_weights_scale=quant_info.w2_weight_scale,
+            gemm2_bias=None,
+            output1_scale_scalar=None,
+            output1_scale_gate_scalar=None,
+            output2_scale_scalar=None,
+            num_experts=quant_info.global_num_experts,
+            top_k=top_k,
+            n_group=topk_output.topk_config.num_expert_group,
+            topk_group=topk_output.topk_config.topk_group,
+            intermediate_size=quant_info.intermediate_size_per_partition,
+            routed_scaling_factor=(
+                topk_output.topk_config.routed_scaling_factor or 1.0
+            ),
+            routing_method_type=RoutingMethodType.DeepSeekV3.value,
+            activation_type=ActivationType.Situ.value,
+            norm_topk_prob=topk_output.topk_config.renormalize,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+            output=symm_output,
+            enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+        )
+        return StandardCombineInput(hidden_states=symm_output)
+
+    from flashinfer import trtllm_fp4_block_scale_moe
+
+    trtllm_gen_output = trtllm_fp4_block_scale_moe(
+        router_logits.to(torch.bfloat16),
+        None,  # routing_bias
+        x_quant,
+        x_scale,
+        quant_info.w13_weight,  # uint8 (e2m1 x 2)
+        quant_info.w13_weight_scale,  # uint8 (e4m3 x 2)
+        quant_info.w13_weight_bias,  # fp32 per expert per channel
+        quant_info.gemm1_alpha,  # fp32 per expert
+        quant_info.gemm1_beta,  # fp32 per expert
+        quant_info.gemm1_clamp_limit,  # fp32 per expert
+        quant_info.w2_weight,  # uint8 (e2m1 x 2)
+        quant_info.w2_weight_scale,  # ue8m0
+        quant_info.w2_weight_bias,  # fp32 per expert per channel
+        None,  # output1_scale_scalar
+        None,  # output1_scale_gate_scalar
+        None,  # output2_scale_scalar
+        quant_info.global_num_experts,
+        top_k,
+        None,  # n_group      # TODO: support n_group
+        None,  # topk_group   # TODO: support topk_group
+        quant_info.intermediate_size_per_partition,  # padded to multiple of 128
+        quant_info.local_expert_offset,
+        quant_info.local_num_experts,
+        None,  # routed_scaling_factor
+        1,  # routing_method_type, renormalize
+        True,  # do finalize
+        tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+        output=symm_output,
+        enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+    )[0]
+    return StandardCombineInput(hidden_states=trtllm_gen_output)
+
+
+@dataclass
 class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by FlashInfer TRT-LLM FP4 MoE kernels."""
 
