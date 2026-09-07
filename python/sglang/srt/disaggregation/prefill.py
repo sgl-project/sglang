@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -248,7 +249,11 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        draft_kv_pool = self.draft_token_to_kv_pool if transfer_draft_cache else None
+        draft_kv_pool = (
+            self.draft_token_to_kv_pool
+            if transfer_draft_cache and (not _is_npu or get_pp_group().is_last_rank)
+            else None
+        )
         num_draft_entries = 0
         if draft_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
