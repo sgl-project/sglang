@@ -36,6 +36,10 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.pp_admission import (
+    PPAdmissionVerdict,
+    map_authoritative_polls,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -52,7 +56,6 @@ from sglang.srt.disaggregation.utils import (
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
-    poll_and_all_reduce_pp,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -95,6 +98,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_PP_ADMIT_FLOW = envs.SGLANG_PP_PD_ADMIT_FLOW.get()
 
 
 def should_force_retry(req: Req) -> bool:
@@ -368,6 +372,33 @@ class PrefillBootstrapQueue:
         assert req.metadata_buffer_index is not None
         return True
 
+    def prepare_bootstrapped_rids(
+        self, candidate_rids: Optional[List[str]] = None
+    ) -> tuple[List[str], List[str]]:
+        """Reserve local metadata before a PP admission verdict is committed."""
+        req_by_rid = {req.rid: req for req in self.queue}
+        ordered_rids = (
+            [req.rid for req in self.queue]
+            if candidate_rids is None
+            else candidate_rids
+        )
+        reqs = [req_by_rid[rid] for rid in ordered_rids if rid in req_by_rid]
+        if not reqs:
+            return [], []
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in reqs],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+        )
+        prepared, failed = [], []
+        for req, poll in zip(reqs, polls):
+            if poll == KVPoll.Failed:
+                failed.append(req.rid)
+            elif poll == KVPoll.WaitingForInput and self.ensure_metadata_buffer(req):
+                prepared.append(req.rid)
+        return prepared, failed
+
     def finalize_bootstrap(self, req: Req) -> bool:
         """Initialize the sender after bootstrap completes.
         Returns False if no metadata buffer is available (non-terminal)."""
@@ -389,6 +420,26 @@ class PrefillBootstrapQueue:
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
         req.pending_bootstrap = False
         return True
+
+    def _pp_admit_flow_try_finalize(self, req: Req) -> bool:
+        """Finalize after this rank's local sender becomes ready."""
+        local_poll = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+        )[0]
+        if local_poll == KVPoll.WaitingForInput:
+            return self.finalize_bootstrap(req)
+        if local_poll == KVPoll.Failed:
+            if self.scheduler.pp_admission_state.record_local_failure(req.rid):
+                logger.warning(
+                    "PP sender failed after admission on pp_rank=%d: rid=%s room=%s",
+                    self.pp_rank,
+                    req.rid,
+                    req.bootstrap_room,
+                )
+            return False
+        return False
 
     def add(self, req: Req, num_kv_heads: int) -> None:
         if not self.create_sender(req, num_kv_heads):
@@ -441,13 +492,19 @@ class PrefillBootstrapQueue:
                 return [], []
 
         if self.pp_size > 1:
-            polls = poll_and_all_reduce_pp(
+            verdict = PPAdmissionVerdict.from_payload([pp_good_rids, pp_bad_rids])
+            assert verdict is not None
+            polls = map_authoritative_polls(
                 (req.rid for req in self.queue),
-                KVPoll.WaitingForInput,
-                pp_good_rids,
-                pp_bad_rids,
+                verdict,
+                admitted_poll=KVPoll.WaitingForInput,
+                failed_poll=KVPoll.Failed,
             )
-            uncovered = [i for i, poll in enumerate(polls) if poll is None]
+            uncovered = (
+                []
+                if _PP_ADMIT_FLOW
+                else [i for i, poll in enumerate(polls) if poll is None]
+            )
             if uncovered:
                 local_polls = poll_and_all_reduce_attn_cp_tp_group(
                     [self.queue[i].disagg_kv_sender for i in uncovered],
@@ -456,6 +513,20 @@ class PrefillBootstrapQueue:
                 )
                 for i, local_poll in zip(uncovered, local_polls):
                     if local_poll == KVPoll.Failed:
+                        if _PP_ADMIT_FLOW and self.pp_rank != 0:
+                            # Queue membership follows PP0; a local removal here
+                            # would desynchronize pipeline batches.
+                            req = self.queue[i]
+                            if self.scheduler.pp_admission_state.record_local_failure(
+                                req.rid
+                            ):
+                                logger.warning(
+                                    "PP sender failed before PP0 ruled on "
+                                    "pp_rank=%d: rid=%s",
+                                    self.pp_rank,
+                                    req.rid,
+                                )
+                            continue
                         polls[i] = KVPoll.Failed
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -488,6 +559,15 @@ class PrefillBootstrapQueue:
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
+                elif _PP_ADMIT_FLOW and self.pp_size > 1:
+                    assert req.metadata_buffer_index >= 0, (
+                        f"PP admission committed rid={req.rid} without a "
+                        f"metadata reservation on pp_rank={self.pp_rank}"
+                    )
+                    assert self.finalize_bootstrap(req), (
+                        f"PP admission could not finalize rid={req.rid} "
+                        f"on pp_rank={self.pp_rank}"
+                    )
                 elif not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
@@ -542,7 +622,15 @@ class SchedulerDisaggregationPrefillMixin:
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
         """
-        candidates = [req for req in self.waiting_queue if not is_aborted(req)]
+        use_pp_admission = _PP_ADMIT_FLOW and self.ps.pp_size > 1
+        candidates = [
+            req
+            for req in self.waiting_queue
+            if not is_aborted(req)
+            and not (
+                use_pp_admission and self.pp_admission_state.has_local_failure(req.rid)
+            )
+        ]
         if not candidates:
             return
         polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -553,6 +641,15 @@ class SchedulerDisaggregationPrefillMixin:
         failed = set()
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
+                if use_pp_admission:
+                    if self.pp_admission_state.record_local_failure(req.rid):
+                        logger.warning(
+                            "PP sender failed while awaiting uniform admission "
+                            "outcome on pp_rank=%d: rid=%s",
+                            self.ps.pp_rank,
+                            req.rid,
+                        )
+                    continue
                 self.handle_bootstrap_failure(req)
                 failed.add(req)
             elif (
@@ -953,6 +1050,14 @@ class SchedulerDisaggregationPrefillMixin:
 
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
+                if (
+                    _PP_ADMIT_FLOW
+                    and poll == KVPoll.Failed
+                    and not self.pp_admission_state.has_uniform_failure(req.rid)
+                ):
+                    self.pp_admission_state.record_local_failure(req.rid)
+                    undone_reqs.append(req)
+                    continue
                 if self.handle_pending_bootstrap(req, poll):
                     self.send_kv_chunk(req, last_chunk=True)
                     undone_reqs.append(req)
@@ -1132,16 +1237,67 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Unexpected poll state {poll} for req {req.rid} in handle_pending_bootstrap"
             )
 
+    def _pp_defer_bootstrap(self: Scheduler, req: Req) -> None:
+        """Register a request whose local sender is not ready yet."""
+        self.pp_admission_state.defer_bootstrap(req)
+
+    def pp_retry_deferred_bootstrap(self: Scheduler) -> None:
+        """Retry local sender initialization once per scheduler body."""
+        pend = self.pp_admission_state.deferred_bootstrap
+        if not pend:
+            return
+        now = self.pp_admission_state.step
+        still = []
+        for req in pend:
+            if not req.pending_bootstrap:
+                continue  # finalized elsewhere (e.g. check_bootstrap)
+            if self.pp_admission_state.has_local_failure(req.rid):
+                still.append(req)
+                continue
+            if self.disagg_prefill_bootstrap_queue._pp_admit_flow_try_finalize(req):
+                start = req.pp_defer_body if req.pp_defer_body is not None else now
+                waited = now - start
+                logger.debug(
+                    "Deferred PP sender initialized for rid=%s after %d bodies",
+                    req.rid,
+                    waited,
+                )
+                owed = req.pp_deferred_send
+                if owed is not None:
+                    req.pp_deferred_send = None
+                    last_chunk, end_idx = owed
+                    self.send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+                continue
+            start = req.pp_defer_body if req.pp_defer_body is not None else now
+            waited = now - start
+            if waited and waited % 16 == 0:
+                logger.warning(
+                    "PP sender for rid=%s is still pending on pp_rank=%d "
+                    "after %d bodies since PP0 admitted it",
+                    req.rid,
+                    self.ps.pp_rank,
+                    waited,
+                )
+            still.append(req)
+        self.pp_admission_state.deferred_bootstrap = still
+
     def check_bootstrap(self: Scheduler, req: Req) -> bool:
         """Check bootstrap status for an optimistic prefilled request.
         Returns True if bootstrap is finished."""
         if not req.pending_bootstrap:
             return True
+        if _PP_ADMIT_FLOW and self.pp_admission_state.has_uniform_failure(req.rid):
+            return False
+        if _PP_ADMIT_FLOW and self.pp_admission_state.has_local_failure(req.rid):
+            return False
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
+        if _PP_ADMIT_FLOW and polls[0] == KVPoll.Failed:
+            self.pp_admission_state.record_local_failure(req.rid)
+            return False
         return self.handle_pending_bootstrap(req, polls[0])
 
     def process_prefill_chunk(
@@ -1235,6 +1391,11 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
+        if _PP_ADMIT_FLOW:
+            assert (
+                not req.pending_bootstrap
+            ), f"PP admission attempted KV send before commit for rid={req.rid}"
+
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
@@ -1425,7 +1586,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
-        max_attempts = get_disagg().optimistic_prefill_attempts
+        max_attempts = self.server_args.optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()

@@ -1302,6 +1302,10 @@ class Req(ReqDllmMixin):
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
+        # PP disaggregated-prefill admission state. These remain unused unless
+        # the optional PP admission flow is enabled.
+        self.pp_defer_body: Optional[int] = None
+        self.pp_deferred_send: Optional[Tuple[bool, Optional[int]]] = None
         # Number of optimistic prefill forward passes started. preserved across retracts.
         self.prefill_attempt_count = 0
 
