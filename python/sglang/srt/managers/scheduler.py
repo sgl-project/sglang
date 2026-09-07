@@ -5216,7 +5216,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                self._cleanup_dllm_req(req)
+                self._cleanup_dllm_req(req, is_abort=True)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )

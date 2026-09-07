@@ -431,13 +431,56 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         scheduler.tree_cache = cache
         scheduler.token_to_kv_pool_allocator = allocator
 
-        scheduler._cleanup_dllm_req(victim)
+        scheduler._cleanup_dllm_req(victim, is_abort=True)
 
         # The live request's prefix stays protected, and nothing is handed back.
         self.assertEqual(live.last_device_node.lock_ref, 1)
         self.assertEqual(cache.protected_size(), len(prefix))
         self.assertEqual(cache.evictable_size(), 0)
         self.assertEqual(freed, [])
+
+    def test_retract_keeps_the_rid_keyed_cache_state_that_abort_drops(self):
+        """A retracted request keeps its rid and re-enters admission, so only
+        the abort path may drop the cache state keyed by that rid."""
+        released = []
+        manager = DllmManager(SimpleNamespace(max_running_requests=4))
+        retracted = _make_req("job_1", [1], self.block_size)
+        aborted = _make_req("job_2", [2], self.block_size)
+        for req in (retracted, aborted):
+            req.origin_input_ids = [1]
+            req.output_ids = [7]
+            req.dllm_config = SimpleNamespace(block_size=self.block_size)
+            req.reset_for_retract = lambda: None
+            req.reset_dllm_for_retract = lambda: None
+            req.time_stats = SimpleNamespace(set_retract_time=lambda: None)
+            # A STAGING request stashed by cache_unfinished_req: the req slot is
+            # gone but kv_allocated_len still records the old length until the
+            # teardown calls mark_kv_released(). Non-zero so that call is pinned.
+            req.kv.kv_allocated_len = self.block_size
+        manager.waiting_queue = [retracted, aborted]
+
+        scheduler = _SchedulerHarness()
+        # Without one of these flags `_release_aborted_request` is a no-op.
+        scheduler.enable_hierarchical_cache = True
+        scheduler.dllm_manager = manager
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            free=lambda indices: None
+        )
+        scheduler.tree_cache = SimpleNamespace(
+            release_aborted_request=released.append,
+            dec_lock_ref=lambda node: None,
+        )
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=lambda msg, req: None)
+        )
+
+        scheduler._retract_dllm_req(retracted)
+        self.assertEqual(released, [])
+        # Retraction still gives the KV back, just not the cache state.
+        self.assertEqual(retracted.kv.kv_allocated_len, 0)
+
+        scheduler._abort_dllm_req_exact(aborted)
+        self.assertEqual(released, ["job_2"])
 
 
 if __name__ == "__main__":

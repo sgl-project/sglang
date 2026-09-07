@@ -72,10 +72,12 @@ class SchedulerDllmMixin:
                 adder, forward_mode = candidate, candidate_mode
                 break
 
-            # A probe that admitted nothing cannot have preempted: dLLM batches
-            # are never merged into `running_batch` (see get_next_batch_to_run),
-            # so `preempt_to_schedule` has no candidates and `preempt_list` stays
-            # empty. Only the selected adder's preempt_list needs draining.
+            # Empty today: dLLM batches never enter `running_batch`, so
+            # `preempt_to_schedule` finds nothing to take. Drained anyway --
+            # only the winning adder reaches `_update_state_for_batch`, so a
+            # probe that did preempt would strand its victims.
+            for preempted_req in candidate.preempt_list:
+                self._add_request_to_queue(preempted_req)
 
         if adder is None:
             self._retract_or_abort_dllm_req(running_batch)
@@ -123,8 +125,9 @@ class SchedulerDllmMixin:
         still cannot be admitted with the pool to itself.
         """
         if not running_batch.is_empty():
-            # Non-dLLM requests are still decoding and will free KV on their own,
-            # so this round is not terminal evidence of anything.
+            # Never fires today (see the probe loop in `get_new_batch_dllm`).
+            # Anything decoding alongside frees KV on its own, so this round is
+            # not terminal evidence of anything.
             return
 
         # Every non-empty phase was attempted and admitted nothing, so every
@@ -171,7 +174,7 @@ class SchedulerDllmMixin:
             "aligned extend",
             req.rid,
         )
-        self._cleanup_dllm_req(req)
+        self._cleanup_dllm_req(req, is_abort=False)
         req.reset_for_retract()
         req.reset_dllm_for_retract()
         req.time_stats.set_retract_time()
@@ -489,8 +492,13 @@ class SchedulerDllmMixin:
 
         return result
 
-    def _cleanup_dllm_req(self: Scheduler, req: Req) -> None:
-        self._release_aborted_request(req.rid)
+    def _cleanup_dllm_req(self: Scheduler, req: Req, *, is_abort: bool) -> None:
+        if is_abort:
+            # Cancels the in-flight prefetch and staged host hold keyed by
+            # this rid. A retracted request keeps its rid and re-enters
+            # admission, so it would only pay for that work twice;
+            # `ScheduleBatch.retract_decode` does not touch it either.
+            self._release_aborted_request(req.rid)
 
         # `Req.kv` is always a ReqKvInfo, so every field below is present.
         kv = req.kv
@@ -521,7 +529,7 @@ class SchedulerDllmMixin:
         # attaches the weight-version spans the tokenizer manager accounts for.
         from sglang.srt.managers.scheduler import _make_abort_req
 
-        self._cleanup_dllm_req(req)
+        self._cleanup_dllm_req(req, is_abort=True)
         self.dllm_manager.pop_aborted_reqs(False, req.rid, exact=True)
         self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
 

@@ -11,24 +11,31 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+def _make_tokenizer_manager(test_case, **server_arg_overrides):
+    """A TokenizerManager carrying only the fields `_validate_one_request`
+    reads, over a server-arg bag the caller picks."""
+    override = get_context().override_server_args(**server_arg_overrides)
+    override.install()
+    test_case.addCleanup(override.restore)
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.context_len = 128
+    manager.num_reserved_tokens = 0
+    manager.allow_auto_truncate = False
+    manager.validate_total_tokens = False
+    manager.is_generation = True
+    manager.server_args = SimpleNamespace(enable_custom_logit_processor=False)
+    manager._validate_token_ids_logprob = Mock()
+    return manager
+
+
 class TestHiddenStateServerMode(CustomTestCase):
     def _make_tokenizer_manager(self, mode):
         # The server-side hidden-state mode is a bag leaf.
-        override = get_context().override_server_args(
+        return _make_tokenizer_manager(
+            self,
             enable_return_hidden_states=mode is not None,
             return_hidden_states_mode=mode,
         )
-        override.install()
-        self.addCleanup(override.restore)
-        manager = TokenizerManager.__new__(TokenizerManager)
-        manager.context_len = 128
-        manager.num_reserved_tokens = 0
-        manager.allow_auto_truncate = False
-        manager.validate_total_tokens = False
-        manager.is_generation = True
-        manager.server_args = SimpleNamespace(enable_custom_logit_processor=False)
-        manager._validate_token_ids_logprob = Mock()
-        return manager
 
     @staticmethod
     def _make_request(return_hidden_states):
@@ -69,6 +76,35 @@ class TestHiddenStateServerMode(CustomTestCase):
                     self._make_request(mode),
                     [1, 2, 3],
                 )
+
+
+class TestDllmRequestValidation(CustomTestCase):
+    """dLLM has no input-logprob stage, so the server would answer a
+    return_logprob request with empty arrays. Refuse it instead."""
+
+    @staticmethod
+    def _make_request(return_logprob):
+        return GenerateReqInput(
+            input_ids=[1, 2, 3],
+            sampling_params={},
+            return_logprob=return_logprob,
+        )
+
+    def test_dllm_server_rejects_return_logprob(self):
+        manager = _make_tokenizer_manager(self, dllm_algorithm="LowConfidence")
+
+        with self.assertRaisesRegex(ValueError, "return_logprob is not supported"):
+            manager._validate_one_request(self._make_request(True), [1, 2, 3])
+
+    def test_dllm_server_accepts_a_request_without_logprobs(self):
+        manager = _make_tokenizer_manager(self, dllm_algorithm="LowConfidence")
+
+        manager._validate_one_request(self._make_request(False), [1, 2, 3])
+
+    def test_non_dllm_server_still_accepts_return_logprob(self):
+        manager = _make_tokenizer_manager(self, dllm_algorithm=None)
+
+        manager._validate_one_request(self._make_request(True), [1, 2, 3])
 
 
 if __name__ == "__main__":

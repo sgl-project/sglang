@@ -396,6 +396,47 @@ class TestPrefillAdder(CustomTestCase):
             adder, running_batch=running_batch, is_prefill=False
         )
 
+    def test_dllm_discarded_probe_returns_its_preempted_reqs(self):
+        # A probe that preempted and admitted nothing is dropped, and only
+        # the winning adder reaches `_update_state_for_batch`. Without an
+        # explicit drain its victims would be lost.
+        victim = SimpleNamespace(rid="victim")
+        admitted = SimpleNamespace(rid="admitted")
+        manager = MagicMock()
+        manager.get_prefill_requests.return_value = [SimpleNamespace(rid="blocked")]
+        manager.get_decode_requests.return_value = [admitted]
+        running_batch = SimpleNamespace(batch_is_full=False, reqs=[])
+        probes = [
+            SimpleNamespace(can_run_list=[], preempt_list=[victim]),
+            SimpleNamespace(can_run_list=[admitted], preempt_list=[]),
+        ]
+        requeued = []
+        scheduler = SimpleNamespace(
+            enable_priority_preemption=True,
+            policy=MagicMock(),
+            waiting_queue=[],
+            dllm_manager=manager,
+            tree_cache=MagicMock(),
+            _should_skip_prefill=lambda *, running_batch: False,
+            _fetch_waiting_reqs=lambda: None,
+            _create_dllm_prefill_adder=MagicMock(side_effect=probes),
+            _process_dllm_batches=MagicMock(return_value=ForwardMode.DLLM_EXTEND),
+            _add_request_to_queue=requeued.append,
+            _update_state_for_batch=MagicMock(),
+            _create_dllm_batch=MagicMock(return_value=MagicMock()),
+        )
+        scheduler._dllm_phase_order = lambda: SchedulerDllmMixin._dllm_phase_order(
+            scheduler
+        )
+
+        with patch("sglang.srt.dllm.mixin.scheduler.set_time_batch"):
+            batch = SchedulerDllmMixin.get_new_batch_dllm(scheduler, running_batch)
+
+        self.assertIsNotNone(batch)
+        self.assertEqual(requeued, [victim])
+        # The winning probe keeps going through the normal drain.
+        scheduler._update_state_for_batch.assert_called_once_with([admitted], probes[1])
+
     def test_dllm_manager_prepares_incoming_req_before_phase_selection(self):
         req = MagicMock()
         req.dllm_phase = DllmReqPhase.INCOMING_PREFILL
@@ -823,15 +864,21 @@ class TestPrefillAdder(CustomTestCase):
             set_retract_time=lambda: events.append("retract_time")
         )
         scheduler = SimpleNamespace(
-            _cleanup_dllm_req=lambda r: events.append("cleanup"),
+            _cleanup_dllm_req=lambda r, *, is_abort: events.append(
+                f"cleanup(is_abort={is_abort})"
+            ),
             ipc_channels=MagicMock(),
             dllm_manager=MagicMock(),
         )
 
         SchedulerDllmMixin._retract_dllm_req(scheduler, req)
 
-        # KV must be released before reset_for_retract(), which asserts req.kv is None.
-        self.assertEqual(events, ["cleanup", "reset", "reset_dllm", "retract_time"])
+        # KV must be released before reset_for_retract(), which asserts req.kv
+        # is None, and the teardown must run in retract mode.
+        self.assertEqual(
+            events,
+            ["cleanup(is_abort=False)", "reset", "reset_dllm", "retract_time"],
+        )
         # Retraction is invisible to the client and keeps the request managed.
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
         scheduler.dllm_manager.pop_aborted_reqs.assert_not_called()
