@@ -750,54 +750,24 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual.numel() == 0 or x.numel() == 0:
-            return self.forward_native(
-                residual,
-                x,
-                gate,
-                shift,
-                scale,
-            )
+        weight = getattr(self.norm, "weight", None)
+        bias = getattr(self.norm, "bias", None)
 
-        if residual.dtype != x.dtype:
-            return self.forward_native(
-                residual,
-                x,
-                gate,
-                shift,
-                scale,
-            )
-        param_dtype = scale.dtype
-        if shift.dtype != param_dtype:
-            shift = shift.to(dtype=param_dtype)
         if isinstance(gate, torch.Tensor):
-            gate_tensor = (
-                gate if gate.dtype == param_dtype else gate.to(dtype=param_dtype)
-            )
+            gate_tensor = gate
         elif isinstance(gate, (int, float)) and gate == 1:
             gate_tensor = None
         else:
-            return self.forward_native(
-                residual,
-                x,
-                gate,
-                shift,
-                scale,
-            )
-        weight = getattr(self.norm, "weight", None)
-        bias = getattr(self.norm, "bias", None)
-        if weight is not None and weight.dtype != param_dtype:
-            weight = weight.to(dtype=param_dtype)
-        if bias is not None and bias.dtype != param_dtype:
-            bias = bias.to(dtype=param_dtype)
+            return self.forward_native(residual, x, gate, shift, scale)
+
         return torch.ops.sgl_kernel.fused_scale_residual_norm_scale_shift_cpu(
-            residual,
-            x,
-            gate_tensor,
-            weight,
-            bias,
-            scale,
-            shift,
+            _ensure_contiguous(residual),
+            _ensure_contiguous(x),
+            _ensure_contiguous(gate_tensor),
+            _ensure_contiguous(weight),
+            _ensure_contiguous(bias),
+            scale.contiguous(),
+            shift.contiguous(),
             self.norm_type,
             self.eps,
         )
@@ -933,11 +903,11 @@ class _NormScaleShift(CustomOp):
         bias = getattr(self.norm, "bias", None)
 
         return torch.ops.sgl_kernel.fused_norm_scale_shift_cpu(
-            x,
-            weight,
-            bias,
-            scale,
-            shift,
+            x.contiguous(),
+            _ensure_contiguous(weight),
+            _ensure_contiguous(bias),
+            scale.contiguous(),
+            shift.contiguous(),
             self.norm_type,
             self.eps,
         )
