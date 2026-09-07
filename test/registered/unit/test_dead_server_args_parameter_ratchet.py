@@ -19,7 +19,7 @@ import sglang
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 _PACKAGE_ROOT = pathlib.Path(next(iter(sglang.__path__)))
 
