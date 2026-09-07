@@ -18,6 +18,15 @@ bitwise identical for any dtype the predicate admits (bf16 / fp16 / fp32, the
 ones the tests cover). The kernel walks the output in its NHWC memory order,
 so the stores and the gathered loads are both contiguous along ``C``.
 
+Layout contract: the output is dense channels_last, which is what aten returns
+exactly when ``suggest_memory_format()`` says channels_last. That requires
+``C > 1`` (with ``C == 1`` the tensor is also NCHW-contiguous and aten picks the
+NCHW kernel, returning e.g. strides ``(4, 4, 2, 1)`` for a ``[1, 1, 2, 2]``
+output) and canonical NHWC strides ``(H*W*C, 1, W*C, C)`` on every dim,
+including size-1 dims (aten's stride test does not skip them, unlike
+``is_contiguous``). The predicate enforces both, so a call it admits is
+value- and layout-identical to ``nn.Upsample``.
+
 Verified (``torch.equal`` vs ``F.interpolate``): ``[1, 192, 240, 416]``,
 ``[4, 192, 120, 208]``, ``[1, 96, 480, 832]``, ``[1, 3, 5, 7]`` at factor 2
 and ``[2, 3, 5, 7]`` at factor ``(3, 2)`` for all three dtypes; end-to-end
@@ -25,6 +34,8 @@ inside the Wan 2.1 (81 frames, 480x832) and Qwen-Image (1024x1024) decoders.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import triton  # type: ignore
@@ -69,35 +80,46 @@ def _nearest_upsample_nhwc_kernel(
 
 
 def _integer_scale(scale) -> tuple[int, int] | None:
+    """``(fh, fw)`` when ``scale`` is a finite integer-valued factor (scalar or
+    pair) of at least 1; ``None`` for anything else, never an exception."""
+    if isinstance(scale, bool):
+        return None
     if isinstance(scale, (int, float)):
         scale = (scale, scale)
     if not isinstance(scale, (tuple, list)) or len(scale) != 2:
         return None
     out = []
     for s in scale:
+        if isinstance(s, bool) or not isinstance(s, (int, float)):
+            return None
         f = float(s)
-        if f < 1.0 or f != int(f):
+        if not math.isfinite(f) or f < 1.0 or f != int(f):
             return None
         out.append(int(f))
     return out[0], out[1]
 
 
+def _canonical_nhwc(x: torch.Tensor) -> bool:
+    """Dense channels_last with ``C > 1``: the exact condition under which
+    aten's nearest upsample runs its NHWC kernel and returns a dense
+    channels_last tensor (see the module docstring)."""
+    _, c, h, w = x.shape
+    return c > 1 and x.stride() == (h * w * c, 1, w * c, c)
+
+
 def can_use_nearest_upsample_nhwc(x: torch.Tensor, scale_factor, mode: str) -> bool:
     """True when ``F.interpolate(x, scale_factor=..., mode=...)`` is a plain
-    integer-factor gather on a dense channels_last 4D tensor."""
+    integer-factor gather on a dense channels_last 4D tensor whose result is
+    value- and layout-identical to aten's. Never raises."""
     return (
         isinstance(x, torch.Tensor)
         and x.is_cuda
-        and not torch.is_grad_enabled()
-        and not x.requires_grad
+        and not (torch.is_grad_enabled() and x.requires_grad)
         and mode in ("nearest", "nearest-exact")
         and x.dim() == 4
         and x.numel() > 0
         and x.dtype in _SUPPORTED_DTYPES
-        # Dense NHWC. For C > 1 this fixes stride(C) == 1, which the kernel
-        # relies on by adding the channel index unscaled; for C == 1 that index
-        # is always 0, so no separate stride check is needed.
-        and x.is_contiguous(memory_format=torch.channels_last)
+        and _canonical_nhwc(x)
         and _integer_scale(scale_factor) is not None
     )
 
@@ -109,12 +131,23 @@ def nearest_upsample_nhwc(x: torch.Tensor, scale_factor) -> torch.Tensor:
     factors = _integer_scale(scale_factor)
     if factors is None:
         raise ValueError(f"scale_factor must be integer-valued, got {scale_factor}")
-    if not (
-        x.is_cuda
-        and x.dim() == 4
-        and x.is_contiguous(memory_format=torch.channels_last)
-    ):
-        raise ValueError("nearest_upsample_nhwc needs a CUDA channels_last 4D tensor")
+    # Re-check everything the predicate checks: a direct call must fail loudly
+    # rather than return a detached tensor (autograd) or a differently laid-out
+    # one (see the layout contract in the module docstring).
+    if torch.is_grad_enabled() and x.requires_grad:
+        raise ValueError(
+            "nearest_upsample_nhwc is inference-only (input requires grad)"
+        )
+    if not (x.is_cuda and x.dim() == 4 and x.dtype in _SUPPORTED_DTYPES):
+        raise ValueError(
+            "nearest_upsample_nhwc needs a CUDA 4D bf16/fp16/fp32 tensor, got "
+            f"{x.device.type} {x.dim()}D {x.dtype}"
+        )
+    if not _canonical_nhwc(x):
+        raise ValueError(
+            "nearest_upsample_nhwc needs dense channels_last strides with C > 1, "
+            f"got shape {tuple(x.shape)} strides {tuple(x.stride())}"
+        )
     fh, fw = factors
     n, c, h, w = x.shape
     out_h, out_w = h * fh, w * fw

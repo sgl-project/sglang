@@ -684,8 +684,8 @@ def test_nearest_upsample_nhwc_is_bit_exact(dtype, shape, scale, mode):
     assert can_use_nearest_upsample_nhwc(x, sf, mode)
     ref = F.interpolate(x, scale_factor=sf, mode=mode)
     out = nearest_upsample_nhwc(x, sf)
-    assert out.is_contiguous(memory_format=torch.channels_last)
     assert out.shape == ref.shape
+    assert out.stride() == ref.stride()  # layout-identical, not just values
     assert torch.equal(out, ref)
 
 
@@ -694,10 +694,35 @@ def test_nearest_upsample_nhwc_rejects_unsupported_inputs():
     x = torch.randn(2, 8, 6, 6, device="cuda", dtype=torch.bfloat16)
     assert not can_use_nearest_upsample_nhwc(x, 2.0, "nearest-exact")  # NCHW
     x_cl = x.contiguous(memory_format=torch.channels_last)
+    assert can_use_nearest_upsample_nhwc(x_cl, 2.0, "nearest-exact")
     assert not can_use_nearest_upsample_nhwc(x_cl, 1.5, "nearest-exact")
     assert not can_use_nearest_upsample_nhwc(x_cl, 2.0, "bilinear")
     assert not can_use_nearest_upsample_nhwc(x_cl[:, :, :0], 2.0, "nearest")
-    with torch.enable_grad():
-        assert not can_use_nearest_upsample_nhwc(x_cl, 2.0, "nearest")
+    # Malformed scale factors must yield False, never raise.
+    for bad in (
+        (None, 2),
+        float("nan"),
+        float("inf"),
+        (2, float("-inf")),
+        "2",
+        True,
+        (2,),
+    ):
+        assert not can_use_nearest_upsample_nhwc(x_cl, bad, "nearest")
+    # C == 1 is also NCHW-contiguous: aten picks its NCHW kernel and returns a
+    # differently laid-out tensor, so the predicate must reject it.
+    x1 = torch.randn(1, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    assert x1.is_contiguous(memory_format=torch.channels_last)
+    assert not can_use_nearest_upsample_nhwc(x1, 2.0, "nearest-exact")
+    with pytest.raises(ValueError):
+        nearest_upsample_nhwc(x1, 2.0)
+    # Direct calls validate too: no silent autograd drop, no layout surprise.
     with pytest.raises(ValueError):
         nearest_upsample_nhwc(x_cl, 1.5)
+    with pytest.raises(ValueError):
+        nearest_upsample_nhwc(x, 2.0)  # NCHW
+    with torch.enable_grad():
+        xg = x_cl.clone().requires_grad_(True)
+        assert not can_use_nearest_upsample_nhwc(xg, 2.0, "nearest")
+        with pytest.raises(ValueError):
+            nearest_upsample_nhwc(xg, 2.0)

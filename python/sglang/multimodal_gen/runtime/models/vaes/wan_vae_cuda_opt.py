@@ -105,14 +105,13 @@ class GatedChannelsLastUpsample(nn.Module):
             and x.is_contiguous(memory_format=torch.channels_last)
         ):
             x = x.as_strided(x.shape, canonical)
-        # With canonical NHWC strides aten itself would run its NHWC kernel
-        # and return a dense channels_last tensor, so the Triton gather is a
-        # layout- and value-identical replacement: it runs on the lossless
-        # path too (the gate only controls the stride canonicalisation above).
-        if (
-            up.size is None
-            and x.stride() == canonical
-            and can_use_nearest_upsample_nhwc(x, up.scale_factor, up.mode)
+        # The predicate admits exactly the inputs on which aten itself would
+        # run its NHWC kernel and return a dense channels_last tensor, so the
+        # Triton gather is a layout- and value-identical replacement: it runs
+        # on the lossless path too (the gate only controls the stride
+        # canonicalisation above).
+        if up.size is None and can_use_nearest_upsample_nhwc(
+            x, up.scale_factor, up.mode
         ):
             return nearest_upsample_nhwc(x, up.scale_factor)
         return up(x)
