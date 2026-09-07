@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
 )
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache import kv_cache_configurator
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -252,6 +253,48 @@ class TestFlashInferSparseMLARunnerCapacity(unittest.TestCase):
                     speculative_num_draft_tokens=6,
                 )
                 self.assertGreaterEqual(capacity, 32768 + 4 * 6)
+
+    def test_ignore_eos_last_prompt_can_overshoot_prefill_budget(self):
+        adder = PrefillAdder(
+            page_size=64,
+            tree_cache=SimpleNamespace(
+                disable=True, supports_mamba=lambda: False, evictable_size=lambda: 0
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 450560),
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=16384,
+            rem_chunk_tokens=None,
+        )
+
+        class Request(SimpleNamespace):
+            def set_extend_range(self, start, end):
+                self.extend_range = SimpleNamespace(length=end - start)
+
+        for length, result in (
+            (8192, AddReqResult.CONTINUE),
+            (30000, AddReqResult.OTHER),
+        ):
+            req = Request(
+                full_untruncated_fill_ids=range(length),
+                origin_input_ids=range(length),
+                prefix_indices=[],
+                output_ids=[],
+                sampling_params=SimpleNamespace(ignore_eos=True, max_new_tokens=8),
+                retracted_stain=False,
+            )
+            self.assertIs(adder.add_one_req(req, False, None), result)
+        self.assertEqual(len(adder.can_run_list), 2)
+        admitted = sum(req.extend_range.length for req in adder.can_run_list)
+        self.assertEqual(admitted, 38192)
+        capacity = _flashinfer_sparse_mla_max_tokens(
+            chunked_prefill_size=None,
+            max_prefill_tokens=16384,
+            context_len=32768,
+            max_running_requests=4,
+            speculative_num_draft_tokens=6,
+        )
+        self.assertGreaterEqual(capacity, admitted + 4 * 6)
 
     def test_chunked_mixed_batch_does_not_reserve_entire_context(self):
         capacity = _flashinfer_sparse_mla_max_tokens(

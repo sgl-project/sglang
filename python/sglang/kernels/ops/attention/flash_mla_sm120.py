@@ -691,9 +691,10 @@ def _flashinfer_sparse_mla_max_tokens(
     chunk_size = int(chunked_prefill_size or 0)
     prefill_tokens = max(64, chunk_size, max_prefill_tokens)
     if chunk_size <= 0:
-        # Unchunked admission allows the first prompt to exceed the prefill
-        # budget. The configured model context still bounds that request.
-        prefill_tokens = max(prefill_tokens, context_len)
+        # Unchunked admission can add one whole prompt before observing that
+        # the budget is exhausted (including ignore_eos without a radix cache).
+        # Reserve the budget plus one context-sized prompt for that overshoot.
+        prefill_tokens += context_len
     # Mixed batches can add decode or verify tokens to the prefill budget.
     return prefill_tokens + max_running_requests * max(
         1, speculative_num_draft_tokens or 1
