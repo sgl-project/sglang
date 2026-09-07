@@ -1559,6 +1559,13 @@
                     ]
                   },
                   {
+                    "group": "InclusionAI",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/InclusionAI/LLaDA-Image"
+                    ]
+                  },
+                  {
                     "group": "CircleStone",
                     "pages": [
                       "cookbook/diffusion/CircleStone/Anima"
