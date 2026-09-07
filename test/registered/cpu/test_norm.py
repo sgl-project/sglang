@@ -534,7 +534,7 @@ class TestFusedScaleShiftKernels:
             eps=eps,
         )
 
-        normalized = self.rmsnorm_ref(x, weight, eps)
+        normalized = self.rmsnorm_ref(x, weight, eps).to(input_dtype).float()
         ref = (normalized * (1.0 + scale.float()) + shift.float()).to(input_dtype)
 
         torch.testing.assert_close(
@@ -607,17 +607,20 @@ class TestFusedScaleShiftKernels:
             residual_fp32 = residual.float() + x.float() * gate.float()
 
         ref_residual = residual_fp32.to(input_dtype)
+        norm_input = ref_residual.float()
 
         if norm_type == "rms":
-            normalized = self.rmsnorm_ref(residual_fp32, weight, eps)
+            normalized = self.rmsnorm_ref(norm_input, weight, eps)
         else:
             normalized = torch.nn.functional.layer_norm(
-                residual_fp32,
+                norm_input,
                 (D,),
                 weight.float() if weight is not None else None,
                 bias.float() if bias is not None else None,
                 eps,
             )
+
+        normalized = normalized.to(input_dtype).float()
 
         ref_out = (normalized * (1.0 + scale.float()) + shift.float()).to(input_dtype)
 

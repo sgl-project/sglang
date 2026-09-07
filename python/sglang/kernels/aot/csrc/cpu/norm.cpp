@@ -318,6 +318,8 @@ struct NormReduceGeneric {
           x_fvec0 += r_fvec0;
           x_fvec1 += r_fvec1;
         }
+        bVec residual_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(residual_bvec);
       }
       sum2_fvec += x_fvec0 * x_fvec0;
       sum2_fvec += x_fvec1 * x_fvec1;
@@ -342,6 +344,7 @@ struct NormReduceGeneric {
         } else {
           x_val += static_cast<float>(residual[d]);
         }
+        x_val = static_cast<float>(static_cast<scalar_t>(x_val));
       }
       sum2_val += x_val * x_val;
       if constexpr (NormTraits<M>::has_mean) {
@@ -383,8 +386,9 @@ struct NormReduceGeneric {
           x_fvec0 += r_fvec0;
           x_fvec1 += r_fvec1;
         }
-        // Write residual + gate * x to the second output.
-        convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(residual_store + d);
+        bVec residual_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        residual_bvec.store(residual_store + d);
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(residual_bvec);
       }
       if constexpr (NormTraits<M>::has_mean) {
         x_fvec0 = x_fvec0 - mean_fvec;
@@ -416,6 +420,8 @@ struct NormReduceGeneric {
         x_fvec1 = NormTraits<M>::apply_gate(x_fvec1, g_fvec1);
       }
       if constexpr (has_scale_shift) {
+        bVec norm_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(norm_bvec);
         apply_scale_shift_vec(x_fvec0, x_fvec1, scale, shift, scale_stride_c, shift_stride_c, d);
       }
       bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
@@ -437,7 +443,9 @@ struct NormReduceGeneric {
         } else {
           x_val += static_cast<float>(residual[d]);
         }
-        residual_store[d] = static_cast<scalar_t>(x_val);
+        const scalar_t residual_val = static_cast<scalar_t>(x_val);
+        residual_store[d] = residual_val;
+        x_val = static_cast<float>(residual_val);
       }
       if constexpr (NormTraits<M>::has_mean) {
         x_val -= mean;
@@ -463,6 +471,7 @@ struct NormReduceGeneric {
         x_val = NormTraits<M>::apply_gate(x_val, g_val);
       }
       if constexpr (has_scale_shift) {
+        x_val = static_cast<float>(static_cast<scalar_t>(x_val));
         x_val = apply_scale_shift_scalar(x_val, scale, shift, scale_stride_c, shift_stride_c, d);
       }
       out[d] = static_cast<scalar_t>(x_val);
