@@ -158,6 +158,8 @@ def resolve_layer_indices(
 
     _assert_pp_mtp_compat(
         model_has_mtp_layers=model_has_mtp_layers,
+        model_architecture=model_config.hf_config.architectures[0],
+        is_draft_worker=is_draft_worker,
         spec_algorithm=spec_algorithm,
         num_effective_layers=num_effective_layers,
         model_num_layers=model_num_layers,
@@ -212,13 +214,24 @@ def _resolve_pp_layer_range(*, model: Any, model_num_layers: int) -> _PPLayerRan
 def _assert_pp_mtp_compat(
     *,
     model_has_mtp_layers: bool,
+    model_architecture: str,
+    is_draft_worker: bool,
     spec_algorithm: SpeculativeAlgorithm,
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
+    # GLM5Next target weights and attention layers are partitioned by PP stage;
+    # its separate NextN draft remains local to the last stage. Keep the draft
+    # layer/KV indexing invariant and the guard for other model architectures.
+    # check_pipeline_parallelism separately restricts speculative PP to
+    # synchronous disaggregation prefill with EAGLE/EAGLE3.
+    glm5_next_target = (
+        model_architecture == "Glm5NextForConditionalGeneration" and not is_draft_worker
+    )
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
+        or glm5_next_target
         or (
             (not spec_algorithm.is_none())
             and (num_effective_layers == model_num_layers)
