@@ -1,6 +1,6 @@
 """Config-time override declarations for deepseek_v2.
 
-Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
+Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, Glm5NextForConditionalGeneration, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
 """
 
 import logging
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
     "MistralLarge3ForCausalLM",
     "PixtralForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
+    "Glm5NextForConditionalGeneration",
     "HYV4ForCausalLM",
     "HYV4ForCausalLMNextN",
     "LongcatFlashForCausalLM",

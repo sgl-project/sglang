@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -729,6 +730,7 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
+        aborted_reqs: List[Req] = []
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
@@ -763,6 +765,13 @@ class SchedulerDisaggregationPrefillMixin:
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
+                if is_aborted(req):
+                    if self._retire_aborted_prefill_result(req):
+                        req.time_stats.set_completion_time()
+                        aborted_reqs.append(req)
+                    advance_logprob_pt(i, req)
+                    continue
+
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
                     self.optimistic_release_and_requeue(req)
@@ -770,6 +779,24 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
+                if req.grammar is not None:
+                    try:
+                        req.grammar.accept_token(next_token_id)
+                    except ValueError as e:
+                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    req.grammar.finished = req.finished()
+                    if is_aborted(req):
+                        if self._retire_aborted_prefill_result(req):
+                            req.time_stats.set_completion_time()
+                            aborted_reqs.append(req)
+                        advance_logprob_pt(i, req)
+                        continue
+
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
@@ -808,17 +835,6 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
-                if req.grammar is not None:
-                    try:
-                        req.grammar.accept_token(next_token_id)
-                    except ValueError as e:
-                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        prepare_abort(
-                            req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                    req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
                 req.inflight_middle_chunks -= 1
@@ -831,16 +847,18 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range is not None
                     and req.extend_range.end >= len(req.origin_input_ids)
                 )
-                if req.pending_bootstrap and not still_chunking:
-                    self.optimistic_release_and_requeue(req)
+                # Abort is terminal. Do not requeue an aborted optimistic
+                # request merely because bootstrap is still pending.
+                if is_aborted(req):
+                    if not still_chunking and self._retire_aborted_prefill_result(req):
+                        req.time_stats.set_completion_time()
+                        aborted_reqs.append(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
-                # Optimistic bootstrap can fail while this overlapped chunk is
-                # already running. Drop aborted chunks instead of sending KV.
-                if is_aborted(req):
-                    self.clear_pending_chunk_send(req)
+                if req.pending_bootstrap and not still_chunking:
+                    self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -876,6 +894,12 @@ class SchedulerDisaggregationPrefillMixin:
                 auxiliary_output_starts,
             )
 
+        if aborted_reqs:
+            self.output_streamer.stream_output(
+                aborted_reqs,
+                any(req.return_logprob for req in aborted_reqs),
+            )
+
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
@@ -883,6 +907,7 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+        self.maybe_send_health_check_signal()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
@@ -1029,6 +1054,35 @@ class SchedulerDisaggregationPrefillMixin:
         for the process lifetime.
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+
+    def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
+        """Release an aborted request when its last prefill result is safe."""
+        self.clear_pending_chunk_send(req)
+        owns_resources = (
+            req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
+        )
+        if not owns_resources:
+            # A bootstrap failure or earlier abort already retired it.
+            return False
+
+        sender = req.disagg_kv_sender
+        if sender is not None:
+            try:
+                sender.abort()
+            except Exception:
+                # Transport notification is best effort; local ownership must
+                # still be released or the next idle invariant check will fail.
+                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
+
+        if req.to_finish is not None and not req.finished():
+            req.update_finish_state()
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        req.pending_bootstrap = False
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        if req.kv.holds_kv or req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
@@ -1254,6 +1308,13 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
+            def _dsa_tail_payload():
+                return get_dsa_tail_state_indices(
+                    self.token_to_kv_pool_allocator.get_kvcache(),
+                    req.kv.req_pool_idx,
+                    seq_len,
+                )
+
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
                 # for the last `window` positions, in ascending position order so
@@ -1290,6 +1351,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,

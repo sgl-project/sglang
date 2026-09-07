@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -1411,6 +1412,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
+            def _dsa_tail_payload():
+                return get_dsa_tail_state_indices(
+                    self.token_to_kv_pool,
+                    decode_req.req.kv.req_pool_idx,
+                    seq_len,
+                )
+
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
@@ -1443,6 +1451,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,

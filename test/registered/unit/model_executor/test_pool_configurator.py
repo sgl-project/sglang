@@ -21,7 +21,7 @@ from sglang.srt.runtime_context import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 @contextlib.contextmanager
@@ -124,9 +124,11 @@ def _make_model_runner(
     mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    mc.hf_config.model_type = "llama"
     mc.hf_config.get_text_config = lambda: mc.hf_config
     mc.linear_attn_registry_result = None
     mc.context_len = 8192
+    mc.is_draft_model = False
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
 
