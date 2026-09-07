@@ -313,7 +313,13 @@ def test_submit_chunk_uses_legacy_batch_transfer_sync_contract() -> None:
     assert runtime.submit_chunk(execution.batches) == -1
 
 
-def test_prepared_request_lowers_partial_page_ranges_to_native_batch() -> None:
+@pytest.mark.parametrize(
+    ("max_batch_operations", "expected_batch_sizes"),
+    [(1024, (10,)), (3, (3, 3, 3, 1))],
+)
+def test_prepared_request_lowers_partial_page_ranges_to_native_batch(
+    max_batch_operations: int, expected_batch_sizes: tuple[int, ...]
+) -> None:
     source_runtime = _runtime(
         "prefill",
         total_layers=1,
@@ -363,13 +369,23 @@ def test_prepared_request_lowers_partial_page_ranges_to_native_batch() -> None:
         target_page_ids=(2,),
         token_start=3,
         token_count=5,
+        max_batch_operations=max_batch_operations,
     )
     assert source_runtime.submit_chunk(batches) == 0
 
-    assert sum(len(batch.sizes) for batch in batches) == 10
+    assert tuple(len(batch.sizes) for batch in batches) == expected_batch_sizes
     assert sum(sum(batch.sizes) for batch in batches) == 5 * 2 * 8 * 2
-    assert len(source_engine.calls) == 1
+    assert len(source_engine.calls) == len(expected_batch_sizes)
     assert source_engine.calls[0][0] == "target:12346"
+
+    with pytest.raises(ValueError, match="page_ids length"):
+        source_runtime.lower_chunk(
+            prepared_plan=prepared,
+            source_page_ids=(),
+            target_page_ids=(2,),
+            token_start=3,
+            token_count=5,
+        )
 
 
 @pytest.mark.parametrize("page_size", [1, 16])
@@ -441,6 +457,17 @@ def test_full_rows_coalesce_contiguous_source_and_target_slots(
     assert sum(len(batch.sizes) for batch in batches) == 2 * expected_runs
     assert len(batches) == 1
     assert sum(sum(batch.sizes) for batch in batches) == token_count * 2 * 2 * 8 * 2
+
+    if page_size == 16:
+        row_bytes = 2 * 8 * 2
+        assert batches[0].sizes == (
+            13 * row_bytes,
+            5 * row_bytes,
+            13 * row_bytes,
+            5 * row_bytes,
+        )
+        assert batches[0].source_addresses[0] == 1_000_000_000 + 19 * row_bytes
+        assert batches[0].target_addresses[0] == 2_000_000_000 + 83 * row_bytes
 
 
 def test_reshard_queue_preserves_legacy_session_affinity() -> None:

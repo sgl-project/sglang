@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from mooncake.reshard.kv_cache import KVCacheTransferBatch
+    from sglang.srt.disaggregation.mooncake.kv_reshard_lowering import (
+        KVCacheTransferBatch,
+    )
 
 KV_RESHARD_PROTOCOL = "KV_RESHARD"
 
@@ -455,8 +457,9 @@ class KVReshardRuntime:
         token_count: int,
         max_batch_operations: int = 1024,
     ) -> tuple[KVCacheTransferBatch, ...]:
-        from mooncake.reshard.kv_cache import (
-            KVCachePreparedTransferPlan,
+        from mooncake.reshard.kv_cache import KVCachePreparedTransferPlan
+
+        from sglang.srt.disaggregation.mooncake.kv_reshard_lowering import (
             lower_kv_cache_transfer,
         )
 
