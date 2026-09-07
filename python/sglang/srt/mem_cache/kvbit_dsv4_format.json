@@ -1,0 +1,19 @@
+{
+  "format_id": "dsv4_int4_sym_g32_e4m3",
+  "version": 1,
+  "nope_dim": 448,
+  "rope_dim": 64,
+  "group_size": 32,
+  "bits": 4,
+  "scale_dtype": "e4m3fn",
+  "scale_rounding": "nearest_even",
+  "code_range": [-7, 7],
+  "rope_dtype": "bfloat16",
+  "transform": "none",
+  "header_alignment": 16,
+  "native_row_bytes": 584,
+  "layouts": {
+    "aos_368": {"row_alignment": 16},
+    "aos_384": {"row_alignment": 128}
+  }
+}

@@ -182,11 +182,17 @@ target_compile_definitions(flashmla_ops PRIVATE)
 
 # Keep the DSV4 INT4 kernel isolated from the upstream FlashMLA ABI.
 # The mirrored sources are from FlashMLA-latest@98751d4 and retain its LICENSE.
+option(SGL_KERNEL_ENABLE_DSV4_INT4 "Build the SM90 DSV4 Direct INT4 extension" ON)
+option(SGL_KERNEL_DSV4_INT4_VECTOR_DEQUANT "Experimental BF16x2 INT4 producer" OFF)
+if(SGL_KERNEL_ENABLE_DSV4_INT4)
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS "12.8")
+    message(FATAL_ERROR "DSV4 Direct INT4 requires CUDA 12.8+; use -DSGL_KERNEL_ENABLE_DSV4_INT4=OFF otherwise")
+endif()
 set(KVBIT_FLASHMLA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../csrc/kvbit/flashmla")
 set(KVBIT_FLASHMLA_SOURCES
     "csrc/kvbit_flashmla_extension.cc"
     ${repo-flashmla_SOURCE_DIR}/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/smxx/decode/combine/combine.cu
+    ${KVBIT_FLASHMLA_ROOT}/sm90/decode/sparse_fp8/combine.cu
     ${KVBIT_FLASHMLA_ROOT}/sm90/decode/sparse_fp8/instantiations/model1_int4_h64.cu
 )
 
@@ -203,6 +209,9 @@ target_compile_options(kvbit_flashmla_ops PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=177>
     $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a>
 )
+if(SGL_KERNEL_DSV4_INT4_VECTOR_DEQUANT)
+    target_compile_definitions(kvbit_flashmla_ops PRIVATE SGL_KERNEL_DSV4_INT4_VECTOR_DEQUANT=1)
+endif()
 target_include_directories(kvbit_flashmla_ops PRIVATE
     ${KVBIT_FLASHMLA_ROOT}
     ${repo-flashmla_SOURCE_DIR}/csrc
@@ -225,3 +234,4 @@ install(
     DESTINATION "sgl_kernel"
     COMPONENT kvbit_flashmla
 )
+endif()

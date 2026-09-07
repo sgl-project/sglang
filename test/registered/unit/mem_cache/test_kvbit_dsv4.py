@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -111,7 +112,7 @@ class TestDSV4INT4Layout(CustomTestCase):
             encode_dsv4_int4_reference(torch.zeros(1, 511))
         with self.assertRaisesRegex(TypeError, "floating point"):
             encode_dsv4_int4_reference(torch.zeros(1, 512, dtype=torch.int32))
-        with self.assertRaisesRegex(ValueError, "last dimension must be 368"):
+        with self.assertRaisesRegex(ValueError, "row width must be 368 or 384"):
             decode_dsv4_int4_reference(torch.zeros(1, 367, dtype=torch.uint8))
 
     def test_geometry_rejects_non_dsv4_shape(self):
@@ -205,6 +206,24 @@ class TestDSV4INT4PackedSWAPool(CustomTestCase):
         self.assertIsInstance(pool, DeepSeekV4SingleKVPool)
         self.assertNotIsInstance(pool, DSV4KVBitPackedSWAPool)
 
+    def test_aligned_factories_account_for_padding(self):
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_DSV4_INT4_LAYOUT": "aos_384"}
+        ):
+            owner = self._owner(enabled=True)
+            pools = (
+                owner._make_swa_kv_pool(**self._pool_kwargs()),
+                owner._make_compressed_kv_pool(**self._pool_kwargs(page_size=64)),
+                owner._make_compressed_kv_pool(**self._pool_kwargs(page_size=2)),
+            )
+        for pool in pools:
+            with self.subTest(page_size=pool.page_size):
+                self.assertEqual(pool.get_bytes_per_token(), 384)
+                self.assertEqual(pool.bytes_per_page_padded, pool.page_size * 384)
+                self.assertEqual(
+                    pool.kv_buffer[0].numel(), pool.num_pages * pool.page_size * 384
+                )
+
 
 class TestDSV4INT4Attention(CustomTestCase):
     def test_sparse_decode_matches_reference(self):
@@ -261,12 +280,20 @@ class TestDSV4INT4Attention(CustomTestCase):
         expected = torch.ones(1, 1, 2, 512, dtype=torch.bfloat16)
         packed = torch.zeros(1, 256 * 368, dtype=torch.uint8)
 
-        for ratio, extra_page_size in ((0, None), (4, 64), (128, 2)):
-            with self.subTest(compress_ratio=ratio):
+        for ratio, extra_page_size, row_bytes in (
+            (0, None, 368),
+            (4, 64, 368),
+            (128, 2, 368),
+            (0, None, 384),
+            (4, 64, 384),
+            (128, 2, 384),
+        ):
+            with self.subTest(compress_ratio=ratio, row_bytes=row_bytes):
+                packed = torch.zeros(1, 256 * row_bytes, dtype=torch.uint8)
                 extra = (
                     None
                     if extra_page_size is None
-                    else torch.zeros(1, extra_page_size * 368, dtype=torch.uint8)
+                    else torch.zeros(1, extra_page_size * row_bytes, dtype=torch.uint8)
                 )
                 backend.token_to_kv_pool = SimpleNamespace(
                     get_extra_key_buffer=lambda _layer_id: extra,
@@ -295,7 +322,7 @@ class TestDSV4INT4Attention(CustomTestCase):
                 torch.testing.assert_close(output, expected.squeeze(1))
                 flashmla.assert_called_once()
                 call = flashmla.call_args.kwargs
-                self.assertEqual(tuple(call["packed_kcache"].shape), (256, 368))
+                self.assertEqual(tuple(call["packed_kcache"].shape), (256, row_bytes))
 
     def test_natural_log_lse_merge_matches_concatenated_attention(self):
         left_scores = torch.tensor([1.0, -2.0])

@@ -7,6 +7,7 @@
 #include <kerutils/kerutils.cuh>
 
 #include "defines.h"
+#include "packed_layout.h"
 #include "params.h"
 
 using namespace cute;
@@ -16,18 +17,14 @@ namespace sm90::decode::sparse_fp8 {
 template <ModelType MODEL_TYPE, int NUM_HEADS>
 class KernelTemplate {
  public:
-  static_assert(NUM_HEADS == 64 || NUM_HEADS == 128);
-  static constexpr bool PACKED_INT4 = true;
+  static_assert(NUM_HEADS == 64 && MODEL_TYPE == ModelType::MODEL1);
   static constexpr int NUM_M_BLOCKS = NUM_HEADS / 64;
   static constexpr int CLUSTER_SIZE = NUM_M_BLOCKS;
 
-  static constexpr int HEAD_DIM_K = MODEL_TYPE == ModelType::V32 ? 576 : 512;
+  static constexpr int HEAD_DIM_K = kvbit::dsv4::NOPE_DIM + kvbit::dsv4::ROPE_DIM;
   static constexpr int HEAD_DIM_V = 512;
-  static constexpr int HEAD_DIM_ROPE = 64;
-  static constexpr int HEAD_DIM_NOPE = HEAD_DIM_K - HEAD_DIM_ROPE;
-
-  static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 128 : 64;
-  static constexpr int NUM_SCALES = MODEL_TYPE == ModelType::V32 ? 4 : 8;  // For MODEL1: 7 fp8_e4m3 + 1 padding
+  static constexpr int HEAD_DIM_ROPE = kvbit::dsv4::ROPE_DIM;
+  static constexpr int HEAD_DIM_NOPE = kvbit::dsv4::NOPE_DIM;
 
   static constexpr int NUM_THREADS = 128 * 3;
   static constexpr int BLOCK_M = 64;
@@ -45,9 +42,6 @@ class KernelTemplate {
 
   using SmemLayoutKTile = decltype(tile_to_shape(
       GMMA::Layout_INTER_Atom<bf16, GMMA::Major::K>{}, Shape<Int<TOPK_BLOCK_SIZE>, _64>{}, Step<_1, _2>{}));
-
-  using SmemLayoutXTile =
-      decltype(tile_to_shape(GMMA::Layout_SW128_Atom<bf16, GMMA::Major::K>{}, Shape<Int<TOPK_BLOCK_SIZE>, _64>{}));
 
   template <int NUM_TILES>
   using SmemLayoutKTiles =
@@ -99,9 +93,6 @@ class KernelTemplate {
 
   using TiledMMA_QK = decltype(make_tiled_mma(
       GMMA::MMA_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{}, Layout<Shape<_1, _1, _1>>{}));
-
-  using TiledMMA_QK_rQ = decltype(make_tiled_mma(
-      GMMA::MMA_64x64x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::K>{}, Layout<Shape<_1, _1, _1>>{}));
 
   using TiledMMA_PV_LocalP = decltype(make_tiled_mma(
       GMMA::MMA_64x256x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>{}, Layout<Shape<_1, _1, _1>>{}));

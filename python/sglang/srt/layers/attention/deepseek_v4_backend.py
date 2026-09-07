@@ -68,7 +68,7 @@ from sglang.srt.layers.attention.verify_mask import (
 )
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.kvbit_dsv4 import DSV4_INT4_LAYOUT
+from sglang.srt.mem_cache.kvbit_dsv4_codec import layout_for_row_bytes
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
@@ -1690,11 +1690,12 @@ class DeepseekV4AttnBackend(
         if swa_indices.ndim == 2:
             swa_indices = swa_indices.unsqueeze(1)
 
+        layout = layout_for_row_bytes(packed_swa_cache.shape[1] // self.page_size)
         swa_shape_carrier = packed_swa_cache.view(
             packed_swa_cache.shape[0],
             self.page_size,
             1,
-            DSV4_INT4_LAYOUT.row_bytes,
+            layout.row_bytes,
         )
 
         extra_shape_carrier = None
@@ -1718,7 +1719,7 @@ class DeepseekV4AttnBackend(
                 extra_cache.shape[0],
                 extra_page_size,
                 1,
-                DSV4_INT4_LAYOUT.row_bytes,
+                layout.row_bytes,
             )
         assert swa_indices.shape[-1] % 64 == 0
         if extra_indices is not None:
@@ -1741,11 +1742,11 @@ class DeepseekV4AttnBackend(
 
         output, _ = kvbit_int4_flash_mla_with_kvcache(
             **common_kwargs,
-            packed_kcache=packed_swa_cache.view(-1, DSV4_INT4_LAYOUT.row_bytes),
+            packed_kcache=packed_swa_cache.view(-1, layout.row_bytes),
             extra_packed_kcache=(
                 None
                 if extra_shape_carrier is None
-                else extra_shape_carrier.view(-1, DSV4_INT4_LAYOUT.row_bytes)
+                else extra_shape_carrier.view(-1, layout.row_bytes)
             ),
         )
         return output.squeeze(1)

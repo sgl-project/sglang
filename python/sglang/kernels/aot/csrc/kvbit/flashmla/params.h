@@ -66,8 +66,7 @@ struct SparseAttnDecodeParams {
   ModelType model_type;
 
   cutlass::bfloat16_t* __restrict__ q;  // [b, s_q, h_q, d_qk]
-  // Optional original-Q pointer used when q carries folded NoPE for packed
-  // orig blocks but extra native blocks still need unfurled/original Q.
+  // Reserved upstream ABI slots; Direct INT4 never folds Q.
   cutlass::bfloat16_t* __restrict__ extra_q = nullptr;  // [b, s_q, h_q, d_qk]
   cutlass::bfloat16_t* __restrict__ kv;                 // [num_blocks, page_block_size, d_qk]
   int* __restrict__ indices;                            // [b, s_q, topk]
@@ -102,88 +101,11 @@ struct SparseAttnDecodeParams {
   int* __restrict__ num_splits_ptr;                             // [batch_size+1, ], contiguous
   int num_sm_parts;
 
-  // ------------------------------------------------------------------
-  // [M3.c.4 Stage-1a wiring] packed-FP8 rotated-quant KV cache pointers
-  // for the sparse decode path (mirrors DecodingParams_fp8 in
-  // csrc/extension/sm90/dense_fp8/flash_mla.h).
-  //
-  // These six pointers + meta are the **device-side handles** to the
-  // rotated low-precision KV cache (INT2/3/4 affine quant after a
-  // dense orthogonal rotation) for the sparse path. They are written
-  // by the host entry `sparse_attn_decode_interface` when all six
-  // caller tensors are non-None. The current sparse kernels do
-  // **not yet read these fields**; the next fork commit will fuse
-  // INT-N unpack + R @ x + ×scale + zero -> FP8 inside the K-tile
-  // load, removing the host-side shadow buffer entirely. Default
-  // values are nullptr / 0 so the pre-existing sparse path is
-  // byte-identical to before.
-  //
-  // Layout convention (matches python/sglang/srt/mem_cache/
-  // rotated_quant_dsv4_memory_pool.py wall-storage layout):
-  //   * packed_kcache : uint8 [num_pages * page_size, row_bytes_nope]
-  //                     (only the nope half; rope half kept BF16
-  //                      contiguous after nope bytes)
-  //   * scale_kcache  : float32 [num_pages * page_size, qk_nope_head_dim]
-  //                     per-element dequant scale
-  //   * R_matrix      : float32 [qk_nope_head_dim, qk_nope_head_dim]
-  //                     dense orthogonal rotation
-  //   * zero_point    : float32 [qk_nope_head_dim] per-element zero
-  // dim_of_bit / bitpos_in_dim: per-config bit-packing metadata
-  // (length = row_bits = sum(bits[d] for d in 0..qk_nope-1)),
-  // per-layer constants.
-  // ------------------------------------------------------------------
+  // Both packed sources use the same codec and row stride. Payload offsets
+  // are generated in packed_layout.h; there is no rotation or affine state.
   void* __restrict__ packed_kcache_ptr = nullptr;
-  float* __restrict__ scale_kcache_ptr = nullptr;
-  float* __restrict__ R_matrix_ptr = nullptr;
-  // [step3r] BF16-prestored R for the uniform-bit (bit_uniform>0) wgmma
-  //   fill_sR path. The kernel already truncates R to bf16 before the
-  //   gemm, so prestoring bf16 is value-identical (RNE) while halving the
-  //   L2 load width and removing the per-element fp32->bf16 conversion.
-  //   Set only when R_matrix is passed as bf16 (bit_uniform>0); the legacy
-  //   variable-bit float4 R@x path (bit_uniform==0) keeps R_matrix_ptr.
-  void* __restrict__ R_matrix_bf16_ptr = nullptr;
-  float* __restrict__ zero_point_ptr = nullptr;
-  int* __restrict__ dim_of_bit_ptr = nullptr;
-  int* __restrict__ bitpos_in_dim_ptr = nullptr;
-  int64_t packed_kv_block_stride = 0;
   int packed_row_bytes = 0;
-  int qk_nope_head_dim = 0;
-  int row_bits = 0;
-
-  // [c4c128-packed] Extra (c4/c128 sink) packed KV cache pointer + block
-  // stride. c4/c128 share the SAME calib cfg as SWA (build_synthetic_
-  // dsv4_calibration builds one R/scale/zero/bit_uniform for all layers),
-  // so scale_kcache_ptr / R_matrix(_bf16)_ptr / zero_point_ptr /
-  // dim_of_bit_ptr / bitpos_in_dim_ptr / packed_row_bytes / row_bits /
-  // qk_nope_head_dim / bit_uniform are REUSED verbatim. Only the packed
-  // byte buffer and its per-page stride differ per pool. When
-  // extra_packed_kcache_ptr is non-null the IS_EXTRA_BLOCK branch reads
-  // packed rows (bit-unpack + R@x fused dequant) instead of the dense
-  // FP8 shadow path. Default nullptr keeps the pre-existing dense extra
-  // path byte-identical.
   void* __restrict__ extra_packed_kcache_ptr = nullptr;
-  int64_t extra_packed_kv_block_stride = 0;
-
-  // ------------------------------------------------------------------
-  // Uniform-bit packed-row layout.
-  //
-  // When bit_uniform == 0 (default), the kernel reads the variable-bit
-  // layout described above (dim_of_bit/bitpos_in_dim + global scale/zp
-  // arrays). When bit_uniform > 0 (e.g. 3 or 4), every nope dim uses
-  // bit_uniform contiguous bits. The Direct INT4 specialization stores
-  // one E4M3 absmax/7 step per group32 in the packed-row header. This
-  // lets the kernel inner loop decode each signed nibble directly and
-  // avoid global scale/zero-point loads.
-  //
-  // bit_uniform == 0 -> legacy path (byte-identical to pre-step-5).
-  // ------------------------------------------------------------------
-  int bit_uniform = 0;
-  int uniform_header_bytes = 0;
-  int uniform_group_size = 32;
-  int uniform_num_groups = 0;
-  int q_nope_is_folded = 0;
-  int identity_tail_bypass = 0;
-  int debug_u32_packed_load = 0;
 };
 
 struct CombineParams {

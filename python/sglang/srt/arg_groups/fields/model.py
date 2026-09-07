@@ -205,8 +205,9 @@ class Model:
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
                 'recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "int4" '
                 "enables the target-only DeepSeek V4 368-byte signed INT4 cache "
-                "with group size 64, seven FP16 steps, and H256. It requires "
-                "CUDA SM90 and resolves its backing dtype as auto."
+                "with group size 32, E4M3-nearest scales, BF16 RoPE, and no rotation. "
+                "It requires CUDA SM90, the INT4 AOT extension, and 64 local query "
+                "heads, and resolves its backing dtype as auto."
             ),
             choices=[
                 "auto",

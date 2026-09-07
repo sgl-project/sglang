@@ -1372,11 +1372,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         positions: torch.Tensor,
     ) -> None:
         if self.swa_kv_pool.is_dsv4_kvbit_packed_swa:
-            # The fused WQKV projection returns KV as a non-contiguous tail
-            # view whose row stride includes the Q-LoRA prefix. The in-place
-            # norm/RoPE kernel assumes tightly packed 512-element rows.
-            kv = kv.contiguous()
-            fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
+            if envs.SGLANG_DSV4_INT4_STRIDED_NORM_ROPE.get():
+                from sglang.kernels.ops.attention.deepseek_v4_rope import (
+                    fused_norm_rope_inplace_triton,
+                )
+
+                # Both this kernel and the packed writer honor the WQKV tail stride.
+                fused_norm_rope_inplace_triton(kv, kv_weight, eps, freqs_cis, positions)
+            else:
+                kv = kv.contiguous()
+                fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
             return self.swa_kv_pool.set_key_buffer_fused(
                 self._swa_local_layer_id(layer_id), swa_loc, kv
             )

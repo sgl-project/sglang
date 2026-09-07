@@ -70,6 +70,12 @@ repos:
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
   - repo: local
     hooks:
+      - id: check-dsv4-int4-layout
+        name: check generated DSV4 INT4 layout ABI
+        entry: python3 scripts/kvbit/generate_dsv4_layout.py --check
+        language: system
+        files: ^(scripts/kvbit/generate_dsv4_layout\.py|python/sglang/srt/mem_cache/kvbit_dsv4_(format\.json|layout_constants\.py)|python/sglang/kernels/aot/csrc/kvbit/flashmla/packed_layout\.h)$
+        pass_filenames: false
       - id: forbid-docs-new-path
         name: forbid docs_new/ (renamed to docs/)
         # docs_new/ was renamed to docs/ in #32123. `language: fail` fires only

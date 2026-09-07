@@ -61,8 +61,8 @@ from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.kvbit_dsv4 import (
     dsv4_kvbit_enabled_for_worker,
     require_dsv4_kvbit_runtime_capability,
-    validate_dsv4_int4_geometry,
 )
+from sglang.srt.mem_cache.kvbit_dsv4_codec import validate_dsv4_int4_attention
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -1350,9 +1350,18 @@ class KVCacheConfigurator:
                 raise RuntimeError(
                     "DSV4 KVBit packed persistent KV does not support disaggregation."
                 )
-            validate_dsv4_int4_geometry(
-                self.model_config.qk_nope_head_dim,
-                self.model_config.qk_rope_head_dim,
+            validate_dsv4_int4_attention(
+                num_attention_heads=self.model_config.num_attention_heads,
+                attn_tp_size=get_parallel().attn_tp_size,
+                nope_dim=self.model_config.qk_nope_head_dim,
+                rope_dim=self.model_config.qk_rope_head_dim,
+                head_dim_v=self.model_config.v_head_dim,
+                kv_heads=getattr(
+                    self.model_config.hf_text_config, "num_key_value_heads", 1
+                ),
+                sparse_width=getattr(
+                    self.model_config.hf_text_config, "index_topk", 512
+                ),
             )
             require_dsv4_kvbit_runtime_capability()
 

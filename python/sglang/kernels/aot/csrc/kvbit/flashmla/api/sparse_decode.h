@@ -1,9 +1,12 @@
 #pragma once
 
+#include <cmath>
+
 #include "common.h"
+#include "packed_layout.h"
 #include "params.h"
+#include "sm90/decode/sparse_fp8/combine.h"
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
-#include "smxx/decode/combine/combine.h"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 
 // Feature set of sparse decoding kernels
@@ -51,21 +54,13 @@ class Decode_Int4_Sm90_Impl : public DecodeImplBase {
   }
 };
 
-// ---------------------------------------------------------------------------
-// [M3.c.4 Stage-1a] sparse-path packed buffer validator.
-//
-// Mirrors validate_packed_buffers() in csrc/extension/sm90/dense_fp8/
-// dense_fp8_packed_entry.cpp but adapted to sparse path's kv layout
-// (`kv` is [num_blocks, page_block_size, h_kv=1, bytes_per_token]).
-// Stage-1a: kernel does NOT yet read these fields. Buffer wiring here
-// only ensures call-site ABI is stable and `params.*_ptr` slots are
-// populated for the next-stage S2-S2 fused-dequant kernel.
-// ---------------------------------------------------------------------------
-inline void sparse_validate_int4_buffer(const at::Tensor& packed_kcache, int kv_num_rows, const char* name) {
+inline void
+sparse_validate_int4_buffer(const at::Tensor& packed_kcache, int64_t kv_num_rows, int row_bytes, const char* name) {
   KU_CHECK_DEVICE(packed_kcache);
   TORCH_CHECK(packed_kcache.dtype() == at::kByte, name, " must be uint8");
-  TORCH_CHECK(packed_kcache.dim() == 2, name, " must be rank-2 [num_rows, 368], got ", packed_kcache.dim());
+  TORCH_CHECK(packed_kcache.dim() == 2, name, " must be rank-2 [num_rows, row_bytes]");
   TORCH_CHECK(packed_kcache.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(packed_kcache.data_ptr()) % 16 == 0, name, " must be 16-byte aligned");
   TORCH_CHECK(
       packed_kcache.size(0) == kv_num_rows,
       name,
@@ -74,23 +69,19 @@ inline void sparse_validate_int4_buffer(const at::Tensor& packed_kcache, int kv_
       " must equal KV num_rows ",
       kv_num_rows);
   TORCH_CHECK(
-      packed_kcache.size(1) == 368,
+      packed_kcache.size(1) == row_bytes,
       name,
-      " row_bytes must be 368 (224-byte signed nibbles + 14-byte G32 E4M3 steps + "
-      "2-byte padding + 128-byte BF16 RoPE), got ",
+      " must match the shape-carrier row stride, got ",
       packed_kcache.size(1));
 }
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_interface(
-    const at::Tensor& q,                           // [b, s_q, h_q, d_qk]
-    const at::Tensor& kv,                          // [num_blocks, page_block_size, h_k, d_qk]
-    const at::Tensor& indices,                     // [b, s_q, topk]
-    const std::optional<at::Tensor>& topk_length,  // [b, s_q]
-    const std::optional<at::Tensor>& attn_sink,    // [h_q]
-    // [Stage-1a fix] non-const ref had broken pybind11 std::optional caster
-    // for Python None on torch 2.9.1 build; switch to const-ref + local
-    // mutable copy below to restore None-acceptance (matches 71c7379 behavior).
+    const at::Tensor& q,                                          // [b, s_q, h_q, d_qk]
+    const at::Tensor& kv,                                         // [num_blocks, page_block_size, h_k, d_qk]
+    const at::Tensor& indices,                                    // [b, s_q, topk]
+    const std::optional<at::Tensor>& topk_length,                 // [b], shared across query positions
+    const std::optional<at::Tensor>& attn_sink,                   // [h_q]
     const std::optional<at::Tensor>& tile_scheduler_metadata_in,  // num_sm_parts x (DecodingSchedMetaSize/4)
     const std::optional<at::Tensor>& num_splits_in,               // batch_size + 1
     const std::optional<at::Tensor>& extra_kv,
@@ -102,16 +93,18 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor>& extra_packed_kcache = std::nullopt) {
   using bf16 = cutlass::bfloat16_t;
 
-  // [Stage-1a fix] Re-introduce mutable local copies so the rest of this
-  // function (which used to take non-const refs) keeps working unchanged.
-  // The function may emplace freshly-allocated tensors below when callers
-  // pass None, then return them out via the std::tuple<...> at the end.
+  // Return newly allocated metadata without mutating optional inputs.
   std::optional<at::Tensor> tile_scheduler_metadata = tile_scheduler_metadata_in;
   std::optional<at::Tensor> num_splits = num_splits_in;
 
   KU_CHECK_NDIM(q, 4);
   KU_CHECK_NDIM(kv, 4);
   KU_CHECK_NDIM(indices, 3);
+  KU_CHECK_NDIM(extra_kv, 4);
+  KU_CHECK_NDIM(extra_indices, 3);
+  TORCH_CHECK(
+      tile_scheduler_metadata.has_value() == num_splits.has_value(),
+      "tile_scheduler_metadata and num_splits must be supplied together");
 
   int b = q.size(0);
   int s_q = q.size(1);
@@ -121,6 +114,13 @@ sparse_attn_decode_interface(
   int page_block_size = kv.size(1);
   int h_kv = kv.size(2);
   int topk = indices.size(2);
+  const int row_bytes = kv.size(3);
+  TORCH_CHECK(
+      row_bytes == kvbit::dsv4::COMPACT_ROW_BYTES || row_bytes == kvbit::dsv4::ALIGNED_ROW_BYTES,
+      "INT4 row width must be 368 or 384, got ",
+      row_bytes);
+  TORCH_CHECK(
+      page_block_size == 2 || page_block_size == 64 || page_block_size == 256, "INT4 page size must be 2, 64 or 256");
 
   bool have_topk_length = topk_length.has_value();
   bool have_extra_kcache = extra_kv.has_value();
@@ -139,6 +139,7 @@ sparse_attn_decode_interface(
   // metadata sanity check
   TORCH_CHECK(b > 0);
   TORCH_CHECK(s_q > 0);
+  TORCH_CHECK(std::isfinite(sm_scale) && sm_scale > 0, "INT4 softmax scale must be finite and positive");
   TORCH_CHECK(h_q == 64, "KVBit sparse decode supports exactly 64 query heads, got ", h_q);
   TORCH_CHECK(h_kv == 1, "Currently only MQA (i.e. h_kv == 1) is supported for sparse decoding");
   TORCH_CHECK(
@@ -147,12 +148,16 @@ sparse_attn_decode_interface(
       "(448 NoPE + 64 RoPE), got ",
       d_qk);
   TORCH_CHECK(d_v == 512, "KVBit sparse decode supports only head_size_v=512");
-  TORCH_CHECK(topk > 0);
+  TORCH_CHECK(topk > 0 && topk % 64 == 0, "INT4 sparse width must be positive and divisible by 64");
 
   if (have_extra_kcache) {
     TORCH_CHECK(
         extra_indices.has_value(),
         "extra_indices_in_kvcache must be provided when extra_kcache is provided for sparse attention");
+    TORCH_CHECK(extra_topk > 0 && extra_topk % 64 == 0, "INT4 extra sparse width must be positive and divisible by 64");
+    TORCH_CHECK(
+        extra_page_block_size == 2 || extra_page_block_size == 64 || extra_page_block_size == 256,
+        "INT4 extra page size must be 2, 64 or 256");
   } else {
     TORCH_CHECK(
         !extra_indices.has_value(), "extra_indices_in_kvcache must not be provided when extra_k_cache is not provided");
@@ -231,12 +236,11 @@ sparse_attn_decode_interface(
   // Check shape
   KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
   {
-    // The shape-carrier aliases the fixed packed row ABI.
-    constexpr int bytes_per_token = 368;
+    const int bytes_per_token = row_bytes;
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, bytes_per_token);
     if (extra_kv.has_value()) {
       const int extra_bpt = static_cast<int>(extra_kv->size(3));
-      TORCH_CHECK(extra_bpt == bytes_per_token, "INT4 extra_kv bytes_per_token must be 368, got ", extra_bpt);
+      TORCH_CHECK(extra_bpt == bytes_per_token, "INT4 sources must use the same physical row layout");
       KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, extra_bpt);
       TORCH_CHECK(
           extra_kv->stride(1) == extra_bpt,
@@ -250,6 +254,18 @@ sparse_attn_decode_interface(
   KU_CHECK_SHAPE(attn_sink, h_q);
   KU_CHECK_SHAPE(extra_indices, b, s_q, extra_topk);
   KU_CHECK_SHAPE(extra_topk_length, b);
+  sparse_validate_int4_buffer(
+      packed_kcache, static_cast<int64_t>(num_blocks) * page_block_size, row_bytes, "packed_kcache");
+  TORCH_CHECK(
+      have_extra_kcache == extra_packed_kcache.has_value(),
+      "extra_kv and extra_packed_kcache must be supplied together");
+  if (have_extra_kcache) {
+    sparse_validate_int4_buffer(
+        *extra_packed_kcache,
+        static_cast<int64_t>(extra_num_blocks) * extra_page_block_size,
+        row_bytes,
+        "extra_packed_kcache");
+  }
 
   auto opts = q.options();
 
@@ -383,30 +399,19 @@ sparse_attn_decode_interface(
   params.stride_o_accum_s_q = int64_stride_to_int(o_accum.stride(1));
   params.stride_o_accum_h_q = int64_stride_to_int(o_accum.stride(2));
 
-  // Wire the single supported 368-byte signed INT4 + G32 E4M3-step row ABI.
+  // Physical stride varies; payload offsets and quantization do not.
   {
     TORCH_CHECK(
         !have_extra_kcache || extra_packed_kcache.has_value(),
         "KVBit INT4 sparse decode requires extra_packed_kcache when extra_kv is present");
 
-    sparse_validate_int4_buffer(packed_kcache, num_blocks * page_block_size, "packed_kcache");
     params.packed_kcache_ptr = packed_kcache.data_ptr();
-    params.packed_row_bytes = 368;
-    params.packed_kv_block_stride = static_cast<int64_t>(page_block_size) * 368;
-    params.qk_nope_head_dim = 448;
-    params.row_bits = 1792;
-    params.bit_uniform = 4;
-    params.identity_tail_bypass = 0;
-    params.uniform_group_size = 32;
-    params.uniform_num_groups = 14;
-    params.uniform_header_bytes = 16;
+    params.packed_row_bytes = row_bytes;
 
     if (extra_packed_kcache.has_value()) {
       TORCH_CHECK(extra_kv.has_value(), "extra_packed_kcache requires extra_kv");
       const at::Tensor& epk = extra_packed_kcache.value();
-      sparse_validate_int4_buffer(epk, extra_num_blocks * extra_page_block_size, "extra_packed_kcache");
       params.extra_packed_kcache_ptr = epk.data_ptr();
-      params.extra_packed_kv_block_stride = static_cast<int64_t>(extra_page_block_size) * 368;
     }
   }
 
@@ -440,7 +445,7 @@ sparse_attn_decode_interface(
 
       ku::get_optional_tensor_ptr<float>(attn_sink),
       at::cuda::getCurrentCUDAStream().stream()};
-  smxx::decode::run_flash_mla_combine_kernel<bf16>(combine_params);
+  kvbit::dsv4::run_int4_combine(combine_params);
 
   return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
 }

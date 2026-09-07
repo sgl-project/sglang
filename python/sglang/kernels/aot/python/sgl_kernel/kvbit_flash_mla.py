@@ -14,8 +14,25 @@ else:
 
 _IMPORT_ERROR = ImportError(
     "Failed to load sgl_kernel.kvbit_flashmla_ops extension. "
-    "Ensure CUDA Driver >= 12.4."
+    "Rebuild the DSV4 INT4 AOT target for this checkout and CUDA installation."
 )
+
+
+def require_kvbit_int4_extension() -> None:
+    """Reject missing, unregistered, or stale native extensions before allocation."""
+    if _kvbit_flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _kvbit_flashmla_import_error
+    ops = torch.ops.sgl_kernel
+    if not hasattr(ops, "kvbit_int4_sparse_decode_fwd") or not hasattr(
+        ops, "kvbit_int4_abi_version"
+    ):
+        raise ImportError("DSV4 INT4 AOT ops are missing; rebuild kvbit_flashmla_ops.")
+    if ops.kvbit_int4_abi_version() != 2:
+        raise ImportError("DSV4 INT4 AOT ABI mismatch; rebuild kvbit_flashmla_ops.")
+    if not torch._C._dispatch_has_kernel_for_dispatch_key(
+        "sgl_kernel::kvbit_int4_sparse_decode_fwd", "CUDA"
+    ):
+        raise ImportError("DSV4 INT4 decode op has no CUDA implementation.")
 
 
 def kvbit_int4_flash_mla_with_kvcache(
@@ -34,7 +51,7 @@ def kvbit_int4_flash_mla_with_kvcache(
     extra_topk_length: Optional[torch.Tensor] = None,
     extra_packed_kcache: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run the 368-byte signed INT4+G64 FP16-step+H256 MODEL1/H64 kernel."""
+    """G32 signed INT4/E4M3-nearest, BF16 RoPE, no rotation; 368/384 B rows."""
     if _kvbit_flashmla_import_error is not None:
         raise _IMPORT_ERROR from _kvbit_flashmla_import_error
     if indices is None:

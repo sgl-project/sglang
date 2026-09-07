@@ -1178,6 +1178,18 @@ class TestDSV4KVBitBudget(CustomTestCase):
         expected = 100_000.0 - (584 - 368) * (0.5 * 60 + 15 / (4 * 2) + 45 / 128)
         self.assertEqual(configurator.bytes_per_full_token, expected)
 
+    def test_aligned_layout_charges_physical_padding(self):
+        from sglang.srt.environ import envs
+
+        configurator = self._configurator()
+        with envs.SGLANG_DSV4_INT4_LAYOUT.override("aos_384"):
+            configurator._apply_kvbit_target_swa_budget(
+                SimpleNamespace(is_draft_worker=False, kv_cache_dtype_str="int4")
+            )
+        expected = 100_000.0 - (584 - 384) * (0.5 * 60 + 15 / 4 + 45 / 128)
+        self.assertEqual(configurator.bytes_per_full_token, expected)
+        self.assertEqual(configurator.kvbit_layout.row_bytes, 384)
+
     def test_draft_and_disabled_budgets_remain_native(self):
         for kv_cache_dtype, is_draft_worker in (("auto", False), ("int4", True)):
             with self.subTest(

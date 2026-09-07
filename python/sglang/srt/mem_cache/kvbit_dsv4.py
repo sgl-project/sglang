@@ -8,7 +8,6 @@ used before the target worker may allocate packed SWA storage.
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import NamedTuple
 
 import torch
 
@@ -23,93 +22,37 @@ except ImportError:
     _HAS_TRITON = False
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache import kvbit_dsv4_layout_constants as abi
+from sglang.srt.mem_cache.kvbit_dsv4_codec import (
+    DSV4_INT4_LAYOUT,
+    DSV4KVBitLayout,
+    decode_dsv4_int4_reference,
+    encode_dsv4_int4_reference,
+    layout_for_row_bytes,
+    validate_dsv4_int4_geometry,
+)
+from sglang.srt.mem_cache.kvbit_dsv4_runtime import (
+    DSV4KVBitRuntimeCapability,
+    require_dsv4_kvbit_runtime_capability,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache
 
-DSV4_KVBIT_NOPE_DIM = 448
-DSV4_KVBIT_ROPE_DIM = 64
-DSV4_KVBIT_GROUP_SIZE = 32
-DSV4_KVBIT_BITS = 4
-DSV4_KVBIT_CODE_BYTES = 224
-DSV4_KVBIT_ROPE_BYTES = 128
-DSV4_KVBIT_INT4_HEADER_BYTES = 16
-DSV4_KVBIT_INT4_ROW_BYTES = 368
-DSV4_NATIVE_SWA_ROW_BYTES = 584
+DSV4_NATIVE_SWA_ROW_BYTES = abi.NATIVE_ROW_BYTES
+
+# Preserve the public reference-codec and capability imports.
+__all__ = [
+    "DSV4_INT4_LAYOUT",
+    "DSV4KVBitLayout",
+    "DSV4KVBitRuntimeCapability",
+    "decode_dsv4_int4_reference",
+    "encode_dsv4_int4_reference",
+    "require_dsv4_kvbit_runtime_capability",
+]
 
 
-class DSV4KVBitLayout(NamedTuple):
-    nope_dim: int
-    rope_dim: int
-    group_size: int
-    bits: int
-    code_bytes: int
-    header_bytes: int
-    rope_bytes: int
-    row_bytes: int
-
-    @property
-    def header_offset(self) -> int:
-        return self.code_bytes
-
-    @property
-    def rope_offset(self) -> int:
-        return self.code_bytes + self.header_bytes
-
-    def offsets(self) -> dict[str, tuple[int, int]]:
-        return {
-            "codes": (0, self.code_bytes),
-            "header": (self.header_offset, self.rope_offset),
-            "rope": (self.rope_offset, self.row_bytes),
-        }
-
-
-DSV4_INT4_LAYOUT = DSV4KVBitLayout(
-    nope_dim=DSV4_KVBIT_NOPE_DIM,
-    rope_dim=DSV4_KVBIT_ROPE_DIM,
-    group_size=DSV4_KVBIT_GROUP_SIZE,
-    bits=DSV4_KVBIT_BITS,
-    code_bytes=DSV4_KVBIT_CODE_BYTES,
-    header_bytes=DSV4_KVBIT_INT4_HEADER_BYTES,
-    rope_bytes=DSV4_KVBIT_ROPE_BYTES,
-    row_bytes=DSV4_KVBIT_INT4_ROW_BYTES,
-)
-
-
-class DSV4KVBitRuntimeCapability(NamedTuple):
-    direct_packed_write: bool
-    direct_packed_decode: bool
-
-
-DSV4_KVBIT_RUNTIME_CAPABILITY = DSV4KVBitRuntimeCapability(
-    direct_packed_write=_HAS_TRITON,
-    direct_packed_decode=_HAS_TRITON,
-)
-
-
-def require_dsv4_kvbit_runtime_capability(
-    capability: DSV4KVBitRuntimeCapability = DSV4_KVBIT_RUNTIME_CAPABILITY,
-) -> None:
-    missing = []
-    if not capability.direct_packed_write:
-        missing.append("direct packed write")
-    if not capability.direct_packed_decode:
-        missing.append("direct packed decode")
-    if missing:
-        raise RuntimeError(
-            "--kv-cache-dtype int4 requires DSV4 "
-            + " and ".join(missing)
-            + " capability; native/scratch fallback is disabled."
-        )
-
-
-def validate_dsv4_int4_geometry(nope_dim: int, rope_dim: int) -> None:
-    if (nope_dim, rope_dim) != (
-        DSV4_INT4_LAYOUT.nope_dim,
-        DSV4_INT4_LAYOUT.rope_dim,
-    ):
-        raise ValueError(
-            "DSV4 INT4 supports only the built-in 448-nope/64-rope "
-            f"layout, got {nope_dim}-nope/{rope_dim}-rope."
-        )
+def get_dsv4_int4_layout() -> DSV4KVBitLayout:
+    return DSV4KVBitLayout(envs.SGLANG_DSV4_INT4_LAYOUT.get())
 
 
 def dsv4_kvbit_enabled_for_worker(
@@ -125,108 +68,14 @@ def dsv4_kvbit_target_persistent_savings(
     num_c4_layers: int,
     num_c128_layers: int,
     c4_shrink_factor: float = 1.0,
+    layout: DSV4KVBitLayout = DSV4_INT4_LAYOUT,
 ) -> float:
-    row_saving = DSV4_NATIVE_SWA_ROW_BYTES - DSV4_INT4_LAYOUT.row_bytes
+    row_saving = DSV4_NATIVE_SWA_ROW_BYTES - layout.row_bytes
     return row_saving * (
         swa_ratio * num_target_layers
         + num_c4_layers / (4 * c4_shrink_factor)
         + num_c128_layers / 128
     )
-
-
-def _require_cpu_tensor(tensor: torch.Tensor, *, name: str) -> None:
-    if tensor.device.type != "cpu":
-        raise ValueError(f"{name} must be a CPU tensor")
-
-
-def encode_dsv4_int4_reference(kv: torch.Tensor) -> torch.Tensor:
-    """Encode signed INT4 DSV4 rows with one E4M3 scale per 32 NoPE values."""
-    _require_cpu_tensor(kv, name="kv")
-    layout = DSV4_INT4_LAYOUT
-    expected_dim = layout.nope_dim + layout.rope_dim
-    if kv.ndim < 1 or kv.shape[-1] != expected_dim:
-        raise ValueError(f"kv last dimension must be {expected_dim}, got {kv.shape}")
-    if not kv.is_floating_point():
-        raise TypeError(f"kv must be floating point, got {kv.dtype}")
-
-    leading_shape = kv.shape[:-1]
-    rows = kv.reshape(-1, expected_dim)
-    num_groups = layout.nope_dim // layout.group_size
-    nope = rows[:, : layout.nope_dim].float().reshape(-1, num_groups, layout.group_size)
-    max_abs = nope.abs().amax(dim=-1)
-    stored_step = (max_abs / 7.0).clamp_max(torch.finfo(torch.float8_e4m3fn).max)
-    stored_step = stored_step.to(torch.float8_e4m3fn)
-    quant_step = stored_step.float()
-    has_step = quant_step > 0
-    safe_step = torch.where(has_step, quant_step, torch.ones_like(quant_step))
-    # torch.round is round-to-nearest-even; -8 remains reserved.
-    codes = torch.round(nope / safe_step.unsqueeze(-1)).clamp_(-7, 7).to(torch.int8)
-    codes = torch.where(has_step.unsqueeze(-1), codes, torch.zeros_like(codes))
-    unsigned_codes = codes.to(torch.uint8) & 0x0F
-    packed_codes = (
-        unsigned_codes[..., 0::2] | (unsigned_codes[..., 1::2] << 4)
-    ).reshape(-1, layout.code_bytes)
-
-    headers = torch.zeros((rows.shape[0], layout.header_bytes), dtype=torch.uint8)
-    headers[:, :num_groups] = (
-        stored_step.contiguous().view(torch.uint8).reshape(-1, num_groups)
-    )
-    rope = (
-        rows[:, layout.nope_dim :]
-        .to(torch.bfloat16)
-        .contiguous()
-        .view(torch.uint8)
-        .reshape(-1, layout.rope_bytes)
-    )
-    packed = torch.cat((packed_codes, headers, rope), dim=-1)
-    return packed.reshape(*leading_shape, layout.row_bytes)
-
-
-def _decode_dsv4_int4_stored_domain(
-    packed: torch.Tensor,
-) -> torch.Tensor:
-    _require_cpu_tensor(packed, name="packed")
-    layout = DSV4_INT4_LAYOUT
-    if packed.dtype != torch.uint8:
-        raise TypeError(f"packed must have dtype torch.uint8, got {packed.dtype}")
-    if packed.ndim < 1 or packed.shape[-1] != layout.row_bytes:
-        raise ValueError(
-            f"packed last dimension must be {layout.row_bytes}, got {packed.shape}"
-        )
-
-    leading_shape = packed.shape[:-1]
-    rows = packed.reshape(-1, layout.row_bytes)
-    packed_codes = rows[:, : layout.code_bytes]
-    unsigned_codes = torch.stack(
-        (packed_codes & 0x0F, packed_codes >> 4), dim=-1
-    ).reshape(-1, layout.nope_dim // layout.group_size, layout.group_size)
-    codes = unsigned_codes.to(torch.int8)
-    codes = torch.where(codes >= 8, codes - 16, codes).float()
-    steps = (
-        rows[
-            :,
-            layout.header_offset : layout.header_offset
-            + layout.nope_dim // layout.group_size,
-        ]
-        .contiguous()
-        .view(torch.float8_e4m3fn)
-        .reshape(-1, layout.nope_dim // layout.group_size)
-        .float()
-    )
-    nope = (codes * steps.unsqueeze(-1)).reshape(-1, layout.nope_dim)
-    rope = (
-        rows[:, layout.rope_offset :]
-        .contiguous()
-        .view(torch.bfloat16)
-        .reshape(-1, layout.rope_dim)
-    )
-    decoded = torch.cat((nope.to(torch.bfloat16), rope), dim=-1)
-    return decoded.reshape(*leading_shape, layout.nope_dim + layout.rope_dim)
-
-
-def decode_dsv4_int4_reference(packed: torch.Tensor) -> torch.Tensor:
-    """Decode E4M3-scale signed INT4 rows without a Hadamard transform."""
-    return _decode_dsv4_int4_stored_domain(packed)
 
 
 def merge_attention_states_natural_log(
@@ -277,13 +126,19 @@ if _HAS_TRITON:
         loc_ptr,
         packed_ptr,
         stride_kv_row,
+        stride_loc,
         stride_page,
         num_pages,
         PAGE_SIZE: tl.constexpr,
         ROW_BYTES: tl.constexpr,
+        CODE_BYTES: tl.constexpr,
+        HEADER_OFFSET: tl.constexpr,
+        ROPE_OFFSET: tl.constexpr,
+        PAYLOAD_BYTES: tl.constexpr,
+        NUM_GROUPS: tl.constexpr,
     ):
-        row = tl.program_id(0)
-        loc = tl.load(loc_ptr + row)
+        row = tl.program_id(0).to(tl.int64)
+        loc = tl.load(loc_ptr + row * stride_loc).to(tl.int64)
         valid_loc = (loc >= 0) & (loc < num_pages * PAGE_SIZE)
         page = loc // PAGE_SIZE
         page_offset = loc % PAGE_SIZE
@@ -293,16 +148,21 @@ if _HAS_TRITON:
         values = tl.load(kv_ptr + row * stride_kv_row + offs).to(tl.float32)
         grouped = tl.reshape(values, [16, 32])
         max_abs = tl.max(tl.abs(grouped), axis=1)
-        stored_step = tl.minimum(max_abs / 7.0, 448.0).to(tl.float8e4nv)
+        stored_step = tl.minimum(tl.div_rn(max_abs, 7.0), 448.0).to(tl.float8e4nv)
         quant_step = stored_step.to(tl.float32)
         has_step = quant_step > 0
         safe_step = tl.where(has_step, quant_step, 1.0)
-        normalized = grouped / safe_step[:, None]
-        lower = tl.floor(normalized)
-        fraction = normalized - lower
-        lower_i32 = lower.to(tl.int32)
-        round_up = (fraction > 0.5) | ((fraction == 0.5) & ((lower_i32 & 1) != 0))
-        rounded = lower_i32 + round_up.to(tl.int32)
+        normalized = tl.minimum(
+            tl.maximum(tl.div_rn(grouped, safe_step[:, None]), -7.0), 7.0
+        )
+        rounded = tl.inline_asm_elementwise(
+            "cvt.rni.s32.f32 $0, $1;",
+            constraints="=r,f",
+            args=[normalized],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
         rounded = tl.where(has_step[:, None], rounded, 0)
         codes = tl.minimum(tl.maximum(rounded, -7), 7).to(tl.int8)
         paired = tl.reshape(codes.to(tl.uint8) & 0x0F, [16, 16, 2])
@@ -312,14 +172,14 @@ if _HAS_TRITON:
         tl.store(
             dst + code_offsets,
             packed_codes,
-            mask=valid_loc & (code_offsets < 224),
+            mask=valid_loc & (code_offsets < CODE_BYTES),
         )
 
         group_offsets = tl.arange(0, 16)
         stored_step_bits = stored_step.to(tl.uint8, bitcast=True)
         tl.store(
-            dst + 224 + group_offsets,
-            tl.where(group_offsets < 14, stored_step_bits, 0),
+            dst + HEADER_OFFSET + group_offsets,
+            tl.where(group_offsets < NUM_GROUPS, stored_step_bits, 0),
             mask=valid_loc,
         )
 
@@ -328,10 +188,13 @@ if _HAS_TRITON:
             tl.bfloat16
         )
         tl.store(
-            (dst + 240).to(tl.pointer_type(tl.bfloat16)) + rope_offsets,
+            (dst + ROPE_OFFSET).to(tl.pointer_type(tl.bfloat16)) + rope_offsets,
             rope,
             mask=valid_loc,
         )
+        if ROW_BYTES > PAYLOAD_BYTES:
+            pad_offsets = tl.arange(0, 16)
+            tl.store(dst + PAYLOAD_BYTES + pad_offsets, 0, mask=valid_loc)
 
     @triton.jit
     def _dsv4_int4_sparse_decode_kernel(
@@ -355,12 +218,17 @@ if _HAS_TRITON:
         index_width: tl.constexpr,
         PAGE_SIZE: tl.constexpr,
         ROW_BYTES: tl.constexpr,
+        HEADER_OFFSET: tl.constexpr,
+        ROPE_OFFSET: tl.constexpr,
+        NUM_GROUPS: tl.constexpr,
         BLOCK_N: tl.constexpr,
         HAS_SINK: tl.constexpr,
     ):
         query_row = tl.program_id(0)
         head = tl.program_id(1)
-        length = tl.load(lengths_ptr + query_row)
+        length = tl.minimum(
+            tl.maximum(tl.load(lengths_ptr + query_row), 0), index_width
+        )
 
         q_offsets = tl.arange(0, 512)
         q = tl.load(
@@ -380,7 +248,7 @@ if _HAS_TRITON:
                 indices_ptr + query_row * stride_indices_row + token_offsets,
                 mask=valid_token & (token_offsets < index_width),
                 other=-1,
-            )
+            ).to(tl.int64)
             valid_token = valid_token & (loc >= 0) & (loc < num_pages * PAGE_SIZE)
             page = loc // PAGE_SIZE
             page_offset = loc % PAGE_SIZE
@@ -391,7 +259,7 @@ if _HAS_TRITON:
             )
 
             score = tl.zeros([BLOCK_N], dtype=tl.float32)
-            for group in range(14):
+            for group in range(NUM_GROUPS):
                 byte_offsets = tl.arange(0, 16)
                 packed_codes = tl.load(
                     row_ptr + group * 16 + byte_offsets[None, :],
@@ -408,7 +276,7 @@ if _HAS_TRITON:
                     unsigned_codes,
                 )
                 scale_bits = tl.load(
-                    row_ptr + 224 + group,
+                    row_ptr + HEADER_OFFSET + group,
                     mask=valid_token[:, None],
                     other=0,
                 )
@@ -417,14 +285,14 @@ if _HAS_TRITON:
                     .to(tl.float8e4nv, bitcast=True)
                     .to(tl.float32)
                 )
-                values = signed_codes * scale[:, None]
+                values = (signed_codes * scale[:, None]).to(tl.bfloat16).to(tl.float32)
                 dim_offsets = group * 32 + tl.arange(0, 32)
                 q_group = tl.gather(q, dim_offsets, axis=0)
                 score += tl.sum(q_group[None, :] * values, axis=1)
 
             rope_offsets = tl.arange(0, 64)
             rope = tl.load(
-                (row_ptr + 240).to(tl.pointer_type(tl.bfloat16))
+                (row_ptr + ROPE_OFFSET).to(tl.pointer_type(tl.bfloat16))
                 + rope_offsets[None, :],
                 mask=valid_token[:, None],
                 other=0.0,
@@ -444,7 +312,7 @@ if _HAS_TRITON:
             probabilities = tl.where(valid_token, probabilities, 0.0)
             accumulator *= rescale
 
-            for group in range(14):
+            for group in range(NUM_GROUPS):
                 byte_offsets = tl.arange(0, 16)
                 packed_codes = tl.load(
                     row_ptr + group * 16 + byte_offsets[None, :],
@@ -461,7 +329,7 @@ if _HAS_TRITON:
                     unsigned_codes,
                 )
                 scale_bits = tl.load(
-                    row_ptr + 224 + group,
+                    row_ptr + HEADER_OFFSET + group,
                     mask=valid_token[:, None],
                     other=0,
                 )
@@ -470,7 +338,7 @@ if _HAS_TRITON:
                     .to(tl.float8e4nv, bitcast=True)
                     .to(tl.float32)
                 )
-                values = signed_codes * scale[:, None]
+                values = (signed_codes * scale[:, None]).to(tl.bfloat16).to(tl.float32)
                 partial = tl.sum(probabilities[:, None] * values, axis=0)
                 relative = tl.maximum(tl.minimum(q_offsets - group * 32, 31), 0)
                 accumulator += tl.where(
@@ -512,12 +380,12 @@ def _reshape_packed_rows(
 ) -> torch.Tensor:
     if packed.dtype != torch.uint8 or packed.ndim != 2:
         raise ValueError("packed cache must be a rank-2 torch.uint8 tensor")
-    expected_page_bytes = page_size * DSV4_INT4_LAYOUT.row_bytes
-    if packed.shape[1] != expected_page_bytes:
-        raise ValueError(
-            f"packed page width must be {expected_page_bytes}, got {packed.shape[1]}"
-        )
-    return packed.reshape(-1, DSV4_INT4_LAYOUT.row_bytes)
+    if page_size not in (2, 64, 256):
+        raise ValueError(f"DSV4 INT4 page_size must be 2, 64 or 256, got {page_size}")
+    if not packed.is_contiguous() or packed.shape[1] % page_size:
+        raise ValueError("packed cache must contain contiguous, whole fixed-size rows")
+    layout = layout_for_row_bytes(packed.shape[1] // page_size)
+    return packed.view(-1, layout.row_bytes)
 
 
 def write_dsv4_int4_packed(
@@ -532,20 +400,34 @@ def write_dsv4_int4_packed(
         raise RuntimeError("DSV4 KVBit packed writes require CUDA and Triton")
     if kv.ndim != 2 or kv.shape[-1] != 512:
         raise ValueError(f"kv must have shape (tokens, 512), got {kv.shape}")
+    if not kv.is_floating_point() or kv.stride(-1) != 1:
+        raise ValueError(
+            "kv must be floating point and contiguous along its last dimension"
+        )
     if loc.ndim != 1 or loc.shape[0] != kv.shape[0]:
         raise ValueError(f"loc must have shape ({kv.shape[0]},), got {loc.shape}")
+    if loc.dtype not in (torch.int32, torch.int64):
+        raise ValueError("loc must be int32 or int64")
     if kv.device != loc.device or kv.device != packed.device:
         raise ValueError("kv, loc, and packed cache must be on the same device")
-    _reshape_packed_rows(packed, page_size=page_size)
+    rows = _reshape_packed_rows(packed, page_size=page_size)
+    if kv.shape[0] == 0:
+        return
     _dsv4_int4_pack_scatter_kernel[(kv.shape[0],)](
         kv,
         loc,
         packed,
         kv.stride(0),
+        loc.stride(0),
         packed.stride(0),
         packed.shape[0],
         PAGE_SIZE=page_size,
-        ROW_BYTES=DSV4_INT4_LAYOUT.row_bytes,
+        ROW_BYTES=rows.shape[-1],
+        CODE_BYTES=abi.CODE_BYTES,
+        HEADER_OFFSET=abi.HEADER_OFFSET,
+        ROPE_OFFSET=abi.ROPE_OFFSET,
+        PAYLOAD_BYTES=abi.PAYLOAD_BYTES,
+        NUM_GROUPS=abi.NUM_GROUPS,
         num_warps=4,
         num_stages=1,
     )
@@ -569,10 +451,10 @@ def _dsv4_sparse_decode_reference(
         device=q.device,
     )
     for row in range(q.shape[0]):
-        count = int(lengths[row])
+        count = max(0, min(int(lengths[row]), indices.shape[-1]))
         selected = indices[row, 0, :count].to(torch.long)
         selected = selected[(selected >= 0) & (selected < rows.shape[0])]
-        stored = _decode_dsv4_int4_stored_domain(rows[selected].cpu()).to(q.device)
+        stored = decode_dsv4_int4_reference(rows[selected].cpu()).to(q.device)
         scores = torch.einsum("qhd,kd->qhk", q[row].float(), stored.float())
         scores.mul_(softmax_scale)
         if attn_sink is not None:
@@ -614,7 +496,24 @@ def dsv4_kvbit_sparse_decode(
         raise ValueError(
             f"indices must have shape ({q.shape[0]}, 1, width), got {indices.shape}"
         )
-    _reshape_packed_rows(packed, page_size=page_size)
+    rows = _reshape_packed_rows(packed, page_size=page_size)
+    if lengths.shape != (q.shape[0],) or lengths.dtype != torch.int32:
+        raise ValueError("lengths must be an int32 vector with one entry per query")
+    if indices.dtype != torch.int32 or indices.stride(-1) != 1:
+        raise ValueError("indices must be int32 and contiguous along the sparse width")
+    if not lengths.is_contiguous():
+        raise ValueError("lengths must be contiguous")
+    if attn_sink is not None and (
+        attn_sink.shape != (q.shape[2],)
+        or attn_sink.dtype != torch.float32
+        or not attn_sink.is_contiguous()
+    ):
+        raise ValueError(
+            "attn_sink must be a contiguous float32 vector with one entry per head"
+        )
+    for tensor in (packed, indices, lengths, attn_sink):
+        if tensor is not None and tensor.device != q.device:
+            raise ValueError("all sparse decode tensors must be on the same device")
     if q.device.type != "cuda" or not _HAS_TRITON:
         return _dsv4_sparse_decode_reference(
             q,
@@ -653,7 +552,10 @@ def dsv4_kvbit_sparse_decode(
         num_heads=q.shape[2],
         index_width=indices.shape[-1],
         PAGE_SIZE=page_size,
-        ROW_BYTES=DSV4_INT4_LAYOUT.row_bytes,
+        ROW_BYTES=rows.shape[-1],
+        HEADER_OFFSET=abi.HEADER_OFFSET,
+        ROPE_OFFSET=abi.ROPE_OFFSET,
+        NUM_GROUPS=abi.NUM_GROUPS,
         BLOCK_N=16,
         HAS_SINK=attn_sink is not None,
         num_warps=4,
@@ -680,6 +582,7 @@ class DSV4KVBitPackedSWAPool(KVCache):
         enable_memory_saver: bool,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        layout: DSV4KVBitLayout | None = None,
     ):
         validate_dsv4_int4_geometry(qk_nope_head_dim, qk_rope_head_dim)
         if page_size not in (2, 64, 256):
@@ -696,11 +599,12 @@ class DSV4KVBitPackedSWAPool(KVCache):
             start_layer,
             end_layer,
         )
+        self.layout = layout if layout is not None else get_dsv4_int4_layout()
         self.store_dtype = torch.uint8
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.kv_cache_total_dim = DSV4_INT4_LAYOUT.row_bytes
-        self.bytes_per_page_padded = self.page_size * DSV4_INT4_LAYOUT.row_bytes
+        self.kv_cache_total_dim = self.layout.row_bytes
+        self.bytes_per_page_padded = self.page_size * self.layout.row_bytes
         self.num_pages = (self.size + self.page_size + 1) // self.page_size
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
@@ -713,7 +617,7 @@ class DSV4KVBitPackedSWAPool(KVCache):
             self.kv_buffer = [
                 torch.zeros(
                     self.num_pages,
-                    self.page_size * DSV4_INT4_LAYOUT.row_bytes,
+                    self.bytes_per_page_padded,
                     dtype=torch.uint8,
                     device=self.device,
                 )
@@ -721,7 +625,7 @@ class DSV4KVBitPackedSWAPool(KVCache):
             ]
 
     def get_bytes_per_token(self) -> int:
-        return DSV4_INT4_LAYOUT.row_bytes
+        return self.layout.row_bytes
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self.kv_buffer[layer_id - self.start_layer]

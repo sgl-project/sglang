@@ -53,6 +53,7 @@ kvbit_int4_sparse_decode_fwd(
 }
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("kvbit_int4_abi_version() -> int", []() -> int64_t { return 2; });
   m.def(
       "kvbit_int4_sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, "
       "Tensor? attn_sink, Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, "
