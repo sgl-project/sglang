@@ -2097,6 +2097,14 @@ class DeepseekV2AttentionMLA(
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
+        if getattr(forward_batch, "symmetric_spec_megamoe_dummy", False):
+            # This activation is a collective-valid MegaMoE row, not a real
+            # decode query. It has no request KV and must not enter DSA/MLA or
+            # write cache slot 0. Preserve it for the decoder's MoE sublayer.
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+            return hidden_states, None, forward_batch, None
+
         if self.attn_mha.kv_b_proj is None and hasattr(self, "kv_b_proj"):
             self.attn_mha.kv_b_proj = self.kv_b_proj
 

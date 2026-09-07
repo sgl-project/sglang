@@ -311,6 +311,9 @@ class DeepseekModelNextN(nn.Module):
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     # The draft checkpoint reports the NextN architecture name.
     fused_shared_experts_architecture = "DeepseekV3ForCausalLMNextN"
+    # Idle DP ranks may carry collective-only rows for MegaMoE. The wrapped
+    # DeepseekV2AttentionMLA explicitly bypasses attention for those rows.
+    supports_symmetric_spec_megamoe_dummy = True
 
     # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
     # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4

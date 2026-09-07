@@ -450,7 +450,13 @@ class EagerRunner(BaseRunner):
         if forward_batch.batch_size > 0:
             if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
+            if getattr(forward_batch, "symmetric_spec_megamoe_dummy", False):
+                # The rows exist only for MegaMoE's symmetric dispatch and have
+                # no request KV. The model-side attention bypass must not reuse
+                # metadata left by an earlier real request either.
+                model_runner.attn_backend.forward_metadata = None
+            else:
+                model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
             model_runner.attn_backend.forward_metadata = None
 

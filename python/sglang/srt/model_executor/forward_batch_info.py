@@ -101,6 +101,39 @@ def _elastic_should_preserve_local_token_counts(
     return uneven_token_count
 
 
+def _should_materialize_idle_eagle_megamoe_dummy(
+    *,
+    model_runner: ModelRunner,
+    forward_mode: ForwardMode,
+    spec_algorithm: Optional[SpeculativeAlgorithm],
+    spec_info: Optional[SpecInput],
+    dp_padding_mode: DpPaddingMode,
+    num_tokens: int,
+) -> bool:
+    """Whether an idle EAGLE draft needs collective-valid MegaMoE rows."""
+    if (
+        not forward_mode.is_idle()
+        or spec_algorithm is None
+        or not spec_algorithm.is_eagle()
+        or spec_info is None
+        or not dp_padding_mode.is_max_len()
+        or num_tokens <= 0
+        or not getattr(
+            model_runner.model, "supports_symmetric_spec_megamoe_dummy", False
+        )
+    ):
+        return False
+
+    from sglang.srt.speculative.spec_info import SpecInputType
+
+    if spec_info.spec_input_type != SpecInputType.EAGLE_DRAFT:
+        return False
+
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    return get_moe_a2a_backend().is_megamoe()
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
@@ -503,6 +536,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
+    # MegaMoE is a rank-symmetric collective. A sparse EAGLE draft iteration
+    # therefore gives an idle DP rank padded rows to enter the same dispatch as
+    # active peers. These rows are valid for MoE routing but have no request KV.
+    symmetric_spec_megamoe_dummy: bool = False
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
@@ -1401,7 +1438,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 is not None
             )
-            if (
+            if _should_materialize_idle_eagle_megamoe_dummy(
+                model_runner=model_runner,
+                forward_mode=self.forward_mode,
+                spec_algorithm=self.spec_algorithm,
+                spec_info=self.spec_info,
+                dp_padding_mode=dp_padding_mode,
+                num_tokens=num_tokens,
+            ):
+                self.symmetric_spec_megamoe_dummy = True
+                # Invert spec_scale_global_num_tokens: one dummy request must
+                # carry the same draft width as an active rank. Keep IDLE mode
+                # so post-forward restores the true zero-request boundary.
+                draft_width = self.spec_info.num_tokens_per_req
+                assert draft_width > 0 and num_tokens % draft_width == 0, (
+                    f"invalid MegaMoE idle draft geometry: num_tokens={num_tokens}, "
+                    f"draft_width={draft_width}"
+                )
+                bs = self.batch_size = num_tokens // draft_width
+                # MegaMoE's pre-dispatch cannot consume an all-invalid rank
+                # while peers dispatch real rows. Treat only this synthetic
+                # buffer as collective-valid; attention is bypassed separately.
+                if self.num_token_non_padded is not None:
+                    self.num_token_non_padded.fill_(num_tokens)
+                self.num_token_non_padded_cpu = num_tokens
+            elif (
                 hybrid_ssm
                 and self.spec_info is not None
                 and not self.spec_info.is_draft_input()
