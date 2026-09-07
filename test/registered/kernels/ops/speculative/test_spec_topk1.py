@@ -1,12 +1,16 @@
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
 
 import unittest
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import (
+    draft_topk1_argmax_only,
+    draft_topk1_postprocess,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -73,6 +77,56 @@ class TestSpecTopk1Triton(CustomTestCase):
                 torch.testing.assert_close(
                     positions, expected_positions, rtol=0, atol=0
                 )
+
+    def test_draft_topk1_masks_vocab_tail_and_nan(self):
+        for vocab_size in (151666, 248320):
+            cases = {
+                "all_nan": torch.full(
+                    (2, vocab_size),
+                    float("nan"),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                "all_neg_inf": torch.full(
+                    (2, vocab_size),
+                    -float("inf"),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                "all_negative": torch.full(
+                    (2, vocab_size),
+                    -1.0,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+            }
+            partial_nan = (
+                torch.arange(vocab_size, dtype=torch.float32, device=self.device)
+                .remainder(97)
+                .repeat(2, 1)
+            )
+            partial_nan[:, vocab_size // 2] = float("nan")
+            cases["partial_nan"] = partial_nan
+
+            for name, logits in cases.items():
+                with self.subTest(vocab_size=vocab_size, case=name):
+                    expected_logits = torch.where(
+                        torch.isnan(logits),
+                        torch.full_like(logits, -1e30),
+                        logits,
+                    )
+                    expected_index = torch.argmax(expected_logits, dim=-1, keepdim=True)
+
+                    topk_p, topk_index = draft_topk1_argmax_only(logits)
+
+                    torch.testing.assert_close(
+                        topk_index, expected_index, rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(
+                        topk_p, torch.ones_like(topk_p), rtol=0, atol=0
+                    )
+                    self.assertTrue(torch.all(topk_index >= 0).item())
+                    self.assertTrue(torch.all(topk_index < vocab_size).item())
 
     def test_draft_topk1_postprocess_can_write_draft_token_column(self):
         batch_size = 17
