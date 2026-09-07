@@ -115,7 +115,7 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "qwen4-main-squashed @ 4ccff141db",
-    accuracy: { gsm8k_pct: 96.8 },
+    accuracy: { gsm8k_pct: 97.3 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 580.18, tpot_ms: 61.63, tokens_per_sec_per_gpu: 80 },
@@ -176,7 +176,7 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 4ccff141db",
-    accuracy: { gsm8k_pct: 97.2 },
+    accuracy: { gsm8k_pct: 97.0 },
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1 },
         ttft_ms: 604.33, tpot_ms: 63.54, tokens_per_sec_per_gpu: 78 },
