@@ -17,6 +17,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchTokenizedEmbeddingReqInput,
     MMInputsProcessError,
+    MMInputsProcessMode,
     TokenizedEmbeddingReqInput,
 )
 from sglang.srt.managers.mm_utils import ShmPointerMMData  # noqa: E402
@@ -133,9 +134,15 @@ def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
     )
     try:
         req = _request(_failed_pointer() if rank == 1 else _successful_pointer())
+        req.mm_inputs_process_mode = MMInputsProcessMode.BROADCAST
         parallel = SimpleNamespace(enable_dp_attention=False)
         receiver = _receiver(tp_size=world_size)
         object.__setattr__(receiver, "tp_cpu_group", torch.distributed.group.WORLD)
+        object.__setattr__(
+            receiver,
+            "tp_group",
+            SimpleNamespace(rank=rank, ranks=list(range(world_size))),
+        )
         with (
             patch(
                 "sglang.srt.managers.mm_utils._get_is_default_transport",
@@ -151,8 +158,11 @@ def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
             ),
         ):
             receiver._finalize_shm_features([req])
+            receiver._materialize_broadcast_mm_inputs([req])
         if not isinstance(req.mm_inputs, MMInputsProcessError):
             raise AssertionError(f"rank {rank} did not receive the VLM request error")
+        if req.mm_inputs_process_mode is not MMInputsProcessMode.LOCAL:
+            raise AssertionError(f"rank {rank} did not finish the MM protocol")
     finally:
         torch.distributed.destroy_process_group()
 
@@ -239,7 +249,9 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
 
         self.assertIsInstance(req.mm_inputs, MMInputsProcessError)
         with self.assertRaises(_MultimodalInputProcessingError):
-            Scheduler._get_multimodal_inputs(object.__new__(Scheduler), req.mm_inputs)
+            Scheduler._get_multimodal_inputs(
+                object.__new__(Scheduler), req.mm_inputs, MMInputsProcessMode.LOCAL
+            )
 
     def test_peer_failure_rejects_the_local_request(self):
         req = _request(torch.zeros(1))

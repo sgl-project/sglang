@@ -23,6 +23,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     MMInputsProcessError,
+    MMInputsProcessMode,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -32,12 +33,18 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_mm,
+    get_parallel,
+    is_ep_scale_joiner,
+)
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -102,6 +109,7 @@ class SchedulerRequestReceiver:
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
+        self._set_mm_process_mode(recv_reqs)
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
 
         if self.ps.pp_rank == 0:
@@ -109,9 +117,57 @@ class SchedulerRequestReceiver:
 
         recv_reqs = self._apply_mm_receiver(recv_reqs)
 
+        # EPD's waiting path can refill ``mm_inputs`` after the initial
+        # request fanout. Only requests that were synchronized as NONE may
+        # transition here; never overwrite an entry-rank BROADCAST decision
+        # from rank-local post-fanout state.
+        # This re-stamp is safe only while every MM receiver backend returns
+        # rank-symmetric refill status and shapes. New backends must preserve
+        # that invariant or scheduler ranks can diverge again.
+        self._set_mm_process_mode(recv_reqs, only_if_none=True)
+
         self._finalize_shm_features(recv_reqs)
+        self._materialize_broadcast_mm_inputs(recv_reqs)
 
         return recv_reqs
+
+    def _set_mm_process_mode(
+        self, recv_reqs: Optional[List], *, only_if_none: bool = False
+    ) -> None:
+        """Stamp the source-selected MM processing mode onto each work request.
+
+        The request payload is subsequently broadcast to TP peers.  Keeping
+        this mode in the payload prevents any scheduler rank from deriving
+        collective participation from its local MM object state.
+        """
+        if not recv_reqs:
+            return
+
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                if (
+                    only_if_none
+                    and req.mm_inputs_process_mode is not MMInputsProcessMode.NONE
+                ):
+                    continue
+                if isinstance(req.mm_inputs, (MultimodalInputs, MMInputsProcessError)):
+                    # A PP predecessor has already prepared a shared result.
+                    mode = MMInputsProcessMode.LOCAL
+                elif req.mm_inputs is None:
+                    mode = MMInputsProcessMode.NONE
+                elif get_mm().mm_feature_transport == "cuda_vmm":
+                    # CUDA-VMM has its own local materialization protocol; do
+                    # not serialize GPU-backed inputs through Gloo.
+                    mode = MMInputsProcessMode.LOCAL
+                elif get_mm().enable_broadcast_mm_inputs_process:
+                    mode = MMInputsProcessMode.BROADCAST
+                else:
+                    mode = MMInputsProcessMode.LOCAL
+                req.mm_inputs_process_mode = mode
+            elif isinstance(
+                req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+            ):
+                self._set_mm_process_mode(req.batch, only_if_none=only_if_none)
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if self.ps.pp_rank == 0:
@@ -167,8 +223,8 @@ class SchedulerRequestReceiver:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
-                work_reqs = None
-                control_reqs = None
+                work_reqs = []
+                control_reqs = []
 
             work_reqs = attn_cp_tp_broadcast_pyobj(work_reqs)
 
@@ -291,6 +347,81 @@ class SchedulerRequestReceiver:
             if failed[index].item():
                 discard_shm_features(req)
                 req.mm_inputs = error
+
+    def _materialize_broadcast_mm_inputs(self, recv_reqs: Optional[List]) -> None:
+        """Run the ordered root-only MM protocol after request fanout.
+
+        Every rank receives the same request list, so iterating its work items
+        in order gives the follow-up collectives an identical schedule.  The
+        result is written back before handlers run, leaving handlers entirely
+        collective-free.
+        """
+        if not recv_reqs:
+            return
+
+        for req in self._iter_tokenized_reqs(recv_reqs):
+            if req.mm_inputs_process_mode is MMInputsProcessMode.BROADCAST:
+                result, error_message = self._broadcast_mm_inputs_result(req)
+                req.mm_inputs = (
+                    MMInputsProcessError(error_message)
+                    if error_message is not None
+                    else result
+                )
+                # A following PP stage must not repeat the large result fanout.
+                req.mm_inputs_process_mode = MMInputsProcessMode.LOCAL
+
+    @staticmethod
+    def _iter_tokenized_reqs(recv_reqs: List):
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                yield req
+            elif isinstance(
+                req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+            ):
+                yield from req
+
+    @staticmethod
+    def _materialize_mm_envelope(req):
+        try:
+            if has_shm_features([req]):
+                unwrap_shm_features(req)
+            mm_inputs = req.mm_inputs
+            result = (
+                mm_inputs
+                if isinstance(mm_inputs, (MultimodalInputs, MMInputsProcessError))
+                else MultimodalInputs.from_processor_output(mm_inputs)
+            )
+            return result, None
+        except Exception as exc:
+            # This runs only on the collective source. Preserve the concise
+            # envelope shared with peers, but retain the full traceback locally
+            # for server-side diagnosis.
+            logger.exception(
+                "Failed to materialize broadcast multimodal inputs on entry rank"
+            )
+            return (
+                None,
+                "Failed to process multimodal inputs on entry rank: "
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def _broadcast_mm_inputs_result(self, req):
+        """Fan out one materialized result using the request fanout topology."""
+        if get_parallel().enable_dp_attention:
+            is_source = self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
+            envelopes = [self._materialize_mm_envelope(req)] if is_source else []
+            return attn_cp_tp_broadcast_pyobj(envelopes)[0]
+
+        is_source = self.tp_group.rank == self.tp_group.ranks[0]
+        envelope = self._materialize_mm_envelope(req) if is_source else None
+        if self.ps.tp_size != 1:
+            envelope = broadcast_pyobj(
+                envelope,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        return envelope
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
         work_reqs = [

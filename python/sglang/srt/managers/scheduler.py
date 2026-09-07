@@ -153,6 +153,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
+    MMInputsProcessMode,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -387,12 +388,6 @@ STEP_MAX_US = 2_000_000
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
 # DP-balancing writer and the router-facing socket.
 LOAD_STALL_REFRESH_S = 0.05
-
-
-@dataclasses.dataclass(frozen=True)
-class _MultimodalInputBroadcast:
-    inputs: Optional[MultimodalInputs] = None
-    error: Optional[str] = None
 
 
 class _MultimodalInputProcessingError(RuntimeError):
@@ -2529,102 +2524,17 @@ class Scheduler(
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
             req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
 
-    def _process_and_broadcast_mm_inputs(
-        self,
-        raw_mm_inputs,
-    ):
-        """Materialize MultimodalInputs once on the entry rank and broadcast to others.
-
-        Entry rank:
-        - constructs MultimodalInputs.from_processor_output() once
-        - broadcasts to other ranks in self.cpu_group (if world_size > 1)
-
-        Non-entry ranks:
-        - receive the object via broadcast (if world_size > 1)
-        - otherwise (single-rank / no group) fall back to local from_processor_output
-
-        Returns:
-            MultimodalInputs | None
-
-        Raises:
-            _MultimodalInputProcessingError: The entry rank could not build the
-                request's multimodal inputs. The same error is broadcast to all
-                ranks before it is raised.
-        """
-        if raw_mm_inputs is None:
+    def _get_multimodal_inputs(self, mm_inputs, mode: MMInputsProcessMode):
+        if mode is MMInputsProcessMode.NONE:
             return None
-
-        group_world_size = 1
-        try:
-            if (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-                and self.dp_tp_cpu_group is not None
-            ):
-                group_world_size = torch.distributed.get_world_size(
-                    group=self.dp_tp_cpu_group
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to get world size in mm_inputs handling with {e}, fallback to 1."
-            )
-
-        # In case tp size > 1, all the Scheduler TP ranks runs the duplicated computing
-        # process in CPU which occupies the main thread CPU cycle. This computing logic
-        # merely needs to be run on TP0 and be broadcast to other TP ranks.
-        # Since the Scheduler is single-threaded, any large CPU cost will impact
-        # handling of other messages. For example, CPU hits 99.9% can significantly
-        # increase the CUDA kernel launch time.
-        result = None
-        if self.dp_tp_group.rank_in_group == 0:
-            try:
-                result = _MultimodalInputBroadcast(
-                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
-                )
-            except Exception as error:
-                result = _MultimodalInputBroadcast(
-                    error=(
-                        "Multimodal input processing failed on the TP entry rank: "
-                        f"{type(error).__name__}: {error}"
-                    )
-                )
-
-            # Broadcast either the prepared inputs or the request-local error.
-            if group_world_size > 1:
-                obj_list = [result]
-                torch.distributed.broadcast_object_list(
-                    obj_list,
-                    src=self.dp_tp_group.first_rank,
-                    group=self.dp_tp_cpu_group,
-                )
-                result = obj_list[0]
-        else:
-            # Non-entry ranks: receive if group size > 1; otherwise materialize locally.
-            if group_world_size > 1:
-                obj_list = [None]
-                torch.distributed.broadcast_object_list(
-                    obj_list,
-                    src=self.dp_tp_group.first_rank,
-                    group=self.dp_tp_cpu_group,
-                )
-                result = obj_list[0]
-            else:
-                result = _MultimodalInputBroadcast(
-                    inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
-                )
-
-        if result.error is not None:
-            raise _MultimodalInputProcessingError(result.error)
-        return result.inputs
-
-    def _get_multimodal_inputs(self, mm_inputs):
         if isinstance(mm_inputs, MMInputsProcessError):
             raise _MultimodalInputProcessingError(mm_inputs.message)
         if isinstance(mm_inputs, MultimodalInputs):
             return mm_inputs
-
-        if get_mm().enable_broadcast_mm_inputs_process:
-            return self._process_and_broadcast_mm_inputs(mm_inputs)
+        if mode is MMInputsProcessMode.BROADCAST:
+            raise _MultimodalInputProcessingError(
+                "Multimodal broadcast protocol completed without a result"
+            )
         return MultimodalInputs.from_processor_output(mm_inputs)
 
     @staticmethod
@@ -2934,9 +2844,10 @@ class Scheduler(
             return
 
         # Handle multimodal inputs
-        if recv_req.mm_inputs is not None:
+        mm_mode = recv_req.mm_inputs_process_mode
+        if mm_mode is not MMInputsProcessMode.NONE:
             try:
-                image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+                image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs, mm_mode)
             except _MultimodalInputProcessingError as error:
                 req.set_finish_with_abort(
                     str(error),
@@ -3313,9 +3224,10 @@ class Scheduler(
             return
 
         # Handle multimodal inputs
-        if recv_req.mm_inputs is not None:
+        mm_mode = recv_req.mm_inputs_process_mode
+        if mm_mode is not MMInputsProcessMode.NONE:
             try:
-                image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+                image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs, mm_mode)
             except _MultimodalInputProcessingError as error:
                 req.set_finish_with_abort(
                     str(error),

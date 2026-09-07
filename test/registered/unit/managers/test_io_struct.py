@@ -12,6 +12,7 @@ import torch
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
+    MMInputsProcessMode,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     msgpack_decode,
@@ -68,6 +69,69 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 ]
             ),
             "Rust may omit only a defaulted suffix of the Python wire schema",
+        )
+
+    def test_mm_process_mode_is_appended_to_array_like_request_dtos(self):
+        self.assertEqual(
+            TokenizedGenerateReqInput.__struct_fields__[-1], "mm_inputs_process_mode"
+        )
+        self.assertEqual(
+            TokenizedEmbeddingReqInput.__struct_fields__[-1], "mm_inputs_process_mode"
+        )
+        self.assertEqual(
+            [(member.name, member.value) for member in MMInputsProcessMode],
+            [("NONE", 0), ("LOCAL", 1), ("BROADCAST", 2)],
+        )
+
+    def test_mm_process_mode_msgpack_round_trip_and_old_array_default(self):
+        generate_req = TokenizedGenerateReqInput(
+            input_text="",
+            input_ids=array("q", [1]),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            return_logprob=False,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            mm_inputs_process_mode=MMInputsProcessMode.BROADCAST,
+        )
+        decoded_generate = self._round_trip(generate_req)
+        self.assertIs(
+            decoded_generate.mm_inputs_process_mode, MMInputsProcessMode.BROADCAST
+        )
+
+        # The old wire format is the same tagged array without the newly
+        # appended tail field. msgspec must apply the DTO default on decode.
+        old_generate_wire = msgspec.msgpack.decode(msgpack_encode(generate_req))
+        old_generate_wire.pop()
+        decoded_old_generate = msgpack_decode(msgspec.msgpack.encode(old_generate_wire))
+        self.assertIs(
+            decoded_old_generate.mm_inputs_process_mode, MMInputsProcessMode.NONE
+        )
+
+        embedding_req = TokenizedEmbeddingReqInput(
+            input_text="",
+            input_ids=array("q", [1]),
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            mm_inputs_process_mode=MMInputsProcessMode.BROADCAST,
+        )
+        decoded_embedding = self._round_trip(embedding_req)
+        self.assertIs(
+            decoded_embedding.mm_inputs_process_mode, MMInputsProcessMode.BROADCAST
+        )
+
+        old_embedding_wire = msgspec.msgpack.decode(msgpack_encode(embedding_req))
+        old_embedding_wire.pop()
+        decoded_old_embedding = msgpack_decode(
+            msgspec.msgpack.encode(old_embedding_wire)
+        )
+        self.assertIs(
+            decoded_old_embedding.mm_inputs_process_mode, MMInputsProcessMode.NONE
         )
 
     def _make_mm_inputs(self, device="cpu"):

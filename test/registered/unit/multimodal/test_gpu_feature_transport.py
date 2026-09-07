@@ -853,9 +853,6 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
                 return_value=materialized,
             ) as build_inputs,
             patch.object(
-                scheduler, "_process_and_broadcast_mm_inputs"
-            ) as cpu_broadcast,
-            patch.object(
                 scheduler_module, "is_health_check_generate_req", return_value=False
             ),
         ):
@@ -864,7 +861,6 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         build_inputs.assert_called_once_with(raw_inputs)
         self.assertIs(request.mm_inputs, materialized)
         scheduler._request_dispatcher.assert_called_once_with(request)
-        cpu_broadcast.assert_not_called()
 
     def test_materializes_batched_inputs_before_dispatch(self):
         from sglang.srt.managers import scheduler as scheduler_module
@@ -923,96 +919,21 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         scheduler._request_dispatcher.assert_called_once_with(request)
 
     def test_already_materialized_inputs_are_reused(self):
+        from sglang.srt.managers.io_struct import MMInputsProcessMode
         from sglang.srt.managers.schedule_batch import MultimodalInputs
         from sglang.srt.managers.scheduler import Scheduler
 
         scheduler = object.__new__(Scheduler)
         mm_inputs = MultimodalInputs(mm_items=[])
 
-        with patch.object(
-            scheduler, "_process_and_broadcast_mm_inputs"
-        ) as process_and_broadcast:
-            self.assertIs(scheduler._get_multimodal_inputs(mm_inputs), mm_inputs)
-
-        process_and_broadcast.assert_not_called()
-
-    def test_broadcast_mm_inputs_sends_entry_rank_processing_error(self):
-        from sglang.srt.managers import scheduler as scheduler_module
-
-        scheduler = object.__new__(scheduler_module.Scheduler)
-        scheduler.dp_tp_group = SimpleNamespace(rank_in_group=0, first_rank=0)
-        scheduler.dp_tp_cpu_group = object()
-
-        with (
-            patch.object(
-                scheduler_module.MultimodalInputs,
-                "from_processor_output",
-                side_effect=ValueError("bad image"),
-            ),
-            patch.object(
-                scheduler_module.torch.distributed, "is_available", return_value=True
-            ),
-            patch.object(
-                scheduler_module.torch.distributed,
-                "is_initialized",
-                return_value=True,
-            ),
-            patch.object(
-                scheduler_module.torch.distributed, "get_world_size", return_value=2
-            ),
-            patch.object(
-                scheduler_module.torch.distributed, "broadcast_object_list"
-            ) as broadcast,
-            self.assertRaisesRegex(
-                scheduler_module._MultimodalInputProcessingError,
-                "ValueError: bad image",
-            ),
-        ):
-            scheduler._process_and_broadcast_mm_inputs(object())
-
-        payload = broadcast.call_args.args[0][0]
-        self.assertIn("ValueError: bad image", payload.error)
-
-    def test_broadcast_mm_inputs_peer_rank_receives_processing_error(self):
-        from sglang.srt.managers import scheduler as scheduler_module
-
-        scheduler = object.__new__(scheduler_module.Scheduler)
-        scheduler.dp_tp_group = SimpleNamespace(rank_in_group=1, first_rank=0)
-        scheduler.dp_tp_cpu_group = object()
-
-        def receive_error(obj_list, **_kwargs):
-            obj_list[0] = scheduler_module._MultimodalInputBroadcast(error="bad image")
-
-        with (
-            patch.object(
-                scheduler_module.MultimodalInputs, "from_processor_output"
-            ) as materialize,
-            patch.object(
-                scheduler_module.torch.distributed, "is_available", return_value=True
-            ),
-            patch.object(
-                scheduler_module.torch.distributed,
-                "is_initialized",
-                return_value=True,
-            ),
-            patch.object(
-                scheduler_module.torch.distributed, "get_world_size", return_value=2
-            ),
-            patch.object(
-                scheduler_module.torch.distributed,
-                "broadcast_object_list",
-                side_effect=receive_error,
-            ),
-            self.assertRaisesRegex(
-                scheduler_module._MultimodalInputProcessingError, "bad image"
-            ),
-        ):
-            scheduler._process_and_broadcast_mm_inputs(object())
-
-        materialize.assert_not_called()
+        self.assertIs(
+            scheduler._get_multimodal_inputs(mm_inputs, MMInputsProcessMode.LOCAL),
+            mm_inputs,
+        )
 
     def test_embedding_request_aborts_broadcast_processing_error(self):
         from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.io_struct import MMInputsProcessMode
 
         scheduler = object.__new__(scheduler_module.Scheduler)
         scheduler.tokenizer = object()
@@ -1038,6 +959,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
             return_pooled_hidden_states=False,
             multi_item_delimiter_indices=None,
             mm_inputs=object(),
+            mm_inputs_process_mode=MMInputsProcessMode.LOCAL,
         )
 
         with patch.object(scheduler_module, "Req", return_value=req):
