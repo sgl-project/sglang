@@ -180,6 +180,7 @@ class SchedulerRequestReceiver:
             _local_ctrl = (
                 get_parallel().enable_dp_attention_local_control_broadcast
                 or get_exec().moe.is_ep_scale_joiner
+                or get_parallel().enable_fault_tolerance
             )
             if _local_ctrl:
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)

@@ -247,7 +247,12 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    is_insert: bool = True,
+    allow_non_spec_overallocated: bool = False,
+):
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -276,7 +281,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
-    _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
+    _release_overallocated_kv_indices(
+        req,
+        start_p,
+        end_p,
+        tree_cache,
+        allow_non_spec_overallocated=allow_non_spec_overallocated,
+    )
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
@@ -293,7 +304,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
 
 def _release_overallocated_kv_indices(
-    req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
+    req: Req,
+    start_p: int,
+    end_p: int,
+    tree_cache: BasePrefixCache,
+    *,
+    allow_non_spec_overallocated: bool = False,
 ) -> None:
     allocator = tree_cache.token_to_kv_pool_allocator
     page_size = allocator.page_size
@@ -301,7 +317,11 @@ def _release_overallocated_kv_indices(
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
-    if spec_algo is None and not get_serving().strip_thinking_cache:
+    if (
+        spec_algo is None
+        and not get_serving().strip_thinking_cache
+        and not allow_non_spec_overallocated
+    ):
         assert start_p == end_p, (
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )

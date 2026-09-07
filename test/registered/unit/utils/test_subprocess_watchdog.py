@@ -134,6 +134,20 @@ class TestSubprocessWatchdog(CustomTestCase):
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
         )
 
+    def test_callback_can_isolate_crash(self):
+        exit_seen = threading.Event()
+        process = self._spawn(slow_crash_worker, args=(0.1,))
+        self._monitor = SubprocessWatchdog(
+            processes=[process],
+            on_exit=lambda *_: exit_seen.set(),
+            fail_stop_on_exit=False,
+            interval=0.01,
+        )
+        self._monitor.start()
+
+        self.assertTrue(exit_seen.wait(timeout=5.0))
+        self.assertFalse(self.sigquit_triggered.is_set())
+
 
 if __name__ == "__main__":
     import unittest

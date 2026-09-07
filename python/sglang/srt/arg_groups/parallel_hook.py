@@ -683,3 +683,16 @@ def handle_expert_distribution_metrics(server_args: Any):
                 "_handle_expert_distribution_metrics",
                 expert_distribution_recorder_buffer_size=1000,
             )
+
+
+def handle_fault_tolerance(server_args: Any):
+    cfg = resolving_view(server_args)
+    if not cfg.enable_fault_tolerance:
+        return
+    assert cfg.dp_size > 1, "Fault tolerance requires --dp-size greater than 1."
+    assert cfg.enable_dp_attention, "Fault tolerance requires --enable-dp-attention."
+    assert cfg.disaggregation_mode == "null", (
+        "Fault tolerance does not support disaggregation."
+    )
+    assert cfg.fault_tolerance_on_error_strategy in ("pause", "continue")
+    assert cfg.fault_tolerance_timeout > 0 and cfg.fault_tolerance_pause_timeout > 0

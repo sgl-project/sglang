@@ -95,7 +95,7 @@ class EPLBManager:
 
             yield from self.rebalance()
 
-    def rebalance(self):
+    def rebalance(self, *, force: bool = False):
         if self._rebalance_disabled_reason is not None:
             if not self._rebalance_disabled_logged:
                 logger.debug(
@@ -131,7 +131,9 @@ class EPLBManager:
         ]
 
         # Check whether rebalancing is needed
-        if not self._check_rebalance_needed(average_utilization_rate_over_window):
+        if not force and not self._check_rebalance_needed(
+            average_utilization_rate_over_window
+        ):
             return
 
         expert_location_metadata = self._compute_expert_location_metadata(

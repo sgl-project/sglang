@@ -172,18 +172,33 @@ class SubprocessWatchdog:
     sends SIGQUIT to trigger proper cleanup.
 
     See: https://github.com/sgl-project/sglang/issues/18421
+
+    An optional ``on_exit`` callback is invoked before the default SIGQUIT path.
+    Callers that can isolate one failed subprocess may disable that fail-stop
+    while retaining polling for the remaining subprocesses.
     """
 
     def __init__(
         self,
         processes: List[Process],
         process_names: Optional[List[str]] = None,
+        on_exit: Optional[Callable[[int, Process, str], None]] = None,
+        fail_stop_on_exit: bool = True,
         interval: float = 1.0,
+        on_poll: Optional[Callable[[], None]] = None,
+        on_thread_stop: Optional[Callable[[], None]] = None,
+        report_clean_exit: bool = False,
     ):
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
         self._interval = interval
+        self._on_exit = on_exit
+        self._fail_stop_on_exit = fail_stop_on_exit
+        self._on_poll = on_poll
+        self._on_thread_stop = on_thread_stop
+        self._report_clean_exit = report_clean_exit
         self._stop_event = threading.Event()
+        self._reported = set()
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
@@ -195,29 +210,58 @@ class SubprocessWatchdog:
         self._thread.start()
 
     def stop(self) -> None:
-        self._stop_event.set()
         if self._thread is not None:
+            self._stop_event.set()
             self._thread.join(timeout=self._interval * 2)
             self._thread = None
 
+    def _on_thread_start(self) -> None:
+        pass
+
     def _monitor_loop(self) -> None:
         try:
+            self._on_thread_start()
             while not self._stop_event.wait(self._interval):
                 if self._check_processes():
                     return
+                if self._on_poll is None and len(self._reported) == len(
+                    self._processes
+                ):
+                    return
+                if self._on_poll is not None:
+                    self._on_poll()
         except Exception as e:
             logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
+        finally:
+            if self._on_thread_stop is not None:
+                self._on_thread_stop()
 
     def _check_processes(self) -> bool:
-        for proc, name in zip(self._processes, self._names):
-            if proc.is_alive() or proc.exitcode == 0:
+        for index, (proc, name) in enumerate(zip(self._processes, self._names)):
+            if index in self._reported or proc.is_alive() or proc.exitcode is None:
                 continue
-
-            logger.error(
-                f"Subprocess {name} (pid={proc.pid}) crashed "
-                f"with exit code {proc.exitcode}. "
-                f"Triggering SIGQUIT for cleanup..."
-            )
-            os.kill(os.getpid(), signal.SIGQUIT)
-            return True
+            self._reported.add(index)
+            if proc.exitcode == 0 and not self._report_clean_exit:
+                continue
+            if self._handle_process_exit(index, proc, name):
+                return True
         return False
+
+    def _handle_process_exit(self, index: int, proc: Process, name: str) -> bool:
+        if self._on_exit is not None:
+            self._on_exit(index, proc, name)
+
+        if proc.exitcode == 0:
+            return False
+
+        if not self._fail_stop_on_exit:
+            logger.warning(f"Subprocess {name} (pid={proc.pid}) crashed with exit code {proc.exitcode}.")
+            return False
+
+        logger.error(
+            f"Subprocess {name} (pid={proc.pid}) crashed "
+            f"with exit code {proc.exitcode}. "
+            f"Triggering SIGQUIT for cleanup..."
+        )
+        os.kill(os.getpid(), signal.SIGQUIT)
+        return True

@@ -367,4 +367,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     validate_deepep_v2_speculative_draft(server_args)
     validate_deepep_v2_dispatch_token_budget(server_args)
 
+    # Validate FT after topology, MoE, and Elastic EP resolution.
+    from sglang.srt.arg_groups.parallel_hook import handle_fault_tolerance
+
+    handle_fault_tolerance(server_args)
+
     server_args._resolution_finished = True

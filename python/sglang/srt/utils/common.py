@@ -2334,6 +2334,15 @@ def kill_process_tree(
         _wait_for_reap_or_raise(killed, wait_timeout)
 
 
+def notify_node_main_process_failure() -> None:
+    """Notify the current Scheduler's node main process to clean up locally."""
+    dpc_process = psutil.Process().parent()
+    node_main_process = dpc_process.parent() if dpc_process is not None else None
+    if node_main_process is None:
+        raise RuntimeError("Node main process not found")
+    node_main_process.send_signal(signal.SIGQUIT)
+
+
 def monkey_patch_p2p_access_check():
     """
     Monkey patch the slow p2p access check.
