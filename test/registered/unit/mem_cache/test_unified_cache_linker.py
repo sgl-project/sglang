@@ -1,6 +1,4 @@
-import json
 from array import array
-from enum import Enum
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -10,10 +8,6 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import InsertResult, MatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-    DevicePoolEntry,
-    DevicePoolGroup,
-)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
@@ -29,10 +23,8 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
-    with_direct_linker_cache_layout_tag,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -145,8 +137,6 @@ def test_restorable_prefix_intersects_sparse_rank_results():
 
 def test_async_offload_pins_node_until_completion():
     class _Component:
-        participates_in_linker = True
-
         def build_external_linker_transfer(self, phase, node, keys):
             assert phase == LinkerTransferPhase.OFFLOAD
             return PoolTransfer(name=PoolName.KV, keys=["page"])
@@ -244,8 +234,6 @@ def test_release_request_cancels_queued_load():
 
 def test_failed_offload_rolls_back_split_fragments():
     class _Component:
-        participates_in_linker = True
-
         def build_external_linker_transfer(self, phase, node, keys):
             return PoolTransfer(name=PoolName.KV, keys=["page"])
 
@@ -321,8 +309,6 @@ def test_split_action_retargets_pending_external_offload():
 
 def test_reset_quiesces_backend_before_releasing_pending_locks():
     class _Component:
-        participates_in_linker = True
-
         def build_external_linker_transfer(self, phase, node, keys):
             return PoolTransfer(name=PoolName.KV, keys=["page"])
 
@@ -468,153 +454,29 @@ def test_component_commit_keeps_only_adopted_pages():
     assert mapped_swa.tolist() == [202, 203, 206, 207]
 
 
-@pytest.fixture
-def dsv4_layout_pool():
+@pytest.mark.parametrize("unified_kv", [False, True])
+@pytest.mark.parametrize("enable_hicache", [False, True])
+def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
+    monkeypatch, unified_kv, enable_hicache
+):
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-    class PlatformDeepSeekV4TokenToKVPool(DeepSeekV4TokenToKVPool):
-        pass
-
-    kvcache = PlatformDeepSeekV4TokenToKVPool.__new__(PlatformDeepSeekV4TokenToKVPool)
-    kvcache._unified_kv = True
-    kvcache.c4_indexer_kv_pool = SimpleNamespace(use_fp4_indexer=False)
-    # Real Pro launch regression: ratios include the MTP layer, KV stage does not.
-    kvcache.compression_ratios = [4] * 62
-    kvcache._stage_start, kvcache._stage_end = 0, 61
-    entry = DevicePoolEntry(
-        name=PoolName.DEEPSEEK_V4_C4,
-        indices_from_pool=PoolName.KV,
-        device_pool=kvcache,
-        components=[[torch.zeros((32, 1, 4), dtype=torch.uint8) for _ in range(3)]],
-        layer_mapping={layer: layer for layer in range(3)},
-        page_size=2,
-        rows_are_pages=False,
-    )
-    return kvcache, DevicePoolGroup([entry], 3, 2, rank_replicated=True)
-
-
-@pytest.mark.parametrize("extra_config", [None, {}, {"extra_backend_tag": "tenant-a"}])
-def test_paged_layout_preserves_config_without_unified_metadata(
-    dsv4_layout_pool, extra_config
-):
-    kvcache, group = dsv4_layout_pool
-    kvcache._unified_kv = False
-    del kvcache.c4_indexer_kv_pool
-    result = with_direct_linker_cache_layout_tag(
-        extra_config, kvcache=kvcache, pool_group=group, pp_rank=0, pp_size=2
-    )
-    assert result == (extra_config or {})
-    assert result is not extra_config
-
-
-@pytest.mark.parametrize("use_fp4_indexer", [False, True])
-@pytest.mark.parametrize(
-    "partition,pp_size", [(None, 1), (None, 2), ("61", 1), ("30,31", 2)]
-)
-def test_unified_layout_tag_isolates_formats_and_matches_across_pp_ranks(
-    monkeypatch, dsv4_layout_pool, use_fp4_indexer, partition, pp_size
-):
-    kvcache, group = dsv4_layout_pool
-    kvcache.c4_indexer_kv_pool.use_fp4_indexer = use_fp4_indexer
-    if partition is None:
-        monkeypatch.delenv("SGLANG_PP_LAYER_PARTITION", raising=False)
-    else:
-        monkeypatch.setenv("SGLANG_PP_LAYER_PARTITION", partition)
-    indexer = "fp4" if use_fp4_indexer else "int8"
-    layers = "auto" if partition is None else partition.replace(",", ".")
-    tag = f"ucdl-dsv4-v1-layout-unified-bf16-indexer-{indexer}-pp{pp_size}-layers-{layers}"
-    for user_config in ({}, {"extra_backend_tag": "tenant-a", "custom_option": "kept"}):
-        original = dict(user_config)
-        expected_tag = f"tenant-a__{tag}" if user_config else tag
-        for rank in range(pp_size):
-            result = with_direct_linker_cache_layout_tag(
-                user_config,
-                kvcache=kvcache,
-                pool_group=group,
-                pp_rank=rank,
-                pp_size=pp_size,
-            )
-            assert result == {**original, "extra_backend_tag": expected_tag}
-        assert user_config == original
-
-
-@pytest.mark.parametrize("backend", ["umbp", "mooncake"])
-@pytest.mark.parametrize("unified_kv", [False, True])
-def test_layout_tag_reaches_direct_linker_storage_config(
-    monkeypatch, dsv4_layout_pool, backend, unified_kv
-):
-    from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
-    from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
-
-    kvcache, group = dsv4_layout_pool
-    kvcache._unified_kv = unified_kv
-    kvcache.c4_indexer_kv_pool.use_fp4_indexer = backend == "mooncake"
-    extra_config = {"extra_backend_tag": "tenant-a", "custom_option": "kept"}
-    storage = MagicMock()
-    if backend == "umbp":
-        module = umbp_direct_linker
-        constructor = module.UMBPDirectLinker
-        storage_arg = {"_storage": storage}
-        mode = Enum("DeploymentMode", ["StandaloneProcess", "Local"])
-        storage._disable_zero_copy_register = False
-        storage.client.get_deployment_mode.return_value = mode.StandaloneProcess
-        storage.client.get_backend_mode.return_value = mode.Local
-        monkeypatch.setattr(module.device_module, "Event", MagicMock())
-    else:
-        module = mooncake_direct_linker
-        constructor = module.MooncakeDirectLinker
-        storage_arg = {"storage": storage}
-        storage.store.register_buffer.return_value = 0
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
-    monkeypatch.delenv("SGLANG_PP_LAYER_PARTITION", raising=False)
-    monkeypatch.setattr(module, "resolve_hybrid_device_pool_group", lambda **_: group)
-    config_factory = MagicMock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
-    monkeypatch.setattr(module, "HiCacheStorageConfig", config_factory)
-    params = SimpleNamespace(
-        page_size=2,
-        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: kvcache),
-        tp_cache_group=None,
-        attn_tp_cache_group=None,
-        pp_rank=1,
-        pp_size=2,
-        attn_cp_rank=0,
-        attn_cp_size=1,
-    )
-    with get_context().override_server_args(
-        model_path="test-model",
-        tp_size=2,
-        hicache_storage_backend_extra_config=json.dumps(extra_config),
-    ) as server_args:
-        linker = constructor(
-            server_args, params, components={ComponentType.FULL}, **storage_arg
-        )
-        try:
-            assert config_factory.call_args.kwargs["tp_size"] == 2
-            config = config_factory.call_args.kwargs["extra_config"]
-            assert config["custom_option"] == "kept"
-            expected_tag = "tenant-a"
-            if unified_kv:
-                indexer = "fp4" if backend == "mooncake" else "int8"
-                expected_tag += f"__ucdl-dsv4-v1-layout-unified-bf16-indexer-{indexer}-pp2-layers-auto"
-            assert config["extra_backend_tag"] == expected_tag
-        finally:
-            linker.close()
-
-
-@pytest.mark.parametrize("unified_kv", [False, True])
-def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
-    dsv4_layout_pool, unified_kv
-):
-    pool, _ = dsv4_layout_pool
+    monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: unified_kv)
+    pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified_kv
     assert pool.swa_is_index_addressed is not unified_kv
     component = SWAComponent.__new__(SWAComponent)
     component.swa_is_index_addressed = pool.swa_is_index_addressed
     component.sliding_window_size = 128
-    assert component.participates_in_linker is not unified_kv
-    assert component.reused_swa_is_trustworthy is not unified_kv
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.components = {ComponentType.SWA: component}
+    cache.cache_controller = object() if enable_hicache else None
+    cache.tree_core = SimpleNamespace(
+        enable_hicache=enable_hicache,
+        has_swa_host_pool=enable_hicache and not unified_kv,
+    )
+    component.tree_core = cache.tree_core
     # #32759: request-relative SWA needs tail re-prefill even without HiCache.
     assert cache.swa_reprefill_tail_tokens() == (128 if unified_kv else 0)
     node = SimpleNamespace(
@@ -631,7 +493,6 @@ def test_cache_without_swa_needs_no_reprefill():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.components = {}
     assert cache.swa_reprefill_tail_tokens() == 0
-    assert FullComponent.__new__(FullComponent).participates_in_linker
 
 
 @pytest.fixture
@@ -648,7 +509,6 @@ def full_linker_component():
 
     return SimpleNamespace(
         component_type=ComponentType.FULL,
-        participates_in_linker=True,
         build_external_linker_transfer=MagicMock(side_effect=build_transfer),
         update_external_linker_load=lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: (
             transfer

@@ -248,9 +248,9 @@ def _build_deepseek_v4_device_pool_group(
         raise ValueError("The direct external linker does not support HiSparse.")
 
     mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
-    swa_is_index_addressed = getattr(kvcache, "swa_is_index_addressed", True)
+    is_unified_kv = getattr(kvcache, "_unified_kv", False)
     entries = []
-    if swa_is_index_addressed:
+    if not is_unified_kv:
         if kvcache.swa_page_size != page_size:
             raise ValueError(
                 "DeepSeek V4 SWA page size must match the tree page size: "
@@ -282,20 +282,13 @@ def _build_deepseek_v4_device_pool_group(
                 )
             )
 
-    if swa_is_index_addressed:
-        c4_pool = kvcache.c4_kv_pool
-        c4_buffers = c4_pool.kv_buffer
-        c128_pool = kvcache.c128_kv_pool
-        c128_buffers = c128_pool.kv_buffer
-    else:
-        c4_pool = c128_pool = kvcache.unified_kv_pool
-        c4_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 4)
-        c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
+    c4_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 4)
+    c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
 
     add(
         PoolName.DEEPSEEK_V4_C4,
         PoolName.KV,
-        c4_pool,
+        kvcache.c4_kv_pool,
         c4_buffers,
         mappings.c4,
     )
@@ -310,11 +303,11 @@ def _build_deepseek_v4_device_pool_group(
     add(
         PoolName.DEEPSEEK_V4_C128,
         PoolName.KV,
-        c128_pool,
+        kvcache.c128_kv_pool,
         c128_buffers,
         mappings.c128,
     )
-    if swa_is_index_addressed:
+    if not is_unified_kv:
         add(
             PoolName.DEEPSEEK_V4_C4_STATE,
             PoolName.SWA,

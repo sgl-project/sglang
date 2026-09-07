@@ -3070,15 +3070,27 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._sliding_window_size
 
     def swa_reprefill_tail_tokens(self) -> int:
-        """Return the SWA tail held out of cross-request prefix reuse.
-
-        Unified-KV stores SWA in a request-relative ring, so another request
-        cannot trust those ring slots unless an explicit restore path has
-        populated them. Re-prefilling one window is the existing mitigation,
-        but is not bit-exact; see sglang#34562.
         """
+        Only unified_kv needs this: SWA lives in a per-request ring
+        (state_slot/pos), not content-stable and never stored in the tree, so a
+        reused prefix's trailing sliding window would read another request's
+        stale ring slots. Re-prefilling that window rewrites this request's ring.
+
+        Applies to plain radix reuse as well as HiCache -- the ring is stale
+        either way. Returns 0 once SWA has a host pool to restore exact contents
+        from, and for every non-unified_kv layout, whose SWA slots are
+        content-stable.
+        """
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
         swa = self.components.get(ComponentType.SWA)
-        if swa is None or swa.reused_swa_is_trustworthy:
+        if swa is None or not swa.sliding_window_size:
+            return 0
+        if not is_unified_kv_triton():
+            return 0
+        if self.tree_core.has_swa_host_pool:
             return 0
         return swa.sliding_window_size
 

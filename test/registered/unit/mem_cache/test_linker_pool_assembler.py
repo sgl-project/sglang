@@ -182,7 +182,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)]
         )
         kvcache.c4_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)]
+            kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)],
+            bytes_per_page_padded=5,
         )
         kvcache.c4_indexer_kv_pool = SimpleNamespace(
             index_k_with_scale_buffer=[
@@ -190,7 +191,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             ]
         )
         kvcache.c128_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)]
+            kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)],
+            bytes_per_page_padded=11,
         )
         kvcache.layer_mapping = [
             DeepSeekV4LayerItem(0, -1),
@@ -277,7 +279,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 regions = {4: (c4, 7), 128: (c128, 11)}
                 kvcache = SimpleNamespace(
                     _unified_kv=True,
-                    swa_is_index_addressed=False,
                     start_layer=0,
                     end_layer=3,
                     layer_mapping=[
@@ -290,7 +291,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     c4_kv_pool=None,
                     c128_kv_pool=None,
                     swa_page_size=3,
-                    unified_kv_pool=object(),
                     c4_indexer_kv_pool=indexer,
                     unified_region_buffers=Mock(side_effect=regions.__getitem__),
                 )
@@ -306,8 +306,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     for got, want in zip(actual, buffers):
                         self.assertEqual(got.data_ptr(), want.data_ptr())
                         self.assertEqual(got.shape, want.shape)
-                    if name in (PoolName.DEEPSEEK_V4_C4, PoolName.DEEPSEEK_V4_C128):
-                        self.assertIs(entry.device_pool, kvcache.unified_kv_pool)
                 self.assertEqual(
                     kvcache.unified_region_buffers.call_args_list, [call(4), call(128)]
                 )

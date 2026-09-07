@@ -111,14 +111,6 @@ class SWAComponent(TreeComponent):
             cur = cur.parent
         return dirty
 
-    @property
-    def reused_swa_is_trustworthy(self) -> bool:
-        return self.swa_is_index_addressed
-
-    @property
-    def participates_in_linker(self) -> bool:
-        return self.swa_is_index_addressed
-
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         return bool(self._dirty_backup_window(node))
 
@@ -318,15 +310,15 @@ class SWAComponent(TreeComponent):
         # A request-relative SWA ring is not represented by tree component
         # values. Let FULL drive the match while the scheduler re-prefills the
         # untrusted tail.
-        reused_swa_is_untrustworthy = not self.reused_swa_is_trustworthy
-
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if reused_swa_is_untrustworthy and (node.backuped or not node.evicted):
+                if not self.swa_is_index_addressed and (
+                    node.backuped or not node.evicted
+                ):
                     return True
                 return False
             state["len"] += len(node.key)

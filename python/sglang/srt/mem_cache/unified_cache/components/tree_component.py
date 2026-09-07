@@ -718,11 +718,6 @@ class TreeComponent(ABC):
 
     # ---- External Cache Linker Hooks ----
 
-    @property
-    def participates_in_linker(self) -> bool:
-        """Whether the component uses the linker's page-indexed transfer path."""
-        return True
-
     def build_external_linker_transfer(
         self,
         phase: LinkerTransferPhase,

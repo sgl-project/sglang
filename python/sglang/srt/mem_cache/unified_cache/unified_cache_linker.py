@@ -20,10 +20,9 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 import logging
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -47,79 +46,8 @@ from sglang.srt.mem_cache.utils import get_hash_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-        DevicePoolGroup,
-    )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-
-DIRECT_LINKER_CACHE_SCHEMA_VERSION = 1
-
-
-def with_direct_linker_cache_layout_tag(
-    extra_config: dict | None,
-    *,
-    kvcache: Any,
-    pool_group: DevicePoolGroup,
-    pp_rank: int,
-    pp_size: int,
-) -> dict:
-    """Namespace unified KV bytes while preserving existing paged cache keys.
-
-    DeepSeek-V4's paged and unified KV layouts use the same logical pool names
-    for incompatible bytes.  Keep the user's tag as the outer namespace, then
-    append a deterministic schema tag only for unified KV before either storage
-    backend constructs its key prefix. Paged configurations retain their
-    existing namespace and user-managed indexer/PP isolation.
-    """
-    config = dict(extra_config or {})
-
-    # Check the resolved names first so generic linker paths do not import the
-    # model-specific pool module. The subsequent isinstance also covers
-    # platform subclasses without relying on duck typing or class-name strings.
-    dsv4_pools = {
-        PoolName.DEEPSEEK_V4_C4,
-        PoolName.DEEPSEEK_V4_C4_INDEXER,
-        PoolName.DEEPSEEK_V4_C128,
-    }
-    if not dsv4_pools.intersection(pool_group.entry_map):
-        return config
-
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-        DeepSeekV4TokenToKVPool,
-    )
-
-    if not isinstance(kvcache, DeepSeekV4TokenToKVPool) or not kvcache._unified_kv:
-        return config
-
-    indexer_pool = kvcache.c4_indexer_kv_pool
-    if not hasattr(indexer_pool, "use_fp4_indexer"):
-        raise ValueError("DeepSeek-V4 indexer pool does not expose its wire format.")
-
-    indexer = "fp4" if indexer_pool.use_fp4_indexer else "int8"
-    pp_size = int(pp_size)
-    if pp_size <= 0 or not 0 <= int(pp_rank) < pp_size:
-        raise ValueError(
-            "Invalid DeepSeek-V4 PP layout for external-cache namespace: "
-            f"pp_rank={pp_rank}, pp_size={pp_size}."
-        )
-
-    # Do not recompute layer ranges here: the model partitions over
-    # num_hidden_layers, compression_ratios also counts the NextN/MTP layer.
-    partition = os.getenv("SGLANG_PP_LAYER_PARTITION")
-    partition = "auto" if partition is None else partition.replace(",", ".")
-
-    layout_tag = (
-        f"ucdl-dsv4-v{DIRECT_LINKER_CACHE_SCHEMA_VERSION}"
-        f"-layout-unified-bf16-indexer-{indexer}"
-        f"-pp{pp_size}-layers-{partition}"
-    )
-    user_tag = config.get("extra_backend_tag")
-    config["extra_backend_tag"] = (
-        layout_tag if user_tag is None else f"{user_tag}__{layout_tag}"
-    )
-    return config
 
 
 logger = logging.getLogger(__name__)
@@ -218,10 +146,12 @@ class UnifiedCacheLinkerWrapper:
     ):
         self.cache = cache
         self.cache_linker = cache_linker
+        swa = cache.components.get(ComponentType.SWA)
+        skip_swa = swa is not None and not swa.swa_is_index_addressed
         self._components = tuple(
             component
             for component in cache._components_tuple
-            if component.participates_in_linker
+            if not (skip_swa and component is swa)
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
@@ -232,8 +162,7 @@ class UnifiedCacheLinkerWrapper:
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
-        swa = cache.components.get(ComponentType.SWA)
-        if swa is not None and not swa.participates_in_linker:
+        if skip_swa:
             logger.warning(
                 "Direct external linker with request-relative SWA uses the "
                 "approximate re-prefill path; restored outputs are not "
