@@ -348,6 +348,74 @@ def test_moe_wna16_marlin_gemm(
     torch.testing.assert_close(c_jit, c_aot, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "n,k,block_size_m",
+    [(320, 2560, block) for block in [8, 16, 32, 48, 64]]
+    + [(64, 128, 8), (192, 2560, 8), (384, 2560, 8)],
+)
+def test_moe_wna16_marlin_n64_tiles(dtype, n, k, block_size_m):
+    """TP shards can have N divisible by 64 but not by 128 (issue #37089)."""
+    torch.manual_seed(0)
+    m, e, topk = 64, 4, 2
+    quant_type = scalar_types.uint4b8
+    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    w_ref, qweight, scales, zeros, g_idx, sort_indices = _setup_moe_weights(
+        e, n, k, quant_type, 128, False, dtype
+    )
+    topk_weights, topk_ids = torch.topk(
+        torch.randn((m, e), device="cuda").softmax(-1), topk
+    )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, e
+    )
+    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    workspace = torch.zeros(sms * 4, dtype=torch.int32, device="cuda")
+
+    def run():
+        return _run_single_gemm(
+            moe_wna16_marlin_gemm,
+            a,
+            None,
+            qweight,
+            scales,
+            zeros,
+            g_idx,
+            sort_indices,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            quant_type,
+            block_size_m,
+            topk,
+            m,
+            n,
+            k,
+            False,
+            True,
+            False,
+        )
+
+    output = run()
+    expected = torch.stack(
+        [
+            a[token].float() @ w_ref[topk_ids[token, route]].float().T
+            for token in range(m)
+            for route in range(topk)
+        ]
+    )
+    torch.testing.assert_close(output.float(), expected, rtol=0.02, atol=0.01)
+
+    # The original failure was reached during decode CUDA graph capture.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    graph.replay()
+    torch.testing.assert_close(captured.float(), expected, rtol=0.02, atol=0.01)
+
+
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="Non-gated NVFP4 Marlin fallback test requires CUDA SM8X/SM9X",
