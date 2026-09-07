@@ -236,6 +236,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     accessors instead).
     """
 
+    # Unlike the CUDA/HIP DSV4 paths, the Ascend backend writes CP-local KV
+    # directly into this pool without materializing global token order first.
+    supports_hicache_shared_cp_storage = False
+
     def __init__(self, *args, **kwargs):
         c128_page_size = get_schedule().c128_page_size
         if c128_page_size <= 0 or c128_page_size % 16 != 0:

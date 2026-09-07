@@ -289,23 +289,28 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
         controller.enable_storage_metrics = False
         parallel = mock.Mock(attn_tp_rank=0, attn_tp_size=1, pp_rank=0)
 
-        for backend, is_dsv4, cp_rank, cp_size, pp_size, shared in [
-            ("file", True, 0, 8, 1, True),
-            ("file", True, 7, 8, 1, True),
-            ("file", True, 0, 1, 1, False),
-            ("file", True, 7, 8, 2, False),
-            ("mooncake", True, 7, 8, 1, False),
-            ("file", False, 7, 8, 1, False),
+        for backend, is_dsv4, supports_shared_cp, cp_rank, cp_size, pp_size, shared in [
+            ("file", True, True, 0, 8, 1, True),
+            ("file", True, True, 7, 8, 1, True),
+            ("file", True, True, 0, 1, 1, False),
+            ("file", True, True, 7, 8, 2, False),
+            ("mooncake", True, True, 7, 8, 1, False),
+            ("file", True, False, 7, 8, 1, False),
+            ("file", False, False, 7, 8, 1, False),
         ]:
             with self.subTest(
                 backend=backend,
                 is_dsv4=is_dsv4,
+                supports_shared_cp=supports_shared_cp,
                 cp_rank=cp_rank,
                 cp_size=cp_size,
                 pp_size=pp_size,
             ):
                 pool_cls = DeepSeekV4TokenToKVPool if is_dsv4 else MLATokenToKVPool
                 controller.mem_pool_device = mock.Mock(spec=pool_cls)
+                controller.mem_pool_device.supports_hicache_shared_cp_storage = (
+                    supports_shared_cp
+                )
                 controller.get_attn_cp_rank_and_size = mock.Mock(
                     return_value=(cp_rank, cp_size)
                 )
