@@ -343,7 +343,7 @@ class DSANPUIndexerMixin:
                     query_quant_mode=0,
                     key_quant_mode=0,
                 )
-                return topk_indices[0].squeeze(1)
+                return topk_indices.squeeze(1)
 
             topk_indices = torch_npu.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),
