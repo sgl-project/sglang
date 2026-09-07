@@ -1468,8 +1468,8 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        # Avoid capturing hip graph failure on torch version smaller than or
-        # equal to 2.11
+        # Always use pynccl to avoid capturing hip graph failure on torch
+        # version smaller than or equal to 2.11
         if is_hip() and self.pynccl_comm is not None and not self.pynccl_comm.disabled:
             self.pynccl_comm.broadcast(input_, src=src)
         else:
