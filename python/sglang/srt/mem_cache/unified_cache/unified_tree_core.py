@@ -530,9 +530,13 @@ class _LazyLeafHeap:
             heap_keys.setdefault(node, []).append(key)
         no_entry = [n for n, k in live.items() if k not in heap_keys.get(n, ())]
         if no_entry:
-            report(f"[{name}] live entry missing from heap: {[n.id for n in no_entry[:5]]}")
+            report(
+                f"[{name}] live entry missing from heap: {[n.id for n in no_entry[:5]]}"
+            )
         if len(self._heap) > 2 * len(live) + 64:
-            report(f"[{name}] heap not compacted: {len(self._heap)} entries for {len(live)} live")
+            report(
+                f"[{name}] heap not compacted: {len(self._heap)} entries for {len(live)} live"
+            )
 
 
 class _InsertPhase(Enum):

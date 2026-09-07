@@ -32,7 +32,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.components import (
+    ComponentType,
+)
 from sglang.srt.mem_cache.unified_cache.components import (
     tree_component as _tree_component,
 )
@@ -308,9 +310,7 @@ def replay_pair(
 ):
     ops = gen_ops(seed, 320, page_size, session)
     reset_time_counter()
-    new = Replay(
-        make_cache(policy=policy, enable_session=session, page_size=page_size)
-    )
+    new = Replay(make_cache(policy=policy, enable_session=session, page_size=page_size))
     new.run(ops)
     reset_time_counter()
     if kill_switch:
@@ -349,7 +349,7 @@ class _Node:
 class TestLazyLeafHeapUnit(CustomTestCase):
     def _heap(self, nodes, **kw):
         members = set(nodes)
-        heap = _LazyLeafHeap(members, lambda: (lambda n: n.key), **kw)
+        heap = _LazyLeafHeap(members, lambda: lambda n: n.key, **kw)
         for n in nodes:
             heap.refresh(n)
         return members, heap
@@ -507,12 +507,16 @@ class TestEvictionOrderParity(CustomTestCase):
 # ---------------------------------------------------------------------------
 def _insert(cache, tokens):
     v = cache.token_to_kv_pool_allocator.alloc(len(tokens))
-    cache.insert(InsertParams(key=RadixKey(array("q", tokens)), value=v.to(torch.int64)))
+    cache.insert(
+        InsertParams(key=RadixKey(array("q", tokens)), value=v.to(torch.int64))
+    )
 
 
 def _match_len(cache, tokens) -> int:
     return len(
-        cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens)))).device_indices
+        cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).device_indices
     )
 
 
@@ -541,7 +545,9 @@ class TestHeapOnRealCache(CustomTestCase):
         cache = make_cache(policy="lru", enable_session=True)
         _insert(cache, [1, 2, 3, 4])
         _insert(cache, [7, 8, 9])
-        res = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4]))))
+        res = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4])))
+        )
         cache.session_refs.register_session_ref(
             SimpleNamespace(
                 session_id="s1",
@@ -559,7 +565,9 @@ class TestHeapOnRealCache(CustomTestCase):
         cache.release_radix_session("s1")
         cache.sanity_check()
         cache.evict(EvictParams(num_tokens=4))
-        self.assertEqual(_match_len(cache, [1, 2, 3, 4]), 0)  # released leaf is evictable again
+        self.assertEqual(
+            _match_len(cache, [1, 2, 3, 4]), 0
+        )  # released leaf is evictable again
         cache.sanity_check()
 
     def test_parent_promotion_within_one_call(self):

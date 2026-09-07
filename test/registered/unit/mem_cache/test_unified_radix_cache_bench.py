@@ -594,7 +594,10 @@ def bench_evict_step(
     warmup = min(20, num_steps // 10)
     # Fresh sequences (unique tails) so each step re-inserts new leaves.
     fresh = env.seqs[inserted:] + env.seqs[:inserted]
-    items = [(step_tokens, fresh[i % len(fresh)][:step_tokens]) for i in range(num_steps + warmup)]
+    items = [
+        (step_tokens, fresh[i % len(fresh)][:step_tokens])
+        for i in range(num_steps + warmup)
+    ]
 
     def step(item):
         n, seq = item
