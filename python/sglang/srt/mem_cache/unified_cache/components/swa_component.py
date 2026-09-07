@@ -80,8 +80,6 @@ class SWAComponent(TreeComponent):
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
-        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        self.swa_is_index_addressed = getattr(kvcache, "swa_is_index_addressed", True)
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -307,18 +305,19 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
-        # A request-relative SWA ring is not represented by tree component
-        # values. Let FULL drive the match while the scheduler re-prefills the
-        # untrusted tail.
+        # unified_kv never caches the SWA ring (per-request, not content-stable),
+        # so SWA bookkeeping must not gate the match here.
+        is_unified_kv = getattr(
+            self.cache.token_to_kv_pool_allocator.get_kvcache(), "_unified_kv", False
+        )
+
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if not self.swa_is_index_addressed and (
-                    node.backuped or not node.evicted
-                ):
+                if is_unified_kv and (node.backuped or not node.evicted):
                     return True
                 return False
             state["len"] += len(node.key)

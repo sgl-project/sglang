@@ -454,28 +454,32 @@ def test_component_commit_keeps_only_adopted_pages():
     assert mapped_swa.tolist() == [202, 203, 206, 207]
 
 
-@pytest.mark.parametrize("unified_kv", [False, True])
+@pytest.mark.parametrize(
+    "pool,unified_kv",
+    [
+        pytest.param(SimpleNamespace(), False, id="other-pool"),
+        pytest.param(SimpleNamespace(_unified_kv=False), False, id="paged"),
+        pytest.param(SimpleNamespace(_unified_kv=True), True, id="unified"),
+    ],
+)
 @pytest.mark.parametrize("enable_hicache", [False, True])
 def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
-    monkeypatch, unified_kv, enable_hicache
+    monkeypatch, pool, unified_kv, enable_hicache
 ):
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: unified_kv)
-    pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-    pool._unified_kv = unified_kv
-    assert pool.swa_is_index_addressed is not unified_kv
     component = SWAComponent.__new__(SWAComponent)
-    component.swa_is_index_addressed = pool.swa_is_index_addressed
     component.sliding_window_size = 128
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.token_to_kv_pool_allocator = SimpleNamespace(get_kvcache=lambda: pool)
     cache.components = {ComponentType.SWA: component}
     cache.cache_controller = object() if enable_hicache else None
     cache.tree_core = SimpleNamespace(
         enable_hicache=enable_hicache,
         has_swa_host_pool=enable_hicache and not unified_kv,
     )
+    component.cache = cache
     component.tree_core = cache.tree_core
     # #32759: request-relative SWA needs tail re-prefill even without HiCache.
     assert cache.swa_reprefill_tail_tokens() == (128 if unified_kv else 0)
@@ -521,7 +525,6 @@ def test_linker_filters_request_relative_swa_from_lookup_and_offload(
 ):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
-    swa.swa_is_index_addressed = False
     swa.build_external_linker_transfer = MagicMock(
         side_effect=AssertionError("excluded SWA reached linker")
     )
@@ -529,6 +532,9 @@ def test_linker_filters_request_relative_swa_from_lookup_and_offload(
     cache = _cache_for_wrapper(
         _components_tuple=(full, swa),
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
+        token_to_kv_pool_allocator=SimpleNamespace(
+            get_kvcache=lambda: SimpleNamespace(_unified_kv=True)
+        ),
         tree_core=SimpleNamespace(
             enable_external_cache_linker=False, mark_write_through_pending=MagicMock()
         ),
@@ -562,19 +568,25 @@ def test_linker_filters_request_relative_swa_from_lookup_and_offload(
 
 
 @pytest.mark.parametrize(
-    "participates,previous_boundary,expected_boundary",
+    "unified_kv,previous_boundary,expected_boundary",
     [
-        pytest.param(False, None, 4, id="unified-tombstones"),
-        pytest.param(False, 8, 8, id="preserve-existing-boundary"),
-        pytest.param(True, None, 2, id="paged-prepare-boundary"),
+        pytest.param(True, None, 4, id="unified-tombstones"),
+        pytest.param(True, 8, 8, id="preserve-existing-boundary"),
+        pytest.param(False, None, 2, id="paged-prepare-boundary"),
+        pytest.param(None, None, 2, id="other-pool-prepare-boundary"),
     ],
 )
 def test_linker_load_preserves_swa_boundaries(
-    full_linker_component, participates, previous_boundary, expected_boundary
+    full_linker_component, unified_kv, previous_boundary, expected_boundary
 ):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
-    swa.swa_is_index_addressed = participates
+    pool = (
+        SimpleNamespace()
+        if unified_kv is None
+        else SimpleNamespace(_unified_kv=unified_kv)
+    )
+    participates = not unified_kv
 
     def prepare(phase, req, full_transfer, transfer, prefix_len, **kwargs):
         if phase == ExternalLinkerLoadPhase.PREPARE:
@@ -597,6 +609,7 @@ def test_linker_load_preserves_swa_boundaries(
         _components_tuple=(full, swa),
         page_size=2,
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
+        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
         tree_core=SimpleNamespace(
             empty_match_result=SimpleNamespace(
                 device_indices=torch.empty(0, dtype=torch.int64)

@@ -19,7 +19,6 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
@@ -48,9 +47,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-
-logger = logging.getLogger(__name__)
 
 
 class UnifiedCacheLinker(ABC):
@@ -147,11 +143,13 @@ class UnifiedCacheLinkerWrapper:
         self.cache = cache
         self.cache_linker = cache_linker
         swa = cache.components.get(ComponentType.SWA)
-        skip_swa = swa is not None and not swa.swa_is_index_addressed
+        self._skip_swa = swa is not None and getattr(
+            cache.token_to_kv_pool_allocator.get_kvcache(), "_unified_kv", False
+        )
         self._components = tuple(
             component
             for component in cache._components_tuple
-            if not (skip_swa and component is swa)
+            if not (self._skip_swa and component is swa)
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
@@ -162,13 +160,6 @@ class UnifiedCacheLinkerWrapper:
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
-        if skip_swa:
-            logger.warning(
-                "Direct external linker with request-relative SWA uses the "
-                "approximate re-prefill path; restored outputs are not "
-                "guaranteed bit-exact with a cold run "
-                "(https://github.com/sgl-project/sglang/issues/34562)."
-            )
 
     @property
     def layer_done_counter(self) -> object:
@@ -315,8 +306,7 @@ class UnifiedCacheLinkerWrapper:
         # Components omitted from the linker do not run their PREPARE hook.
         # Keep a non-restorable SWA range as tombstones instead of rebuilding
         # it from an uninitialized FULL-to-SWA mapping during cache.insert().
-        swa = cache.components.get(ComponentType.SWA)
-        if swa is not None and swa not in self._components:
+        if self._skip_swa:
             if req.kv is None:
                 from sglang.srt.managers.schedule_batch import ReqKvInfo
 
