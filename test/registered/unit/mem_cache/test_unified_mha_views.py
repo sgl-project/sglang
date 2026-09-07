@@ -23,7 +23,7 @@ Addressing law under test:
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
@@ -367,6 +367,18 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
 
 
 class TestFactoryViews(unittest.TestCase):
+    def setUp(self):
+        # `KVIndexTranslator.__init__` asks the parallel context for
+        # `attn_dcp_size`, which is a quotient of the configured leaves and is
+        # computed at publish. A bare process has none, so state one the way a
+        # real process does.
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
+
     """Over the real SWA factory: matching kernel-facing multipliers in the
     composite allocator, and a rebind that emits both write locs."""
 
