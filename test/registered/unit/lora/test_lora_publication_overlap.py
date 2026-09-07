@@ -161,7 +161,8 @@ class TestPublicationOverlap(unittest.IsolatedAsyncioTestCase):
                 await tm.lora_registry.release(new_id)
             finally:
                 finish.set()
-                await task
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         await tm.lora_registry.release(old_ids)
 
     async def test_base_and_in_place_sessions_still_wait_for_readers(self):
