@@ -20,7 +20,6 @@ import torch
 
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
-    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -31,22 +30,15 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
+from sglang.srt.layers.cp.utils import mla_use_prefill_cp
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
     get_local_dp_buffer,
 )
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel
-
-
-def dsa_enable_prefill_cp():
-    # After using cp, the communication mode of this part changes.
-    # The three parts of prepare_attn, prepare_mlp, and postprocess_layer
-    # no longer require additional communication for reduce, scatter, etc.
-    return is_dsa_enable_prefill_cp()
 
 
 def maybe_prefetch_next_full_attention_kv(

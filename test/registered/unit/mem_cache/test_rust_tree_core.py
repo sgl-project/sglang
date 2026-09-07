@@ -12,7 +12,7 @@ from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInte
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=90, suite="base-a-test-cpu")
+register_cpu_ci(est_time=17, suite="base-a-test-cpu")
 
 if shutil.which("cargo") is None:
     pytest.skip("the rust backend builds with cargo", allow_module_level=True)
