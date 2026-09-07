@@ -386,6 +386,29 @@ def _serving_coverage_phases(
 
     phases.append(("short-prompts", _per_rank(_short_prompts)))
 
+    if _fits(chunk + 64):
+
+        async def _cached_prefix(rank):
+            # A completed multi-chunk request publishes recurrent checkpoints.
+            # Reusing it exercises slot copy-on-write, which cold requests and
+            # short natural prompts do not necessarily reach during warmup.
+            prefix = _ids(chunk + 64)
+            await _run(_request(rank, input_ids=list(prefix), max_new_tokens=4))
+            await _run(_request(rank, input_ids=list(prefix), max_new_tokens=4))
+            await _gather(
+                _request(rank, input_ids=list(prefix), max_new_tokens=4)
+                for _ in range(max_running)
+            )
+
+        phases.append(("cached-prefix", _per_rank(_cached_prefix)))
+    else:
+        logger.info(
+            "serving_coverage: skipping cached-prefix phase: prompts are "
+            "clamped to %d tokens, below the checkpoint warmup length (%d + 64)",
+            max_prompt,
+            chunk,
+        )
+
     if text_ok:
 
         async def _natural_text(rank):
@@ -481,6 +504,8 @@ async def serving_coverage(
       chunked-prefill chunk,
     * single prefills at exact chunk multiples,
     * short prompts and one long decode,
+    * completed multi-chunk prefixes reused alone and concurrently (recurrent
+      slot copy-on-write otherwise first runs on a real cached request),
     * natural-text prompts (accepted speculative drafts widen verify batches
       in ways random token ids never do),
     * non-greedy sampling variants (the sampling kernels are otherwise built

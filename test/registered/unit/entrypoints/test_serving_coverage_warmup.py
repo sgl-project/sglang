@@ -99,9 +99,34 @@ class TestServingCoveragePhases(_PublishedConfig):
                 "cold-cohort",
                 "chunk-multiples",
                 "short-prompts",
+                "cached-prefix",
                 "natural-text",
                 "sampling",
             ],
+        )
+
+    async def test_cached_prefix_is_published_before_reuse(self):
+        class CacheAwareManager(FakeTokenizerManager):
+            completed = set()
+
+            async def generate_request(self, req, request):
+                prefix = tuple(req.input_ids)
+                if self.requests:
+                    assert prefix in self.completed, (
+                        "reuse started before prefill drained"
+                    )
+                async for response in super().generate_request(req, request):
+                    yield response
+                self.completed.add(prefix)
+
+        tm = CacheAwareManager()
+        await _phases(tm)["cached-prefix"]()
+        self.assertEqual(len(tm.requests), 2 + MAX_RUNNING)
+        self.assertEqual(len(tm.completed), 1)
+        self.assertEqual(len(next(iter(tm.completed))), CHUNK + 64)
+        self.assertEqual(tm.max_in_flight, MAX_RUNNING)
+        self.assertEqual(
+            len({id(req.input_ids) for req in tm.requests}), len(tm.requests)
         )
 
     async def test_cohort_issues_max_running_requests_concurrently(self):
@@ -405,10 +430,11 @@ class TestPhasesThatCannotFitAreSkipped(_PublishedConfig):
             phases = _phases(tm)
         self.assertNotIn("cold-cohort", phases)
         self.assertNotIn("chunk-multiples", phases)
+        self.assertNotIn("cached-prefix", phases)
         self.assertIn("cohort", phases)
         self.assertIn("short-prompts", phases)
         skipped = [line for line in cm.output if "skipping" in line]
-        self.assertEqual(len(skipped), 2)
+        self.assertEqual(len(skipped), 3)
         self.assertTrue(all("640" in line and "4096" in line for line in skipped))
 
     async def test_remaining_phases_still_fit(self):
