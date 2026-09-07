@@ -16,15 +16,18 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 # Do not lower the ROCm value: the per-layer read path loses bandwidth below it.
-DEFAULT_BLOCK_QUOTA = 16 if is_hip_runtime() else 2
+_is_hip = is_hip_runtime()
 
-# Mirrors device::kWarpThreads in sgl_kernel/utils.cuh.
+DEFAULT_BLOCK_QUOTA = 16 if _is_hip else 2
+
+# Mirrors device::kWarpThreads in sgl_kernel/utils.cuh, which kvcacheio/hicache.cuh
+# static_asserts so the two cannot drift apart.
 WARP_THREADS = 32
 
 # Copy-round widths, widest first. The narrow rounds admit element sizes 128
 # does not divide, such as MLA's 576 B fp8 row, but only pay off against the
 # ROCm quota above, so CUDA keeps the original 128 B requirement.
-GROUP_BYTES = (128, 64, 32, 16) if is_hip_runtime() else (128,)
+GROUP_BYTES = (128, 64, 32, 16) if _is_hip else (128,)
 
 
 @cache_once
