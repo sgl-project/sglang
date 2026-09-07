@@ -398,11 +398,27 @@ class VisionSdpaAttention(nn.Module):
                 s, cu_seqlens, flatten_batch=self.flatten_batch
             )
 
-        if attention_mask is None:
-            if self.softmax_in_single_precision:
-                raise RuntimeError("Empty attention mask")
-        else:
+        if attention_mask is not None:
             attention_mask = attention_mask.to(device=q.device)
+
+        causal = kwargs.get("causal", False)
+        window_size = kwargs.get("window_size", (-1, -1))
+        if causal or window_size != (-1, -1):
+            row = torch.arange(s, device=q.device).unsqueeze(1)
+            col = torch.arange(s, device=q.device).unsqueeze(0)
+            local_mask = torch.ones((s, s), dtype=torch.bool, device=q.device)
+            if causal:
+                local_mask &= col <= row
+            if window_size[0] >= 0:
+                local_mask &= col >= row - window_size[0]
+            if window_size[1] >= 0:
+                local_mask &= col <= row + window_size[1]
+            attention_mask = (
+                local_mask if attention_mask is None else attention_mask & local_mask
+            )
+
+        if attention_mask is None and self.softmax_in_single_precision:
+            raise RuntimeError("Empty attention mask")
 
         q = q.reshape(bsz, s, self.num_heads, self.head_size).transpose(1, 2)
         k = k.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
@@ -445,9 +461,7 @@ class VisionSdpaAttention(nn.Module):
 
 
 class VisionTritonAttention(nn.Module):
-    """
-    Triton-implemented attention without a causal mask
-    """
+    """Triton-implemented attention."""
 
     def __init__(
         self,
@@ -505,6 +519,12 @@ class VisionTritonAttention(nn.Module):
             # [b * s, head, head_size]
             output = torch.empty_like(q)
 
+        window_size = kwargs.get("window_size", (-1, -1))
+        if window_size != (-1, -1):
+            raise NotImplementedError(
+                "Triton vision attention does not support sliding-window attention"
+            )
+
         context_attention_fwd(
             q,
             k,
@@ -513,7 +533,7 @@ class VisionTritonAttention(nn.Module):
             cu_seqlens_gpu,
             seq_lens,
             max_seqlen,
-            is_causal=False,
+            is_causal=kwargs.get("causal", False),
             sm_scale=softmax_scale,
         )
 
@@ -575,6 +595,7 @@ class VisionFlash3Attention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             softmax_scale=softmax_scale,
+            causal=kwargs.get("causal", False),
             window_size=window_size,
         )
         if s_aux is not None:
@@ -630,6 +651,9 @@ class VisionFlash4Attention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             softmax_scale=softmax_scale,
+            causal=kwargs.get("causal", False),
+            window_size=kwargs.get("window_size", (-1, -1)),
+            sinks=kwargs.get("s_aux"),
             ver=4,
         )
 
@@ -666,6 +690,11 @@ class VisionFlashInferAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if kwargs.get("window_size", (-1, -1)) != (-1, -1):
+            raise NotImplementedError(
+                "FlashInfer cuDNN vision attention does not support sliding-window attention"
+            )
+
         # ---- resolve sequence_lengths, packed indptrs, max_seqlen ----
         if forward_metadata is not None and forward_metadata.packed_indptrs is not None:
             sequence_lengths = forward_metadata.sequence_lengths
@@ -753,7 +782,7 @@ class VisionFlashInferAttention(nn.Module):
             max_sequence_kv=max_seqlen,
             actual_seq_lens_q=seq_lens_4d,
             actual_seq_lens_kv=seq_lens_4d,
-            causal=False,
+            causal=kwargs.get("causal", False),
             return_lse=True,
             batch_offsets_q=indptr_qk,
             batch_offsets_k=indptr_qk,
@@ -815,6 +844,8 @@ class VisionAiterAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             softmax_scale=softmax_scale,
+            causal=kwargs.get("causal", False),
+            window_size=kwargs.get("window_size", (-1, -1)),
         )
 
 
@@ -860,6 +891,14 @@ class VisionAscendAttention(nn.Module):
                 attention_mask=attention_mask,
                 forward_metadata=forward_metadata,
                 **kwargs,
+            )
+
+        if kwargs.get("causal", False) or kwargs.get("window_size", (-1, -1)) != (
+            -1,
+            -1,
+        ):
+            raise NotImplementedError(
+                "Ascend vision attention does not support causal sliding-window attention"
             )
 
         if forward_metadata is not None:
@@ -983,6 +1022,11 @@ class VisionAMXAttention(nn.Module):
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
+        if kwargs.get("window_size", (-1, -1)) != (-1, -1):
+            raise NotImplementedError(
+                "AMX vision attention does not support sliding-window attention"
+            )
+
         output = flash_attn_varlen_func(
             q,
             k,
@@ -991,7 +1035,7 @@ class VisionAMXAttention(nn.Module):
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
-            causal=False,
+            causal=kwargs.get("causal", False),
         )
 
         return output
@@ -1037,6 +1081,7 @@ class VisionIntelXPUAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             softmax_scale=softmax_scale,
+            causal=kwargs.get("causal", False),
             window_size=window_size,
         )
         if s_aux is not None:
@@ -1106,6 +1151,7 @@ class VisionAttention(nn.Module):
         workspace_buffer: Optional[torch.Tensor] = None,
         use_sink: bool = False,
         window_size: Tuple[int, int] = (-1, -1),
+        causal: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -1227,6 +1273,7 @@ class VisionAttention(nn.Module):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
 
         self.window_size = window_size
+        self.causal = causal
         if use_sink:
             # Allocate the full (unsharded) sink tensor for weight loading;
             # only the local TP slice is used in forward.
@@ -1518,7 +1565,10 @@ class VisionAttention(nn.Module):
             else:
                 q, k = self._apply_qk_norm(q, k)
 
-        if full_attn or self.sinks is None:
+        if self.causal:
+            effective_window_size = self.window_size
+            s_aux = None
+        elif full_attn or self.sinks is None:
             effective_window_size = (-1, -1)
             s_aux = None
         else:
@@ -1540,6 +1590,7 @@ class VisionAttention(nn.Module):
             max_seqlen=max_seqlen,
             output_ws=attn_output_ws,
             softmax_scale=self.softmax_scale,
+            causal=self.causal,
             window_size=effective_window_size,
             s_aux=s_aux,
         )
