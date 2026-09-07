@@ -447,6 +447,14 @@ class CudaIpcPackedTensorTransportProxy(CudaIpcTensorTransportProxy):
             and self.reconstruct_tensor.device == device
         ):
             return self.reconstruct_tensor
+        if self.owner._producer_cancelled or (
+            self.owner._consumer_acknowledged
+            and (
+                self.owner.reconstruct_tensor is None
+                or self.owner.reconstruct_tensor.device != device
+            )
+        ):
+            raise RuntimeError("Packed CUDA IPC payload has already released its lease")
         packed = self.owner.reconstruct_on_target_device(
             rebuild_device_idx,
             consumer_count=consumer_count,

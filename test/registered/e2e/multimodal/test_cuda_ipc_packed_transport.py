@@ -84,6 +84,9 @@ def _publish_batch(commands, results, consumer_count, use_handle_cache):
     finally:
         if pool is not None:
             pool.shutdown()
+            del pool
+        gc.collect()
+        torch.cuda.ipc_collect()
 
 
 def _consume_second_rank(wire, device, results):
@@ -100,6 +103,8 @@ def _consume_second_rank(wire, device, results):
     finally:
         proxies[0].owner._pool_storage = None
         _pool_handle_cache_clear()
+        gc.collect()
+        torch.cuda.ipc_collect()
 
 
 @contextmanager
@@ -208,6 +213,8 @@ class TestPackedCudaIpcTransport(CustomTestCase):
             self.assertIsNone(proxies[0].owner.reconstruct_tensor)
             commands.put("reuse")
             self.assertEqual(results.get(timeout=10), ("reused", True))
+            with self.assertRaisesRegex(RuntimeError, "already released its lease"):
+                proxies[-1].reconstruct_on_target_device(0)
 
     def test_scheduler_failure_releases_shared_lease(self):
         with _published_batch() as (proxies, _, commands, results):
