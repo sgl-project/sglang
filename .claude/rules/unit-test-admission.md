@@ -1,6 +1,7 @@
 ---
 paths:
   - "test/**/*.py"
+  - "python/sglang/multimodal_gen/test/**/*.py"
 ---
 
 # Unit Test Admission Criteria
@@ -67,6 +68,14 @@ change that every dependent test catches anyway.
 One strong case beats several weak ones: each additional case must guard a
 distinct failure mode. Ask "which bug escapes if I delete this case?" -- no
 answer means delete it.
+
+New cases join an existing file in the same subsystem by default. Create a new
+file only when it needs a different fixture, dependency, owner, or CI contract;
+every file pays a separate interpreter-import cost in the CPU gate.
+
+Suite cadence is part of admission: if a failing run cannot be attributed to a
+single PR's diff, the test belongs in a nightly or weekly suite rather than a
+per-commit lane.
 
 Test mechanics (placement, CI registration, fixtures) live in
 [`write-sglang-test`](../skills/write-sglang-test/SKILL.md).

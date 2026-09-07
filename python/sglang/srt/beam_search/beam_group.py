@@ -211,9 +211,9 @@ class BeamGroup:
         cums = sel.cum_logprobs.tolist()
         # A parent outside the committed frontier means a tick-gating bug let an
         # unsynchronized step through; fail rather than build a corrupt DAG.
-        assert not parents or max(parents) < len(
-            self.leaves
-        ), "beam commit consumed an unsynced or misordered step"
+        assert not parents or max(parents) < len(self.leaves), (
+            "beam commit consumed an unsynced or misordered step"
+        )
         for token, parent, cum in zip(tokens, parents, cums):
             leaf = BeamNode(token, self.leaves[parent])
             self.completed.append(CompletedBeam(leaf, cum, new_len, matched_token=None))
