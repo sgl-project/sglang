@@ -676,11 +676,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         if not (
             current_platform.is_cuda()
+            or current_platform.is_cpu()
             or current_platform.is_mps()
             or current_platform.is_npu()
         ):
             raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CUDA, MPS, or Ascend NPU"
+                "MiniMax H3 full-loop denoise requires CPU, CUDA, MPS, or Ascend NPU"
             )
 
         device = current_platform.get_local_torch_device()
