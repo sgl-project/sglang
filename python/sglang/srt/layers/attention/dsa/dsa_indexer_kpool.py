@@ -25,7 +25,10 @@ if is_cuda():
         deep_gemm = e
 
 if is_npu():
-    import custom_ops  # noqa: F401
+    try:
+        import custom_ops  # noqa: F401
+    except ImportError:
+        pass
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
