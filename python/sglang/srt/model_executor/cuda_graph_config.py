@@ -97,7 +97,7 @@ class PhaseConfig:
     bs: Optional[List[int]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
-    # Effective for both full and breakable backend: maximum captured context length.
+    # Effective for both full and breakable backend and currently only DSV4: maximum captured context length.
     # Replay rounds the largest seq_len in the batch up to one of these buckets, using to
     # avoid padding every graph to the model's maximum context.
     context_buckets: Optional[List[int]] = None
