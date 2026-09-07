@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import ctypes
+import hashlib
 import logging
 import os
 import pickle
@@ -87,6 +88,7 @@ rid_to_receive_endpoint: Dict[str, Set[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
+encode_state_condition = asyncio.Condition()
 
 
 async def _get_receive_condition(req_id: str) -> asyncio.Condition:
@@ -96,11 +98,48 @@ async def _get_receive_condition(req_id: str) -> asyncio.Condition:
         return rid_to_cond[req_id]
 
 
+async def _notify_receive_waiters(req_id: str) -> None:
+    """Wake an existing destination waiter without creating new state."""
+    async with cond_dict_lock:
+        cond = rid_to_cond.get(req_id)
+    if cond is not None:
+        async with cond:
+            cond.notify_all()
+
+
 ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
 ENCODER_MAX_BATCH_SIZE_EXPLICIT = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.is_set()
 # Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
 # if the batch worker stalls (NCCL hang, dead worker proc, etc.).
 ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
+
+
+async def await_task_completion_on_cancel(task: asyncio.Task, operation: str):
+    """Keep task-owned resources live until cancellation reaches a safe point."""
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(
+                "%s failed while draining cancellation",
+                operation,
+                exc_info=task.exception(),
+            )
+        raise
+
+
+async def _await_transfer_completion(awaitable, operation: str):
+    """Do not let cancellation outlive a zero-copy transfer using its buffer."""
+    return await await_task_completion_on_cancel(
+        asyncio.ensure_future(awaitable), operation
+    )
 
 
 class EncoderMetaRegistry:
@@ -117,9 +156,10 @@ class EncoderMetaRegistry:
         # Backstop for state whose /send calls never all land.
         self.sweep_timeout = sweep_timeout
         self._rid_to_meta: Dict[str, dict] = {}
-        self._rid_to_send_done: Dict[str, int] = {}
+        self._rid_to_send_done: Dict[str, Set[str]] = {}
         self._pending_at: Dict[str, float] = {}
         self._sweeper_task: Optional[asyncio.Task] = None
+        self._stale_release_tasks: Dict[str, asyncio.Task] = {}
         # Set only where the embedding also lives; None in the DP main process.
         self.on_release: Optional[Callable[[str], Awaitable[None]]] = None
 
@@ -146,9 +186,36 @@ class EncoderMetaRegistry:
                 rid
                 for rid, ts in self._pending_at.items()
                 if now - ts > self.sweep_timeout
+                and rid not in self._stale_release_tasks
             ]
             for rid in stale:
-                await self._release(rid)
+                self._schedule_stale_release(rid)
+
+    def _schedule_stale_release(self, req_id: str) -> asyncio.Task:
+        """Release one stale request without blocking cleanup of other requests."""
+        if task := self._stale_release_tasks.get(req_id):
+            return task
+        task = asyncio.create_task(self._release_stale(req_id))
+        self._stale_release_tasks[req_id] = task
+        task.add_done_callback(
+            lambda done, rid=req_id: self._finish_stale_release(rid, done)
+        )
+        return task
+
+    def _finish_stale_release(self, req_id: str, task: asyncio.Task) -> None:
+        if self._stale_release_tasks.get(req_id) is task:
+            self._stale_release_tasks.pop(req_id)
+
+    async def _release_stale(self, req_id: str) -> None:
+        try:
+            await self._release(req_id)
+        except Exception:
+            logger.exception("Failed to release stale encoder request %s", req_id)
+            # Keep the request eligible for a later sweep without retrying in a
+            # tight loop. Its metadata and buffer ownership remain intact.
+            async with rid_lock:
+                if req_id in self._pending_at:
+                    self._pending_at[req_id] = time.monotonic()
 
     async def publish(
         self,
@@ -187,12 +254,15 @@ class EncoderMetaRegistry:
             )
         return self._rid_to_meta.get(req_id)
 
-    async def note_send_done(self, req_id: str, receive_count: int) -> None:
-        """Count one completed ``/send``; release everything at receive_count."""
+    async def note_send_done(
+        self, req_id: str, receive_count: int, destination_endpoint: str
+    ) -> None:
+        """Count one destination once; release after every receiver has sent."""
         async with rid_lock:
-            count = self._rid_to_send_done.get(req_id, 0) + 1
-            self._rid_to_send_done[req_id] = count
-        if count >= receive_count:
+            completed = self._rid_to_send_done.setdefault(req_id, set())
+            completed.add(destination_endpoint)
+            all_done = len(completed) >= receive_count
+        if all_done:
             await self._release(req_id)
 
     async def _release(self, req_id: str) -> None:
@@ -247,6 +317,36 @@ class EncodeContext(msgspec.Struct):
     str_mm_hashes: Optional[List[str]]
     use_global_cache: bool
     is_health_check: bool
+
+
+def _preprocess_layout_digest(ctx: EncodeContext) -> tuple[int, int]:
+    """Hash metadata that must agree before TP ranks enter model forward."""
+
+    def normalize(value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        if isinstance(value, np.ndarray):
+            return (
+                str(value.dtype),
+                tuple(value.shape),
+                tuple(value.reshape(-1).tolist()),
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(normalize(item) for item in value)
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    signature = (
+        tuple(ctx.items_per_req),
+        tuple(ctx.preprocess_result.token_counts),
+        normalize(ctx.preprocess_result.grid_thw),
+    )
+    digest = hashlib.blake2b(pickle.dumps(signature), digest_size=16).digest()
+    return (
+        int.from_bytes(digest[:8], byteorder="little", signed=True),
+        int.from_bytes(digest[8:], byteorder="little", signed=True),
+    )
 
 
 @dataclass
@@ -582,6 +682,9 @@ class MMEncoder:
                     )
 
             self.req_states: Dict[str, ReqState] = {}
+            # A DP caller can disappear before its encode creates ReqState.
+            # Preserve that release intent until _acquire_encode_ref runs.
+            self.abandoned_req_ids: Set[str] = set()
             # Need to ensure the NCCL launch order on rank0 matches the dispatch order rank>0
             self.encode_dispatch_lock = asyncio.Lock()
 
@@ -641,7 +744,21 @@ class MMEncoder:
             state = ReqState(req_id)
             self.req_states[req_id] = state
         state.active_encodes += 1
+        if req_id in self.abandoned_req_ids:
+            state.release_requested = True
+            self.abandoned_req_ids.discard(req_id)
         return state
+
+    async def abandon_request(self, req_id: str) -> None:
+        """Release now, or remember the release until encode state exists."""
+        self.abandoned_req_ids.add(req_id)
+        if req_id in self.req_states:
+            self.abandoned_req_ids.discard(req_id)
+            await self.release_request(req_id)
+
+    def clear_abandoned_request(self, req_id: str) -> None:
+        """Drop an unused release marker after the worker task exits."""
+        self.abandoned_req_ids.discard(req_id)
 
     async def _release_encode_ref(self, state: Optional[ReqState]) -> None:
         if state is None:
@@ -718,8 +835,16 @@ class MMEncoder:
         async with state.lifecycle_condition:
             state.release_requested = True
             state.preserve_metadata_on_release |= preserve_metadata
-            if state.active_encodes > 0:
-                return
+            encode_is_active = state.active_encodes > 0
+
+        # ``send_with_url`` may be waiting for a destination that will never
+        # arrive after its HTTP caller disappears. Wake it so the worker slot
+        # is retired together with the staged embedding.
+        await _notify_receive_waiters(req_id)
+        if encode_is_active:
+            return
+
+        async with state.lifecycle_condition:
             await state.lifecycle_condition.wait_for(lambda: state.active_sends == 0)
             if self.req_states.get(req_id) is not state:
                 return
@@ -735,21 +860,43 @@ class MMEncoder:
         expected_destination_count: int,
         destination_urls: Iterable[str],
     ) -> None:
-        async with rid_lock:
-            if req_id not in rid_to_receive_endpoint:
-                rid_to_receive_endpoint[req_id] = set()
-                rid_to_receive_count[req_id] = expected_destination_count
-            registered_count = rid_to_receive_count[req_id]
-            if registered_count != expected_destination_count:
-                raise BadRequestError(
-                    f"Inconsistent receive_count for req_id={req_id}: "
-                    f"registered {registered_count}, got {expected_destination_count}"
-                )
-            rid_to_receive_endpoint[req_id].update(destination_urls)
+        state = self.req_states.get(req_id)
+        if state is None:
+            # registration can beat /encode or its queued batch; only encode creates state
+            try:
+                async with encode_state_condition:
+                    await asyncio.wait_for(
+                        encode_state_condition.wait_for(
+                            lambda: req_id in self.req_states
+                        ),
+                        timeout=ENCODER_REQ_TIMEOUT,
+                    )
+            except asyncio.TimeoutError as exc:
+                raise MMError(
+                    f"Timed out waiting for encoder request to start: {req_id}",
+                    code=HTTPStatus.GATEWAY_TIMEOUT,
+                ) from exc
+            state = self.req_states.get(req_id)
+        if state is None:
+            raise BadRequestError(f"Encoder request is not active: {req_id}")
 
-        cond = await _get_receive_condition(req_id)
-        async with cond:
-            cond.notify_all()
+        async with state.lifecycle_condition:
+            if self.req_states.get(req_id) is not state or state.release_requested:
+                raise BadRequestError(f"Encoder request is not active: {req_id}")
+            async with rid_lock:
+                if req_id not in rid_to_receive_endpoint:
+                    rid_to_receive_endpoint[req_id] = set()
+                    rid_to_receive_count[req_id] = expected_destination_count
+                registered_count = rid_to_receive_count[req_id]
+                if registered_count != expected_destination_count:
+                    raise BadRequestError(
+                        f"Inconsistent receive_count for req_id={req_id}: "
+                        f"registered {registered_count}, got {expected_destination_count}"
+                    )
+                rid_to_receive_endpoint[req_id].update(destination_urls)
+            cond = await _get_receive_condition(req_id)
+            async with cond:
+                cond.notify_all()
 
     def _infer_embedding_dims(self) -> dict:
         """Infer per-modality embedding dimensions from hf_config at init time."""
@@ -974,10 +1121,14 @@ class MMEncoder:
                 preprocess_result,
                 items_per_req,
             ) = await self.preprocessor.process_batch_mm_items(requests, modality)
+        except MMError:
+            raise
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
-        except Exception as e:
+        except (TypeError, ValueError) as e:
             raise BadRequestError(f"Failed to process mm items: {str(e)}")
+        except Exception as e:
+            raise InternalError(f"Failed to process mm items: {str(e)}")
 
         if len(items_per_req) != len(requests) or any(n <= 0 for n in items_per_req):
             raise InternalError(
@@ -1052,6 +1203,134 @@ class MMEncoder:
             use_global_cache=use_global_cache,
             is_health_check=is_health_check,
         )
+
+    async def _prepare_encode_context_on_all_ranks(
+        self,
+        requests: List[dict],
+        modality: Modality,
+        *,
+        use_global_cache: bool,
+        is_health_check: bool = False,
+    ) -> EncodeContext:
+        """Prepare one context consistently before TP ranks enter model forward."""
+        ctx = None
+        local_error = None
+        error_phase = 0
+        try:
+            ctx = await self._prepare_encode_context(
+                requests,
+                modality,
+                use_global_cache=use_global_cache,
+                is_health_check=is_health_check,
+            )
+        except Exception as e:
+            local_error = e
+            error_phase = 1
+
+        if local_error is None:
+            try:
+                assert ctx is not None
+                await self._publish_preprocess_metadata(ctx, requests)
+            except Exception as e:
+                local_error = e
+                error_phase = 2
+
+        if local_error is None:
+            assert ctx is not None
+            layout_digest = _preprocess_layout_digest(ctx)
+        else:
+            layout_digest = (0, 0)
+        statuses = self._sync_tp_prepare_status(
+            local_error,
+            error_phase=error_phase,
+            layout_digest=layout_digest,
+        )
+
+        expected_layout = tuple(statuses[0][2:].tolist())
+        mismatch_rank = next(
+            (
+                rank
+                for rank, rank_status in enumerate(statuses[1:], start=1)
+                if tuple(rank_status[2:].tolist()) != expected_layout
+            ),
+            None,
+        )
+        if mismatch_rank is not None:
+            raise InternalError(
+                "Encoder preprocessing produced inconsistent layouts across TP "
+                f"ranks 0 and {mismatch_rank}"
+            )
+
+        assert ctx is not None
+        return ctx
+
+    def _sync_tp_prepare_status(
+        self,
+        local_error: Optional[Exception],
+        *,
+        error_phase: int,
+        layout_digest: tuple[int, int],
+    ) -> List[torch.Tensor]:
+        """Raise the same preparation error on every TP rank."""
+        tp_group = get_tp_group()
+        error_code = (
+            int(
+                local_error.code
+                if isinstance(local_error, MMError)
+                else HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            if local_error is not None
+            else 0
+        )
+        local_status = torch.tensor(
+            [error_code, error_phase, *layout_digest], dtype=torch.int64
+        )
+        statuses = [torch.empty_like(local_status) for _ in range(tp_group.world_size)]
+        if tp_group.world_size > 1:
+            torch.distributed.all_gather(
+                statuses,
+                local_status,
+                group=tp_group.cpu_group,
+            )
+        else:
+            statuses[0].copy_(local_status)
+
+        failures = [
+            (
+                rank,
+                int(rank_status[0].item()),
+                int(rank_status[1].item()),
+            )
+            for rank, rank_status in enumerate(statuses)
+            if rank_status[0].item() != 0
+        ]
+        if not failures:
+            return statuses
+
+        errors = (
+            tp_group.all_gather_object(
+                str(local_error) if local_error is not None else None
+            )
+            if tp_group.world_size > 1
+            else [str(local_error)]
+        )
+        rank, failure_code, failure_phase = next(
+            (
+                (rank, rank_error_code, rank_error_phase)
+                for rank, rank_error_code, rank_error_phase in failures
+                if rank_error_code != HTTPStatus.BAD_REQUEST
+            ),
+            failures[0],
+        )
+        phase = (
+            "Encoder metadata publication"
+            if failure_phase == 2
+            else "Encoder preprocessing"
+        )
+        message = f"{phase} failed on TP rank {rank}: {errors[rank]}"
+        if failure_code == HTTPStatus.BAD_REQUEST:
+            raise BadRequestError(message)
+        raise InternalError(message)
 
     def _broadcast_global_cache_mask(self, mask_tensor: torch.Tensor):
         if get_parallel().tp_size > 1:
@@ -1737,7 +2016,10 @@ class MMEncoder:
             # Queue sends in order under the lock, then wait for buffer
             # ownership independently so libzmq can pipeline the connection.
             try:
-                await asyncio.to_thread(tracker.wait, self.send_timeout)
+                await _await_transfer_completion(
+                    asyncio.to_thread(tracker.wait, self.send_timeout),
+                    f"ZMQ transfer for req_id={mm_data.req_id}",
+                )
             except Exception:
                 if self.scheduler_send_sockets.get(endpoint) is sock:
                     self.scheduler_send_sockets.pop(endpoint, None)
@@ -1772,7 +2054,10 @@ class MMEncoder:
             finally:
                 sock.close(linger=5000)
 
-        await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
+        await _await_transfer_completion(
+            asyncio.get_running_loop().run_in_executor(self.executor, send_with_socket),
+            f"ZMQ transfer for req_id={mm_data.req_id}",
+        )
         if (
             encoder_metrics_collector is not None
             and get_disagg().encoder_transfer_backend != "mooncake"
@@ -1790,23 +2075,16 @@ class MMEncoder:
         size: int,
     ) -> int:
         """Keep the send active until its blocking transfer stops using the MR."""
-        transfer_task = asyncio.create_task(
+        return await _await_transfer_completion(
             asyncio.to_thread(
                 self.engine.transfer_sync,
                 session_id,
                 source_address,
                 destination_address,
                 size,
-            )
+            ),
+            f"Mooncake transfer to session={session_id}",
         )
-        try:
-            return await asyncio.shield(transfer_task)
-        except asyncio.CancelledError:
-            try:
-                await transfer_task
-            except Exception:
-                pass
-            raise
 
     def _register_shared_mr(self, mm_data: EmbeddingData, embedding: torch.Tensor):
         """Register one MR shared by every rank's /send; _send re-registers on failure."""
@@ -1943,13 +2221,15 @@ class MMEncoder:
         keep_on_gpu = self.use_mooncake and not is_health_check
         use_global_cache = self.mm_global_cache is not None and not is_health_check
         try:
-            ctx = await self._prepare_encode_context(
+            if self.rank == 0:
+                async with encode_state_condition:
+                    encode_state_condition.notify_all()
+            ctx = await self._prepare_encode_context_on_all_ranks(
                 requests,
                 modality,
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
             )
-            await self._publish_preprocess_metadata(ctx, requests)
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
 
             if self.profiler is not None:
@@ -2034,6 +2314,9 @@ class MMEncoder:
 
         try:
             while True:
+                if state.release_requested:
+                    break
+
                 async with rid_lock:
                     current_targets = rid_to_receive_endpoint.get(req_id, set()).copy()
                     expected_count = rid_to_receive_count.get(req_id)
