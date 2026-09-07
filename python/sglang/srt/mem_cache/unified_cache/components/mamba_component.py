@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -162,18 +163,32 @@ class MambaComponent(TreeComponent):
         last_node = result.best_match_node
 
         mamba_boundary_len = len(result.device_indices) + result.host_hit_length
+        full_kv_hit_length_aligned = (
+            result.full_kv_hit_length
+            // self.mamba_checkpoint_grid
+            * self.mamba_checkpoint_grid
+        )
 
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
         # that lies beyond the current Mamba boundary. With HiCache, incremental
         # persistence of a new branching state is currently write-through only;
         # write-back eviction may discard the device-only state.
-        aligned_seqlen = (
-            result.full_kv_hit_length // self.mamba_checkpoint_grid
-        ) * self.mamba_checkpoint_grid
-        branching_seqlen = (
-            aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
-        )
+        if full_kv_hit_length_aligned > mamba_boundary_len:
+            branching_seqlen = full_kv_hit_length_aligned
+        else:
+            # Enable shorter Mamba states positions via hit rate
+            mamba_offload_hit_rate = envs.SGLANG_MAMBA_OFFLOAD_HIT_RATE.get()
+            request_length = len(params.req.full_untruncated_fill_ids)
+            aligned_seqlen = (
+                int(request_length * mamba_offload_hit_rate)
+                // self.mamba_checkpoint_grid
+            ) * self.mamba_checkpoint_grid
+            branching_seqlen = (
+                aligned_seqlen
+                if (mamba_offload_hit_rate < 1 and aligned_seqlen > mamba_boundary_len)
+                else None
+            )
 
         # HiCache: if mamba was evicted from device but has host backup,
         # ensure mamba_host_hit_length >= 1 so load_back is triggered.

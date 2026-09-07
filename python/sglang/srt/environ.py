@@ -201,6 +201,16 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+class EnvPositiveFraction(EnvFloat):
+    """A float in the interval [0, 1]."""
+
+    def parse(self, value: str) -> float:
+        parsed = super().parse(value)
+        if not 0 <= parsed <= 1:
+            raise ValueError(f'"{value}" is not in the interval [0, 1]')
+        return parsed
+
+
 class GateGemvMode(IntEnum):
     """Small-batch Inkling gate linear implementation.
 
@@ -1305,6 +1315,7 @@ class Envs:
     # ===================================================================
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    SGLANG_MAMBA_OFFLOAD_HIT_RATE = EnvPositiveFraction(1.0)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
