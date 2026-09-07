@@ -560,6 +560,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    otlp_service_name: str | None = None
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
@@ -2829,6 +2830,13 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.otlp_traces_endpoint,
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--otlp-service-name",
+            type=str,
+            default=ServerArgs.otlp_service_name,
+            help="Service name for OTLP traces (displayed as 'service.name' in trace backends). "
+            "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
         )
         parser.add_argument(
             "--log-requests",
