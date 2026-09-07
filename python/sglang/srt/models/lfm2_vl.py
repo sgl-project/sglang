@@ -34,10 +34,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.lfm2 import Lfm2ForCausalLM
@@ -69,6 +66,7 @@ class Lfm2VlMultiModalProjector(nn.Module):
             config.projector_hidden_size,
             bias=config.projector_bias,
             quant_config=quant_config,
+            prefix=add_prefix("linear_1", prefix),
         )
         self.act = ACT2FN[config.projector_hidden_act]
         self.linear_2 = RowParallelLinear(
@@ -76,6 +74,7 @@ class Lfm2VlMultiModalProjector(nn.Module):
             config.text_config.hidden_size,
             bias=config.projector_bias,
             quant_config=quant_config,
+            prefix=add_prefix("linear_2", prefix),
         )
 
     def forward(

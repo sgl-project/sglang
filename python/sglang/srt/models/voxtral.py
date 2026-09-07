@@ -34,6 +34,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.utils import add_prefix
 
 
 class AudioLanguageAdapter(nn.Module):
@@ -62,18 +63,27 @@ class VoxtralWhisperAttention(nn.Module):
         embed_dim: int,
         num_heads: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.head_dim = embed_dim // num_heads
         self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
-            embed_dim, self.head_dim, num_heads, quant_config=quant_config
+            embed_dim,
+            self.head_dim,
+            num_heads,
+            quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
         )
         # After TP split, the local head count lives on the linear layer
         self.num_heads = self.qkv_proj.num_heads
         self.out_proj = RowParallelLinear(
-            embed_dim, embed_dim, bias=True, quant_config=quant_config
+            embed_dim,
+            embed_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("out_proj", prefix),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -107,6 +117,7 @@ class VoxtralWhisperEncoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         embed_dim = config.d_model
@@ -114,6 +125,7 @@ class VoxtralWhisperEncoderLayer(nn.Module):
             embed_dim=embed_dim,
             num_heads=config.encoder_attention_heads,
             quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
         )
         self.self_attn_layer_norm = nn.LayerNorm(embed_dim)
         self.activation_fn = get_act_fn(
@@ -152,6 +164,7 @@ class VoxtralWhisperEncoder(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         embed_dim = config.d_model
@@ -161,8 +174,12 @@ class VoxtralWhisperEncoder(nn.Module):
         self.embed_positions = nn.Embedding(config.max_source_positions, embed_dim)
         self.layers = nn.ModuleList(
             [
-                VoxtralWhisperEncoderLayer(config, quant_config)
-                for _ in range(config.encoder_layers)
+                VoxtralWhisperEncoderLayer(
+                    config,
+                    quant_config,
+                    prefix=add_prefix(f"layers.{layer_idx}", prefix),
+                )
+                for layer_idx in range(config.encoder_layers)
             ]
         )
         self.layer_norm = nn.LayerNorm(embed_dim)
@@ -227,7 +244,11 @@ class VoxtralForConditionalGeneration(nn.Module):
         )
 
         # Encoder (named audio_tower to match HF weight prefix directly)
-        self.audio_tower = VoxtralWhisperEncoder(audio_config, quant_config)
+        self.audio_tower = VoxtralWhisperEncoder(
+            audio_config,
+            quant_config,
+            prefix=add_prefix("audio_tower", prefix),
+        )
 
         # Projector: input = d_model * downsample_factor, output = text_hidden_size
         adapter_input_dim = audio_config.d_model * self.downsample_factor
@@ -237,7 +258,11 @@ class VoxtralForConditionalGeneration(nn.Module):
         )
 
         # Language model
-        self.language_model = LlamaForCausalLM(text_config, quant_config=quant_config)
+        self.language_model = LlamaForCausalLM(
+            text_config,
+            quant_config=quant_config,
+            prefix=add_prefix("language_model", prefix),
+        )
 
         # Mel filter bank for raw waveform -> mel spectrogram
         self._init_mel_filters(audio_config)

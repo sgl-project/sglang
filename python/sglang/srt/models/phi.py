@@ -51,11 +51,13 @@ class PhiAttention(nn.Module):
             self.total_num_heads,
             bias=True,
             quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.dense = RowParallelLinear(
             self.hidden_size,
             self.hidden_size,
             quant_config=quant_config,
+            prefix=add_prefix("dense", prefix),
         )
 
         scaling = self.head_size**-0.5
@@ -99,7 +101,10 @@ class PhiAttention(nn.Module):
 
 class PhiMLP(nn.Module):
     def __init__(
-        self, config: PhiConfig, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config: PhiConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -110,11 +115,13 @@ class PhiMLP(nn.Module):
             config.hidden_size,
             n_inner,
             quant_config=quant_config,
+            prefix=add_prefix("fc1", prefix),
         )
         self.fc2 = RowParallelLinear(
             n_inner,
             config.hidden_size,
             quant_config=quant_config,
+            prefix=add_prefix("fc2", prefix),
         )
         self.act = get_act_fn(config.hidden_act)
 
@@ -143,7 +150,11 @@ class PhiLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             layer_id=idx,
         )
-        self.mlp = PhiMLP(config, quant_config)
+        self.mlp = PhiMLP(
+            config,
+            quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
 
     def forward(
         self,
@@ -250,6 +261,7 @@ class PhiForCausalLM(nn.Module):
             config.hidden_size,
             bias=True,
             quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 

@@ -10,13 +10,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.moe.router import (
-    ROUTER_GATE_MATVEC_MAX_M,
-    router_gate_matvec,
-)
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    is_fp8_fnuz,
-)
+from sglang.kernels.ops.moe.router import ROUTER_GATE_MATVEC_MAX_M, router_gate_matvec
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import KimiLinearConfig
 from sglang.srt.distributed import (
     get_pp_group,
@@ -69,9 +64,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cpu_amx_available,
@@ -1337,6 +1330,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                     # in the logits processor. Accuracy-neutral on ling-v3.
                     params_dtype=torch.bfloat16,
                     quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
                     use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
             )

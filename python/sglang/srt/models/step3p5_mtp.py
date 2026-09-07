@@ -45,11 +45,15 @@ class SharedHead(nn.Module):
         self,
         config,
         quant_config=None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.norm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("head", prefix),
         )
         self.lm_head = self.head
 
@@ -78,7 +82,11 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         self.enorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.hnorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
-        self.shared_head = SharedHead(config=config, quant_config=quant_config)
+        self.shared_head = SharedHead(
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("shared_head", prefix),
+        )
         self.mtp_block = Step3p5DecoderLayer(
             config=config, layer_id=layer_id, prefix=f"{prefix}.mtp_block"
         )

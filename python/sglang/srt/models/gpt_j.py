@@ -100,6 +100,7 @@ class GPTJAttention(nn.Module):
             num_kv_heads=num_heads,
             layer_id=layer_id,
             quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -257,6 +258,7 @@ class GPTJForCausalLM(nn.Module):
             config.n_embd,
             bias=True,
             quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 
