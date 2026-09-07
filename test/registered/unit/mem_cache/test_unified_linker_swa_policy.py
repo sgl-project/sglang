@@ -110,19 +110,13 @@ def test_deepseek_v4_swa_addressing_mode_tracks_layout():
     assert not pool.swa_is_index_addressed
 
 
-def test_swa_trust_and_linker_participation_are_independent():
+def test_swa_trust_and_linker_participation_follow_addressing_mode():
     component = SWAComponent.__new__(SWAComponent)
     component.swa_is_index_addressed = False
-    component.swa_restore_wired = False
     assert not component.participates_in_linker
     assert not component.reused_swa_is_trustworthy
 
-    component.swa_restore_wired = True
-    assert not component.participates_in_linker
-    assert component.reused_swa_is_trustworthy
-
     component.swa_is_index_addressed = True
-    component.swa_restore_wired = False
     assert component.participates_in_linker
     assert component.reused_swa_is_trustworthy
 
@@ -134,10 +128,13 @@ def test_tree_component_participates_in_linker_by_default():
 
 def test_untrusted_swa_enables_reprefill_without_a_tier_condition():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-    cache.components = {ComponentType.SWA: _ExcludedSWA()}
+    component = SWAComponent.__new__(SWAComponent)
+    component.sliding_window_size = 128
+    component.swa_is_index_addressed = False
+    cache.components = {ComponentType.SWA: component}
     assert cache.swa_reprefill_tail_tokens() == 128
 
-    cache.components[ComponentType.SWA].reused_swa_is_trustworthy = True
+    component.swa_is_index_addressed = True
     assert cache.swa_reprefill_tail_tokens() == 0
 
     cache.components = {}
@@ -148,7 +145,6 @@ def test_untrusted_request_relative_swa_tombstone_does_not_gate_full_match():
     component = SWAComponent.__new__(SWAComponent)
     component.sliding_window_size = 128
     component.swa_is_index_addressed = False
-    component.swa_restore_wired = False
     node = SimpleNamespace(
         component_data={
             ComponentType.SWA: SimpleNamespace(value=None, host_value=None)
@@ -159,7 +155,7 @@ def test_untrusted_request_relative_swa_tombstone_does_not_gate_full_match():
 
     assert component.create_match_validator(match_device_only=True)(node)
 
-    component.swa_restore_wired = True
+    component.swa_is_index_addressed = True
     assert not component.create_match_validator(match_device_only=True)(node)
 
 

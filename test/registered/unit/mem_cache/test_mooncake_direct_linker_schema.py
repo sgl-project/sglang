@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -18,7 +19,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def test_dsv4_layout_tag_is_appended_to_mooncake_storage_config(monkeypatch):
+@pytest.mark.parametrize("unified_kv", [False, True])
+def test_dsv4_layout_tag_only_changes_unified_mooncake_storage_config(
+    monkeypatch, unified_kv
+):
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
         DeepSeekV4TokenToKVPool,
     )
@@ -27,7 +31,7 @@ def test_dsv4_layout_tag_is_appended_to_mooncake_storage_config(monkeypatch):
         pass
 
     kvcache = PlatformDeepSeekV4TokenToKVPool.__new__(PlatformDeepSeekV4TokenToKVPool)
-    kvcache._unified_kv = False
+    kvcache._unified_kv = unified_kv
     kvcache.c4_indexer_kv_pool = SimpleNamespace(use_fp4_indexer=True)
 
     entry = SimpleNamespace(
@@ -92,9 +96,11 @@ def test_dsv4_layout_tag_is_appended_to_mooncake_storage_config(monkeypatch):
         storage=storage,
     )
     try:
-        assert captured["extra_config"]["custom_option"] == "kept"
-        assert captured["extra_config"]["extra_backend_tag"] == (
-            "tenant-b__ucdl-dsv4-v1-layout-paged-indexer-fp4-pp2-layers-auto"
-        )
+        expected = {"extra_backend_tag": "tenant-b", "custom_option": "kept"}
+        if unified_kv:
+            expected["extra_backend_tag"] += (
+                "__ucdl-dsv4-v1-layout-unified-bf16-indexer-fp4-pp2-layers-auto"
+            )
+        assert captured["extra_config"] == expected
     finally:
         linker.close()

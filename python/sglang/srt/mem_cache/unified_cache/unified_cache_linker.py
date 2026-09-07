@@ -65,13 +65,13 @@ def with_direct_linker_cache_layout_tag(
     pp_rank: int,
     pp_size: int,
 ) -> dict:
-    """Return storage config namespaced by the direct-linker byte layout.
+    """Namespace unified KV bytes while preserving existing paged cache keys.
 
     DeepSeek-V4's paged and unified KV layouts use the same logical pool names
     for incompatible bytes.  Keep the user's tag as the outer namespace, then
-    append a deterministic schema tag before either storage backend constructs
-    its key prefix. This intentionally makes pre-schema DSV4 entries cold-miss
-    after an upgrade instead of risking a cross-layout hit.
+    append a deterministic schema tag only for unified KV before either storage
+    backend constructs its key prefix. Paged configurations retain their
+    existing namespace and user-managed indexer/PP isolation.
     """
     config = dict(extra_config or {})
 
@@ -90,14 +90,13 @@ def with_direct_linker_cache_layout_tag(
         DeepSeekV4TokenToKVPool,
     )
 
-    if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
+    if not isinstance(kvcache, DeepSeekV4TokenToKVPool) or not kvcache._unified_kv:
         return config
 
     indexer_pool = kvcache.c4_indexer_kv_pool
     if not hasattr(indexer_pool, "use_fp4_indexer"):
         raise ValueError("DeepSeek-V4 indexer pool does not expose its wire format.")
 
-    layout = "unified-bf16" if kvcache._unified_kv else "paged"
     indexer = "fp4" if indexer_pool.use_fp4_indexer else "int8"
     pp_size = int(pp_size)
     if pp_size <= 0 or not 0 <= int(pp_rank) < pp_size:
@@ -113,7 +112,7 @@ def with_direct_linker_cache_layout_tag(
 
     layout_tag = (
         f"ucdl-dsv4-v{DIRECT_LINKER_CACHE_SCHEMA_VERSION}"
-        f"-layout-{layout}-indexer-{indexer}"
+        f"-layout-unified-bf16-indexer-{indexer}"
         f"-pp{pp_size}-layers-{partition}"
     )
     user_tag = config.get("extra_backend_tag")

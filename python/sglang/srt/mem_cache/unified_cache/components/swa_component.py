@@ -82,9 +82,6 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.swa_is_index_addressed = getattr(kvcache, "swa_is_index_addressed", True)
-        # Set by a future request-relative restore path only after that path is
-        # fully wired for this cache instance.
-        self.swa_restore_wired = False
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -116,7 +113,7 @@ class SWAComponent(TreeComponent):
 
     @property
     def reused_swa_is_trustworthy(self) -> bool:
-        return self.swa_is_index_addressed or self.swa_restore_wired
+        return self.swa_is_index_addressed
 
     @property
     def participates_in_linker(self) -> bool:
@@ -320,7 +317,7 @@ class SWAComponent(TreeComponent):
 
         # A request-relative SWA ring is not represented by tree component
         # values. Let FULL drive the match while the scheduler re-prefills the
-        # untrusted tail (or a future restore path makes it trustworthy).
+        # untrusted tail.
         reused_swa_is_untrustworthy = not self.reused_swa_is_trustworthy
 
         def validator(node: UnifiedTreeNode) -> bool:
@@ -1028,8 +1025,8 @@ class SWAComponent(TreeComponent):
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
-        # A request-relative SWA ring has no page-indexed HiCache pool.
-        if not self.swa_is_index_addressed:
+        # unified_kv keeps SWA as a device-only ring.
+        if not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache:
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:

@@ -191,13 +191,15 @@ def dsv4_layout_pool():
     return kvcache, DevicePoolGroup([entry], 3, 2, rank_replicated=True)
 
 
-def test_dsv4_layout_tag_is_appended_to_umbp_storage_config(
-    monkeypatch, dsv4_layout_pool
+@pytest.mark.parametrize("unified_kv", [False, True])
+def test_dsv4_layout_tag_only_changes_unified_umbp_storage_config(
+    monkeypatch, dsv4_layout_pool, unified_kv
 ):
     from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
     from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
     kvcache, group = dsv4_layout_pool
+    kvcache._unified_kv = unified_kv
     extra_config = {"extra_backend_tag": "tenant-a", "custom_option": "kept"}
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.delenv("SGLANG_PP_LAYER_PARTITION", raising=False)
@@ -246,9 +248,12 @@ def test_dsv4_layout_tag_is_appended_to_umbp_storage_config(
     )
     try:
         assert captured["extra_config"]["custom_option"] == "kept"
-        assert captured["extra_config"]["extra_backend_tag"] == (
-            "tenant-a__ucdl-dsv4-v1-layout-unified-bf16-indexer-int8-pp4-layers-auto"
-        )
+        expected_tag = extra_config["extra_backend_tag"]
+        if unified_kv:
+            expected_tag += (
+                "__ucdl-dsv4-v1-layout-unified-bf16-indexer-int8-pp4-layers-auto"
+            )
+        assert captured["extra_config"]["extra_backend_tag"] == expected_tag
     finally:
         linker.close()
 
@@ -274,3 +279,53 @@ def test_dsv4_layout_tag_is_identical_across_pp_ranks_for_extkv(
     ]
     assert tags[0] == tags[1]
     assert tags[0].endswith("-pp2-layers-30.31")
+
+
+@pytest.mark.parametrize("extra_config", [None, {}, {"extra_backend_tag": "tenant-a"}])
+def test_paged_layout_preserves_config_without_unified_metadata(
+    monkeypatch, dsv4_layout_pool, extra_config
+):
+    from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+        with_direct_linker_cache_layout_tag,
+    )
+
+    kvcache, group = dsv4_layout_pool
+    kvcache._unified_kv = False
+    del kvcache.c4_indexer_kv_pool
+    monkeypatch.setenv("SGLANG_PP_LAYER_PARTITION", "30,31")
+    result = with_direct_linker_cache_layout_tag(
+        extra_config, kvcache=kvcache, pool_group=group, pp_rank=0, pp_size=2
+    )
+    assert result == (extra_config or {})
+    assert result is not extra_config
+
+
+@pytest.mark.parametrize("use_fp4_indexer", [False, True])
+@pytest.mark.parametrize("partition,pp_size", [(None, 1), (None, 2), ("30,31", 2)])
+def test_unified_layout_tag_preserves_indexer_and_pp_isolation(
+    monkeypatch, dsv4_layout_pool, use_fp4_indexer, partition, pp_size
+):
+    from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+        with_direct_linker_cache_layout_tag,
+    )
+
+    kvcache, group = dsv4_layout_pool
+    kvcache.c4_indexer_kv_pool.use_fp4_indexer = use_fp4_indexer
+    if partition is None:
+        monkeypatch.delenv("SGLANG_PP_LAYER_PARTITION", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_PP_LAYER_PARTITION", partition)
+    extra_config = {"extra_backend_tag": "tenant-a", "custom_option": "kept"}
+    result = with_direct_linker_cache_layout_tag(
+        extra_config, kvcache=kvcache, pool_group=group, pp_rank=0, pp_size=pp_size
+    )
+    indexer = "fp4" if use_fp4_indexer else "int8"
+    layers = "auto" if partition is None else "30.31"
+    assert result == {
+        "extra_backend_tag": (
+            f"tenant-a__ucdl-dsv4-v1-layout-unified-bf16-indexer-{indexer}"
+            f"-pp{pp_size}-layers-{layers}"
+        ),
+        "custom_option": "kept",
+    }
+    assert extra_config == {"extra_backend_tag": "tenant-a", "custom_option": "kept"}
