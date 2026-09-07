@@ -1257,8 +1257,6 @@ class Envs:
     # Permit GLM-5 Next projection fusion in quantized checkpoints only when
     # each source projection resolves to an unquantized linear method.
     SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION = EnvBool(False)
-    # Experimental SM90 raw-FP8 DSA tile for full GLM-5.3-Flash prefill chunks.
-    SGLANG_OPT_DSA_SM90_LARGE_FP8_TILE = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

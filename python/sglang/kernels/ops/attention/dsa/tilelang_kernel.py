@@ -7,7 +7,6 @@ import tilelang.language as T
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
@@ -77,11 +76,6 @@ def _cuda_sm_count() -> int:
     return torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
-
-
-@lru_cache(maxsize=1)
-def _cuda_is_sm90() -> bool:
-    return torch.cuda.get_device_capability() == (9, 0)
 
 
 @lru_cache(maxsize=8)
@@ -1367,19 +1361,6 @@ def tilelang_sparse_fwd(
                 # block_I=32/threads=128 uses ~25 KB smem and block_I=64
                 # would use ~42 KB; 32/128 is the shape validated on GB10.
                 block_I, threads, block_per_cu, cu = 32, 128, 1, _cuda_sm_count()
-                if (
-                    envs.SGLANG_OPT_DSA_SM90_LARGE_FP8_TILE.get()
-                    and q.shape[0] >= 8000
-                    and num_heads == 16
-                    and d_v == 512
-                    and tail_dim == 0
-                    and topk == 2112
-                    and _cuda_is_sm90()
-                ):
-                    # Experimental GLM-5.3-Flash TP4 prefill tile. Small
-                    # chunks retain 32/128; partial/combine grouping follows
-                    # the same inner-iteration and padded-index contract.
-                    block_I = 64
             elif _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
