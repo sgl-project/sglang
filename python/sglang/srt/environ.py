@@ -1411,6 +1411,14 @@ class Envs:
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    # HIP only: run the c4 decode compress and its norm + RoPE + fp8 store
+    # as a single kernel. The compressed row they hand between them has no
+    # other consumer, so the fused kernel keeps it in registers. Output is
+    # not bit-identical: the two-kernel chain rounds the compressed row to
+    # bf16 before the norm reads it and the fused kernel keeps it in fp32, so
+    # a small number of fp8 codes land differently. Default off pending
+    # isolated fused-path coverage and soak time; set to 1 to enable.
+    SGLANG_OPT_FUSE_COMPRESS_NORM_ROPE = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
