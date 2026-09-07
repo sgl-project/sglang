@@ -1468,9 +1468,10 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.broadcast(input_, src=src)
+        # Avoid capturing hip graph failure on torch version smaller than or
+        # equal to 2.11
+        if is_hip() and self.pynccl_comm is not None and not self.pynccl_comm.disabled:
+            self.pynccl_comm.broadcast(input_, src=src)
         else:
             # Broadcast.
             torch.distributed.broadcast(
