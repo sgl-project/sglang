@@ -430,9 +430,7 @@ class UnifiedCacheLinkerWrapper:
         )
         for component, transfer in transfers:
             component_canonical = canonical_full
-            if phase == ExternalLinkerLoadPhase.COMMIT and (
-                component.linker_indices_are_paged
-            ):
+            if phase == ExternalLinkerLoadPhase.COMMIT:
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [
@@ -442,19 +440,33 @@ class UnifiedCacheLinkerWrapper:
                     )
                     if max(start, coverage_start) < min(end, prefix_len)
                 ]
-                indices, keys = self._select_adopted_pages(
-                    transfer.device_indices,
-                    ranges,
-                    prefix_len,
-                    transfer.keys,
-                )
-                if not keys:
-                    continue
-                transfer.device_indices = indices
-                transfer.keys = keys
-                component_canonical, _ = self._select_adopted_pages(
-                    canonical_full, ranges, prefix_len
-                )
+                if not component.linker_indices_are_paged:
+                    # Slot-addressed state is adopted as a unit or not at all,
+                    # and non-empty ranges is exactly the test for "the adopted
+                    # region reaches the boundary the state is keyed at".
+                    # Dropping it must not free it: load_back() already handed
+                    # the slot to tree_core.insert() as InsertParams.mamba_value
+                    # and freed it there in the mamba_exist case, so releasing it
+                    # here double-frees -- the slot lands in free_slots while a
+                    # tree node still references it, which the idle invariant
+                    # reports as a count that exceeds the pool size by one with
+                    # leaked_mamba_pages=None.
+                    if not ranges:
+                        continue
+                else:
+                    indices, keys = self._select_adopted_pages(
+                        transfer.device_indices,
+                        ranges,
+                        prefix_len,
+                        transfer.keys,
+                    )
+                    if not keys:
+                        continue
+                    transfer.device_indices = indices
+                    transfer.keys = keys
+                    component_canonical, _ = self._select_adopted_pages(
+                        canonical_full, ranges, prefix_len
+                    )
             transfer = component.update_external_linker_load(
                 phase,
                 req,
