@@ -34,6 +34,7 @@ from sglang.kernels.ops.gemm.kv_b_lora_absorbed import (
 from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -186,41 +187,43 @@ def test_prepare_batch_neutralizes_static_tail_segments():
             self.batch_size = batch_size
             self.forward_mode = ForwardMode.DECODE
 
-    server_args = type("ServerArgs", (), {"max_lora_chunk_size": 16})
-    backend = ChunkedSgmvLoRABackend(
-        max_loras_per_batch=NUM_LORAS,
-        device=torch.device("cuda"),
-        server_args=server_args,
-    )
-    backend.init_cuda_graph_batch_info(max_bs_in_cuda_graph=BS, num_tokens_per_req=1)
-    lora_ranks = [MAX_RANK] * NUM_LORAS
-    scalings = [1.0] * NUM_LORAS
+    with get_context().override_server_args(max_lora_chunk_size=16) as server_args:
+        backend = ChunkedSgmvLoRABackend(
+            max_loras_per_batch=NUM_LORAS,
+            device=torch.device("cuda"),
+            server_args=server_args,
+        )
+        backend.init_cuda_graph_batch_info(
+            max_bs_in_cuda_graph=BS, num_tokens_per_req=1
+        )
+        lora_ranks = [MAX_RANK] * NUM_LORAS
+        scalings = [1.0] * NUM_LORAS
 
-    backend.prepare_lora_batch(
-        forward_batch=MockForwardBatch(BS),
-        weight_indices=[0, 1, 2, 3, 4, 0, 1, 2],
-        lora_ranks=lora_ranks,
-        scalings=scalings,
-        use_cuda_graph=True,
-    )
-    backend.prepare_lora_batch(
-        forward_batch=MockForwardBatch(2),
-        weight_indices=[0, 0],
-        lora_ranks=lora_ranks,
-        scalings=scalings,
-        use_cuda_graph=True,
-    )
-    torch.cuda.synchronize()
+        backend.prepare_lora_batch(
+            forward_batch=MockForwardBatch(BS),
+            weight_indices=[0, 1, 2, 3, 4, 0, 1, 2],
+            lora_ranks=lora_ranks,
+            scalings=scalings,
+            use_cuda_graph=True,
+        )
+        backend.prepare_lora_batch(
+            forward_batch=MockForwardBatch(2),
+            weight_indices=[0, 0],
+            lora_ranks=lora_ranks,
+            scalings=scalings,
+            use_cuda_graph=True,
+        )
+        torch.cuda.synchronize()
 
-    assert backend.batch_info.num_segments == 1
-    torch.testing.assert_close(
-        backend.batch_info.weight_indices.cpu(),
-        torch.tensor([0] * BS, dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        backend.batch_info.seg_indptr.cpu(),
-        torch.tensor([0, 2, 2, 2, 2, 2, 2, 2, 2], dtype=torch.int32),
-    )
+        assert backend.batch_info.num_segments == 1
+        torch.testing.assert_close(
+            backend.batch_info.weight_indices.cpu(),
+            torch.tensor([0] * BS, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            backend.batch_info.seg_indptr.cpu(),
+            torch.tensor([0, 2, 2, 2, 2, 2, 2, 2, 2], dtype=torch.int32),
+        )
 
 
 def test_absorbed_kv_b_replay_uses_all_current_segments():
