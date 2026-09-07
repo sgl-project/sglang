@@ -10,7 +10,7 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci
 # deployed on); triton / flashinfer stay runnable locally, and their spec verify
 # numerics live in attention/unittests/dense/test_{triton,flashinfer}.py.
 # Non-V2 backends moved to test_spec_standalone_extra.py.
-register_cuda_ci(est_time=170, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=74, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestStandaloneV2SpeculativeDecodingBase(
