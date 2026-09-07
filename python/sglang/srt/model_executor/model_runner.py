@@ -627,6 +627,7 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        self.preflight_model_backends()
         self.load_model()
         prepare_moe_topk(
             model=self.model,
@@ -660,6 +661,17 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
+    def preflight_model_backends(self) -> None:
+        """Delegate model-specific kernel checks before loading weights."""
+
+        from sglang.srt.layers.attention.qsa.preflight import (
+            preflight_qsa_sparse_decode_backend,
+        )
+
+        preflight_qsa_sparse_decode_backend(
+            model_config=self.model_config, tp_rank=self.ps.tp_rank
+        )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
