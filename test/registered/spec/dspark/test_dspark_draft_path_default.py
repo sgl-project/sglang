@@ -105,19 +105,21 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args
 
-    def test_only_megamoe_is_admitted(self):
-        """Both sides of the allowlist: megamoe passes, others raise by name."""
+    def test_static_admits_megamoe_and_deepep(self):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
-            _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
-            for backend in ("deepep", "pplx"):
-                with self.assertRaisesRegex(ValueError, backend):
+            for backend in ("megamoe", "deepep"):
+                with self.subTest(backend=backend):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
 
-    def test_a2a_backend_with_compact_verify_mode_raises(self):
-        server_args = self._dp_server_args(moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "pplx"):
+                _handle_dspark(self._dp_server_args(moe_a2a_backend="pplx"))
+
+    def test_compact_admits_deepep_but_rejects_megamoe(self):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            _handle_dspark(self._dp_server_args(moe_a2a_backend="deepep"))
+
             with self.assertRaisesRegex(ValueError, "static"):
-                _handle_dspark(server_args)
+                _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
 
 
 if __name__ == "__main__":

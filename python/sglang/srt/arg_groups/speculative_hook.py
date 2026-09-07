@@ -512,13 +512,17 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.enable_dp_attention and cfg.dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe"):
+        if not _is_npu and cfg.moe_a2a_backend not in (
+            "none",
+            "megamoe",
+            "deepep",
+        ):
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE) or 'megamoe', got "
+                "(built-in TP MoE), 'megamoe', or 'deepep', got "
                 f"{cfg.moe_a2a_backend!r}."
             )
-        if not _is_npu and cfg.moe_a2a_backend != "none":
+        if not _is_npu and cfg.moe_a2a_backend == "megamoe":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
                 read_ragged_verify_mode,
