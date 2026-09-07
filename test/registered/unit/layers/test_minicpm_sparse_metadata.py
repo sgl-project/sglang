@@ -1142,6 +1142,8 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         )
         backend._get_fused_topk_kernel = Mock(return_value="kernel")
         backend.sparse_get_topk_impl = Mock(return_value="forecast-topk")
+        backend.head_group_num = 1
+        backend.heads_per_group = 16
         forward_batch = SimpleNamespace(batch_size=2)
         selector_query = torch.tensor([[[11.0]], [[22.0]]])
 
@@ -1156,7 +1158,8 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
 
         self.assertEqual(result, "forecast-topk")
         args = backend.sparse_get_topk_impl.call_args.args
-        self.assertEqual(args[0].flatten().tolist(), [22.0])
+        self.assertEqual(args[0].shape, (16, 1, 1))
+        self.assertEqual(args[0].flatten().tolist(), [22.0] * 16)
         self.assertIsNone(backend.sparse_get_topk_impl.call_args.kwargs["fused_kernel"])
         backend._get_fused_topk_kernel.assert_not_called()
 
