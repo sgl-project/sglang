@@ -444,6 +444,8 @@ class ModelConfig:
 
         # Set enable_multimodal
         if enable_multimodal is None:
+            from sglang.srt.utils.tensor_bridge import use_mlx
+
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
@@ -467,6 +469,18 @@ class ModelConfig:
                     "Multimodal is disabled for this MiMoV2 checkpoint: "
                     "vision_config/audio_config not found in the model config "
                     "(likely a text-only MiMoV2 variant)."
+                )
+            elif use_mlx():
+                # The MLX backend is text-only (there is no vision/audio
+                # inference path). Do not attempt to build a multimodal
+                # processor on MLX; otherwise loading a checkpoint whose HF
+                # config carries a vision_config (e.g. a language-model-only
+                # MLX release of a multimodal arch) fails on the missing image
+                # processor. To force it, set --enable-multimodal.
+                enable_multimodal = False
+                logger.info(
+                    "Multimodal is disabled on the MLX backend (text-only "
+                    "inference path). To force it, set --enable-multimodal."
                 )
             else:
                 enable_multimodal = True
