@@ -82,8 +82,8 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 =======
 from sglang.multimodal_gen.runtime.utils.precision import (
-    temporary_module_dtype,
-    temporary_modules_dtype,
+    temporary_module_fp32_dtype,
+    temporary_modules_fp32_dtype,
 )
 >>>>>>> 8d4af1f2ea (opt codes)
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
@@ -709,14 +709,7 @@ class MOVADenoisingStage(PipelineStage):
                 device_type=current_platform.device_type, dtype=torch.float32
             )
             if current_platform.device_type != "cpu"
-            else temporary_modules_dtype(
-                [visual_dit, self.audio_dit],
-                dtype=torch.float32,
-                enabled=[
-                    next(m.parameters()).dtype != torch.float32
-                    for m in [visual_dit, self.audio_dit]
-                ],
-            )
+            else temporary_modules_fp32_dtype([visual_dit, self.audio_dit])
         )
         with autocast_ctx:
             visual_t = visual_dit.time_embedding(
@@ -1025,11 +1018,7 @@ class MOVADecodingStage(PipelineStage):
                     device_type=current_platform.device_type, dtype=torch.float32
                 )
                 if current_platform.device_type != "cpu"
-                else temporary_module_dtype(
-                    self.audio_vae,
-                    torch.float32,
-                    enabled=next(self.audio_vae.parameters()).dtype != torch.float32,
-                )
+                else temporary_module_fp32_dtype(self.audio_vae)
             )
             with autocast_ctx:
                 audio = self.audio_vae.decode(batch.audio_latents)
