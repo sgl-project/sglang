@@ -1574,6 +1574,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
         self._original_num_tokens = self.positions.shape[0]
+        if self.spec_info is not None and self.spec_info.is_draft_input():
+            # post_forward_mlp_sync_batch must restore the scheduler-owned KV
+            # locations, not the padded buffer created below.  Refresh this
+            # snapshot for every forward because ForwardBatch objects can be
+            # reused across speculative draft steps.
+            self.output_cache_loc_backup = self.out_cache_loc
+            self.hidden_states_backup = self.spec_info.hidden_states
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         if self.input_embeds is not None:
             # Keep token-aligned inputs consistent after padding.
@@ -1670,8 +1677,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
-            self.output_cache_loc_backup = self.out_cache_loc
-            self.hidden_states_backup = spec_info.hidden_states
             # spec_info is EagleDraftInput | EagleDraftExtendInput; each carries
             # a disjoint subset of the fields below, so getattr-guard each one.
             if getattr(spec_info, "topk_p", None) is not None:
@@ -1758,6 +1763,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
+                if (
+                    self.forward_mode.is_idle()
+                    and self.symmetric_spec_megamoe_dummy
+                    and self._original_num_tokens is not None
+                ):
+                    # This rank entered MegaMoE with a synthetic request/token,
+                    # but the next EAGLE draft step must observe the original
+                    # zero-row scheduler boundary.  out_cache_loc is restored
+                    # from its pre-padding snapshot below.
+                    self.positions = self.positions[: self._original_num_tokens]
+                    self.seq_lens = self.seq_lens[:bs]
+                    self.req_pool_indices = self.req_pool_indices[:bs]
+                    if self.seq_lens_cpu is not None:
+                        self.seq_lens_cpu = self.seq_lens_cpu[:bs]
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs

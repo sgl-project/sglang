@@ -177,6 +177,10 @@ class TestEagleDraftDPPadding(unittest.TestCase):
         self.assertEqual(logits_output.hidden_states.shape[0], 0)
         self.assertEqual(spec_info.hidden_states.shape[0], 0)
         self.assertEqual(forward_batch.out_cache_loc.shape[0], 0)
+        self.assertEqual(forward_batch.positions.shape[0], 0)
+        self.assertEqual(forward_batch.seq_lens.shape[0], 0)
+        self.assertEqual(forward_batch.req_pool_indices.shape[0], 0)
+        self.assertEqual(forward_batch.seq_lens_cpu.shape[0], 0)
 
     def test_megamoe_dummy_bypasses_attention_but_preserves_rows(self):
         hidden_states = torch.randn(1, 8)
