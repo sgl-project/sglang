@@ -342,6 +342,20 @@ def _is_glm47(ctx):
     )
 
 
+def _is_spark25(ctx):
+    # Spark-X2.5 uses the GLM-style <arg_key>/<arg_value> tool-call body, but
+    # emits it on one line with no newline between the tags, which
+    # Glm4MoeDetector does not parse. Its template is distinctive: DeepSeek
+    # style sentence markers with <|Bot|> / <|Tool|> role tags, which no other
+    # supported template uses. Check the template text rather than the vocab
+    # so it does not depend on which markers the tokenizer registers as tokens.
+    return (
+        ctx.has_text("<|Bot|>")
+        and ctx.has_text("<tool_call>")
+        and ctx.has_text("<arg_key>")
+    )
+
+
 def _is_xml_kv_tool_call(ctx):
     # Structural signature for the GLM-4.5 / GLM-4.6 style tool-call format
     # (`<tool_call>name<arg_key>k</arg_key>\n<arg_value>v</arg_value>...</tool_call>`).
@@ -525,6 +539,9 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="deepseek_v32", value="deepseekv32", predicate=_is_deepseek_v32),
     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
     DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
+    # Before the GLM rules and the generic xml_kv fallback: Spark shares the
+    # <arg_key> body but needs its own parser (see _is_spark25).
+    DetectionRule(name="spark25", value="spark25", predicate=_is_spark25),
     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
     DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
