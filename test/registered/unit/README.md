@@ -1,7 +1,8 @@
 # Unit Tests
 
-Component-level tests that do **not** launch a server or load model weights.
-Tests can use CPU or GPU — the key criterion is **no server process**.
+CPU-only component tests that do **not** launch a server, load model weights,
+or require an accelerator. GPU operator correctness belongs under
+`test/registered/kernel/<subsystem>/`.
 
 ## Quick Start
 
@@ -15,11 +16,7 @@ Tests can use CPU or GPU — the key criterion is **no server process**.
    ```python
    from sglang.test.ci.ci_register import register_cpu_ci
    register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-   # or: register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
    ```
-   CUDA suites whose names follow `{stage}-test-{runner_config}` use the
-   `stage=` + `runner_config=` form. Legacy `suite="..."` is kept for
-   nightly/stress/weekly + AMD/CPU/NPU suites that don't fit that shape.
 4. Run locally:
    ```bash
    pytest test/registered/unit/ -v            # all unit tests
@@ -95,4 +92,6 @@ process. If you must stub, use `patch.dict("sys.modules", ...)` with proper clea
 - **No** `popen_launch_server()` or `Engine(...)`.
 - **No** model weight loading.
 - Use `CustomTestCase` (from `sglang.test.test_utils`, adds CI retry).
-- Use `unittest.mock` for dependencies that are expensive to construct.
+- Mock external or slow dependency boundaries only when the assertion still
+  checks a result, state transition, protocol output, or error. A test that
+  proves only that its mock was called is not sufficient.
