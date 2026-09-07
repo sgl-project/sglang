@@ -14,7 +14,7 @@ from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 RAW_BS = 2
 RAW_NUM_TOKENS = 3

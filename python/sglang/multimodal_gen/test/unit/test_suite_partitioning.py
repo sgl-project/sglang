@@ -5,6 +5,8 @@ suite when standalone files outnumber the shards, and the shards must agree on
 who runs what without talking to each other.
 """
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +20,11 @@ from sglang.multimodal_gen.test.run_suite import (
 from sglang.multimodal_gen.test.server.gpu_cases import (
     PARAMETRIZED_CASE_GROUPS,
     STANDALONE_FILES,
+    TWO_GPU_CASES,
+)
+
+_H100_BASELINE_PATH = (
+    Path(__file__).resolve().parents[1] / "server/perf_baselines/h100.json"
 )
 
 
@@ -108,3 +115,28 @@ def test_failing_cases_do_not_skip_the_shards_standalone_files(monkeypatch, tmp_
 
     assert executed_standalone == [standalone_rel]
     assert exit_code == 1
+
+
+def test_two_gpu_cases_have_h100_full_test_time_estimates():
+    """Every 2-gpu case must have an h100 estimated_full_test_time_s.
+
+    NVIDIA LPT sharding falls back to 300s when the field is missing, which
+    unbalances the three 2-gpu partitions.
+    """
+    scenarios = json.loads(_H100_BASELINE_PATH.read_text())["scenarios"]
+    missing = [
+        case.id
+        for case in TWO_GPU_CASES
+        if scenarios.get(case.id, {}).get("estimated_full_test_time_s") is None
+    ]
+    assert missing == []
+
+
+def test_qwen_quality_variants_use_the_same_generation_request():
+    cases = {case.id: case for case in TWO_GPU_CASES}
+    lossless = cases["qwen_image_t2i_2_gpus"].sampling_params
+    extra_high = cases["qwen_image_t2i_2_gpus_extra_high"].sampling_params
+
+    assert extra_high.prompt == lossless.prompt
+    assert extra_high.output_size == lossless.output_size
+    assert extra_high.extras == {"quality": "extra-high"}

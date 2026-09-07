@@ -9,7 +9,7 @@
 //!   * To_scheduler   — 1 thread driving the FSM
 //!   * From_scheduler — 1 thread draining the scheduler → detok shards
 //!   * MM workers     — K unpinned OS threads, spawned late via
-//!     [`Runtime::spawn_mm_pool`] (multimodal models only)
+//!     [`Runtime::start_mm_workers`] (multimodal models only)
 //!
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
 //! axum's worker threads.
@@ -41,18 +41,11 @@ pub trait Runnable: Send + 'static {
 pub struct Runtime {
     pub to_scheduler_rx: ToSchedulerRx,
     pub from_scheduler_tx: FromSchedulerTx,
-    /// Requests parked in `Encoding`, drained by the MM worker pool
-    /// (`Server.start_mm_workers`). Stays empty for non-multimodal models —
-    /// request never routes to it.
-    pub to_mm_worker_rx: flume::Receiver<crate::message::request::MmRequest>,
-    /// Back-channel for the MM workers' `MmEncoded` / `MmFailed` into to_scheduler.
-    pub from_mm_worker_tx: flume::Sender<TmEvent>,
-    /// The loaded tokenizer, shared with the MM worker path (`None` under
-    /// `skip_tokenizer_init`).
-    pub tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>>,
     /// MM results parked between a worker's `MmEncoded` and the scheduler drain
     /// (`Server.take_mm_result`).
-    pub mm_sidecar: crate::multi_modality::sidecar::Sidecar,
+    pub mm_results: crate::multi_modality::result_store::MmResultStore,
+    /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
+    mm_wiring: crate::multi_modality::worker::MmWiring,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -64,23 +57,34 @@ pub struct Runtime {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
-    /// Spawn `workers` `mm-worker-{i}` threads into the shutdown join set —
-    /// late, once Python has built the mm spec (`Server::start_mm_workers`).
+    /// Build the family context from `spec` and spawn `workers`
+    /// `mm-worker-{i}` threads into the shutdown join set — late, once Python
+    /// has built the mm spec (`Server.start_mm_workers`).
     ///
     /// Deliberately unpinned: the threads inherit the launch thread's affinity,
     /// already narrowed by `RustServer.launch` to the server cores, so bursty
     /// MM preprocessing floats over that whole set (rather than owning cores
     /// that idle between bursts) and never preempts the scheduler's reserved
     /// cores.
-    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::Context>) {
+    pub fn start_mm_workers(
+        &self,
+        spec: crate::message::config::MmSpec,
+        workers: usize,
+    ) -> Result<(), String> {
+        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(
+            spec,
+            self.mm_wiring.tokenizer.clone(),
+            self.mm_results.clone(),
+        )?);
         let mut threads = self.threads.lock().unwrap();
         spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
             crate::multi_modality::worker::MmWorker::new(
-                self.to_mm_worker_rx.clone(),
-                self.from_mm_worker_tx.clone(),
+                self.mm_wiring.mm_rx.clone(),
+                self.mm_wiring.tm_tx.clone(),
                 ctx.clone(),
             )
         });
+        Ok(())
     }
 
     /// Stop the runtime and join every worker thread (with a bounded wait).
@@ -165,7 +169,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
 
     // Shared: MM workers park, the Python drain pops.
-    let mm_sidecar: crate::multi_modality::sidecar::Sidecar = Default::default();
+    let mm_results: crate::multi_modality::result_store::MmResultStore = Default::default();
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -250,10 +254,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
             .map(|c| vec![c]);
         let limits = tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args);
-        let mm = tokenizer_manager::to_scheduler::Mm {
+        let mm = tokenizer_manager::to_scheduler::MmDispatch {
             enabled: cfg.server_args.model_is_multimodal(),
             tx: mm_worker_tx,
-            sidecar: mm_sidecar.clone(),
+            results: mm_results.clone(),
         };
         let mut parts = Some((tok_manager_rx, to_scheduler_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
@@ -318,10 +322,12 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     Ok(Runtime {
         to_scheduler_rx,
         from_scheduler_tx,
-        to_mm_worker_rx: mm_worker_rx,
-        from_mm_worker_tx: tok_manager_tx,
-        tokenizer: text_tokenizer,
-        mm_sidecar,
+        mm_results,
+        mm_wiring: crate::multi_modality::worker::MmWiring {
+            mm_rx: mm_worker_rx,
+            tm_tx: tok_manager_tx,
+            tokenizer: text_tokenizer,
+        },
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })

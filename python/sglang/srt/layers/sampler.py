@@ -902,7 +902,15 @@ def sampling_from_probs_torch(
     Note: For deterministic sampling from logprobs, use Sampler._sample_from_logprobs instead.
     """
     if sampling_seed is None:
-        sampled_index = torch.multinomial(probs, num_samples=1)
+        if envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
+            # Gumbel-max trick: distributionally equivalent to torch.multinomial,
+            # but avoids multinomial's CPU-side philox offset bookkeeping and
+            # distribution-validity assert that stall the decode critical path.
+            q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+            q.clamp_min_(torch.finfo(torch.float32).tiny)
+            sampled_index = (probs.float() / q).argmax(dim=-1, keepdim=True)
+        else:
+            sampled_index = torch.multinomial(probs, num_samples=1)
     else:
         # Deterministic sampling: convert probs to logprobs and use gumbel trick
         sampled_index = multinomial_with_seed(

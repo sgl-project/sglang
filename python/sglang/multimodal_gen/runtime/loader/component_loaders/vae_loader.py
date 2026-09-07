@@ -1,14 +1,12 @@
 import hashlib
 import importlib.util
 import os
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 from safetensors.torch import safe_open
 from safetensors.torch import save_file as safetensors_save_file
-from torch.nn.utils import parametrize
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
@@ -25,10 +23,12 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     _normalize_component_type,
+    adopt_plain_weight_norm_state,
     checkpoint_bytes,
+    initialize_model,
     keep_checkpoint_mapped,
+    load_model_state_dict,
     set_default_torch_dtype,
-    skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -283,56 +283,6 @@ def _hold_decoder_weights_in_decode_dtype(
         )
 
 
-def _match_checkpoint_dtypes(loaded: dict, target_state: dict) -> dict:
-    """Convert checkpoint tensors whose dtype differs from their parameter's.
-
-    Assignment replaces the parameter rather than writing through it, so a
-    mismatched dtype would silently change the module's. Converting makes a
-    copy, which is the point: only the tensors that already match can stay on
-    the mapping.
-    """
-    for name, tensor in list(loaded.items()):
-        param = target_state.get(name)
-        if param is not None and param.dtype != tensor.dtype:
-            loaded[name] = tensor.to(dtype=param.dtype)
-    return loaded
-
-
-def _adopt_plain_weight_norm_state(
-    module: nn.Module, loaded_names: Iterable[str]
-) -> int:
-    """Make deparameterized checkpoint weights native module state.
-
-    PyTorch's weight-norm load hook accepts legacy ``weight_g``/``weight_v``
-    tensors, while inference exports commonly fold those tensors into one
-    plain ``weight``. Removing only the matching parametrizations preserves
-    that already-computed weight exactly and leaves every other parameterized
-    module untouched.
-    """
-    state_names = set(module.state_dict())
-    module_by_name = dict(module.named_modules())
-    owners: set[str] = set()
-    for name in loaded_names:
-        if name == "weight":
-            owner_name = ""
-        elif name.endswith(".weight"):
-            owner_name = name.removesuffix(".weight")
-        else:
-            continue
-        state_prefix = f"{owner_name}." if owner_name else ""
-        if {
-            f"{state_prefix}parametrizations.weight.original0",
-            f"{state_prefix}parametrizations.weight.original1",
-        }.issubset(state_names):
-            owners.add(owner_name)
-
-    for owner_name in sorted(owners):
-        parametrize.remove_parametrizations(
-            module_by_name[owner_name], "weight", leave_parametrized=True
-        )
-    return len(owners)
-
-
 def _vae_checkpoint_arch_metadata_names(
     vae_config: VAEConfig,
     target_state: dict[str, torch.Tensor],
@@ -444,7 +394,7 @@ def _assign_direct_gpu_vae_state(
     vae_config: VAEConfig,
 ) -> tuple[int, tuple[str, ...]]:
     """Stream a complete standard VAE state directly onto its target device."""
-    num_deparameterized = _adopt_plain_weight_norm_state(
+    num_deparameterized = adopt_plain_weight_norm_state(
         vae, _vae_checkpoint_tensor_names(weight_files)
     )
     target_state, slots = _direct_gpu_vae_state_slots(vae, component_name)
@@ -664,21 +614,15 @@ class VAELoader(WeightOverrideComponentLoader):
             return vae
 
         # Load from ModelRegistry (standard VAE classes)
-        if direct_gpu_weight_loading:
-            with (
-                set_default_torch_dtype(vae_dtype),
-                skip_init_modules(),
-                torch.device("meta"),
-            ):
-                vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-                vae = vae_cls(vae_config)
-        else:
-            with (
-                set_default_torch_dtype(vae_dtype),
-                skip_init_modules(),
-            ):
-                vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-                vae = vae_cls(vae_config).to(target_device)
+        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        vae = initialize_model(
+            vae_cls,
+            {"config": vae_config},
+            vae_dtype,
+            torch.device("meta") if direct_gpu_weight_loading else None,
+        )
+        if not direct_gpu_weight_loading:
+            vae = vae.to(target_device)
 
         if os.path.isfile(component_weights_path):
             if not component_weights_path.endswith(".safetensors"):
@@ -729,7 +673,7 @@ class VAELoader(WeightOverrideComponentLoader):
         for sf_path in safetensors_list:
             loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
-        num_deparameterized = _adopt_plain_weight_norm_state(vae, loaded)
+        num_deparameterized = adopt_plain_weight_norm_state(vae, loaded)
         target_state = vae.state_dict()
         consumed_metadata = _consume_vae_checkpoint_arch_metadata(
             loaded, vae_config, target_state
@@ -759,9 +703,8 @@ class VAELoader(WeightOverrideComponentLoader):
                 component=f"{component_name or 'vae'} (VAE)",
             )
         )
-        if keep_mapping:
-            _match_checkpoint_dtypes(loaded, target_state)
-        vae.load_state_dict(
+        load_model_state_dict(
+            vae,
             loaded,
             strict=strict_load,
             assign=keep_mapping,

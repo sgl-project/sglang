@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use super::sidecar::{FeatureStore, MmSidecarEntry, Sidecar, park_features_in_shm};
+use super::result_store::{FeatureStore, MmEncodedEntry, MmResultStore, park_features_in_shm};
 use crate::message::config::MmSpec;
 use crate::message::ids::Rid;
 use crate::message::request::MmRequest;
@@ -46,27 +46,27 @@ fn parse_caller_hash(entry: &str) -> Option<u64> {
 }
 
 /// Shared state of the mm path, built once at `start_mm_workers`.
-pub struct Context {
+pub struct MmContext {
     pub family: Box<dyn sglang_mm::pipeline::MmFamilyProcessor>,
     /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
     pub tokenizer: Option<Arc<dyn TextTokenizer>>,
-    pub sidecar: Sidecar,
+    pub results: MmResultStore,
     /// Park feature buffers in POSIX shm. Set by the Python launcher
     /// (`RustMmProcessor._use_feature_shm`) exactly when the scheduler broadcasts
     /// across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
 }
 
-impl Context {
+impl MmContext {
     pub fn new(
         spec: MmSpec,
         tokenizer: Option<Arc<dyn TextTokenizer>>,
-        sidecar: Sidecar,
+        results: MmResultStore,
     ) -> Result<Self, String> {
         Ok(Self {
             family: sglang_mm::registry::build_pipeline(spec.pipeline)?,
             tokenizer,
-            sidecar,
+            results,
             feature_shm: spec.feature_shm,
         })
     }
@@ -75,7 +75,7 @@ impl Context {
 /// Run the pipeline for one request. `Ok` returns the final expanded ids, the
 /// buffers already parked; `Err` rejects the request back to the client.
 fn process(
-    ctx: &Context,
+    ctx: &MmContext,
     rid: &Rid,
     mut work: crate::message::request::MmWorkItem,
 ) -> Result<Vec<i32>, String> {
@@ -87,42 +87,60 @@ fn process(
         })?;
         tokenizer.encode(text).map_err(|error| error.to_string())
     })?;
-    let mut drain = sglang_mm::qwen_vl::pack_drain(output)?;
-    apply_caller_hashes(&mut drain.hashes, &caller_hashes);
+    // TODO(mm-families): the one family-specific call in this worker — dispatch
+    // on the spec's `family` (as `registry::build_pipeline` does) once a
+    // second family lands.
+    let mut packed = sglang_mm::qwen_vl::pack_output(output)?;
+    apply_caller_hashes(&mut packed.hashes, &caller_hashes);
     let features = if ctx.feature_shm {
-        park_features_in_shm(&drain.features, &drain.grids)
+        park_features_in_shm(&packed.features, &packed.grids)
     } else {
-        FeatureStore::Inline(drain.features)
+        FeatureStore::Inline(packed.features)
     };
-    ctx.sidecar.park(
+    ctx.results.park(
         rid.as_str().to_owned(),
-        MmSidecarEntry {
+        MmEncodedEntry {
             features,
-            grids: drain.grids,
-            hashes: drain.hashes,
-            offsets: drain.offsets,
-            mrope: drain.mrope,
-            mrope_delta: drain.mrope_delta,
+            grids: packed.grids,
+            hashes: packed.hashes,
+            offsets: packed.offsets,
+            mrope: packed.mrope,
+            mrope_delta: packed.mrope_delta,
         },
     );
-    Ok(drain.input_ids)
+    Ok(packed.input_ids)
 }
 
-/// One MM worker, spawned via `Runtime::spawn_mm_pool` (which owns the
+/// Boot-time wiring of the MM path, held privately by the `Runtime` for the
+/// late pool spawn (`Runtime::start_mm_workers`, once Python has resolved
+/// the spec).
+pub struct MmWiring {
+    /// Requests parked in `Encoding`, drained by the worker pool. Stays empty
+    /// for non-multimodal models — nothing routes to it.
+    pub mm_rx: flume::Receiver<MmRequest>,
+    /// Back-channel for the workers' `MmEncoded` / `MmFailed` into the
+    /// to-scheduler loop.
+    pub tm_tx: flume::Sender<TmEvent>,
+    /// The loaded tokenizer, shared with the tokenizer pool (`None` under
+    /// `skip_tokenizer_init`).
+    pub tokenizer: Option<Arc<dyn TextTokenizer>>,
+}
+
+/// One MM worker, spawned via `Runtime::start_mm_workers` (which owns the
 /// pinning policy for this pool — see its docs).
 pub struct MmWorker {
-    rx: flume::Receiver<MmRequest>,
-    tm: flume::Sender<TmEvent>,
-    ctx: Arc<Context>,
+    mm_rx: flume::Receiver<MmRequest>,
+    tm_tx: flume::Sender<TmEvent>,
+    ctx: Arc<MmContext>,
 }
 
 impl MmWorker {
     pub fn new(
-        rx: flume::Receiver<MmRequest>,
-        tm: flume::Sender<TmEvent>,
-        ctx: Arc<Context>,
+        mm_rx: flume::Receiver<MmRequest>,
+        tm_tx: flume::Sender<TmEvent>,
+        ctx: Arc<MmContext>,
     ) -> Self {
-        Self { rx, tm, ctx }
+        Self { mm_rx, tm_tx, ctx }
     }
 }
 
@@ -131,7 +149,7 @@ impl Runnable for MmWorker {
     /// shutdown). One request at a time, so the pool size bounds MM
     /// concurrency; an error rejects the request back to the client.
     fn run(self) {
-        while let Ok(req) = self.rx.recv() {
+        while let Ok(req) = self.mm_rx.recv() {
             let rid = req.rid;
             let event = match process(&self.ctx, &rid, req.work) {
                 Ok(input_ids) => {
@@ -143,7 +161,7 @@ impl Runnable for MmWorker {
                     TmEvent::MmFailed { rid, message }
                 }
             };
-            if self.tm.send(event).is_err() {
+            if self.tm_tx.send(event).is_err() {
                 return; // to-scheduler gone: shutdown
             }
         }
