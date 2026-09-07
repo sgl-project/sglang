@@ -1423,11 +1423,18 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.begin_weight_update(obj, None)
         )
 
-    def end_weight_update(self, expected_lora_checksums: Optional[Dict] = None):
+    def end_weight_update(
+        self,
+        expected_lora_checksums: Optional[Dict] = None,
+        expected_base_weight_checksums: Optional[Dict[str, Dict[str, str]]] = None,
+    ):
         """Close the session opened by begin_weight_update(): finalize quantized
         weights into kernel layout (sync_base sessions) and apply the streamed
         LoRA stash (optionally checksum-verified)."""
-        obj = EndWeightUpdateReqInput(expected_lora_checksums=expected_lora_checksums)
+        obj = EndWeightUpdateReqInput(
+            expected_lora_checksums=expected_lora_checksums,
+            expected_base_weight_checksums=expected_base_weight_checksums,
+        )
         return self.loop.run_until_complete(
             self.tokenizer_manager.end_weight_update(obj, None)
         )

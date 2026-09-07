@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import (
@@ -29,8 +30,8 @@ _ENABLE_MM_DEEPGEMM = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
 )
 # If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
-_ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var(
-    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0"
+_ENABLE_MM_FALLBACK_VARIANT = (
+    envs.SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT.get()
 )
 _ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"

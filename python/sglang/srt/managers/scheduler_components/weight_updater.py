@@ -78,7 +78,7 @@ def _split_lora_named_tensors(named_tensors):
 
 def _sha256_tensor(tensor: torch.Tensor) -> str:
     return hashlib.sha256(
-        tensor.detach().cpu().contiguous().flatten().view(torch.uint8).numpy().tobytes()
+        tensor.detach().cpu().contiguous().flatten().view(torch.uint8).numpy()
     ).hexdigest()
 
 
@@ -419,17 +419,81 @@ class SchedulerWeightUpdaterManager:
         assert (
             self._weight_update_in_progress
         ), "end_weight_update called without begin_weight_update"
-        if self._weight_update_sync_base:
-            run_post_load = not self._weight_update_loaded
-            for _, runner in self.get_model_runners(self._weight_update_selector):
-                runner.end_weight_update(run_post_load=run_post_load)
-        success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
+        success, message = self._verify_base_weight_checksums(
+            recv_req.expected_base_weight_checksums
+        )
+        if success:
+            if self._weight_update_sync_base:
+                run_post_load = not self._weight_update_loaded
+                for _, runner in self.get_model_runners(self._weight_update_selector):
+                    runner.end_weight_update(run_post_load=run_post_load)
+            success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
         self._weight_update_in_progress = False
         if success:
             self.record_weight_version_after_update(self._weight_update_pending_version)
         self._weight_update_pending_version = None
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=success, message=message)
+
+    def _verify_base_weight_checksums(
+        self, expected_checksums: Optional[Dict[str, Dict[str, str]]]
+    ) -> Tuple[bool, str]:
+        if expected_checksums is None:
+            return True, "Success"
+
+        try:
+            success, message = self._verify_local_base_weight_checksums(
+                expected_checksums
+            )
+        except Exception as e:
+            logger.error("[BASE-WEIGHT-CHECK] local verification raised", exc_info=True)
+            success, message = False, f"local verification raised {e!r}"
+
+        world_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+        statuses: List[Optional[Tuple[bool, str]]] = [None] * world_size
+        torch.distributed.all_gather_object(
+            statuses, (success, message), group=self.tp_cpu_group
+        )
+        failures = [
+            f"group rank {rank}: {status[1]}"
+            for rank, status in enumerate(statuses)
+            if not status[0]
+        ]
+        if failures:
+            failure_message = "[BASE-WEIGHT-CHECK] " + "; ".join(failures)
+            logger.error(failure_message)
+            return False, failure_message
+        return True, "Success"
+
+    def _verify_local_base_weight_checksums(
+        self, expected_checksums: Dict[str, Dict[str, str]]
+    ) -> Tuple[bool, str]:
+        if not self._weight_update_sync_base:
+            return False, (
+                "a base-weight checksum manifest requires a sync_base=True "
+                "weight-update session"
+            )
+
+        tp_rank = self.tp_worker.ps.tp_rank
+        if (expected := expected_checksums.get(str(tp_rank))) is None:
+            return False, (
+                f"tp_rank {tp_rank} has no manifest entry; the manifest covers "
+                f"{sorted(expected_checksums)}"
+            )
+
+        actual = dict(self.tp_worker.model_runner.model.named_parameters())
+        missing = sorted(set(expected) - set(actual))
+        unexpected = sorted(set(actual) - set(expected))
+        if missing or unexpected:
+            return False, (
+                f"tp_rank {tp_rank} parameter names do not match the manifest "
+                f"(missing={missing}, unexpected={unexpected})"
+            )
+
+        for name in sorted(expected):
+            if _sha256_tensor(actual[name]) != expected[name]:
+                return False, f"tp_rank {tp_rank} checksum mismatch for {name!r}"
+        return True, "Success"
 
     def forget_lora_adapter(self, lora_name: str) -> None:
         """Drop the partial-stream guard entry: a re-registered or unloaded name
