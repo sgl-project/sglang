@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -535,6 +535,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         index_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        skip_topk_layers: Optional[List[bool]] = None,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -550,6 +551,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+
+        # A DSA layer that reuses the previous layer's top-k indices owns no
+        # Indexer module at all, so it never writes index-K and its rows here
+        # are pure waste. On GLM-5.2 that is 57 of 78 layers. Mirrors the CUDA
+        # pool, which routes the same mask into IndexKeyCache.
+        self.skip_topk_layers = (
+            list(skip_topk_layers)
+            if skip_topk_layers is not None
+            else [False] * layer_num
+        )
+        assert len(self.skip_topk_layers) == layer_num, (
+            f"skip_topk_layers describes {len(self.skip_topk_layers)} layers but "
+            f"the pool holds {layer_num}"
+        )
 
         self.custom_mem_pool = None
 
@@ -579,17 +594,44 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                self.index_k_buffer = torch.zeros(
-                    (
-                        layer_num,
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        1,
-                        self.index_head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
+                num_pages = self.size // self.page_size + 1
+                if any(self.skip_topk_layers):
+                    # Per-layer tensors, so an elided layer can hold zero pages.
+                    # The list stays layer-aligned, which keeps every
+                    # `index_k_buffer[layer_id - start_layer]` access unchanged.
+                    self.index_k_buffer = [
+                        torch.zeros(
+                            (
+                                0 if self.skip_topk_layers[i] else num_pages,
+                                self.page_size,
+                                1,
+                                self.index_head_dim,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for i in range(layer_num)
+                    ]
+                else:
+                    # Nothing to elide: keep the single dense tensor. This is not
+                    # only the cheaper allocation -- the hierarchical-cache
+                    # transfer path hands this buffer whole to
+                    # `sgl_kernel_npu.kvcacheio.transfer_kv_dim_exchange`
+                    # alongside the dense k/v buffers (mem_cache/pool_host/mla.py),
+                    # and that vendor kernel is not ours to teach about lists.
+                    # `_should_elide_dsa_index_k` already excludes hierarchical
+                    # cache, so the two shapes never have to meet.
+                    self.index_k_buffer = torch.zeros(
+                        (
+                            layer_num,
+                            num_pages,
+                            self.page_size,
+                            1,
+                            self.index_head_dim,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
 
         self._finalize_allocation_log(size)
 
@@ -615,12 +657,23 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.v_buffer[layer_id - self.start_layer],
         )
 
+    def _index_k_item_len(self, i: int) -> int:
+        """Bytes per page for one layer's index-K buffer, 0 when elided.
+
+        An elided layer holds no pages, so ``buffer[0]`` would raise. Elision
+        and the transfer paths that call this are mutually exclusive today --
+        ``_should_elide_dsa_index_k`` requires ``disaggregation_mode "null"`` --
+        so this is a guard against a future combination, not a live case.
+        """
+        buf = self.index_k_buffer[i]
+        return buf[0].nbytes if buf.shape[0] else 0
+
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
             return [], [], []
         data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
         data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
-        item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        item_lens = [self._index_k_item_len(i) for i in range(self.layer_num)]
         return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
@@ -666,9 +719,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_data_lens += [
                 self.index_k_buffer[i].nbytes for i in range(self.layer_num)
             ]
-            kv_item_lens += [
-                self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
-            ]
+            kv_item_lens += [self._index_k_item_len(i) for i in range(self.layer_num)]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
@@ -712,6 +763,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
+        # Only layers that own an Indexer produce index-K, and those are exactly
+        # the layers given a non-empty buffer. A write here to an elided layer
+        # means the pool's mask disagrees with the model's own
+        # `self.indexer is None` decision -- fail loudly rather than scatter into
+        # a zero-page tensor.
+        assert not self.skip_topk_layers[layer_id - self.start_layer], (
+            f"layer {layer_id} was elided as skip-topk but wrote index-K; the "
+            "pool's skip_topk_layers disagrees with the model's indexer layout"
+        )
+
         if index_k.dtype != self.dtype:
             index_k = index_k.to(self.dtype)
 
@@ -752,7 +813,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             v_layer = self.v_buffer[local_layer_id].view(-1, 1, self.qk_rope_head_dim)
             ik_layer = (
                 self.index_k_buffer[local_layer_id].view(-1, 1, self.index_head_dim)
-                if has_ik
+                if has_ik and not self.skip_topk_layers[local_layer_id]
                 else None
             )
             buf_of_layers.append([k_layer, v_layer, ik_layer])
@@ -770,7 +831,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             v_layer = self.v_buffer[local_layer_id].view(-1, 1, self.qk_rope_head_dim)
             ik_layer = (
                 self.index_k_buffer[local_layer_id].view(-1, 1, self.index_head_dim)
-                if has_ik
+                if has_ik and not self.skip_topk_layers[local_layer_id]
                 else None
             )
             for i in range(0, len(indices), chunk_size):
@@ -780,7 +841,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 assert k_cpu.shape[0] == len(chunk_indices)
                 k_layer[chunk_indices] = k_cpu.to(k_layer.device, non_blocking=True)
                 v_layer[chunk_indices] = v_cpu.to(v_layer.device, non_blocking=True)
-                if has_ik:
+                # Not `has_ik`: an elided layer contributed no index-K tensor to
+                # the chunk, so chunk[2] does not exist for it.
+                if ik_layer is not None:
                     ik_cpu = chunk[2]
                     ik_layer[chunk_indices] = ik_cpu.to(
                         ik_layer.device, non_blocking=True

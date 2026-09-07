@@ -1483,6 +1483,22 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
 
+        # Same mask, same predicate, same construction as the CUDA DSA pool
+        # above: layers that reuse the previous layer's top-k own no Indexer and
+        # never write index-K, so they need no rows. On GLM-5.2 that elides 57 of
+        # 78 layers -- the single largest memory saving available on this path,
+        # and unrelated to DCP.
+        skip_topk_layers = None
+        if is_dsa_model and _should_elide_dsa_index_k(
+            is_draft_worker=self.is_draft_worker
+        ):
+            skip_topk_layers = [
+                dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                for layer_id in range(
+                    self.layer_info.start_layer, self.layer_info.end_layer
+                )
+            ]
+
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1495,6 +1511,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            skip_topk_layers=skip_topk_layers,
         )
         return token_to_kv_pool
 
