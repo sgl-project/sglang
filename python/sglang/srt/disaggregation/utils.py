@@ -79,6 +79,31 @@ def is_dsv4_c128_online_enabled() -> bool:
     return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
+def get_dsv4_c4_state_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    ring_size: int,
+) -> np.ndarray:
+    """Return physical rows for the live C4 compressor history.
+
+    Prefill and decode may use different C4 ring sizes (8 without speculative
+    decoding and 16 with EAGLE/MTP).  State transfer must therefore pair rows
+    by logical token position instead of copying a whole request-local bank.
+    The C4 overlap compressor keeps ``seq_len % 4 + 4`` live rows.
+    """
+    if ring_size < 8 or ring_size % 4 != 0:
+        raise ValueError(
+            f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
+        )
+
+    seq_len = max(0, int(seq_len))
+    state_len = seq_len % 4 + 4
+    positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
+    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
+    return rows.astype(np.int32)
+
+
 def get_dsv4_c128_state_indices(
     req_pool_idx: int,
     seq_len: int,
@@ -1467,6 +1492,22 @@ def setup_state_kv_args(
                 c128_lens,
                 c128_item_lens,
             )
+
+        # On A5 (CYCLE cache_mode), C4 state uses request-local ring rows rather
+        # than SWA pages.  Register it separately so P and D can independently
+        # map logical positions when their local ring sizes differ.
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        if is_npu_arch35():
+            c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
+            if c4_ptrs:
+                append_state_component(
+                    kv_args,
+                    AscendStateType.DSV4_C4_STATE,
+                    c4_ptrs,
+                    c4_lens,
+                    c4_item_lens,
+                )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component

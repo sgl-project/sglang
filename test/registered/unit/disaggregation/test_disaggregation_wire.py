@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    get_dsv4_c4_state_indices,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
@@ -365,7 +366,12 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         buffers.set_buf(self._make_req(seed))
         buffers.set_buf(self._make_req(None, metadata_buffer_index=1))
 
-        self.assertTrue(torch.equal(buffers.output_dsa_topk_indices[0], seed))
+        self.assertTrue(
+            torch.equal(
+                buffers.output_dsa_topk_indices[0],
+                seed.to(buffers.output_dsa_topk_indices.device),
+            )
+        )
         self.assertEqual(buffers.output_dsa_topk_indices[1].tolist(), [-1, -1, -1])
         ptrs, data_lens, item_lens = buffers.get_buf_infos()
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
@@ -517,6 +523,39 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertTrue(future_map.need_topk)
         self.assertEqual(future_map.topk_p_buf.shape, (4, 3))
         self.assertEqual(future_map.topk_index_buf.shape, (4, 3))
+
+
+class TestDSV4C4StateIndices(unittest.TestCase):
+    def test_non_mtp_to_mtp_maps_the_same_logical_positions(self):
+        # seq_len=13 keeps logical positions [8, 13) for the overlap C4 state.
+        src = get_dsv4_c4_state_indices(2, 13, ring_size=8)
+        dst = get_dsv4_c4_state_indices(2, 13, ring_size=16)
+
+        np.testing.assert_array_equal(src, np.array([16, 17, 18, 19, 20]))
+        np.testing.assert_array_equal(dst, np.array([40, 41, 42, 43, 44]))
+        self.assertEqual(src.size, dst.size)
+
+    def test_ring_wrap_preserves_position_order(self):
+        np.testing.assert_array_equal(
+            get_dsv4_c4_state_indices(0, 10, ring_size=8),
+            np.array([4, 5, 6, 7, 0, 1], dtype=np.int32),
+        )
+
+    def test_short_and_empty_sequences(self):
+        np.testing.assert_array_equal(
+            get_dsv4_c4_state_indices(3, 3, ring_size=8),
+            np.array([24, 25, 26], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            get_dsv4_c4_state_indices(3, 0, ring_size=8),
+            np.empty((0,), dtype=np.int32),
+        )
+
+    def test_invalid_ring_size_is_rejected(self):
+        with self.assertRaises(ValueError):
+            get_dsv4_c4_state_indices(0, 8, ring_size=4)
+        with self.assertRaises(ValueError):
+            get_dsv4_c4_state_indices(0, 8, ring_size=10)
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):
