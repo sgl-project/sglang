@@ -754,5 +754,87 @@ def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:
     assert torch.equal(lru_slots.cpu().view(-1), expected_lru)
 
 
+def test_load_cache_to_device_buffer_multi_iteration_planner_scan() -> None:
+    """Cover a block geometry whose planner prefix scans run for many iterations.
+
+    The hit/evict and miss scans walk NUM_BUFFER_CHUNKS and NUM_TOKEN_CHUNKS in
+    NUM_WARPS-wide steps, so a block with few warps needs several iterations.
+    block_size=128 gives 8 buffer and 4 token iterations on both warp32 and
+    wavefront64. The other cases in this file use one iteration and never
+    exercise the carry between them.
+    """
+    top_k = 512
+    hot_buffer_size = 1024
+    seq_len = 4096
+    kv_dim = 4
+    item_size_bytes = kv_dim * torch.empty((), dtype=DTYPE).element_size()
+
+    host_cache = torch.empty((seq_len, 1, kv_dim), dtype=DTYPE, pin_memory=True)
+    host_cache.copy_(
+        torch.arange(seq_len, dtype=DTYPE)
+        .view(seq_len, 1, 1)
+        .expand(seq_len, 1, kv_dim)
+    )
+    device_buffer = torch.full(
+        (hot_buffer_size + 1, 1, kv_dim), -1, dtype=DTYPE, device=DEVICE
+    )
+    # Token t < hot_buffer_size is resident in slot t.
+    device_buffer[:hot_buffer_size].copy_(host_cache[:hot_buffer_size].to(DEVICE))
+
+    device_buffer_tokens = torch.cat(
+        [
+            torch.arange(hot_buffer_size, dtype=torch.int32),
+            torch.tensor([-1], dtype=torch.int32),
+        ]
+    ).view(1, -1)
+    device_buffer_locs = torch.arange(hot_buffer_size + 1, dtype=torch.int32).view(
+        1, -1
+    )
+    lru_slots = torch.arange(hot_buffer_size, dtype=torch.int16).view(1, -1)
+    host_cache_locs = torch.arange(seq_len, dtype=torch.int64).view(1, -1)
+
+    # Alternate resident and non-resident tokens so every chunk of the scan
+    # carries a mix of hits and misses.
+    resident = torch.arange(top_k, dtype=torch.int32)
+    absent = torch.arange(hot_buffer_size, hot_buffer_size + top_k, dtype=torch.int32)
+    top_k_tokens = torch.stack([resident, absent], dim=1).view(-1)[:top_k].view(1, -1)
+
+    top_k_tokens = top_k_tokens.to(DEVICE)
+    device_buffer_tokens = device_buffer_tokens.to(DEVICE)
+    device_buffer_locs = device_buffer_locs.to(DEVICE)
+    lru_slots = lru_slots.to(DEVICE)
+    host_cache_locs = host_cache_locs.to(DEVICE)
+    out = torch.full_like(top_k_tokens, -1)
+
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=host_cache_locs,
+        device_buffer_locs=device_buffer_locs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
+        lru_slots=lru_slots,
+        item_size_bytes=item_size_bytes,
+        num_top_k=top_k,
+        hot_buffer_size=hot_buffer_size,
+        page_size=1,
+        block_size=128,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    out_locs = out.view(-1).cpu()
+    assert int(out_locs.min()) >= 0
+    # A corrupted prefix sum hands the same device slot to two top-k entries.
+    assert len(set(out_locs.tolist())) == top_k
+    assert torch.equal(
+        device_buffer[out_locs.to(DEVICE).long()].cpu(),
+        host_cache[top_k_tokens.view(-1).cpu().long()],
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
