@@ -119,7 +119,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
         return _flexkv_factory(ctx)
 
-    if server_args.enable_unified_cache_external_linker:
+    if get_memory().enable_unified_cache_external_linker:
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
