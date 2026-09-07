@@ -33,7 +33,7 @@ This example demonstrates how to create a custom server on top of the SGLang Eng
 2. Run the server:
 
    ```bash
-   python custom_server
+   python custom_server.py
    ```
 
 3. Send requests:

@@ -1,6 +1,6 @@
 """
 Usage:
-python offline_batch_inference_async.py --model-path Qwen/Qwen2-VL-7B-Instruct
+python offline_batch_inference_async.py --model-path Qwen/Qwen2.5-0.5B-Instruct
 
 Note:
 This demo shows the usage of async generation,
