@@ -50,6 +50,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
@@ -1160,8 +1161,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         return self.compose_image_artifacts(input_text, artifacts)
 
     def _mark_cuda_ipc_features_for_deferred_reconstruction(self, mm_items):
-        supports_deferred_reconstruction = self.server_args.mm_enable_dp_encoder or (
-            self.server_args.tp_size == 1
+        supports_deferred_reconstruction = get_mm().mm_enable_dp_encoder or (
+            get_parallel().tp_size == 1
             and self.model_type in ("qwen3_vl", "qwen3_vl_moe")
         )
         if not (

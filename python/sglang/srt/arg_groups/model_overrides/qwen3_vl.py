@@ -105,17 +105,19 @@ def _qwen3vl_hopper_serving_overrides(server_args: Any, hf_config: Any) -> dict:
     cache_retention_enabled = (
         preprocess_cache_size_mb > 0 or envs.SGLANG_VLM_CACHE_SIZE_MB.get() > 0
     )
-    if cfg.mm_feature_transport is None and not cache_retention_enabled:
+    if (
+        cfg.mm_feature_transport is None
+        and cfg.nnodes == 1
+        and not cache_retention_enabled
+    ):
         updates["mm_feature_transport"] = "cuda_ipc"
+    resolved_transport = updates.get("mm_feature_transport", cfg.mm_feature_transport)
     if (
         not envs.SGLANG_MM_FEATURE_CACHE_MB.is_set()
         and cfg.max_running_requests is not None
         and cfg.max_running_requests >= 400
         and not cache_retention_enabled
-        and (
-            updates.get("mm_feature_transport", cfg.mm_feature_transport)
-            in (None, "cuda_ipc")
-        )
+        and resolved_transport == "cuda_ipc"
     ):
         # Keep a full high-concurrency wave GPU-resident instead of
         # falling back to CPU transport while the scheduler drains it.
