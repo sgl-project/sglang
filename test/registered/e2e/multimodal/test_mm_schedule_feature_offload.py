@@ -85,9 +85,9 @@ def _fake_encoder(device: torch.device):
 
     def encode(items):
         for item in items:
-            assert (
-                item.feature.device.type == device.type
-            ), "feature must be on the encoder device when encoding"
+            assert item.feature.device.type == device.type, (
+                "feature must be on the encoder device when encoding"
+            )
         calls.append(list(items))
         return torch.cat([_encode(item.feature) for item in items], dim=0)
 
