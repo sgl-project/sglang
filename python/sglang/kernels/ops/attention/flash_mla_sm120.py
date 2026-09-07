@@ -822,14 +822,16 @@ def flashinfer_sparse_mla_forward(
                 "GLM-5.3 native NoPE sparse MLA supports at most "
                 f"{_GLM53_NOPE_FLASHINFER_TOPK} candidates, got {topk}"
             )
-        # Pass the EXACT per-row valid candidate count, not seq_lens. Raw
-        # seq_lens exceeds the index width for long rows, which turns -1
-        # pad columns into "active" candidates: their logits are masked,
-        # but the slot-0-clamped gathered rows still feed the value MMA,
-        # so one NaN-decoding byte in that row poisons the whole output
-        # row (0 * NaN). Valid entries are a contiguous prefix by the
-        # top-k transform's construction, so the count bounds them all.
-        seq_lens = (indices >= 0).sum(dim=-1, dtype=seq_lens.dtype)
+        # A valid tail can follow -1 holes from defensive top-k selection.
+        # Bound by the last valid column, not the number of valid columns.
+        # FlashInfer must mask the invalid KV payload as well as its logit.
+        if topk:
+            columns = torch.arange(
+                1, topk + 1, device=indices.device, dtype=seq_lens.dtype
+            )
+            seq_lens = torch.where(indices >= 0, columns, 0).amax(dim=-1)
+        else:
+            seq_lens = torch.zeros_like(seq_lens)
         if topk < _GLM53_NOPE_FLASHINFER_TOPK:
             indices = torch.nn.functional.pad(
                 indices,

@@ -239,5 +239,64 @@ class TestFlashInferSparseMLAKVLayout(unittest.TestCase):
                 )
 
 
+class TestFlashInferSparseMLAIndexAndWorkspaceBounds(unittest.TestCase):
+    def _run(self, indices, heads=32, workspace_bytes=None):
+        captured = {}
+
+        class FakeRunner:
+            def run(self, q, kv_cache, indices, output, sm_scale, **kwargs):
+                captured.update(indices=indices, **kwargs)
+                output.zero_()
+
+        tokens = indices.shape[0]
+        scratch_heads = 8 if heads == 8 else ((heads + 15) // 16) * 16
+        required = tokens * scratch_heads * 34 * (512 * 2 + 4)
+        flashinfer_sparse_mla_forward(
+            q=torch.zeros(tokens, heads, 512, dtype=torch.bfloat16),
+            kv_cache=torch.zeros(1, 64, 528, dtype=torch.uint8),
+            indices=indices,
+            seq_lens=torch.full((tokens,), 8192, dtype=torch.int32),
+            workspace_buffer=torch.zeros(
+                required if workspace_bytes is None else workspace_bytes,
+                dtype=torch.uint8,
+            ),
+            runner=FakeRunner(),
+            page_size=64,
+            kv_cache_dim=528,
+            qk_nope_head_dim=256,
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+            sm_scale=0.125,
+            skip_softmax_threshold_scale_factor=None,
+        )
+        return captured, required
+
+    def test_holes_do_not_exclude_kpool_tail(self):
+        indices = torch.full((1, 2051), -1, dtype=torch.int32)
+        indices[0, :2044] = torch.arange(1, 2045, dtype=torch.int32)
+        indices[0, 2048:] = torch.tensor([9000, 9001, 9002], dtype=torch.int32)
+        captured, _ = self._run(indices)
+        self.assertEqual(captured["topk_length"].tolist(), [2051])
+        torch.testing.assert_close(captured["indices"][:, :2051], indices)
+
+    def test_leading_holes_and_empty_rows(self):
+        indices = torch.tensor([[-1, 2, 3, -1], [-1, -1, -1, -1]], dtype=torch.int32)
+        captured, _ = self._run(indices)
+        self.assertEqual(captured["topk_length"].tolist(), [3, 0])
+
+    def test_exact_and_one_byte_short_workspace(self):
+        indices = torch.tensor([[2, -1]], dtype=torch.int32)
+        for heads in (8, 24, 32):
+            with self.subTest(heads=heads):
+                captured, required = self._run(indices, heads=heads)
+                expected_heads = 8 if heads == 8 else 32
+                self.assertEqual(
+                    captured["mid_out"].shape, (1, expected_heads, 34, 512)
+                )
+                self.assertEqual(captured["mid_lse"].shape, (1, expected_heads, 34))
+                with self.assertRaisesRegex(ValueError, "workspace is too small"):
+                    self._run(indices, heads=heads, workspace_bytes=required - 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -531,12 +531,14 @@ class DeepseekSparseAttnBackend(
                     device=model_runner.device,
                 ),
             )
+            # Mixed chunks can include decode or verify tokens in addition
+            # to the prefill token budget.
             max_runner_tokens = max(
                 64,
                 int(getattr(model_runner.server_args, "chunked_prefill_size", 0) or 0),
                 int(getattr(model_runner.server_args, "max_prefill_tokens", 0) or 0),
-                model_runner.max_running_requests
-                * max(1, self.speculative_num_draft_tokens or 1),
+            ) + model_runner.max_running_requests * max(
+                1, self.speculative_num_draft_tokens or 1
             )
             self.flashinfer_sparse_mla_runner = create_flashinfer_sparse_mla_runner(
                 qk_rope_head_dim=self.qk_rope_head_dim,
