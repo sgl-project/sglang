@@ -1179,9 +1179,8 @@ class TestSWAPeerMappedContract(CustomTestCase):
             allocator.free_swa(indices, start_pos=0)
             allocator.free_group_end()
 
-        # Warm up outside the window, both paths: a first-time cudaMalloc can
-        # synchronize on its own, which the detector would report as this
-        # call's fault.
+        # Warm up both paths outside the window: a first-time cudaMalloc can
+        # synchronize on its own, which the detector would blame on this call.
         allocator.free_swa(_swa_alloc(allocator, 2 * ps), start_pos=0)
         grouped(_swa_alloc(allocator, 2 * ps))
         first = _swa_alloc(allocator, 3 * ps)
@@ -1233,9 +1232,8 @@ class TestSWAPeerMappedContract(CustomTestCase):
 
 
 class TestSWAPageRepsFree(CustomTestCase):
-    """page_size > 1: a kv-row segment hands `free_swa` its start position, so
-    the SWA side frees by one representative per page instead of expanding
-    pages, filtering the sentinel and dedup'ing through torch.unique."""
+    """page_size > 1: with a start position the SWA side frees one representative
+    per page instead of expanding, filtering and dedup'ing through torch.unique."""
 
     PS = 4
 
@@ -1267,9 +1265,8 @@ class TestSWAPageRepsFree(CustomTestCase):
                 self.assertTrue(torch.all(mapping[indices[touched:]] > 0))
 
     def test_node_frees_take_the_page_path_through_the_tree(self):
-        """Tree values are page-aligned copies of a kv row: SWA eviction of
-        internal nodes and leaves, then full eviction of the tombstones, all
-        free by page reps."""
+        """Tree values are page-aligned copies of a kv row, so SWA eviction and
+        the full eviction of its tombstones both free by page reps."""
         ps = self.PS
         tree, allocator, _ = _build_swa_tree(
             is_eagle=False, page_size=ps, sliding_window_size=ps

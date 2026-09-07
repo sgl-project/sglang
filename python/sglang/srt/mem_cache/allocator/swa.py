@@ -351,14 +351,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_index_mapping.index_fill_(0, full_indices, 0)
 
     def free_swa(self, free_index: torch.Tensor, *, start_pos: Optional[int] = None):
-        """Release the SWA peers of ``free_index`` and clear their mapping.
-
-        With ``start_pos`` the indices are ``kv_row[start_pos : start_pos + n]``
-        of one request (or a page-aligned copy), so one token per page stands
-        for the page and every op keeps a fixed shape. Without it the input is
-        an arbitrary set (alloc rollback): whole pages are expanded, gathered
-        and filtered, which synchronizes at page_size > 1.
-        """
+        """Release the SWA peers and clear their mapping. ``start_pos`` follows the
+        free_segment() contract and keeps every op fixed-shape; without it the
+        set-shaped path synchronizes at page_size > 1."""
         if free_index.numel() == 0:
             return
 
@@ -366,9 +361,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._free_swa_reps(free_index, start_pos=start_pos or 0)
             return
 
-        # Set-shaped input: the expansion gathers slots this caller never
-        # allocated, whose entries read as the padding slot, so the sentinel
-        # filter stays; `_release_swa` applies it once per group.
+        # The expansion gathers slots this caller never allocated, which read as
+        # the padding slot; `_release_swa` filters them once per group.
         mapping_indices = self._expand_to_full_pages(free_index)
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         self.clear_full_to_swa_mapping(mapping_indices)
@@ -384,10 +378,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def _free_swa_reps(self, free_index: torch.Tensor, *, start_pos: int):
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
-        # The first token of every page the segment touches. The caller
-        # allocated each one, so its entry is live unless the caller wanted
-        # free_full; a filter here would make the output shape data-dependent,
-        # which costs a device-to-host sync.
+        # First token of every page the segment touches; the caller allocated
+        # each one, so a dead entry means the caller wanted free_full.
         reps = free_index[::ps]
         swa_reps = self.full_to_swa_index_mapping[reps]
         expect(_SWA_PEER_MAPPED, swa_reps > 0, msg="caller wants free_full")

@@ -299,8 +299,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_page_reps(reps)
 
     def free_page_reps(self, reps: torch.Tensor):
-        """Free the pages ``reps`` stand for: one token per page, any offset
-        within it, no page twice. Fixed shape, like free_segment()."""
+        """Free the pages ``reps`` stand for: one token per page, no page twice."""
         if reps.numel() == 0:
             return
 

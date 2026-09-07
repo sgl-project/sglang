@@ -101,8 +101,6 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        # A contiguous kv-row range with host-int bounds: the start position
-        # lets the allocator take page reps by stride instead of `torch.unique`.
         token_to_kv_pool_allocator.free_swa(
             free_slots, start_pos=req.kv.swa_evicted_seqlen
         )
