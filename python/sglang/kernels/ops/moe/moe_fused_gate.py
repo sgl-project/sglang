@@ -127,12 +127,9 @@ def _router_triton_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    # With programmatic dependent launch this grid may start before the
-    # preceding kernel's stores are visible, so every load that can depend on
-    # prior work must come after the wait. The bias is such an input: callers
-    # pass buffers produced right before this launch (a dtype cast of the
-    # correction bias, or historically a fresh torch.zeros), and a load placed
-    # before the wait read the buffer's previous contents.
+    # PDL may start this grid before prior kernel stores are visible. Bias can
+    # be produced by a preceding cast or fill kernel, so wait before loading
+    # either bias or scores.
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
 
