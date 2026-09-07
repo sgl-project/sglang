@@ -3610,7 +3610,7 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 positions,
             )
-        elif self.hc_pre_from_prev_sublayer:
+        if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
             hidden_states, last_pre = self._forward_layers_hc_pre_from_prev(
                 positions,
