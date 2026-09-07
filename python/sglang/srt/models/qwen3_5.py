@@ -1264,8 +1264,38 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 )
 
 
+# What load_weights does to a checkpoint name before it looks the parameter up,
+# exposed so ParameterMapper (the RL weight-transfer path that seeds a CPU
+# replica by name) resolves the same sglang names load_weights would.
+_QWEN3_5_STACKED_PARAMS_MAPPING = [
+    ("attn.qkv_proj.", "attn.qkv.", None),
+    ("qkv_proj", "q_proj", "q"),
+    ("qkv_proj", "k_proj", "k"),
+    ("qkv_proj", "v_proj", "v"),
+    ("gate_up_proj", "gate_proj", 0),
+    ("gate_up_proj", "up_proj", 1),
+    ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+    ("in_proj_qkvz.", "in_proj_z.", 3),
+    ("in_proj_ba.", "in_proj_b.", 0),
+    ("in_proj_ba.", "in_proj_a.", 1),
+]
+
+
+def _qwen3_5_mutate_weight_preload(self, name: str) -> str:
+    if "language_model" in name:
+        name = name.replace("model.language_model.", "model.")
+    if ".self_attn." in name:
+        name = name.replace(".self_attn", "")
+    if "visual" in name:
+        name = name.replace("model.visual.", "visual.")
+    return name
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
+
+    stacked_params_mapping = _QWEN3_5_STACKED_PARAMS_MAPPING
+    mutate_weight_preload = _qwen3_5_mutate_weight_preload
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -1776,6 +1806,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+
+    stacked_params_mapping = _QWEN3_5_STACKED_PARAMS_MAPPING
+    mutate_weight_preload = _qwen3_5_mutate_weight_preload
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
@@ -1938,6 +1971,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
+
+    stacked_params_mapping = _QWEN3_5_STACKED_PARAMS_MAPPING
+    mutate_weight_preload = _qwen3_5_mutate_weight_preload
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None

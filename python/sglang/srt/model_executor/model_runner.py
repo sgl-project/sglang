@@ -1865,6 +1865,9 @@ class ModelRunner:
         (when load_weights was bypassed this session, e.g. P2P/RDMA), then finalize
         quantized weights into kernel layout."""
         if run_post_load:
+            from sglang.srt.model_loader.loader import PreshardedModelLoader
+
+            PreshardedModelLoader._rebind_parameter_aliases(self.model)
             post_load_weights(self.model)
         postprocess_weight(self.model, torch.device(self.device))
 
