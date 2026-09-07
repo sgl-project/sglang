@@ -1511,6 +1511,14 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            # Passed explicitly even though it equals the default, because the
+            # indexer's extent is a separate decision from the latent KV's and
+            # the two diverge under DCP: the latent KV is sharded and stays at
+            # max_total, while the replicated indexer has to span the full
+            # virtual range. `_build_dsa_kv_pool` omits this argument on the
+            # CUDA path and so silently under-allocates the indexer by the DCP
+            # factor; naming it here keeps that bug off this path.
+            index_buf_size=max_total_num_tokens,
             skip_topk_layers=skip_topk_layers,
         )
         return token_to_kv_pool

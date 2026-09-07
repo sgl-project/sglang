@@ -535,6 +535,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         index_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        index_buf_size: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
     ):
         super(MLATokenToKVPool, self).__init__(
@@ -551,6 +552,33 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+
+        # How many token rows the index-K buffer spans, independent of how many
+        # the latent KV spans. The CUDA pool has had this seam since it was
+        # written -- `DSATokenToKVPool` takes `index_buf_size` and hands it to
+        # `IndexKeyCache` (memory_pool.py:4444, :4496) -- and `hisparse` already
+        # passes something other than `size` through it
+        # (hisparse_memory_pool.py:58). This pool derived both counts from
+        # `self.size`, which is only correct while the two are equal.
+        #
+        # They stop being equal under decode context parallelism. The latent KV
+        # is sharded, so each rank keeps `size` rows and translates writes into
+        # them; the LightningIndexer is replicated and has to address every
+        # global position, so its buffer spans the full virtual range,
+        # `size * dcp_size`, and is written at a raw, unfiltered `loc`. That is
+        # the same division of labour the CUDA DSA pool already has.
+        #
+        # Nothing passes a widened value yet: at dcp_size 1 the two are equal
+        # and this is a pure refactor. The seam lands first, on its own, so that
+        # the write-path translation it enables is a separate diff to bisect.
+        #
+        # One consumer to keep in view before widening it: the HiCache host
+        # mirror allocates index-K from the *same* `base_dims` as k/v
+        # (pool_host/mla.py:163-192, layout "page_first_kv_split"), so a
+        # widened device buffer would outgrow its host counterpart. Hierarchical
+        # cache and DCP have no reason to meet on this path, but nothing asserts
+        # it here yet.
+        self.index_buf_size = size if index_buf_size is None else index_buf_size
 
         # A DSA layer that reuses the previous layer's top-k indices owns no
         # Indexer module at all, so it never writes index-K and its rows here
@@ -594,7 +622,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                num_pages = self.size // self.page_size + 1
+                # From index_buf_size, not self.size -- see the note above.
+                num_pages = self.index_buf_size // self.page_size + 1
                 if any(self.skip_topk_layers):
                     # Per-layer tensors, so an elided layer can hold zero pages.
                     # The list stays layer-aligned, which keeps every
