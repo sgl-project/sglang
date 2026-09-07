@@ -314,6 +314,7 @@ add_fp8_gemm_runner_backend_choices = FP8_GEMM_RUNNER_BACKEND_CHOICES.extend
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
+    "flashinfer_b12x",
     "flashinfer_cudnn",
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
@@ -1737,7 +1738,7 @@ class ServerArgs:
     fp4_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
+            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_b12x' (FlashInfer SM120/SM121 b12x backend; requires CUDA 13+), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
