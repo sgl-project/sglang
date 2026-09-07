@@ -1044,7 +1044,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
-        self.validate_swa_pool_size(swa_tokens, self.sliding_window_size, page_size)
+        if not self._unified:
+            # Ring mode: the paged SWA pool is vestigial, so its floor does not apply.
+            self.validate_swa_pool_size(swa_tokens, self.sliding_window_size, page_size)
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,

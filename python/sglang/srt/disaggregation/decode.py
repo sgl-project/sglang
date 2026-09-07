@@ -73,6 +73,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -1715,7 +1716,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         window_size = self.scheduler.sliding_window_size or 0
         swa_total = self.token_to_kv_pool_allocator.size_swa
         swa_available = self.token_to_kv_pool_allocator.swa_available_size()
-        swa_evictable = self.tree_cache.swa_evictable_size()
+        # Per-request SWA ring: cached prefixes still report swa_evictable, but
+        # evicting them frees no ring space.
+        swa_evictable = (
+            0
+            if is_swa_req_ring(self.token_to_kv_pool_allocator)
+            else self.tree_cache.swa_evictable_size()
+        )
         swa_used = swa_total - swa_available - swa_evictable
         swa_growth_potential = max(0, n_active * window_size - swa_used)
         swa_reserved_tokens = min(reserved_tokens, swa_growth_potential)

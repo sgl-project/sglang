@@ -341,8 +341,8 @@ class KVCacheConfigurator:
         alloc = pools.token_to_kv_pool_allocator
         if not self.is_draft_worker and is_swa_req_ring(alloc):
             # Per-request SWA ring: the sizer's swa token count describes the
-            # vestigial paged pool; the real capacity is every req slot's ring.
-            swa_max_total_num_tokens = int(alloc.swa_available_size())
+            # vestigial paged pool; the allocator knows the real ring total.
+            swa_max_total_num_tokens = alloc.size_swa
             logger.info(
                 "SWA ring: swa_max_total_num_tokens "
                 f"{sizes.swa_max_total_num_tokens} -> {swa_max_total_num_tokens} "

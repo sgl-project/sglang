@@ -126,10 +126,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._swa_ring_cost = (
                 (ring_size + self.page_size - 1) // self.page_size
             ) * self.page_size
+            # Total SWA capacity is every req slot's ring; all slots are free here.
+            self._size_swa = req_to_token_pool.available_size() * self._swa_ring_cost
             logger.info(
                 "SWA per-request ring accounting enabled: "
                 f"ring_size={ring_size}, ring_cost_tokens={self._swa_ring_cost}, "
-                f"paged size_swa={self._size_swa} (bypassed)"
+                f"size_swa={self._size_swa} (paged size_swa={size_swa} bypassed)"
             )
         else:
             self._swa_ring_cost = 0
@@ -532,7 +534,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         size_full = int(config.full_max_total_num_tokens)
         size_swa = int(config.swa_max_total_num_tokens)
         self._size_full = size_full
-        self._size_swa = size_swa
+        if not self._swa_req_ring:
+            # Ring capacity follows the req slot count, not the token config.
+            self._size_swa = size_swa
         for alloc, sz in (
             (self.full_attn_allocator, size_full),
             (self.swa_attn_allocator, size_swa),
