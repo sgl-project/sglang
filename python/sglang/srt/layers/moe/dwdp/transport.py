@@ -13,7 +13,7 @@ import torch.distributed as dist
 try:
     from cuda.bindings import driver as cuda
 except ImportError:
-    # For non-cuda platform.
+    # CUDA-only; DwdpManager rejects non-CUDA before anything touches this.
     cuda = None
 
 from sglang.srt.layers.moe.dwdp.layout import (

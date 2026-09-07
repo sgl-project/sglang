@@ -15,7 +15,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 _is_xpu = is_xpu()
 
-# Measured on the XPU canary runner; DEFAULT_RUN_TIMEOUT_S is not enough there.
+# 3x DEFAULT_RUN_TIMEOUT_S: headroom for slower XPU decode, not a measured bound.
 XPU_RUN_TIMEOUT_S: float = 360.0
 
 

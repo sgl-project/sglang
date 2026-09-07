@@ -23,11 +23,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-def _seq_lens_per_encoder(pipeline_config, embeds) -> list[list[int]]:
-    """Per-encoder text lengths; ComfyUI embeds arrive unpadded and maskless."""
-    return [pipeline_config.seq_lens_from_prompt_embeds(e) for e in embeds]
-
-
 class ComfyUILatentPreparationStage(LatentPreparationStage):
     """
     ComfyUI-specific latent preparation stage with device mismatch fix.
@@ -107,16 +102,18 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
         # No TextEncodingStage here, so back-fill require_text_seq_lens' input.
         pipeline_config = server_args.pipeline_config
         if batch.prompt_embeds is not None and batch.prompt_seq_lens is None:
-            batch.prompt_seq_lens = _seq_lens_per_encoder(
-                pipeline_config, batch.prompt_embeds
-            )
+            batch.prompt_seq_lens = [
+                pipeline_config.seq_lens_from_prompt_embeds(e)
+                for e in batch.prompt_embeds
+            ]
         if (
             batch.negative_prompt_embeds is not None
             and batch.negative_prompt_seq_lens is None
         ):
-            batch.negative_prompt_seq_lens = _seq_lens_per_encoder(
-                pipeline_config, batch.negative_prompt_embeds
-            )
+            batch.negative_prompt_seq_lens = [
+                pipeline_config.seq_lens_from_prompt_embeds(e)
+                for e in batch.negative_prompt_embeds
+            ]
 
         original_latents_shape = None
         if batch.latents is not None:

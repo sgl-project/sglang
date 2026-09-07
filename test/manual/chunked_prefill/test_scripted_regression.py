@@ -7,18 +7,12 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    drain_until_kv_released,
     run_until,
     run_until_all_finished,
     run_until_finished,
     warmup_radix,
 )
-
-
-def _drain_until_released(*reqs):
-    for _ in range(12):
-        if all(r.kv.req_pool_idx is None and r.kv.is_kv_released for r in reqs):
-            return
-        yield
 
 
 def _run_until_prefix_locked(r):
@@ -47,7 +41,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert req is not None
 
         t.abort(r)
-        yield from _drain_until_released(req)
+        yield from drain_until_kv_released(req)
 
         assert req.kv.is_kv_released, f"kv_allocated_len={req.kv.kv_allocated_len}"
         assert req.kv.req_pool_idx is None
@@ -256,7 +250,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.kv_pages > 0, "committed KV must be held mid-chunk"
 
         t.abort(r)
-        yield from _drain_until_released(req)
+        yield from drain_until_kv_released(req)
 
         assert req.kv.req_pool_idx is None, (
             f"96d4749094: abort must release row; got row_idx={req.kv.req_pool_idx!r}"
@@ -364,7 +358,7 @@ class TestRegressionPp(ScriptedTestCase):
             f"waiting_queue; got {occurrences} occurrences of rid="
             f"{r.rid} (pre-fix bug would yield 3)"
         )
-        yield from _drain_until_released(req)
+        yield from drain_until_kv_released(req)
         assert r.finished
 
 

@@ -11,15 +11,18 @@ import triton
 import triton.language as tl
 
 
+_TRITON_DEVICE_TYPES = ("cuda", "xpu")
+
+
 def _require_triton_device(dst: torch.Tensor, src: torch.Tensor, fn_name: str) -> None:
-    """Both tensors must share one Triton-capable device (i.e. not CPU)."""
+    """Both tensors must share one device with a Triton backend in this tree."""
     if dst.device != src.device:
         raise ValueError(
             f"{fn_name}: dst and src must be on the same device. "
             f"{dst.device=} {src.device=}"
         )
-    if dst.device.type == "cpu":
-        raise ValueError(f"{fn_name}: CPU tensors are not supported.")
+    if dst.device.type not in _TRITON_DEVICE_TYPES:
+        raise ValueError(f"{fn_name}: unsupported device {dst.device.type}.")
 
 
 def _require_entry_contiguous_dst(

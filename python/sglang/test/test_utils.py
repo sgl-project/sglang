@@ -283,6 +283,7 @@ def auto_config_device() -> str:
 
 
 def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
+    device_choices = ["auto"] + SUPPORTED_DEVICES
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
@@ -291,11 +292,10 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
         "--device",
         type=str,
         default="auto",
-        choices=["auto"] + SUPPORTED_DEVICES,
+        choices=device_choices,
         help=(
-            "Device type ("
-            + "/".join(["auto"] + SUPPORTED_DEVICES)
-            + "). 'auto' detects the available platform."
+            f"Device type ({'/'.join(device_choices)}). "
+            "'auto' detects the available platform."
         ),
     )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
@@ -697,7 +697,7 @@ def popen_launch_server(
         other_args: Additional command line arguments
         env: Environment dict for subprocess
         return_stdout_stderr: Optional tuple for output capture
-        device: Device type ("auto", "cuda", "rocm", "xpu" or "cpu")
+        device: "auto" appends a detected --device; other values are ignored
         pd_separated: Whether to use PD separated mode
         num_replicas: Number of replicas for mixed PD mode
 
@@ -1381,12 +1381,7 @@ def run_bench_serving_multi(
 
 
 def run_bench_one_batch(model, other_args):
-    """Launch a offline process with automatic device detection.
-
-    Args:
-        device: Device type ("auto", "cuda", "rocm", "xpu" or "cpu").
-                If "auto", will detect available platforms automatically.
-    """
+    """Launch a offline process with automatic device detection."""
     device = auto_config_device()
     print(f"Auto-configed device: {device}", flush=True)
     other_args += ["--device", str(device)]
