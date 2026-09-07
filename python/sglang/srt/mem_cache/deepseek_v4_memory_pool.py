@@ -16,6 +16,10 @@ from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.attention.dsv4.mxfp4_k_cache import (
+    MXFP4_BYTES_PER_TOKEN,
+    quantize_dsv4_mxfp4_k_cache_into,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -74,6 +78,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        use_mxfp4: bool = False,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -89,6 +94,17 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.dsv4_kv_cache_store_mxfp4 = use_mxfp4
+        if self.dsv4_kv_cache_store_mxfp4:
+            if qk_nope_head_dim != 448 or qk_rope_head_dim != 64:
+                raise ValueError(
+                    "DeepSeek V4 MXFP4 requires qk_nope_head_dim=448 and "
+                    f"qk_rope_head_dim=64, got {qk_nope_head_dim=} and "
+                    f"{qk_rope_head_dim=}."
+                )
+            # The base class only maps FP8 dtypes to a uint8 store; the MXFP4
+            # 368 B/token layout is also byte-addressed.
+            self.store_dtype = torch.uint8
 
         self.scale_pad = 1
         self.quantize_block_size = 64
@@ -111,6 +127,8 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
+        if self.dsv4_kv_cache_store_mxfp4:
+            return MXFP4_BYTES_PER_TOKEN
         dim_per_token = (
             self.qk_nope_head_dim
             + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
@@ -123,12 +141,18 @@ class DeepSeekV4SingleKVPool(KVCache):
         bytes_per_token = self.get_bytes_per_token()
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
-        self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
+        if self.dsv4_kv_cache_store_mxfp4:
+            self.bytes_per_page_padded = bytes_per_page_non_padded
+        else:
+            self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
 
-        assert bytes_per_token == 448 + 64 * 2 + 8, (
-            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
-            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
-        )
+        if self.dsv4_kv_cache_store_mxfp4:
+            assert bytes_per_token == MXFP4_BYTES_PER_TOKEN
+        else:
+            assert bytes_per_token == 448 + 64 * 2 + 8, (
+                "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+                "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+            )
         assert self.store_dtype == torch.uint8
 
         return torch.zeros(
@@ -144,6 +168,23 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
+        if self.dsv4_kv_cache_store_mxfp4:
+            # Dequant the input FP8+UE8M0 pack to BF16, then re-quantize to MXFP4.
+            scale_pow2 = torch.exp2(
+                cache_nope_fp8_rope_bf16_pack.scale_k_nope_ue8m0.float() - 127.0
+            ).repeat_interleave(64, dim=-1)
+            k_nope = (cache_nope_fp8_rope_bf16_pack.k_nope_fp8.float() * scale_pow2).to(
+                torch.bfloat16
+            )
+            cache_k = torch.cat(
+                (k_nope, cache_nope_fp8_rope_bf16_pack.k_rope_bf16), dim=-1
+            )
+            return quantize_dsv4_mxfp4_k_cache_into(
+                cache_k=cache_k,
+                kv_buffer=self.kv_buffer[layer_id],
+                loc=loc,
+                page_size=self.page_size,
+            )
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
@@ -157,6 +198,13 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if self.dsv4_kv_cache_store_mxfp4:
+            return quantize_dsv4_mxfp4_k_cache_into(
+                cache_k=cache_k,
+                kv_buffer=self.kv_buffer[layer_id],
+                loc=loc,
+                page_size=self.page_size,
+            )
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
@@ -166,6 +214,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
 
     def get_key_buffer(self, layer_id: int):
+        if self.dsv4_kv_cache_store_mxfp4:
+            return self.kv_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
@@ -192,20 +242,27 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        use_mxfp4: bool = False,
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
+        if use_mxfp4:
+            raise ValueError(
+                "MXFP4 KV cache is not supported with HiSparse; "
+                "disable HiSparse or use the FP8 KV cache."
+            )
         super().__init__(
-            size,
-            page_size,
-            dtype,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            layer_num,
-            device,
-            enable_memory_saver,
-            start_layer,
-            end_layer,
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            use_mxfp4=use_mxfp4,
+            start_layer=start_layer,
+            end_layer=end_layer,
         )
 
         self.data_ptrs = torch.tensor(
@@ -536,6 +593,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        use_mxfp4: bool = False,
     ):
         super().__init__(
             swa_size,
@@ -614,6 +672,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.indexer_head_dim = indexer_head_dim
+        # Decided by the caller from kv_cache_dtype/fp4_kv_cache_recipe; the
+        # pool no longer reads environment variables directly.
+        self.dsv4_kv_cache_store_mxfp4 = use_mxfp4
 
         stage_layer_num = len(stage_ratios)
         c4_layer_num = sum(1 for r in stage_ratios if r == 4)
@@ -662,6 +723,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
+                use_mxfp4=self.dsv4_kv_cache_store_mxfp4,
             )
 
             c4_kv_pool_type = DeepSeekV4SingleKVPool
@@ -675,6 +737,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=page_size,
+                use_mxfp4=self.dsv4_kv_cache_store_mxfp4,
                 cls=c4_kv_pool_type,
             )
 
@@ -686,6 +749,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=page_size,
+                use_mxfp4=self.dsv4_kv_cache_store_mxfp4,
             )
 
         indexer_size = self.c4_logical_size
@@ -885,6 +949,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         device: str,
         enable_memory_saver: bool,
         global_page_size: int,
+        use_mxfp4: bool = False,
         cls: type = DeepSeekV4SingleKVPool,
     ) -> DeepSeekV4SingleKVPool:
         """Build a full / SWA / c4 / c128 single-KV pool. ``global_page_size``
@@ -902,6 +967,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            use_mxfp4=use_mxfp4,
         )
 
     def _make_indexer_pool(
