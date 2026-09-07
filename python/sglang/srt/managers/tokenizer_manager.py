@@ -2246,7 +2246,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                     continue
-                logger.error(
+                logger.warning(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
                 continue
