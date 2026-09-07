@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -128,7 +127,12 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
                 "get_parallel",
                 return_value=parallel,
             ),
-            get_context().override_server_args(ep_join_mode=None),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver."
                 "attn_cp_tp_broadcast_pyobj",
