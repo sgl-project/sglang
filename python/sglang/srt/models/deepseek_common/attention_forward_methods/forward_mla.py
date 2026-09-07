@@ -960,6 +960,8 @@ class DeepseekMLAForwardMixin:
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
+        if self.rotary_emb is None:
+            return False
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
                 get_exec().kernel.dsa_decode_backend == "trtllm"

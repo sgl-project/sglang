@@ -12,6 +12,7 @@ import contextlib
 import logging
 import multiprocessing as mp
 import os
+import sys
 import time
 import traceback
 import uuid
@@ -31,6 +32,7 @@ from sglang.srt.disaggregation.encoder.server import (
     EncoderProfiler,
     MMEncoder,
     MMError,
+    await_task_completion_on_cancel,
     launch_encoder,
 )
 from sglang.srt.environ import envs
@@ -76,6 +78,46 @@ class PendingRequest:
 # vary per request and can't merge into one HF processor call.
 _BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
 _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE = 2
+_DP_RELEASE_AFTER_ENCODE = "release_after_encode"
+
+
+def validate_encode_request(request: dict) -> Optional[str]:
+    """Return a client-facing error before an encode request is dispatched."""
+    if not isinstance(request, dict):
+        return f"request is not a dict: {type(request).__name__}"
+
+    req_id = request.get("req_id")
+    if not isinstance(req_id, str) or not req_id:
+        return "missing or invalid req_id"
+
+    modality = request.get("modality")
+    if not isinstance(modality, str):
+        return "missing or invalid modality"
+    try:
+        Modality.from_str(modality)
+    except ValueError:
+        return f"unsupported modality: {modality}"
+
+    mm_items = request.get("mm_items")
+    if mm_items is None or (isinstance(mm_items, (list, tuple)) and len(mm_items) == 0):
+        return "missing or empty mm_items"
+
+    num_parts = request.get("num_parts")
+    part_idx = request.get("part_idx")
+    if not isinstance(num_parts, int) or isinstance(num_parts, bool) or num_parts <= 0:
+        return "num_parts must be a positive integer"
+    if (
+        not isinstance(part_idx, int)
+        or isinstance(part_idx, bool)
+        or part_idx < 0
+        or part_idx >= num_parts
+    ):
+        return f"part_idx must be in [0, {num_parts})"
+
+    hashes = request.get("hashes")
+    if hashes is not None and not isinstance(hashes, (list, tuple, str, int, bytes)):
+        return f"hashes must be list/scalar, got {type(hashes).__name__}"
+    return None
 
 
 def _resolve_encoder_batch_policy(
@@ -203,27 +245,12 @@ class EncoderScheduler:
                     if not p.future.done():
                         p.future.set_exception(e)
 
-    @staticmethod
-    def _validate_request_shape(req: dict) -> Optional[str]:
-        # Cheap pre-broadcast checks: shape errors that don't require running
-        # the HF processor. Once a request reaches TP workers they enter
-        # batch_encode and expect to join its collectives — a malformed batch
-        # that makes rank-0 bail mid-flight would deadlock the workers.
-        if not isinstance(req, dict):
-            return f"request is not a dict: {type(req).__name__}"
-        if not req.get("req_id"):
-            return "missing req_id"
-        if not req.get("mm_items"):
-            return "missing or empty mm_items"
-        if "num_parts" not in req or "part_idx" not in req:
-            return "missing num_parts / part_idx"
-        h = req.get("hashes")
-        if h is not None and not isinstance(h, (list, tuple, str, int, bytes)):
-            return f"hashes must be list/scalar, got {type(h).__name__}"
-        return None
-
     async def _dispatch_group(
-        self, group: List[PendingRequest], modality: Modality
+        self,
+        group: List[PendingRequest],
+        modality: Modality,
+        *,
+        observe_queue_wait: bool = True,
     ) -> None:
         # A request may time out while queued. Never start work that no caller
         # can observe, or its eventual staged embedding would have no owner.
@@ -241,7 +268,7 @@ class EncoderScheduler:
         # abandoned.
         valid: List[PendingRequest] = []
         for p in group:
-            err = self._validate_request_shape(p.request)
+            err = validate_encode_request(p.request)
             if err is None:
                 valid.append(p)
                 continue
@@ -255,7 +282,7 @@ class EncoderScheduler:
         requests = [p.request for p in group]
         start = time.time()
         modality_str = modality.name.lower()
-        if server_module.encoder_metrics_collector is not None:
+        if observe_queue_wait and server_module.encoder_metrics_collector is not None:
             for p in group:
                 server_module.encoder_metrics_collector.observe_queue_wait(
                     max(0.0, start - p.submit_time), modality=modality_str
@@ -309,6 +336,22 @@ class EncoderScheduler:
                     p.future.set_exception(err)
             return
 
+        if len(group) > 1 and all(
+            result[3] is not None
+            and result[4] is not None
+            and int(result[4]) == HTTPStatus.BAD_REQUEST
+            for result in results
+        ):
+            logger.warning(
+                f"Retrying failed {modality.name} batch as {len(group)} "
+                "individual requests"
+            )
+            for pending in group:
+                await self._dispatch_group(
+                    [pending], modality, observe_queue_wait=False
+                )
+            return
+
         for p, result in zip(group, results):
             if not p.future.done():
                 p.future.set_result(result)
@@ -324,6 +367,8 @@ class EncoderScheduler:
                 continue
             req = p.request
             try:
+                if err := validate_encode_request(req):
+                    raise server_module.BadRequestError(err)
                 start = time.time()
                 if server_module.encoder_metrics_collector is not None:
                     server_module.encoder_metrics_collector.observe_queue_wait(
@@ -380,6 +425,7 @@ class DPDispatcher:
         self,
         dp_size: int,
         dispatch_sockets: List,
+        release_sockets: List,
         result_socket,
         worker_processes: List[mp.Process],
         enable_metrics: bool = False,
@@ -387,6 +433,7 @@ class DPDispatcher:
     ):
         self.dp_size = dp_size
         self.dispatch_sockets = dispatch_sockets
+        self.release_sockets = release_sockets
         self.result_socket = result_socket
         self.worker_processes = worker_processes
         # Key = req_id for encode/broadcast, or a per-control-request key for
@@ -405,7 +452,7 @@ class DPDispatcher:
         # Set when _result_listener gives up; makes alive_ranks report empty.
         self._listener_failed = False
         # The event loop only keeps weak references to tasks, so the long-lived
-        # loops started in `start()` need a strong reference to survive GC.
+        # loops and fire-and-forget notifications need a strong reference.
         self.background_tasks: Set[asyncio.Task] = set()
 
         # Prometheus gauge: pending requests per DP rank. Lives in the main
@@ -460,6 +507,28 @@ class DPDispatcher:
         self.pending_futures[rank].pop(req_id, None)
         self.req_id_to_rank.pop(req_id, None)
         self._update_pending_gauge()
+
+    def _release_abandoned_encode(self, rank: int, req_id: str) -> None:
+        """Tell the owning worker to release an encode that lost its caller."""
+
+        async def notify_worker() -> None:
+            try:
+                await async_sock_send(
+                    self.release_sockets[rank],
+                    wrap_as_pickle(
+                        {"_dp_type": _DP_RELEASE_AFTER_ENCODE, "req_id": req_id}
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to retire abandoned encoder DP request %s on rank %s",
+                    req_id,
+                    rank,
+                )
+
+        task = asyncio.create_task(notify_worker())
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
 
     @staticmethod
     def _send_req_key(req_id: str, request: dict) -> str:
@@ -546,6 +615,7 @@ class DPDispatcher:
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][req_id] = future
         self._update_pending_gauge()
+        dispatched = False
         logger.info(
             f"MM-Encoder DP dispatch: req_id={req_id}, "
             f"modality={request.get('modality', 'image')}, "
@@ -563,6 +633,7 @@ class DPDispatcher:
                     await async_sock_send(
                         self.dispatch_sockets[rank], wrap_as_pickle(request)
                     )
+                    dispatched = True
                 except BaseException:
                     self._drop_pending_and_mapping(rank, req_id)
                     self._mapping_condition.notify_all()
@@ -574,6 +645,8 @@ class DPDispatcher:
                 future, timeout=server_module.ENCODER_REQ_TIMEOUT
             )
         except asyncio.TimeoutError:
+            if dispatched:
+                self._release_abandoned_encode(rank, req_id)
             self._drop_pending_and_mapping(rank, req_id)
             return self._timeout_envelope(
                 req_id,
@@ -581,6 +654,8 @@ class DPDispatcher:
                 f"Encoder DP rank={rank} timed out after {server_module.ENCODER_REQ_TIMEOUT}s",
             )
         except BaseException:
+            if dispatched:
+                self._release_abandoned_encode(rank, req_id)
             self._drop_pending_and_mapping(rank, req_id)
             raise
 
@@ -898,6 +973,12 @@ class DPDispatcher:
                     return
                 await asyncio.sleep(min(0.1 * consecutive_errors, 1.0))
                 continue
+            if not isinstance(msg, dict):
+                logger.error(
+                    "_result_listener received a non-dict envelope (%s); dropping",
+                    type(msg).__name__,
+                )
+                continue
             req_id = msg.get("req_id", "")
             dp_type = msg.get("_dp_type", "encode")
             if dp_type == "send":
@@ -1028,9 +1109,7 @@ async def _push_embedding_to_prefill(
     if backend == "zmq_to_scheduler" and request.get("embedding_port") is None:
         send_coro = enc.send_with_url(req_id=req_id)
         if background_url_send:
-            task = asyncio.create_task(send_coro)
-            enc.background_tasks.add(task)
-            task.add_done_callback(enc.background_tasks.discard)
+            enc._create_background_task(send_coro)
         else:
             await send_coro
         return
@@ -1064,11 +1143,96 @@ async def _push_embedding_to_prefill(
             await enc.release_request(req_id)
 
 
+async def send_staged_embedding(
+    enc: MMEncoder,
+    request: dict,
+    *,
+    release_without_count: bool,
+) -> bool:
+    """Send one Mooncake embedding and retire its state on any failure."""
+    req_id = request["req_id"]
+    try:
+        sent = await enc.send(
+            req_id=req_id,
+            prefill_host=request["prefill_host"],
+            embedding_port=request["embedding_port"],
+            session_id=request["session_id"],
+            buffer_address=request["buffer_address"],
+        )
+        if not sent:
+            return False
+
+        receive_count = request.get("receive_count")
+        if receive_count:
+            destination_endpoint = NetworkAddress(
+                request["prefill_host"], request["embedding_port"]
+            ).to_host_port_str()
+            await server_module.meta_registry.note_send_done(
+                req_id, receive_count, destination_endpoint
+            )
+        elif release_without_count:
+            await enc.release_request(req_id)
+        return True
+    except BaseException as error:
+        try:
+            await enc.release_request(req_id)
+        except Exception as cleanup_error:
+            if sys.version_info >= (3, 11):
+                error.add_note(f"Failed to release encoder request: {cleanup_error}")
+            else:
+                logger.exception(
+                    "Failed to release encoder request %s after send failure", req_id
+                )
+        raise
+
+
 def _record_pipeline_result(modality: Modality, status: str) -> None:
     if server_module.encoder_metrics_collector is not None:
         server_module.encoder_metrics_collector.inc_requests_total(
             modality=modality.name.lower(), status=status
         )
+
+
+async def _publish_pipeline_error(req_id: str, error_msg: str) -> bool:
+    """Report a request error without letting reporting block cleanup."""
+    try:
+        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
+        return True
+    except Exception:
+        logger.exception("Failed to publish encoder error for req_id=%s", req_id)
+        return False
+
+
+async def _release_failed_request(
+    enc: MMEncoder,
+    req_id: str,
+    *,
+    preserve_metadata: bool = False,
+) -> None:
+    """Release request resources without hiding the original request error."""
+    try:
+        await enc.release_request(req_id, preserve_metadata=preserve_metadata)
+    except Exception:
+        logger.exception("Failed to release encoder resources for req_id=%s", req_id)
+
+
+async def _run_dispatched_encode(
+    enc: MMEncoder, request: dict, modality: Modality
+) -> Tuple:
+    """Finish TP encode collectives before propagating caller cancellation."""
+    encode_task = asyncio.create_task(
+        enc.encode(
+            mm_items=request["mm_items"],
+            modality=modality,
+            req_id=request["req_id"],
+            num_parts=request["num_parts"],
+            part_idx=request["part_idx"],
+            hashes=request.get("hashes"),
+        )
+    )
+    return await await_task_completion_on_cancel(
+        encode_task, f"Encoder request {request['req_id']}"
+    )
 
 
 async def execute_encode_pipeline(
@@ -1084,6 +1248,8 @@ async def execute_encode_pipeline(
     and keeps the result until follow-up /send calls complete. ZMQ has no early
     consumer: it waits for encode, sends the embedding, releases it, then returns.
     """
+    if err := validate_encode_request(request):
+        raise server_module.BadRequestError(err)
     req_id = request["req_id"]
     time_stats_json = request.pop("time_stats_json", None)
     time_stats = EncoderReqTimeStats()
@@ -1113,14 +1279,7 @@ async def execute_encode_pipeline(
             async with enc.encode_dispatch_lock:
                 for socket in send_sockets:
                     sock_send(socket, wrap_as_pickle(request))
-                result = await enc.encode(
-                    mm_items=request["mm_items"],
-                    modality=modality,
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
-                    hashes=request.get("hashes"),
-                )
+                result = await _run_dispatched_encode(enc, request, modality)
         else:
             result = await enc.encode(
                 mm_items=request["mm_items"],
@@ -1130,27 +1289,48 @@ async def execute_encode_pipeline(
                 part_idx=request["part_idx"],
                 hashes=request.get("hashes"),
             )
+    except asyncio.CancelledError:
+        error_msg = "encoder request cancelled"
+        time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        try:
+            await asyncio.shield(enc.release_request(req_id))
+        except Exception:
+            logger.exception("Failed to release cancelled encoder request %s", req_id)
+        _record_pipeline_result(modality, "error")
+        raise
     except asyncio.TimeoutError:
         error_msg = "encoder batch timed out"
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
-        await enc.release_request(req_id, preserve_metadata=backend == "mooncake")
+        error_published = await _publish_pipeline_error(req_id, error_msg)
+        await _release_failed_request(
+            enc,
+            req_id,
+            preserve_metadata=backend == "mooncake" and error_published,
+        )
         _record_pipeline_result(modality, "error")
         raise
     except Exception as e:
         error_msg = str(e)
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
-        await enc.release_request(req_id, preserve_metadata=backend == "mooncake")
+        error_published = await _publish_pipeline_error(req_id, error_msg)
+        await _release_failed_request(
+            enc,
+            req_id,
+            preserve_metadata=backend == "mooncake" and error_published,
+        )
         _record_pipeline_result(modality, "error")
         raise
 
     nbytes, embedding_len, embedding_dim, error_msg, error_code = result
     if error_msg:
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        await server_module.meta_registry.publish(req_id, 0, 0, 0, error=error_msg)
+        error_published = await _publish_pipeline_error(req_id, error_msg)
         if backend == "mooncake":
-            await enc.release_request(req_id, preserve_metadata=True)
+            await _release_failed_request(
+                enc,
+                req_id,
+                preserve_metadata=error_published,
+            )
         else:
             try:
                 await _push_embedding_to_prefill(
@@ -1163,6 +1343,7 @@ async def execute_encode_pipeline(
                     f"Error-send failed for req_id={req_id}: {send_err}",
                     exc_info=True,
                 )
+                await _release_failed_request(enc, req_id)
         _record_pipeline_result(modality, "error")
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
 
@@ -1289,12 +1470,10 @@ async def _dp_worker_handle_request(
                 ) from e
         elif dp_type == "send":
             req_id = request["req_id"]
-            sent = await enc.send(
-                req_id=req_id,
-                prefill_host=request["prefill_host"],
-                embedding_port=request["embedding_port"],
-                session_id=request["session_id"],
-                buffer_address=request["buffer_address"],
+            sent = await send_staged_embedding(
+                enc,
+                request,
+                release_without_count=True,
             )
             if not sent:
                 # Error envelope, not 200 + phantom count: the decoder must
@@ -1302,13 +1481,6 @@ async def _dp_worker_handle_request(
                 raise MMError(
                     f"no staged embedding for /send req_id={req_id} (already released)"
                 )
-            # Releasing on the first /send breaks decoder TP > 1. No count means
-            # a pre-refcount decoder: stay eager rather than pin until the sweep.
-            receive_count = request.get("receive_count")
-            if receive_count:
-                await server_module.meta_registry.note_send_done(req_id, receive_count)
-            else:
-                await enc.release_request(req_id)
             content = None
         else:
             content = await execute_encode_pipeline(enc, sched, request)
@@ -1339,7 +1511,12 @@ async def _dp_worker_handle_request(
             f"req_id={request.get('req_id', '?')}: {e}",
             exc_info=True,
         )
-        err_code = int(getattr(e, "code", None) or HTTPStatus.INTERNAL_SERVER_ERROR)
+        # Only MMError carries an HTTP status in this protocol. Third-party
+        # exceptions may expose a callable ``code`` attribute (for example
+        # gRPC errors), which must not make error reporting fail a second time.
+        err_code = int(
+            e.code if isinstance(e, MMError) else HTTPStatus.INTERNAL_SERVER_ERROR
+        )
         envelope = {
             "req_id": request.get("req_id", ""),
             "_dp_type": dp_type,
@@ -1370,11 +1547,27 @@ async def _dp_worker_handle_request(
         )
 
 
+async def _retire_abandoned_encode(
+    enc: MMEncoder,
+    encode_task: Optional[asyncio.Task],
+    req_id: str,
+) -> None:
+    """Retire an abandoned request without interrupting its encode work."""
+    try:
+        if encode_task is None or not encode_task.done():
+            await enc.abandon_request(req_id)
+        else:
+            await enc.release_request(req_id)
+    except Exception:
+        logger.exception("Failed to release abandoned encoder DP request %s", req_id)
+
+
 async def run_dp_worker(
     server_args: ServerArgs,
     dp_rank: int,
     gpu_id: int,
     dispatch_path: str,
+    release_path: str,
     result_path: str,
 ):
     logger.info(
@@ -1416,9 +1609,34 @@ async def run_dp_worker(
 
     ctx = zmq.asyncio.Context(2)
     recv_sock = get_zmq_socket(ctx, zmq.PULL, dispatch_path, False)
+    release_sock = get_zmq_socket(ctx, zmq.PULL, release_path, False)
     send_sock = get_zmq_socket(ctx, zmq.PUSH, result_path, False)
     send_lock = asyncio.Lock()
     inflight: Set[asyncio.Task] = set()
+    encode_tasks: Dict[str, asyncio.Task] = {}
+    release_tasks: Set[asyncio.Task] = set()
+
+    async def listen_for_releases() -> None:
+        # Cleanup must not wait behind the bounded encode queue: under a
+        # cancellation burst every normal worker slot may already be occupied.
+        while True:
+            try:
+                request = await async_sock_recv(release_sock)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(f"DP worker {dp_rank} release recv error", exc_info=True)
+                continue
+            if not isinstance(request, dict) or not request.get("req_id"):
+                logger.error(f"DP worker {dp_rank} received malformed release request")
+                continue
+            req_id = request["req_id"]
+            task = asyncio.create_task(
+                _retire_abandoned_encode(enc, encode_tasks.get(req_id), req_id)
+            )
+            release_tasks.add(task)
+            task.add_done_callback(release_tasks.discard)
+
     # Acquire-before-recv → back-pressure propagates to the dispatcher
     # PUSH buffer. Must be at least max_batch_size or batching degrades.
     max_inflight = envs.SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT.get()
@@ -1430,6 +1648,7 @@ async def run_dp_worker(
         )
     inflight_sem = asyncio.Semaphore(max_inflight)
     sched.start()
+    release_listener_task = asyncio.create_task(listen_for_releases())
     logger.info(f"DP worker {dp_rank} ready")
 
     try:
@@ -1464,12 +1683,30 @@ async def run_dp_worker(
                 spawned = True
                 inflight.add(task)
                 task.add_done_callback(inflight.discard)
+                if dp_type == "encode":
+                    req_id = request["req_id"]
+                    encode_tasks[req_id] = task
+
+                    def forget_encode_task(
+                        completed_task: asyncio.Task, request_id: str = req_id
+                    ) -> None:
+                        if encode_tasks.get(request_id) is completed_task:
+                            encode_tasks.pop(request_id, None)
+                        enc.clear_abandoned_request(request_id)
+
+                    task.add_done_callback(forget_encode_task)
             finally:
                 if not spawned:
                     inflight_sem.release()
     finally:
+        release_listener_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await release_listener_task
         for task in inflight:
             task.cancel()
+        for task in release_tasks:
+            task.cancel()
+        await asyncio.gather(*inflight, *release_tasks, return_exceptions=True)
         ctx.destroy(linger=0)
 
 
@@ -1478,13 +1715,21 @@ def launch_dp_worker(
     dp_rank: int,
     gpu_id: int,
     dispatch_path: str,
+    release_path: str,
     result_path: str,
 ):
     publish(server_args, role="encoder")
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
         asyncio.run(
-            run_dp_worker(server_args, dp_rank, gpu_id, dispatch_path, result_path)
+            run_dp_worker(
+                server_args,
+                dp_rank,
+                gpu_id,
+                dispatch_path,
+                release_path,
+                result_path,
+            )
         )
     except KeyboardInterrupt:
         logger.info(f"DP worker {dp_rank} exiting")
@@ -1601,6 +1846,12 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
         )
         for r in range(dp_size)
     ]
+    release_sockets: List[zmq.asyncio.Socket] = [
+        get_zmq_socket(
+            async_zmq_ctx, zmq.PUSH, f"ipc:///tmp/{ipc_prefix}_dp_release_{r}", True
+        )
+        for r in range(dp_size)
+    ]
 
     worker_processes: List[mp.Process] = []
 
@@ -1630,6 +1881,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
                     dp_rank,
                     gpu_id,
                     f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
+                    f"ipc:///tmp/{ipc_prefix}_dp_release_{dp_rank}",
                     result_path,
                 ),
                 daemon=False,
@@ -1643,6 +1895,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     return DPDispatcher(
         dp_size,
         dispatch_sockets,
+        release_sockets,
         result_socket,
         worker_processes,
         enable_metrics=get_observability().enable_metrics,
