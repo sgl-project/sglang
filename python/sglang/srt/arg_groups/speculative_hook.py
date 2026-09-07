@@ -802,7 +802,6 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 
 def _handle_eagle_family(server_args: ServerArgs) -> None:
-
     cfg = resolving_view(server_args)
 
     if (
