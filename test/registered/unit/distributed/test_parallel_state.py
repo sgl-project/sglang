@@ -125,10 +125,12 @@ def test_parallel_group_construction_tp8_attn_cp2():
     ):
         # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
+        created_group_options = {}
 
         def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
             group_name = kwargs.get("group_name", "unknown")
             created_groups[group_name] = group_ranks
+            created_group_options[group_name] = kwargs
 
             # Create a mock group object
             mock_group = Mock()
@@ -184,6 +186,10 @@ def test_parallel_group_construction_tp8_attn_cp2():
             assert attn_cp_groups == expected_attn_cp, (
                 f"Wrong ATTN_CP groups: {attn_cp_groups}"
             )
+
+            # Derived attention-TP groups inherit the global custom-AR policy;
+            # the communicator performs the final per-group capability check.
+            assert created_group_options["attention_tp"]["use_custom_allreduce"] is None
 
             print("TP=8, Attn CP=2 group construction verified")
 
