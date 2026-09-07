@@ -36,11 +36,12 @@ class MemForensicsTest(unittest.TestCase):
     def test_start_records_once_with_configured_parameters(self):
         with envs.SGLANG_MEM_FORENSICS_DIR.override("/tmp/forensics"):
             with envs.SGLANG_MEM_FORENSICS_MAX_ENTRIES.override(1234):
-                with mock.patch.object(
-                    torch.cuda, "is_available", return_value=True
-                ), mock.patch.object(
-                    torch.cuda.memory, "_record_memory_history"
-                ) as record:
+                with (
+                    mock.patch.object(torch.cuda, "is_available", return_value=True),
+                    mock.patch.object(
+                        torch.cuda.memory, "_record_memory_history"
+                    ) as record,
+                ):
                     mem_forensics.maybe_start_memory_forensics()
                     mem_forensics.maybe_start_memory_forensics()
         self.assertEqual(record.call_count, 1)
@@ -52,12 +53,13 @@ class MemForensicsTest(unittest.TestCase):
 
     def test_start_failure_is_contained_and_not_marked_started(self):
         with envs.SGLANG_MEM_FORENSICS_DIR.override("/tmp/forensics"):
-            with mock.patch.object(
-                torch.cuda, "is_available", return_value=True
-            ), mock.patch.object(
-                torch.cuda.memory,
-                "_record_memory_history",
-                side_effect=RuntimeError("driver"),
+            with (
+                mock.patch.object(torch.cuda, "is_available", return_value=True),
+                mock.patch.object(
+                    torch.cuda.memory,
+                    "_record_memory_history",
+                    side_effect=RuntimeError("driver"),
+                ),
             ):
                 mem_forensics.maybe_start_memory_forensics()
         self.assertFalse(mem_forensics._started)
@@ -67,11 +69,14 @@ class MemForensicsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out_dir:
             with envs.SGLANG_MEM_FORENSICS_DIR.override(out_dir):
                 mem_forensics._started = True
-                with mock.patch.object(
-                    torch.cuda.memory, "_snapshot", return_value=snapshot
-                ), mock.patch.object(
-                    torch.cuda.memory, "_record_memory_history"
-                ) as record:
+                with (
+                    mock.patch.object(
+                        torch.cuda.memory, "_snapshot", return_value=snapshot
+                    ),
+                    mock.patch.object(
+                        torch.cuda.memory, "_record_memory_history"
+                    ) as record,
+                ):
                     mem_forensics.maybe_dump_memory_forensics("ready")
                     mem_forensics.maybe_dump_memory_forensics("ready")
                     mem_forensics.maybe_dump_memory_forensics("corruption")
@@ -117,9 +122,12 @@ class MemForensicsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out_dir:
             with envs.SGLANG_MEM_FORENSICS_DIR.override(out_dir):
                 mem_forensics._started = True
-                with mock.patch.object(
-                    torch.cuda.memory, "_snapshot", return_value=WITH_HISTORY
-                ), mock.patch.object(pickle, "dump", side_effect=OSError("disk full")):
+                with (
+                    mock.patch.object(
+                        torch.cuda.memory, "_snapshot", return_value=WITH_HISTORY
+                    ),
+                    mock.patch.object(pickle, "dump", side_effect=OSError("disk full")),
+                ):
                     mem_forensics.maybe_dump_memory_forensics("ready")
             self.assertEqual(os.listdir(out_dir), [])
             self.assertNotIn("ready", mem_forensics._dumped_tags)
@@ -128,17 +136,20 @@ class MemForensicsTest(unittest.TestCase):
         # Sequence from the review: a MEM torch profile ran and stopped the
         # process-wide recorder, then a retained phase asks for a snapshot.
         with tempfile.TemporaryDirectory() as out_dir:
-            with envs.SGLANG_MEM_FORENSICS_DIR.override(
-                out_dir
-            ), envs.SGLANG_MEM_FORENSICS_MAX_ENTRIES.override(4321):
+            with (
+                envs.SGLANG_MEM_FORENSICS_DIR.override(out_dir),
+                envs.SGLANG_MEM_FORENSICS_MAX_ENTRIES.override(4321),
+            ):
                 mem_forensics._started = True
-                with mock.patch.object(
-                    torch.cuda.memory, "_snapshot", return_value=NO_HISTORY
-                ), mock.patch.object(
-                    torch.cuda.memory, "_record_memory_history"
-                ) as record, self.assertLogs(
-                    LOGGER, level="WARNING"
-                ) as logs:
+                with (
+                    mock.patch.object(
+                        torch.cuda.memory, "_snapshot", return_value=NO_HISTORY
+                    ),
+                    mock.patch.object(
+                        torch.cuda.memory, "_record_memory_history"
+                    ) as record,
+                    self.assertLogs(LOGGER, level="WARNING") as logs,
+                ):
                     mem_forensics.maybe_dump_memory_forensics("retained-kda:extend")
                 # Re-armed with the configured parameters, nothing written,
                 # tag still open.
@@ -150,11 +161,14 @@ class MemForensicsTest(unittest.TestCase):
                 self.assertNotIn("retained-kda:extend", mem_forensics._dumped_tags)
                 self.assertTrue(any("re-armed" in line for line in logs.output))
                 # The next request for the same tag finds history and writes.
-                with mock.patch.object(
-                    torch.cuda.memory, "_snapshot", return_value=WITH_HISTORY
-                ), mock.patch.object(
-                    torch.cuda.memory, "_record_memory_history"
-                ) as record:
+                with (
+                    mock.patch.object(
+                        torch.cuda.memory, "_snapshot", return_value=WITH_HISTORY
+                    ),
+                    mock.patch.object(
+                        torch.cuda.memory, "_record_memory_history"
+                    ) as record,
+                ):
                     mem_forensics.maybe_dump_memory_forensics("retained-kda:extend")
                 self.assertFalse(record.called)
                 names = os.listdir(out_dir)
@@ -166,14 +180,16 @@ class MemForensicsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out_dir:
             with envs.SGLANG_MEM_FORENSICS_DIR.override(out_dir):
                 mem_forensics._started = True
-                with mock.patch.object(
-                    torch.cuda.memory, "_snapshot", return_value=NO_HISTORY
-                ), mock.patch.object(
-                    torch.cuda.memory,
-                    "_record_memory_history",
-                    side_effect=RuntimeError("driver"),
-                ), self.assertLogs(
-                    LOGGER, level="ERROR"
+                with (
+                    mock.patch.object(
+                        torch.cuda.memory, "_snapshot", return_value=NO_HISTORY
+                    ),
+                    mock.patch.object(
+                        torch.cuda.memory,
+                        "_record_memory_history",
+                        side_effect=RuntimeError("driver"),
+                    ),
+                    self.assertLogs(LOGGER, level="ERROR"),
                 ):
                     mem_forensics.maybe_dump_memory_forensics("ready")
             self.assertEqual(os.listdir(out_dir), [])
