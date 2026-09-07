@@ -20,8 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=300, suite="base-b-test-4-npu-a3")
-register_npu_ci(est_time=300, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(est_time=300, suite="full-4-npu-a3", nightly=True)
 
 
 class TestNpuSpeculativeTokenMap(CustomTestCase):
