@@ -15,7 +15,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.moe import mega_moe
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):

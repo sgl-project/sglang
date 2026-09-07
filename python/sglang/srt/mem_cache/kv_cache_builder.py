@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
@@ -126,6 +127,7 @@ def uses_ssm_state(model_config) -> bool:
         or mamba2_config(model_config) is not None
         or (spec.uses_mamba_radix_cache if spec is not None else False)
         or kimi_linear_config(model_config) is not None
+        or glm5_next_config(model_config) is not None
         or hybrid_lightning_config(model_config) is not None
     )
 

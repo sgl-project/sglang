@@ -334,6 +334,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def role_affinity(self):
         return RoleType.DENOISER
 
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
+
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
     ) -> None:

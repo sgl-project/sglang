@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=320, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=265, stage="base-b", runner_config="2-gpu-large")
 
 PREFILL_GRAPH_REPLAY_PATTERN = re.compile(r"Prefill batch.*cuda graph: True")
 CACHED_PREFIX_GRAPH_REPLAY_PATTERN = re.compile(

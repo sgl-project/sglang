@@ -41,7 +41,7 @@ from sglang.srt.mem_cache.unified_cache.components.swa_component import SWACompo
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _SWA = ComponentType.SWA
