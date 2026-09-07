@@ -520,6 +520,17 @@ endif()
 list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_90,code=sm_90")
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_120a,code=sm_120a")
+    # Match the main sgl-kernel arch list: on aarch64 with CUDA 13+ the
+    # Blackwell parts are sm_110a (Thor) and sm_121a (GB10 / DGX Spark).
+    # sm_120a code does not run on sm_121, and this module ships no PTX to
+    # JIT from, so without these gencodes infllm_ops has no usable kernel on
+    # those devices even though common_ops does.
+    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        list(APPEND INFLLM_FLASH_CUDA_FLAGS
+            "-gencode=arch=compute_110a,code=sm_110a"
+            "-gencode=arch=compute_121a,code=sm_121a"
+        )
+    endif()
 endif()
 
 set(INFLLM_FLASH_SOURCES
