@@ -665,6 +665,16 @@ def should_use_dp_reduce_scatterv():
     )
 
 
+def has_replicated_shared_expert(mlp) -> bool:
+    """Return whether an MoE owns a replicated (TP1) shared expert."""
+    if not getattr(mlp, "_shared_expert_tp1", False):
+        return False
+    return (
+        getattr(mlp, "shared_experts", None) is not None
+        or getattr(mlp, "shared_expert", None) is not None
+    )
+
+
 def should_skip_mlp_all_reduce() -> bool:
     """Whether dense MLP / row-parallel projections should skip their all-reduce.
 
