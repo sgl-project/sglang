@@ -355,7 +355,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
     # NPUMHATokenToKVPool stores buffers as
     #   (num_pages, page_size, head_num, head_dim)            # use_fia=False
     #   (num_pages*page_size, 1, head_num, head_dim)          # use_fia=True
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.npu.synchronize()
         buf_of_layers = []
         for local_layer_id in range(self.layer_num):
@@ -370,7 +370,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         torch.npu.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
@@ -880,7 +882,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ]
         return buffers
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.npu.synchronize()
         buf_of_layers = [
             self._get_cpu_offload_layer_buffers(i) for i in range(self.layer_num)
@@ -902,7 +904,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 if buffer.shape[-1] != 0:
                     buffer[tgt_loc] = buffer[src_loc]
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):

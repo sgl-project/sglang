@@ -512,6 +512,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Lfm2ForCausalLM",
         "Lfm2MoeForCausalLM",
         "ZayaForCausalLM",
+        "Glm5NextForConditionalGeneration",
     }
 )
 
@@ -533,6 +534,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "BailingMoeV3ForCausalLM",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
@@ -609,7 +611,14 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
-    if get_platform().is_npu or get_platform().is_xpu:
+    if get_platform().is_npu:
+        return {}
+    if get_platform().is_xpu:
+        if view.kv_cache_dtype == "auto":
+            logger.warning(
+                "Setting KV cache dtype to bfloat16 for DeepSeek DSA on XPU."
+            )
+            return {"kv_cache_dtype": "bfloat16"}
         return {}
 
     import torch
@@ -628,8 +637,16 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
 
     kv_cache_dtype = view.kv_cache_dtype
+    has_attention_sinks = bool(getattr(hf_config, "learnable_sink", False))
+    if has_attention_sinks and kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+        raise ValueError(
+            "Learnable DSA attention sinks require a bfloat16 KV cache; "
+            f"got kv_cache_dtype={kv_cache_dtype}."
+        )
     if kv_cache_dtype == "auto":
-        kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
+        kv_cache_dtype = (
+            "fp8_e4m3" if major >= 10 and not has_attention_sinks else "bfloat16"
+        )
         logger.warning(
             f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
         )
@@ -679,8 +696,26 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
-    if get_platform().is_npu or get_platform().is_xpu:
+    if get_platform().is_npu:
         return {}
+    if get_platform().is_xpu:
+        declared: Dict[str, Any] = {}
+        if view.dsa_prefill_backend is None:
+            declared["dsa_prefill_backend"] = "intel_xpu"
+        if view.dsa_decode_backend is None:
+            declared["dsa_decode_backend"] = "intel_xpu"
+        # sgl-kernel topk ops (the default) are CUDA-only; fall back to the
+        # torch-native topk implementation on XPU, unless the user already
+        # picked a different backend explicitly (e.g. "flashinfer").
+        if view.dsa_topk_backend == "sgl-kernel":
+            declared["dsa_topk_backend"] = "torch"
+        logger.warning(
+            "Set DSA backends for XPU: prefill=%s, decode=%s, topk=%s.",
+            declared.get("dsa_prefill_backend", view.dsa_prefill_backend),
+            declared.get("dsa_decode_backend", view.dsa_decode_backend),
+            declared.get("dsa_topk_backend", view.dsa_topk_backend),
+        )
+        return declared
 
     import torch
 
@@ -696,6 +731,27 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         and kv_cache_dtype == "fp8_e4m3"
         and not get_platform().is_hip
     )
+
+    if getattr(hf_config, "learnable_sink", False):
+        backend = "flashmla_sparse"
+        for field in ("dsa_prefill_backend", "dsa_decode_backend"):
+            value = getattr(view, field)
+            if value is not None and value != backend:
+                option = "--" + field.replace("_", "-")
+                raise ValueError(
+                    f"{model_arch} uses learnable attention sinks and requires "
+                    f"{option} {backend!r}; got {value!r}"
+                )
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = backend
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = backend
+        logger.warning(
+            "Set DSA backends for learnable attention sinks: "
+            f"prefill={declared.get('dsa_prefill_backend', view.dsa_prefill_backend)}, "
+            f"decode={declared.get('dsa_decode_backend', view.dsa_decode_backend)}."
+        )
+        return declared
 
     if is_glm_sm12_fp8:
         backend = "flashinfer_sparse_mla"
@@ -763,6 +819,9 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",
