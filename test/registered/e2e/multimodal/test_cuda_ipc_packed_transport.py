@@ -243,6 +243,86 @@ class TestPackedCudaIpcTransport(CustomTestCase):
             commands.put("reuse")
             self.assertEqual(results.get(timeout=10), ("reused", True))
 
+    def test_scheduler_materializes_before_embedding_cache_lookup(self):
+        with _published_batch() as (proxies, _, commands, results):
+            items = [
+                MultimodalDataItem(
+                    modality=Modality.IMAGE, feature=proxy, hash=index + 1, pad_value=1
+                )
+                for index, proxy in enumerate(proxies)
+            ]
+            for item in items:
+                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
+                    True
+                )
+            inputs = MultimodalInputs.from_processor_output(
+                MultimodalProcessorOutput(input_ids=[1], mm_items=items)
+            )
+            commands.put("reuse")
+            self.assertEqual(results.get(timeout=10), ("reused", True))
+            for index, (item, expected) in enumerate(
+                zip(inputs.mm_items, _features("cpu"), strict=True)
+            ):
+                self.assertIsInstance(item.feature, torch.Tensor)
+                self.assertEqual(item.hash, index + 1)
+                torch.testing.assert_close(item.feature.cpu(), expected, rtol=0, atol=0)
+
+    def test_pack_failure_and_distinct_request_ownership(self):
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
+        features = _features("cuda")
+        try:
+            with (
+                patch(
+                    "sglang.srt.multimodal.transport.cuda_ipc.CudaIpcPackedTensorTransportProxy",
+                    side_effect=RuntimeError("forced proxy creation failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "forced proxy creation failure"),
+            ):
+                pool.wrap_tensors(features, use_pool_handle_cache=True)
+            _wait_for_recycle(pool)
+            first = pool.wrap_tensors(features, use_pool_handle_cache=True)
+            second = pool.wrap_tensors(features, use_pool_handle_cache=True)
+            self.assertIsNot(first[0].owner, second[0].owner)
+            self.assertEqual(pool.active_lease_count, 2)
+            for batch in (first, second):
+                for proxy in batch:
+                    pool.cancel_proxy(proxy)
+            _wait_for_recycle(pool)
+        finally:
+            pool.shutdown()
+
+    def test_full_pool_falls_back_to_individual_transport(self):
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+        processor.use_cuda_ipc = True
+        processor.use_ipc_pool_handle_cache = True
+        processor.cudaipc_mmfeature_pool = pool
+        # One image fits, but the packed request exceeds the existing pool budget.
+        features = [torch.ones(160_000, device="cuda") for _ in range(2)]
+        items = [
+            MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
+            for feature in features
+        ]
+        try:
+            with patch(
+                "sglang.srt.multimodal.processors.base_processor.get_mm",
+                return_value=SimpleNamespace(mm_enable_dp_encoder=False),
+            ):
+                processor._prepare_mm_items_for_transport(items)
+            self.assertEqual(pool.active_lease_count, 1)
+            self.assertNotIsInstance(
+                items[0].feature, CudaIpcPackedTensorTransportProxy
+            )
+            self.assertEqual(items[1].feature.device.type, "cpu")
+            torch.testing.assert_close(
+                items[1].feature, features[1].cpu(), rtol=0, atol=0
+            )
+            pool.cancel_proxy(items[0].feature)
+            _wait_for_recycle(pool)
+        finally:
+            pool.shutdown()
+
     def test_generic_processor_policy_and_rollback(self):
         pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
         with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
