@@ -931,7 +931,7 @@ export const config = {
     // --mem-fraction-static 0.85 the two pools share ~12-18 GB, and at TP=1 a
     // mamba state slot is ~113 MB (fp32), so concurrency is pinned low:
     // 8 requests with MTP (5 slots each), 24 without on the lazy strategy (4
-    // slots each). Verified 2026-09-06 on qwen4-main-squashed @ 9b2aee2283 (the
+    // slots each). Verified 2026-09-06 on qwen4-main-squashed @ 4ccff141db (the
     // Python install path); boot ~10-11 min once the table file is fresh (see
     // the chip hint). Full-set GSM8K in the benchmarks config.
     //
@@ -994,7 +994,7 @@ export const config = {
     // ModelOpt MIXED_PRECISION export: NVFP4 routed experts, FP8 N-gram table,
     // FP8_BLOCK_SCALES (128-wide) MTP experts. Loading it needs the mixed-
     // precision loader from sgl-project/sglang#38121 (merged into
-    // qwen4-main-squashed as 9b2aee2283, the branch the Python install path
+    // qwen4-main-squashed as 4ccff141db, the branch the Python install path
     // builds); the qwen38flashnext image predates it. Same TP=2 shape and flags
     // as the RDXA cells, with two differences forced by this export:
     //   - `--quantization` is NOT passed (the checkpoint resolves to
@@ -1006,7 +1006,7 @@ export const config = {
     //     trained head kept in BF16 there, whereas this export's fp8
     //     block-scaled MTP experts cannot be TP-sharded (640/2 = 320 is not a
     //     multiple of the 128 block) and fault on the triton fp8 path under EP.
-    // Measured 2026-09-05 on the qwen4-main-squashed tip 9b2aee2283 (#38121
+    // Measured 2026-09-05 on the qwen4-main-squashed tip 4ccff141db (#38121
     // merged), TP=2: bench (ISL 1024/OSL 256) ~48 tok/s single stream with MTP,
     // 253 tok/s output at 96 concurrent without. Full-set GSM8K in the benchmarks config.
     {
@@ -1067,7 +1067,7 @@ export const config = {
     // At TP=1 the in-checkpoint MTP head loads directly: its fp8 block-scaled
     // experts need no sharding, so the RadixArk draft used by the 2-node cell
     // is not needed. Verified 2026-09-06 on the dev-qwen38-next-local image
-    // (9b2aee2283): MTP accept 3.0-3.6; boot ~11-12 min with a fresh table
+    // (4ccff141db): MTP accept 3.0-3.6; boot ~11-12 min with a fresh table
     // file. Full-set GSM8K in the benchmarks config. The smaller fp8 draft leaves a
     // 174k-token KV pool with MTP (vs 93k for the RDXA cell) and 300k without.
     {
