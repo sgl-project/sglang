@@ -1174,6 +1174,15 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Opt-in: hand batch-size-1 top-k v2 rows longer than the floor below to a
+    # grid-wide cooperative kernel, which spreads one row over every SM instead of
+    # one 8-block cluster. Needs SGLANG_OPT_USE_TOPK_V2 and a cooperative launch,
+    # so CUDA only. Measured on B200 at 512K-1M context; untuned elsewhere.
+    SGLANG_OPT_USE_COOP_TOPK = EnvBool(False)
+    # Rows with seq_len > this go to the cooperative kernel, the rest stay on the
+    # official one. Measured crossover on 8xB200 TP8; must be >= 32768, below which
+    # a batch-1 row can reach a top-k v2 kernel that carries no handoff guard.
+    SGLANG_OPT_COOP_TOPK_FLOOR = EnvInt(524288)
 
     # ===================================================================
     # Kernel selection and fused backends
