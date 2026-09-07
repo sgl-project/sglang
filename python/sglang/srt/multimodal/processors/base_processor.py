@@ -967,7 +967,8 @@ class BaseMultimodalProcessor(ABC):
 
         # Long-video preprocessing stays on CPU to avoid competing with scheduler GPU pools.
         if videos and self.video_preprocessing_device is not None:
-            kwargs["device"] = self.video_preprocessing_device
+            processor_device = self.video_preprocessing_device
+            kwargs["device"] = processor_device
 
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
