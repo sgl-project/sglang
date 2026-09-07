@@ -120,6 +120,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._swa_req_ring = ring_size is not None
         self._req_to_token_pool = req_to_token_pool
         if self._swa_req_ring:
+            assert req_to_token_pool is not None, (
+                "per-request SWA ring: capacity is counted in req slots"
+            )
             self._swa_ring_cost = (
                 (ring_size + self.page_size - 1) // self.page_size
             ) * self.page_size
@@ -160,9 +163,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def swa_available_size(self):
         if self._swa_req_ring:
             # Ring-based availability: free request slots * per-slot ring cost.
-            # Fall back to non-binding if the req pool wasn't wired in.
-            if self._req_to_token_pool is None:
-                return self.full_attn_allocator.available_size()
             return self._req_to_token_pool.available_size() * self._swa_ring_cost
         return self.swa_attn_allocator.available_size()
 

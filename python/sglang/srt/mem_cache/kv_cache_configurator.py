@@ -338,20 +338,16 @@ class KVCacheConfigurator:
         )
 
         swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
-        # Per-request SWA ring: swa_max_total_num_tokens was sized from the
-        # vestigial paged SWA pool; reconcile to the real ring capacity.
         alloc = pools.token_to_kv_pool_allocator
         if not self.is_draft_worker and is_swa_req_ring(alloc):
-            ring_capacity = int(alloc.swa_available_size())
-            # Only reconcile downward: a value >= the current total means
-            # swa_available_size() hit its non-binding fallback.
-            if 0 < ring_capacity < swa_max_total_num_tokens:
-                logger.info(
-                    "SWA ring: reconciling swa_max_total_num_tokens "
-                    f"{swa_max_total_num_tokens} -> {ring_capacity} "
-                    "(fixed per-request SWA ring capacity)."
-                )
-                swa_max_total_num_tokens = ring_capacity
+            # Per-request SWA ring: the sizer's swa token count describes the
+            # vestigial paged pool; the real capacity is every req slot's ring.
+            swa_max_total_num_tokens = int(alloc.swa_available_size())
+            logger.info(
+                "SWA ring: swa_max_total_num_tokens "
+                f"{sizes.swa_max_total_num_tokens} -> {swa_max_total_num_tokens} "
+                "(fixed per-request SWA ring capacity)."
+            )
 
         logger.info(
             f"Memory pool end. "

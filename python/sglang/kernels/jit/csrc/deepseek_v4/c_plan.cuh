@@ -47,8 +47,8 @@ struct Prefill0Params {
   uint32_t num_q_tokens;
   int32_t compress_ratio;
   int32_t swa_page_size;
-  /// \brief Trailing tokens the write plan keeps resident in the compress state
-  /// ring; the bound is derived in `plan_compress_prefill`.
+  /// \brief Trailing tokens the write plan keeps resident in the compress state ring.
+  /// Derived from the ring in `plan_compress_prefill`; see the bound there.
   int32_t mtp_pad;
   bool use_req_ring;
 };
@@ -213,8 +213,8 @@ __global__ __launch_bounds__(1024, 1)  //
       }
     }
   } else {
-    // Path 2: general prefill (long extend_len). Iterate batches in an outer
-    // loop; the whole block sweeps each batch's tokens in parallel.
+    // Path 2: general prefill (long extend_len). Iterate batches in an outer loop;
+    // the whole block sweeps each batch's tokens in parallel.
     uint32_t base_e = 0;
     for (uint32_t batch_id = 0; batch_id < params.batch_size; ++batch_id) {
       const int32_t pl = s_prefix_len[batch_id];
@@ -511,20 +511,24 @@ inline PrefillPlan plan_compress_prefill(
   RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
-  // Write pad: trailing tokens kept resident so a verify batch's committed tail
-  // survives any accept length. A write at `w` aliases onto `w - ring_size`, and
-  // the earliest position a future compression still needs is
-  // `prefix_len - window_size + 2` -- the next batch commits >= 1 token, and
-  // `run_prefill` launches compress before write, so a batch's own compressions
-  // read the pre-write ring.
+  // Write pad: trailing tokens kept resident so a verify batch's committed tail survives
+  // any accept length. Zero without speculation -- nothing rolls back, and the ring is
+  // then exactly one window wide. Otherwise the ring bounds it: a write at `w` aliases
+  // onto `w - ring_size`, and the earliest position a future compression still needs is
+  // `prefix_len - window_size + 2` (the next batch commits >= 1 token, and `run_prefill`
+  // launches the compress kernel before the write kernel, so a batch's own compressions
+  // read the pre-write ring). Padding past the extend range is harmless: the loops only
+  // span `[prefix_len, seq_len)`.
   const auto mtp_pad = ring_size > window_size ? ring_size - window_size + 2 : 0;
 
   const auto device = device_.unwrap();
   const auto stream = LaunchKernel::resolve_device(device);
 
   if (cpu_or_gpu.unwrap().device_type == kDLGPU) {
-    // GPU input path for MTP / cuda-graph capture, where a host sync would be
-    // expensive: kernel0 builds the plan metadata, kernel_1 translates SWA locs.
+    // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
+    // on device, padding to num_q_tokens with invalid; kernel_1 then finalizes the
+    // SWA-translated read/write locations. Used for MTP / cuda-graph capture where
+    // a host sync would be expensive.
     RuntimeCheck(batch_size <= kMaxPrefillBatchSize, "GPU plan only support batch size up to ", kMaxPrefillBatchSize);
     auto C = ffi::empty({num_q_tokens, sizeof(PlanC)}, kDLUInt8, device);
     auto W = ffi::empty({num_q_tokens, sizeof(PlanW)}, kDLUInt8, device);
@@ -541,8 +545,7 @@ inline PrefillPlan plan_compress_prefill(
         .use_req_ring = use_req_ring,
     };
     LaunchKernel(1, kMaxPrefillBatchSize, device)(plan_compress_prefill_kernel0, params0);
-    // kernel_1 sees the already-padded buffers, so num_c == num_w == num_padded
-    // == num_q_tokens.
+    // kernel_1 sees the already-padded buffers, so num_c == num_w == num_padded == num_q_tokens.
     const auto params1 = Prefill1Params{
         .plan_c = static_cast<PlanC*>(C.data_ptr()),
         .plan_w = static_cast<PlanW*>(W.data_ptr()),
