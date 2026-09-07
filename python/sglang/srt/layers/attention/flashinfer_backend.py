@@ -1949,7 +1949,7 @@ class FlashInferIndicesUpdaterPrefill:
                 if use_ragged:
                     # K for extend tokens is written after the paged wrapper runs, so
                     # the paged wrapper sees prefix-only. Trim to the last `window` tokens
-                    # (required for SWATokenToKVPoolAllocator; also keeps mask O(window)).
+                    # (required for HybridSWAKVAllocator; also keeps mask O(window)).
                     effective_start = torch.clamp(
                         prefix_lens - sliding_window_size, min=0
                     )

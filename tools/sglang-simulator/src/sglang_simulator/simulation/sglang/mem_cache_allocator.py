@@ -110,8 +110,8 @@ def alloc_decode_cpu(*args, **kwargs):
     return _alloc_decode_cpu(*args, **kwargs)
 
 
-class C_PagedTokenToKVPoolAllocatorHook(BaseHook):
-    HOOK_CLASS_NAME = "PagedTokenToKVPoolAllocator"
+class C_PagedKVPoolHook(BaseHook):
+    HOOK_CLASS_NAME = "PagedKVPool"
     HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\.allocator(?:\.paged)?$"
     REGEX = True
 

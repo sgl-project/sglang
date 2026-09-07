@@ -145,7 +145,7 @@ class PureSWARadixCache(RadixCache):
 
     def available_and_evictable_str(self) -> str:
         allocator = self.token_to_kv_pool_allocator
-        swa_available = allocator.swa_available_size()
+        swa_available = allocator.available_size()
         swa_evictable = self.swa_evictable_size()
         return (
             f"SWA available tokens: {swa_available + swa_evictable} "

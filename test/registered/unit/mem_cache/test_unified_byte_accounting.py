@@ -26,10 +26,8 @@ live + holes + pending pages at EVERY point of a lifecycle, not just at rest.
 
 import unittest
 
-from test_multi_ended_allocator import TestPagedMultiEndedAllocator as _PagedFixture
-from test_multi_ended_allocator import (
-    TestUnifiedSWATokenToKVPoolAllocator as _SwaFixture,
-)
+from test_multi_ended_allocator import TestPagedMultiEndedKVPool as _PagedFixture
+from test_multi_ended_allocator import TestUnifiedHybridSWAKVAllocator as _SwaFixture
 
 from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -102,7 +100,7 @@ class TestDriftReportsLoudly(unittest.TestCase):
         the swa band's watermark outside the buffer."""
         inst, allocator, kvcache = _swa_composite()
         inst._alloc(allocator, kvcache, 8)
-        swa = allocator.swa_attn_allocator
+        swa = allocator.swa.pool
         # grow-down member: low frontier = (wm+1)*bytes; wm == num_pages puts
         # it past the buffer top.
         self.assertEqual(swa.grow_direction, "down")

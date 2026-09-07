@@ -17,7 +17,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.kv_cache_builder import uses_ssm_state
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -524,7 +524,7 @@ class SchedulerDPAttnAdapter:
     model_runner: ModelRunner
     tp_group: GroupCoordinator
     req_to_token_pool: ReqToTokenPool
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    token_to_kv_pool_allocator: BaseKVAllocator
     tree_cache: BasePrefixCache
     offload_tags: set[str]
     ps: ParallelState

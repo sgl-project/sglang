@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tri-pool composite (`UnifiedMambaSWATokenToKVPoolAllocator`) -- full KV +
+"""Tri-pool composite (`UnifiedMambaHybridSWAKVAllocator`) -- full KV +
 SWA KV + mamba/conv state in ONE unified byte buffer, chain
 ``[mamba (up END) | swa (FLOAT) | full (down END)]``.
 
@@ -24,11 +24,11 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
+    UnifiedMambaHybridSWAKVAllocator,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-    FloatMultiEndedAllocator,
-    MultiEndedAllocator,
+    FloatMultiEndedKVPool,
+    MultiEndedKVPool,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -129,7 +129,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+        allocator = UnifiedMambaHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             mamba_kvcache=mamba_kv,
@@ -143,8 +143,8 @@ class TestUnifiedTriPool(unittest.TestCase):
         return pool, allocator, kvcache, mamba_kv
 
     def _stamp(self, allocator, kvcache, v):
-        fa = allocator.full_attn_allocator
-        sa = allocator.swa_attn_allocator
+        fa = allocator.full.pool
+        sa = allocator.swa.pool
         kvcache.full_kv_pool.buf[fa.virtual_to_physical[v]] = v
         kvcache.swa_kv_pool.buf[sa.virtual_to_physical[v]] = v
 
@@ -152,10 +152,10 @@ class TestUnifiedTriPool(unittest.TestCase):
 
     def test_chain_wiring_and_float_swa(self):
         pool, allocator, kvcache, _ = self._build()
-        fa = allocator.full_attn_allocator
-        sa = allocator.swa_attn_allocator
+        fa = allocator.full.pool
+        sa = allocator.swa.pool
         ma = allocator.mamba_allocator
-        self.assertIsInstance(sa, FloatMultiEndedAllocator)
+        self.assertIsInstance(sa, FloatMultiEndedKVPool)
         self.assertIs(ma.high_peer, sa)
         self.assertIs(sa.low_peer, ma)
         self.assertIs(sa.high_peer, fa)
@@ -170,9 +170,9 @@ class TestUnifiedTriPool(unittest.TestCase):
 
     def test_empty_float_is_transparent_to_the_ends(self):
         _, allocator, _, _ = self._build()
-        fa = allocator.full_attn_allocator
+        fa = allocator.full.pool
         ma = allocator.mamba_allocator
-        self.assertTrue(allocator.swa_attn_allocator._is_frontier_transparent())
+        self.assertTrue(allocator.swa.pool._is_frontier_transparent())
         # full's chain gap reaches the mamba end's frontier straight through.
         self.assertEqual(
             fa._current_gap_bytes(),
@@ -196,7 +196,7 @@ class TestUnifiedTriPool(unittest.TestCase):
     def _swa_interior_block(self, allocator, blocks):
         """The block whose SWA-physical pages touch neither float boundary:
         `free_swa` on it holes; a boundary block would be absorbed instead."""
-        sa = allocator.swa_attn_allocator
+        sa = allocator.swa.pool
         for v in blocks:
             pages = set(int(x) for x in sa.virtual_to_physical[v].tolist())
             if sa.low_wm_page not in pages and (sa.high_wm_page - 1) not in pages:
@@ -209,13 +209,13 @@ class TestUnifiedTriPool(unittest.TestCase):
         for v in blocks:
             self.assertIsNotNone(v)
             self._stamp(allocator, kvcache, v)
-        sa = allocator.swa_attn_allocator
-        fa = allocator.full_attn_allocator
+        sa = allocator.swa.pool
+        fa = allocator.full.pool
         span_before = (sa.low_wm_page, sa.high_wm_page)
 
         # Window slide: an INTERIOR block ages out of the SWA window.
         v_mid = self._swa_interior_block(allocator, blocks)
-        allocator.free_swa(v_mid)
+        allocator.swa.free(v_mid)
         # The full side keeps the token; the swa side tombstoned it.
         self.assertTrue(bool((fa.virtual_to_physical[v_mid] >= 0).all()))
         self.assertTrue(bool((sa.virtual_to_physical[v_mid] == -1).all()))
@@ -238,7 +238,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         blocks = [allocator.alloc(4) for _ in range(2)]
         for v in blocks:
             self._stamp(allocator, kvcache, v)
-        sa = allocator.swa_attn_allocator
+        sa = allocator.swa.pool
         span_pages = sa._span_pages()
         # Pick a block holding a span-boundary page.
         boundary = None
@@ -248,20 +248,20 @@ class TestUnifiedTriPool(unittest.TestCase):
                 boundary = v
                 break
         self.assertIsNotNone(boundary)
-        allocator.free_swa(boundary)
-        allocator.flush_opportunistic()  # the deferred reclaim point
+        allocator.swa.free(boundary)
+        allocator.chain.flush_opportunistic()  # the deferred reclaim point
         self.assertEqual(sa._hole_pages(), 0)  # absorbed, not holed
         self.assertEqual(sa._span_pages(), span_pages - 4)
         self.assertEqual(len(sa._inverse_history), 0)  # zero copies
 
-    def test_free_releases_both_sides_and_filters_tombstones(self):
+    def test_request_finish_after_tombstone_frees_the_full_side(self):
         _, allocator, kvcache, _ = self._build()
         va = allocator.alloc(4)
         self._stamp(allocator, kvcache, va)
-        allocator.free_swa(va)  # tombstone first (aged out of window)
-        allocator.free(va)  # then the request finishes
-        fa = allocator.full_attn_allocator
-        sa = allocator.swa_attn_allocator
+        allocator.swa.free(va)  # tombstone first (aged out of window)
+        allocator.full.free(va)  # then the request finishes: full side only
+        fa = allocator.full.pool
+        sa = allocator.swa.pool
         self.assertTrue(bool((fa.virtual_to_physical[va] == -1).all()))
         self.assertTrue(bool((sa.virtual_to_physical[va] == -1).all()))
         # Fully-freed float parks and is transparent again.
@@ -304,13 +304,12 @@ class TestUnifiedTriPool(unittest.TestCase):
         blocks = [allocator.alloc(4) for _ in range(3)]
         for v in blocks:
             self._stamp(allocator, kvcache, v)
-        allocator.free_swa(self._swa_interior_block(allocator, blocks))
-        sa = allocator.swa_attn_allocator
+        allocator.swa.free(self._swa_interior_block(allocator, blocks))
+        sa = allocator.swa.pool
         holes = sa._hole_pages()
         self.assertGreater(holes, 0)
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import _relieve_for_alloc
 
-        _relieve_for_alloc(allocator, 1)
+        allocator.chain.relieve(1)
         self.assertEqual(sa._hole_pages(), holes)  # holes are assets, not backlog
 
 
@@ -319,8 +318,8 @@ class TestTriPagedFreeGroup(unittest.TestCase):
     path: free_group_begin -> free_segment -> free_group_end.
 
     Regression: every other tri test runs at page_size=1, where the
-    page-representative machinery is dead code. At ps>1 the composite releases
-    reps via `swa_attn_allocator.free(..., _pages=...)`, which the float must
+    page-representative machinery is dead code. At ps>1 the swa side releases
+    reps via `swa.pool.free(..., _pages=...)`, which the float must
     accept or the first decode batch dies; honouring `_pages` is also what
     keeps the free path off the data-dependent `torch.unique` host sync.
     """
@@ -341,7 +340,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+        allocator = UnifiedMambaHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             mamba_kvcache=mamba_kv,
@@ -363,12 +362,12 @@ class TestTriPagedFreeGroup(unittest.TestCase):
 
         allocator.free_group_begin()
         allocator.free_segment(v, start_pos=0)
-        allocator.free_group_end()  # -> _release_page_reps -> float.free(_pages=)
+        allocator.free_group_end()  # -> swa side reps -> float.free(_pages=)
 
         self.assertEqual(allocator.verify_byte_accounting(), [])
         self.assertGreaterEqual(allocator.available_size(), before)
         # Capacity fully recovered: the float parked, both ends rewound.
-        self.assertTrue(allocator.swa_attn_allocator._is_frontier_transparent())
+        self.assertTrue(allocator.swa.pool._is_frontier_transparent())
 
     def test_ungrouped_segment_free_also_reaches_the_float(self):
         pool, allocator = self._build_paged()
@@ -407,7 +406,7 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
                 torch.Tensor, "item", side_effect=AssertionError("item = host sync")
             ),
         ):
-            alloc.free_swa(v[: 4 * self.PS], start_pos=0)
+            alloc.swa.free_segment(v[: 4 * self.PS], start_pos=0)
         self.assertEqual(alloc.verify_byte_accounting(), [])
 
     def test_fallback_free_swa_still_correct_for_radix_shapes(self):
@@ -416,12 +415,12 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
         a1, a2 = self._tri(), self._tri()
         v1, v2 = a1.alloc(6 * self.PS), a2.alloc(6 * self.PS)
         self.assertTrue(torch.equal(v1, v2))
-        a1.free_swa(v1[: 4 * self.PS], start_pos=0)
-        a2.free_swa(v2[: 4 * self.PS])
+        a1.swa.free_segment(v1[: 4 * self.PS], start_pos=0)
+        a2.swa.free(v2[: 4 * self.PS])
         self.assertTrue(
             torch.equal(
-                a1.swa_attn_allocator.virtual_to_physical,
-                a2.swa_attn_allocator.virtual_to_physical,
+                a1.swa.pool.virtual_to_physical,
+                a2.swa.pool.virtual_to_physical,
             )
         )
         self.assertEqual(a1.available_size(), a2.available_size())
@@ -447,10 +446,10 @@ class TestGeneralizedRebalance(unittest.TestCase):
         """Raw end+float+end chain, BOTH orientations in one fixture: the
         up-growing end opens the float's LOW side, the down-growing end its
         HIGH side."""
-        from test_multi_ended_allocator import TestFloatMultiEndedAllocator
+        from test_multi_ended_allocator import TestFloatMultiEndedKVPool
 
-        inst = TestFloatMultiEndedAllocator(
-            [m for m in dir(TestFloatMultiEndedAllocator) if m.startswith("test_")][0]
+        inst = TestFloatMultiEndedKVPool(
+            [m for m in dir(TestFloatMultiEndedKVPool) if m.startswith("test_")][0]
         )
         _pool, up_end, fla, down_end, _kv = inst._build_tri()
         v = fla.alloc(8)  # opaque float mid-region
@@ -476,7 +475,7 @@ class TestGeneralizedRebalance(unittest.TestCase):
 
     def test_two_pool_chain_rebalance_is_a_noop(self):
         from test_multi_ended_allocator import (
-            TestPagedMultiEndedAllocator as _PagedFixture,
+            TestPagedMultiEndedKVPool as _PagedFixture,
         )
 
         inst = _PagedFixture(
@@ -497,7 +496,7 @@ class TestGeneralizedRebalance(unittest.TestCase):
         alloc = self._tri()
         alloc.alloc(4 * self.PS)
         ma = alloc.mamba_allocator
-        sa = alloc.swa_attn_allocator
+        sa = alloc.swa.pool
         huge = (ma.num_pages + 10) * ma.page_size  # beyond index space
         with mock.patch.object(
             sa, "make_room", side_effect=AssertionError("useless make_room")
@@ -520,7 +519,7 @@ class TestComputedShortSide(unittest.TestCase):
         return inst._build_paged(page_size=self.PS)[1]
 
     def _sides(self, alloc):
-        sa = alloc.swa_attn_allocator
+        sa = alloc.swa.pool
         low = max(0, sa._byte_low_frontier() - sa._chain_high_frontier_below_bytes())
         high = max(0, sa._chain_low_frontier_above_bytes() - sa._byte_high_frontier())
         return low, high
@@ -536,8 +535,8 @@ class TestComputedShortSide(unittest.TestCase):
         alloc = self._tri()
         v = alloc.alloc(6 * self.PS)  # places the float mid-region
         self.assertIsNotNone(v)
-        sa = alloc.swa_attn_allocator
-        fa = alloc.full_attn_allocator
+        sa = alloc.swa.pool
+        fa = alloc.full.pool
         e_f, e_s = fa.entry_bytes_per_page, sa.entry_bytes_per_page
 
         # Position: slide the float LOW (setup uses the mechanism directly),
@@ -569,7 +568,7 @@ class TestComputedShortSide(unittest.TestCase):
         with mock.patch.object(
             sa, "make_room", side_effect=lambda **kw: calls.append(kw) or real(**kw)
         ):
-            alloc._ask_float_for_room(chosen * self.PS)
+            alloc.chain._ask_float_for_room(chosen * self.PS)
         self.assertEqual(len(calls), 1, calls)
         self.assertEqual(calls[0]["side"], "low")  # the STATE side
 
@@ -581,7 +580,7 @@ class TestComputedShortSide(unittest.TestCase):
         alloc = self._tri()
         v = alloc.alloc(4 * self.PS)
         self.assertIsNotNone(v)
-        sa, fa = alloc.swa_attn_allocator, alloc.full_attn_allocator
+        sa, fa = alloc.swa.pool, alloc.full.pool
         e_f, e_s = fa.entry_bytes_per_page, sa.entry_bytes_per_page
         chosen = None
         for need_n in range(1, 256):
@@ -597,7 +596,7 @@ class TestComputedShortSide(unittest.TestCase):
         with mock.patch.object(
             sa, "make_room", side_effect=lambda **kw: calls.append(kw)
         ):
-            alloc._ask_float_for_room(chosen * self.PS)
+            alloc.chain._ask_float_for_room(chosen * self.PS)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["side"], "high")
         self.assertEqual(calls[0]["min_bytes"], want)
@@ -612,24 +611,24 @@ class TestComputedShortSide(unittest.TestCase):
         v = alloc.alloc(6 * self.PS)
         self.assertIsNotNone(v)
         sa, fa, ma = (
-            alloc.swa_attn_allocator,
-            alloc.full_attn_allocator,
+            alloc.swa.pool,
+            alloc.full.pool,
             alloc.mamba_allocator,
         )
         # Synthetic coupling: the state end joins the demand vector, the
         # override a composite with ends on both sides would ship.
-        need = lambda self, t: {
-            fa: -(-t // self.page_size),
-            sa: -(-t // self.page_size),
-            ma: -(-t // self.page_size),
+        need = lambda chain, t: {
+            fa: -(-t // alloc.page_size),
+            sa: -(-t // alloc.page_size),
+            ma: -(-t // alloc.page_size),
         }
-        with mock.patch.object(type(alloc), "_alloc_demand", need):
+        with mock.patch.object(type(alloc.chain), "_alloc_demand", need):
             # (a) both sides short: absurd need -> both demands exceed their
             # bands -> make_room must NOT be called.
             with mock.patch.object(
                 sa, "make_room", side_effect=AssertionError("zero-sum move")
             ):
-                alloc._ask_float_for_room(10_000 * self.PS)
+                alloc.chain._ask_float_for_room(10_000 * self.PS)
 
             # (b) one side short: find a need where the HIGH side (full) is
             # short while the LOW side (mamba demand) still fits.
@@ -645,7 +644,7 @@ class TestComputedShortSide(unittest.TestCase):
                 with mock.patch.object(
                     sa, "make_room", side_effect=lambda **kw: calls.append(kw)
                 ):
-                    alloc._ask_float_for_room(chosen * self.PS)
+                    alloc.chain._ask_float_for_room(chosen * self.PS)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0]["side"], "high")
 
@@ -656,13 +655,13 @@ class TestComputedShortSide(unittest.TestCase):
 
         alloc = self._tri()
         alloc.alloc(4 * self.PS)
-        demand = alloc._alloc_demand(2 * self.PS)
+        demand = alloc.chain._alloc_demand(2 * self.PS)
         self.assertEqual(demand[alloc.mamba_allocator], 0)
-        sa = alloc.swa_attn_allocator
+        sa = alloc.swa.pool
         with mock.patch.object(
             sa, "make_room", side_effect=AssertionError("needless move")
         ):
-            alloc._ask_float_for_room(1)
+            alloc.chain._ask_float_for_room(1)
 
 
 class TestFloatPolicyTotalTarget(unittest.TestCase):
@@ -685,7 +684,7 @@ class TestFloatPolicyTotalTarget(unittest.TestCase):
         alloc = self._tri()
         v = alloc.alloc(6 * self.PS)
         self.assertIsNotNone(v)
-        ma, sa = alloc.mamba_allocator, alloc.swa_attn_allocator
+        ma, sa = alloc.mamba_allocator, alloc.swa.pool
         e_m = ma.entry_bytes_per_page
         gap_slots = int((sa._byte_low_frontier() - ma._byte_high_frontier()) // e_m)
         self.assertGreater(gap_slots, 2)
@@ -713,12 +712,12 @@ class TestTriDeferredAbsorption(unittest.TestCase):
     def test_per_step_flush_reclaims_the_span(self):
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        sa = alloc.swa_attn_allocator
+        sa = alloc.swa.pool
         span = sa._span_pages()
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
+        alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
         self.assertGreater(sa._hole_pages(), 0)  # deferred
         self.assertEqual(sa._span_pages(), span)
-        moved = alloc.flush_opportunistic()
+        moved = alloc.chain.flush_opportunistic()
         self.assertGreater(moved, 0)
         self.assertLess(sa._span_pages(), span)
         self.assertEqual(alloc.verify_byte_accounting(), [])
@@ -728,13 +727,12 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         rebalance deficit and buys a relocation the shrink already covers."""
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        sa = alloc.swa_attn_allocator
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)
+        sa = alloc.swa.pool
+        alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)
         self.assertGreater(sa._hole_pages(), 0)
         moves_before = len(sa._inverse_history)
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import _relieve_for_alloc
 
-        _relieve_for_alloc(alloc, 1)  # the ladder
+        alloc.chain.relieve(1)  # the ladder
         self.assertEqual(sa._hole_pages(), 0)  # rung 0 ran
         self.assertEqual(len(sa._inverse_history), moves_before)  # zero copies
 
@@ -743,9 +741,9 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         value -- under-reporting is safe, over-reporting would over-admit."""
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)
+        alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)
         deferred = alloc.available_size()
-        alloc.swa_attn_allocator._flush(urgent=False)
+        alloc.swa.pool._flush(urgent=False)
         absorbed = alloc.available_size()
         self.assertLessEqual(deferred, absorbed)
         self.assertEqual(alloc.verify_byte_accounting(), [])
@@ -759,14 +757,14 @@ class TestTriDeferredAbsorption(unittest.TestCase):
 
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        alloc.free_swa(v[2 * self.PS : 4 * self.PS], start_pos=2 * self.PS)
-        alloc.flush_opportunistic()  # consumes the dirty flag
-        sa = alloc.swa_attn_allocator
+        alloc.swa.free_segment(v[2 * self.PS : 4 * self.PS], start_pos=2 * self.PS)
+        alloc.chain.flush_opportunistic()  # consumes the dirty flag
+        sa = alloc.swa.pool
         self.assertGreater(sa._hole_pages(), 0)  # interior holes remain
         with mock.patch.object(
             torch.Tensor, "tolist", side_effect=AssertionError("tolist = D2H")
         ):
-            self.assertEqual(alloc.flush_opportunistic(), 0)
+            self.assertEqual(alloc.chain.flush_opportunistic(), 0)
             self.assertEqual(sa._flush(urgent=False), 0)
 
     def test_alloc_between_frees_cannot_hide_a_boundary_hole(self):
@@ -774,14 +772,14 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         COUNT, so the flag must be armed by `free`, not read off `numel()`."""
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        sa = alloc.swa_attn_allocator
-        alloc.free_swa(v[: 2 * self.PS], start_pos=0)  # low-edge holes
+        sa = alloc.swa.pool
+        alloc.swa.free_segment(v[: 2 * self.PS], start_pos=0)  # low-edge holes
         n_after_free = sa._hole_pages()
         alloc.alloc(2 * self.PS)  # drains them back to live
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
+        alloc.swa.free_segment(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
         self.assertEqual(sa._hole_pages(), n_after_free)  # same COUNT as before
         span = sa._span_pages()
-        self.assertGreater(alloc.flush_opportunistic(), 0)  # still absorbed
+        self.assertGreater(alloc.chain.flush_opportunistic(), 0)  # still absorbed
         self.assertLess(sa._span_pages(), span)
         self.assertEqual(alloc.verify_byte_accounting(), [])
 
@@ -790,14 +788,14 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         that empties must go transparent immediately, with no flush needed."""
         alloc = self._tri()
         v = alloc.alloc(4 * self.PS)
-        sa = alloc.swa_attn_allocator
+        sa = alloc.swa.pool
         self.assertFalse(sa._is_frontier_transparent())
         from unittest import mock
 
         with mock.patch.object(
             torch.Tensor, "tolist", side_effect=AssertionError("tolist = D2H")
         ):
-            alloc.free_swa(v, start_pos=0)
+            alloc.swa.free_segment(v, start_pos=0)
         self.assertTrue(sa._is_frontier_transparent())
         self.assertEqual(sa._hole_pages(), 0)
 
@@ -900,13 +898,13 @@ class TestTriPoolHardening(unittest.TestCase):
         # low band's free bytes off from `full`; the next alloc must SLIDE it
         # rather than fail while total bytes suffice.
         _, allocator, kvcache, _ = self._build(n_full=32, n_swa=24, n_state=8)
-        sa = allocator.swa_attn_allocator
+        sa = allocator.swa.pool
         v0 = allocator.alloc(4)  # places the float at the region midpoint
         self.assertIsNotNone(v0)
         TestUnifiedTriPool._stamp(self, allocator, kvcache, v0)
         # Exhaust the high band directly on the full end (full-only growth,
         # e.g. long decode of already-admitted requests).
-        fa = allocator.full_attn_allocator
+        fa = allocator.full.pool
         b_high_pages = fa._current_gap_bytes() // fa.entry_bytes_per_page
         grab = fa.alloc(max(0, (b_high_pages - 2)))
         self.assertIsNotNone(grab)
@@ -953,15 +951,15 @@ class TestTriPoolHardening(unittest.TestCase):
         # Alternating full-grow / swa-churn: hole recycling and absorption do
         # the steady-state work, so total float moves stay bounded.
         _, allocator, kvcache, _ = self._build(n_full=48, n_swa=32, n_state=8)
-        sa = allocator.swa_attn_allocator
-        fa = allocator.full_attn_allocator
+        sa = allocator.swa.pool
+        fa = allocator.full.pool
         total_alloc_pages = 0
         for _ in range(6):
             v = allocator.alloc(8)
             self.assertIsNotNone(v)
             total_alloc_pages += 8
             TestUnifiedTriPool._stamp(self, allocator, kvcache, v)
-            allocator.free_swa(v)  # window slide: tombstones -> holes/absorb
+            allocator.swa.free(v)  # window slide: tombstones -> holes/absorb
             g = fa.alloc(4)  # full-side decode growth
             self.assertIsNotNone(g)
             total_alloc_pages += 4
@@ -1010,7 +1008,7 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
             page_size=page_size,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        return pool, UnifiedMambaSWATokenToKVPoolAllocator(
+        return pool, UnifiedMambaHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
@@ -1062,8 +1060,8 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
                             )
                             self.assertEqual(out.numel(), n)
                             # Both sides bound for every allocated virtual id.
-                            fa = alloc.full_attn_allocator
-                            sa = alloc.swa_attn_allocator
+                            fa = alloc.full.pool
+                            sa = alloc.swa.pool
                             self.assertTrue(
                                 bool((fa.virtual_to_physical[out] >= 0).all())
                             )
@@ -1090,7 +1088,7 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
                 lazy=False,
                 specs=specs,
             )
-            sa = alloc.swa_attn_allocator
+            sa = alloc.swa.pool
             n_pages = alloc.available_size() // page_size
             lo, hi = sa._region_bounds_pages()
             with self.subTest(ps=page_size):
@@ -1124,7 +1122,7 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
             enable_memory_saver=False,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        alloc = UnifiedMambaSWATokenToKVPoolAllocator(
+        alloc = UnifiedMambaHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=kvcache,
             mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
@@ -1157,7 +1155,7 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
 
     def test_make_room_settles_before_the_first_move(self):
         _pool, alloc, _kv = self._tri()
-        flt = alloc.swa_attn_allocator
+        flt = alloc.swa.pool
         # Occupy the float, then free an interior page so a relocation has
         # something to move and somewhere to move it.
         v = alloc.alloc(12)
@@ -1175,7 +1173,7 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
 
     def test_compact_holes_settles_before_the_first_move(self):
         _pool, alloc, _kv = self._tri()
-        flt = alloc.swa_attn_allocator
+        flt = alloc.swa.pool
         v = alloc.alloc(12)
         self.assertIsNotNone(v)
         alloc.free(v[2:6])  # interior holes, so compact_holes has work
@@ -1188,7 +1186,7 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
     def test_the_settle_is_a_stream_wait_not_a_host_sync(self):
         """The settle before a float move must be a stream wait: a host sync
         there would land on the alloc-shortfall path every time the float moves."""
-        src = inspect.getsource(MultiEndedAllocator._settle_inflight_forward)
+        src = inspect.getsource(MultiEndedKVPool._settle_inflight_forward)
         self.assertIn("wait_event", src)
         self.assertNotIn(".item()", src)
         self.assertNotIn("synchronize()", src)
@@ -1216,7 +1214,7 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
         )
-        alloc = UnifiedMambaSWATokenToKVPoolAllocator(
+        alloc = UnifiedMambaHybridSWAKVAllocator(
             unified_buffer=pool,
             kvcache=_FakeUnifiedSWAKVPool(pool),
             mamba_kvcache=_FakeKVCache(pool.max_slots("mamba")),
@@ -1227,7 +1225,7 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
             forward_stream=None,
             lazy_compaction=True,
         )
-        return alloc, alloc.swa_attn_allocator
+        return alloc, alloc.swa.pool
 
     def test_schedulable_never_exceeds_the_sum_of_the_two_sides(self):
         """Upper bound that the undirected scalar could violate: no side may be

@@ -33,7 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator import BaseKVAllocator
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -283,7 +283,7 @@ class PrefetchOperation(StorageOperation):
 class HiCacheController:
     def __init__(
         self,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseKVAllocator,
         mem_pool_host: HostKVCache,
         page_size: int,
         tp_group: torch.distributed.ProcessGroup,

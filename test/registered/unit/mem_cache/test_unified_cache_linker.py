@@ -397,7 +397,7 @@ def test_component_commit_keeps_only_adopted_pages():
     cache = _cache_for_wrapper(
         page_size=2,
         token_to_kv_pool_allocator=SimpleNamespace(
-            set_full_to_swa_mapping=mapping.set_full_to_swa_mapping
+            pairing=SimpleNamespace(set=mapping.set_full_to_swa_mapping)
         ),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())

@@ -19,13 +19,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import BaseFreeListKVPool
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
-class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+class TokenedKVPool(BaseFreeListKVPool):
     """An allocator managing the indices to kv cache data."""
 
     def __init__(

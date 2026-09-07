@@ -29,7 +29,7 @@ import torch
 
 class MambaSlotAllocator:
     """Free-list of Mamba pool slot indices. Deliberately not a subclass of
-    ``BaseTokenToKVPoolAllocator``: slots are per request, not per token."""
+    ``BaseKVAllocator``: slots are per request, not per token."""
 
     def __init__(self, size: int, device: str):
         self.size = size

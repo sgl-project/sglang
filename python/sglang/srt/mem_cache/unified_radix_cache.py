@@ -598,15 +598,9 @@ class UnifiedRadixCache(BasePrefixCache):
         Shared allocators expose schedulable capacity, which includes peer holes
         that an urgent allocator flush can reclaim without further eviction.
         """
-        if component_type == ComponentType.FULL:
-            if self.supports_swa():
-                return self.token_to_kv_pool_allocator.full_available_size()
-            return self.token_to_kv_pool_allocator.available_size()
-        if component_type == ComponentType.SWA:
-            return self.token_to_kv_pool_allocator.swa_available_size()
         if component_type == ComponentType.MAMBA:
             return self.req_to_token_pool.mamba_allocator.schedulable_available_size()
-        raise ValueError(f"Unsupported cache component: {component_type}")
+        return self.token_to_kv_pool_allocator.side(component_type).available_size()
 
     def _evict(
         self,
@@ -1098,8 +1092,9 @@ class UnifiedRadixCache(BasePrefixCache):
             for indices in action.indices:
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, FreeDeviceKVFullOnly):
+            full = self.token_to_kv_pool_allocator.side(ComponentType.FULL)
             for indices in action.indices:
-                self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
+                full.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
                 self.linker.offload_nodes(action.node_ids)
@@ -1112,7 +1107,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self, device_frees: dict[ComponentType, list[torch.Tensor]]
     ) -> None:
         # Free per component device slots, consuming each entry as it frees.
-        for ct in list(device_frees):
+        # SWA before FULL: the full side's peer check reads the pairing that the
+        # swa side's free clears.
+        for ct in sorted(device_frees, key=lambda ct: 0 if ct.is_swa else 1):
             self._apply_cache_action(
                 FreeComponentDeviceSlot(device_frees.pop(ct), component_type=ct)
             )
@@ -3169,10 +3166,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def available_and_evictable_str(self) -> str:
         # TODO(zhangmj): need more detailed log info for session reference.
-        if self.supports_swa():
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-        else:
-            full_available_size = self.token_to_kv_pool_allocator.available_size()
+        full_available_size = self.token_to_kv_pool_allocator.side(
+            BASE_COMPONENT_TYPE
+        ).available_size()
         full_evictable = self.tree_core.component_evictable_size(BASE_COMPONENT_TYPE)
         lines = [
             f"Available full tokens: {full_available_size + full_evictable} "
@@ -3181,10 +3177,12 @@ class UnifiedRadixCache(BasePrefixCache):
         for ct in self.tree_components:
             if ct == BASE_COMPONENT_TYPE:
                 continue
-            if ct.is_swa:
-                available_size = self.token_to_kv_pool_allocator.swa_available_size()
-            elif ct.is_mamba:
+            if ct.is_mamba:
                 available_size = self.req_to_token_pool.mamba_allocator.available_size()
+            elif ct in self.token_to_kv_pool_allocator.sides:
+                available_size = self.token_to_kv_pool_allocator.side(
+                    ct
+                ).available_size()
             else:
                 continue
 

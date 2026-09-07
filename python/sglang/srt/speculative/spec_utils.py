@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator import BaseKVAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 
@@ -705,7 +705,7 @@ def move_accept_tokens_to_target_kvcache(
     batch: ScheduleBatch,
     accept_index: torch.Tensor,
     num_correct_drafts: torch.Tensor,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    token_to_kv_pool_allocator: BaseKVAllocator,
 ):
     """
     Move accepted tokens (drafts + bonus) to the target KV cache.

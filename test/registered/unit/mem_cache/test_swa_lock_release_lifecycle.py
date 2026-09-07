@@ -16,7 +16,7 @@ from array import array
 
 import torch
 
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import HybridSWAKVAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -63,7 +63,7 @@ def _build_tree(
         full_attention_layer_ids=full_ids,
         device=device,
     )
-    allocator = SWATokenToKVPoolAllocator(
+    allocator = HybridSWAKVAllocator(
         size=kv_size,
         size_swa=kv_size_swa,
         page_size=page_size,
@@ -88,7 +88,7 @@ def _build_tree(
 def _swa_alloc(allocator, need_size):
     """Allocate from SWA allocator for any page_size.
 
-    SWATokenToKVPoolAllocator.alloc() asserts page_size == 1; for page_size > 1
+    HybridSWAKVAllocator.alloc() asserts page_size == 1; for page_size > 1
     we drive the underlying paged allocators directly (mirrors the helper in
     test_swa_eviction_boundary.py). Required: need_size is a multiple of
     page_size when page_size > 1.
@@ -100,12 +100,12 @@ def _swa_alloc(allocator, need_size):
         f"page_size > 1 requires page-aligned alloc, got {need_size=} "
         f"with {allocator.page_size=}"
     )
-    if need_size > allocator.full_attn_allocator.available_size():
+    if need_size > allocator.full.pool.available_size():
         return None
-    if need_size > allocator.swa_attn_allocator.available_size():
+    if need_size > allocator.swa.pool.available_size():
         return None
-    full_indices = allocator.full_attn_allocator.alloc(need_size)
-    swa_indices = allocator.swa_attn_allocator.alloc(need_size)
+    full_indices = allocator.full.pool.alloc(need_size)
+    swa_indices = allocator.swa.pool.alloc(need_size)
     assert full_indices is not None and swa_indices is not None
     allocator.full_to_swa_index_mapping[full_indices] = swa_indices
     return full_indices
@@ -151,8 +151,8 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         swa_uuid = inc_res.swa_uuid_for_lock
         self.assertIsNotNone(swa_uuid)
 
-        swa_avail_before = allocator.swa_available_size()
-        full_avail_before = allocator.full_available_size()
+        swa_avail_before = allocator.swa.available_size()
+        full_avail_before = allocator.full.available_size()
         self.assertEqual(leaf.swa_lock_ref, 1)
         self.assertEqual(leaf.full_lock_ref, 1)
         self.assertFalse(leaf.swa_tombstone)
@@ -164,10 +164,10 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         self.assertFalse(tree.swa_lru_list.in_list(leaf))
         self.assertEqual(leaf.swa_lock_ref, 0)
         self.assertEqual(
-            allocator.swa_available_size(), swa_avail_before + len(leaf.value)
+            allocator.swa.available_size(), swa_avail_before + len(leaf.value)
         )
         self.assertEqual(leaf.full_lock_ref, 1)
-        self.assertEqual(allocator.full_available_size(), full_avail_before)
+        self.assertEqual(allocator.full.available_size(), full_avail_before)
 
         # sanity_check forbids live locks; release the full half before checking.
         tree.dec_lock_ref(
@@ -194,7 +194,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
 
         swa_protected_before = tree.swa_protected_size_
         swa_evictable_before = tree.swa_evictable_size_
-        swa_avail_before = allocator.swa_available_size()
+        swa_avail_before = allocator.swa.available_size()
 
         tree.dec_swa_lock_only(leaf_a, swa_uuid_for_lock=swa_uuid)
 
@@ -206,7 +206,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         )
         self.assertEqual(tree.swa_evictable_size_, swa_evictable_before + 7)
         self.assertEqual(
-            allocator.swa_available_size(), swa_avail_before + len(leaf_a.value)
+            allocator.swa.available_size(), swa_avail_before + len(leaf_a.value)
         )
 
         tree.dec_lock_ref(
@@ -225,7 +225,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         self.assertTrue(leaf.swa_tombstone)
         self.assertEqual(leaf.full_lock_ref, 1)
 
-        swa_avail_after_release = allocator.swa_available_size()
+        swa_avail_after_release = allocator.swa.available_size()
         swa_protected_after_release = tree.swa_protected_size_
 
         # Without skip_swa, dec_lock_ref would assert on the swa_tombstone leaf.
@@ -234,7 +234,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         )
 
         self.assertEqual(leaf.full_lock_ref, 0)
-        self.assertEqual(allocator.swa_available_size(), swa_avail_after_release)
+        self.assertEqual(allocator.swa.available_size(), swa_avail_after_release)
         self.assertEqual(tree.swa_protected_size_, swa_protected_after_release)
         tree.sanity_check()
 
@@ -246,8 +246,8 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         inc_res = tree.inc_lock_ref(leaf)
         swa_uuid = inc_res.swa_uuid_for_lock
 
-        full_avail_before = allocator.full_available_size()
-        swa_avail_before = allocator.swa_available_size()
+        full_avail_before = allocator.full.available_size()
+        swa_avail_before = allocator.swa.available_size()
 
         tree.dec_lock_ref(leaf, DecLockRefParams(swa_uuid_for_lock=swa_uuid))
 
@@ -256,8 +256,8 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         self.assertEqual(tree.full_protected_size_, 0)
         self.assertEqual(tree.swa_protected_size_, 0)
         # dec_lock_ref releases locks but doesn't free; eviction does.
-        self.assertEqual(allocator.full_available_size(), full_avail_before)
-        self.assertEqual(allocator.swa_available_size(), swa_avail_before)
+        self.assertEqual(allocator.full.available_size(), full_avail_before)
+        self.assertEqual(allocator.swa.available_size(), swa_avail_before)
         tree.sanity_check()
 
     def test_evict_swa_leaf_with_full_lock_tombstones_in_place(self):
@@ -274,7 +274,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         self.assertFalse(leaf.swa_tombstone)
         self.assertTrue(tree.swa_lru_list.in_list(leaf))
 
-        swa_avail_before = allocator.swa_available_size()
+        swa_avail_before = allocator.swa.available_size()
         swa_evictable_before = tree.swa_evictable_size_
 
         # num_tokens=0 skips the full eviction loop; swa loop hits the new branch.
@@ -285,7 +285,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         self.assertFalse(tree.swa_lru_list.in_list(leaf))
         self.assertEqual(leaf.full_lock_ref, 1)
         self.assertEqual(
-            allocator.swa_available_size(), swa_avail_before + len(leaf.value)
+            allocator.swa.available_size(), swa_avail_before + len(leaf.value)
         )
         # Full lock prevents _delete_leaf, so the node stays attached.
         self.assertIs(leaf.parent.children[leaf.key.child_key(tree.page_size)], leaf)
@@ -351,8 +351,8 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
                     f"{len(leaf.value)} >= window={window}",
                 )
 
-                swa_avail_before = allocator.swa_available_size()
-                full_avail_before = allocator.full_available_size()
+                swa_avail_before = allocator.swa.available_size()
+                full_avail_before = allocator.full.available_size()
 
                 tree.dec_swa_lock_only(leaf, swa_uuid_for_lock=swa_uuid)
 
@@ -360,12 +360,12 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
                 self.assertFalse(tree.swa_lru_list.in_list(leaf))
                 self.assertEqual(leaf.swa_lock_ref, 0)
                 self.assertEqual(
-                    allocator.swa_available_size(),
+                    allocator.swa.available_size(),
                     swa_avail_before + len(leaf.value),
                     "free_swa must release the leaf's full page-aligned slot count",
                 )
                 self.assertEqual(leaf.full_lock_ref, 1)
-                self.assertEqual(allocator.full_available_size(), full_avail_before)
+                self.assertEqual(allocator.full.available_size(), full_avail_before)
 
                 tree.dec_lock_ref(
                     leaf,
@@ -404,7 +404,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
 
         swa_protected_before = tree.swa_protected_size_
         swa_evictable_before = tree.swa_evictable_size_
-        swa_avail_before = allocator.swa_available_size()
+        swa_avail_before = allocator.swa.available_size()
 
         tree.dec_swa_lock_only(leaf_a, swa_uuid_for_lock=swa_uuid)
 
@@ -412,7 +412,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         self.assertTrue(leaf_a.swa_tombstone)
         self.assertFalse(tree.swa_lru_list.in_list(leaf_a))
         self.assertEqual(
-            allocator.swa_available_size(),
+            allocator.swa.available_size(),
             swa_avail_before + len(leaf_a.value),
         )
         # Internal side: protected -> evictable, still in lru, no free.

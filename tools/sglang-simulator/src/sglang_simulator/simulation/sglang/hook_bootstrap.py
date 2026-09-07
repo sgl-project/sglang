@@ -48,7 +48,7 @@ def install_simulator_hooks() -> None:
             cache_controller.C_HybridCacheController,
             hiradix_cache.C_HiRadixCacheHook,
             unified_radix_cache.C_UnifiedRadixCacheHook,
-            mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
+            mem_cache_allocator.C_PagedKVPoolHook,
             mem_pool_host.C_MHATokenToKVPoolHostHook,
             mem_pool_host.C_HostKVCacheHook,
             mem_pool_host.C_PackedSingleKVPoolHook,

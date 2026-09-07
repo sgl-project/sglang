@@ -69,7 +69,7 @@ if TYPE_CHECKING:
         EmbeddingBatchResult,
         GenerationBatchResult,
     )
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator import BaseKVAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -95,7 +95,7 @@ class SchedulerBatchResultProcessor:
     enable_overlap: bool
     enable_overlap_mlx: bool
     model_config: ModelConfig
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    token_to_kv_pool_allocator: BaseKVAllocator
     tree_cache: BasePrefixCache
     hisparse_coordinator: Optional[HiSparseCoordinator]
     req_to_token_pool: ReqToTokenPool

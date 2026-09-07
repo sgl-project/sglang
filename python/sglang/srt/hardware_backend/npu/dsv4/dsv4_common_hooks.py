@@ -262,7 +262,7 @@ def _write_per_req(
     ``bounds_fn(i) -> (lo, hi)`` gives req i's write window; the matching
     ``hi - lo`` slots are sliced off ``flat_loc`` in order and written via
     ``write_fn((req_idx, slice(lo, hi)), values)``. flat_loc may be None /
-    empty when the alloc path bypassed DSV4NPUTokenToKVPoolAllocator (e.g.
+    empty when the alloc path bypassed NPUDSV4HybridSWAKVAllocator (e.g.
     page_size=1 or HiSparse wrapper); skip then.
     """
     if flat_loc is None or flat_loc.numel() == 0:

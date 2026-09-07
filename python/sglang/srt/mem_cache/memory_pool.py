@@ -16,7 +16,7 @@ Memory pool.
 
 SGLang has two levels of memory pool.
 ReqToTokenPool maps a request to its token locations.
-TokenToKVPoolAllocator manages the indices to kv cache data.
+TokenedKVPool manages the indices to kv cache data.
 KVCache actually holds the physical kv cache.
 """
 

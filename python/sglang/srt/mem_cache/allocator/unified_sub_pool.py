@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MultiEndedAllocator: one allocator per sub-pool over a `UnifiedKVPool`.
+"""MultiEndedKVPool: one allocator per sub-pool over a `UnifiedKVPool`.
 
 `alloc*` run the upstream kernels ONCE in virtual space using `free_virtual_ids`
 as the free-page pointer, then bind consumed virtual pages to physical pages so
@@ -45,7 +45,7 @@ from sglang.kernels.ops.memory.virtual_slot import (
     free_unbind_inplace,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import BaseKVPool
 from sglang.srt.mem_cache.allocator.paged import (
     alloc_decode_kernel,
     alloc_extend_kernel,
@@ -70,7 +70,7 @@ _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
     envs.SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC.get()
 )
 # Signal handler emits each instance's final counters (atexit misses signal exits).
-_STATS_INSTANCES: weakref.WeakSet[MultiEndedAllocator] = weakref.WeakSet()
+_STATS_INSTANCES: weakref.WeakSet[MultiEndedKVPool] = weakref.WeakSet()
 _SIGNAL_HANDLERS_INSTALLED = False
 
 
@@ -205,7 +205,7 @@ def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
     return need_tokens <= short_pool.available_size()
 
 
-class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
+class MultiEndedKVPool(BaseKVPool):
     """Allocator for one sub-pool over a `UnifiedKVPool`."""
 
     # Capacity-bearing state: any rebind bumps `_capacity_epoch`, invalidating
@@ -305,8 +305,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         # Chain neighbours: `low_peer` toward byte 0, `high_peer` toward
         # `total_bytes`. Ends have one (`bind_peer`), float middles have both.
-        self.low_peer: Optional[MultiEndedAllocator] = None
-        self.high_peer: Optional[MultiEndedAllocator] = None
+        self.low_peer: Optional[MultiEndedKVPool] = None
+        self.high_peer: Optional[MultiEndedKVPool] = None
 
         # Inverse history of relocations (spec rollback), at PAGE granularity.
         self._inverse_history: List[
@@ -375,7 +375,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
         logger.info(
-            "[unified-memory-pool] MultiEndedAllocator(%r) ready: grow=%s, max_slots=%d, "
+            "[unified-memory-pool] MultiEndedKVPool(%r) ready: grow=%s, max_slots=%d, "
             "min_slot_index=%d, page_size=%d, num_pages=%d, min_page_index=%d, "
             "entry_bytes=%d, entry_bytes_per_page=%d, is_id_owner=%s, "
             "initial_watermark_page=%d, allocatable_pages=%d",
@@ -395,7 +395,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- chain-neighbor binding --
 
-    def bind_peer(self, peer: MultiEndedAllocator) -> None:
+    def bind_peer(self, peer: MultiEndedKVPool) -> None:
         """Bind the OTHER end as this end's growth-side neighbor: a grow-up
         pool's neighbor sits above it, a grow-down pool's below.
         """
@@ -413,11 +413,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.low_peer = peer
         self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
-    def bind_low_peer(self, peer: MultiEndedAllocator) -> None:
+    def bind_low_peer(self, peer: MultiEndedKVPool) -> None:
         self.low_peer = peer
         self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
-    def bind_high_peer(self, peer: MultiEndedAllocator) -> None:
+    def bind_high_peer(self, peer: MultiEndedKVPool) -> None:
         self.high_peer = peer
         self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
@@ -603,7 +603,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             p = p.high_peer
         return total
 
-    def _growth_side_neighbor(self) -> Optional[MultiEndedAllocator]:
+    def _growth_side_neighbor(self) -> Optional[MultiEndedKVPool]:
         """Nearest NON-transparent chain member on this pool's GROWTH side -- the
         one whose compaction releases bytes reachable at this pool's frontier."""
         p = self.high_peer if self.grow_direction == "up" else self.low_peer
@@ -687,7 +687,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """A band short on its OWN pages asks the growth-side member, if it is a
         float, to open the side facing it; the policy is `_float_open_short_side`."""
         blocker = self._growth_side_neighbor()
-        if not isinstance(blocker, FloatMultiEndedAllocator):
+        if not isinstance(blocker, FloatMultiEndedKVPool):
             return
         _float_open_short_side(blocker, {self: -(-need_tokens // self.page_size)})
 
@@ -1055,13 +1055,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         with record_function("MultiEndedAlloc.alloc"):
             assert self.is_id_owner, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc called on a "
+                f"MultiEndedKVPool({self.sub_pool_name!r}).alloc called on a "
                 "non-id-owner allocator; use alloc_with_virtual instead"
             )
             if need_size <= 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
             assert need_size % self.page_size == 0, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc: need_size="
+                f"MultiEndedKVPool({self.sub_pool_name!r}).alloc: need_size="
                 f"{need_size} must be a multiple of page_size={self.page_size}"
             )
             if need_size > self.available_size():
@@ -1095,7 +1095,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 virtual_pages, int(virtual_pages.numel())
             )
             assert phys_pages is not None, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
+                f"MultiEndedKVPool({self.sub_pool_name!r}).alloc_with_virtual: out of "
                 "physical room (the composite's byte-budget check should have caught this)"
             )
 
@@ -1885,7 +1885,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             v_moveds_t = self.physical_to_virtual[src_pages_t]
             torch._assert_async(
                 (v_moveds_t >= 0).all(),
-                "invalid p2v mapping in MultiEndedAllocator._flush",
+                "invalid p2v mapping in MultiEndedKVPool._flush",
             )
             # Expand to PHYSICAL token granularity (the move kernel is
             # token-granular over pool rows).
@@ -1929,7 +1929,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         frames = inspect.stack()[1:9]
         callers = " <- ".join(f"{f.filename.split('/')[-1]}:{f.lineno}" for f in frames)
         raise AssertionError(
-            f"MultiEndedAllocator({self.sub_pool_name!r}).free: virtual id(s) {bad} have "
+            f"MultiEndedKVPool({self.sub_pool_name!r}).free: virtual id(s) {bad} have "
             f"virtual_to_physical == -1 (double-free or never-allocated). "
             f"State: {self.allocator_state_str()}. free_index unique={free_v.tolist()}. "
             f"recent _inverse_history (last 3): "
@@ -1952,7 +1952,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
 
 def _chain_byte_accounting_violations(
-    chain: List[MultiEndedAllocator],
+    chain: List[MultiEndedKVPool],
 ) -> List[str]:
     """Conservation for an ordered low-to-high chain of band allocators: each
     member's own accounting, plus the frontier total order -- a member's low
@@ -1977,15 +1977,13 @@ def _chain_byte_accounting_violations(
     return out
 
 
-def _end_pair_chain(
-    a: MultiEndedAllocator, b: MultiEndedAllocator
-) -> List[MultiEndedAllocator]:
+def _end_pair_chain(a: MultiEndedKVPool, b: MultiEndedKVPool) -> List[MultiEndedKVPool]:
     """Order an end pair low→high by grow direction (the factories and the
     unit fixtures orient the pair differently; the chain check must not care)."""
     return sorted((a, b), key=lambda x: x.grow_direction != "up")
 
 
-class FloatMultiEndedAllocator(MultiEndedAllocator):
+class FloatMultiEndedKVPool(MultiEndedKVPool):
     """Float MIDDLE cache pool: a span ``[low_wm_page, high_wm_page)`` between
     two chain neighbors, with freed HOLES allowed inside the span.
 
@@ -2014,7 +2012,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     def __init__(self, **kwargs):
         assert not kwargs.get("lazy_compaction", False), (
-            "FloatMultiEndedAllocator is holes-first; the lazy event pipeline "
+            "FloatMultiEndedKVPool is holes-first; the lazy event pipeline "
             "is end-pool machinery and must stay off for float middles"
         )
         # Base __init__ ends with self.clear(), which reads these via our
@@ -2023,7 +2021,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         self.high_wm_page = 0
         super().__init__(**kwargs)
         assert self.grow_direction == "float", (
-            f"FloatMultiEndedAllocator needs a 'float' sub-pool spec; got "
+            f"FloatMultiEndedKVPool needs a 'float' sub-pool spec; got "
             f"{self.grow_direction!r}"
         )
 
@@ -2501,7 +2499,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         new_entries = self._inverse_history[n_inverse:]
         if new_entries:
             logger.warning(
-                "FloatMultiEndedAllocator.restore_state: %d relocation(s) inside "
+                "FloatMultiEndedKVPool.restore_state: %d relocation(s) inside "
                 "a backup window (sub_pool=%s) — float moves are not reversible.",
                 len(new_entries),
                 self.sub_pool_name,
@@ -2530,7 +2528,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     # -- band-incompatible base APIs --
 
-    def bind_peer(self, peer: MultiEndedAllocator) -> None:  # pragma: no cover
+    def bind_peer(self, peer: MultiEndedKVPool) -> None:  # pragma: no cover
         raise AssertionError(
             "float middles must be wired via bind_low_peer/bind_high_peer"
         )

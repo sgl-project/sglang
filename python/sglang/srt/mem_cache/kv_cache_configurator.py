@@ -37,23 +37,24 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.allocator import (
-    BaseTokenToKVPoolAllocator,
-    PagedTokenToKVPoolAllocator,
-    TokenToKVPoolAllocator,
+    BaseKVAllocator,
+    PagedKVPool,
+    TokenedKVPool,
 )
+from sglang.srt.mem_cache.allocator.base import SinglePoolKVAllocator
 from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseTokenToKVPoolAllocator,
+    HiSparseHybridSWAKVAllocator,
+    HiSparseKVAllocator,
 )
 from sglang.srt.mem_cache.allocator.swa import (
-    PureSWATokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
+    HybridSWAKVAllocator,
+    PureSWAKVAllocator,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
+    UnifiedHybridSWAKVAllocator,
 )
 from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
+    UnifiedMambaKVAllocator,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
@@ -218,7 +219,7 @@ class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
     swa_max_total_num_tokens: Optional[int]
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: KVCache
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    token_to_kv_pool_allocator: BaseKVAllocator
     memory_pool_config: MemoryPoolConfig
     unified_memory_pool: Optional[UnifiedKVPool] = None
 
@@ -226,7 +227,7 @@ class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
 class _InitializedPools(msgspec.Struct, frozen=True, kw_only=True):
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: KVCache
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    token_to_kv_pool_allocator: BaseKVAllocator
     unified_memory_pool: Optional[UnifiedKVPool] = None
 
 
@@ -267,7 +268,7 @@ class KVCacheConfigurator:
     layer_info: ModelLayerInfo
     forward_stream: Any
     req_to_token_pool: Optional[ReqToTokenPool]
-    token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
+    token_to_kv_pool_allocator: Optional[BaseKVAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
@@ -426,7 +427,7 @@ class KVCacheConfigurator:
         *,
         sizes: _PoolSizes,
         req_to_token_pool: Optional[ReqToTokenPool],
-        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
+        token_to_kv_pool_allocator: Optional[BaseKVAllocator],
     ) -> _InitializedPools:
         """Initialize the memory pools."""
         token_to_kv_pool = None
@@ -512,8 +513,8 @@ class KVCacheConfigurator:
             if isinstance(
                 token_to_kv_pool_allocator,
                 (
-                    UnifiedMambaTokenToKVPoolAllocator,
-                    UnifiedSWATokenToKVPoolAllocator,
+                    UnifiedMambaKVAllocator,
+                    UnifiedHybridSWAKVAllocator,
                 ),
             ):
                 draft_virtual_id_space = (
@@ -536,7 +537,7 @@ class KVCacheConfigurator:
                 if (
                     isinstance(
                         token_to_kv_pool_allocator,
-                        UnifiedSWATokenToKVPoolAllocator,
+                        UnifiedHybridSWAKVAllocator,
                     )
                     and self.is_hybrid_swa
                 ):
@@ -645,7 +646,7 @@ class KVCacheConfigurator:
 
         config = self.mambaish_config
         assert config is not None
-        # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
+        # The full sub-pool is page-aware (via `MultiEndedKVPool(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
         # Mirror the non-shared path's extra_max_context_len computation.
@@ -1909,20 +1910,22 @@ class KVCacheConfigurator:
         token_to_kv_pool: KVCache,
         is_dsv4_model: bool,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
-    ) -> BaseTokenToKVPoolAllocator:
+        token_to_kv_pool_allocator: Optional[BaseKVAllocator],
+    ) -> BaseKVAllocator:
         # Initialize token_to_kv_pool_allocator
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
             if current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
-                token_to_kv_pool_allocator = AllocatorCls(
-                    sizes.max_total_num_tokens,
-                    page_size=get_schedule().page_size,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=token_to_kv_pool,
-                    need_sort=need_sort,
+                token_to_kv_pool_allocator = SinglePoolKVAllocator(
+                    AllocatorCls(
+                        sizes.max_total_num_tokens,
+                        page_size=get_schedule().page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
                 )
             elif _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
@@ -1934,12 +1937,12 @@ class KVCacheConfigurator:
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
                     if is_dsv4_model:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
-                            DSV4NPUTokenToKVPoolAllocator,
+                            NPUDSV4HybridSWAKVAllocator,
                         )
 
-                        swa_allocator_cls = DSV4NPUTokenToKVPoolAllocator
+                        swa_allocator_cls = NPUDSV4HybridSWAKVAllocator
                     else:
-                        swa_allocator_cls = SWATokenToKVPoolAllocator
+                        swa_allocator_cls = HybridSWAKVAllocator
                     token_to_kv_pool_allocator = swa_allocator_cls(
                         sizes.full_max_total_num_tokens,
                         sizes.swa_max_total_num_tokens,
@@ -1951,20 +1954,22 @@ class KVCacheConfigurator:
                     )
                 else:
                     from sglang.srt.hardware_backend.npu.allocator_npu import (
-                        NPUPagedTokenToKVPoolAllocator,
+                        NPUPagedKVPool,
                     )
 
-                    token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
-                        sizes.max_total_num_tokens,
-                        page_size=get_schedule().page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=token_to_kv_pool,
-                        need_sort=need_sort,
+                    token_to_kv_pool_allocator = SinglePoolKVAllocator(
+                        NPUPagedKVPool(
+                            sizes.max_total_num_tokens,
+                            page_size=get_schedule().page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
                     )
             else:
                 if self.is_hybrid_swa and sizes.full_max_total_num_tokens == 0:
-                    token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
+                    token_to_kv_pool_allocator = PureSWAKVAllocator(
                         sizes.swa_max_total_num_tokens,
                         page_size=get_schedule().page_size,
                         dtype=self.kv_cache_dtype,
@@ -1973,7 +1978,11 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 elif self.is_hybrid_swa:
-                    token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                    if get_memory().enable_hisparse and is_dsv4_model:
+                        hybrid_allocator_cls = HiSparseHybridSWAKVAllocator
+                    else:
+                        hybrid_allocator_cls = HybridSWAKVAllocator
+                    token_to_kv_pool_allocator = hybrid_allocator_cls(
                         sizes.full_max_total_num_tokens,
                         sizes.swa_max_total_num_tokens,
                         page_size=get_schedule().page_size,
@@ -1989,7 +1998,7 @@ class KVCacheConfigurator:
                         )
 
                         hisparse_cfg = parse_hisparse_config()
-                        token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
+                        token_to_kv_pool_allocator = HiSparseKVAllocator(
                             sizes.max_total_num_tokens,
                             page_size=get_schedule().page_size,
                             dtype=self.kv_cache_dtype,
@@ -2001,29 +2010,31 @@ class KVCacheConfigurator:
                     elif (
                         get_schedule().page_size == 1 and not get_parallel().dcp_enabled
                     ):
-                        token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                            sizes.max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=token_to_kv_pool,
-                            need_sort=need_sort,
+                        token_to_kv_pool_allocator = SinglePoolKVAllocator(
+                            TokenedKVPool(
+                                sizes.max_total_num_tokens,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
                         )
                     else:
-                        token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
-                            page_size=get_schedule().page_size
-                            * get_parallel().attn_dcp_size,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=token_to_kv_pool,
-                            need_sort=need_sort,
+                        token_to_kv_pool_allocator = SinglePoolKVAllocator(
+                            PagedKVPool(
+                                sizes.max_total_num_tokens
+                                * get_parallel().attn_dcp_size,
+                                page_size=get_schedule().page_size
+                                * get_parallel().attn_dcp_size,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
                         )
 
             if get_memory().enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
-                token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
-                    token_to_kv_pool_allocator
-                )
 
             # DSV4-NPU: wire allocator back-ref into req_to_token_pool so its
             # free(req) can release c4/c128 pool pages alongside the slot.
@@ -2033,15 +2044,8 @@ class KVCacheConfigurator:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                if isinstance(
-                    token_to_kv_pool_allocator,
-                    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-                ):
-                    swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
-                else:
-                    swa_allocator = token_to_kv_pool_allocator
                 uses_unified_virtual_ids = isinstance(
-                    swa_allocator, UnifiedSWATokenToKVPoolAllocator
+                    token_to_kv_pool_allocator, UnifiedHybridSWAKVAllocator
                 )
                 has_draft_swa_layers = (
                     not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
@@ -2060,9 +2064,12 @@ class KVCacheConfigurator:
                     identity_mapping[-1] = -1
                     token_to_kv_pool.register_mapping(identity_mapping)
                 elif not uses_unified_virtual_ids:
-                    assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
+                    assert isinstance(
+                        token_to_kv_pool_allocator,
+                        (HybridSWAKVAllocator, PureSWAKVAllocator),
+                    )
                     token_to_kv_pool.register_mapping(
-                        swa_allocator.full_to_swa_index_mapping
+                        token_to_kv_pool_allocator.full_to_swa_index_mapping
                     )
         return token_to_kv_pool_allocator
 

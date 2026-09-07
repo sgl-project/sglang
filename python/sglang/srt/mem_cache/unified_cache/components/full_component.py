@@ -431,7 +431,7 @@ class FullComponent(TreeComponent):
     def _full_allocator(self):
         """The allocator that owns the full-attention pool alone."""
         allocator = self.cache.token_to_kv_pool_allocator
-        return allocator.full_attn_allocator if self.cache.is_swa_enabled else allocator
+        return allocator.side(ComponentType.FULL).pool
 
     def build_external_linker_transfer(
         self,
@@ -505,7 +505,7 @@ class FullComponent(TreeComponent):
             for indices in action.indices:
                 # tree values are page-aligned copies of a kv row: page-exact segments
                 if self.cache.is_swa_enabled:
-                    alloc.full_attn_allocator.free_segment(indices, start_pos=0)
+                    alloc.full.free_segment(indices, start_pos=0)
                 else:
                     alloc.free_segment(indices, start_pos=0)
             return
