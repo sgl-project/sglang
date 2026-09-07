@@ -1323,6 +1323,38 @@ class TestPortArgs(unittest.TestCase):
 
         self.assertIn("Missing port", str(context.exception))
 
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_recovery_joiner_reports_to_primary_tokenizer(self, _mock_wait_port):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.port = 30000
+        server_args.nccl_port = 25010
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 4
+        server_args.node_rank = 3
+        server_args.dist_init_addr = "192.168.1.1:25000"
+        server_args.ep_join_mode = "recover"
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertEqual(port_args.tokenizer_ipc_name, "tcp://192.168.1.1:25001")
+        self.assertEqual(port_args.detokenizer_ipc_name, "tcp://192.168.1.1:30234")
+
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_scale_joiner_keeps_private_tokenizer_port(self, _mock_wait_port):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.port = 30000
+        server_args.nccl_port = 25010
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 4
+        server_args.node_rank = 3
+        server_args.dist_init_addr = "192.168.1.1:25000"
+        server_args.ep_join_mode = "scale"
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertEqual(port_args.tokenizer_ipc_name, "tcp://192.168.1.1:30233")
+        self.assertEqual(port_args.detokenizer_ipc_name, "tcp://192.168.1.1:30234")
+
     def test_init_new_with_malformed_ipv4_address_invalid_port(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000

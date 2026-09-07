@@ -53,7 +53,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
 )
-from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
+from sglang.srt.arg_groups.model_override_base import ep_joiner_of
 from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
     resolution_projection,
@@ -1012,14 +1012,17 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + cfg.dp_size
-            if ep_scale_joiner_of(resolving_view(server_args)):
+            if dist_init_port + NUM_DERIVED_PORTS > 65535:
+                primary_port_base = dist_init_port - NUM_DERIVED_PORTS - 1
+            else:
+                primary_port_base = dist_init_port + 1
+
+            if ep_joiner_of(cfg):
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
-            elif dist_init_port + NUM_DERIVED_PORTS > 65535:
-                port_base = dist_init_port - NUM_DERIVED_PORTS - 1
             else:
-                port_base = dist_init_port + 1
+                port_base = primary_port_base
 
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
@@ -1037,6 +1040,8 @@ class PortArgs:
                 scheduler_input_port = worker_ports[dp_rank]
 
             is_joiner = ep_joiner_of(resolving_view(server_args))
+            is_recovery_joiner = cfg.ep_join_mode == "recover"
+            tokenizer_port = primary_port_base if is_recovery_joiner else port_base
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
@@ -1048,9 +1053,10 @@ class PortArgs:
                 if dp_rank is None:
                     if not (is_joiner or dist_init_overridden):
                         wait_port_available(dist_init_port, "dist_init_port")
-                    wait_port_available(port_base, "port_base")
-                    wait_port_available(detokenizer_port, "detokenizer_port")
-                    if not dist_init_overridden:
+                    if not is_recovery_joiner:
+                        wait_port_available(port_base, "port_base")
+                        wait_port_available(detokenizer_port, "detokenizer_port")
+                    if not (is_recovery_joiner or dist_init_overridden):
                         wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
@@ -1058,7 +1064,9 @@ class PortArgs:
                         wait_port_available(load_collector_port, "load_collector_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
-                if dp_rank is None or worker_ports is None:
+                if not is_recovery_joiner and (
+                    dp_rank is None or worker_ports is None
+                ):
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
@@ -1067,7 +1075,9 @@ class PortArgs:
                 raise
 
             return PortArgs(
-                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
+                tokenizer_ipc_name=NetworkAddress(
+                    dist_init_host, tokenizer_port
+                ).to_tcp(),
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),

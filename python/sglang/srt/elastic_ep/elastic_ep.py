@@ -512,6 +512,14 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
     elastic_ep_state = ElasticEPStateManager.instance()
     if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
         return False
+    group = get_world_group()
+    if torch.distributed.get_backend(group.cpu_group) == "mooncake-cpu":
+        from mooncake import pg
+
+        for backend in (group.device_group, group.cpu_group):
+            response = pg.sync_after_failure(backend)
+            assert response.status != pg.SyncAfterFailureStatus.Rejected
+        group.barrier()
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
     logger.info("EPLB due to rank faults")
@@ -521,4 +529,6 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
             next(gen)
         except StopIteration:
             break
+    if torch.distributed.get_backend(group.cpu_group) == "mooncake-cpu":
+        group.barrier()
     return True

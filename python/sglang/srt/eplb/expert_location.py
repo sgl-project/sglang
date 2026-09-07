@@ -516,6 +516,7 @@ def broadcast_global_expert_location_metadata(
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
+    # Ensure device tensors are contiguous before broadcasting in-place
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
     torch.distributed.broadcast(
         metadata.physical_to_logical_map, src=src_rank, group=group

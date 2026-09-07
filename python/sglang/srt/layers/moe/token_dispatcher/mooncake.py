@@ -19,8 +19,9 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import get_resources
+from sglang.srt.layers.moe.utils import DeepEPMode, get_moe_runner_backend
+from sglang.srt.runtime_context import get_exec, get_resources
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ class EPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        connect_on_init: bool = True,
     ):
         state = cls._state()
         if state.buffer is not None:
@@ -118,7 +120,9 @@ class EPBuffer:
                 num_experts,
             )
 
-        state.buffer = Buffer(group, num_ep_buffer_bytes)
+        state.buffer = Buffer(
+            group, num_ep_buffer_bytes, connect_on_init=connect_on_init
+        )
         return state.buffer
 
 
@@ -166,6 +170,9 @@ class _MooncakeEPDispatcherImpl:
 
         self.handle = None
 
+        if get_exec().moe.ep_join_mode == "recover":
+            self._get_buffer(connect_on_init=False)
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -181,7 +188,7 @@ class _MooncakeEPDispatcherImpl:
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
-            use_fp8=True,
+            use_fp8=self._should_use_fp8_dispatch(),
         )
         return (
             hidden_states,
@@ -246,6 +253,12 @@ class _MooncakeEPDispatcherImpl:
         )
         return packed_recv_hidden, packed_recv_count, event, hook
 
+    def _should_use_fp8_dispatch(self) -> bool:
+        backend = get_moe_runner_backend()
+        if envs.SGLANG_DEEPEP_BF16_DISPATCH.get() or backend.is_triton():
+            return False
+        return True
+
     def combine_a(
         self,
         hidden_states: torch.Tensor,
@@ -291,7 +304,7 @@ class _MooncakeEPDispatcherImpl:
             return elastic_state.active_ranks
         return torch.ones(self.group.size(), dtype=torch.int32, device="cuda")
 
-    def _get_buffer(self):
+    def _get_buffer(self, connect_on_init: bool = True):
         return EPBuffer.get_ep_buffer(
             self.group,
             self.hidden_size,
@@ -299,6 +312,7 @@ class _MooncakeEPDispatcherImpl:
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            connect_on_init,
         )
 
 
