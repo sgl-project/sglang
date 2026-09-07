@@ -4,7 +4,9 @@ import json
 import os
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.linker_load_failure_kit import LinkerLoadFailureMixin
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.mooncake_utils import MooncakeTestServices
@@ -18,7 +20,7 @@ from sglang.test.test_utils import (
 GLM52_MODEL = os.environ.get("SGLANG_LINKER_GLM52_MODEL", "zai-org/GLM-5.2-FP8")
 GLM52_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=383, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=766, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
@@ -130,6 +132,54 @@ class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     def test_multiturn_decode_cache_hit_branching(self):
         self._run_linker_kl_case(super().test_multiturn_decode_cache_hit_branching)
+
+
+class TestGLM52UnifiedCacheLinkerLoadFailure(
+    LinkerLoadFailureMixin, TestGLM52UnifiedCacheLinkerKL
+):
+    """The same linker arm, with a fraction of its remote KV reads failing.
+
+    Inherits the launch configuration above rather than restating it, so the
+    load-backs this faults are the same load-backs the KL arm measures.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Entered before the launch so the server subprocesses inherit it --
+        # the injection is read inside the linker, in each TP worker.
+        cls._failure_ctx = envs.SGLANG_TEST_LINKER_LOAD_FAILURE_PROB.override(
+            cls.linker_load_failure_prob
+        )
+        cls._failure_ctx.__enter__()
+        try:
+            super().setUpClass()
+        except Exception:
+            cls._failure_ctx.__exit__(None, None, None)
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            super().tearDownClass()
+        finally:
+            cls._failure_ctx.__exit__(None, None, None)
+
+    # See the DSV4 file for why the inherited KL cases are skipped here: their
+    # helpers post a batch of prompts as one /generate call, so a single
+    # aborted member loses the whole batch instead of reporting it.
+    _BATCHED = "Batched KL helpers cannot report a per-request abort"
+
+    @unittest.skip(_BATCHED)
+    def test_multiturn_logprobs_match(self):
+        pass
+
+    @unittest.skip(_BATCHED)
+    def test_multiturn_prefill_cache_hit_branching(self):
+        pass
+
+    @unittest.skip(_BATCHED)
+    def test_multiturn_decode_cache_hit_branching(self):
+        pass
 
 
 if __name__ == "__main__":

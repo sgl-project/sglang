@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     is_aborted,
     is_dsv4_c128_online_enabled,
+    is_external_kv_load_failure,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
@@ -775,6 +776,32 @@ class SchedulerDisaggregationPrefillMixin:
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
                     self.optimistic_release_and_requeue(req)
+                    advance_logprob_pt(i, req)
+                    continue
+
+                # An external-linker load that failed over the very KV this
+                # forward consumed must not have that KV sent, or the decode
+                # side serves pages that never arrived. Finish it here the way
+                # handle_bootstrap_failure does rather than queueing it for a
+                # transfer.
+                #
+                # Deliberately narrower than is_aborted(): a user abort reaches
+                # the decode node through its own AbortReq, so it needs no drop
+                # here, and widening this would change PD abort semantics well
+                # outside the linker path. A linker failure has no such second
+                # path -- it is an internal decision of this node.
+                if is_external_kv_load_failure(req):
+                    req.update_finish_state()
+                    self.clear_pending_chunk_send(req)
+                    if req.disagg_kv_sender is not None:
+                        req.disagg_kv_sender.abort()
+                    maybe_release_metadata_buffer(
+                        req, self.req_to_metadata_buffer_idx_allocator
+                    )
+                    req.pending_bootstrap = False
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.set_completion_time()
+                    self.output_streamer.stream_output([req], req.return_logprob)
                     advance_logprob_pt(i, req)
                     continue
 

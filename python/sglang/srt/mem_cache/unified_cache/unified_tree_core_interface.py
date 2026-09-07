@@ -297,6 +297,36 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def detach_external_load_chain(
+        self, endpoint_id: NodeId, anchor_id: NodeId
+    ) -> list[NodeId]:
+        """Cut the chain an external-linker load published before failing out
+        of the tree, so nothing can match or extend pages that hold no KV.
+        Returns the detached node ids, endpoint first, for the purge."""
+        ...
+
+    @abstractmethod
+    def holds_detached_node(self, node_id: NodeId) -> bool:
+        """Whether the arena still holds this node, so a declined reclaim can
+        tell "still owned, retry" from "already gone, drop it"."""
+        ...
+
+    @abstractmethod
+    def is_on_detached_chain(self, node_id: NodeId) -> bool:
+        """Whether this node, or any ancestor of it, is on a chain a failed
+        external-linker load left detached -- i.e. whether a request pointing
+        here is pointing at KV that never arrived."""
+        ...
+
+    @abstractmethod
+    def invalidate_external_load_chain(
+        self, node_id: NodeId
+    ) -> DropSubtreeNoHostResult:
+        """Free a detached chain's slots; declines (is_dropped=False) for any
+        node something else still owns, leaving it for the caller to retry."""
+        ...
+
+    @abstractmethod
     def demote(self, node_id: NodeId) -> DemoteResult:
         """Demote a backed-up node: drop its device value after a successful backup."""
         ...

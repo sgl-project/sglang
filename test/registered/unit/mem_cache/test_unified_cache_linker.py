@@ -146,6 +146,7 @@ def test_async_offload_pins_node_until_completion():
         id=node_id,
         external_cache_stored=False,
         write_through_pending_id=None,
+        detached=False,
     )
     cache = _cache_for_wrapper(
         tree_core=SimpleNamespace(
@@ -192,13 +193,13 @@ def test_async_load_pins_node_until_completion():
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
 
-    wrapper._queue_load("rid", node_id, [object()])
+    wrapper._queue_load("rid", node_id, [object()], anchor=0)
 
     assert locks == [node_id]
     assert not unlocks
 
-    linker.completed_loads.append(["rid"])
-    wrapper.drain_loads(finish_count=1)
+    linker.completed_loads.append((["rid"], True))
+    wrapper.commit_completed_loads(wrapper.take_completed_loads(1))
 
     assert unlocks == [(node_id, lock_params)]
 
@@ -212,7 +213,7 @@ def test_release_request_cancels_queued_load():
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
     wrapper.hit_markers["rid"] = object()
-    wrapper.pending_loads["rid"] = (7, lock_params)
+    wrapper.pending_loads["rid"] = (7, lock_params, 0)
     linker.queued_loads["rid"] = [object()]
 
     wrapper.release_request("rid")
@@ -235,11 +236,13 @@ def test_failed_offload_rolls_back_split_fragments():
         id=7,
         external_cache_stored=False,
         write_through_pending_id=None,
+        detached=False,
     )
     parent = SimpleNamespace(
         id=8,
         external_cache_stored=False,
         write_through_pending_id=None,
+        detached=False,
     )
     nodes = {child.id: child, parent.id: parent}
 
@@ -315,6 +318,7 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
         id=7,
         external_cache_stored=False,
         write_through_pending_id=None,
+        detached=False,
     )
     cache = _cache_for_wrapper(
         tree_core=SimpleNamespace(
@@ -329,7 +333,7 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
         resolve_node_handle=lambda node_id: node,
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper._queue_load("rid", node.id, [object()])
+    wrapper._queue_load("rid", node.id, [object()], anchor=0)
     wrapper.offload_nodes([node.id])
 
     wrapper.reset()
@@ -354,7 +358,7 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id))
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper.pending_loads["rid"] = (7, object())
+    wrapper.pending_loads["rid"] = (7, object(), 0)
 
     wrapper.close()
 
@@ -366,9 +370,16 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
 def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache._failed_linker_rids = []
+
+    def commit_loads(successes):
+        committed.append(("load", successes))
+        return []
+
     cache.linker = SimpleNamespace(
         num_completed_loads=lambda: 1,
-        drain_loads=lambda count: committed.append(("load", count)),
+        take_completed_loads=lambda count: [True] * count,
+        commit_completed_loads=commit_loads,
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
@@ -389,7 +400,7 @@ def test_check_hicache_events_commits_common_rank_results():
 
     cache.check_hicache_events()
 
-    assert committed == [("load", 1), [False]]
+    assert committed == [("load", [False]), [False]]
 
 
 def test_component_commit_keeps_only_adopted_pages():
