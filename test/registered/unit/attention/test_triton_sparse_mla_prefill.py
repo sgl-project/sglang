@@ -2,7 +2,7 @@
 """CPU unit tests for the Triton sparse-MLA prefill adapter and its capability
 check. The kernel is mocked, so these guard the wiring rather than the numerics
 (which live in
-``test/registered/kernels/ops/attention/test_dsa_triton_sparse_mla_prefill.py``):
+``test/registered/kernel/attention/test_dsa_triton_sparse_mla_prefill.py``):
 
 - argument marshalling between the DSA backend and the kernel entry point,
 - the two fast-path switches being off unless asked for, at both the CLI layer
