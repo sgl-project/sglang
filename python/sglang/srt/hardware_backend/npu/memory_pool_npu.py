@@ -613,14 +613,23 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         for i in range(layer_num)
                     ]
                 else:
-                    # Nothing to elide: keep the single dense tensor. This is not
-                    # only the cheaper allocation -- the hierarchical-cache
-                    # transfer path hands this buffer whole to
+                    # Nothing to elide: keep the single dense tensor, because the
+                    # hierarchical-cache path cannot accept anything else. It
+                    # hands this buffer whole to
                     # `sgl_kernel_npu.kvcacheio.transfer_kv_dim_exchange`
-                    # alongside the dense k/v buffers (mem_cache/pool_host/mla.py),
-                    # and that vendor kernel is not ours to teach about lists.
-                    # `_should_elide_dsa_index_k` already excludes hierarchical
-                    # cache, so the two shapes never have to meet.
+                    # (mem_cache/pool_host/mla.py), whose op host requires
+                    # `dim() == 5`, derives one pitch from
+                    # `pages * page_size * heads * head_dim * itemsize`, and
+                    # strides `height = total_num_layers` rows from
+                    # `device_k[0][page]` in a 2D aclrtMemcpy2dAsync -- so it
+                    # assumes every layer occupies the same pages at a uniform
+                    # stride, and separately asserts device layer count equals
+                    # host layer count. A ragged buffer has no such pitch.
+                    # `_should_elide_dsa_index_k` excludes hierarchical cache, so
+                    # the two shapes never meet. Combining them later would mean
+                    # compacting device *and* host index-K to the indexer layers
+                    # together, with a layer->slot remap on both sides; the
+                    # kernel only needs the two counts to agree.
                     self.index_k_buffer = torch.zeros(
                         (
                             layer_num,
