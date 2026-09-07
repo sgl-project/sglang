@@ -2612,7 +2612,7 @@ def add_prometheus_middleware(app):
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
-    registry = CollectorRegistry()
+    registry = CollectorRegistry(support_collectors_without_names=True)
     multiprocess.MultiProcessCollector(registry)
     metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
 
