@@ -612,7 +612,7 @@ class DeepseekMHAForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda:
+        if _is_cuda or _use_aiter_gfx95:
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
@@ -677,9 +677,22 @@ class DeepseekMHAForwardMixin:
     def _concat_and_cast_mha_k(
         self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,
-        k_pe: torch.Tensor,
+        k_pe: torch.Tensor | None,
         forward_batch: ForwardBatch,
     ):
+        if self.qk_rope_head_dim == 0:
+            assert k_pe is None or k_pe.shape[-1] == 0
+            k = k_nope.contiguous()
+            if (
+                _is_cuda
+                and self.current_attention_backend == "fa3"
+                and self.kv_cache_dtype != "auto"
+            ):
+                # fa3 requires k in the pool dtype when KV cache is fp8; the
+                # concat branch below does the same cast for roped models.
+                k = k.to(get_token_to_kv_pool().dtype)
+            return k
+
         # Temporary for DeepSeek V3/R1 only, but can generalize if needed
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
         if (

@@ -11,7 +11,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class _FakeReq:
