@@ -101,6 +101,10 @@ MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
 
 
+def _default_diffusion_log_level() -> str:
+    return envs.SGLANG_DIFFUSION_LOGGING_LEVEL.lower()
+
+
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
@@ -549,7 +553,7 @@ class ServerArgs(DisaggServerArgsMixin):
     pool_control_advertised_endpoint: str | None = None
 
     # Logging
-    log_level: str = "info"
+    log_level: str = field(default_factory=_default_diffusion_log_level)
     log_requests: bool = False
     log_requests_level: int = 2
     log_requests_format: str = "text"
@@ -2813,7 +2817,7 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--log-level",
             type=str,
-            default=ServerArgs.log_level,
+            default=_default_diffusion_log_level(),
             help="The logging level of all loggers.",
         )
 

@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 import sys
@@ -138,6 +139,36 @@ def _from_dict_without_model_resolution(
         _mock_cuda_platform(),
     ):
         return ServerArgs.from_dict(kwargs)
+
+
+class TestDiffusionLoggingEnvDefaults(unittest.TestCase):
+    def test_server_args_default_follows_environment(self):
+        log_level_field = next(
+            field
+            for field in dataclasses.fields(ServerArgs)
+            if field.name == "log_level"
+        )
+
+        with patch.dict(os.environ, {"SGLANG_DIFFUSION_LOGGING_LEVEL": "WARNING"}):
+            self.assertEqual(log_level_field.default_factory(), "warning")
+
+    def test_cli_default_follows_environment(self):
+        with patch.dict(os.environ, {"SGLANG_DIFFUSION_LOGGING_LEVEL": "ERROR"}):
+            parser = FlexibleArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            args, _unknown = parser.parse_known_args(["--model-path", "/fake"])
+
+        self.assertEqual(args.log_level, "error")
+
+    def test_cli_explicit_log_level_overrides_environment(self):
+        with patch.dict(os.environ, {"SGLANG_DIFFUSION_LOGGING_LEVEL": "ERROR"}):
+            parser = FlexibleArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            args, _unknown = parser.parse_known_args(
+                ["--model-path", "/fake", "--log-level", "debug"]
+            )
+
+        self.assertEqual(args.log_level, "debug")
 
 
 class TestServerArgsPathExpansion(unittest.TestCase):
