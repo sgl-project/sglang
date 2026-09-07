@@ -118,9 +118,12 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
         ):
             runner = self._make_runner(runner_cls, CaptureHiddenMode.NULL)
 
-            with self.subTest(runner_cls=runner_cls), self.assertRaisesRegex(
-                RuntimeError,
-                "exceeds the fixed (CUDA|CPU) graph capture mode",
+            with (
+                self.subTest(runner_cls=runner_cls),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "exceeds the fixed (CUDA|CPU) graph capture mode",
+                ),
             ):
                 runner._validate_capture_hidden_mode(
                     self._make_forward_batch(CaptureHiddenMode.LAST)

@@ -22,6 +22,9 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
         # still looks busy). That's expected for this test; disable strict
         # mode so the leak warning doesn't crash the scheduler.
         "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "0",
+        # A perturbed slot reaches free_swa with its peer already released: that
+        # is the corruption under test, not a swa.peer_mapped regression.
+        "SGLANG_INVARIANT_CHECK": "0",
     }
 
     @classmethod

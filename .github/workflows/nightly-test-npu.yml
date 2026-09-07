@@ -278,6 +278,7 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      test_timeout_minutes: '180'
 
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
@@ -413,6 +414,11 @@ jobs:
           - name: glm_5_2_w4a8_16p_gpqa
             node_size: 2
             test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w4a8_16p_gpqa.py
+            test_type: 'accuracy'
+          # kimi_k3 accuracy tests
+          - name: kimi_k3_w4a8_32p_gpqa
+            node_size: 4
+            test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
             test_type: 'accuracy'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:

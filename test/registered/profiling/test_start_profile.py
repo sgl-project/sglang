@@ -45,7 +45,6 @@ def _is_nsys_available():
 
 
 class TestStartProfile(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         envs.SGLANG_TORCH_PROFILER_DIR.set(OUTPUT_DIR)

@@ -13,7 +13,6 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestResolveFn(CustomTestCase):
-
     def test_resolves_top_level_function(self):
         self.assertIs(resolve_fn("json:dumps"), json.dumps)
 
@@ -46,7 +45,6 @@ class TestResolveFn(CustomTestCase):
 
 
 class TestEnsureScriptImportable(CustomTestCase):
-
     _FAKE_ENTRY = "/tmp/__scripted_runtime_ut_fake_sys_path__"
 
     def setUp(self):

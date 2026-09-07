@@ -193,9 +193,9 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
 
         if logprobs:
             assert response.choices[0].logprobs
-            assert isinstance(
-                response.choices[0].logprobs.tokens[0], str
-            ), f"{response=}"
+            assert isinstance(response.choices[0].logprobs.tokens[0], str), (
+                f"{response=}"
+            )
             assert isinstance(response.choices[0].logprobs.top_logprobs[1], dict)
             ret_num_top_logprobs = len(response.choices[0].logprobs.top_logprobs[1])
 
@@ -209,9 +209,9 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
 
         assert response.id
         assert response.created
-        assert (
-            response.usage.prompt_tokens == num_prompt_tokens
-        ), f"{response.usage.prompt_tokens} vs {num_prompt_tokens}"
+        assert response.usage.prompt_tokens == num_prompt_tokens, (
+            f"{response.usage.prompt_tokens} vs {num_prompt_tokens}"
+        )
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
@@ -264,9 +264,9 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
 
             if logprobs:
                 assert response.choices[0].logprobs, f"no logprobs in response"
-                assert isinstance(
-                    response.choices[0].logprobs.tokens[0], str
-                ), f"{response.choices[0].logprobs.tokens[0]} is not a string"
+                assert isinstance(response.choices[0].logprobs.tokens[0], str), (
+                    f"{response.choices[0].logprobs.tokens[0]} is not a string"
+                )
                 if not (is_first and echo):
                     assert isinstance(
                         response.choices[0].logprobs.top_logprobs[0], dict
@@ -280,17 +280,17 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
 
             if is_first:
                 if echo:
-                    assert response.choices[0].text.startswith(
-                        prompt
-                    ), f"{response.choices[0].text} and all args {echo} {logprobs} {token_input} {is_first}"
+                    assert response.choices[0].text.startswith(prompt), (
+                        f"{response.choices[0].text} and all args {echo} {logprobs} {token_input} {is_first}"
+                    )
                 is_firsts[index] = False
             assert response.id, f"no id in response"
             assert response.created, f"no created in response"
 
         for index in [i for i in range(parallel_sample_num * num_choices)]:
-            assert not is_firsts.get(
-                index, True
-            ), f"index {index} is not found in the response"
+            assert not is_firsts.get(index, True), (
+                f"index {index} is not found in the response"
+            )
 
     def run_chat_completion(self, logprobs, parallel_sample_num):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -317,9 +317,9 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
             ret_num_top_logprobs = len(
                 response.choices[0].logprobs.content[0].top_logprobs
             )
-            assert (
-                ret_num_top_logprobs == logprobs
-            ), f"{ret_num_top_logprobs} vs {logprobs}"
+            assert ret_num_top_logprobs == logprobs, (
+                f"{ret_num_top_logprobs} vs {logprobs}"
+            )
 
         assert len(response.choices) == parallel_sample_num
         assert response.choices[0].message.role == "assistant"
@@ -366,9 +366,9 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
             data = response.choices[0].delta
 
             if is_firsts.get(index, True):
-                assert (
-                    data.role == "assistant"
-                ), f"data.role was not 'assistant' for first chunk"
+                assert data.role == "assistant", (
+                    f"data.role was not 'assistant' for first chunk"
+                )
                 is_firsts[index] = False
                 continue
 
@@ -383,9 +383,9 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
                 ret_num_top_logprobs = len(
                     response.choices[0].logprobs.content[0].top_logprobs
                 )
-                assert (
-                    ret_num_top_logprobs == logprobs
-                ), f"{ret_num_top_logprobs} vs {logprobs}"
+                assert ret_num_top_logprobs == logprobs, (
+                    f"{ret_num_top_logprobs} vs {logprobs}"
+                )
 
             assert (
                 isinstance(data.content, str)
@@ -397,18 +397,18 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
             assert response.created
 
         for index in [i for i in range(parallel_sample_num)]:
-            assert not is_firsts.get(
-                index, True
-            ), f"index {index} is not found in the response"
+            assert not is_firsts.get(index, True), (
+                f"index {index} is not found in the response"
+            )
 
         # Verify that each choice gets exactly one finish_reason chunk
         for index in range(parallel_sample_num):
-            assert (
-                index in finish_reason_counts
-            ), f"No finish_reason found for index {index}"
-            assert (
-                finish_reason_counts[index] == 1
-            ), f"Expected 1 finish_reason chunk for index {index}, got {finish_reason_counts[index]}"
+            assert index in finish_reason_counts, (
+                f"No finish_reason found for index {index}"
+            )
+            assert finish_reason_counts[index] == 1, (
+                f"Expected 1 finish_reason chunk for index {index}, got {finish_reason_counts[index]}"
+            )
 
     def test_completion(self):
         for echo in [False, True]:

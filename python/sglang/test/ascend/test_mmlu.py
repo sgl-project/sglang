@@ -6,7 +6,6 @@ from sglang.test.run_eval import run_eval
 
 
 class TestMMLU:
-
     mmlu_num_examples = 128
 
     def test_mmlu(self):

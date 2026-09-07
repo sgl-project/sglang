@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from sglang.srt.disaggregation.encode_server import (
+from sglang.srt.disaggregation.encoder.runtime import (
     EncoderScheduler,
     PendingRequest,
     _resolve_encoder_batch_policy,

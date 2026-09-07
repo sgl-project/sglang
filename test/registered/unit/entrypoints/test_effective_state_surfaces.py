@@ -137,9 +137,9 @@ def _expanded_write_keys(rel: str, tree: ast.AST, call: ast.Call, kw: ast.keywor
             if isinstance(key, ast.Constant):
                 keys.add(key.value)
                 continue
-            assert isinstance(
-                key, ast.Name
-            ), f"non-literal dict key in a writer expansion at {rel}:{call.lineno}"
+            assert isinstance(key, ast.Name), (
+                f"non-literal dict key in a writer expansion at {rel}:{call.lineno}"
+            )
             bound = loop_bound(key.id)
             assert bound, (
                 f"dict key {key.id!r} at {rel}:{call.lineno} is not bound by a "
@@ -150,12 +150,12 @@ def _expanded_write_keys(rel: str, tree: ast.AST, call: ast.Call, kw: ast.keywor
 
     if isinstance(kw.value, ast.Dict):
         return dict_keys(kw.value)
-    assert isinstance(
-        kw.value, ast.Name
-    ), f"unresolvable writer expansion at {rel}:{call.lineno}"
-    assert (
-        enclosing is not None
-    ), f"writer expansion outside any function at {rel}:{call.lineno}"
+    assert isinstance(kw.value, ast.Name), (
+        f"unresolvable writer expansion at {rel}:{call.lineno}"
+    )
+    assert enclosing is not None, (
+        f"writer expansion outside any function at {rel}:{call.lineno}"
+    )
     name = kw.value.id
     if enclosing.args.kwarg is not None and enclosing.args.kwarg.arg == name:
         return set()
@@ -349,7 +349,7 @@ class TestEffectiveStateSurfaces(CustomTestCase):
         self.assertEqual(
             missing,
             {},
-            "a serving surface cannot report what it is running: " f"{missing}",
+            f"a serving surface cannot report what it is running: {missing}",
         )
 
     def test_every_surface_reports_the_manager_owned_identity(self):

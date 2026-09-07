@@ -25,7 +25,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -60,10 +60,12 @@ fn config() -> Config {
             // mid-test; round-robin fallback for the initial pin of a key.
             sticky: Some(StickyConfig {
                 header_name: HEADER.to_string(),
-                fallback_policy: PolicyKind::RoundRobin,
+                fallback_policy: StickyFallbackKind::RoundRobin,
                 idle_secs: 3600,
                 eviction_interval_secs: 3600,
             }),
+            fused: None,
+            eligibility: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

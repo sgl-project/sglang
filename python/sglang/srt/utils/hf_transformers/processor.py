@@ -54,11 +54,16 @@ from .tokenizer import (
 _IMAGE_PROCESSOR_BACKENDS = {"auto", "torchvision", "pil"}
 
 
-def resolve_image_processor_backend(server_args) -> str:
-    """Resolve the new backend option while honoring the legacy disable flag."""
-    if getattr(server_args, "disable_fast_image_processor", False):
+def resolve_image_processor_backend(mm_config) -> str:
+    """Resolve the new backend option while honoring the legacy disable flag.
+
+    Takes the `mm` config bag (`get_mm()`): both leaves are resolved config, and
+    every caller is past publish. `getattr` with a default keeps it working for a
+    stand-in that carries only one of the two.
+    """
+    if getattr(mm_config, "disable_fast_image_processor", False):
         return "pil"
-    return getattr(server_args, "image_processor_backend", "auto")
+    return getattr(mm_config, "image_processor_backend", "auto")
 
 
 def _normalize_image_processor_backend(

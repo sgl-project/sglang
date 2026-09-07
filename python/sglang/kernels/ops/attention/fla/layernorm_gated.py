@@ -345,7 +345,6 @@ def rms_norm_gated(
 
 
 class LayerNormFn(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -389,7 +388,6 @@ def layernorm_fn(
 
 
 class LayerNorm(torch.nn.Module):
-
     def __init__(
         self,
         hidden_size,
@@ -431,7 +429,6 @@ class LayerNorm(torch.nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
-
     def __init__(
         self,
         hidden_size,
@@ -465,7 +462,9 @@ class RMSNorm(torch.nn.Module):
                 self.norm_before_gate
                 and self.group_size is None
                 and self.activation == "swish"
-            ), "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
+            ), (
+                "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
+            )
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, z, self.eps
             )

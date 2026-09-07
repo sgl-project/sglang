@@ -41,12 +41,26 @@ from sglang.srt.models.bailing_moe_linear import (
     BailingMoELinearDecoderLayer,
     BailingMoeV2_5ForCausalLM,
 )
+from sglang.srt.models.bailing_moe_v3 import (
+    BailingMoELinearDecoderLayer as BailingMoeV3DecoderLayer,
+)
+from sglang.srt.models.bailing_moe_v3 import (
+    BailingMoeV3ForCausalLM,
+)
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator, add_prefix
 
-LoraConfig = None
 logger = logging.getLogger(__name__)
+
+
+def _is_bailing_moe_v3_config(config: PretrainedConfig) -> bool:
+    """Ling-V3 (KDA + gated MLA) vs the V2.5 lightning checkpoint.
+
+    ``use_kda`` is set by BailingHybridConfig from the presence of a short
+    conv, which is exactly what distinguishes the two.
+    """
+    return config.model_type == "bailing_hybrid" and config.use_kda
 
 
 class BailingMoEModelNextN(nn.Module):
@@ -55,6 +69,7 @@ class BailingMoEModelNextN(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        num_fused_shared_experts: int = 0,
     ) -> None:
         super().__init__()
         self.layer_group_size = 1
@@ -95,19 +110,22 @@ class BailingMoEModelNextN(nn.Module):
         )
         if self.is_hybrid:
             config.attention_type = 1
-            self.decoder = BailingMoELinearDecoderLayer(
-                config,
-                quant_config=quant_config,
-                layer_id=0,
-                is_nextn=True,
-                prefix=add_prefix(f"layers.{config.num_hidden_layers}", prefix),
-            )
+            decoder_layer_cls = BailingMoELinearDecoderLayer
+            decoder_kwargs = {
+                "quant_config": quant_config,
+                "layer_id": 0,
+                "is_nextn": True,
+                "prefix": add_prefix(f"layers.{config.num_hidden_layers}", prefix),
+            }
+            if _is_bailing_moe_v3_config(config):
+                decoder_layer_cls = BailingMoeV3DecoderLayer
+                decoder_kwargs["num_fused_shared_experts"] = num_fused_shared_experts
+            self.decoder = decoder_layer_cls(config, **decoder_kwargs)
         else:
             self.decoder = BailingMoEBlock(
                 config,
                 0,
                 quant_config=quant_config,
-                # is_nextn=True,
                 prefix=add_prefix("decoder", prefix),
             )
 
@@ -174,17 +192,25 @@ class BailingMoEModelNextN(nn.Module):
 
 
 class BailingMoeForCausalLMNextN(nn.Module):
-
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-    # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
             "attention.dense": "attention.o_proj",
         },
     )
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        if not _is_bailing_moe_v3_config(hf_config):
+            return None
+        return BailingMoeV3ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config,
+            quant_config,
+            expected_architecture="BailingMoeForCausalLMNextN",
+        )
 
     def __init__(
         self,
@@ -196,12 +222,19 @@ class BailingMoeForCausalLMNextN(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
-        if hasattr(self, "determine_num_fused_shared_experts"):
+        self.num_fused_shared_experts = 0
+        is_bailing_moe_v3 = _is_bailing_moe_v3_config(config)
+        if is_bailing_moe_v3:
+            BailingMoeV3ForCausalLM.determine_num_fused_shared_experts(self)
+        elif hasattr(self, "determine_num_fused_shared_experts"):
             # Asystem has determine_num_fused_shared_experts but theta does not.
             self.determine_num_fused_shared_experts("BailingMoeForCausalLMNextN")
 
         self.model = BailingMoEModelNextN(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            num_fused_shared_experts=self.num_fused_shared_experts,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -211,13 +244,26 @@ class BailingMoeForCausalLMNextN(nn.Module):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-        if hasattr(self.config, "model_type") and config.model_type == "bailing_hybrid":
+        if is_bailing_moe_v3:
+            self.base_load_weights_func = BailingMoeV3ForCausalLM.load_weights
+            self.post_load_weights_func = BailingMoeV3ForCausalLM.post_load_weights
+        elif config.model_type == "bailing_hybrid":
             self.base_load_weights_func = BailingMoeV2_5ForCausalLM.load_weights
             self.post_load_weights_func = BailingMoeV2_5ForCausalLM.post_load_weights
         else:
             self.base_load_weights_func = BailingMoEForCausalLM.load_weights
             # V1 BailingMoeAttention is standard QKV (no kv_b_proj), no fixup needed.
             self.post_load_weights_func = None
+
+    @staticmethod
+    def weight_direct_load(param: torch.Tensor, loaded_weight: torch.Tensor):
+        # Defensive: V3's load_weights references `self.weight_direct_load` as the
+        # default in `getattr(param, "weight_loader", self.weight_direct_load)`,
+        # which is eagerly evaluated. Today the linear-attn branch that uses it is
+        # never reached on NextN (attention_type is forced to softmax and
+        # is_linear_layer(0, 1) is False), but keep this forward so a future change
+        # that enables KDA-style layers on NextN doesn't hit AttributeError.
+        BailingMoeV3ForCausalLM.weight_direct_load(param, loaded_weight)
 
     @torch.no_grad()
     def forward(

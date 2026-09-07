@@ -23,6 +23,16 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         self.assertEqual(int(built["img_pos"].shape[0]), 62 * 24 * 38)
         self.assertEqual(int(built["seq_len"]) % 64, 0)
         self.assertEqual(built["token_tags"][built["audio_pos"]].unique().tolist(), [2])
+        self.assertEqual(
+            built["stream_layout"],
+            {
+                "target_shape": (62, 24, 38),
+                "cond_image_shapes": (),
+                "cond_image_roles": (),
+                "cond_event_orders": (),
+                "cond_audio_stream_lens": (),
+            },
+        )
 
     def test_fl2va_first_last_cond_blocks_use_exact_rope_span(self):
         text_len = 11
@@ -61,6 +71,16 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         )
         self.assertFalse(built["update_mask"][:cond_rows].any())
         self.assertTrue(built["update_mask"][cond_rows:].all())
+        self.assertEqual(
+            built["stream_layout"],
+            {
+                "target_shape": (37, 24, 38),
+                "cond_image_shapes": ((1, 24, 38), (1, 24, 38)),
+                "cond_image_roles": ("joint_cube", "joint_cube"),
+                "cond_event_orders": (("imgvid", 0), ("imgvid", 1)),
+                "cond_audio_stream_lens": (),
+            },
+        )
 
     def test_i2va_and_l2va_single_cond_blocks_use_endpoint_rope(self):
         text_len = 11
@@ -154,3 +174,46 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         target_video_t0 = built["img_position_ids"][built["img_pos"][12], 0]
         target_audio_t0 = built["img_position_ids"][built["audio_pos"][8], 0]
         self.assertEqual(float(target_audio_t0), float(target_video_t0))
+        self.assertEqual(
+            built["stream_layout"],
+            {
+                "target_shape": (2, 2, 2),
+                "cond_image_shapes": ((1, 2, 2), (2, 2, 2)),
+                "cond_image_roles": ("dense_prefix", "independent_cube"),
+                "cond_event_orders": (
+                    ("imgvid", 0),
+                    ("audio", 0),
+                    ("imgvid", 1),
+                    ("audio", 1),
+                ),
+                "cond_audio_stream_lens": (6, 2),
+            },
+        )
+
+    def test_ref2va_hybrid_packs_keyframes_before_references(self):
+        built = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=5,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[{"kind": "image", "latent_h": 4, "latent_w": 4}],
+            keyframe_frame_indices=[0, -1],
+            frame_count=5,
+        )
+
+        frame_rows = 4
+        frozen_rows = 2 * frame_rows + frame_rows
+        self.assertEqual(int((~built["update_mask"]).sum()), frozen_rows)
+        keyframe_positions = built["img_pos"][: 2 * frame_rows].reshape(2, -1)
+        keyframe_times = [
+            float(built["img_position_ids"][positions, 0].unique().item())
+            for positions in keyframe_positions
+        ]
+        target_origin = 6.0  # text origin 5 + one reference-image time slot
+        self.assertEqual(keyframe_times[0], target_origin)
+        self.assertAlmostEqual(
+            keyframe_times[1], target_origin + 4 * (5.0 / 3.0), places=12
+        )
+        target_t0 = built["img_position_ids"][built["img_pos"][frozen_rows], 0]
+        self.assertEqual(float(target_t0), target_origin)

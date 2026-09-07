@@ -83,9 +83,9 @@ class WeightUpdater:
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
         """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
         assert group_name != "", "Group name cannot be empty"
 
         rank = rank_offset + self.tp_rank

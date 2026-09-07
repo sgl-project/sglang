@@ -78,9 +78,12 @@ def _image_item(feature, grid_hws):
 
 class TestKimiVLEncoderParallelism(CustomTestCase):
     def test_moonvit_uses_tensor_parallel_layers(self):
-        with get_parallel().override(
-            tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-        ), get_context().override_server_args():
+        with (
+            get_parallel().override(
+                tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+            ),
+            get_context().override_server_args(),
+        ):
             layer = MoonVitEncoderLayer(
                 num_heads=2,
                 hidden_dim=8,

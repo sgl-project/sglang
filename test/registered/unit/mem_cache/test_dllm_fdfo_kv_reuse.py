@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.dllm.mixin.scheduler import DllmManager
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context
@@ -61,22 +62,22 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
         rid=rid,
         prefix_indices=torch.tensor(prefix, dtype=torch.int32),
-        req_pool_idx=req_pool_idx,
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
-        kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
-        kv=(
-            SimpleNamespace(kv_allocated_len=len(prefix) + block_size)
-            if req_pool_idx is not None
-            else None
+        kv=ReqKvInfo(
+            req_pool_idx=req_pool_idx,
+            kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
+            kv_allocated_len=(
+                len(prefix) + block_size if req_pool_idx is not None else 0
+            ),
         ),
     )
 
 
 def _remove_allocated_req_slots(pool, *reqs):
     for req in reqs:
-        if req.req_pool_idx in pool.free_slots:
-            pool.free_slots.remove(req.req_pool_idx)
+        if req.kv.req_pool_idx in pool.free_slots:
+            pool.free_slots.remove(req.kv.req_pool_idx)
 
 
 def _make_batch(pool, allocator, reqs, extend_lens):
@@ -105,8 +106,8 @@ def _make_batch(pool, allocator, reqs, extend_lens):
 
 def _seed_retained_block(pool, req, values):
     prefix_len = len(req.prefix_indices)
-    pool.req_to_token[req.req_pool_idx, :prefix_len] = req.prefix_indices
-    pool.req_to_token[req.req_pool_idx, prefix_len : prefix_len + len(values)] = (
+    pool.req_to_token[req.kv.req_pool_idx, :prefix_len] = req.prefix_indices
+    pool.req_to_token[req.kv.req_pool_idx, prefix_len : prefix_len + len(values)] = (
         torch.tensor(values, dtype=torch.int32)
     )
 

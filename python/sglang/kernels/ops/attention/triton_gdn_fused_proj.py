@@ -330,6 +330,312 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     return mixed_qkv, z, b, a
 
 
+# Fusion begins after the quantized GEMMs: qkvz=[q|k|v|z], ba=[b|a].
+# This tail unpacks both projections and updates the causal Conv1D state.
+
+
+@triton.jit
+def _fused_qkvzba_causal_conv1d_update_contiguous_kernel(
+    mixed_qkv,
+    z,
+    b,
+    a,
+    mixed_qkvz,
+    mixed_ba,
+    conv_state,
+    conv_weight,
+    conv_bias,
+    conv_state_indices,
+    stride_qkvz_batch: tl.constexpr,
+    stride_qkvz_dim: tl.constexpr,
+    stride_ba_batch: tl.constexpr,
+    stride_ba_dim: tl.constexpr,
+    stride_state_batch: tl.constexpr,
+    stride_state_dim: tl.constexpr,
+    stride_state_pos: tl.constexpr,
+    stride_weight_dim: tl.constexpr,
+    stride_weight_width: tl.constexpr,
+    stride_state_indices: tl.constexpr,
+    QKV_DIM: tl.constexpr,
+    V_DIM: tl.constexpr,
+    NUM_V_HEADS: tl.constexpr,
+    NUM_STATE_SLOTS: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    PAD_SLOT_ID: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    dim_idx = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    qkv_mask = dim_idx < QKV_DIM
+
+    x = tl.load(
+        mixed_qkvz + batch_idx * stride_qkvz_batch + dim_idx * stride_qkvz_dim,
+        mask=qkv_mask,
+        other=0.0,
+    )
+
+    state_slot = tl.load(conv_state_indices + batch_idx * stride_state_indices).to(
+        tl.int64
+    )
+    # Treat every out-of-range index as padding so stale replay metadata cannot
+    # turn an indexed state update into an OOB access.
+    valid_slot = (
+        (state_slot != PAD_SLOT_ID) & (state_slot >= 0) & (state_slot < NUM_STATE_SLOTS)
+    )
+    state_base = (
+        conv_state + state_slot * stride_state_batch + dim_idx * stride_state_dim
+    )
+
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    if HAS_BIAS:
+        acc += tl.load(conv_bias + dim_idx, mask=qkv_mask, other=0.0).to(tl.float32)
+
+    # Match the deployed direct-Triton update exactly. Its effective decode
+    # state length is width-1 even when the physical cache tensor is wider.
+    for pos in tl.static_range(KERNEL_WIDTH - 1):
+        state_value = tl.load(
+            state_base + pos * stride_state_pos,
+            mask=qkv_mask & valid_slot,
+            other=0.0,
+        )
+        weight_value = tl.load(
+            conv_weight + dim_idx * stride_weight_dim + pos * stride_weight_width,
+            mask=qkv_mask,
+            other=0.0,
+        )
+        # Do not force an FP32 multiply here. This expression deliberately
+        # retains the operand types/order of causal_conv1d_triton.py.
+        acc += state_value * weight_value
+
+    last_weight = tl.load(
+        conv_weight
+        + dim_idx * stride_weight_dim
+        + (KERNEL_WIDTH - 1) * stride_weight_width,
+        mask=qkv_mask,
+        other=0.0,
+    )
+    acc += x * last_weight
+    if SILU_ACTIVATION:
+        conv_out = acc / (1.0 + tl.exp(-acc))
+    else:
+        conv_out = acc
+
+    # The legacy kernel leaves padded rows' input unchanged.
+    conv_out = tl.where(valid_slot, conv_out, x)
+    tl.store(
+        mixed_qkv + batch_idx * QKV_DIM + dim_idx,
+        conv_out,
+        mask=qkv_mask,
+    )
+
+    # The direct-Triton wrapper sets effective state_len=width-1 for decode.
+    for pos in tl.static_range(KERNEL_WIDTH - 2):
+        next_value = tl.load(
+            state_base + (pos + 1) * stride_state_pos,
+            mask=qkv_mask & valid_slot,
+            other=0.0,
+        )
+        tl.store(
+            state_base + pos * stride_state_pos,
+            next_value,
+            mask=qkv_mask & valid_slot,
+        )
+    tl.store(
+        state_base + (KERNEL_WIDTH - 2) * stride_state_pos,
+        x,
+        mask=qkv_mask & valid_slot,
+    )
+
+    # The first feature lanes also materialize the smaller downstream tensors.
+    z_mask = dim_idx < V_DIM
+    z_value = tl.load(
+        mixed_qkvz
+        + batch_idx * stride_qkvz_batch
+        + (QKV_DIM + dim_idx) * stride_qkvz_dim,
+        mask=z_mask,
+        other=0.0,
+    )
+    tl.store(z + batch_idx * V_DIM + dim_idx, z_value, mask=z_mask)
+
+    gate_mask = dim_idx < NUM_V_HEADS
+    b_value = tl.load(
+        mixed_ba + batch_idx * stride_ba_batch + dim_idx * stride_ba_dim,
+        mask=gate_mask,
+        other=0.0,
+    )
+    a_value = tl.load(
+        mixed_ba
+        + batch_idx * stride_ba_batch
+        + (NUM_V_HEADS + dim_idx) * stride_ba_dim,
+        mask=gate_mask,
+        other=0.0,
+    )
+    tl.store(b + batch_idx * NUM_V_HEADS + dim_idx, b_value, mask=gate_mask)
+    tl.store(a + batch_idx * NUM_V_HEADS + dim_idx, a_value, mask=gate_mask)
+
+
+def can_use_fused_qkvzba_causal_conv1d_update_contiguous(
+    mixed_qkvz: torch.Tensor,
+    mixed_ba: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state_indices: torch.Tensor,
+    *,
+    qkv_dim: int,
+    v_dim: int,
+    num_v_heads: int,
+    activation: str | None,
+) -> tuple[bool, str]:
+    """Return an explicit eligibility decision for the decode fusion."""
+    tensors = (mixed_qkvz, mixed_ba, conv_state, conv_weight, conv_state_indices)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        return False, "all inputs must be torch.Tensor instances"
+    if not all(tensor.is_cuda for tensor in tensors):
+        return False, "CUDA tensors are required"
+    if mixed_qkvz.ndim != 2 or mixed_ba.ndim != 2:
+        return False, "projection outputs must be rank-2"
+    if conv_state.ndim != 3 or conv_weight.ndim != 2:
+        return False, "Conv1D state/weight ranks must be 3/2"
+    if conv_state_indices.ndim != 1:
+        return False, "conv_state_indices must be rank-1"
+    batch = mixed_qkvz.shape[0]
+    if mixed_ba.shape[0] != batch or conv_state_indices.shape[0] != batch:
+        return False, "batch dimensions must match"
+    if qkv_dim <= 0 or v_dim <= 0 or num_v_heads <= 0:
+        return False, "TP-local dimensions must be positive"
+    if mixed_qkvz.shape[1] != qkv_dim + v_dim:
+        return False, "qkvz layout is not contiguous [Q|K|V|Z]"
+    if mixed_ba.shape[1] != 2 * num_v_heads:
+        return False, "ba layout is not contiguous [B|A]"
+    if conv_state.shape[1] != qkv_dim or conv_weight.shape[0] != qkv_dim:
+        return False, "Conv1D feature dimension does not match packed QKV"
+    width = conv_weight.shape[1]
+    if width < 2 or width > 4:
+        return False, "only Conv1D widths 2 through 4 are supported"
+    if conv_state.shape[2] < width - 1:
+        return False, "Conv1D state is shorter than width - 1"
+    supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+    if mixed_qkvz.dtype not in supported_dtypes:
+        return False, "QKVZ activation dtype must be FP16, BF16, or FP32"
+    if conv_state.dtype != mixed_qkvz.dtype or conv_weight.dtype != mixed_qkvz.dtype:
+        return False, "QKVZ, Conv1D state, and weight dtypes must match"
+    if mixed_ba.dtype not in supported_dtypes:
+        return False, "BA activation dtype must be FP16, BF16, or FP32"
+    if conv_bias is not None:
+        if (
+            not isinstance(conv_bias, torch.Tensor)
+            or not conv_bias.is_cuda
+            or conv_bias.ndim != 1
+            or conv_bias.shape[0] != qkv_dim
+            or conv_bias.dtype != mixed_qkvz.dtype
+        ):
+            return False, "Conv1D bias contract is incompatible"
+    if activation not in (None, "silu", "swish"):
+        return False, "activation must be None, silu, or swish"
+    if mixed_qkvz.stride(1) != 1 or mixed_ba.stride(1) != 1:
+        return False, "projection feature dimensions must be contiguous"
+    if conv_weight.stride(1) != 1:
+        return False, "Conv1D weight width dimension must be contiguous"
+    if conv_state_indices.dtype not in (torch.int32, torch.int64):
+        return False, "conv_state_indices must be int32 or int64"
+    return True, "eligible"
+
+
+def fused_qkvzba_causal_conv1d_update_contiguous(
+    mixed_qkvz: torch.Tensor,
+    mixed_ba: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state_indices: torch.Tensor,
+    *,
+    qkv_dim: int,
+    v_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    activation: str | None,
+    pad_slot_id: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Decode-only fused Qwen3.5 projection unpack and Conv1D state update."""
+    eligible, reason = can_use_fused_qkvzba_causal_conv1d_update_contiguous(
+        mixed_qkvz,
+        mixed_ba,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        conv_state_indices,
+        qkv_dim=qkv_dim,
+        v_dim=v_dim,
+        num_v_heads=num_v_heads,
+        activation=activation,
+    )
+    if not eligible:
+        raise ValueError(f"Ineligible fused GDN decode projection/Conv1D: {reason}")
+    if v_dim != num_v_heads * head_v_dim:
+        raise ValueError(
+            "Ineligible fused GDN decode projection/Conv1D: "
+            "v_dim must equal num_v_heads * head_v_dim"
+        )
+
+    batch = mixed_qkvz.shape[0]
+    mixed_qkv = torch.empty(
+        (batch, qkv_dim), dtype=mixed_qkvz.dtype, device=mixed_qkvz.device
+    )
+    z = torch.empty(
+        (batch, num_v_heads, head_v_dim),
+        dtype=mixed_qkvz.dtype,
+        device=mixed_qkvz.device,
+    )
+    b = torch.empty(
+        (batch, num_v_heads),
+        dtype=mixed_ba.dtype,
+        device=mixed_ba.device,
+    )
+    a = torch.empty_like(b)
+
+    block_size = 256
+    grid = (batch, triton.cdiv(qkv_dim, block_size))
+    _fused_qkvzba_causal_conv1d_update_contiguous_kernel[grid](
+        mixed_qkv,
+        z,
+        b,
+        a,
+        mixed_qkvz,
+        mixed_ba,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        conv_state_indices,
+        mixed_qkvz.stride(0),
+        mixed_qkvz.stride(1),
+        mixed_ba.stride(0),
+        mixed_ba.stride(1),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
+        conv_weight.stride(0),
+        conv_weight.stride(1),
+        conv_state_indices.stride(0),
+        QKV_DIM=qkv_dim,
+        V_DIM=v_dim,
+        NUM_V_HEADS=num_v_heads,
+        NUM_STATE_SLOTS=conv_state.shape[0],
+        STATE_LEN=conv_state.shape[2],
+        KERNEL_WIDTH=conv_weight.shape[1],
+        HAS_BIAS=conv_bias is not None,
+        SILU_ACTIVATION=activation in ("silu", "swish"),
+        PAD_SLOT_ID=pad_slot_id,
+        BLOCK_SIZE=block_size,
+        num_warps=8,
+        num_stages=2,
+    )
+    return mixed_qkv, z, b, a
+
+
 @triton.jit
 def fused_qkv_split_gdn_prefill_kernel(
     q,

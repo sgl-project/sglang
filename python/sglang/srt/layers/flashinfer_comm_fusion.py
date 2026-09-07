@@ -13,13 +13,16 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_resources,
+)
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
     is_flashinfer_available,
-    is_sm90_supported,
-    is_sm100_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -38,27 +41,27 @@ _flashinfer_allreduce_supports_trigger_completion = False
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
     """Whether the mnnvl backend is usable on the current system."""
-    if is_sm100_supported():
+    if get_platform().is_sm100:
         return True
-    return is_sm90_supported() and not is_multi_node
+    return get_platform().is_sm90 and not is_multi_node
 
 
 def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
-    if not (is_sm90_supported() or is_sm100_supported()):
+    if not (get_platform().is_sm90 or get_platform().is_sm100):
         raise ValueError(
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
 
     if backend == "auto":
         if is_multi_node:
-            if is_sm100_supported():
+            if get_platform().is_sm100:
                 return "mnnvl"
             raise ValueError(
                 "FlashInfer allreduce fusion does not support multi-node on "
                 "non-Blackwell systems."
             )
-        if is_sm100_supported():
+        if get_platform().is_sm100:
             return "mnnvl"
         return "trtllm"
 
@@ -75,12 +78,16 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     return backend
 
 
-def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
-    backend = getattr(server_args, "flashinfer_allreduce_fusion_backend", None)
+def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:
+    """The fusion backend for this process, or None when fusion is off.
+
+    Reads the published leaves (`exec.comm`, `parallel`): the backend is a
+    resolution decision, and the node count is launch topology.
+    """
+    backend = get_exec().comm.flashinfer_allreduce_fusion_backend
     if backend is None:
         return None
-    is_multi_node = getattr(server_args, "nnodes", 1) > 1
-    return _resolve_backend(backend, is_multi_node)
+    return _resolve_backend(backend, get_parallel().nnodes > 1)
 
 
 if is_flashinfer_available():
@@ -626,7 +633,6 @@ class FlashInferWorkspaceManager:
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
     """The per-group fusion workspace manager; the instances live on
     ``ctx.resources`` (one per comm group, created lazily)."""
-    from sglang.srt.runtime_context import get_resources
 
     buffers = get_resources().buffers
     name = (
@@ -716,8 +722,7 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    server_args = get_server_args()
-    backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
+    backend = resolve_flashinfer_allreduce_fusion_backend()
     if backend is None:
         return False
 
@@ -1015,7 +1020,6 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    from sglang.srt.runtime_context import get_resources
 
     buffers = get_resources().buffers
     for name in (

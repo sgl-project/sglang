@@ -28,7 +28,7 @@ FETCH = CORE and CORE.common.fetch_bytes
 
 @unittest.skipUnless(FETCH, "sglang-mm fetch binding not built")
 class TestRustMediaSourceLoading(CustomTestCase):
-    DATA = b"native-mm-source"
+    DATA = b"rust-mm-source"
 
     def test_inline_sources(self):
         encoded = base64.b64encode(self.DATA).decode()

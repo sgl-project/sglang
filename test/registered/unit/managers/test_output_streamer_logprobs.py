@@ -43,6 +43,7 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = None
         self.is_retracted = is_retracted
+        self.beam_group = None
 
         self.return_logprob = True
         self.input_logprob_sent = True
@@ -73,6 +74,7 @@ def _make_accumulator() -> _GenerationStreamAccumulator:
         default_stream_interval=1,
         default_force_stream_interval=1,
         get_cached_tokens_details=lambda req: None,
+        current_weight_version=None,
     )
 
 

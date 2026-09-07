@@ -159,22 +159,27 @@ class TestPerturbManager(CustomTestCase):
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
         calls: list[str] = []
 
-        with patch.object(
-            manager,
-            "perturb_real_kv_post_forward",
-            lambda batch: calls.append("real_kv_post_forward"),
-        ), patch.object(
-            manager,
-            "perturb_req_to_token",
-            lambda batch: calls.append("req_to_token"),
-        ), patch.object(
-            manager,
-            "perturb_real_kv_used",
-            lambda batch: calls.append("real_kv_used"),
-        ), patch.object(
-            manager,
-            "perturb_real_kv_unused_cache",
-            lambda batch: calls.append("real_kv_unused_cache"),
+        with (
+            patch.object(
+                manager,
+                "perturb_real_kv_post_forward",
+                lambda batch: calls.append("real_kv_post_forward"),
+            ),
+            patch.object(
+                manager,
+                "perturb_req_to_token",
+                lambda batch: calls.append("req_to_token"),
+            ),
+            patch.object(
+                manager,
+                "perturb_real_kv_used",
+                lambda batch: calls.append("real_kv_used"),
+            ),
+            patch.object(
+                manager,
+                "perturb_real_kv_unused_cache",
+                lambda batch: calls.append("real_kv_unused_cache"),
+            ),
         ):
             manager.perturb_post_forward(maybe_inaccurate_forward_batch=forward_batch)
 
@@ -394,10 +399,13 @@ class TestRealKvUsedPerturb(CustomTestCase):
 
         pool_snapshot = pool.req_to_token.clone()
         source_snapshot = source.tensor.clone()
-        with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
-            real_kv_unused_cache_module,
-            "_pick_sweep_slot_for_group",
-            return_value=3,
+        with (
+            patch.object(torch, "rand", return_value=torch.tensor(0.0)),
+            patch.object(
+                real_kv_unused_cache_module,
+                "_pick_sweep_slot_for_group",
+                return_value=3,
+            ),
         ):
             manager.perturb(maybe_inaccurate_forward_batch=forward_batch)
 
@@ -436,10 +444,13 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         manager.attach_radix_cache(make_radix_cache([[], [3]], device=device))
 
         snapshot = source.tensor.clone()
-        with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
-            torch,
-            "randint",
-            return_value=torch.tensor(0),
+        with (
+            patch.object(torch, "rand", return_value=torch.tensor(0.0)),
+            patch.object(
+                torch,
+                "randint",
+                return_value=torch.tensor(0),
+            ),
         ):
             manager.perturb_real_kv_unused_cache(None)
 

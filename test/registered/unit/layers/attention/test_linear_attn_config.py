@@ -120,11 +120,11 @@ class TestLinearAttnBackends(CustomTestCase):
 
         from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 
+        # The draft-token width is a bag leaf read before the stamp.
+        self._publish(speculative_eagle_topk=0)
         runner = SimpleNamespace(
             device="cpu",
-            server_args=SimpleNamespace(
-                speculative_eagle_topk=0, enable_unified_memory=False
-            ),
+            server_args=SimpleNamespace(enable_unified_memory=False),
             is_draft_worker=False,
             req_to_token_pool=SimpleNamespace(
                 mamba_pool=SimpleNamespace(

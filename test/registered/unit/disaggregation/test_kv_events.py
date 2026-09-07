@@ -18,12 +18,96 @@ from sglang.srt.disaggregation.kv_events import (
     KVEventBatch,
     StorageMedium,
     ZmqEventPublisher,
+    resolve_load_pub_range,
     select_kv_publisher_dp_rank,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestResolveLoadPubRange(CustomTestCase):
+    """The single source of truth both the bind and /server_info route through."""
+
+    @staticmethod
+    def _base(kv, replay=None, dp_size=1, explicit="auto"):
+        resolved, _ = resolve_load_pub_range(
+            kv_endpoint=kv,
+            replay_endpoint=replay,
+            dp_size=dp_size,
+            load_publish_endpoint=explicit,
+        )
+        return None if resolved is None else resolved[1]
+
+    def test_off_by_default(self):
+        # Opt-in: unset or "off" reserves nothing, even with a valid config.
+        self.assertIsNone(self._base("tcp://*:5557", explicit=None))
+        self.assertIsNone(self._base("tcp://*:5557", explicit="off"))
+
+    def test_auto_packs_after_kv_range(self):
+        self.assertEqual(self._base("tcp://*:5557"), 5558)
+        self.assertEqual(self._base("tcp://*:5557", dp_size=2), 5559)
+
+    def test_auto_skips_an_overlapping_replay_range(self):
+        # Conventional replay = kv + 1 always overlaps the packed candidate.
+        self.assertEqual(self._base("tcp://*:5557", "tcp://*:5558"), 5559)
+        self.assertEqual(self._base("tcp://*:5557", "tcp://*:5558", dp_size=4), 5562)
+
+    def test_non_adjacent_replay_leaves_packing_unchanged(self):
+        self.assertEqual(self._base("tcp://*:5557", "tcp://*:6000"), 5558)
+
+    def test_auto_declines_connect_style_and_underivable_endpoints(self):
+        for kv in (
+            "tcp://10.0.0.5:5557",  # concrete host: connect-style
+            "tcp://[2001:db8::5]:5557",  # concrete IPv6 ("::" is not a wildcard)
+            "tcp://::1:5557",  # bare IPv6: ambiguous
+            "tcp://host",  # no port
+            "ipc:///tmp/kv",
+            None,
+        ):
+            with self.subTest(kv=kv):
+                self.assertIsNone(self._base(kv))
+
+    def test_auto_declines_on_u16_overflow(self):
+        self.assertIsNone(self._base("tcp://*:65535"))
+
+    def test_explicit_endpoint_moves_and_validates_the_range(self):
+        self.assertEqual(self._base("tcp://*:5557", explicit="tcp://*:7000"), 7000)
+        # A concrete explicit host, or one overlapping the kv range, declines.
+        self.assertIsNone(self._base("tcp://*:5557", explicit="tcp://10.0.0.5:7000"))
+        self.assertIsNone(
+            self._base("tcp://*:5557", dp_size=4, explicit="tcp://*:5558")
+        )
+
+    def test_reason_is_set_only_for_actionable_declines(self):
+        # Off by default is unremarkable (no reason); an opt-in the operator
+        # asked for that can't resolve is worth surfacing.
+        _, quiet = resolve_load_pub_range(
+            kv_endpoint="tcp://10.0.0.5:5557", replay_endpoint=None, dp_size=1
+        )
+        self.assertIsNone(quiet)
+        _, auto_loud = resolve_load_pub_range(
+            kv_endpoint="tcp://10.0.0.5:5557",  # connect-style: can't derive
+            replay_endpoint=None,
+            dp_size=1,
+            load_publish_endpoint="auto",
+        )
+        self.assertIsNotNone(auto_loud)
+        # A missing config surfaces at startup — no message may render a bare
+        # "None". Both the likely mistakes (auto and an explicit address
+        # without --kv-events-config) go through this.
+        for endpoint in ("auto", "tcp://*:7000"):
+            with self.subTest(endpoint=endpoint):
+                _, no_cfg = resolve_load_pub_range(
+                    kv_endpoint=None,
+                    replay_endpoint=None,
+                    dp_size=1,
+                    load_publish_endpoint=endpoint,
+                )
+                self.assertIsNotNone(no_cfg)
+                self.assertNotIn("None", no_cfg)
+                self.assertIn("--kv-events-config", no_cfg)
 
 
 class TestSelectKvPublisherDpRank(CustomTestCase):

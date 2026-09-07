@@ -40,7 +40,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_device,
     get_exec,
     get_parallel,
@@ -133,15 +132,18 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+if _is_cuda or _is_hip:
+    # Plain-torch graph helpers: usable wherever the split-op surface is.
+    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+        logits_head_gate_graph,
+        scale_head_gate_graph,
+    )
+
 if _is_cuda:
     from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.kernels.ops.quantization.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
-    )
-    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
-        logits_head_gate_graph,
-        scale_head_gate_graph,
     )
 
     @register_custom_op(mutates_args=["topk_indices"])
@@ -155,11 +157,14 @@ def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
     if group.world_size == 1:
         return
 
-    if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
-        if group.pynccl_comm is None:
-            raise RuntimeError(
-                "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
-            )
+    # PyNCCL is the faster path under capture, but it is not a precondition:
+    # a split attn-TP group is built without one (parallel_state.py), and the
+    # process-group broadcast captures and replays correctly.
+    if (
+        topk_indices.device.type == "cuda"
+        and torch.cuda.is_current_stream_capturing()
+        and group.pynccl_comm is not None
+    ):
         with group.pynccl_comm.change_state(enable=True):
             group.pynccl_comm.broadcast(topk_indices, src=0)
     else:
@@ -191,9 +196,9 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
-    assert (
-        hidden_size & (hidden_size - 1)
-    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    assert (hidden_size & (hidden_size - 1)) == 0, (
+        "Hidden size must be a power of 2 for Hadamard transform."
+    )
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
@@ -201,6 +206,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
+    # aiter's fp8_mqa_logits only compiles below 2 GiB of logits (buffer_store).
+    _MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
     @staticmethod
@@ -249,7 +256,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = configured_pp_size()
+            pp_size = get_parallel().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -575,7 +582,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        # Rotary may update both inputs in place, so the K-only path must not
+        # alias its dummy query with the key.
+        if _is_cuda or _is_hip or _is_xpu:
+            dummy_q_rope = torch.empty_like(k_rope)
+        else:
+            dummy_q_rope = k_rope
+        _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
 
@@ -796,13 +809,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
             if _use_aiter_preshuffle:
-                assert (
-                    page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                assert page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                )
             else:
-                assert (
-                    page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                assert page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                )
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
@@ -995,7 +1008,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self, num_q: int, num_k: int, device_index: int
     ) -> Tuple[bool, int]:
         """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM
+        Detect whether we need to chunk the MQA logits computation to avoid OOM,
+        and on ROCm to stay under aiter's 2 GiB logits limit
         Return: (need_chunk, logits_budget_bytes)
         """
         # Quick static check for normal batches
@@ -1004,6 +1018,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         logits_bytes = num_q * num_k * self._MQA_LOGITS_BYTES_PER_ELEM
         logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
+        if _is_hip:
+            logits_budget_bytes = min(
+                logits_budget_bytes, self._MQA_LOGITS_MAX_BYTES_ROCM
+            )
 
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes
@@ -1026,13 +1044,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         page_size = get_token_to_kv_pool().page_size
         if _is_hip:
             if _use_aiter_preshuffle:
-                assert (
-                    page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                assert page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                )
             else:
-                assert (
-                    page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                assert page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                )
         else:
             assert page_size == 64, "only support page size 64"
 
@@ -1144,13 +1162,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if global_topk_offset is None:
             cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
 
-        assert (
-            seq_lens_expanded.shape[0] == q_offset
-        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        assert seq_lens_expanded.shape[0] == q_offset, (
+            f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        )
         if global_topk_offset is not None:
-            assert (
-                global_topk_offset.shape[0] >= q_offset
-            ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+            assert global_topk_offset.shape[0] >= q_offset, (
+                f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+            )
 
         start = 0
         while start < q_offset:

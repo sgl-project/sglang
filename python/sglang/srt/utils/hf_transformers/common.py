@@ -27,6 +27,7 @@ from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
+    Dots3Config,
     DotsOCRConfig,
     DotsVLMConfig,
     ExaoneConfig,
@@ -41,6 +42,7 @@ from sglang.srt.configs import (
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
+    K2HorizonConfig,
     KimiK3Config,
     KimiK25Config,
     KimiLinearConfig,
@@ -48,6 +50,7 @@ from sglang.srt.configs import (
     LagunaConfig,
     LocateAnythingConfig,
     LongcatFlashConfig,
+    MiniCPMHybridConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
     MiniMaxM3VLConfig,
@@ -64,9 +67,11 @@ from sglang.srt.configs import (
     Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
     Qwen3NextConfig,
+    Spark2_5Config,
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
+    XllmConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
@@ -97,9 +102,11 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVL2Config,
         MultiModalityConfig,
         KimiVLConfig,
+        K2HorizonConfig,
         LocateAnythingConfig,
         InternVLChatConfig,
         LagunaConfig,
+        Spark2_5Config,
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
@@ -112,6 +119,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         GraniteMoeHybridConfig,
         DotsVLMConfig,
         DotsOCRConfig,
+        Dots3Config,
         NemotronH_Nano_VL_V2_Config,
         NemotronH_Nano_Omni_Reasoning_V3_Config,
         NemotronHConfig,
@@ -129,6 +137,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         KimiK25Config,
         Step3p5Config,
         Step3p7Config,
+        MiniCPMHybridConfig,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
         InklingModelConfig,
@@ -136,8 +145,10 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         InklingVisionConfig,
         InklingMMConfig,
         MiniMaxM3VLConfig,
+        XllmConfig,
     ]
 }
+
 
 # DeepSeek V3.2 / V4 reuse the V3 config schema. Subclass the upstream
 # transformers class with each model_type so AutoConfig.register passes its
@@ -647,9 +658,15 @@ def get_tokenizer_from_processor(processor):
 
 
 # Turn-final markers that some checkpoints ship without EOS metadata:
-# <|eom_id|> (Llama-3 tool use) and <|content_model_end_sampling|> (Inkling,
-# whose bundled tokenizer config leaves eos_token unset).
-_ADDITIONAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|content_model_end_sampling|>")
+# <|eom_id|> (Llama-3 tool use), <|content_model_end_sampling|> (Inkling,
+# whose bundled tokenizer config leaves eos_token unset), and
+# <|ifm|im_end|> (some K2 Horizon checkpoints, notably 0.9B, name only
+# <|endoftext|> as EOS).
+_ADDITIONAL_STOP_TOKEN_TEXTS = (
+    "<|eom_id|>",
+    "<|content_model_end_sampling|>",
+    "<|ifm|im_end|>",
+)
 
 
 def attach_additional_stop_token_ids(tokenizer):

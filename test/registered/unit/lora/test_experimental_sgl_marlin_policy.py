@@ -40,7 +40,11 @@ def _validate_server(**overrides):
     server_args.update(overrides)
     return validate_experimental_sgl_marlin_server_args(
         types.SimpleNamespace(**server_args),
-        types.SimpleNamespace(ep_size=4, moe_a2a_backend="none"),
+        types.SimpleNamespace(
+            ep_size=4,
+            moe_a2a_backend="none",
+            enable_lora=server_args["enable_lora"],
+        ),
     )
 
 

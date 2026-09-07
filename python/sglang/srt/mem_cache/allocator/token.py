@@ -44,8 +44,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
-        self.is_not_in_free_group = True
-        self.free_group = []
+        self.free_group = None
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def available_size(self):
@@ -67,7 +66,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        if self.is_not_in_free_group:
+        if self.free_group is None:
             if self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:

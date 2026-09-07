@@ -25,6 +25,11 @@ Please refer to the [official SGLang-diffusion installation guide](/docs/sglang-
 sglang serve --model-path Rabinovich/LongLive-2.0-5B-Diffusers
 ```
 
+In `auto` mode, GPUs with at least 60 GiB available keep the DiT, text encoder,
+and VAE resident. This uses about 44 GiB on H200 for the 832x480 preset and
+avoids moving encoder and decoder layers from host memory on every request.
+Smaller GPUs retain the layerwise-offload defaults.
+
 If the GPU runs out of memory, move the text encoder, VAE, and DiT to CPU between stages:
 
 ```bash Command

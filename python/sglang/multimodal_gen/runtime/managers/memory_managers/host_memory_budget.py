@@ -17,6 +17,7 @@ import os
 
 import psutil
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -130,6 +131,22 @@ def host_memory_available_bytes() -> int:
     The smaller of what the kernel reports free and what the cgroup still
     allows, so a container does not plan against the whole machine.
     """
+    forced_gib = envs.SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB
+    if forced_gib is not None:
+        # Behave like a machine of that size: what such a host would still
+        # have free is the pretend total minus what this process has already
+        # taken in anonymous memory.
+        own_anonymous = 0
+        try:
+            with open("/proc/self/status") as handle:
+                for line in handle:
+                    if line.startswith("RssAnon:"):
+                        own_anonymous = int(line.split()[1]) * 1024
+                        break
+        except OSError:
+            pass
+        return max(0, int(forced_gib * GIB_BYTES) - own_anonymous)
+
     available = int(psutil.virtual_memory().available)
     capped = cgroup_memory_limit_bytes()
     if capped is None:
@@ -222,12 +239,16 @@ def module_weight_bytes(module) -> int:
     seen: set[int] = set()
     total = 0
     for tensor in list(module.parameters()) + list(module.buffers()):
-        storage = tensor.untyped_storage()
-        pointer = storage.data_ptr()
+        try:
+            storage = tensor.untyped_storage()
+            pointer = storage.data_ptr()
+            storage_bytes = storage.nbytes()
+        except RuntimeError:
+            continue
         if pointer == 0 or pointer in seen:
             continue
         seen.add(pointer)
-        total += storage.nbytes()
+        total += storage_bytes
     return total
 
 
@@ -236,9 +257,9 @@ def describe_host_memory() -> str:
     capped = cgroup_memory_limit_bytes()
     available = host_memory_available_bytes()
     if capped is None:
-        return f"host memory available: {available / GIB_BYTES:.1f} GiB (no cgroup cap)"
+        return f"{available / GIB_BYTES:.1f} GiB available (no cgroup cap)"
     limit, usage = capped
     return (
-        f"host memory available: {available / GIB_BYTES:.1f} GiB "
+        f"{available / GIB_BYTES:.1f} GiB available "
         f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB)"
     )

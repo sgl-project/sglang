@@ -119,8 +119,8 @@ class TestMlxQuantization(unittest.TestCase):
         self.assertGreater(
             reduction,
             0.40,
-            f"expected >40% memory reduction with mlx_q4, got {reduction*100:.1f}% "
-            f"(fp16={mem_fp/1024**3:.2f} GB, q4={mem_q4/1024**3:.2f} GB)",
+            f"expected >40% memory reduction with mlx_q4, got {reduction * 100:.1f}% "
+            f"(fp16={mem_fp / 1024**3:.2f} GB, q4={mem_q4 / 1024**3:.2f} GB)",
         )
 
     def test_mlx_q8_creates_quantized_linear_modules(self):

@@ -678,9 +678,9 @@ def _launch_gdn_spec(
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
     B = query_start_loc.shape[0] - 1
-    assert (
-        max_cache_len & (max_cache_len - 1) == 0
-    ), "circular cache requires power-of-two max_cache_len"
+    assert max_cache_len & (max_cache_len - 1) == 0, (
+        "circular cache requires power-of-two max_cache_len"
+    )
     assert d_cache.shape[2] == max_cache_len
 
     BK = triton.next_power_of_2(K)

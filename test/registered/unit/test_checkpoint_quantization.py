@@ -2,6 +2,8 @@
 
 import unittest
 
+from transformers import PretrainedConfig
+
 from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.checkpoint_quantization import (
@@ -12,19 +14,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-
-class _ConfigObject:
-    def __init__(self, **values):
-        self.__dict__.update(values)
-
-
-class _QuantConfigObject:
-    def __init__(self, values):
-        self._values = values
-
-    def to_dict(self):
-        return self._values
 
 
 class TestResolveCheckpointQuantSpec(CustomTestCase):
@@ -75,9 +64,9 @@ class TestResolveCheckpointQuantSpec(CustomTestCase):
             ),
         )
 
-    def test_text_config_fallback_supports_config_objects(self):
-        config = _ConfigObject(
-            text_config=_ConfigObject(
+    def test_text_config_fallback_supports_pretrained_configs(self):
+        config = PretrainedConfig(
+            text_config=PretrainedConfig(
                 quantization_config={"quant_method": "gptq", "bits": 4}
             ),
             compression_config={"quant_method": "compressed-tensors"},
@@ -90,7 +79,7 @@ class TestResolveCheckpointQuantSpec(CustomTestCase):
         self.assertEqual(spec.source, "text_config.quantization_config")
 
     def test_compression_config_fallback(self):
-        config = _ConfigObject(
+        config = PretrainedConfig(
             compression_config={"quant_method": "compressed-tensors"}
         )
 
@@ -113,18 +102,6 @@ class TestResolveCheckpointQuantSpec(CustomTestCase):
         self.assertIsNotNone(spec)
         self.assertIsNone(spec.declared_method)
         self.assertEqual(spec.config["quant_algo"], "FP8")
-
-    def test_quant_config_object_is_converted(self):
-        config = _ConfigObject(
-            quantization_config=_QuantConfigObject(
-                {"quant_method": "bitsandbytes", "load_in_4bit": True}
-            )
-        )
-
-        spec = resolve_checkpoint_quant_spec(config)
-
-        self.assertIsNotNone(spec)
-        self.assertEqual(spec.config["load_in_4bit"], True)
 
     def test_lookup_priority_matches_srt_loader(self):
         config = {

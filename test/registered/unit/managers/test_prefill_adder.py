@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -79,14 +80,14 @@ class TestPrefillAdder(CustomTestCase):
         batch.filter_batch.return_value = None
         return batch
 
-    def create_server_args(
-        self, *, schedule_low_priority_values_first: bool
-    ) -> MagicMock:
-        server_args = MagicMock()
-        server_args.schedule_low_priority_values_first = (
-            schedule_low_priority_values_first
+    def scheduling_order(self, *, schedule_low_priority_values_first: bool):
+        """State the policy on the context, which is where the scheduler reads
+        it: `preempt_to_schedule` takes no record to state it on."""
+        override = get_context().override_server_args(
+            schedule_low_priority_values_first=schedule_low_priority_values_first
         )
-        return server_args
+        override.install()
+        self.addCleanup(override.restore)
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
@@ -100,6 +101,11 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.storage_hit_length = 0
+        req.storage_hit_start = None
+        req.host_hit_is_storage = False
+        req.host_loaded_length = 0
+        req.materialized_host_hit_len.return_value = 0
+        req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
@@ -119,6 +125,51 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
 
+    def test_storage_prefetch_fulfillment_resolves_at_admission(self):
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_mock_req("storage-hit", priority=0, max_new_tokens=1)
+        req.host_hit_length = 12
+        req.host_loaded_length = 4
+        req.storage_hit_length = 8
+        req.storage_hit_start = 4
+        req.materialized_host_hit_len.return_value = 4
+        req.fulfilled_storage_hit_len.return_value = 8
+        req.needs_host_load_back.return_value = True
+
+        adder._account_prefill_cache_admission(req, prefix_len=12)
+
+        self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
+            "storage-hit",
+            fulfilled_tokens=8,
+            reason=None,
+        )
+        self.assertEqual(adder.log_device_hit_tokens, 4)
+        self.assertEqual(adder.log_host_hit_tokens, 0)
+        self.assertEqual(adder.log_storage_hit_tokens, 8)
+
+        self.mock_tree_cache.finish_storage_prefetch_admission.reset_mock()
+        req.host_loaded_length = 0
+        req.materialized_host_hit_len.return_value = 0
+        req.fulfilled_storage_hit_len.return_value = 0
+        adder._account_prefill_cache_admission(req, prefix_len=0)
+        self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
+            "storage-hit", fulfilled_tokens=0, reason="device_capacity"
+        )
+
+    def test_retracted_storage_prefetch_accounting_is_omitted(self):
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_mock_req(
+            "retracted-storage-hit", priority=0, max_new_tokens=1
+        )
+        req.retracted_stain = True
+
+        adder._account_prefill_cache_admission(req, prefix_len=8)
+
+        self.mock_tree_cache.discard_storage_prefetch_accounting.assert_called_once_with(
+            "retracted-storage-hit"
+        )
+        self.mock_tree_cache.finish_storage_prefetch_admission.assert_not_called()
+
     def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),
@@ -129,9 +180,7 @@ class TestPrefillAdder(CustomTestCase):
             self.create_mock_req(rid, priority, max_new_tokens)
             for rid, priority, max_new_tokens in params
         ]
-        mock_server_args = self.create_server_args(
-            schedule_low_priority_values_first=False
-        )
+        self.scheduling_order(schedule_low_priority_values_first=False)
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
@@ -144,7 +193,7 @@ class TestPrefillAdder(CustomTestCase):
 
         new_req = self.create_mock_req("new1", priority=1, max_new_tokens=49)
 
-        success = adder.preempt_to_schedule(new_req, mock_server_args)
+        success = adder.preempt_to_schedule(new_req)
 
         self.assertTrue(success)
         self.assertIn(running_reqs[0], adder.preempt_list)
@@ -161,9 +210,7 @@ class TestPrefillAdder(CustomTestCase):
             self.create_mock_req(rid, priority, max_new_tokens)
             for rid, priority, max_new_tokens in params
         ]
-        mock_server_args = self.create_server_args(
-            schedule_low_priority_values_first=True
-        )
+        self.scheduling_order(schedule_low_priority_values_first=True)
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
@@ -176,7 +223,7 @@ class TestPrefillAdder(CustomTestCase):
 
         new_req = self.create_mock_req("new1", priority=1, max_new_tokens=49)
 
-        success = adder.preempt_to_schedule(new_req, mock_server_args)
+        success = adder.preempt_to_schedule(new_req)
 
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
@@ -193,9 +240,7 @@ class TestPrefillAdder(CustomTestCase):
             self.create_mock_req(rid, priority, max_new_tokens)
             for rid, priority, max_new_tokens in params
         ]
-        mock_server_args = self.create_server_args(
-            schedule_low_priority_values_first=True
-        )
+        self.scheduling_order(schedule_low_priority_values_first=True)
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
@@ -211,7 +256,7 @@ class TestPrefillAdder(CustomTestCase):
         )
 
         success_by_priority_check = adder.preempt_to_schedule(
-            new_req_fail_by_priority_check, mock_server_args
+            new_req_fail_by_priority_check
         )
         self.assertFalse(success_by_priority_check)
 
@@ -219,7 +264,7 @@ class TestPrefillAdder(CustomTestCase):
             "new2", priority=1, max_new_tokens=110
         )
         success_by_capacity_check = adder.preempt_to_schedule(
-            new_req_fail_by_priority_check, mock_server_args
+            new_req_fail_by_priority_check
         )
         self.assertFalse(success_by_capacity_check)
 
@@ -233,9 +278,7 @@ class TestPrefillAdder(CustomTestCase):
             self.create_mock_req(rid, priority, max_new_tokens)
             for rid, priority, max_new_tokens in params
         ]
-        mock_server_args = self.create_server_args(
-            schedule_low_priority_values_first=False
-        )
+        self.scheduling_order(schedule_low_priority_values_first=False)
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
@@ -251,7 +294,7 @@ class TestPrefillAdder(CustomTestCase):
         )
 
         success_by_priority_check = adder.preempt_to_schedule(
-            new_req_fail_by_priority_check, mock_server_args
+            new_req_fail_by_priority_check
         )
         self.assertFalse(success_by_priority_check)
 
@@ -259,7 +302,7 @@ class TestPrefillAdder(CustomTestCase):
             "new2", priority=-1, max_new_tokens=110
         )
         success_by_capacity_check = adder.preempt_to_schedule(
-            new_req_fail_by_priority_check, mock_server_args
+            new_req_fail_by_priority_check
         )
         self.assertFalse(success_by_capacity_check)
 
@@ -273,9 +316,7 @@ class TestPrefillAdder(CustomTestCase):
             self.create_mock_req(rid, priority, max_new_tokens)
             for rid, priority, max_new_tokens in params
         ]
-        mock_server_args = self.create_server_args(
-            schedule_low_priority_values_first=False
-        )
+        self.scheduling_order(schedule_low_priority_values_first=False)
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
@@ -288,7 +329,7 @@ class TestPrefillAdder(CustomTestCase):
         first_req = self.create_mock_req(
             "new_req_prio_1", priority=1, max_new_tokens=49
         )
-        first_success = adder.preempt_to_schedule(first_req, mock_server_args)
+        first_success = adder.preempt_to_schedule(first_req)
         self.assertTrue(first_success)
         self.assertIn(running_reqs[0], adder.preempt_list)
         self.assertEqual(adder.rem_total_token_offset, 175)
@@ -299,7 +340,7 @@ class TestPrefillAdder(CustomTestCase):
         second_req = self.create_mock_req(
             "second_new_req_prio_1", priority=1, max_new_tokens=76
         )
-        second_success = adder.preempt_to_schedule(second_req, mock_server_args)
+        second_success = adder.preempt_to_schedule(second_req)
 
         self.assertFalse(second_success)
         self.assertEqual(adder.rem_total_token_offset, 175)
@@ -318,9 +359,7 @@ class TestPrefillAdder(CustomTestCase):
             self.create_mock_req(rid, priority, max_new_tokens)
             for rid, priority, max_new_tokens in params
         ]
-        mock_server_args = self.create_server_args(
-            schedule_low_priority_values_first=True
-        )
+        self.scheduling_order(schedule_low_priority_values_first=True)
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
@@ -333,7 +372,7 @@ class TestPrefillAdder(CustomTestCase):
 
         new_req = self.create_mock_req("new1", priority=1, max_new_tokens=75)
 
-        success = adder.preempt_to_schedule(new_req, mock_server_args)
+        success = adder.preempt_to_schedule(new_req)
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
         self.assertEqual(
@@ -353,9 +392,7 @@ class TestPrefillAdder(CustomTestCase):
             self.create_mock_req(rid, priority, max_new_tokens)
             for rid, priority, max_new_tokens in params
         ]
-        mock_server_args = self.create_server_args(
-            schedule_low_priority_values_first=True
-        )
+        self.scheduling_order(schedule_low_priority_values_first=True)
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
@@ -368,7 +405,7 @@ class TestPrefillAdder(CustomTestCase):
 
         new_req = self.create_mock_req("new1", priority=1, max_new_tokens=200)
 
-        success = adder.preempt_to_schedule(new_req, mock_server_args)
+        success = adder.preempt_to_schedule(new_req)
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
         self.assertIn(running_reqs[3], adder.preempt_list)

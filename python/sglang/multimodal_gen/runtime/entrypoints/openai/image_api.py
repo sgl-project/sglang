@@ -3,7 +3,6 @@
 import asyncio
 import base64
 import contextlib
-import json
 import os
 import time
 from typing import Any, List, Optional
@@ -37,9 +36,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
-    flatten_extra_params,
+    get_sampling_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
+    request_extra_value,
+    resolve_sampling_params_cls,
     save_image_to_path,
     temp_dir_if_disabled,
 )
@@ -53,20 +54,7 @@ router = APIRouter(prefix="/v1/images", tags=["images"])
 
 
 def _get_extra_field(request, field_name):
-    """Get a field from model_extra, with fallback to nested extra_body dict."""
-    extra = request.model_extra or {}
-    value = extra.get(field_name)
-    if value is not None:
-        return value
-    if field_name == "use_guardrails" and extra.get("guardrails") is not None:
-        return extra["guardrails"]
-
-    for container_name in ("extra_body", "extra_json", "extra_args", "extra_params"):
-        value = _parse_extra_container(extra.get(container_name)).get(field_name)
-        if value is not None:
-            return value
-
-    return value
+    return request_extra_value(request, field_name)
 
 
 def _get_request_field_or_extra(request, field_name):
@@ -76,20 +64,23 @@ def _get_request_field_or_extra(request, field_name):
     return _get_extra_field(request, field_name)
 
 
+def _image_request_model_kwargs(
+    request: ImageGenerationsRequest,
+    sampling_params_cls: type[SamplingParams],
+) -> dict[str, Any]:
+    """Extract fields owned and declared by the active model contract."""
+
+    kwargs = {}
+    for field_name in get_sampling_request_extra_fields(sampling_params_cls, "image"):
+        value = _get_extra_field(request, field_name)
+        if value is not None:
+            kwargs[field_name] = value
+    return kwargs
+
+
 def _runtime_sampling_quality(quality: str | None) -> str | None:
     """Keep OpenAI's automatic default out of SGLang's sampling contract."""
     return None if quality in (None, "auto") else quality
-
-
-def _parse_extra_container(value: Any) -> dict[str, Any]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except Exception:
-            return {}
-    if isinstance(value, dict):
-        return flatten_extra_params(dict(value))
-    return {}
 
 
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
@@ -257,13 +248,15 @@ def _get_response_resize(
                 width, height = output_image.size
             return f"{width}x{height}"
         except (OSError, ValueError):
-            # Fall back to the aligned sampling canvas if the output cannot be
-            # inspected (for example, for a custom output transport).
+            # Fall back to request metadata if the output cannot be inspected
+            # (for example, for a custom output transport).
             pass
 
-    if sampling_params.width is None or sampling_params.height is None:
+    width = sampling_params.requested_width or sampling_params.width
+    height = sampling_params.requested_height or sampling_params.height
+    if width is None or height is None:
         return None
-    return sampling_params.output_size_str()
+    return f"{width}x{height}"
 
 
 @router.post("/generations", response_model=ImageResponse)
@@ -273,12 +266,14 @@ async def generations(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
-    is_cosmos3 = "cosmos3" in (server_args.model_path or "").lower()
-    ext = (
-        "png"
-        if is_cosmos3 and request.output_format is None
-        else choose_output_image_ext(request.output_format, request.background)
+    sampling_params_cls = resolve_sampling_params_cls(server_args)
+    model_kwargs = _image_request_model_kwargs(request, sampling_params_cls)
+    output_format = (
+        request.output_format
+        if request.output_format is not None
+        else sampling_params_cls.default_image_output_format()
     )
+    ext = choose_output_image_ext(output_format, request.background)
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
         sampling = build_sampling_params(
@@ -307,12 +302,6 @@ async def generations(
                 if request.flow_shift is not None
                 else _get_extra_field(request, "flow_shift")
             ),
-            use_duration_template=_get_extra_field(request, "use_duration_template"),
-            use_resolution_template=_get_extra_field(
-                request, "use_resolution_template"
-            ),
-            use_system_prompt=_get_extra_field(request, "use_system_prompt"),
-            use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
             enable_cache_dit=_get_extra_field(request, "enable_cache_dit"),
             cache_dit_params=_get_extra_field(request, "cache_dit_params"),
@@ -328,13 +317,12 @@ async def generations(
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
-            use_pe=_get_extra_field(request, "use_pe"),
-            preset=_get_extra_field(request, "preset"),
             progressive_mode=_get_request_field_or_extra(request, "progressive_mode"),
             progressive_levels=_get_request_field_or_extra(
                 request, "progressive_levels"
             ),
             progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
+            **model_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
@@ -351,13 +339,12 @@ async def generations(
         )
         save_file_path = save_file_path_list[0]
         response_resize = _get_response_resize(sampling, save_file_path)
-        resp_format = (request.response_format or "b64_json").lower()
-        if (
-            is_cosmos3
-            and "response_format" not in request.model_fields_set
-            and request.response_format == "url"
-        ):
-            resp_format = "b64_json"
+        response_format = request.response_format
+        if "response_format" not in request.model_fields_set:
+            response_format = (
+                sampling_params_cls.default_image_response_format() or response_format
+            )
+        resp_format = (response_format or "b64_json").lower()
 
         # read b64 before cloud upload may delete the local file
         b64_list = (

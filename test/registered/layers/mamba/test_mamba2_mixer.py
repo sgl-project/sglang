@@ -42,9 +42,9 @@ def test_mixer2_gated_norm_multi_gpu(
     if device not in ["cuda", "xpu"]:
         pytest.skip("Test only supports CUDA and XPU devices")
 
-    assert (
-        get_device_count() >= NUM_GPUS
-    ), f"This test requires at least {NUM_GPUS} GPUs, but only {get_device_count()} available"
+    assert get_device_count() >= NUM_GPUS, (
+        f"This test requires at least {NUM_GPUS} GPUs, but only {get_device_count()} available"
+    )
 
     hidden_size, n_groups = hidden_size_n_groups
     num_processes = NUM_GPUS
@@ -109,9 +109,12 @@ def mixer2_gated_norm_tensor_parallel(
 
     import sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated as m2
 
-    # Force attn-TP rank through the context (the weight loader reads it via
-    # get_parallel().attn_tp_rank); avoids calling initialize_dp_attention.
-    with get_parallel().override(attn_tp_rank=local_rank):
+    # Force the TP topology through the context (the weight loader reads
+    # get_parallel().attn_tp_rank, Mixer2RMSNormGated reads tp_size / tp_rank);
+    # avoids calling initialize_dp_attention.
+    with get_parallel().override(
+        attn_tp_rank=local_rank, tp_size=world_size, tp_rank=local_rank
+    ):
         # create gated-norm with TP
         mixer = m2.Mixer2RMSNormGated(
             full_hidden_size=hidden_size,

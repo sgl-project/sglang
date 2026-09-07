@@ -62,7 +62,6 @@ def _build_fp8_quant_pair(device: str = "cuda"):
 
 
 class TestQuantUlp(CustomTestCase):
-
     def test_matches_bruteforce_spacing_for_fp8(self):
         for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             all_bits = torch.arange(256, dtype=torch.uint8).view(dtype)
@@ -183,7 +182,6 @@ class TestCompareQuantPair(CustomTestCase):
 
 
 class TestSelectComparableWeight(CustomTestCase):
-
     def test_returns_none_when_not_a_quant_method(self):
         self.assertIsNone(select_comparable_weight(None))
 

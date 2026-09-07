@@ -467,11 +467,13 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
     # The IPC consumer count asks for the *configured* TP size (matching
     # MmItemMemoryPool.try_to_recycle), so publish it; the live topology the
     # sharding helper reads is forced through the context's own override.
-    with mock_patch(
-        "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
-        return_value=sharded_embeddings,
-    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, attn_tp_size=1
+    with (
+        mock_patch(
+            "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
+            return_value=sharded_embeddings,
+        ) as run_dp,
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, attn_tp_size=1),
     ):
         output = model.get_image_feature(items)
         # Exercise the loader while the runtime topology is forced.
@@ -503,6 +505,7 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
 
 
 def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
+    """A vision-DP owner uses each assigned image's grid when preprocessing."""
     from unittest.mock import patch as mock_patch
 
     from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -531,13 +534,15 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
             "pad_height": 0,
         },
     )
+    grids = [[1, 1, 1], [1, 1, 2]]
+    patch_counts = [grid[0] * grid[1] * grid[2] for grid in grids]
     items = [
         MultimodalDataItem(
             modality=Modality.IMAGE,
             offsets=[(index, index)],
             feature=torch.full((3, 2, 2), index, dtype=torch.uint8),
             model_specific_data={
-                "image_grid_thw": torch.tensor([[1, 1, 1]]),
+                "image_grid_thw": torch.tensor([grids[index]]),
                 DEFERRED_PREPROCESSING_KEY: deferred_config,
             },
         )
@@ -546,19 +551,26 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     calls = []
 
     def fake_preprocess(images, resize_configs, *args, **kwargs):
-        calls.append([int(image[0, 0, 0]) for image in images])
-        return torch.tensor([[float(calls[-1][0]), 0.0]]), torch.tensor([[1, 1, 1]])
+        ids = [int(image[0, 0, 0]) for image in images]
+        calls.append(ids)
+        pixel_values = torch.cat(
+            [torch.full(size=(patch_counts[i], 2), fill_value=float(i)) for i in ids]
+        )
+        return pixel_values, torch.tensor([grids[i] for i in ids])
 
     # Configured TP size (the IPC consumer count) comes from the published
     # bags; the live topology is forced through the context's own override.
-    with mock_patch(
-        "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
-        return_value=torch.zeros(1, 2),
-    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, attn_tp_size=1
-    ), mock_patch(
-        "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
-        side_effect=fake_preprocess,
+    with (
+        mock_patch(
+            "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
+            return_value=torch.zeros(1, 2),
+        ) as run_dp,
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, attn_tp_size=1),
+        mock_patch(
+            "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+            side_effect=fake_preprocess,
+        ),
     ):
         model.get_image_feature(items)
         loader = run_dp.call_args.kwargs["load_local_pixel_values"]
@@ -566,7 +578,8 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
 
     assert calls == [[1]]
     assert one.dtype == torch.float32
-    assert one.tolist() == [[1.0, 0.0]]
+    assert one.shape == (2, 2)
+    assert (one == 1.0).all()
 
 
 def test_kimi_k3_scheduler_leaves_feature_placement_to_dp_owner():

@@ -130,8 +130,9 @@ def select_best_resolution(original_size, possible_resolutions):
     for width, height in possible_resolutions:
         # Calculate the downscaled size to keep the aspect ratio
         scale = min(width / original_width, height / original_height)
-        downscaled_width, downscaled_height = int(original_width * scale), int(
-            original_height * scale
+        downscaled_width, downscaled_height = (
+            int(original_width * scale),
+            int(original_height * scale),
         )
 
         # Calculate effective and wasted resolutions

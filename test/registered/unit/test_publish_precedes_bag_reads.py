@@ -42,6 +42,7 @@ import unittest
 
 import sglang
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.config_publishers import publisher_names
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
@@ -77,15 +78,22 @@ _KNOWN_ENTRIES = frozenset(
             "run_data_parallel_controller_process",
         ),
         ("srt/ray/scheduler_actor.py", "__init__"),
-        ("srt/disaggregation/encode_server.py", "__init__"),
-        ("srt/disaggregation/encode_server.py", "launch_server"),
-        ("srt/managers/tokenizer_manager.py", "__init__"),
+        ("srt/disaggregation/encoder/http_server.py", "launch_server"),
         ("srt/entrypoints/engine.py", "_launch_subprocesses"),
         (
             "srt/elastic_ep/expert_backup_manager.py",
             "run_expert_backup_manager_process",
         ),
         ("srt/weight_cache/daemon.py", "load"),
+        # The multi-tokenizer worker, the benchmark work functions (run
+        # inline or spawned per rank), and the encoder's gRPC / spawned-TP /
+        # spawned-DP entries.
+        ("srt/entrypoints/http_server.py", "init_multi_tokenizer"),
+        ("benchmark/one_batch.py", "latency_test"),
+        ("benchmark/one_batch.py", "correctness_test"),
+        ("srt/disaggregation/encoder/grpc_server.py", "serve_grpc_encoder"),
+        ("srt/disaggregation/encoder/server.py", "launch_encoder"),
+        ("srt/disaggregation/encoder/runtime.py", "launch_dp_worker"),
     }
 )
 
@@ -103,6 +111,13 @@ _UNREAD_ENTRIES: dict = {
     ),
     ("multimodal_gen/test/unit/test_disagg_trace.py", "_srt_trace_server_args"): (
         "a trace fixture publishing its own context"
+    ),
+    (
+        "multimodal_gen/runtime/managers/gpu_worker.py",
+        "init_device_and_model",
+    ): (
+        "a worker installing a placeholder when its process has nothing "
+        "published; it reads its own config, not the srt bags"
     ),
 }
 
@@ -158,6 +173,9 @@ def _calls(fn):
     return out
 
 
+_PUBLISH_NAMES = publisher_names(_PACKAGE_ROOT / "srt")
+
+
 class _Module:
     """One parsed module: what it calls the config API, and what it defines.
 
@@ -183,9 +201,7 @@ class _Module:
                 if node.module in _CONFIG_MODULES:
                     for alias in node.names:
                         local = alias.asname or alias.name
-                        if alias.name == "publish" or alias.name.startswith(
-                            "set_global_server_args"
-                        ):
+                        if alias.name in _PUBLISH_NAMES:
                             self.publishers.add(local)
                         elif alias.name in _ACCESSORS:
                             self.accessors.add(local)
@@ -387,6 +403,9 @@ def _publishing_functions():
     for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
         rel = path.relative_to(_PACKAGE_ROOT).as_posix()
         if rel in _PUBLISH_HOMES:
+            continue
+        source = path.read_text(encoding="utf-8-sig")
+        if not any(name in source for name in _PUBLISH_NAMES):
             continue
         mod = _module(rel)
         if mod is None or not mod.publishers:

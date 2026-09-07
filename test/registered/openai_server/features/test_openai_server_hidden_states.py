@@ -25,7 +25,6 @@ register_amd_ci(
 
 
 class BaseTestOpenAIServerWithHiddenStates(ABC):
-
     @classmethod
     def setUpClass(cls):
         cls.return_hidden_states = [False, True]
@@ -55,18 +54,14 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
 
     def test_chat_completion(self):
         for return_hidden_states in self.return_hidden_states:
-            for (
-                parallel_sample_num
-            ) in (
+            for parallel_sample_num in (
                 self.parallel_sample_nums
             ):  # parallel sample num 2 breaks in the adapter with a 400 for EAGLE
                 self.run_chat_completion(parallel_sample_num, return_hidden_states)
 
     def test_chat_completion_stream(self):
         for return_hidden_states in self.return_hidden_states:
-            for (
-                parallel_sample_num
-            ) in (
+            for parallel_sample_num in (
                 self.parallel_sample_nums
             ):  # parallel sample num > 1 breaks in the adapter with a 400 for EAGLE
                 self.run_chat_completion_stream(
@@ -144,13 +139,13 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
                     hidden_states_list.append(choice.hidden_states)
 
         if return_hidden_states:
-            assert (
-                len(hidden_states_list) == parallel_sample_num * num_choices
-            ), f"Expected {parallel_sample_num * num_choices} hidden states, got {len(hidden_states_list)}"
+            assert len(hidden_states_list) == parallel_sample_num * num_choices, (
+                f"Expected {parallel_sample_num * num_choices} hidden states, got {len(hidden_states_list)}"
+            )
         else:
-            assert (
-                hidden_states_list == []
-            ), "hidden_states were returned and should not have been"
+            assert hidden_states_list == [], (
+                "hidden_states were returned and should not have been"
+            )
 
     def run_chat_completion(self, parallel_sample_num, return_hidden_states):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -201,13 +196,13 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
                     hidden_states_list.append(choice.delta.hidden_states)
 
         if return_hidden_states:
-            assert (
-                len(hidden_states_list) == parallel_sample_num
-            ), f"Expected {parallel_sample_num} hidden states, got {len(hidden_states_list)}"
+            assert len(hidden_states_list) == parallel_sample_num, (
+                f"Expected {parallel_sample_num} hidden states, got {len(hidden_states_list)}"
+            )
         else:
-            assert (
-                hidden_states_list == []
-            ), "hidden_states were returned and should not have been"
+            assert hidden_states_list == [], (
+                "hidden_states were returned and should not have been"
+            )
 
 
 class TestOpenAIServerWithHiddenStatesEnabled(

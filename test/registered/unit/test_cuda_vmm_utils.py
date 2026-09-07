@@ -21,8 +21,8 @@ import torch.distributed as dist
 from cuda.bindings import driver as drv
 
 from sglang.kernels.jit.utils import cache_once
-from sglang.srt import cuda_vmm_utils
-from sglang.srt.cuda_vmm_utils import (
+from sglang.srt.utils import cuda_vmm_utils
+from sglang.srt.utils.cuda_vmm_utils import (
     check_drv,
     exchange_posix_fds,
     export_shareable_handles,
@@ -104,9 +104,7 @@ def _byte(rank: int, chunk: int) -> int:
 def _assert_region(va: int, expected: int, peer: int, chunk: int) -> None:
     host = np.empty(16, dtype=np.uint8)
     check_drv(drv.cuMemcpyDtoH(host.ctypes.data, va, host.nbytes), "cuMemcpyDtoH")
-    assert (
-        host == expected
-    ).all(), (
+    assert (host == expected).all(), (
         f"read {host.tolist()} from peer {peer} chunk {chunk}, expected all {expected}"
     )
 

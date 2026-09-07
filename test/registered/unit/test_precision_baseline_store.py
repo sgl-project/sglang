@@ -62,6 +62,18 @@ class TestHfStoreConfig(CustomTestCase):
             cfg = hfs.HfStoreConfig.from_env()
         self.assertEqual(cfg.revision, "dev")
 
+    def test_from_env_reads_read_only_mode(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_PRECISION_HF_REPO": "my/repo",
+                "SGLANG_PRECISION_HF_READ_ONLY": "1",
+            },
+            clear=False,
+        ):
+            cfg = hfs.HfStoreConfig.from_env()
+        self.assertTrue(cfg.read_only)
+
     def test_from_env_raises_when_missing(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RuntimeError):
@@ -280,23 +292,32 @@ class TestFetchLatestBaseline(CustomTestCase):
             (tensors / "layer0.pt").write_bytes(b"\x00")
             mock_snapshot.return_value = snap_dir
 
-            with tempfile.TemporaryDirectory() as target:
+            with tempfile.TemporaryDirectory() as target_root:
+                target = Path(target_root) / "tensors"
+                target.mkdir()
+                (target / "stale.pt").write_bytes(b"\xff")
                 result = hfs.fetch_latest_baseline(
                     config=_make_config(),
                     model="org/m",
-                    target_tensors_dir=Path(target),
+                    target_tensors_dir=target,
                 )
+                self.assertEqual((target / "layer0.pt").read_bytes(), b"\x00")
+                self.assertFalse((target / "stale.pt").exists())
             self.assertEqual(result, "org__m/2025/01/01/run-abc")
 
     @patch.object(hfs, "_read_manifest")
     def test_returns_none_when_no_runs(self, mock_manifest):
         mock_manifest.return_value = ([], "")
-        with tempfile.TemporaryDirectory() as target:
+        with tempfile.TemporaryDirectory() as target_root:
+            target = Path(target_root) / "tensors"
+            target.mkdir()
+            (target / "stale.pt").write_bytes(b"\xff")
             result = hfs.fetch_latest_baseline(
                 config=_make_config(),
                 model="org/m",
-                target_tensors_dir=Path(target),
+                target_tensors_dir=target,
             )
+            self.assertFalse(target.exists())
         self.assertIsNone(result)
 
     @patch("sglang.test.precision_baseline_store.snapshot_download")
@@ -338,6 +359,19 @@ class TestPushRun(CustomTestCase):
     """push_run deletes its temp manifest file in a finally block, so tests
     that inspect the manifest content must capture it via a side_effect on
     the mock upload_file *before* push_run cleans up."""
+
+    def test_read_only_store_rejects_push_before_api_access(self):
+        config = hfs.HfStoreConfig(repo="test/repo", read_only=True)
+        with tempfile.TemporaryDirectory() as td, patch.object(hfs, "HfApi") as api:
+            with self.assertRaisesRegex(PermissionError, "read-only"):
+                hfs.push_run(
+                    config=config,
+                    model="org/model",
+                    sglang_commit="abc1234",
+                    today_tensors_dir=Path(td),
+                    meta={},
+                )
+        api.assert_not_called()
 
     @staticmethod
     def _make_push_mocks(mock_manifest, mock_api_cls):
