@@ -323,7 +323,7 @@ class TestSWA(unittest.TestCase):
             allocator.free_swa_segment(indices, start_pos=0)
 
         # The reps were gathered at enqueue time, not from these views.
-        self.assertEqual(len(allocator.swa_page_reps_group), len(index_batches))
+        self.assertEqual(len(allocator.swa_page_ids_group), len(index_batches))
         self.assertEqual(allocator.swa_available_size(), available_before_free)
         for indices in index_batches:
             indices.zero_()
