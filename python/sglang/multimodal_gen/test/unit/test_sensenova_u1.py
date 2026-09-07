@@ -732,6 +732,7 @@ def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=Non
     worker.server_args = server_args
     worker.is_output_rank = True
     worker._runtime_peak_reserved_mb = 0.0
+    worker._release_warmup_pool_before_serving = False
     worker._realtime_sessions = SimpleNamespace(attach=lambda _req: None)
     return batch, trace_ctx, pipeline.executor, _WorkerBackedSchedulerClient(worker)
 
