@@ -92,7 +92,11 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-if is_cpu() or is_cuda() or _is_gfx95_supported:
+# On XPU the OCP-MoE `Mxfp4Config` path is served by the sgl-kernel-xpu grouped
+# GEMM, which consumes the packed e2m1 + ue8m0 g32 checkpoint layout directly.
+# Other backends without that kernel keep the existing "unknown quantization
+# method" error rather than falling through to a bf16 upcast.
+if is_cpu() or is_cuda() or _is_gfx95_supported or is_xpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,

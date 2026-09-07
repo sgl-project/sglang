@@ -459,6 +459,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             require_gathered_buffer=self.require_gathered_buffer,
             enable_prefill_cp=self.enable_prefill_cp,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
+            attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             dp_size=self.dp_size,
             source=self.buffers,
         )
@@ -915,17 +916,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
 
-        # Adjust for attention TP if needed (matching replay path in
-        # populate_from_forward_batch).
+        # Localize the count when this bucket is attn-TP sharded (SP on).
+        attn_tp_sharded = self.model_runner.attn_tp_sequence_sharded(num_tokens)
         buffers.num_token_non_padded[...] = num_tokens
         if (
             enable_num_token_non_padded()
-            and self.require_gathered_buffer
             and not self.enable_prefill_cp
+            and attn_tp_sharded
         ):
             local = compute_local_num_token_non_padded(
                 global_num_token_non_padded=buffers.num_token_non_padded,
                 num_tokens_per_dp=num_tokens,
+                sharded=True,
             )
             buffers.num_token_non_padded.copy_(local)
 
@@ -1009,6 +1011,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
+            attn_tp_sequence_sharded=attn_tp_sharded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
             rids_int=rids_int,
