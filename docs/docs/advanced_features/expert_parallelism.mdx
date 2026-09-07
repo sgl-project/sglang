@@ -245,6 +245,46 @@ To enable EPLB, use the flags `--enable-eplb`. For optimal performance, increase
 
 For more details, refer to the [EPLB Section in the Large-Scale EP Blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/#expert-parallelism-load-balancer) and the [EPLB Repository](https://github.com/deepseek-ai/eplb).
 
+### Topology-aware placement (experimental)
+
+The default EPLB balances expert load without using the physical links between
+EP ranks. `--eplb-algorithm topology_aware` also uses a user-provided cost
+matrix, so the planner can prefer a rank with a cheaper path for the observed
+token traffic. The matrix is relative: smaller values mean cheaper
+communication, and the diagonal must be zero.
+
+Create a JSON file with one row and column per EP rank:
+
+```json
+{
+  "rank_cost_matrix": [
+    [0.0, 1.0],
+    [1.0, 0.0]
+  ]
+}
+```
+
+Then enable the planner on a CUDA deployment:
+
+```bash
+python -m sglang.launch_server \
+  --model-path MODEL_PATH \
+  --tp-size 8 \
+  --enable-eplb \
+  --eplb-algorithm topology_aware \
+  --eplb-topology /path/to/ep_topology.json
+```
+
+The current implementation requires an A2A backend, `ep_size == tp_size`,
+`--moe-data-parallel-size 1`, no redundant experts, and the `stat` or
+`stat_approx` expert-distribution recorder. `stat_approx` is supported only
+with DeepEP normal mode; DeepEP low-latency/auto and Mori do not expose the
+source-rank counts needed by this planner. It does not support elastic EP.
+
+Rows and columns in the matrix use the SGLang MoE-EP group rank order (the
+same rank order used by the CUDA process group and `CUDA_VISIBLE_DEVICES`),
+not an independently sorted PCIe or hostname order.
+
 
 ## Ascend NPU Guidance
 ### Guidance on SGLang configuration in Ascend NPU

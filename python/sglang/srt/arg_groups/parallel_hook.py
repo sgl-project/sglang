@@ -528,6 +528,56 @@ def handle_eplb_and_dispatch(server_args: Any):
             "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
         )
 
+    if cfg.eplb_algorithm == "topology_aware":
+        if not cfg.enable_eplb:
+            raise ValueError("--eplb-algorithm topology_aware requires --enable-eplb")
+        if cfg.eplb_topology is None:
+            raise ValueError("--eplb-algorithm topology_aware requires --eplb-topology")
+        if cfg.ep_num_redundant_experts != 0:
+            raise ValueError(
+                "topology-aware EPLB currently requires --ep-num-redundant-experts 0"
+            )
+        if cfg.elastic_ep_backend is not None:
+            raise ValueError(
+                "topology-aware EPLB currently does not support elastic EP"
+            )
+        if cfg.moe_dp_size != 1:
+            raise ValueError(
+                "topology-aware EPLB currently requires --moe-data-parallel-size 1"
+            )
+        if resolved_view(server_args).ep_size != cfg.tp_size:
+            raise ValueError(
+                "topology-aware EPLB currently requires ep_size == tp_size"
+            )
+        if getattr(cfg, "ep_dispatch_algorithm", None) not in (None, "static"):
+            raise ValueError(
+                "topology-aware EPLB currently requires --ep-dispatch-algorithm static"
+            )
+        if cfg.expert_distribution_recorder_mode not in ("stat", "stat_approx"):
+            raise ValueError(
+                "topology-aware EPLB requires expert distribution recorder mode "
+                "'stat' or 'stat_approx'"
+            )
+        a2a_backend = resolved_view(server_args).moe_a2a_backend
+        if a2a_backend == "none":
+            raise ValueError(
+                "topology-aware EPLB requires an MoE A2A backend; "
+                "--moe-a2a-backend none has no source-to-destination traffic"
+            )
+        if cfg.expert_distribution_recorder_mode == "stat_approx" and (
+            a2a_backend != "deepep" or cfg.deepep_mode != "normal"
+        ):
+            raise ValueError(
+                "topology-aware EPLB with stat_approx requires DeepEP normal mode"
+            )
+        if (a2a_backend == "deepep" and cfg.deepep_mode != "normal") or (
+            a2a_backend == "mori"
+        ):
+            raise ValueError(
+                "topology-aware EPLB requires a source-aware A2A path; "
+                "DeepEP low-latency/auto and Mori do not expose source counts"
+            )
+
     # Without an a2a backend all EP ranks run the MoE over the same tokens and
     # sum their partial outputs, so the pick has to agree across ranks.
     needs_rank_invariant_dispatch = resolved_view(server_args).moe_a2a_backend == "none"
