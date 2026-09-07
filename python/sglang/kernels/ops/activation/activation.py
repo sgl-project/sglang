@@ -134,6 +134,11 @@ def run_activation(
     if expert_ids is None:
         _run_activation_inplace(op_name, input, out)
     else:
+        # The JIT kernel indexes expert ids as int32. Routing ids may arrive as
+        # int64 (e.g. from torch.topk) and torch.compile realizes them at their
+        # true dtype, so normalize here instead of asserting downstream.
+        if expert_ids.dtype != torch.int32:
+            expert_ids = expert_ids.to(torch.int32)
         _run_activation_filtered_inplace(op_name, input, out, expert_ids, expert_step)
     return out
 
@@ -157,9 +162,9 @@ def run_unary_activation(
     Unlike :func:`run_activation`, there is no gate/up split — ``input`` and
     ``out`` share the same shape.
     """
-    assert (
-        op_name in SUPPORTED_UNARY_ACTIVATIONS
-    ), f"Unsupported unary activation: {op_name}"
+    assert op_name in SUPPORTED_UNARY_ACTIVATIONS, (
+        f"Unsupported unary activation: {op_name}"
+    )
     if out is None:
         out = torch.empty_like(input)
     _run_unary_activation_inplace(op_name, input, out)
@@ -198,6 +203,17 @@ def silu_and_mul_with_activation_rounding_(input: torch.Tensor) -> torch.Tensor:
     hidden_size = input.shape[-1] // 2
     _run_silu_and_mul_with_rounding_inplace(input)
     return input[..., :hidden_size]
+
+
+def gelu_and_mul_with_activation_rounding(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    hidden_size = input.shape[-1] // 2
+    if out is None:
+        out = input.new_empty(*input.shape[:-1], hidden_size)
+    _run_activation_with_rounding_inplace("gelu", input, out)
+    return out
 
 
 def gelu_and_mul(

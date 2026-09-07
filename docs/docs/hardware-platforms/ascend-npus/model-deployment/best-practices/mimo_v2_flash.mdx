@@ -83,6 +83,7 @@ export SGLANG_DEEPEP_BF16_DISPATCH=0
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -103,8 +104,8 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=1024
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=1024
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
         export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1
@@ -130,7 +131,6 @@ do
         --disable-cuda-graph \
         --disable-piecewise-cuda-graph \
         --dp-size 2
-        NODE_RANK=$i
         break
     fi
 done
@@ -141,8 +141,8 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=800
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 
@@ -172,7 +172,6 @@ do
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency
-        NODE_RANK=$i
         break
     fi
 done
@@ -206,11 +205,12 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 64 \
+    --num-prompts 128 \
+    --request-rate 0.4 \
     --random-input-len 16000 \
     --random-output-len 1 \
-    --num-prompts 128 \
     --random-range-ratio 1 \
-    --request-rate 0.4
+    --seed 1
 ```
 
 ### MiMo-V2-Flash 1P1D 12P IN16K OUT1K TPOT 20ms
@@ -268,6 +268,7 @@ export SGLANG_DEEPEP_BF16_DISPATCH=0
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -288,8 +289,8 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=1024
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=1024
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
         export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1
@@ -315,7 +316,6 @@ do
         --disable-cuda-graph \
         --disable-piecewise-cuda-graph \
         --dp-size 2
-        NODE_RANK=$i
         break
     fi
 done
@@ -326,8 +326,8 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=800
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 
@@ -357,7 +357,6 @@ do
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency
-        NODE_RANK=$i
         break
     fi
 done
@@ -391,11 +390,12 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 32 \
+    --num-prompts 128 \
+    --request-rate inf \
     --random-input-len 16000 \
     --random-output-len 1000 \
-    --num-prompts 128 \
     --random-range-ratio 1 \
-    --request-rate inf
+    --seed 1
 ```
 
 ### MiMo-V2-Flash 1P1D 12P IN32K OUT1 TTFT 5s
@@ -453,6 +453,7 @@ export SGLANG_DEEPEP_BF16_DISPATCH=0
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -473,8 +474,8 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=1024
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=1024
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
         export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1
@@ -500,7 +501,6 @@ do
         --disable-cuda-graph \
         --disable-piecewise-cuda-graph \
         --dp-size 2
-        NODE_RANK=$i
         break
     fi
 done
@@ -511,8 +511,8 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=800
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 
@@ -542,7 +542,6 @@ do
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency
-        NODE_RANK=$i
         break
     fi
 done
@@ -576,11 +575,12 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 64 \
+    --num-prompts 128 \
+    --request-rate 0.4 \
     --random-input-len 32000 \
     --random-output-len 1 \
-    --num-prompts 128 \
     --random-range-ratio 1 \
-    --request-rate 0.4
+    --seed 1
 ```
 
 ### MiMo-V2-Flash 1P1D 12P IN32K OUT1K TPOT 20ms
@@ -638,6 +638,7 @@ export SGLANG_DEEPEP_BF16_DISPATCH=0
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -658,8 +659,8 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=1024
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=1024
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
         export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1
@@ -685,7 +686,6 @@ do
         --disable-cuda-graph \
         --disable-piecewise-cuda-graph \
         --dp-size 2
-        NODE_RANK=$i
         break
     fi
 done
@@ -696,8 +696,8 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=800
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 
@@ -727,7 +727,6 @@ do
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency
-        NODE_RANK=$i
         break
     fi
 done
@@ -760,10 +759,11 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 64 \
+    --max-concurrency 48 \
+    --num-prompts 192 \
+    --request-rate inf \
     --random-input-len 32000 \
     --random-output-len 1000 \
-    --num-prompts 128 \
     --random-range-ratio 1 \
-    --request-rate inf
+    --seed 1
 ```

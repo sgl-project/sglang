@@ -82,8 +82,6 @@ class TimestepPreparationStage(PipelineStage):
         """
         Prepare timesteps for the diffusion process.
 
-
-
         Returns:
             The batch with prepared timesteps.
         """

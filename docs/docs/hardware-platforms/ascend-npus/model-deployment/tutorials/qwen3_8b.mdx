@@ -15,8 +15,8 @@ editions.
 This document demonstrates the deployment of Qwen3-8B on Ascend NPUs using SGLang, including single-node PD mixed mode,
 feature configuration, and performance optimization.
 
-This document is validated and written based on **SGLang v0.5.13**. The current model (Qwen3-8B) is fully supported in
-this version. To use the latest features (e.g., speculative decoding), it is recommended to use v0.5.13 or a later
+This document is validated and written based on **SGLang v0.5.16**. The current model (Qwen3-8B) is fully supported in
+this version. To use the latest features (e.g., speculative decoding), it is recommended to use v0.5.16 or a later
 version.
 
 ## Supported features
@@ -90,7 +90,7 @@ For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/fa
   <Tab title="Atlas 800I A3">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
+docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -118,14 +118,14 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
+quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 ```
 
   </Tab>
   <Tab title="Atlas 800I A2">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
+docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -145,7 +145,7 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
+quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 ```
 
   </Tab>

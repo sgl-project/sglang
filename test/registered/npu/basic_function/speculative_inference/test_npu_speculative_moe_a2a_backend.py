@@ -16,12 +16,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-16-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-16-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
 
 
 class TestAscendDistTimeout(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH
@@ -30,8 +29,6 @@ class TestAscendDistTimeout(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         os.environ["HCCL_BUFFSIZE"] = "2048"
         os.environ["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"
-        os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
-        os.environ["SGLANG_NPU_FUSED_MOE_MODE"] = "1"
         os.environ["TRANSFORMERS_VERBOSITY"] = "error"
         cls.env = os.environ.copy()
         cls.common_args = [
@@ -58,10 +55,16 @@ class TestAscendDistTimeout(CustomTestCase):
             2,
             "--moe-a2a-backend",
             "ascend_fuseep",
+            "--fuseep-mode",
+            1,
             "--deepep-mode",
             "auto",
             "--speculative-draft-model-quantization",
             "unquant",
+            "--speculative-draft-attention-backend",
+            "ascend",
+            "--speculative-moe-runner-backend",
+            "auto",
         ]
 
     def test_a_gsm8k(self):

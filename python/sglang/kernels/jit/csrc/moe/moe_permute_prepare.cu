@@ -69,8 +69,6 @@ __global__ void moe_permute_prepare_kernel(
   }
 }
 
-}  // namespace sglang
-
 void moe_permute_prepare(
     TensorView sorted_topk_ids,
     TensorView reorder_ids,
@@ -110,7 +108,7 @@ void moe_permute_prepare(
   constexpr int threads = 256;
   int num_blocks = std::max(1, (std::max(numel, num_experts_i32 + 1) + threads - 1) / threads);
 
-  sglang::moe_permute_prepare_kernel<<<num_blocks, threads, 0, stream>>>(
+  moe_permute_prepare_kernel<<<num_blocks, threads, 0, stream>>>(
       static_cast<const int32_t*>(sorted_topk_ids.data_ptr()),
       static_cast<const int64_t*>(reorder_ids.data_ptr()),
       expert_offsets.data_ptr(),
@@ -125,3 +123,5 @@ void moe_permute_prepare(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare, moe_permute_prepare);
+
+}  // namespace sglang

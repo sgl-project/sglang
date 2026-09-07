@@ -15,7 +15,10 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_reserve_per_decode,
+    page_aligned_decode_alloc_lens,
+)
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
@@ -92,7 +95,10 @@ def _eagle_prefill_tail_tokens(
         for i, r in enumerate(batch.reqs):
             if r is batch.chunked_req:
                 tail_tokens = tail_tokens.clone()
-                tail_tokens[i] = next_prompt_token
+                # Keep the scalar as a kernel argument. Assigning a Python scalar
+                # through scalar indexing issues a pageable H2D copy and
+                # synchronizes the current CUDA stream before draft extend.
+                tail_tokens[i : i + 1].fill_(next_prompt_token)
                 break
     return tail_tokens
 
@@ -478,13 +484,30 @@ def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
     return target_hidden * num_aux
 
 
+def get_draft_recurrent_hidden_state_spec_from_config(
+    model_config, spec_algorithm
+) -> tuple[Optional[int], Optional[torch.dtype]]:
+    """Return hidden_states width/dtype carried between draft decode steps.
+
+    Config-only so callers without a draft runner can reach it: prefill-side PP
+    builds the draft on the last stage alone, but the PD metadata wire schema it
+    feeds has to come out identical on every rank.
+    """
+    if spec_algorithm.is_standalone():
+        return None, None
+    return model_config.spec_hidden_size, model_config.dtype
+
+
 def get_draft_recurrent_hidden_state_spec(
     model_runner: ModelRunner,
 ) -> tuple[Optional[int], Optional[torch.dtype]]:
     """Return hidden_states width/dtype carried between draft decode steps."""
-    if model_runner.spec_algorithm.is_standalone():
-        return None, None
-    return model_runner.model_config.spec_hidden_size, model_runner.model_config.dtype
+    return get_draft_recurrent_hidden_state_spec_from_config(
+        model_runner.model_config, model_runner.spec_algorithm
+    )
+
+
+_PREPARE_FOR_VERIFY_DEPS = None
 
 
 def eagle_prepare_for_verify(
@@ -493,15 +516,34 @@ def eagle_prepare_for_verify(
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
 ):
-    from sglang.kernels.ops.speculative.cache_locs import (
+    # Imports must stay lazy (import-cycle safety) but only need to resolve
+    # once, not on every decode cycle of this hot path.
+    global _PREPARE_FOR_VERIFY_DEPS
+    if _PREPARE_FOR_VERIFY_DEPS is None:
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_extend_cache_locs_uniform_func,
+        )
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+        )
+        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+
+        _PREPARE_FOR_VERIFY_DEPS = (
+            assign_extend_cache_locs_uniform_func,
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+            prepare_mamba_track_for_verify,
+        )
+    (
         assign_extend_cache_locs_uniform_func,
-    )
-    from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
-    )
-    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+        prepare_mamba_track_for_verify,
+    ) = _PREPARE_FOR_VERIFY_DEPS
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -643,11 +685,30 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _can_use_sparse_uno_tree_target_sampling(
+    max_top_k: Optional[int],
+    sampling_info: SamplingBatchInfo,
+) -> bool:
+    if max_top_k is None:
+        return False
+
+    from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
+
+    return bool(
+        _is_cuda
+        and max_top_k <= _SPARSE_TOP_K_LIMIT
+        and sampling_info.sampling_seed is None
+        and not sampling_info.need_min_p_sampling
+        and not get_spec().speculative_use_rejection_sampling
+    )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
+    uno_target_max_top_k: Optional[int] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -734,6 +795,57 @@ def eagle_sample(
             target_predict=target_predict,
             topk=verify_input.tree_topk,
         )
+
+        if _is_hip:
+            # On ROCm, the per-rank draft tokens can differ, so ranks accept a
+            # different number of drafts, desynchronize the committed seq_lens, and
+            # deadlock the next TP collective. Broadcast from rank 0 to ensure
+            # consistency, the same way the sampling branch below does.
+            tp_group = (
+                get_parallel().attn_tp_group
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
+    elif _can_use_sparse_uno_tree_target_sampling(
+        uno_target_max_top_k,
+        sampling_info,
+    ):
+        from sglang.srt.speculative.uno_utils import (
+            sample_uno_tree_target_tokens,
+        )
+
+        target_predict = sample_uno_tree_target_tokens(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            batch_size=bs,
+            verify_width=verify_input.draft_token_num,
+            max_top_k=uno_target_max_top_k,
+        )
+        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=num_correct_drafts,
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_sibling=verify_input.retrieve_next_sibling,
+            target_predict=target_predict,
+            topk=verify_input.tree_topk,
+        )
+
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
     else:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -747,7 +859,12 @@ def eagle_sample(
 
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
-        # Apply temperature and get target probs
+        sampling_fn = (
+            chain_speculative_sampling_triton
+            if use_rejection_sampling
+            else tree_speculative_sampling_target_only
+        )
+
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
@@ -778,9 +895,8 @@ def eagle_sample(
             if use_rejection_sampling
             else torch.zeros_like(target_probs)
         )
-        # Defense-in-depth behind the spec_hook startup allowlist: validate the
-        # actual kernel inputs (catches draft_probs plumbing regressions or a
-        # startup guard bypassed by a worker subclass) before the Triton kernel.
+        # Defense-in-depth behind the spec_hook startup allowlist: validate
+        # the actual kernel inputs before the Triton kernel.
         if use_rejection_sampling and (
             draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
         ):
@@ -796,12 +912,6 @@ def eagle_sample(
             draft_token_num=verify_input.draft_token_num,
             candidates=candidates,
             device=device,
-        )
-
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
         )
         sampling_fn(
             predicts=predict,  # mutable
@@ -819,6 +929,13 @@ def eagle_sample(
             threshold_single=get_spec().speculative_accept_threshold_single,
             threshold_acc=get_spec().speculative_accept_threshold_acc,
             deterministic=True,
+        )
+        del (
+            expanded_temperature,
+            target_probs,
+            draft_probs,
+            coins,
+            coins_for_final_sampling,
         )
 
         # Sync sampling results across TP ranks: different GPUs may
@@ -889,26 +1006,12 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
 
-    cur_kv_lens = [0] * bs
-    nxt_kv_lens = [0] * bs
-    num_needed_tokens = 0
-    for i, r in enumerate(batch.reqs):
-        cur = r.kv.kv_allocated_len
-        # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
-        # kv_committed_len is honest (bonus committed in resolve, not here),
-        # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
-        # Whole-page accounting: the paged allocator hands out full pages, so
-        # round nxt up to the page boundary or the unaligned tail is allocated
-        # but never recorded — a stranded-tail leak at page_size > 1.
-        nxt = max(
-            cur,
-            (r.kv_committed_len + double_alloc + page_size - 1)
-            // page_size
-            * page_size,
-        )
-        cur_kv_lens[i] = cur
-        nxt_kv_lens[i] = nxt
-        num_needed_tokens += nxt - cur
+    cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
+        batch.reqs,
+        reserve=double_alloc,
+        page_size=page_size,
+    )
+    for r in batch.reqs:
         r.decode_batch_idx += 1
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")

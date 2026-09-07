@@ -8,12 +8,16 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_kimi_k3,
 )
-from sglang.srt.runtime_context import get_context, get_exec, get_schedule
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_context,
+    get_observability,
+    get_schedule,
+)
 from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +33,11 @@ def maybe_disable_chunked_prefix_cache(
     # model's (often non-MLA) config must not flip the shared setting.
     if is_draft_worker:
         return
+    # Chunked prefix cache is a prefill feature: the prefill half decides.
+    prefill_backend, _ = attention_backends()
     if (
         not use_mla_backend
-        or get_exec().kernel.attention_backend
-        not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        or prefill_backend not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
     ):
         if not get_schedule().disable_chunked_prefix_cache:
             get_context().override(
@@ -43,8 +48,8 @@ def maybe_disable_chunked_prefix_cache(
         logger.info("Chunked prefix cache is turned on.")
 
 
-def create_msprobe_debugger(server_args: ServerArgs) -> Optional[Any]:
-    if server_args.msprobe_dump_config is None:
+def create_msprobe_debugger() -> Optional[Any]:
+    if get_observability().msprobe_dump_config is None:
         return None
 
     try:
@@ -57,7 +62,7 @@ def create_msprobe_debugger(server_args: ServerArgs) -> Optional[Any]:
         return None
 
     seed_all(mode=True)
-    return PrecisionDebugger(config_path=server_args.msprobe_dump_config)
+    return PrecisionDebugger(config_path=get_observability().msprobe_dump_config)
 
 
 def resolve_pp_proxy_topk_size(

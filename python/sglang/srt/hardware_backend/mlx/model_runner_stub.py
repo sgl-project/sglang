@@ -19,7 +19,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
 )
-from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+from sglang.srt.runtime_context import get_exec, get_memory, get_model, get_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +107,25 @@ class MlxModelRunnerStub(ModelRunner):
     # that path working instead of raising AttributeError.
     prefill_aware_swa = False
 
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        """Return zero for the base Torch loader accounting hook.
+
+        The native MLX runner materializes weights before sizing its own KV
+        pool. This stub has no Torch ``ModelLoader`` or Torch-owned weights to
+        report.
+        """
+        return 0
+
+    @staticmethod
+    def validate_startup_weight_load_mode() -> None:
+        if get_model().is_startup_weight_load_overlap:
+            raise ValueError(
+                "--startup-weight-load-mode=overlap is not supported: CUDA only"
+            )
+
     def __init__(self, *args, mlx_pool_size: int | None = None, **kwargs):
+        self.validate_startup_weight_load_mode()
         self._mlx_pool_size = mlx_pool_size
         super().__init__(*args, **kwargs)
 
@@ -308,3 +326,12 @@ class MlxModelRunnerStub(ModelRunner):
     def alloc_memory_pool(self, memory_pool_config=None):
         """No-op: MLX manages its own KV cache."""
         pass
+
+    def init_attention_backends(self):
+        """No-op: attention runs inside the MLX runner.
+
+        The backend named by ``server_args.attention_backend`` would never
+        be used, and building one can crash: some backends read real KV
+        buffers in ``__init__``, which this stub never allocates.
+        """
+        self.attn_backend = None

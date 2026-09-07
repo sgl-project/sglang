@@ -5,6 +5,8 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+namespace sglang {
+
 namespace device::hisparse {
 
 /// NOTE: We call nope+rope as a "value" here.
@@ -74,3 +76,5 @@ SGL_DEVICE void transfer_item(void* dst_cache, void* src_cache, const int32_t ds
 }
 
 }  // namespace device::hisparse
+
+}  // namespace sglang

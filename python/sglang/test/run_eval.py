@@ -66,12 +66,15 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         if value is not None:
             extra_body[param_name] = value
 
+    max_tokens = getattr(args, "max_tokens", None)
+    top_p = getattr(args, "top_p", None)
+    temperature = getattr(args, "temperature", None)
     common_kwargs = dict(
         model=getattr(args, "model", None),
-        max_tokens=getattr(args, "max_tokens", 2048),
-        top_p=getattr(args, "top_p", 1.0),
+        max_tokens=2048 if max_tokens is None else max_tokens,
+        top_p=1.0 if top_p is None else top_p,
         base_url=base_url,
-        temperature=getattr(args, "temperature", 0.0),
+        temperature=0.0 if temperature is None else temperature,
     )
 
     api_mode = getattr(args, "api", "chat")
@@ -119,35 +122,55 @@ def _run_sgl_eval(eval_name, args) -> dict:
     ).expanduser()
     out_parent.mkdir(parents=True, exist_ok=True)
 
+    model_preset_id = getattr(args, "load_preset_from_model_id", None)
     cmd = [
         "sgl-eval",
         "run",
         eval_name,
         "--base-url",
         base_url,
-        "--num-threads",
-        str(getattr(args, "num_threads", 64)),
-        "--temperature",
-        str(getattr(args, "temperature", 0.0)),
         "--out-dir",
         str(out_parent),
     ]
+    if model_preset_id:
+        cmd += ["--load-preset-from-model-id", model_preset_id]
     if getattr(args, "model", None):
         cmd += ["--model", args.model]
     if getattr(args, "num_examples", None) is not None:
         cmd += ["--num-examples", str(args.num_examples)]
+    if getattr(args, "num_threads", None) is not None:
+        cmd += ["--num-threads", str(args.num_threads)]
+    if getattr(args, "temperature", None) is not None:
+        cmd += ["--temperature", str(args.temperature)]
+    elif not model_preset_id:
+        cmd += ["--temperature", "0.0"]
+    if getattr(args, "top_p", None) is not None:
+        cmd += ["--top-p", str(args.top_p)]
+    elif not model_preset_id and getattr(args, "_sgl_eval_from_cli", False):
+        cmd += ["--top-p", "1.0"]
+    # Unset by default in sgl-eval; only a sampling caller (temperature > 0) needs it.
+    if getattr(args, "seed", None) is not None:
+        cmd += ["--seed", str(args.seed)]
+    # gpt-oss grades one score per effort tier, so dropping this collapses every
+    # tier onto the served model's default.
+    if getattr(args, "reasoning_effort", None) is not None:
+        cmd += ["--reasoning-effort", str(args.reasoning_effort)]
+    if getattr(args, "repeat", None) is not None:
+        cmd += ["--n-repeats", str(args.repeat)]
     # Bound generation length so long-reasoning models don't stall the eval.
     if getattr(args, "max_tokens", None) is not None:
         cmd += ["--max-tokens", str(args.max_tokens)]
-    else:
+    elif not model_preset_id:
         cmd += ["--max-tokens", "2048"]
     # Reasoning models (e.g. Qwen3.5) put their answer in the reasoning channel;
     # without --thinking their message.content is empty and sgl-eval scores 0.
-    if getattr(args, "sgl_eval_thinking", None) is None:
-        model_l = (getattr(args, "model", None) or "").lower()
-        if "qwen3.5" in model_l or "qwen3-thinking" in model_l:
-            cmd += ["--thinking"]
-    elif args.sgl_eval_thinking:
+    sgl_eval_thinking = getattr(args, "sgl_eval_thinking", None)
+    if sgl_eval_thinking is None:
+        if not model_preset_id:
+            model_l = (getattr(args, "model", None) or "").lower()
+            if "qwen3.5" in model_l or "qwen3-thinking" in model_l:
+                cmd += ["--thinking"]
+    elif sgl_eval_thinking:
         cmd += ["--thinking"]
 
     try:
@@ -242,56 +265,22 @@ def run_eval(args):
     )
 
     if args.eval_name == "mmlu":
-        from sglang.test.simple_eval_mmlu import MMLUEval
-
-        filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
-        eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
-    elif args.eval_name == "math":
-        from sglang.test.simple_eval_math import MathEval
-
-        equality_checker = ChatCompletionSampler(model="gpt-4-turbo")
-
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/math_test.csv"
-        )
-        eval_obj = MathEval(
-            filename, equality_checker, args.num_examples, args.num_threads
-        )
-    elif args.eval_name == "mgsm":
-        from sglang.test.simple_eval_mgsm import MGSMEval
-
-        eval_obj = MGSMEval(args.num_examples, args.num_threads)
+        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
+        # caller's threshold has to be measured against it, not inherited.
+        # `simple_eval_mmlu` stays: the ascend eval imports its subject2category.
+        return _run_sgl_eval("mmlu", args)
     elif args.eval_name == "mgsm_en":
         from sglang.test.simple_eval_mgsm import MGSMEval
 
         eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
     elif args.eval_name == "gpqa":
-        from sglang.test.simple_eval_gpqa import GPQAEval
-
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
-        )
-        eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
+        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
+        # caller's threshold has to be measured against it, not inherited.
+        return _run_sgl_eval("gpqa", args)
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
 
         eval_obj = HumanEval(args.num_examples, args.num_threads)
-    elif args.eval_name == "longbench_v2":
-        from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
-
-        # Default to HuggingFace dataset, can be overridden with --dataset-path
-        data_source = args.dataset_path
-        categories = args.categories.split(",") if args.categories else None
-
-        eval_obj = LongBenchV2Eval(
-            model=getattr(args, "model", None),
-            data_source=data_source,
-            num_examples=args.num_examples,
-            num_threads=args.num_threads,
-            categories=categories,
-            max_context_length=getattr(args, "max_context_length", None),
-            min_context_length=getattr(args, "min_context_length", None),
-        )
     elif args.eval_name == "mmmu":
         # VLM MMMU evaluation with fixed 100 examples by default
         from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
@@ -301,10 +290,15 @@ def run_eval(args):
             args.num_threads,
             response_answer_regex=getattr(args, "response_answer_regex", None),
         )
+    elif args.eval_name in ("mmmu_pro", "mmmu-pro"):
+        # Canonical sgl-eval name for MMMU-Pro's standard 10-option split.
+        return _run_sgl_eval("mmmu_pro", args)
+    elif args.eval_name == "mmmu_pro_vision":
+        # sgl-eval owns this benchmark's dataset, prompt and grader; there is no
+        # simple_eval implementation to fall back to.
+        return _run_sgl_eval("mmmu_pro_vision", args)
     elif args.eval_name == "aime25":
-        from sglang.test.simple_eval_aime25 import AIME25Eval
-
-        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+        return _run_sgl_eval("aime25", args)
     elif args.eval_name == "gsm8k":
         if getattr(args, "api", None) == "sgl_eval":
             # Only the nightly correctness eval opts into sgl-eval (zero-shot
@@ -455,6 +449,12 @@ if __name__ == "__main__":
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
     )
     parser.add_argument(
+        "--load-preset-from-model-id",
+        type=str,
+        default=None,
+        help="Load repository-maintained sgl-eval generation defaults for this model ID.",
+    )
+    parser.add_argument(
         "--repeat", type=int, default=1, help="repeat the evaluation n times"
     )
     parser.add_argument("--eval-name", type=str, default="mmlu")
@@ -467,9 +467,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
-    parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument(
         "--top-k", type=int, default=None, help="Top-k sampling parameter"
     )
@@ -492,28 +492,6 @@ if __name__ == "__main__":
     )
 
     # LongBench-v2 specific arguments
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        default="THUDM/LongBench-v2",
-        help="Path to dataset file or HuggingFace dataset name for LongBench-v2",
-    )
-    parser.add_argument(
-        "--categories",
-        type=str,
-        default=None,
-        help="Comma-separated list of categories to evaluate for LongBench-v2",
-    )
-    parser.add_argument(
-        "--max-context-length",
-        type=int,
-        help="Maximum context length in characters for LongBench-v2",
-    )
-    parser.add_argument(
-        "--min-context-length",
-        type=int,
-        help="Minimum context length in characters for LongBench-v2",
-    )
     parser.add_argument(
         "--num-shots",
         type=int,
@@ -540,5 +518,6 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    args._sgl_eval_from_cli = True
 
     run_eval(args)

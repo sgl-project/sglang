@@ -15,12 +15,14 @@ from sglang.srt.hardware_backend.mlx.aot import (
     MlxAOTRoPEContext,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
+    get_attention_scale,
     get_head_dim,
     get_num_heads,
     get_num_kv_heads,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
     ContiguousAttentionKVCache,
+    WindowedAttentionKVCache,
 )
 
 _thread_local = threading.local()
@@ -33,9 +35,15 @@ class BatchedDecodeContext:
 
     batch_size: int
     seq_lens: list[int]  # per-request token count before the new token
-    # attention_layer_caches[attention_pool_idx][req_idx] = ContiguousAttentionKVCache
-    attention_layer_caches: list[list[ContiguousAttentionKVCache]]
+    # attention_layer_caches[cache_idx][req_idx], dense over attention layers.
+    # Windowed caches hold only trailing-window KV, so read them through
+    # write_token/get_kv, never by slicing .keys at an absolute offset.
+    attention_layer_caches: list[
+        list[ContiguousAttentionKVCache | WindowedAttentionKVCache]
+    ]
     attention_pool_index_by_layer: dict[int, int] = field(default_factory=dict)
+    # Dense index into the shared pool's buffers; full-attention layers only.
+    full_kv_pool_index_by_layer: dict[int, int] = field(default_factory=dict)
 
     # Optional AOT kernel state. Keep kernel-specific fields out of the regular
     # MLX decode path so future AOT kernels can be added without growing this
@@ -49,6 +57,10 @@ class BatchedDecodeContext:
     needs_padding: bool = field(init=False)
     pad_sizes: list[int] = field(init=False)
     positions: Optional[mx.array] = field(init=False)
+    # Padding metadata memo, keyed by window size: it depends only on
+    # ``seq_lens`` and the window, so every layer sharing a window reuses
+    # one entry instead of rebuilding it.
+    _padding_by_window: dict = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         seq_lens = self.seq_lens
@@ -63,6 +75,54 @@ class BatchedDecodeContext:
             self.attention_pool_index_by_layer = {
                 idx: idx for idx in range(len(self.attention_layer_caches))
             }
+        if self.aot.rope is not None and not self.full_kv_pool_index_by_layer:
+            # The fused scatter addresses pool buffers by full-attention index;
+            # defaulting to the cache index would write the wrong buffer
+            # whenever sliding-window layers are interleaved.
+            raise ValueError(
+                "BatchedDecodeContext requires full_kv_pool_index_by_layer "
+                "when the fused AOT RoPE + pool-scatter kernel is active"
+            )
+
+    def decode_padding(
+        self, window: int | None
+    ) -> tuple[list[int], Optional[mx.array]]:
+        """Right-pad sizes and the keep-mask for one decode step.
+
+        Requests are padded to a common KV width so they can be batched into
+        one SDPA call.  Without a window that width is ``max_len``; a
+        sliding-window layer only reads the trailing ``window`` keys, so its
+        width is ``max(min(seq_len + 1, window))`` instead -- which is why the
+        context's full-length metadata cannot be reused for it.
+
+        The mask is boolean (``True`` keeps the key), broadcast-shaped
+        ``(B, 1, 1, width)``, and ``None`` when no request needs padding.
+        """
+        cached = self._padding_by_window.get(window, None)
+        if cached is not None:
+            return cached
+
+        if window is None:
+            pad_sizes = self.pad_sizes
+            keep = (
+                self.positions[None, :] < self.valid_lens[:, None]
+                if self.needs_padding
+                else None
+            )
+        else:
+            eff_lens = [min(n + 1, window) for n in self.seq_lens]
+            max_eff = max(eff_lens)
+            pad_sizes = [max_eff - n for n in eff_lens]
+            keep = (
+                mx.arange(max_eff)[None, :]
+                < mx.array(eff_lens, dtype=mx.int32)[:, None]
+                if min(eff_lens) < max_eff
+                else None
+            )
+
+        result = (pad_sizes, None if keep is None else keep[:, None, None, :])
+        self._padding_by_window[window] = result
+        return result
 
     @classmethod
     def from_decode(
@@ -76,10 +136,13 @@ class BatchedDecodeContext:
         req_to_token_pool: Any | None,
         attention_layer_indices: list[int] | None = None,
         attention_pool_index_by_layer: dict[int, int] | None = None,
+        full_kv_pool_index_by_layer: dict[int, int] | None = None,
     ) -> BatchedDecodeContext:
         batch_size = len(req_ids)
         if attention_layer_indices is None:
             attention_layer_indices = list(range(len(caches[0])))
+        # Any attention layer will do: ``offset`` is the ABSOLUTE sequence
+        # position on every cache, even a windowed one storing far fewer tokens.
         seq_lens = [
             caches[i][attention_layer_indices[0]].offset for i in range(batch_size)
         ]
@@ -92,6 +155,7 @@ class BatchedDecodeContext:
             seq_lens=seq_lens,
             attention_layer_caches=attention_layer_caches,
             attention_pool_index_by_layer=attention_pool_index_by_layer or {},
+            full_kv_pool_index_by_layer=full_kv_pool_index_by_layer or {},
             aot=MlxAOTKernelContext.from_decode(
                 aot_kernels=aot_kernels,
                 kv_pool=kv_pool,
@@ -120,12 +184,50 @@ class MLXAttentionWrapper(nn.Module):
 
     When ``BatchedDecodeContext`` is set, performs per-request RoPE,
     cache writes, and batched SDPA.  Otherwise delegates to inner module.
+
+    ``window_size`` marks a sliding-window layer: the wrapper attends to
+    the trailing window of the cached keys only, which is numerically
+    identical to a rotating cache.  Both cache kinds keep KV in temporal
+    order and report absolute offsets, so the same trailing-window slice
+    works whether the cache holds full history or only the window.
     """
 
-    def __init__(self, inner: nn.Module, layer_idx: int):
+    def __init__(
+        self, inner: nn.Module, layer_idx: int, window_size: int | None = None
+    ):
         super().__init__()
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_layer_idx", layer_idx)
+        object.__setattr__(self, "_window_size", window_size)
+        # Resolved once at patch time (weights are loaded before patching and
+        # the inner module is never swapped afterwards), keeping the decode
+        # hot path free of attribute scans and failing fast on a bad module.
+        scale = get_attention_scale(inner)
+        if scale is None:
+            raise RuntimeError(
+                f"Cannot determine attention scale for {type(inner).__name__}"
+            )
+        n_heads = get_num_heads(inner)
+        n_kv_heads = get_num_kv_heads(inner)
+        if n_heads is None or n_kv_heads is None:
+            raise RuntimeError(
+                f"Cannot determine attention head counts for {type(inner).__name__}"
+            )
+        object.__setattr__(self, "_scale", scale)
+        object.__setattr__(self, "_n_heads", n_heads)
+        object.__setattr__(self, "_n_kv_heads", n_kv_heads)
+        # None for modules that expose head_dim only through a projection
+        # shape; _batched_decode falls back to the runtime K shape.
+        object.__setattr__(self, "_head_dim", get_head_dim(inner))
+        object.__setattr__(self, "_has_q_norm", hasattr(inner, "q_norm"))
+        object.__setattr__(self, "_has_k_norm", hasattr(inner, "k_norm"))
+        # Only pass sinks when the module has them: the kwarg requires a
+        # recent mlx and must not constrain models without sinks.
+        sinks = getattr(inner, "sinks", None)
+        object.__setattr__(self, "_sinks", sinks)
+        object.__setattr__(
+            self, "_sink_kwargs", {} if sinks is None else {"sinks": sinks}
+        )
 
     def __call__(self, x: mx.array, mask: Any = None, cache: Any = None) -> mx.array:
         ctx = get_context()
@@ -137,18 +239,14 @@ class MLXAttentionWrapper(nn.Module):
         inner = self._inner
         layer_idx = self._layer_idx
         B = ctx.batch_size
-        n_heads = get_num_heads(inner)
-        n_kv_heads = get_num_kv_heads(inner)
-        if n_heads is None or n_kv_heads is None:
-            raise RuntimeError(
-                f"Cannot determine attention head counts for {type(inner).__name__}"
-            )
+        n_heads = self._n_heads
+        n_kv_heads = self._n_kv_heads
 
         q_proj_output = inner.q_proj(x)
         keys = inner.k_proj(x)
         values = inner.v_proj(x)
 
-        head_dim = get_head_dim(inner)
+        head_dim = self._head_dim
         if head_dim is None:
             head_dim = keys.shape[-1] // n_kv_heads
 
@@ -170,9 +268,9 @@ class MLXAttentionWrapper(nn.Module):
         keys = keys.reshape(B, 1, n_kv_heads, head_dim)
         values = values.reshape(B, 1, n_kv_heads, head_dim)
 
-        if hasattr(inner, "q_norm"):
+        if self._has_q_norm:
             queries = inner.q_norm(queries)
-        if hasattr(inner, "k_norm"):
+        if self._has_k_norm:
             keys = inner.k_norm(keys)
 
         queries = queries.transpose(0, 2, 1, 3)
@@ -181,26 +279,32 @@ class MLXAttentionWrapper(nn.Module):
 
         # Vectorized RoPE with per-batch offsets (cached on the context).
         offsets = ctx.offsets
-        attention_pool_idx = ctx.attention_pool_index_by_layer[layer_idx]
+        cache_idx = ctx.attention_pool_index_by_layer[layer_idx]
+        window = self._window_size
 
-        if ctx.aot.rope is not None:
-            # AOT path: real .metallib RoPE + fused KV pool scatter.
+        if ctx.aot.rope is not None and window is None:
+            # AOT path: real .metallib RoPE + fused scatter into this layer's
+            # pool buffer.
             queries, keys = self._rope_custom_aot(
                 queries,
                 keys,
                 values,
                 offsets,
-                attention_pool_idx,
+                ctx.full_kv_pool_index_by_layer[layer_idx],
                 ctx.aot.rope,
             )
         else:
-            # Fallback: MLX's built-in mx.fast.rope (used when the AOT kernel
-            # isn't built or the model uses an unsupported RoPE variant).
+            # Fallback: MLX's built-in mx.fast.rope. Used when the AOT kernel
+            # isn't built, the model uses an unsupported RoPE variant, or the
+            # layer is sliding-window (windowed KV never enters the pool).
             queries = inner.rope(queries, offset=offsets)
             keys = inner.rope(keys, offset=offsets)
 
-        layer_caches = ctx.attention_layer_caches[attention_pool_idx]
-        pad_sizes = ctx.pad_sizes
+        layer_caches = ctx.attention_layer_caches[cache_idx]
+        # A sliding-window layer reads only the trailing ``window`` keys, so its
+        # padded width differs from the unwindowed one.  Both are memoised on
+        # the context and shared by every layer of their kind.
+        pad_sizes, attn_mask = ctx.decode_padding(window)
 
         # TODO: replace per-request loop with native batched/ragged
         # attention once mx.fast.scaled_dot_product_attention supports
@@ -211,7 +315,7 @@ class MLXAttentionWrapper(nn.Module):
         for i in range(B):
             layer_caches[i].write_token(keys[i : i + 1], values[i : i + 1])
 
-            k_all, v_all = layer_caches[i].get_kv()
+            k_all, v_all = layer_caches[i].get_kv(window)
 
             pad = pad_sizes[i]
             if pad > 0:
@@ -226,17 +330,13 @@ class MLXAttentionWrapper(nn.Module):
         keys_b = mx.concatenate(all_k, axis=0)
         values_b = mx.concatenate(all_v, axis=0)
 
-        attn_mask = None
-        if ctx.needs_padding:
-            mask_bool = ctx.positions[None, :] >= ctx.valid_lens[:, None]
-            attn_mask = mx.where(
-                mask_bool[:, None, None, :],
-                mx.array(mx.finfo(queries.dtype).min, dtype=queries.dtype),
-                mx.array(0.0, dtype=queries.dtype),
-            )
-
         output = mx.fast.scaled_dot_product_attention(
-            queries, keys_b, values_b, scale=inner.scale, mask=attn_mask
+            queries,
+            keys_b,
+            values_b,
+            scale=self._scale,
+            mask=attn_mask,
+            **self._sink_kwargs,
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, 1, -1)
@@ -250,14 +350,14 @@ class MLXAttentionWrapper(nn.Module):
         keys: mx.array,
         values: mx.array,
         positions: mx.array,
-        attention_pool_idx: int,
+        full_pool_idx: int,
         rope_ctx: MlxAOTRoPEContext,
     ) -> tuple[mx.array, mx.array]:
         """AOT path: rotate Q/K and scatter K/V into the shared pool.
 
         The kernel call does RoPE on Q/K and scatters
-        rotated K + (untouched) V into ``kv_pool`` at ``new_token_slots``
-        for ``layer_idx``.
+        rotated K + (untouched) V into ``kv_pool`` buffer ``full_pool_idx``
+        at ``new_token_slots``.
 
         If ``new_token_slots`` is None, slot=-1 sentinel is used (no pool
         write, RoPE-only mode). Returns rotated (queries, keys) in the
@@ -274,8 +374,8 @@ class MLXAttentionWrapper(nn.Module):
         else:
             slots = rope_ctx.new_token_slots.astype(mx.int32)
 
-        k_pool = rope_ctx.kv_pool.k_buffer[attention_pool_idx]
-        v_pool = rope_ctx.kv_pool.v_buffer[attention_pool_idx]
+        k_pool = rope_ctx.kv_pool.k_buffer[full_pool_idx]
+        v_pool = rope_ctx.kv_pool.v_buffer[full_pool_idx]
 
         q_rot, k_rot, k_pool_new, v_pool_new = rope_ctx.kernel.rope_pool_fused(
             q_flat,
@@ -291,8 +391,8 @@ class MLXAttentionWrapper(nn.Module):
             rope_base=rope_ctx.kernel.base,
         )
         # Rebind pool buffers (zero-copy donation result).
-        rope_ctx.kv_pool.k_buffer[attention_pool_idx] = k_pool_new
-        rope_ctx.kv_pool.v_buffer[attention_pool_idx] = v_pool_new
+        rope_ctx.kv_pool.k_buffer[full_pool_idx] = k_pool_new
+        rope_ctx.kv_pool.v_buffer[full_pool_idx] = v_pool_new
 
         # (B, n_heads, head_dim) -> (B, n_heads, 1, head_dim) for SDPA path
         return q_rot[:, :, None, :], k_rot[:, :, None, :]

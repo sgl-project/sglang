@@ -62,9 +62,10 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
                     left = mid + 1
         i_n = left
 
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
         i_t = i_tg - bos
     else:

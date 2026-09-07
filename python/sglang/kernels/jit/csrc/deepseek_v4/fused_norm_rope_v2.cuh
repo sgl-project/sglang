@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 using PlanC = device::compress::CompressPlan;
 using PlanD = device::compress::DecodePlan;
@@ -679,4 +679,4 @@ struct FusedNormRopeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

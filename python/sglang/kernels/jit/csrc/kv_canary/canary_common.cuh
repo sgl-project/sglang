@@ -5,6 +5,8 @@
 #include "consts.cuh"
 #include <cstdint>
 
+namespace sglang {
+
 namespace canary {
 
 // Device-side handle for one real-KV source.
@@ -134,3 +136,5 @@ SGL_DEVICE uint64_t compute_slot_hash(const uint8_t* canary_buf, int64_t slot_st
 }
 
 }  // namespace canary
+
+}  // namespace sglang

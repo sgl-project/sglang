@@ -26,7 +26,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
-namespace {
+namespace sglang {
 
 struct CausalConv1dParams {
   const void* __restrict__ x;           // [T, D]
@@ -175,7 +175,7 @@ struct CausalConv1dKernel {
     // x may be a non-contiguous row view (stride_t arbitrary) but must be
     // channel-contiguous. cache_mask is torch-bool (verify shape/device only).
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(x);
-    TensorMatcher({-1, Km1, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    TensorMatcher({-1, Km1, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({NS}).with_dtype<int64_t>().with_device(dev).verify(safe_idx);
     TensorMatcher({NS, 1, 1}).with_device(dev).verify(cache_mask);
     TensorMatcher({D, Wd}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(weight);
@@ -214,4 +214,4 @@ struct CausalConv1dKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

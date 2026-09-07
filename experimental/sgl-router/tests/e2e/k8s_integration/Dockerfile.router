@@ -10,7 +10,11 @@ FROM rust:1.90-bookworm AS builder
 # `channel = "1.90"`.
 ENV RUSTUP_TOOLCHAIN=1.90.0
 
-# libssl-dev + pkg-config ship with rust:1.90-bookworm already; no apt-get needed.
+# libssl-dev + pkg-config ship with rust:1.90-bookworm already; protoc does not,
+# and the Indexer's build script needs it to compile the KV-indexer protos.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 

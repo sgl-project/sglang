@@ -77,6 +77,9 @@ class RealtimeCameraControlState:
     ) -> None:
         """Replace active controls with a finite per-frame script."""
         self.camera_state_queue.clear()
+        # the script is itself a signal: when it drains, the state holds at
+        # released rather than reporting no-signal
+        self.camera_state_queue.mark_received()
         self.camera_script_queue.push_script(
             [list(actions) for actions in camera_actions],
             event_id=event_id,

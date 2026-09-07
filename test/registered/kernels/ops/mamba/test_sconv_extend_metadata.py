@@ -9,6 +9,7 @@ clamp, long, to(int64), arange, searchsorted, clamp, to(int32).
 import pytest
 import torch
 
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.srt.models.inkling_common.kernels.sconv import (
     HIS_ONES,
     HIS_PREFIX,
@@ -20,12 +21,41 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# Nightly expands the representative PR cases below to the complete matrix.
+register_cuda_ci(est_time=40, stage="nightly", runner_config="1-gpu-large")
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 
 # cross si tiles (BLOCK_T=256) and the single-tile B bound
 BATCH_SIZES = [1, 2, 7, 64, 257, 1023]
+EXTEND_CASES = get_ci_test_range(
+    [
+        (b, his_mode, lens_dtype)
+        for lens_dtype in (torch.int32, torch.int64)
+        for his_mode in (HIS_ZEROS, HIS_PREFIX, HIS_SEQ_MINUS_EXT)
+        for b in BATCH_SIZES
+    ],
+    [
+        (1, HIS_ZEROS, torch.int32),
+        (2, HIS_PREFIX, torch.int64),
+        (7, HIS_SEQ_MINUS_EXT, torch.int32),
+        (64, HIS_ZEROS, torch.int64),
+        (257, HIS_PREFIX, torch.int32),
+        (1023, HIS_SEQ_MINUS_EXT, torch.int64),
+    ],
+)
+VERIFY_CASES = get_ci_test_range(
+    [(b, draft_token_num) for draft_token_num in (1, 9) for b in BATCH_SIZES],
+    [
+        (1, 1),
+        (2, 9),
+        (7, 1),
+        (64, 9),
+        (257, 1),
+        (1023, 9),
+    ],
+)
 
 
 def _ref_extend(B, extend_seq_lens, his_mode, his_src, cache_indices, T):
@@ -88,9 +118,7 @@ def _cache_indices(b, idx_dtype):
 
 
 @requires_cuda
-@pytest.mark.parametrize("b", BATCH_SIZES)
-@pytest.mark.parametrize("his_mode", [HIS_ZEROS, HIS_PREFIX, HIS_SEQ_MINUS_EXT])
-@pytest.mark.parametrize("lens_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("b,his_mode,lens_dtype", EXTEND_CASES)
 def test_extend_matches_unfused(b, his_mode, lens_dtype):
     torch.manual_seed(b * 10 + his_mode)
     lens = torch.randint(0, 33, (b,), dtype=lens_dtype, device="cuda")
@@ -118,8 +146,7 @@ def test_extend_matches_unfused(b, his_mode, lens_dtype):
 
 
 @requires_cuda
-@pytest.mark.parametrize("b", BATCH_SIZES)
-@pytest.mark.parametrize("draft_token_num", [1, 9])
+@pytest.mark.parametrize("b,draft_token_num", VERIFY_CASES)
 def test_verify_matches_unfused(b, draft_token_num):
     torch.manual_seed(b)
     cache_indices = _cache_indices(b, torch.int64)

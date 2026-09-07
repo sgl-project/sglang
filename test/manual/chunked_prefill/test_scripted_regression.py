@@ -19,7 +19,7 @@ def _drain_until_released(t, *handles):
         if all(
             h.kv_pages == 0
             and h.lock_refs == 0
-            and (h.req is None or h.req.req_pool_idx is None)
+            and (h.req is None or h.req.kv.req_pool_idx is None)
             for h in handles
         ):
             return
@@ -41,7 +41,7 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
-        assert r.req.req_pool_idx is None
+        assert r.req.kv.req_pool_idx is None
         assert r.lock_refs == 0
         assert not r.is_chunking
         assert r.req.inflight_middle_chunks == 0
@@ -58,7 +58,7 @@ class TestRegressionBasic(ScriptedTestCase):
         yield
 
         assert r.kv_pages == 0
-        assert r.req.req_pool_idx is None
+        assert r.req.kv.req_pool_idx is None
         assert r.lock_refs == 0
         assert not r.is_chunking
 
@@ -100,9 +100,9 @@ class TestRegressionBasic(ScriptedTestCase):
             f"observed max={observed_max} (pre-fix bug would bump to 2 "
             f"at the last-chunk admit boundary)"
         )
-        assert (
-            cleared_inflight
-        ), "inflight_middle_chunks should be 0 once the chunk loop clears"
+        assert cleared_inflight, (
+            "inflight_middle_chunks should be 0 once the chunk loop clears"
+        )
 
         yield from run_until_finished(r)
         assert r.finished
@@ -240,22 +240,22 @@ class TestRegressionBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        assert r.req.req_pool_idx is not None, "row must be held mid-chunk"
+        assert r.req.kv.req_pool_idx is not None, "row must be held mid-chunk"
         assert r.kv_pages > 0, "committed KV must be held mid-chunk"
         assert r.lock_refs >= 1, "radix lock_ref must be held mid-chunk"
 
         t.abort(r)
         yield from _drain_until_released(t, r)
 
-        assert (
-            r.req.req_pool_idx is None
-        ), f"96d4749094: abort must release row; got row_idx={r.req.req_pool_idx!r}"
-        assert (
-            r.kv_pages == 0
-        ), f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
-        assert (
-            r.lock_refs == 0
-        ), f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
+        assert r.req.kv.req_pool_idx is None, (
+            f"96d4749094: abort must release row; got row_idx={r.req.kv.req_pool_idx!r}"
+        )
+        assert r.kv_pages == 0, (
+            f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
+        )
+        assert r.lock_refs == 0, (
+            f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
+        )
         assert not r.is_chunking
         assert r.req.inflight_middle_chunks == 0
         assert sum(t.get_all_node_lock_refs().values()) == baseline_refs
@@ -269,14 +269,14 @@ class TestRegressionBasic(ScriptedTestCase):
     def _script_pause_retract_releases_waiting_chunked_resume(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        assert r.req.req_pool_idx is not None and r.kv_pages > 0 and r.lock_refs >= 1
+        assert r.req.kv.req_pool_idx is not None and r.kv_pages > 0 and r.lock_refs >= 1
 
         t.pause_generation(mode="retract")
         yield
 
-        assert r.req.req_pool_idx is None, (
+        assert r.req.kv.req_pool_idx is None, (
             f"f38e69f87d: pause(retract) must release waiting "
-            f"chunked-resume row; got row_idx={r.req.req_pool_idx!r}"
+            f"chunked-resume row; got row_idx={r.req.kv.req_pool_idx!r}"
         )
         assert r.kv_pages == 0
         assert r.lock_refs == 0
@@ -509,7 +509,7 @@ class TestRegressionGptOss(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        committed = r.req.kv_committed_len
+        committed = r.req.kv.kv_committed_len
         assert committed > 0
 
         assert len(r.req.prefix_indices) <= committed, (

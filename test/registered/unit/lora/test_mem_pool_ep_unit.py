@@ -16,7 +16,7 @@ Usage:
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 import ast
 import types
@@ -114,15 +114,18 @@ def _load_lora_weight_to_buffer(pool, **kwargs):
 
 def _load_moe_backend_enum():
     tree = ast.parse(MOE_UTILS_PATH.read_text())
-    backend = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MoeRunnerBackend"
-    )
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    backend = classes["MoeRunnerBackend"]
+    body = [
+        classes[base.id]
+        for base in backend.bases
+        if isinstance(base, ast.Name) and base.id in classes
+    ]
+    body.append(backend)
     namespace = {"Enum": Enum}
     exec(
         compile(
-            ast.fix_missing_locations(ast.Module(body=[backend], type_ignores=[])),
+            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
             str(MOE_UTILS_PATH),
             "exec",
         ),

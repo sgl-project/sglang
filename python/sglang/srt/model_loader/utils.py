@@ -16,6 +16,7 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.utils import get_device_sm
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +26,10 @@ def set_default_torch_dtype(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    yield
-    torch.set_default_dtype(old_dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(old_dtype)
 
 
 def _is_moe_model(model_config: ModelConfig, architectures: list[str]) -> bool:
@@ -235,6 +238,11 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     return model_cls, resolved_arch
 
 
+def supports_cuda_vmm_feature_transport(model_config: ModelConfig) -> bool:
+    model_cls, _ = get_model_architecture(model_config)
+    return bool(getattr(model_cls, "supports_cuda_vmm_feature_transport", False))
+
+
 def get_resolved_model_impl(model_config: ModelConfig) -> ModelImpl:
     resolved_model_impl = getattr(model_config, "_resolved_model_impl", None)
     if resolved_model_impl is not None:
@@ -269,6 +277,10 @@ def should_deepgemm_weight_requant_ue8m0(
         and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         and weight_block_size is not None
     ):
+        return False
+    # SM120 routes dense block-FP8 GEMMs to CUTLASS/Triton (fp32 scales);
+    # only the grouped MoE GEMM consumes DeepGEMM layouts there.
+    if get_device_sm() == 120:
         return False
     if output_dtype is not None and output_dtype != torch.bfloat16:
         return False

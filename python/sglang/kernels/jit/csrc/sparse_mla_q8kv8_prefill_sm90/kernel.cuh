@@ -32,7 +32,9 @@ limitations under the License.
 #include <cuda_fp8.h>
 
 // using namespace cute must be at global scope BEFORE including dense_fp8 headers
-// (they use bare Tensor, make_tensor etc. from cute namespace)
+// (they use bare Tensor, make_tensor etc. from cute namespace). That mid-file
+// include is also why this subtree stays outside `namespace sglang` while the
+// rest of csrc/ moved into it - only entry.cuh, the host wrapper, is wrapped.
 using namespace cute;
 
 // Include the fp8 transpose utility

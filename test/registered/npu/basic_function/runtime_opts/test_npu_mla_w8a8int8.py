@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-4-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
@@ -26,7 +26,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendMlaW8A8Int8(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
