@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import array
 import logging
+import multiprocessing
 import os
 import socket
 import struct
@@ -18,6 +19,15 @@ from sglang.srt.utils import MultiprocessingSerializer
 from .protocol import send_msg
 
 logger = logging.getLogger(__name__)
+
+# Torch's CUDA-storage pickle uses multiprocessing.resource_sharer, which
+# authenticates each handle request with the exporting process authkey. Daemon
+# and client are independent interpreters, so opt-in cache deployments must
+# provide the same key on both sides. Keep the default process-local key for
+# existing callers and only override it when explicitly configured.
+_AUTHKEY = os.getenv("SGLANG_WEIGHT_CACHE_AUTHKEY")
+if _AUTHKEY:
+    multiprocessing.current_process().authkey = _AUTHKEY.encode("utf-8")
 
 TORCH_IPC_BACKEND = "torch_ipc"
 VMM_FD_BACKEND = "vmm_fd"
