@@ -340,14 +340,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
-        # Set by LiLiCorrDraftModel; None for every other DFLASH draft. Assigned
-        # unconditionally because __getattr__ delegates unknown names to the
-        # target worker, which would turn a missing attribute into an error that
-        # names the wrong object.
-        self.lilicorr = getattr(self.draft_model, "lilicorr", None)
-        # The head's context: each request's last committed target row, already
-        # fc-projected. Written by _append_target_hidden_to_draft_kv_by_loc,
-        # consumed by the next draft forward.
+        # Set by LiLiCorrDraftModel, None on every other DFLASH draft.
+        self.lilicorr = self.draft_model.lilicorr
         self._lilicorr_anchor: Optional[torch.Tensor] = None
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -680,7 +674,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
         if self.lilicorr is not None:
-            return build_lilicorr_draft_sampler(worker=self, lm_head=lm_head)
+            return build_lilicorr_draft_sampler(
+                head=self.lilicorr,
+                draft_model=self.draft_model,
+                embed_tokens=target_input_embeddings(target_model),
+                lm_head=lm_head,
+                block_size=self.block_size,
+            )
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
@@ -1456,6 +1456,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        extend_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -1537,7 +1538,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._lilicorr_anchor = publish_anchor(
                     draft_sampler=self._draft_sampler,
                     ctx_hidden=ctx_hidden,
-                    positions=positions,
+                    extend_lens=extend_lens,
                     commit_lens=commit_lens,
                 )
 
@@ -1975,6 +1976,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_hidden=logits_output.hidden_states,
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
+                extend_lens=ctx_lens,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -2212,7 +2214,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 head=self.lilicorr,
                 draft_hidden=draft_hidden.view(bs, int(self.block_size), -1),
                 lm_head=lm_head,
-                embed_tokens=target_input_embeddings(self),
+                embed_tokens=target_input_embeddings(
+                    self.target_worker.model_runner.model
+                ),
                 anchor=self._lilicorr_anchor,
             )
         else:

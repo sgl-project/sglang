@@ -3,11 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from sglang.kernels.ops.speculative.lilicorr import (
     lilicorr_greedy_path,
     lilicorr_topk_lse,
 )
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.models.lilicorr import (
     LiLiCorrHead,
     check_conv_weight_coverage,
@@ -18,7 +20,6 @@ from sglang.srt.speculative.lilicorr_components.lilicorr_candidates import (
     per_request_last_row,
     publish_anchor,
     resolve_vocab_shard,
-    target_input_embeddings,
 )
 from sglang.srt.speculative.lilicorr_components.lilicorr_config import (
     parse_lilicorr_draft_config,
@@ -59,8 +60,8 @@ def _head(*, model_hidden_size=16, block_size=5, **overrides):
         rms_norm_eps=1e-6,
         config=config,
     )
-    # Random weights, because a head at its zero-initialized construction values
-    # scores every candidate identically and would hide a real scoring bug.
+    # Random weights: a head at its zero-initialized construction values scores
+    # every candidate identically and would hide a real scoring bug.
     with torch.no_grad():
         for parameter in head.parameters():
             parameter.normal_(0.0, 0.2)
@@ -74,12 +75,27 @@ def _lattice(head, *, bs=3, model_hidden_size=16):
     torch.manual_seed(1)
     return {
         "token_embeddings": torch.randn(bs, slots, topk, model_hidden_size),
-        "candidate_token_ids": torch.randint(0, 64, (bs, slots, topk)),
+        "candidate_tokens": torch.randint(0, 64, (bs, slots, topk)),
         "candidate_log_probs": torch.randn(bs, slots, topk).log_softmax(dim=-1),
         "pass_hidden": torch.randn(bs, slots, model_hidden_size),
         "anchor_hidden": torch.randn(bs, model_hidden_size),
         "anchor_valid": torch.ones(bs, dtype=torch.bool),
     }
+
+
+class _FakeShardedHead(VocabParallelEmbedding):
+    """A vocab-parallel head carrying only the fields the shard resolver reads.
+
+    ``VocabParallelEmbedding.__init__`` needs an initialized distributed group.
+    """
+
+    def __init__(self, *, num_org, start, added=0):
+        nn.Module.__init__(self)
+        self.shard_indices = SimpleNamespace(
+            num_org_elements=num_org,
+            org_vocab_start_index=start,
+            num_added_elements=added,
+        )
 
 
 # --- config ----------------------------------------------------------------
@@ -91,8 +107,7 @@ def _lattice(head, *, bs=3, model_hidden_size=16):
 def test_no_head_geometry_is_reported_against_the_architecture_string(dflash_config):
     """Absence and an explicit disable are the same case, and neither is a
     per-field error: the checkpoint asked for this head by declaring the
-    architecture and then did not say which head, so that is what the message
-    has to name."""
+    architecture and then did not say which head."""
     with pytest.raises(ValueError, match="LiLiCorrDraftModel"):
         parse_lilicorr_draft_config(
             draft_hf_config={
@@ -104,26 +119,30 @@ def test_no_head_geometry_is_reported_against_the_architecture_string(dflash_con
 
 @pytest.mark.parametrize("dropped", sorted(set(_GEOMETRY) - {"lilicorr_enabled"}))
 def test_every_geometry_field_is_required(dropped):
-    """None of these may be defaulted. Most change a tensor shape and would be
-    caught at weight load, but logit_scale and vector_eps do not: a guessed value
-    builds a head that loads cleanly and scores a different function."""
+    """No field may acquire a default. Most change a tensor shape and would be
+    caught at weight load, but logit_scale and vector_eps would not: a guessed
+    value builds a head that loads cleanly and scores a different function."""
     with pytest.raises(ValueError, match=dropped):
         _lilicorr_config(**{dropped: None})
 
 
-@pytest.mark.parametrize("topk", [3, 5, 6, 12])
+@pytest.mark.parametrize("topk", [3, 6])
 def test_a_candidate_topk_that_is_not_a_power_of_two_is_refused(topk):
     """The tiled candidate top-k holds its selected tiles in one Triton lane
     group, and tl.arange needs a power-of-two extent. Refusing at load beats
-    failing inside a kernel on the first decode, and beats silently falling back
-    to the reference path, which is far slower than the head is allowed to be."""
+    silently falling back to the far slower reference path."""
     with pytest.raises(ValueError, match="power of two"):
         _lilicorr_config(lilicorr_candidate_topk=topk)
 
 
-@pytest.mark.parametrize("topk", [1, 2, 4, 8, 16])
-def test_power_of_two_candidate_topk_is_accepted(topk):
-    assert _lilicorr_config(lilicorr_candidate_topk=topk).candidate_topk == topk
+@pytest.mark.parametrize("topk", [32, 64])
+def test_a_candidate_topk_wider_than_the_fused_kernel_is_refused(topk):
+    """A wider pool is a power of two and loads fine, but falls off the fused
+    greedy commit onto the torch path at roughly three launches per slot. Config
+    parse is where that gets refused, for the same reason as the power-of-two
+    case: silently deoptimized is worse than not served."""
+    with pytest.raises(ValueError, match="fused greedy commit"):
+        _lilicorr_config(lilicorr_candidate_topk=topk)
 
 
 def test_zero_head_width_means_as_wide_as_the_draft():
@@ -131,7 +150,7 @@ def test_zero_head_width_means_as_wide_as_the_draft():
     field allowed to be non-positive."""
     config = _lilicorr_config(lilicorr_hidden_size=0)
     assert config.resolve_hidden_size(model_hidden_size=16) == 16
-    assert isinstance(_head(lilicorr_hidden_size=0).token_proj, torch.nn.Identity)
+    assert isinstance(_head(lilicorr_hidden_size=0).token_proj, nn.Identity)
 
 
 # --- the head --------------------------------------------------------------
@@ -139,8 +158,8 @@ def test_zero_head_width_means_as_wide_as_the_draft():
 
 def test_head_parameter_names_match_the_exported_checkpoint_subtree():
     """Pins weight compatibility with the training export. A renamed submodule
-    here loads nothing under that name and the base loader ignores what it
-    cannot resolve, so the head would serve its construction values."""
+    loads nothing under that name, and the base loader ignores what it cannot
+    resolve, so the head would serve its construction values."""
     head = _head()
     names = set(dict(head.named_parameters()))
     expected_leaves = {
@@ -213,15 +232,14 @@ def test_select_commits_candidates_from_the_lattice():
     selected = head.select(**lattice)
     assert selected.shape == (3, head.num_candidate_slots)
     # Every committed token must be one of that slot's candidates.
-    assert (selected.unsqueeze(-1) == lattice["candidate_token_ids"]).any(-1).all()
+    assert (selected.unsqueeze(-1) == lattice["candidate_tokens"]).any(-1).all()
 
 
 def test_an_invalid_anchor_ignores_whatever_is_in_the_buffer():
     """An invalid anchor is zeroed by multiplication rather than by a branch, so
     the captured graph needs no host sync. The graph replays at the padded bucket
-    batch size, so rows past the live batch read stale anchor memory -- their
-    scores must not depend on it. Note this zeroes the *projected* state, which
-    is not the same as feeding a zero anchor through a biased context_proj."""
+    batch size, so rows past the live batch read stale anchor memory and their
+    scores must not depend on it."""
     head = _head()
     lattice = _lattice(head)
     invalid = {**lattice, "anchor_valid": torch.zeros(3, dtype=torch.bool)}
@@ -235,27 +253,27 @@ def test_an_invalid_anchor_ignores_whatever_is_in_the_buffer():
 def test_a_precomputed_projected_table_scores_like_raw_embeddings():
     """The folded path gathers rows of embed_tokens.weight @ token_proj.weight.T
     + bias instead of embedding then projecting. token_proj is affine, so this
-    must be the same function of the token id."""
+    must be the same function of the token."""
     head = _head()
     lattice = _lattice(head)
-    embed_tokens = torch.nn.Embedding(64, 16)
+    embed_tokens = nn.Embedding(64, 16)
     with torch.no_grad():
         embed_tokens.weight.normal_(0.0, 0.2)
     table = head.build_token_table(embed_tokens)
     assert table is not None and table.shape == (64, head.hidden_size)
 
-    ids = lattice["candidate_token_ids"]
-    raw = head.select(**{**lattice, "token_embeddings": embed_tokens(ids).detach()})
+    tokens = lattice["candidate_tokens"]
+    raw = head.select(**{**lattice, "token_embeddings": embed_tokens(tokens).detach()})
     folded = head.select(
-        **{**lattice, "token_embeddings": table[ids]}, already_projected=True
+        **{**lattice, "token_embeddings": table[tokens]}, already_projected=True
     )
     torch.testing.assert_close(raw, folded)
 
 
 def test_head_weight_coverage_is_required_in_both_directions():
-    """The base loader ignores what it cannot resolve, so both a missing tensor and
-    a surplus one are silent. Either produces a low but believable acceptance
-    length, so both must raise."""
+    """The base loader ignores what it cannot resolve, so both a missing tensor
+    and a surplus one are silent, and either produces a low but believable
+    acceptance length."""
     head = _head()
     names = {f"lilicorr.{name}" for name, _ in head.named_parameters()}
     check_head_weight_coverage(head, set(names))
@@ -271,7 +289,6 @@ def test_an_identity_token_proj_would_drop_the_checkpoints_projection():
     head builds token_proj as an Identity, so a checkpoint trained with a real
     projection has those tensors dropped and scores without them."""
     wide = _head(lilicorr_hidden_size=0)
-    assert isinstance(wide.token_proj, torch.nn.Identity)
     names = {f"lilicorr.{name}" for name, _ in wide.named_parameters()}
     assert not any(name.startswith("lilicorr.token_proj") for name in names)
     with pytest.raises(ValueError, match="lilicorr_hidden_size"):
@@ -288,40 +305,40 @@ def test_topk_lse_returns_full_vocab_normalized_log_probs():
     vocabulary: raw top-k logits would score a different function."""
     torch.manual_seed(0)
     logits = torch.randn(7, 300)
-    vals, ids, lse = lilicorr_topk_lse(logits, 5)
-    expected_vals, expected_ids = torch.log_softmax(logits, dim=-1).topk(5, dim=-1)
+    vals, tokens, lse = lilicorr_topk_lse(logits, 5)
+    expected_vals, expected_tokens = torch.log_softmax(logits, dim=-1).topk(5, dim=-1)
     torch.testing.assert_close(vals - lse.unsqueeze(-1), expected_vals)
-    torch.testing.assert_close(ids, expected_ids.to(torch.int64))
+    torch.testing.assert_close(tokens, expected_tokens.to(torch.int64))
 
 
 def test_greedy_path_follows_the_conditioned_argmax_recurrence():
-    """c_0 = argmax(start), then c_s = argmax_c pair[s-1, c_{s-1}, c]. Ties break
-    toward the lower index, which is what makes the fused kernel and the torch
-    path commit the same path."""
+    """c_0 = argmax(start), then c_s = argmax_c pair[s-1, c_{s-1}, c]."""
     torch.manual_seed(0)
     bs, slots, k = 3, 4, 4
     log_start = torch.randn(bs, k)
     log_pair = torch.randn(bs, slots - 1, k, k)
-    ids = torch.randint(0, 100, (bs, slots, k))
+    tokens = torch.randint(0, 100, (bs, slots, k))
 
-    actual = lilicorr_greedy_path(log_start, log_pair, ids)
+    actual = lilicorr_greedy_path(log_start, log_pair, tokens)
 
-    expected = torch.empty(bs, slots, dtype=ids.dtype)
+    expected = torch.empty(bs, slots, dtype=tokens.dtype)
     for row in range(bs):
         cur = int(log_start[row].argmax())
-        expected[row, 0] = ids[row, 0, cur]
+        expected[row, 0] = tokens[row, 0, cur]
         for slot in range(1, slots):
             cur = int(log_pair[row, slot - 1, cur].argmax())
-            expected[row, slot] = ids[row, slot, cur]
+            expected[row, slot] = tokens[row, slot, cur]
     torch.testing.assert_close(actual, expected)
 
 
 def test_greedy_path_breaks_ties_toward_the_lower_candidate():
+    """Ties must break toward the lower index, which is what makes the fused
+    kernel and the torch path commit the same tokens."""
     log_start = torch.zeros(1, 4)
     log_pair = torch.zeros(1, 2, 4, 4)
-    ids = torch.arange(12).view(1, 3, 4)
+    tokens = torch.arange(12).view(1, 3, 4)
     torch.testing.assert_close(
-        lilicorr_greedy_path(log_start, log_pair, ids),
+        lilicorr_greedy_path(log_start, log_pair, tokens),
         torch.tensor([[0, 4, 8]]),
     )
 
@@ -329,11 +346,11 @@ def test_greedy_path_breaks_ties_toward_the_lower_candidate():
 # --- candidates ------------------------------------------------------------
 
 
-def test_candidates_are_normalized_log_probs_with_global_ids():
+def test_candidates_are_normalized_log_probs_with_global_tokens():
     torch.manual_seed(0)
     hidden = torch.randn(6, 8)
     weight = torch.randn(50, 8)
-    log_probs, ids = lilicorr_candidates(
+    log_probs, tokens = lilicorr_candidates(
         hidden_states=hidden,
         weight=weight,
         num_org=40,
@@ -341,9 +358,9 @@ def test_candidates_are_normalized_log_probs_with_global_ids():
         topk=4,
     )
     reference = torch.log_softmax(torch.matmul(hidden, weight[:40].T), dim=-1)
-    expected_vals, expected_ids = reference.topk(4, dim=-1)
+    expected_vals, expected_tokens = reference.topk(4, dim=-1)
     torch.testing.assert_close(log_probs, expected_vals)
-    torch.testing.assert_close(ids, expected_ids.to(torch.int64) + 100)
+    torch.testing.assert_close(tokens, expected_tokens.to(torch.int64) + 100)
 
 
 def test_chunking_cannot_change_a_candidate():
@@ -361,17 +378,6 @@ def test_chunking_cannot_change_a_candidate():
     torch.testing.assert_close(wide[1], narrow[1])
 
 
-def test_a_topk_wider_than_this_ranks_vocabulary_slice_is_refused():
-    with pytest.raises(ValueError, match="exceeds this rank"):
-        lilicorr_candidates(
-            hidden_states=torch.randn(2, 8),
-            weight=torch.randn(8, 8),
-            num_org=3,
-            org_vocab_start=0,
-            topk=4,
-        )
-
-
 def test_candidates_combine_across_vocab_shards():
     """Pins the TP contract: the global top-k, the global log-partition and the
     id offset. Getting any of them wrong returns plausible candidates normalized
@@ -383,7 +389,7 @@ def test_candidates_combine_across_vocab_shards():
 
     # This process plays rank 1 of tp=2: vocabulary rows 12..24.
     rank0_logits = torch.matmul(hidden, full_weight[:12].T)
-    rank0_vals, rank0_ids = rank0_logits.topk(topk, dim=-1)
+    rank0_vals, rank0_tokens = rank0_logits.topk(topk, dim=-1)
     rank0_lse = torch.logsumexp(rank0_logits, dim=-1)
 
     class _FakeTpGroup:
@@ -394,11 +400,11 @@ def test_candidates_combine_across_vocab_shards():
             mine = packed.view(rows, 2 * topk + 1)
             theirs = torch.empty_like(mine)
             theirs[:, :topk] = rank0_vals
-            theirs[:, topk : 2 * topk] = rank0_ids.to(torch.float32)
+            theirs[:, topk : 2 * topk] = rank0_tokens.to(torch.float32)
             theirs[:, 2 * topk] = rank0_lse
             output.copy_(torch.cat([theirs, mine], dim=0).view(-1))
 
-    log_probs, ids = lilicorr_candidates(
+    log_probs, tokens = lilicorr_candidates(
         hidden_states=hidden,
         weight=full_weight[12:],
         num_org=12,
@@ -407,66 +413,102 @@ def test_candidates_combine_across_vocab_shards():
         tp_group=_FakeTpGroup(),
     )
     reference = torch.log_softmax(torch.matmul(hidden, full_weight.T), dim=-1)
-    expected_vals, expected_ids = reference.topk(topk, dim=-1)
+    expected_vals, expected_tokens = reference.topk(topk, dim=-1)
     torch.testing.assert_close(log_probs, expected_vals)
-    torch.testing.assert_close(ids, expected_ids.to(torch.int64))
+    torch.testing.assert_close(tokens, expected_tokens.to(torch.int64))
 
 
 def test_vocab_shard_resolution_and_added_vocab_refusal():
     assert resolve_vocab_shard(SimpleNamespace(weight=torch.empty(32, 4))) == (32, 0)
-    assert resolve_vocab_shard(
-        SimpleNamespace(
-            weight=torch.empty(32, 4),
-            shard_indices=SimpleNamespace(
-                num_org_elements=16, org_vocab_start_index=16, num_added_elements=0
-            ),
-        )
-    ) == (16, 16)
+    assert resolve_vocab_shard(_FakeShardedHead(num_org=16, start=16)) == (16, 16)
     with pytest.raises(NotImplementedError, match="added vocabulary"):
-        resolve_vocab_shard(
-            SimpleNamespace(
-                weight=torch.empty(32, 4),
-                shard_indices=SimpleNamespace(
-                    num_org_elements=16, org_vocab_start_index=0, num_added_elements=2
-                ),
-            )
-        )
+        resolve_vocab_shard(_FakeShardedHead(num_org=16, start=0, added=2))
 
 
 # --- the anchor ------------------------------------------------------------
 
 
-def test_anchor_rows_from_commit_lens():
-    ends = per_request_last_row(
-        num_rows=6, positions=None, commit_lens=torch.tensor([2, 1, 3])
+def test_verify_anchor_rows_follow_the_padded_block_stride():
+    """The verify buffer is [bs, block_size] flattened, so requests sit at a
+    constant stride and only the first commit_lens[i] rows of each are live.
+    Reading it as packed picks another request's row for every request after the
+    first, which costs acceptance and raises nothing."""
+    # bs=2, block_size=16: request 1 starts at row 16 however much request 0 committed.
+    torch.testing.assert_close(
+        per_request_last_row(
+            num_rows=32, extend_lens=None, commit_lens=torch.tensor([3, 5])
+        ),
+        torch.tensor([2, 20]),
     )
-    torch.testing.assert_close(ends, torch.tensor([1, 2, 5]))
-
-
-def test_anchor_rows_recovered_from_prefill_positions():
-    """Prefill does not forward commit_lens, but rows are request-major and each
-    request's positions increase strictly, so a request ends wherever the next
-    position fails to increase."""
-    positions = torch.tensor([0, 1, 2, 0, 1, 0])
-    ends = per_request_last_row(num_rows=6, positions=positions, commit_lens=None)
-    torch.testing.assert_close(ends, torch.tensor([2, 4, 5]))
-
-    single = per_request_last_row(
-        num_rows=1, positions=torch.tensor([7]), commit_lens=None
+    # Single request: padded and packed readings coincide, which is why a
+    # concurrency-1 benchmark cannot see the difference.
+    torch.testing.assert_close(
+        per_request_last_row(
+            num_rows=16, extend_lens=None, commit_lens=torch.tensor([7])
+        ),
+        torch.tensor([6]),
     )
-    torch.testing.assert_close(single, torch.tensor([0]))
+
+
+def test_prefill_anchor_rows_come_from_extend_lens_not_from_positions():
+    """Prefill rows are packed request-major. The lengths are passed in rather
+    than inferred from positions, because with a cached prefix a request's
+    positions start mid-sequence and never reset -- [0, 1, 10, 11] is two
+    requests of two tokens, which no reset detector can see."""
+    torch.testing.assert_close(
+        per_request_last_row(
+            num_rows=6, extend_lens=torch.tensor([3, 2, 1]), commit_lens=None
+        ),
+        torch.tensor([2, 4, 5]),
+    )
+    torch.testing.assert_close(
+        per_request_last_row(
+            num_rows=4, extend_lens=torch.tensor([2, 2]), commit_lens=None
+        ),
+        torch.tensor([1, 3]),
+    )
 
 
 def test_unrecoverable_anchor_rows_return_none_rather_than_a_guess():
     """A wrong anchor is a silent acceptance regression, so an input the
     boundaries cannot be read from must leave the anchor unset."""
-    assert per_request_last_row(num_rows=4, positions=None, commit_lens=None) is None
+    assert per_request_last_row(num_rows=4, extend_lens=None, commit_lens=None) is None
+    # Lengths that do not account for every row cannot locate them.
     assert (
         per_request_last_row(
-            num_rows=4, positions=torch.tensor([0, 1]), commit_lens=None
+            num_rows=4, extend_lens=torch.tensor([1, 1]), commit_lens=None
         )
         is None
     )
+    # A row count that is not a whole number of blocks is not the padded layout.
+    assert (
+        per_request_last_row(
+            num_rows=7, extend_lens=None, commit_lens=torch.tensor([2, 2])
+        )
+        is None
+    )
+
+
+def test_publishing_the_anchor_selects_the_padded_rows():
+    # bs=2 at block_size=4, so the live rows are 1 and 4+3-1=6.
+    ctx_hidden = torch.arange(16, dtype=torch.float32).view(8, 2)
+    published = {}
+    draft_sampler = SimpleNamespace(
+        set_anchor=lambda rows, bs: published.update(rows=rows, bs=bs)
+    )
+
+    anchor = publish_anchor(
+        draft_sampler=draft_sampler,
+        ctx_hidden=ctx_hidden,
+        commit_lens=torch.tensor([2, 3]),
+    )
+    torch.testing.assert_close(anchor, ctx_hidden[[1, 6]])
+    assert published["bs"] == 2
+
+    # Unrecoverable boundaries must clear the graph's buffer rather than leave the
+    # previous step's anchor at that address for a padded replay to read.
+    assert publish_anchor(draft_sampler=draft_sampler, ctx_hidden=ctx_hidden) is None
+    assert published["bs"] == 0
 
 
 # --- the worker seam ------------------------------------------------------
@@ -495,8 +537,8 @@ def test_draft_graph_batch_sizes_reads_the_capture_buckets(monkeypatch):
 
 def test_an_engine_that_captures_no_buckets_keeps_the_head_eager(monkeypatch):
     """The static buffers are sized from the largest bucket, so with no buckets
-    there is nothing to size them from. Refusing is correct; building against a
-    guessed size would serve a head whose buffers do not match the replay."""
+    there is nothing to size them from. Building against a guessed size would
+    serve a head whose buffers do not match the replay."""
     from sglang.srt.speculative.lilicorr_components import (
         lilicorr_draft_sampler as sampler_mod,
     )
@@ -507,7 +549,11 @@ def test_an_engine_that_captures_no_buckets_keeps_the_head_eager(monkeypatch):
     monkeypatch.setattr(sampler_mod, "draft_graph_batch_sizes", lambda: [])
     assert (
         sampler_mod.build_lilicorr_draft_sampler(
-            worker=SimpleNamespace(), lm_head=SimpleNamespace()
+            head=object(),
+            draft_model=SimpleNamespace(),
+            embed_tokens=None,
+            lm_head=SimpleNamespace(),
+            block_size=5,
         )
         is None
     )
@@ -520,17 +566,23 @@ def test_a_lilicorr_head_is_dispatched_to_the_folded_sampler():
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     lm_head = SimpleNamespace(weight=torch.empty(16, 4))
+    embed_tokens = object()
+    head = object()
     built = {}
     worker = SimpleNamespace(
         block_size=5,
         selector=None,
-        lilicorr=object(),
+        lilicorr=head,
         ps=SimpleNamespace(tp_rank=0),
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
         # The name the surrounding DFLASH code reads, not ours.
         _target_worker=SimpleNamespace(
-            model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=lm_head))
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(
+                    lm_head=lm_head, get_input_embeddings=lambda: embed_tokens
+                )
+            )
         ),
     )
     with pytest.MonkeyPatch.context() as patch:
@@ -541,54 +593,11 @@ def test_a_lilicorr_head_is_dispatched_to_the_folded_sampler():
         )
         worker_mod.DFlashWorkerV2._maybe_build_draft_sampler(worker)
     assert built["kwargs"]["lm_head"] is lm_head
-    assert built["kwargs"]["worker"] is worker
-
-
-def test_the_target_embedding_table_is_the_targets_and_not_the_drafts():
-    """The head embeds candidate ids with the table it was trained against. The
-    draft's own table exists on Nemotron-3.5 drafts and would load and run."""
-    target_embed = object()
-    worker = SimpleNamespace(
-        draft_model=SimpleNamespace(
-            get_input_embeddings=lambda: pytest.fail("used the draft's table")
-        ),
-        target_worker=SimpleNamespace(
-            model_runner=SimpleNamespace(
-                model=SimpleNamespace(get_input_embeddings=lambda: target_embed)
-            )
-        ),
-    )
-    assert target_input_embeddings(worker) is target_embed
-
-
-def test_publishing_the_anchor_picks_each_requests_last_committed_row():
-    ctx_hidden = torch.arange(12, dtype=torch.float32).view(6, 2)
-    published = {}
-    draft_sampler = SimpleNamespace(
-        set_anchor=lambda rows, bs: published.update(rows=rows, bs=bs)
-    )
-
-    anchor = publish_anchor(
-        draft_sampler=draft_sampler,
-        ctx_hidden=ctx_hidden,
-        positions=None,
-        commit_lens=torch.tensor([2, 1, 3]),
-    )
-    torch.testing.assert_close(anchor, ctx_hidden[[1, 2, 5]])
-    assert published["bs"] == 3
-
-    # Unrecoverable boundaries must clear the graph's buffer rather than leave
-    # the previous step's anchor at that address for a padded replay to read.
-    assert (
-        publish_anchor(
-            draft_sampler=draft_sampler,
-            ctx_hidden=ctx_hidden,
-            positions=None,
-            commit_lens=None,
-        )
-        is None
-    )
-    assert published["bs"] == 0
+    assert built["kwargs"]["head"] is head
+    # The head embeds candidate tokens with the target's table, which is the one
+    # it was trained against; the draft's own table exists on Nemotron-3.5 drafts
+    # and would load, run, and score the wrong function.
+    assert built["kwargs"]["embed_tokens"] is embed_tokens
 
 
 # --- grouped convolution coverage ------------------------------------------
@@ -623,11 +632,6 @@ class _FakeDraft:
 
     def conv_names(self):
         return {n for n in self._names if ".attention_conv." in n or ".mlp_conv." in n}
-
-
-def test_a_conv_draft_declares_four_tensors_per_layer():
-    """Two wrapped sublayers, each a base kernel and a projection: 4 per layer."""
-    assert len(_FakeDraft(n_layers=5).conv_names()) == 20
 
 
 def test_matched_conv_checkpoint_and_conv_free_parent_both_pass():

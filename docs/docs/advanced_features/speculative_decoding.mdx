@@ -611,12 +611,14 @@ LiLiCorr composes with the grouped dynamic convolutions that wrap each DFlash su
 
 The one thing worth knowing is how it fails. Both geometry keys default to `0`, so a checkpoint whose config lost them builds no convolution modules at all; the backbone loader then drops every convolution tensor it cannot resolve — correct behaviour for rotary caches, and the worst possible behaviour here, because the draft would serve as its convolution-free parent at a lower but entirely believable acceptance length. The loader therefore refuses any checkpoint whose convolution tensors and built modules disagree, in either direction, rather than letting that happen quietly.
 
+No LiLiCorr drafter is published yet, so the draft path below is a placeholder: point it at any checkpoint whose config declares the architecture and carries the geometry.
+
 ```bash Command
 python3 -m sglang.launch_server \
     --model Qwen/Qwen3-8B \
     --attention-backend fa3 \
     --speculative-algorithm DFLASH \
-    --speculative-draft-model-path <org>/<target>-DFlash-LiLiCorr
+    --speculative-draft-model-path <your-lilicorr-draft-model>
 ```
 
 ---

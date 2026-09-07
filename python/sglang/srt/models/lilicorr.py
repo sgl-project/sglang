@@ -17,12 +17,6 @@ The head is built here rather than by the worker, so the checkpoint's
 parameter subtree. It is selected by the checkpoint declaring
 ``architectures=["LiLiCorrDraftModel"]``, the same way ``DFlash2DraftModel``
 selects the candidate selector; the serving algorithm stays DFLASH.
-
-The scoring configuration is fixed and is what the exported geometry describes: a
-single projected DFLASH anchor row as context, unit start and pair factor weights,
-no additive log-prob prior (the log-prob *features* still feed the feature MLP),
-and the left-to-right greedy decode that matches the locally-normalized training
-objective.
 """
 
 from __future__ import annotations
@@ -45,15 +39,10 @@ logger = logging.getLogger(__name__)
 
 
 class LiLiCorrRMSNorm(nn.Module):
-    """RMSNorm with the trained module's ``weight`` key and fp32 reduction.
-
-    Deliberately not ``sglang.srt.layers.layernorm.RMSNorm``: the head's decode
-    body is compiled, and the gap that compilation closes is pointwise fusion
-    across a long tail of small elementwise ops. A custom-op norm is opaque to
-    inductor and splits the body at every norm, which is most of the fusion
-    opportunity. ``F.rms_norm`` is one kernel with the same math and stays
-    fusable.
-    """
+    # Deliberately not sglang.srt.layers.layernorm.RMSNorm: a custom-op norm is
+    # opaque to inductor and splits the compiled decode body at every norm, which
+    # is most of the pointwise fusion the compile exists to buy. Same math, same
+    # weight key.
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -71,18 +60,9 @@ class LiLiCorrRMSNorm(nn.Module):
 
 
 class LiLiCorrLatticeAttention(nn.Module):
-    """Bidirectional self-attention over the lattice, read through SDPA.
-
-    Carries the parameter layout ``nn.MultiheadAttention`` exports
-    (``in_proj_weight`` / ``in_proj_bias`` / ``out_proj``), so the trained
-    ``attn.*`` tensors load unchanged, but runs the projections and
-    ``scaled_dot_product_attention`` directly. Same math as the eager module
-    (scale ``1/sqrt(head_dim)``, additive bias), without the Python control flow
-    and ``need_weights`` bookkeeping that make the module uncapturable.
-
-    ``attention_bias`` arrives in the ``[batch * heads, L, L]`` layout the eager
-    module requires, and is reshaped here into SDPA's ``[batch, heads, L, L]``.
-    """
+    # Carries nn.MultiheadAttention's exported parameter layout so the trained
+    # attn.* tensors load unchanged, but runs SDPA directly: the module's Python
+    # control flow and need_weights bookkeeping are what make it uncapturable.
 
     def __init__(self, hidden_size: int, num_heads: int) -> None:
         super().__init__()
@@ -101,6 +81,7 @@ class LiLiCorrLatticeAttention(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, attention_bias: torch.Tensor
     ) -> torch.Tensor:
+        # attention_bias arrives [batch * heads, L, L], the eager module's layout.
         bsz, seq_len, _ = hidden_states.shape
         qkv = F.linear(hidden_states, self.in_proj_weight, self.in_proj_bias)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -120,8 +101,6 @@ class LiLiCorrLatticeAttention(nn.Module):
 
 
 class LiLiCorrLayer(nn.Module):
-    """One pre-norm lattice attention block with a SiLU MLP."""
-
     def __init__(
         self,
         hidden_size: int,
@@ -152,14 +131,9 @@ class LiLiCorrLayer(nn.Module):
 class LiLiCorrHead(nn.Module):
     """Anchor-conditioned chain factors over the per-slot top-k candidates.
 
-    Parameter names match the trained head one for one. Every geometry and
-    scaling argument is required, because the checkpoint records each one and a
+    Parameter names match the trained head one for one, and every geometry and
+    scaling argument is required: the checkpoint records each one, and a
     defaulted value here would describe a different function of the same weights.
-
-    ``score`` is collective-free and control-flow-free, which is what lets the
-    worker compile it and fold it into the draft CUDA graph. The candidate
-    embedding lookup is done by the caller and passed in, because on the target
-    model it may be a TP-sharded collective.
     """
 
     # Per-candidate features, in the order the trained first Linear expects:
@@ -228,16 +202,13 @@ class LiLiCorrHead(nn.Module):
         self.anchor_norm = LiLiCorrRMSNorm(hidden_size, eps=rms_norm_eps)
         # The factor heads read [self, anchor, self*anchor] (3*h).
         self.factor_input_proj = nn.Linear(hidden_size * 3, hidden_size)
-        # Named by edge direction: a transition runs out of the previous token
-        # and in to the next (pair = out_vec[s] . in_vec[s+1], start = anchor_out
-        # . in_vec[0]).
+        # Named by edge direction: a transition runs out of the previous token and
+        # in to the next (pair = out_vec[s] . in_vec[s+1]).
         self.out_head = nn.Linear(hidden_size, self.factor_dim)
         self.in_head = nn.Linear(hidden_size, self.factor_dim)
         self.anchor_out_head = nn.Linear(hidden_size, self.factor_dim)
 
-        # Buffers derived from the trained parameters and from the fixed
-        # slots x topk geometry. Built by materialize_inference_buffers after
-        # weight load; see its docstring for why they cannot be built here.
+        # Built by materialize_inference_buffers after weight load.
         self._attn_bias: Optional[torch.Tensor] = None
         self._fused_edge_weight: Optional[torch.Tensor] = None
         self._fused_edge_bias: Optional[torch.Tensor] = None
@@ -251,17 +222,14 @@ class LiLiCorrHead(nn.Module):
     ) -> None:
         """Precompute every parameter-derived, geometry-fixed buffer once.
 
-        Must run after weight load, on the real device and dtype, and before any
-        CUDA-graph capture: it does host work and host-to-device copies that are
-        not capturable. Skipping it does not raise on its own, so ``score``
-        checks for it rather than scoring against unbuilt buffers.
+        Must run after weight load and before CUDA-graph capture: it does host
+        work and host-to-device copies that are not capturable.
         """
         topk = self.candidate_topk
         self._attn_bias = self._build_attention_bias(device=device, dtype=dtype)
 
         # Row-concatenating the two edge heads is parity-safe: each output row is
-        # the same dot product as the split head, and they share their input, so
-        # one GEMM plus a split replaces two small GEMMs.
+        # the same dot product as the split head, and they share their input.
         self._fused_edge_weight = (
             torch.cat([self.out_head.weight, self.in_head.weight], dim=0)
             .to(device=device, dtype=dtype)
@@ -273,9 +241,9 @@ class LiLiCorrHead(nn.Module):
             .contiguous()
         )
 
-        # W . cat([h, a, h*a]) == W1.h + W2.a + W3.(h*a), and the anchor is one
-        # row per request, so splitting the projection this way means neither the
-        # concatenation nor the anchor's expansion over slots is materialized.
+        # W . cat([h, a, h*a]) == W1.h + W2.a + W3.(h*a), and the anchor is one row
+        # per request, so splitting the projection materializes neither the
+        # concatenation nor the anchor's expansion over slots.
         weight = self.factor_input_proj.weight
         hdim = self.hidden_size
         self._factor_input_splits = (
@@ -298,19 +266,8 @@ class LiLiCorrHead(nn.Module):
     def _build_attention_bias(
         self, *, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        """Per-head lattice bias core ``[num_heads, S, S]``, S = slots * topk.
-
-        A pure function of the trained bias parameters and the fixed geometry, so
-        it is built once instead of per step.
-
-        ``score`` then materializes ``[batch_blocks * num_heads, S, S]`` from it
-        rather than handing SDPA a batch-broadcast ``[1, num_heads, S, S]`` view.
-        The broadcast form is mathematically identical and saves one copy per
-        block, but a stride-0 mask is a measured regression when stacked on the
-        compiled body -- **+0.73% alone, −1.75pp on top of compile** -- and the
-        compiled body is the shipped configuration. The copy it costs is ~2 µs,
-        about 0.3% of the head.
-        """
+        # Per-head lattice bias core [num_heads, S, S], S = slots * topk. A pure
+        # function of the trained bias parameters and the fixed geometry.
         topk = self.candidate_topk
         slot_ids = torch.arange(
             self.num_candidate_slots, device=device, dtype=torch.long
@@ -335,13 +292,8 @@ class LiLiCorrHead(nn.Module):
     def _project_anchor(
         self, anchor_hidden: torch.Tensor, anchor_valid: torch.Tensor
     ) -> torch.Tensor:
-        """``context_proj`` of the single DFLASH anchor row, zeroed when invalid.
-
-        ``anchor_hidden`` is ``[bsz, n_blocks, feat]`` and ``anchor_valid`` is
-        ``[bsz, n_blocks]``. Branch-free, so there is no host sync inside the
-        captured region: an invalid anchor multiplies to zero rather than
-        selecting a different path.
-        """
+        # Branch-free, so there is no host sync inside the captured region: an
+        # invalid anchor multiplies to zero rather than selecting another path.
         anchor = self.context_proj(anchor_hidden)
         return anchor * anchor_valid.unsqueeze(-1).to(anchor.dtype)
 
@@ -366,11 +318,9 @@ class LiLiCorrHead(nn.Module):
 
         ``already_projected`` says the caller gathered rows of a precomputed
         ``embed_tokens.weight @ token_proj.weight.T + bias`` table, so
-        ``token_proj`` must not be applied twice. ``token_proj`` is affine, so
-        that is the same function of the token id; only the GEMM's accumulation
-        order differs. It is an argument rather than head state because the two
-        call sites disagree and a sticky flag would silently mis-score the eager
-        one.
+        ``token_proj`` must not be applied twice. It is an argument rather than
+        head state because the two call sites disagree, and a sticky flag would
+        silently mis-score the eager one.
         """
         self._require_materialized()
         bsz, n_blocks, n_slots, topk = candidate_log_probs.shape
@@ -381,9 +331,8 @@ class LiLiCorrHead(nn.Module):
                 "attention bias are both sized for the trained width."
             )
 
-        # Match external inputs to the projector dtype. A no-op when everything
-        # is bf16; the candidate embeddings come from the target's table, which
-        # need not share the head's dtype.
+        # A no-op when everything is bf16; the candidate embeddings come from the
+        # target's table, which need not share the head's dtype.
         proj_dtype = self.pass_hidden_proj.weight.dtype
         if token_embeddings.dtype != proj_dtype:
             token_embeddings = token_embeddings.to(proj_dtype)
@@ -417,7 +366,10 @@ class LiLiCorrHead(nn.Module):
         )
 
         anchor_state = self._project_anchor(anchor_hidden, anchor_valid)
-        # Materialized per call, not broadcast; see _build_attention_bias.
+        # Materialized rather than handed to SDPA as a batch-broadcast view: the
+        # broadcast form is identical math and saves one ~2us copy per block, but
+        # a stride-0 mask measured -1.75pp stacked on the compiled body, and the
+        # shipped path is always compiled. Measure before changing it back.
         lattice = self._attn_bias.shape[-1]
         attention_bias = (
             self._attn_bias.unsqueeze(0)
@@ -438,9 +390,8 @@ class LiLiCorrHead(nn.Module):
         pre = pre + F.linear(hidden_states * anchor_row, w_cross)
         factor_hidden = F.silu(pre)
 
-        # One GEMM over [out | in], then one normalize over the [.., 2,
-        # factor_dim] view, which is a per-vector normalize because each
-        # factor_dim vector is normalized independently.
+        # One GEMM over [out | in], then one normalize over the [.., 2, factor_dim]
+        # view, which is per-vector because each factor_dim vector is independent.
         edges = F.linear(factor_hidden, self._fused_edge_weight, self._fused_edge_bias)
         out_vec, in_vec = F.normalize(
             edges.unflatten(-1, (2, self.factor_dim)),
@@ -452,9 +403,8 @@ class LiLiCorrHead(nn.Module):
         )
 
         start_scores = (anchor_out[:, :, None, :] * in_vec[:, :, 0, :, :]).sum(dim=-1)
-        # The same contraction over the factor dimension as an elementwise
-        # product summed over that axis, but as one batched matmul, so the
-        # [.., K, K, factor_dim] intermediate is never materialized.
+        # One batched matmul instead of an elementwise product summed over the
+        # factor dim, so the [.., K, K, factor_dim] intermediate never exists.
         pair_scores = torch.matmul(
             out_vec[:, :, :-1], in_vec[:, :, 1:].transpose(-1, -2)
         )
@@ -463,12 +413,9 @@ class LiLiCorrHead(nn.Module):
     def log_factors(
         self, start_scores: torch.Tensor, pair_scores: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """The log-potentials ``logit_scale * cos`` for the start and pair factors.
-
-        ``logit_scale`` is a fixed, non-learnable constant that sets how sharp the
-        chain may become, since a cosine in ``[-1, 1]`` is too flat to commit on.
-        fp32 because the decode's argmax runs on these values.
-        """
+        # logit_scale is a fixed, non-learnable constant that sets how sharp the
+        # chain may become, since a cosine in [-1, 1] is too flat to commit on.
+        # fp32 because the decode's argmax runs on these values.
         return (
             self.logit_scale * start_scores.float(),
             self.logit_scale * pair_scores.float(),
@@ -478,7 +425,7 @@ class LiLiCorrHead(nn.Module):
         self,
         *,
         token_embeddings: torch.Tensor,
-        candidate_token_ids: torch.Tensor,
+        candidate_tokens: torch.Tensor,
         candidate_log_probs: torch.Tensor,
         pass_hidden: torch.Tensor,
         anchor_hidden: torch.Tensor,
@@ -490,11 +437,10 @@ class LiLiCorrHead(nn.Module):
         ``candidate_*`` are ``[bs, slots, topk]``, ``token_embeddings`` is ``[bs,
         slots, topk, *]``, ``pass_hidden`` is ``[bs, slots, model_hidden]``,
         ``anchor_hidden`` is ``[bs, feat]`` and ``anchor_valid`` is ``[bs]``.
-        Returns the selected token ids ``[bs, slots]``.
+        Returns the selected tokens ``[bs, slots]``.
 
-        This is the function the worker compiles: score, log-factors and greedy
-        decode with static shapes, no collectives, no host syncs and a fixed
-        decode trip count.
+        This is the function the worker compiles: static shapes, no collectives,
+        no host syncs and a fixed decode trip count.
         """
         start_scores, pair_scores = self.score(
             token_embeddings=token_embeddings.unsqueeze(1),
@@ -506,7 +452,7 @@ class LiLiCorrHead(nn.Module):
         )
         log_start, log_pair = self.log_factors(start_scores, pair_scores)
         return lilicorr_greedy_path(
-            log_start[:, 0, :], log_pair[:, 0], candidate_token_ids
+            log_start[:, 0, :], log_pair[:, 0], candidate_tokens
         )
 
     @torch.no_grad()
@@ -514,19 +460,14 @@ class LiLiCorrHead(nn.Module):
         """Precompute ``embed_tokens.weight @ token_proj.weight.T + bias``.
 
         ``token_proj`` is affine and its input is a row of the target embedding
-        table, so ``token_proj(embed[id])`` is a pure function of the id and can
-        be precomputed for the whole vocabulary. The per-step work then drops
-        from a ``[bs, slots, topk, model_hidden]`` gather plus a GEMM to a ``[bs,
-        slots, topk, hidden]`` gather. Callers must pass ``already_projected`` for
-        rows gathered from the result.
-
-        Returns None when there is nothing to fold (an identity ``token_proj``)
-        or when the shapes do not line up, rather than guessing: a silently wrong
-        table would score plausibly and wrong.
+        table, so the product is a pure function of the token id. Callers must
+        pass ``already_projected`` for rows gathered from the result. None means
+        there is nothing to fold, rather than a guess: a silently wrong table
+        would score plausibly and wrong.
         """
-        weight = getattr(embed_tokens, "weight", None)
-        if weight is None or isinstance(self.token_proj, nn.Identity):
+        if isinstance(self.token_proj, nn.Identity):
             return None
+        weight = embed_tokens.weight
         if int(self.token_proj.weight.shape[1]) != int(weight.shape[1]):
             return None
         return F.linear(
@@ -537,23 +478,13 @@ class LiLiCorrHead(nn.Module):
 
 
 def check_head_weight_coverage(head: LiLiCorrHead, seen: set) -> None:
-    """Require the checkpoint's head tensors and the built head to correspond exactly.
+    """Require the checkpoint's ``lilicorr.*`` tensors and the built head to correspond.
 
-    ``seen`` is the set of ``lilicorr.*`` names the checkpoint offered. The base
-    loader silently ignores weights it cannot resolve, which is correct for HF
-    rotary caches and the worst possible behaviour here, in both directions:
-
-    * a name the head wants and the checkpoint lacks leaves that parameter at its
-      construction values, so the head serves partly randomly initialized;
-    * a name the checkpoint carries and the head does not want is dropped, so the
-      head serves a *different architecture* than the one that was trained. The
-      live case is ``token_proj``, which is an ``Identity`` when the head is as
-      wide as the draft: a checkpoint carrying ``token_proj.*`` under a config
-      that leaves ``lilicorr_hidden_size`` unset loses its input projection and
-      scores on regardless.
-
-    Either way the symptom is a low but entirely believable acceptance length, so
-    both directions raise.
+    The base loader silently ignores weights it cannot resolve, which is correct
+    for HF rotary caches and wrong here in both directions: a missing name leaves
+    that parameter randomly initialized, and a surplus one means the served head
+    is a different architecture than the trained one. Either reads as a low but
+    believable acceptance length.
     """
     expected = {f"lilicorr.{name}" for name, _ in head.named_parameters()}
     missing = sorted(expected - seen)
@@ -578,24 +509,11 @@ def check_head_weight_coverage(head: LiLiCorrHead, seen: set) -> None:
 def check_conv_weight_coverage(model: DFlashDraftModel, seen: set) -> None:
     """Require the checkpoint's backbone conv tensors and the built backbone to agree.
 
-    The grouped conv that wraps every draft sublayer belongs to the DFlash backbone,
-    so its tensors are named ``layers.*.{attention,mlp}_conv.*`` and none of them is
-    under ``lilicorr.``. ``check_head_weight_coverage`` therefore cannot see them, and
-    the backbone loader beneath it drops names it cannot resolve — correct for HF
-    rotary caches, and the worst possible behaviour here.
-
-    The dangerous direction is the quiet one. ``parse_dflash_draft_config`` defaults
-    ``conv_kernel_size`` and ``conv_group_size`` to 0, so a checkpoint whose config
-    omits them builds NO conv modules at all: all 20 tensors of a 5-layer drafter are
-    dropped, the draft serves as its conv-free parent, and the run evaluates a body
-    that was trained with convolutions. Nothing raises and nothing warns — the only
-    symptom is an acceptance length that is lower than it should be and entirely
-    believable, which is how the `dflash2` selector trap cost this project a table.
-
-    The other direction is louder but not loud enough: a config that declares the
-    geometry against a checkpoint that carries no conv tensors leaves
-    ``kernel_projection`` at ``nn.Linear``'s random init, which perturbs the drafter
-    rather than disabling it.
+    Separate from the head check because these tensors are backbone parameters
+    named ``layers.*.{attention,mlp}_conv.*``, none of them under ``lilicorr.``.
+    ``parse_dflash_draft_config`` defaults ``conv_kernel_size`` and
+    ``conv_group_size`` to 0, so a config that lost them builds no conv modules
+    and the loader drops every conv tensor without a word.
 
     ``seen`` is the set of conv names the checkpoint offered, stripped of any
     ``model.`` prefix. Both directions raise.
@@ -654,7 +572,7 @@ class LiLiCorrDraftModel(DFlashDraftModel):
         self.lilicorr = LiLiCorrHead(
             model_hidden_size=int(config.hidden_size),
             block_size=int(self.block_size),
-            rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
+            rms_norm_eps=self.rms_norm_eps,
             config=parse_lilicorr_draft_config(draft_hf_config=config),
         )
 
@@ -671,18 +589,6 @@ class LiLiCorrDraftModel(DFlashDraftModel):
             )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load the backbone and the head, then build the head's cached buffers.
-
-        The base loader silently ignores weights it cannot resolve, which is
-        correct for HF rotary caches but is the worst possible behaviour for this
-        head: a checkpoint whose head tensors do not match would leave the head
-        at its construction values and serve a randomly initialized reranker,
-        reporting a low but entirely believable acceptance length. So the head's
-        parameters are checked for complete coverage.
-
-        The backbone's optional grouped convolution is checked the same way and for
-        the same reason, separately because its tensors are not under ``lilicorr.``.
-        """
         seen: set[str] = set()
         seen_conv: set[str] = set()
 
