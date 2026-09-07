@@ -380,7 +380,7 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
-    def adjust_num_frames(self, num_frames):
+    def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
         return num_frames
 
     # tokenize the prompt
