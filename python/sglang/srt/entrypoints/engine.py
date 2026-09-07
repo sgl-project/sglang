@@ -414,6 +414,9 @@ class Engine(EngineScoreMixin, EngineBase):
         disagg_prefill_dp_rank: Optional[int] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
+        # Versioned per-request KV-hint envelope, forwarded untouched to the
+        # HiCache storage backend. See GenerateReqInput.kv_hints.
+        kv_hints: Optional[Dict] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -456,6 +459,7 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            kv_hints=kv_hints,
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
@@ -527,6 +531,9 @@ class Engine(EngineScoreMixin, EngineBase):
         disagg_prefill_dp_rank: Optional[int] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
+        # Versioned per-request KV-hint envelope, forwarded untouched to the
+        # HiCache storage backend. See GenerateReqInput.kv_hints.
+        kv_hints: Optional[Dict] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -569,6 +576,7 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            kv_hints=kv_hints,
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,

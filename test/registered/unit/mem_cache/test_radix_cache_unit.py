@@ -37,6 +37,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStoredMetadata,
     BlockStoredWithMetadata,
     StorageMedium,
+    cache_salt_extra_keys,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -65,6 +66,7 @@ class TestKVCacheEventQueue(unittest.TestCase):
         medium: StorageMedium = StorageMedium.GPU,
         lora_id: int | None = None,
         cache_salt: str | None = None,
+        **placement,
     ) -> BlockStored:
         event_args = dict(
             block_hashes=[block_hash],
@@ -73,7 +75,9 @@ class TestKVCacheEventQueue(unittest.TestCase):
             block_size=block_size,
             lora_id=lora_id,
             medium=medium,
+            extra_keys=cache_salt_extra_keys(cache_salt),
         )
+        event_args.update(placement)
         if cache_salt is None:
             return BlockStored(**event_args)
         return BlockStoredWithMetadata(
@@ -103,11 +107,24 @@ class TestKVCacheEventQueue(unittest.TestCase):
         self.assertEqual(events[0].block_hashes, [1, 2, 3])
 
     def test_enqueue_preserves_fusion_boundaries(self):
+        # Coalescing rewrites the tail's block_hashes/token_ids in place, so any
+        # field describing the blocks as a whole must match first -- otherwise the
+        # merged event reports the tail's value for the incoming event's blocks.
+        # The placement fields below are unpopulated today; they are guarded so
+        # that stays true when something starts setting them.
         incompatible_stores = [
             self._store(2, 1, medium=StorageMedium.CPU),
             self._store(3, 1, lora_id=1),
             self._store(4, 1, block_size=1),
             self._store(5, None),
+            self._store(6, 1, lora_name="adapter"),
+            # extra_keys is per-block, so it would misalign with block_hashes.
+            self._store(7, 1, extra_keys=[["k"]]),
+            self._store(8, 1, group_idx=1),
+            self._store(9, 1, kv_cache_spec_kind="sliding_window"),
+            self._store(10, 1, kv_cache_spec_sliding_window=4),
+            self._store(11, 1, locality="REMOTE"),
+            self._store(12, 1, ownership="kvcr"),
         ]
         for incoming in incompatible_stores:
             queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
@@ -122,10 +139,17 @@ class TestKVCacheEventQueue(unittest.TestCase):
         queue.enqueue(self._store(2, None))
         self.assertEqual(len(queue.take()), 4)
 
-        queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
-        queue.enqueue(BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU))
-        queue.enqueue(BlockRemoved(block_hashes=[2], medium=StorageMedium.CPU))
-        self.assertEqual(len(queue.take()), 2)
+        incompatible_removes = [
+            BlockRemoved(block_hashes=[2], medium=StorageMedium.CPU),
+            BlockRemoved(block_hashes=[2], medium=StorageMedium.GPU, group_idx=1),
+            BlockRemoved(block_hashes=[2], medium=StorageMedium.GPU, locality="REMOTE"),
+            BlockRemoved(block_hashes=[2], medium=StorageMedium.GPU, ownership="kvcr"),
+        ]
+        for incoming in incompatible_removes:
+            queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
+            queue.enqueue(BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU))
+            queue.enqueue(incoming)
+            self.assertEqual(len(queue.take()), 2)
 
         queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
         queue.enqueue(self._store(1, None, cache_salt="tenant-a"))

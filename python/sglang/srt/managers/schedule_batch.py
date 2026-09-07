@@ -958,6 +958,7 @@ class Req(ReqDllmMixin):
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        kv_hints: Optional[dict] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -1279,6 +1280,8 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        # Versioned KV-hint envelope, threaded to the HiCache storage backend.
+        self.kv_hints: Optional[dict] = kv_hints
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.

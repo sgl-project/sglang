@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
+    get_attention_dp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
@@ -46,6 +47,9 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
+
+# The rate limiter is consulted on every request; log it at most this often.
+_RATE_LIMIT_LOG_INTERVAL_S = 30.0
 
 device_module = get_device_module()
 
@@ -212,6 +216,21 @@ class PrefetchAck:
     completed_req: Optional[bool] = None
 
 
+# Free-form key under HiCacheStorageExtraInfo.extra_info that carries the per-request
+# KV-hint envelope down to storage backends (currently read by the KVCR backend,
+# which implements the kv.source_locations action). Kept as a literal here so this
+# generic controller stays backend-agnostic; the KVCR backend owns the matching
+# constant, and a test pins the two together.
+_ROUTER_HINT_EXTRA_INFO_KEY = "kv_hints"
+
+
+def _router_hint_extra_info(operation: StorageOperation) -> Optional[dict]:
+    """Wrap an operation's router hint into the extra_info dict, or None if absent."""
+    if operation.router_hint is None:
+        return None
+    return {_ROUTER_HINT_EXTRA_INFO_KEY: operation.router_hint}
+
+
 class StorageOperation:
     counter = 0
 
@@ -222,6 +241,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        router_hint: Optional[dict] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -237,6 +257,10 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        self.stats_total_tokens = 0
+        # Per-request KV router hint (dynamo) injected into HiCacheStorageExtraInfo
+        # so storage backends (e.g. KVCR) can locate the source of a remote prefix.
+        self.router_hint = router_hint
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -261,6 +285,7 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        router_hint: Optional[dict] = None,
     ):
         self.request_id = request_id
 
@@ -269,7 +294,13 @@ class PrefetchOperation(StorageOperation):
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
-        super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(
+            None,
+            token_ids,
+            last_hash,
+            prefix_keys=prefix_keys,
+            router_hint=router_hint,
+        )
 
     def mark_terminate(self):
         with self._lock:
@@ -581,6 +612,7 @@ class HiCacheController:
                 self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
+            self._last_rate_limit_log_s = 0.0
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
@@ -593,7 +625,7 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori", "kvcr"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -688,10 +720,12 @@ class HiCacheController:
             self.tp_rank = get_parallel().attn_tp_rank
             self.tp_size = get_parallel().attn_tp_size
             self.dp_rank = get_attention_dp_rank()
+            self.dp_size = get_attention_dp_size()
         else:
             self.tp_rank = get_parallel().tp_rank
             self.tp_size = get_parallel().tp_size
             self.dp_rank = 0
+            self.dp_size = 1
 
         self.pp_rank = get_parallel().pp_rank
         self.pp_size = get_parallel().pp_size
@@ -734,6 +768,8 @@ class HiCacheController:
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
+            dp_rank=self.dp_rank,
+            dp_size=self.dp_size,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
@@ -967,12 +1003,17 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        router_hint: Optional[dict] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            router_hint=router_hint,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1061,7 +1102,10 @@ class HiCacheController:
                 ]
 
                 # Get one batch token, and update the completed_tokens if succeed
-                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+                extra_info = HiCacheStorageExtraInfo(
+                    prefix_keys=prefix_keys,
+                    extra_info=_router_hint_extra_info(operation),
+                )
 
                 hit_pages = self._page_transfer_kv_batch(
                     operation,
@@ -1160,9 +1204,31 @@ class HiCacheController:
             return max(0, used) >= self.prefetch_capacity_limit
         # cancel prefetch if too much memory is occupied
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+            # Log it: `prefetch_tokens_occupied` is reserved when a prefetch is
+            # created and released on its completion path, so a prefetch that
+            # ends anywhere else leaks the reservation permanently. Once the
+            # total crosses the cap, L3 stops for the life of the process --
+            # and silently, because `query_storage_hit_length` consults this
+            # same limiter, so `batch_exists` keeps reporting hits that no
+            # `batch_get` ever follows. Rate-limited by design and leaked look
+            # identical from outside; only this counter tells them apart.
+            self._log_rate_limited()
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
+
+    def _log_rate_limited(self) -> None:
+        now = time.monotonic()
+        if now - self._last_rate_limit_log_s < _RATE_LIMIT_LOG_INTERVAL_S:
+            return
+        self._last_rate_limit_log_s = now
+        logger.warning(
+            "HiCache prefetch rate-limited: %d/%d host tokens reserved. "
+            "If no prefetch is in flight, this reservation has leaked and L3 "
+            "will not recover without a restart.",
+            self.prefetch_tokens_occupied,
+            self.prefetch_capacity_limit,
+        )
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
@@ -1178,7 +1244,10 @@ class HiCacheController:
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info=_router_hint_extra_info(operation),
+            )
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size

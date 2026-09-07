@@ -12,6 +12,9 @@ import unittest
 import msgspec
 
 from sglang.srt.disaggregation.kv_events import (
+    CACHE_SALT_EXTRA_KEY_PREFIX,
+    AllBlocksCleared,
+    BlockRemoved,
     BlockStored,
     BlockStoredMetadata,
     BlockStoredWithMetadata,
@@ -19,6 +22,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
     ZmqEventPublisher,
     resolve_load_pub_range,
+    cache_salt_extra_keys,
     select_kv_publisher_dp_rank,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -186,8 +190,9 @@ class TestSelectKvPublisherDpRank(CustomTestCase):
 
 
 class TestBlockStoredWireFormat(CustomTestCase):
-    def _event(self, metadata=None):
-        event_type = BlockStored if metadata is None else BlockStoredWithMetadata
+    def _event(self, cache_salt=None):
+        # Mirrors how KVCacheEventRecorder.record_store builds an event: a salt
+        # goes into both the positional extra_keys slot and the typed struct.
         kwargs = dict(
             block_hashes=[123],
             parent_block_hash=None,
@@ -195,28 +200,99 @@ class TestBlockStoredWireFormat(CustomTestCase):
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
+            extra_keys=cache_salt_extra_keys(cache_salt),
         )
-        if metadata is not None:
-            kwargs["metadata"] = metadata
-        return event_type(**kwargs)
+        if cache_salt is None:
+            return BlockStored(**kwargs)
+        return BlockStoredWithMetadata(
+            **kwargs, metadata=BlockStoredMetadata(cache_salt=cache_salt)
+        )
 
-    def test_unsalted_event_keeps_legacy_array_shape(self):
+    def test_event_matches_the_positional_layout_routers_parse(self):
+        # These fields are read by position by KV-aware routers, which parse one
+        # layout for every framework. The order below is that layout, not ours to
+        # choose: a field landing on the wrong slot is misread as its neighbour
+        # rather than rejected. Reordering or inserting anywhere but the end
+        # breaks every consumer, so pin the whole tuple.
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(self._event()))
-        self.assertEqual(len(decoded), 7)
+        self.assertEqual(
+            decoded,
+            [
+                "BlockStored",
+                [123],  # block_hashes
+                None,  # parent_block_hash
+                [1, 2],  # token_ids
+                2,  # block_size
+                None,  # lora_id
+                StorageMedium.GPU,  # medium
+                None,  # lora_name
+                None,  # extra_keys
+                None,  # group_idx
+                None,  # kv_cache_spec_kind
+                None,  # kv_cache_spec_sliding_window
+                None,  # locality
+                None,  # ownership
+            ],
+        )
 
-    def test_salted_event_appends_typed_metadata(self):
-        event = self._event(BlockStoredMetadata(cache_salt="tenant-a"))
+    def test_salt_rides_in_extra_keys_and_past_the_positional_layout(self):
+        # Regression: the salt used to be appended straight after `medium`, which
+        # is the router's `lora_name: Option<String>` slot -- a map there fails to
+        # decode and takes the whole published batch down with it. It now goes in
+        # the positional `extra_keys` slot the router actually reads a cache
+        # namespace from, while the typed struct stays for name-decoding
+        # consumers, parked past every position the router interprets.
+        event = self._event("tenant-a")
         encoded = msgspec.msgpack.encode(event)
         decoded = msgspec.msgpack.decode(encoded)
         round_tripped = msgspec.msgpack.decode(encoded, type=BlockStoredWithMetadata)
-        self.assertEqual(len(decoded), 8)
-        self.assertEqual(decoded[7], {"cache_salt": "tenant-a"})
+
+        self.assertEqual(decoded[7], None, "lora_name slot must stay a string-or-null")
+        self.assertEqual(decoded[8], [[f"{CACHE_SALT_EXTRA_KEY_PREFIX}tenant-a"]])
+        self.assertEqual(decoded[14], {"cache_salt": "tenant-a"})
         self.assertEqual(round_tripped.metadata.cache_salt, "tenant-a")
+
+    def test_extra_keys_helper_leaves_the_slot_null_when_unsalted(self):
+        # The overwhelmingly common event carries no salt; it must not start
+        # emitting an empty list, which a consumer would index into.
+        self.assertIsNone(cache_salt_extra_keys(None))
+        self.assertEqual(
+            cache_salt_extra_keys("tenant-a"),
+            [[f"{CACHE_SALT_EXTRA_KEY_PREFIX}tenant-a"]],
+        )
+
+    def test_cache_salt_prefix_matches_the_router_constant(self):
+        # Copied from dynamo's DYNAMO_CACHE_SALT_PREFIX
+        # (lib/kv-router/src/zmq_wire/extra_keys.rs). The router strips exactly
+        # this prefix to recover the namespace; drift silently yields no match.
+        self.assertEqual(CACHE_SALT_EXTRA_KEY_PREFIX, "dynamo-cache-salt:")
+
+    def test_removed_and_cleared_reserve_the_same_trailing_slots(self):
+        # BlockRemoved shares BlockStored's trailing tail, and the router only
+        # engages that parse when all five slots are present.
+        removed = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(BlockRemoved(block_hashes=[123]))
+        )
+        self.assertEqual(
+            removed,
+            [
+                "BlockRemoved",
+                [123],  # block_hashes
+                None,  # medium
+                None,  # group_idx
+                None,  # kv_cache_spec_kind
+                None,  # kv_cache_spec_sliding_window
+                None,  # locality
+                None,  # ownership
+            ],
+        )
+        cleared = msgspec.msgpack.decode(msgspec.msgpack.encode(AllBlocksCleared()))
+        self.assertEqual(cleared, ["AllBlocksCleared", None])  # ownership
 
     def test_salted_event_remains_compatible_with_typed_batch_consumers(self):
         batch = KVEventBatch(
             ts=1.0,
-            events=[self._event(BlockStoredMetadata(cache_salt="tenant-a"))],
+            events=[self._event("tenant-a")],
         )
         round_tripped = msgspec.msgpack.decode(
             msgspec.msgpack.encode(batch), type=KVEventBatch
