@@ -8,7 +8,7 @@ Example usage:
 
 python save_sharded_state.py \
     --model-path /path/to/load \
-    --quantization deepspeedfp \
+    --quantization fp8 \
     --tensor-parallel-size 8 \
     --output /path/to/save
 
@@ -17,7 +17,7 @@ Then, the model can be loaded with
 llm = Engine(
     model_path="/path/to/save",
     load_format="sharded_state",
-    quantization="deepspeedfp",
+    quantization="fp8",
     tensor_parallel_size=8,
 )
 """
