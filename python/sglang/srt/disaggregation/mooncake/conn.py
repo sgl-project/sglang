@@ -81,6 +81,45 @@ FAILED_SESSION_RECOVERIES = Counter(
 )
 
 
+def _pack_status_message(
+    room: int,
+    status: KVPoll,
+    prefill_rank: int,
+    failure_reason: Optional[str] = None,
+    status_code: Optional[int] = None,
+) -> List[bytes]:
+    message = [
+        str(room).encode("ascii"),
+        str(int(status)).encode("ascii"),
+        str(prefill_rank).encode("ascii"),
+    ]
+    if failure_reason is not None:
+        message.extend(
+            [
+                failure_reason.encode("utf-8"),
+                str(status_code if status_code is not None else "").encode("ascii"),
+            ]
+        )
+    return message
+
+
+def _unpack_status_message(
+    message: List[bytes],
+) -> Tuple[int, int, int, Optional[str], Optional[int]]:
+    room, status, prefill_rank = message[:3]
+    failure_reason = message[3].decode("utf-8") if len(message) > 3 else None
+    status_code = (
+        int(message[4].decode("ascii")) if len(message) > 4 and message[4] else None
+    )
+    return (
+        int(room.decode("ascii")),
+        int(status.decode("ascii")),
+        int(prefill_rank.decode("ascii")),
+        failure_reason,
+        status_code,
+    )
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -221,6 +260,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = get_observability().enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.required_dst_info_num_table: dict[int, int] = {}
+            self.failure_timestamps: dict[int, float] = {}
+            self.orphan_failed_room_ttl = (
+                envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            )
+            self._orphan_failed_room_cleanup_interval = 60.0
+            self._next_orphan_failed_room_cleanup_time = 0.0
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
@@ -1684,18 +1730,120 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def sync_status_to_decode_endpoint(
-        self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
+        self,
+        remote: str,
+        dst_port: int,
+        room: int,
+        status: KVPoll,
+        prefill_rank: int,
+        failure_reason: Optional[str] = None,
+        status_code: Optional[int] = None,
     ):
         na = NetworkAddress(remote, dst_port)
         self._send_multipart_locked(
             na.to_tcp(),
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-            ],
+            _pack_status_message(
+                room,
+                status,
+                prefill_rank,
+                failure_reason,
+                status_code,
+            ),
             is_ipv6=na.is_ipv6,
         )
+
+    def record_failure(
+        self,
+        bootstrap_room: int,
+        failure_reason: str,
+        status_code: Optional[int] = None,
+    ):
+        super().record_failure(bootstrap_room, failure_reason, status_code)
+        if hasattr(self, "failure_timestamps"):
+            with self.failure_lock:
+                self.failure_timestamps.setdefault(bootstrap_room, time.monotonic())
+            self.maybe_cleanup_orphan_failed_rooms()
+
+    def _is_decode_metadata_ready(self, room: int) -> bool:
+        required = self.required_dst_info_num_table.get(room)
+        return (
+            required is not None
+            and room in self.transfer_infos
+            and len(self.transfer_infos[room]) >= required
+        )
+
+    def notify_decode_status_for_room(
+        self,
+        room: int,
+        status: KVPoll,
+        failure_reason: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ) -> bool:
+        if not self._is_decode_metadata_ready(room):
+            return False
+        prefill_rank = self._prefill_unique_rank()
+        for info in self.transfer_infos[room].values():
+            if not info.is_dummy:
+                self.sync_status_to_decode_endpoint(
+                    info.endpoint,
+                    info.dst_port,
+                    info.room,
+                    status,
+                    prefill_rank,
+                    failure_reason,
+                    status_code,
+                )
+        return True
+
+    def clear_room(self, room: int) -> None:
+        self.request_status.pop(room, None)
+        with self.failure_lock:
+            self.failure_records.pop(room, None)
+            self.failure_status_codes.pop(room, None)
+            self.failure_timestamps.pop(room, None)
+        self.transfer_infos.pop(room, None)
+        self.req_to_decode_prefix_len.pop(room, None)
+        self.required_dst_info_num_table.pop(room, None)
+
+    def try_notify_decode_failure_and_clear(self, room: int) -> bool:
+        if self.request_status.get(room) != KVPoll.Failed:
+            return False
+        if not self._is_decode_metadata_ready(room):
+            return False
+        with self.failure_lock:
+            failure_reason = self.failure_records.get(room)
+            status_code = self.failure_status_codes.get(room)
+        if not self.notify_decode_status_for_room(
+            room,
+            KVPoll.Failed,
+            failure_reason,
+            status_code,
+        ):
+            return False
+        self.clear_room(room)
+        return True
+
+    def maybe_cleanup_orphan_failed_rooms(self) -> None:
+        now = time.monotonic()
+        if now < self._next_orphan_failed_room_cleanup_time:
+            return
+        self._next_orphan_failed_room_cleanup_time = (
+            now + self._orphan_failed_room_cleanup_interval
+        )
+        with self.failure_lock:
+            failure_timestamps = list(self.failure_timestamps.items())
+        for room, failed_at in failure_timestamps:
+            if now - failed_at < self.orphan_failed_room_ttl:
+                continue
+            if self._is_decode_metadata_ready(room):
+                self.try_notify_decode_failure_and_clear(room)
+            else:
+                logger.warning(
+                    "Cleaning up orphan failed Mooncake room %s after %.1fs",
+                    room,
+                    now - failed_at,
+                )
+                self.clear_room(room)
 
     def transfer_worker(
         self,
@@ -2064,6 +2212,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                self.maybe_cleanup_orphan_failed_rooms()
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -2170,6 +2319,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    self.required_dst_info_num_table[room] = required_dst_info_num
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
@@ -2187,6 +2337,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             ),
                             0,
                         )
+                        if self.request_status.get(room) == KVPoll.Failed:
+                            self.try_notify_decode_failure_and_clear(room)
+                            continue
                         self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -2236,10 +2389,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                     continue
 
-                bootstrap_room, status, prefill_rank = msg
-                status = int(status.decode("ascii"))
-                bootstrap_room = int(bootstrap_room.decode("ascii"))
-                prefill_rank = int(prefill_rank.decode("ascii"))
+                (
+                    bootstrap_room,
+                    status,
+                    prefill_rank,
+                    failure_reason,
+                    status_code,
+                ) = _unpack_status_message(msg)
 
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
@@ -2259,7 +2415,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,
-                        "Failed to get kvcache from prefill instance, it might be dead",
+                        failure_reason
+                        or "Failed to get kvcache from prefill instance, it might be dead",
+                        status_code,
                     )
                     self.update_status(bootstrap_room, status)
 
@@ -2381,15 +2539,20 @@ class MooncakeFailureExceptionMixin:
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        self.clear()
-
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+            status_code = self.kv_mgr.failure_status_codes.pop(
+                self.bootstrap_room, None
+            )
+        self.clear()
         is_propagated = failure_reason is None
         if is_propagated:
             failure_reason = "Failed due to an unknown reason from another rank"
         raise KVTransferError(
-            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+            self.bootstrap_room,
+            failure_reason,
+            is_from_another_rank=is_propagated,
+            status_code=status_code,
         )
 
 

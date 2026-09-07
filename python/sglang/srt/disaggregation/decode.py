@@ -127,6 +127,29 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
+def _resolve_kv_failure(
+    kv_receiver: CommonKVReceiver, fallback_message: str
+) -> Tuple[str, bool, int]:
+    """Return the message, propagation flag, and HTTP status for a KV failure."""
+    try:
+        kv_receiver.failure_exception()
+    except Exception as error:
+        is_propagated = getattr(error, "is_from_another_rank", False)
+        status_code = getattr(error, "status_code", None)
+        if status_code is not None:
+            return (
+                getattr(error, "failure_reason", str(error)),
+                is_propagated,
+                status_code,
+            )
+        return (
+            f"{fallback_message} with exception {error}",
+            is_propagated,
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    return fallback_message, False, HTTPStatus.INTERNAL_SERVER_ERROR
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -900,13 +923,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
-                error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
-                is_propagated = False
-                try:
-                    decode_req.kv_receiver.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                    is_propagated = getattr(e, "is_from_another_rank", False)
+                fallback_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                error_message, is_propagated, status_code = _resolve_kv_failure(
+                    decode_req.kv_receiver, fallback_message
+                )
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -915,7 +935,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prepare_abort(
                     decode_req.req,
                     error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=status_code,
                 )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
@@ -2314,12 +2334,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
+                status_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 if poll == KVPoll.Failed:
-                    try:
-                        decode_req.kv_receiver.failure_exception()
-                    except Exception as e:
-                        error_message += f" with exception {e}"
-                        is_propagated = getattr(e, "is_from_another_rank", False)
+                    error_message, is_propagated, status_code = _resolve_kv_failure(
+                        decode_req.kv_receiver, error_message
+                    )
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
@@ -2329,7 +2348,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 prepare_abort(
                     decode_req.req,
                     error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=status_code,
                 )
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],
