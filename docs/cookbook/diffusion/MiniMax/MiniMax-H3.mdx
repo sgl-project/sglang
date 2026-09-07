@@ -28,7 +28,8 @@ reload the model.
 The Docker form installs the platform-specific diffusion extra from the source
 bundled in the image. For conditioned requests, set **Host media directory**
 under **Variables**; the builder mounts it read-only at `/data/minimax-h3`.
-AMD currently offers the Python form, while NVIDIA also offers Docker.
+AMD and Grace Blackwell currently offer the Python form; the other NVIDIA
+recipes also offer Docker.
 
 To use ModelScope through the same normal `sglang serve` path, prefix the copied
 command with `SGLANG_USE_MODELSCOPE=true` and replace the model path with
@@ -71,6 +72,24 @@ The builder accepts legal custom GPU counts and topologies, marking them
 **Unverified** until the exact recipe has completed end-to-end validation.
 Static H3 head or partition violations disable Copy before they reach
 `sglang serve`.
+
+### Grace Blackwell
+
+Select **GB300** or **GB200** in the builder. The default is one Linux ARM64
+host with four GPUs, Ulysses4, and resident weights. This follows the
+[four-GPU compute-tray layout](https://docs.nvidia.com/dgx/dgxgb200-user-guide/hardware.html);
+an NVL72 rack is not a single 72-GPU process host.
+
+For two four-GPU hosts, set **Nodes = 2** and **GPUs / node = 4**. The builder
+emits Ulysses4 inside each host, Ring2 across hosts, and replicated encoders.
+Set the same reachable **Head address** on both hosts and use node ranks 0 and
+1. Run the generated command once per host, with the same SGLang revision and
+dependencies. Let `sglang serve` resolve and download the selected weights.
+
+GB200 is a **derived, unverified recipe**, not a measured GB300-equivalent
+performance claim. Keep the native precision and platform-default attention
+for the baseline; the B200/B300 quantization measurements and H200 Cache-DiT
+quality audit do not establish coverage on Grace Blackwell.
 
 ### Checkpoint and adapter formats
 

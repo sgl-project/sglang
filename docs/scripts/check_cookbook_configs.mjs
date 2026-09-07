@@ -300,6 +300,18 @@ for (const path of walk(CONFIGS)) {
       checkH3("B200 1x8", { hw: "b200", nodes: 1, gpus_per_node: 8, placement: "resident" }, { tp_size: 1, ulysses_degree: 8, ring_degree: 1 });
       checkH3("H100 1x4", { hw: "h100", nodes: 1, gpus_per_node: 4, placement: "resident" }, { tp_size: 2, ulysses_degree: 2, ring_degree: 1 });
       checkH3("H200 2x8", { hw: "h200", nodes: 2, gpus_per_node: 8, placement: "resident" }, { tp_size: 1, ulysses_degree: 8, ring_degree: 2 });
+      for (const hw of ["gb200", "gb300"]) {
+        checkH3(`${hw} 1x4`, { hw, nodes: 1, gpus_per_node: 4, placement: "resident" }, { tp_size: 1, ulysses_degree: 4, ring_degree: 1 }, false);
+        checkH3(`${hw} 2x4`, { hw, nodes: 2, gpus_per_node: 4, placement: "resident" }, { tp_size: 1, ulysses_degree: 4, ring_degree: 2 }, false);
+        const selection = selectionOf({ hw, nodes: 2, gpus_per_node: 4 });
+        const encoder = config.overlayDims.find((dim) => dim.id === "encoder").options.find((option) => option.id === "auto");
+        if (!encoder.flags(selection).includes("--encoder-parallel replicate")) {
+          fail(where, `${hw} cross-node auto encoder must replicate`);
+        }
+        if (config.runModes(selection).includes("docker")) {
+          fail(where, `${hw} must not advertise an unvalidated Docker command`);
+        }
+      }
       for (const hw of ["mi300x", "mi355x"]) {
         for (const count of [1, 2, 4, 8]) {
           checkH3(`${hw} 1x${count}`, { hw, nodes: 1, gpus_per_node: count, placement: "resident" }, { tp_size: 1, ulysses_degree: count, ring_degree: 1 });
