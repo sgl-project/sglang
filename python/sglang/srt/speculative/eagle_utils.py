@@ -813,16 +813,20 @@ def eagle_sample(
     elif _is_npu:
         from sglang.srt.speculative.npu_sampling import sample_npu_target_tokens
 
-        target_predict = sample_npu_target_tokens(
-            next_token_logits=next_token_logits,
-            sampling_info=sampling_info,
-            positions=verify_input.positions,
-            tree_topk=verify_input.tree_topk,
-            num_draft_tokens=verify_input.draft_token_num,
-            max_tree_depth=verify_input.max_tree_depth,
-            retrieve_index_shape=tuple(verify_input.retrieve_index.shape),
-            batch_size=bs,
-        ).to(candidates.dtype).reshape(bs, verify_input.draft_token_num)
+        target_predict = (
+            sample_npu_target_tokens(
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                positions=verify_input.positions,
+                tree_topk=verify_input.tree_topk,
+                num_draft_tokens=verify_input.draft_token_num,
+                max_tree_depth=verify_input.max_tree_depth,
+                retrieve_index_shape=tuple(verify_input.retrieve_index.shape),
+                batch_size=bs,
+            )
+            .to(candidates.dtype)
+            .reshape(bs, verify_input.draft_token_num)
+        )
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()

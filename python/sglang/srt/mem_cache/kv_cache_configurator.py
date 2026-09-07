@@ -96,10 +96,10 @@ from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_available_gpu_memory,
     get_device_memory_capacity,
+    is_950_npu,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
-    is_950_npu,
 )
 
 logger = logging.getLogger(__name__)

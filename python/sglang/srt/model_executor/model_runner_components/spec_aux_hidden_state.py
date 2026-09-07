@@ -112,9 +112,7 @@ def _resolve_eagle_aux_hidden_state(
 
     _, config.eagle_draft_kv_cache_dtype = configure_kv_cache_dtype(
         server_args_kv_cache_dtype=get_model().kv_cache_dtype,
-        speculative_draft_kv_cache_dtype=(
-            get_spec().speculative_draft_kv_cache_dtype
-        ),
+        speculative_draft_kv_cache_dtype=(get_spec().speculative_draft_kv_cache_dtype),
         model=None,
         model_dtype=draft_model_config.dtype,
         is_draft_worker=True,

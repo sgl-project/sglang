@@ -76,7 +76,7 @@ def validate_npu_target_only_sampling(
 def sample_npu_target_tokens(
     *,
     next_token_logits: torch.Tensor,
-    sampling_info: "SamplingBatchInfo",
+    sampling_info: SamplingBatchInfo,
     positions: torch.Tensor,
     tree_topk: int,
     num_draft_tokens: int,

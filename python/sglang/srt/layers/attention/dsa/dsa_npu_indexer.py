@@ -36,7 +36,7 @@ def _create_hadamard_128_cpu() -> torch.Tensor:
 def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     assert head_dim == 128
     # Match vllm-ascend SFA: BF16 matrix, normalized once on the pool's device.
-    return (_create_hadamard_128_cpu().to(device=device) / (128 ** 0.5)).contiguous()
+    return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
 def _quantize_npu_indexer_activation(x, hadamard, dst_type):

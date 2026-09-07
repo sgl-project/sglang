@@ -52,10 +52,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
+    is_950_npu,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
-    is_950_npu,
     spec_decode_alloc_len_per_request,
 )
 
@@ -248,9 +248,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
                     draft_dtype = kvc.spec_aux_config.eagle_draft_kv_cache_dtype
                     model_config = kvc.model_config
-                    use_c8 = (
-                        draft_dtype == torch.float8_e4m3fn
-                        and is_950_npu(kvc.gpu_id)
+                    use_c8 = draft_dtype == torch.float8_e4m3fn and is_950_npu(
+                        kvc.gpu_id
                     )
                     draft_main_bytes = (
                         calculate_mla_kv_cache_dim(
@@ -481,15 +480,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
             )
             num_indexer_layers = (
-                len(resolve_dsa_indexer_layer_ids(
-                    kvc.model_config.hf_config,
-                    kvc.layer_info.start_layer,
-                    kvc.layer_info.end_layer,
-                ))
-                if is_glm_compact_rollout else num_layers
+                len(
+                    resolve_dsa_indexer_layer_ids(
+                        kvc.model_config.hf_config,
+                        kvc.layer_info.start_layer,
+                        kvc.layer_info.end_layer,
+                    )
+                )
+                if is_glm_compact_rollout
+                else num_layers
             )
             return num_indexer_layers * (
-                index_head_dim + 4 if use_c8
+                index_head_dim + 4
+                if use_c8
                 else index_head_dim * torch._utils._element_size(dtype)
             )
         indexer_size_per_token = (
