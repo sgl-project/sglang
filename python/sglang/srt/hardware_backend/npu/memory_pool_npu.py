@@ -574,12 +574,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         # and this is a pure refactor. The seam lands first, on its own, so that
         # the write-path translation it enables is a separate diff to bisect.
         #
-        # One consumer to keep in view before widening it: the HiCache host
-        # mirror allocates index-K from the *same* `base_dims` as k/v
-        # (pool_host/mla.py:163-192, layout "page_first_kv_split"), so a
-        # widened device buffer would outgrow its host counterpart. Hierarchical
-        # cache and DCP have no reason to meet on this path, but nothing asserts
-        # it here yet.
+        # One consumer this diverges from: the HiCache host mirror allocates
+        # index-K from the same `base_dims` as k/v (pool_host/mla.py, layout
+        # "page_first_kv_split"), sized from this pool's *sharded* `size` times
+        # hicache_ratio. A DCP-widened index buffer outgrows it whenever
+        # hicache_ratio < dcp_size. HiCache + DCP is permitted for MLA
+        # (hybrid_pool_assembler.py:153), so that combination is reachable and
+        # the host pool now asserts the page counts rather than transferring
+        # into a short buffer.
         self.index_buf_size = size if index_buf_size is None else index_buf_size
 
         # A DSA layer that reuses the previous layer's top-k indices owns no
