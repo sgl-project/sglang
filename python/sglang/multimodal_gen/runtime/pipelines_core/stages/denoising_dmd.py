@@ -25,6 +25,12 @@ logger = init_logger(__name__)
 
 
 class DmdDenoisingStage(DenoisingStage):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        # a fixed distilled schedule: the same count at any requested step count
+        return len(self.server_args.pipeline_config.dmd_denoising_steps)
+
     """
     Denoising stage for DMD.
     """

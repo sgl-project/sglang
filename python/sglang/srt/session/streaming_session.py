@@ -66,6 +66,8 @@ class SessionSlot:
             # Later turns run on the slot's record (see restore_to_req).
             assert kv is self.kv
 
+        req.swa_branching_seqlen = None
+
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
         req.kv = self.kv
