@@ -60,6 +60,7 @@ class TestDSAMetadataKernels(CustomTestCase):
         max_len: int,
         dsa_index_topk: int,
         real_page_size: int,
+        seq_len_offset: int = 0,
     ):
         bs = len(seq_lens_values)
         pool_size = max(bs + 3, 8)
@@ -96,16 +97,16 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_len=max_len,
             dsa_index_topk=dsa_index_topk,
             real_page_size=real_page_size,
+            seq_len_offset=seq_len_offset,
         )
 
-        expected_cache = seq_lens.to(torch.int32)
+        expected_cache = seq_lens.to(torch.int32) + seq_len_offset
         expected_page_table = req_to_token[req_pool_indices, :max_len].contiguous()
         expected_dsa = _dsa_seqlens(expected_cache, dsa_index_topk)
 
-        # Compare only the live prefix [:seq_len]: whole blocks starting past
-        # the kv length are skipped (keep stale values), while the last
-        # partially live block still writes lanes past it -- the tail is
-        # unspecified either way, and consumers never read past cache_seqlens.
+        # Compare only the live prefix [:seq_len]. The kernel leaves the tail
+        # untouched across graph replays, and consumers bound reads by
+        # cache_seqlens.
         cols = torch.arange(max_len, dtype=torch.int32, device=self.device)
         live_mask = cols.view(1, -1) < expected_cache.view(-1, 1)
 
@@ -132,6 +133,15 @@ class TestDSAMetadataKernels(CustomTestCase):
                 expected_real[real_live_mask],
                 "decode real_page_table (live [:seq_len] prefix)",
             )
+
+    def test_decode_step_offset_updates_lengths_and_page_table_prefix(self):
+        self._check_decode(
+            [1, 129],
+            max_len=256,
+            dsa_index_topk=64,
+            real_page_size=64,
+            seq_len_offset=2,
+        )
 
     def _check_target_verify(
         self,

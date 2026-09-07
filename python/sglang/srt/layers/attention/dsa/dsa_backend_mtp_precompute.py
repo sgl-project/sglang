@@ -1,8 +1,4 @@
-"""Multi-step precompute utilities for Native Sparse Attention backend.
-
-This module provides optimization utilities for multi-step speculative decoding
-by precomputing shared metadata once and copying it to multiple backend instances.
-"""
+"""Multi-step precompute utilities for Native Sparse Attention backends."""
 
 from __future__ import annotations
 
@@ -24,13 +20,7 @@ _is_hip = is_hip()
 
 @dataclass
 class PrecomputedMetadata:
-    """Precomputed metadata shared across multiple backend instances.
-
-    Used for multi-step speculative decoding where multiple backends
-    need identical metadata. Precomputing once and copying N times
-    is much faster than computing N times.
-
-    """
+    """Metadata precomputed outside a CUDA graph for one backend instance."""
 
     # Basic seqlens
     cache_seqlens: torch.Tensor  # int32, [bs]
@@ -63,21 +53,18 @@ def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
 
 
 class DeepseekSparseAttnBackendMTPPrecomputeMixin:
-    """Mixin class providing metadata precomputation for multi-step speculative decoding.
-
-    This mixin provides the _precompute_replay_metadata method and its helpers,
-    which are used to optimize CUDA graph replay in multi-step scenarios.
-    """
+    """Precompute one child's metadata before CUDA graph replay."""
 
     def _precompute_replay_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
         forward_mode: ForwardMode,
+        seq_len_offset: int = 0,
     ) -> PrecomputedMetadata:
-        """Precompute all shared metadata for multi-step backends.
+        """Precompute metadata for one multi-step backend.
 
         This function extracts and computes all operations that are
         identical across different backend instances in multi-step
@@ -91,7 +78,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             forward_mode: Forward mode (decode/target_verify)
 
         Returns:
-            PrecomputedMetadata containing all shared intermediate results
+            PrecomputedMetadata containing the child's intermediate results
         """
         # Slice inputs to batch size
         seq_lens = seq_lens[:bs]
@@ -102,7 +89,11 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         # Dispatch to mode-specific precomputation
         if forward_mode.is_decode_or_idle():
             return self._precompute_decode_mode(
-                bs, req_pool_indices, seq_lens, seq_lens_cpu
+                bs,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu,
+                seq_len_offset=seq_len_offset,
             )
         elif forward_mode.is_target_verify():
             return self._precompute_target_verify_mode(
@@ -116,10 +107,19 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        seq_len_offset: int = 0,
     ) -> PrecomputedMetadata:
         """Precompute metadata for normal decode mode."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
+        if seq_lens_cpu is not None and (
+            int(seq_lens_cpu.max().item()) + seq_len_offset > max_len
+        ):
+            raise RuntimeError(
+                "DSA decode sequence length exceeds page-table capacity: "
+                f"max_seq_len={int(seq_lens_cpu.max().item())}, "
+                f"offset={seq_len_offset}, capacity={max_len}"
+            )
 
         if _is_cuda and not _is_hip:
             from sglang.kernels.ops.attention.dsa_metadata import (
@@ -159,6 +159,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 max_len=max_len,
                 dsa_index_topk=self.dsa_index_topk,
                 real_page_size=self.real_page_size,
+                seq_len_offset=seq_len_offset,
             )
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
@@ -185,7 +186,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             )
 
         # Convert to int32 and compute cumsum
-        cache_seqlens = seq_lens.to(torch.int32)
+        cache_seqlens = (seq_lens + seq_len_offset).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
 
         # Get page indices from cache
@@ -226,6 +227,40 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded_size=seqlens_expanded_size,
             max_len=max_len,
             max_seqlen_k=max_len,
+            flashmla_metadata=flashmla_metadata,
+        )
+
+    def _adjust_decode_precomputed_metadata(
+        self, previous: PrecomputedMetadata, seq_len_delta: int
+    ) -> PrecomputedMetadata:
+        """Adjust child-specific lengths while reusing a max-prefix page table."""
+        if seq_len_delta == 0:
+            return previous
+
+        cache_seqlens = previous.cache_seqlens + seq_len_delta
+        cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
+        dsa_cache_seqlens = compute_dsa_seqlens(
+            cache_seqlens, dsa_index_topk=self.dsa_index_topk
+        )
+        dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
+        flashmla_metadata = None
+        if self.dsa_decode_impl == "flashmla_kv":
+            flashmla_metadata = self._compute_flashmla_metadata(
+                cache_seqlens=dsa_cache_seqlens,
+                seq_len_q=1,
+            )
+
+        return PrecomputedMetadata(
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            page_indices=previous.page_indices,
+            real_page_table=previous.real_page_table,
+            seqlens_expanded=cache_seqlens,
+            dsa_cache_seqlens=dsa_cache_seqlens,
+            dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+            seqlens_expanded_size=previous.seqlens_expanded_size,
+            max_len=previous.max_len,
+            max_seqlen_k=previous.max_seqlen_k,
             flashmla_metadata=flashmla_metadata,
         )
 

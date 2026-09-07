@@ -32,6 +32,7 @@ def _fused_dsa_decode_metadata_kernel(
     real_page_table_stride_1: tl.constexpr,
     bs: tl.constexpr,
     max_len,
+    seq_len_offset: tl.constexpr,
     dsa_index_topk: tl.constexpr,
     real_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
@@ -45,7 +46,7 @@ def _fused_dsa_decode_metadata_kernel(
         offs_b = tl.arange(0, BLOCK_BS)
         mask_b = offs_b < bs
         seq = tl.load(seq_lens + offs_b * seq_lens_stride, mask=mask_b, other=0)
-        seq_i32 = seq.to(tl.int32)
+        seq_i32 = seq.to(tl.int32) + seq_len_offset
         dsa_seq = tl.minimum(seq_i32, dsa_index_topk)
 
         cu = tl.cumsum(seq_i32, 0)
@@ -74,11 +75,14 @@ def _fused_dsa_decode_metadata_kernel(
     # Skip column blocks past the request's kv length: no consumer reads there
     # (attention and the indexer both stay within cache_seqlens). Loaded after
     # req_idx so the two scalar loads pipeline (no added latency when live).
-    kv_len = tl.load(
-        seq_lens + row * seq_lens_stride,
-        mask=row < bs,
-        other=0,
-    ).to(tl.int32)
+    kv_len = (
+        tl.load(
+            seq_lens + row * seq_lens_stride,
+            mask=row < bs,
+            other=0,
+        ).to(tl.int32)
+        + seq_len_offset
+    )
     if col_block * BLOCK_N >= kv_len:
         return
     vals = tl.load(
@@ -121,6 +125,7 @@ def fused_dsa_decode_metadata(
     max_len: int,
     dsa_index_topk: int,
     real_page_size: int,
+    seq_len_offset: int = 0,
 ) -> None:
     """Fill decode-graph DSA metadata (seqlens + page tables) from req_to_token.
 
@@ -191,6 +196,7 @@ def fused_dsa_decode_metadata(
         real_page_table.stride(1) if has_real_page_table else 0,
         bs,
         max_len,
+        seq_len_offset,
         dsa_index_topk,
         real_page_size,
         has_real_page_table,
