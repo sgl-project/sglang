@@ -628,7 +628,7 @@ class XPUAttentionBackend(AttentionBackend):
                 page_table, cache_seqlens, causal = self._encoder_decoder_page_table(
                     layer, metadata
                 )
-                o = self._forward_attn_flat_page_table(
+                o = self._forward_encoder_decoder_attn(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     key_cache=key_cache,
                     value_cache=value_cache,
@@ -639,7 +639,6 @@ class XPUAttentionBackend(AttentionBackend):
                     scale=layer.scaling,
                     softcap=layer.logit_cap,
                     causal=causal,
-                    handle_empty_cache_rows=True,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if layer.is_cross_attention:
@@ -823,7 +822,6 @@ class XPUAttentionBackend(AttentionBackend):
         window_size: tuple[int, int] = (-1, -1),
         sinks: Optional[torch.Tensor] = None,
         return_softmax_lse: bool = False,
-        handle_empty_cache_rows: bool = False,
     ):
         """Attention against a ``page_table`` that indexes individual token
         slots rather than ``self.page_size``-sized blocks. Serves cascade
@@ -835,14 +833,6 @@ class XPUAttentionBackend(AttentionBackend):
         assert sinks is None, (
             "flat-page-table attention does not support attention sinks"
         )
-
-        # Encoder-decoder batches can have requests with zero encoder/cache
-        # length; the kernel returns NaN for those rows rather than zeros.
-        # Cascade's expand rows are never empty, so cascade callers leave
-        # this off and skip the device-to-host sync below.
-        if handle_empty_cache_rows and int(cache_seqlens.max().item()) == 0:
-            out = q.new_zeros((q.shape[0], q.shape[1], value_cache.shape[-1]))
-            return (out, None) if return_softmax_lse else out
 
         # key_cache/value_cache carry the backend's configured page_size, but
         # page_table indexes individual tokens regardless of that page_size, so
@@ -856,7 +846,7 @@ class XPUAttentionBackend(AttentionBackend):
             -1, 1, value_cache.shape[-2], value_cache.shape[-1]
         )
 
-        result = flash_attn_with_kvcache(
+        return flash_attn_with_kvcache(
             q=q,
             k_cache=k_cache_unpaged,
             v_cache=v_cache_unpaged,
@@ -874,15 +864,47 @@ class XPUAttentionBackend(AttentionBackend):
             return_softmax_lse=return_softmax_lse,
         )
 
-        # Mixed batch: requests with cache_seqlens==0 attend to no keys and come
-        # back as NaN, so zero their query rows (mapped via cu_seqlens_q). `out`
-        # aliases result[0] when a tuple, so the in-place zero-fill below updates
-        # both.
-        if handle_empty_cache_rows and int(cache_seqlens.min().item()) == 0:
-            out = result[0] if return_softmax_lse else result
+    def _forward_encoder_decoder_attn(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        scale: float,
+        softcap: float,
+        causal: bool,
+    ):
+        """Encoder-decoder cross-/self-attention via the flat page-table path.
+
+        A request with cache_seqlens==0 (empty encoder region, or an idle
+        decoder row) attends to no keys and the kernel returns NaN for it
+        rather than zeros, so those rows are zeroed here (an all-empty batch
+        skips the launch entirely). Cascade's expand rows are never empty, so
+        this check -- and its two device-to-host syncs -- stays out of
+        _forward_attn_flat_page_table and off that path.
+        """
+        if int(cache_seqlens.max().item()) == 0:
+            return q.new_zeros((q.shape[0], q.shape[1], value_cache.shape[-1]))
+
+        out = self._forward_attn_flat_page_table(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            scale=scale,
+            softcap=softcap,
+            causal=causal,
+        )
+        if int(cache_seqlens.min().item()) == 0:
             seg = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
             out[(cache_seqlens == 0).repeat_interleave(seg)] = 0
-        return result
+        return out
 
     def forward_decode(
         self,
@@ -993,7 +1015,7 @@ class XPUAttentionBackend(AttentionBackend):
                 page_table, cache_seqlens, causal = self._encoder_decoder_page_table(
                     layer, metadata
                 )
-                o = self._forward_attn_flat_page_table(
+                o = self._forward_encoder_decoder_attn(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     key_cache=key_cache,
                     value_cache=value_cache,
@@ -1004,7 +1026,6 @@ class XPUAttentionBackend(AttentionBackend):
                     scale=layer.scaling,
                     softcap=layer.logit_cap,
                     causal=causal,
-                    handle_empty_cache_rows=True,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
