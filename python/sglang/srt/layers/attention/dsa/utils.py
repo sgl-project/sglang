@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 import triton
@@ -115,7 +115,9 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
 
 
 def is_dsa_enable_prefill_cp():
-    if is_hip() or is_npu() or is_musa():
+    # NPU prefill CP stays supported (the DSV4 backend consumes the V2
+    # strategy metadata); HIP/MUSA remain on the deprecated path.
+    if is_hip() or is_musa():
         return False
 
     # Generic prefill CP derives activation from the runtime topology and model
