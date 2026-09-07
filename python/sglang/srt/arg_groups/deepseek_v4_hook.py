@@ -147,13 +147,14 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     if cfg.speculative_algorithm is not None:
         assert cfg.speculative_algorithm in (
             "EAGLE",
+            "NEXTN",
             "DSPARK",
         ), (
-            f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
+            f"Only EAGLE, NEXTN, and DSPARK speculative algorithms are supported for {model_arch}"
         )
-        if cfg.speculative_algorithm == "EAGLE":
+        if cfg.speculative_algorithm in ("EAGLE", "NEXTN"):
             assert cfg.speculative_eagle_topk == 1, (
-                f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+                f"Only EAGLE/NEXTN speculative decoding with topk == 1 is supported for {model_arch}"
             )
 
 

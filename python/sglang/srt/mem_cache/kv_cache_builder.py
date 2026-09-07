@@ -261,17 +261,18 @@ def build_kv_cache(
                     "window attention (SWA) models requires the unified radix "
                     "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
                 )
-            if enable_hierarchical_cache:
+            is_deepseek_v4 = getattr(model_config, "is_deepseek_v4_arch", False)
+            if enable_hierarchical_cache and not is_deepseek_v4:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache with sliding "
                     "window attention (SWA) models currently supports only "
                     "device-resident cache and is incompatible with "
                     "--enable-hierarchical-cache."
                 )
-            if getattr(model_config, "is_deepseek_v4_arch", False):
+            if is_deepseek_v4 and not enable_hierarchical_cache:
                 raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
+                    "--disaggregation-decode-enable-radix-cache with "
+                    "DeepSeek-V4 requires --enable-hierarchical-cache."
                 )
             if getattr(model_config, "is_hybrid_swa_compress", False):
                 raise ValueError(

@@ -710,6 +710,7 @@ def filter_kv_indices_for_cp_rank(
     kv_indices: np.ndarray,
     index_slice: slice,
     total_pages: Optional[int] = None,
+    page_offset: int = 0,
 ) -> Tuple[np.ndarray, slice]:
     """Filters kv_indices and index_slice for the current CP rank."""
     if total_pages is None:
@@ -721,19 +722,20 @@ def filter_kv_indices_for_cp_rank(
         return kv_indices, index_slice
 
     rank_start, rank_end = _get_cp_rank_page_bounds(total_pages, cp_rank, cp_size)
-    chunk_start = index_slice.start if index_slice.start is not None else 0
-    chunk_end = index_slice.stop if index_slice.stop is not None else total_pages
+    local_start = index_slice.start if index_slice.start is not None else 0
+    chunk_start = page_offset + local_start
+    chunk_end = chunk_start + len(kv_indices)
     first_pos = max(rank_start, chunk_start) - chunk_start
     last_pos = min(rank_end, chunk_end) - chunk_start
 
     if last_pos <= first_pos:
         new_kv_indices = kv_indices[:0]
-        new_index_slice = slice(chunk_start, chunk_start)
+        new_index_slice = slice(local_start, local_start)
     else:
         new_kv_indices = kv_indices[first_pos:last_pos]
         new_index_slice = slice(
-            chunk_start + first_pos,
-            chunk_start + last_pos,
+            local_start + first_pos,
+            local_start + last_pos,
         )
     return new_kv_indices, new_index_slice
 

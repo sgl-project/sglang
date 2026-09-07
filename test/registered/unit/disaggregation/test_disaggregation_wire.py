@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    filter_kv_indices_for_cp_rank,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
@@ -145,6 +146,27 @@ class TestDisaggregationWire(unittest.TestCase):
 
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):
+    def test_prefix_hit_keeps_cp_partition_request_relative(self):
+        suffix_pages = np.arange(100, 108, dtype=np.int32)
+        expected = {
+            0: ([], slice(0, 0)),
+            1: ([100, 101, 102, 103], slice(0, 4)),
+            2: ([104, 105, 106, 107], slice(4, 8)),
+        }
+
+        for cp_rank, (pages, destination_slice) in expected.items():
+            with self.subTest(cp_rank=cp_rank):
+                manager = SimpleNamespace(attn_cp_rank=cp_rank, attn_cp_size=3)
+                actual_pages, actual_slice = filter_kv_indices_for_cp_rank(
+                    manager,
+                    suffix_pages,
+                    slice(0, 8),
+                    total_pages=12,
+                    page_offset=4,
+                )
+                self.assertEqual(actual_pages.tolist(), pages)
+                self.assertEqual(actual_slice, destination_slice)
+
     def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
         cases = [
             (1, 0, False, False),
