@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    format_kv_cache_dtype,
 )
 
 if TYPE_CHECKING:
@@ -638,6 +639,7 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            kv_cache_dtype=format_kv_cache_dtype(self.mem_pool_host.dtype),
         )
 
     def reset(self):

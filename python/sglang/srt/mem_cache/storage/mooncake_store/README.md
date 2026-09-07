@@ -305,6 +305,35 @@ python -m sglang.launch_server \
     --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_group_semantics": true}'
 ```
 
+**KV Cache Dtype Isolation:**
+
+HiCache keys do not include `--kv-cache-dtype` by default. Sharing one Mooncake store between a `bfloat16` instance and an `fp8_e4m3` instance would therefore collide on the same object keys. SGLang now namespaces Mooncake objects by the host KV cache dtype using existing Mooncake isolation APIs:
+
+- **Default (`extra_backend_tag`)**: prefix keys with `dtype_<kv_cache_dtype>_`, and combine that prefix with a user-provided `extra_backend_tag` when one is set.
+- **Optional (`tenant`)**: put the dtype into Mooncake `tenant_id` instead of the key prefix. This requires a Mooncake version whose `MooncakeDistributedStore.setup()` accepts `tenant_id`.
+
+```bash
+# Default: isolate dtypes through extra_backend_tag key prefixes
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --kv-cache-dtype fp8_e4m3 \
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "extra_backend_tag": "prod"}'
+
+# Optional: isolate dtypes through Mooncake tenant namespaces
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --kv-cache-dtype fp8_e4m3 \
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "tenant_id": "tenant-a", "kv_cache_dtype_isolation": "tenant"}'
+```
+
+**Mooncake Tenant ID (`tenant_id`):**
+
+Mooncake Store can isolate object namespaces by tenant. SGLang forwards a non-default `tenant_id` to `MooncakeDistributedStore.setup(..., tenant_id=...)`. Configure it in `--hicache-storage-backend-extra-config`, in the JSON file selected by `SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`, or with `MOONCAKE_TENANT_ID`. The default value is `default`; that default is not passed to `setup()` so older Mooncake versions keep working.
+
+When strict multi-tenant mode is enabled on the master (`--enable_multi_tenants=true`), write requests must use a registered tenant. All instances that should share KV cache entries must use the same `tenant_id` and compatible model / dtype / release namespaces.
+
 **HiCache Related Parameters for SGLang Server**
 
 For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.io/advanced_features/hicache_design.html#related-parameters).
