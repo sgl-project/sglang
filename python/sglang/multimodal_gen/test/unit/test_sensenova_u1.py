@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SenseNovaU1GenerationStage,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
 
 
@@ -508,6 +509,18 @@ def test_sensenova_u1_rejects_unsupported_runtime_modes(override, expected):
 
     with pytest.raises(ValueError, match=expected):
         config.validate_server_args(SimpleNamespace(**args))
+
+
+def test_sensenova_u1_rejects_direct_server_args_quantization():
+    config = SenseNovaU1PipelineConfig()
+    args = ServerArgs(
+        model_path="sensenova/SenseNova-U1.5-8B-MoT",
+        pipeline_config=config,
+        quantization="fp8",
+    )
+
+    with pytest.raises(ValueError, match="quantization"):
+        config.validate_server_args(args)
 
 
 def test_sensenova_u1_vision_config_round_trips_sequence_fields(tmp_path):
