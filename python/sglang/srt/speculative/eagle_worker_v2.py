@@ -139,6 +139,50 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
+_EAGLE_CUDA_SYNC_DEBUG_CHECKPOINTS = frozenset(
+    {
+        "before_draft_extend",
+        "after_draft_extend",
+        "after_prepare_pp_next_draft_batch",
+        "after_draft",
+        "before_pp_raw_tree_to_cpu",
+    }
+)
+
+
+def _resolve_eagle_cuda_sync_debug_checkpoints(device: str) -> frozenset[str]:
+    selected = frozenset(envs.SGLANG_EAGLE_CUDA_SYNC_DEBUG.get())
+    unknown = selected - _EAGLE_CUDA_SYNC_DEBUG_CHECKPOINTS
+    if unknown:
+        raise RuntimeError(
+            "Unknown SGLANG_EAGLE_CUDA_SYNC_DEBUG checkpoint(s): "
+            f"{sorted(unknown)}; expected a comma-separated subset of "
+            f"{sorted(_EAGLE_CUDA_SYNC_DEBUG_CHECKPOINTS)}"
+        )
+    if selected and not _is_cuda:
+        raise RuntimeError(
+            "SGLANG_EAGLE_CUDA_SYNC_DEBUG is supported only on CUDA devices"
+        )
+    if selected:
+        logger.warning(
+            "EAGLE CUDA sync debug enabled on device=%s: checkpoints=%s",
+            device,
+            sorted(selected),
+        )
+    return selected
+
+
+def _sync_eagle_cuda_debug(checkpoint: str, device: str) -> None:
+    """Synchronize one previously validated EAGLE diagnostic boundary."""
+    logger.warning("EAGLE CUDA sync debug begin: checkpoint=%s", checkpoint)
+    try:
+        torch.cuda.synchronize(device=device)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"EAGLE CUDA sync debug failed: checkpoint={checkpoint}"
+        ) from exc
+    logger.warning("EAGLE CUDA sync debug end: checkpoint=%s", checkpoint)
+
 
 def _slice_draft_output_to_local_tokens(
     next_token_logits: torch.Tensor,
@@ -767,12 +811,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         num_local_tokens,
                     )
                 )
-                maybe_detect_nan(
-                    next_token_logits, f"draft_forward step {i}"
-                )
-                maybe_detect_inf(
-                    next_token_logits, f"draft_forward step {i}"
-                )
+                maybe_detect_nan(next_token_logits, f"draft_forward step {i}")
+                maybe_detect_inf(next_token_logits, f"draft_forward step {i}")
                 if get_spec().speculative_use_rejection_sampling:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         next_token_logits,
@@ -1176,6 +1216,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         self._pp_enabled = get_parallel().pp_size > 1
         self._pp_is_last_rank = get_pp_group().is_last_rank
+        self._eagle_cuda_sync_debug_checkpoints = (
+            _resolve_eagle_cuda_sync_debug_checkpoints(self.device)
+        )
         # Non-last PP ranks have no draft worker but still need the same tree
         # mask policy when rebuilding relayed verify trees.
         self.tree_mask_mode = default_tree_mask_mode()
@@ -1420,16 +1463,36 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
+                    if "before_draft_extend" in (
+                        self._eagle_cuda_sync_debug_checkpoints
+                    ):
+                        _sync_eagle_cuda_debug("before_draft_extend", self.device)
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
                     if self._pp_enabled:
+                        if "after_draft_extend" in (
+                            self._eagle_cuda_sync_debug_checkpoints
+                        ):
+                            _sync_eagle_cuda_debug("after_draft_extend", self.device)
                         self._prepare_pp_next_draft_batch(batch, batch_output)
+                        if "after_prepare_pp_next_draft_batch" in (
+                            self._eagle_cuda_sync_debug_checkpoints
+                        ):
+                            _sync_eagle_cuda_debug(
+                                "after_prepare_pp_next_draft_batch", self.device
+                            )
                         (
                             pp_draft_tokens,
                             pp_parent_list,
                             pp_top_scores_index,
                         ) = self.draft_worker.draft(batch)
+                        if "after_draft" in (self._eagle_cuda_sync_debug_checkpoints):
+                            _sync_eagle_cuda_debug("after_draft", self.device)
 
             if self._pp_enabled:
+                if "before_pp_raw_tree_to_cpu" in (
+                    self._eagle_cuda_sync_debug_checkpoints
+                ):
+                    _sync_eagle_cuda_debug("before_pp_raw_tree_to_cpu", self.device)
                 batch_output.pp_verify_input_raw = EaglePPVerifyInputRaw(
                     draft_tokens=pp_draft_tokens.reshape(
                         batch.batch_size(), self.speculative_num_draft_tokens

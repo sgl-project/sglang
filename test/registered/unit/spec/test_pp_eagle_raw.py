@@ -13,7 +13,12 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
 from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.eagle_worker_v2 import (
+    EagleDraftWorker,
+    EAGLEWorkerV2,
+    _resolve_eagle_cuda_sync_debug_checkpoints,
+    _sync_eagle_cuda_debug,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -61,6 +66,67 @@ class TestEaglePPVerifyInputRaw(unittest.TestCase):
         raw.parent_list = None
         with self.assertRaisesRegex(RuntimeError, "requires a relayed or dummy"):
             raw.filter_batch(torch.tensor([0]))
+
+
+class TestEagleCudaSyncDebug(unittest.TestCase):
+    def test_unset_resolves_empty(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EAGLE_CUDA_SYNC_DEBUG.override(""):
+            self.assertEqual(
+                _resolve_eagle_cuda_sync_debug_checkpoints("cuda:0"), frozenset()
+            )
+
+    @patch("sglang.srt.speculative.eagle_worker_v2.torch.cuda.synchronize")
+    def test_selected_checkpoint_synchronizes(self, synchronize):
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_EAGLE_CUDA_SYNC_DEBUG.override(
+                "after_draft_extend,after_draft"
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2._is_cuda",
+                True,
+            ),
+        ):
+            selected = _resolve_eagle_cuda_sync_debug_checkpoints("cuda:1")
+
+        self.assertEqual(selected, frozenset({"after_draft_extend", "after_draft"}))
+        _sync_eagle_cuda_debug("after_draft", "cuda:1")
+
+        synchronize.assert_called_once_with(device="cuda:1")
+
+    def test_unknown_checkpoint_fails_closed(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EAGLE_CUDA_SYNC_DEBUG.override("after_typo"):
+            with self.assertRaisesRegex(
+                RuntimeError, "Unknown SGLANG_EAGLE_CUDA_SYNC_DEBUG"
+            ):
+                _resolve_eagle_cuda_sync_debug_checkpoints("cuda:0")
+
+    def test_non_cuda_enablement_fails_closed(self):
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_EAGLE_CUDA_SYNC_DEBUG.override("before_draft_extend"),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2._is_cuda",
+                False,
+            ),
+            self.assertRaisesRegex(RuntimeError, "supported only on CUDA"),
+        ):
+            _resolve_eagle_cuda_sync_debug_checkpoints("cpu")
+
+    @patch("sglang.srt.speculative.eagle_worker_v2.torch.cuda.synchronize")
+    def test_sync_error_identifies_checkpoint(self, synchronize):
+        synchronize.side_effect = RuntimeError("illegal memory access")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "EAGLE CUDA sync debug failed: checkpoint=after_draft_extend",
+        ):
+            _sync_eagle_cuda_debug("after_draft_extend", "cuda:0")
 
 
 class TestEaglePPVerifyRebuild(unittest.TestCase):
@@ -231,21 +297,27 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
         batch = SimpleNamespace(spec_info=None)
         idle_draft_input = object()
 
-        with patch(
-            "sglang.srt.speculative.eagle_worker_v2.get_draft_recurrent_hidden_state_spec",
-            return_value=(64, torch.float32),
-        ), patch(
-            "sglang.srt.speculative.eagle_worker_v2.EagleDraftInput.create_idle_input",
-            return_value=idle_draft_input,
-        ), patch(
-            "sglang.srt.speculative.eagle_worker_v2.speculative_moe_backend_context",
-            return_value=nullcontext(),
-        ), patch(
-            "sglang.srt.speculative.eagle_worker_v2.speculative_moe_a2a_backend_context",
-            return_value=nullcontext(),
-        ), patch(
-            "sglang.srt.speculative.eagle_worker_v2.spec_stage_span",
-            return_value=nullcontext(),
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_draft_recurrent_hidden_state_spec",
+                return_value=(64, torch.float32),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.EagleDraftInput.create_idle_input",
+                return_value=idle_draft_input,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.speculative_moe_backend_context",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.speculative_moe_a2a_backend_context",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.spec_stage_span",
+                return_value=nullcontext(),
+            ),
         ):
             result = EAGLEWorkerV2._build_idle_verify_input(worker, batch)
 

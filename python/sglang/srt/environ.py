@@ -1477,6 +1477,11 @@ class Envs:
     # this off selects the legacy request-relative/unfused seed contract and
     # therefore also keeps the seed-bearing draft decode/extend phases eager.
     SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK = EnvBool(True)
+    # Diagnostic-only comma-separated EAGLE checkpoints at which the current
+    # CUDA device is synchronized. The runtime rejects unknown checkpoints.
+    # Keep unset outside targeted fault localization because synchronization
+    # changes execution timing and is not valid for performance evidence.
+    SGLANG_EAGLE_CUDA_SYNC_DEBUG = EnvTuple(())
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
