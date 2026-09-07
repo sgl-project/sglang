@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -44,6 +45,61 @@ class TestMamba(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def test_whole_slot_consumer_waits_for_final_hicache_layer(self):
+        calls = []
+
+        class Counter:
+            num_layers = 48
+
+            def wait_until(self, layer_id):
+                calls.append(layer_id)
+
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.layer_transfer_counter = Counter()
+
+        pool.wait_for_hicache_load_complete()
+
+        self.assertEqual(calls, [47])
+
+    def test_deferred_cow_waits_for_hicache_before_copy(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        calls = []
+
+        class Counter:
+            num_layers = 48
+
+            def wait_until(self, layer_id):
+                calls.append(("wait", layer_id))
+
+        class MambaState:
+            def copy_from(self, src, dst):
+                calls.append(("copy", src.clone(), dst.clone()))
+
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.layer_transfer_counter = Counter()
+        pool.mamba_ckpt_pool = None
+        pool.mamba_pool = MambaState()
+        pool.translate_mamba_indices = lambda indices: indices
+
+        runner = object.__new__(ModelRunner)
+        runner.req_to_token_pool = pool
+        runner.is_draft_worker = False
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            mamba_clear_indices=None,
+            mamba_cow_src_indices=torch.tensor([2]),
+            mamba_cow_dst_indices=torch.tensor([5]),
+        )
+
+        runner._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+
+        self.assertEqual(calls[0], ("wait", 47))
+        self.assertEqual(calls[1][0], "copy")
+        self.assertTrue(torch.equal(calls[1][1], torch.tensor([2])))
+        self.assertTrue(torch.equal(calls[1][2], torch.tensor([5])))
 
     def test_hybrid_linear_kv_pool(self):
         size = 16

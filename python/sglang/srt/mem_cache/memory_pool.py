@@ -1385,6 +1385,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
+    def wait_for_hicache_load_complete(self) -> None:
+        """Order whole-slot consumers after an active layerwise H->D load."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(
+                self.layer_transfer_counter.num_layers - 1
+            )
+
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba-slot translate. Identity for a static pool
         (slots are physical); UnifiedHybridReqToTokenPool overrides it for the
