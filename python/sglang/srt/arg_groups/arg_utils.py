@@ -233,9 +233,8 @@ def with_fallback(cls, name: str, value: Any) -> Any:
     on `if cfg.swa_full_tokens_ratio is None`, and a fallback answering there
     would make that branch dead. `test_declared_fallbacks.py` pins both halves.
 
-    Every declared fallback is an immutable scalar. A mutable one would have to
-    be copied per read, for the reason a dataclass spells this
-    `default_factory`; that is the moment to add it, not now.
+    A mutable fallback would need copying per read, for the reason a dataclass
+    spells this `default_factory`. Every declared one is a scalar.
     """
     if value is not None:
         return value

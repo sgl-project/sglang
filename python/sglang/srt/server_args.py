@@ -48,9 +48,6 @@ from sglang.srt.arg_groups.arg_utils import (
     add_cli_args_from_dataclass,
 )
 from sglang.srt.arg_groups.argparse_actions import (
-    DeprecatedAction,
-    DeprecatedAliasStoreAction,
-    DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
 )
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
@@ -61,7 +58,6 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import get_platform, publish
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
@@ -482,12 +478,9 @@ class ServerArgs:
         # belongs in the stash, where it carries a source and does not destroy
         # the input it was derived from.
         # Underscore names are the record's own bookkeeping -- `_input_frozen`,
-        # `_raw_input`, `_resolved_overrides`, the memo slots -- and resolution
-        # writes those on purpose. No *field* starts with an underscore, which
-        # is what makes this spelling test sufficient;
-        # `test_no_field_starts_with_an_underscore` fails if that stops being
-        # true, because then a field would be silently writable during
-        # resolution.
+        # `_raw_input`, `_resolved_overrides`, the memo slots -- which
+        # resolution writes on purpose. No *field* is spelled that way, which
+        # is what makes this spelling test sufficient.
         if not name.startswith("_"):
             if getattr(self, "_input_frozen", False):
                 raise AttributeError(
@@ -632,17 +625,10 @@ def set_global_server_args_for_tokenizer(server_args: ServerArgs):
 def get_global_server_args() -> ServerArgs:
     """Retired. Read the configuration from its namespace bag.
 
-    This was the last spelling of "reach for the whole record and pick a field
-    off it". Runtime code reads `get_<namespace>()[.sub].field` now -- the value
-    that is in effect, which is what a reader almost always means, and a plain
-    attribute load that survives `override` and dynamo tracing. The 15 record
-    reads that legitimately remain each hold a record they were handed.
-
-    It raises rather than warning-and-returning because a returned record is
-    exactly the thing that has to stop: it answers with the operator's *input*,
-    so a caller reading a field resolution decided gets a stale value and no
-    error. The name is kept so an out-of-tree caller lands here instead of on
-    an ImportError.
+    It raises rather than returning, because what it returns is the problem:
+    the record answers with the operator's *input*, so a caller reading a field
+    resolution decided gets a stale value and no error. The name is kept so an
+    out-of-tree caller lands here instead of on an ImportError.
     """
     warnings.warn(
         "get_global_server_args() is retired; read the config bag instead "
