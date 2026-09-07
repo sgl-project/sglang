@@ -18,7 +18,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 
@@ -115,7 +115,7 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
 
 
 def is_dsa_enable_prefill_cp():
-    if is_hip() or is_npu():
+    if is_hip() or is_npu() or is_musa():
         return get_parallel().enable_dsa_prefill_context_parallel
 
     # Generic prefill CP derives activation from the runtime topology and model
@@ -126,13 +126,6 @@ def is_dsa_enable_prefill_cp():
 
     hf_config = process_model_config().hf_config
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
-
-
-def is_dsa_prefill_cp_in_seq_split():
-    return (
-        is_dsa_enable_prefill_cp()
-        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
-    )
 
 
 def is_dsa_prefill_cp_round_robin_split():
@@ -196,7 +189,18 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
         return input_[indices]
 
     # for torch device tensor
-    return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
+    shard = input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank]
+    # .contiguous() is not sufficient here. When tokens == cp_size every rank's
+    # shard has a single row, and a size-1 outer dimension imposes no contiguity
+    # constraint, so is_contiguous() is True whatever stride(0) is and
+    # .contiguous() becomes a no-op. The shard then keeps the cp_size-inflated
+    # row pitch (cp_size * row_numel instead of row_numel), which any kernel that
+    # takes its row pitch from stride(0) will read as an oversized tensor.
+    # Compare the pitch against the parent's explicitly, so the copy happens
+    # exactly when the shard really is strided -- and not at all for cp_size == 1.
+    if shard.stride(0) != input_.stride(0):
+        shard = shard.clone(memory_format=torch.contiguous_format)
+    return shard
 
 
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
