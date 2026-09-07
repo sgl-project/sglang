@@ -327,11 +327,11 @@ def handle_linear_attn_backend(server_args: Any):
 
     # ReplaySSM buffered decode guards. Runs on Triton, or Helion for KDA.
     # cuda-graph is supported (slice 1b: CUDA-graph-safe static
-    # write-cursor buffers). The RADIX prefix cache is now supported (slice
-    # 2b: the decode kernel force-flushes the ring into temporal[slot] on
-    # the radix track boundary `seq_lens % mamba_track_interval == 0`, and
-    # the COW copy-into-slot path resets the ring cursor) -- so the
-    # --disable-radix-cache requirement is dropped.
+    # write-cursor buffers). The original GDN/raw-KDA path supports the RADIX
+    # prefix cache by force-flushing the ring at track boundaries. The bounded
+    # KDA pre-decay specialization stays inactive while Radix Cache is enabled:
+    # a temporal checkpoint and the in-place conv state must describe the same
+    # token boundary, which the current finish-time rollback cannot guarantee.
     #
     # Slice 2b only wires the no_buffer mamba scheduler strategy (the
     # default). The extra_buffer strategy donates the track snapshot via
@@ -340,6 +340,12 @@ def handle_linear_attn_backend(server_args: Any):
     # cursor of the donated/kept slot would not be reset there. Handling
     # that donation path is a follow-up; for now require no_buffer.
     if cfg.enable_linear_replayssm:
+        if cfg.enable_unified_memory:
+            raise ValueError(
+                "--enable-linear-replayssm is not supported with "
+                "--enable-unified-memory: the unified Mamba pool does not "
+                "allocate the ReplaySSM ring."
+            )
         if decode not in {"triton", "helion"}:
             raise ValueError(
                 "--enable-linear-replayssm requires Triton, or Helion for "
