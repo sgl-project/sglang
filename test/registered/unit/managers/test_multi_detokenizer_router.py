@@ -36,9 +36,11 @@ class _RecordingSocketMapping:
 
 def _make_router(num_workers: int) -> mtm.MultiDetokenizerRouter:
     ipc_names = [f"ipc://detok-{i}" for i in range(num_workers)]
-    with patch.object(mtm, "zmq", MagicMock()), patch.object(
-        mtm, "get_zmq_socket", return_value=MagicMock()
-    ), patch.object(mtm, "SocketMapping", _RecordingSocketMapping):
+    with (
+        patch.object(mtm, "zmq", MagicMock()),
+        patch.object(mtm, "get_zmq_socket", return_value=MagicMock()),
+        patch.object(mtm, "SocketMapping", _RecordingSocketMapping),
+    ):
         return mtm.MultiDetokenizerRouter(ipc_names, MagicMock())
 
 
