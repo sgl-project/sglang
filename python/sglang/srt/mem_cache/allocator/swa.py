@@ -1,3 +1,5 @@
+import logging
+
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -7,6 +9,8 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
+
+logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 
@@ -28,6 +32,10 @@ _SWA_PEER_RELEASED = Invariant("swa.peer_released", Bucket.GUARD, IsTrue())
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
+    # Per-request SWA ring (BaseSWAKVPool.swa_req_ring_size). Class default so
+    # subclasses that bypass this __init__ read False.
+    _swa_req_ring = False
+
     def __init__(
         self,
         size: int,
@@ -37,6 +45,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: BaseSWAKVPool,
         need_sort: bool,
+        req_to_token_pool=None,
     ):
         assert isinstance(kvcache, BaseSWAKVPool)
         self._size_full = size
@@ -104,10 +113,45 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_free_group = []
 
         self._kvcache = kvcache
+
+        # Per-request SWA ring: the paged SWA indices built here are unused and
+        # SWA capacity is bounded by req slots, not tokens.
+        ring_size = kvcache.swa_req_ring_size
+        self._swa_req_ring = ring_size is not None
+        self._req_to_token_pool = req_to_token_pool
+        if self._swa_req_ring:
+            assert req_to_token_pool is not None, (
+                "per-request SWA ring: capacity is counted in req slots"
+            )
+            self._swa_ring_cost = (
+                (ring_size + self.page_size - 1) // self.page_size
+            ) * self.page_size
+            # Total SWA capacity is every req slot's ring; all slots are free here.
+            self._size_swa = req_to_token_pool.available_size() * self._swa_ring_cost
+            logger.info(
+                "SWA per-request ring accounting enabled: "
+                f"ring_size={ring_size}, ring_cost_tokens={self._swa_ring_cost}, "
+                f"size_swa={self._size_swa} (paged size_swa={size_swa} bypassed)"
+            )
+        else:
+            self._swa_ring_cost = 0
+
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
+    @property
+    def swa_req_ring(self) -> bool:
+        return self._swa_req_ring
+
+    @property
+    def swa_ring_cost_tokens(self) -> int:
+        return self._swa_ring_cost
+
     def available_size(self):
+        if self._swa_req_ring:
+            # The SWA ring is pre-allocated per slot and reused by decode, so it
+            # never constrains token growth; full attention is the real limiter.
+            return self.full_attn_allocator.available_size()
         return min(
             self.full_attn_allocator.available_size(),
             self.swa_attn_allocator.available_size(),
@@ -117,6 +161,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.full_attn_allocator.available_size()
 
     def swa_available_size(self):
+        if self._swa_req_ring:
+            # Ring-based availability: free request slots * per-slot ring cost.
+            return self._req_to_token_pool.available_size() * self._swa_ring_cost
         return self.swa_attn_allocator.available_size()
 
     # Slot-conservation views for the leak invariant. On the non-shared allocator
@@ -142,7 +189,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def debug_print(self) -> str:
         msg = ""
-        msg += f"#swa-available-size: {self.swa_attn_allocator.available_size()}, "
+        msg += f"#swa-available-size: {self.swa_available_size()}, "
         msg += (
             f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
         )
@@ -171,11 +218,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 
     def new_pages_available(self, num_full_pages: int, num_swa_pages: int) -> bool:
-        return (
+        full_ok = (
             num_full_pages
             <= self.full_attn_allocator.available_size() // self.page_size
-            and num_swa_pages
-            <= self.swa_attn_allocator.available_size() // self.page_size
+        )
+        if self._swa_req_ring:
+            # SWA ring rows are pre-allocated per slot; no per-token SWA paging.
+            return full_ok
+        return full_ok and (
+            num_swa_pages <= self.swa_attn_allocator.available_size() // self.page_size
         )
 
     def alloc_extend(
@@ -194,6 +245,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if not self.new_pages_available(num_new_pages, num_new_pages):
             return None
+
+        if self._swa_req_ring:
+            # Ring mode pages full KV only; full_to_swa_index_mapping stays unwritten.
+            return self.full_attn_allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+                num_new_pages=num_new_pages,
+            )
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
@@ -245,6 +308,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if not self.new_pages_available(num_full_pages, num_swa_pages):
             return None
 
+        if self._swa_req_ring:
+            # See alloc_extend: full KV only.
+            return self.full_attn_allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+                num_new_pages=num_full_pages,
+            )
+
         alloc_full_indices = self.full_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -291,6 +366,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
         assert self.page_size > 1
+        if self._swa_req_ring:
+            # See alloc_extend: slot-addressed ring, so full-attention KV only.
+            return self.full_attn_allocator.alloc_decode(
+                seq_lens, seq_lens_cpu, last_loc
+            )
+
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
         alloc_full_indices = self.full_attn_allocator.alloc_decode(
@@ -453,7 +534,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         size_full = int(config.full_max_total_num_tokens)
         size_swa = int(config.swa_max_total_num_tokens)
         self._size_full = size_full
-        self._size_swa = size_swa
+        if not self._swa_req_ring:
+            # Ring capacity follows the req slot count, not the token config.
+            self._size_swa = size_swa
         for alloc, sz in (
             (self.full_attn_allocator, size_full),
             (self.swa_attn_allocator, size_swa),
@@ -625,3 +708,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def clear(self):
         self.swa_attn_allocator.clear()
         self.free_group = None
+
+
+def is_swa_req_ring(allocator) -> bool:
+    return isinstance(allocator, SWATokenToKVPoolAllocator) and allocator.swa_req_ring
