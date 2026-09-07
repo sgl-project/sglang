@@ -216,18 +216,14 @@ def mla_quantize_without_rope_for_fp8(
 def concat_mla_absorb_q_general(q_nope, q_rope):
     # Adjacent slices of one fused [T, H, d_nope + d_rope] tensor: return the
     # parent instead of allocating a copy. DSA splits then re-concats this way.
-    if (
-        q_nope.dim() == 3
-        and q_rope.dim() == 3
-        and q_nope.dtype == q_rope.dtype
-        and q_nope.shape[:2] == q_rope.shape[:2]
-    ):
+    if q_nope.dim() == 3 and q_rope.dim() == 3:
         tokens, heads, d_nope = q_nope.shape
         width = d_nope + q_rope.shape[2]
         fused_stride = (heads * width, width, 1)
         if (
             q_nope.stride() == fused_stride
             and q_rope.stride() == fused_stride
+            and q_nope.shape[:2] == q_rope.shape[:2]
             and q_rope.storage_offset() == q_nope.storage_offset() + d_nope
             and q_nope.untyped_storage().data_ptr()
             == q_rope.untyped_storage().data_ptr()
