@@ -4,6 +4,8 @@
 
 #include <iostream>
 
+namespace sglang {
+
 namespace device::marlin {
 // Marlin params
 
@@ -81,3 +83,5 @@ __device__ inline void cp_async_wait() {
 #endif
 
 }  // namespace device::marlin
+
+}  // namespace sglang

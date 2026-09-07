@@ -6,13 +6,16 @@ import triton
 import triton.testing
 
 from sglang.kernels.jit.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE
-from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_mla
+from sglang.kernels.ops.kvcache.hisparse import (
+    copy_cache_planned_mla,
+    load_cache_to_device_buffer_mla,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
-    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=18, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=12, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=18, stage="jit-kernel-benchmark", runner_config="amd")
 
 DEVICE = DEFAULT_DEVICE
 DTYPE = DEFAULT_DTYPE
@@ -159,6 +162,66 @@ def _time_kernel(batch_size: int, hot_buffer_size: int, miss_rate: float) -> flo
     return start.elapsed_time(end) * 1000.0 / ROUNDS
 
 
+def _time_planned_copy(
+    batch_size: int, hot_buffer_size: int, miss_rate: float
+) -> float:
+    """Time the copy-only replay used by shared-index skip layers: one anchor
+    swap-in records a real plan, each timed round replays it (num_blocks=4)."""
+    state = _build_inputs(batch_size, hot_buffer_size, miss_rate)
+    miss_src = torch.zeros((batch_size, TOP_K), dtype=torch.int64, device=DEVICE)
+    miss_dst = torch.zeros((batch_size, TOP_K), dtype=torch.int32, device=DEVICE)
+    miss_count = torch.zeros((batch_size,), dtype=torch.int32, device=DEVICE)
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=state["top_k_tokens"],
+        device_buffer_tokens=state["device_buffer_tokens"],
+        host_cache_locs=state["host_cache_locs"],
+        device_buffer_locs=state["device_buffer_locs"],
+        host_cache=state["host_cache"],
+        device_buffer=state["device_buffer"],
+        top_k_device_locs=state["top_k_device_locs"],
+        req_pool_indices=state["req_pool_indices"],
+        seq_lens=state["seq_lens"],
+        lru_slots=state["lru_slots"],
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=TOP_K,
+        hot_buffer_size=hot_buffer_size,
+        block_size=1024,
+        num_real_reqs=state["num_real_reqs"],
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+    )
+    torch.cuda.synchronize()
+    skip_layer_buffer = torch.empty_like(state["device_buffer"])
+
+    def run_once():
+        copy_cache_planned_mla(
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+            num_real_reqs=state["num_real_reqs"],
+            host_cache=state["host_cache"],
+            device_buffer=skip_layer_buffer,
+            item_size_bytes=ITEM_SIZE_BYTES,
+            num_blocks=4,
+        )
+
+    run_once()
+    torch.cuda.synchronize()
+    for _ in range(WARMUP_ROUNDS):
+        run_once()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(ROUNDS):
+        run_once()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) * 1000.0 / ROUNDS
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size", "hot_buffer_size", "miss_rate", "miss_tokens_cnt"],
@@ -188,5 +251,35 @@ def benchmark_latency(
     return avg_us, avg_us, avg_us
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["batch_size", "hot_buffer_size", "miss_rate", "miss_tokens_cnt"],
+        x_vals=CONFIGS,
+        line_arg="provider",
+        line_vals=LINE_VALS,
+        line_names=LINE_NAMES,
+        styles=STYLES,
+        ylabel="us",
+        plot_name="hisparse-planned-copy-latency",
+        args={},
+    )
+)
+def benchmark_planned_copy_latency(
+    batch_size: int,
+    hot_buffer_size: int,
+    miss_rate: float,
+    miss_tokens_cnt: int,
+    provider: str,
+) -> Tuple[float, float, float]:
+    assert provider == "jit"
+    batch_size = int(batch_size)
+    hot_buffer_size = int(hot_buffer_size)
+    miss_rate = float(miss_rate)
+    assert miss_tokens_cnt == batch_size * _miss_tokens_per_req(miss_rate)
+    avg_us = _time_planned_copy(batch_size, hot_buffer_size, miss_rate)
+    return avg_us, avg_us, avg_us
+
+
 if __name__ == "__main__":
     benchmark_latency.run(print_data=True)
+    benchmark_planned_copy_latency.run(print_data=True)

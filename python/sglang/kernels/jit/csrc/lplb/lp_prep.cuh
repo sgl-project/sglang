@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 template <int NC, int NV, int NUM_SINGLE, int NUM_RED_LOG, int NUM_GPUS, int BLOCK_DIM>
 __global__ void lp_prep_kernel(
@@ -179,4 +179,4 @@ void lp_prep(
       static_cast<const float*>(A_base_row_sum.data_ptr()));
 }
 
-}  // namespace
+}  // namespace sglang

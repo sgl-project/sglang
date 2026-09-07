@@ -19,7 +19,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 constexpr uint32_t kRsVec = 8;  // bf16x8 = 16 B
 constexpr uint32_t kRsBlock = 256;
@@ -113,4 +113,4 @@ void row_compact(tvm::ffi::TensorView x, tvm::ffi::TensorView out) {
   row_scale_launch<kUsePDL, false>(x, nullptr, out, R, N, dev);
 }
 
-}  // namespace
+}  // namespace sglang

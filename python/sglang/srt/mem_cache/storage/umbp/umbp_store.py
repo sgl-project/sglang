@@ -18,6 +18,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
@@ -34,6 +38,8 @@ def _import_umbp_client():
     UMBPIoBackend = getattr(umbp_mod, "UMBPIoBackend", None)
     UMBPDurabilityMode = getattr(umbp_mod, "UMBPDurabilityMode", None)
     UMBPDistributedConfig = getattr(umbp_mod, "UMBPDistributedConfig", None)
+    UMBPStandaloneProcessConfig = getattr(umbp_mod, "UMBPStandaloneProcessConfig", None)
+    UMBPDeploymentMode = getattr(umbp_mod, "UMBPDeploymentMode", None)
 
     return (
         UMBPClient,
@@ -42,6 +48,8 @@ def _import_umbp_client():
         UMBPIoBackend,
         UMBPDurabilityMode,
         UMBPDistributedConfig,
+        UMBPStandaloneProcessConfig,
+        UMBPDeploymentMode,
     )
 
 
@@ -130,6 +138,10 @@ def _select_rank_config_value(
 # knobs outside this list go through the "spdk_passthrough" escape hatch.
 _COMMON_EXTRA_KEYS = frozenset(
     {
+        "node_address",
+        "node_id",
+        "node_tags",
+        "tags",
         "dram_capacity_bytes",
         "ssd_enabled",
         "ssd_storage_dir",
@@ -160,6 +172,8 @@ _COMMON_EXTRA_KEYS = frozenset(
         "kv_events_subscriber",
         "kv_events_endpoint",
         "kv_events_topic",
+        "disable_zero_copy_register",
+        "extra_backend_tag",
     }
 )
 
@@ -171,24 +185,25 @@ _STANDALONE_ONLY_EXTRA_KEYS = frozenset(
         "eviction_policy",
         "eviction_candidate_window",
         "auto_promote_on_read",
+        "standalone_address",
+        "standalone_auto_start",
+        "standalone_startup_timeout_ms",
     }
 )
 
 _DISTRIBUTED_ONLY_EXTRA_KEYS = frozenset(
     {
         "master_address",
-        "node_address",
-        "node_id",
         "auto_heartbeat",
         "io_engine_host",
         "io_engine_port",
         "staging_buffer_size",
+        "ranged_scratch_size",
         "ssd_staging_buffer_size",
         "ssd_staging_buffer_slots",
         "peer_service_port",
         "cache_remote_fetches",
         "dram_page_size",
-        "disable_zero_copy_register",
     }
 )
 
@@ -234,7 +249,13 @@ class UMBPStore(HiCacheStorage):
         self,
         storage_config: HiCacheStorageConfig = None,
         mem_pool_host: HostKVCache = None,
+        *,
+        per_rank_keyspace: bool = False,
     ):
+        # per_rank_keyspace: the direct linker already organises keys by its own
+        # cache-group rank, so HiCache's shared-SSD leader/follower deduplication
+        # must not be layered on top. Default False preserves the existing
+        # HiCache L3 behaviour.
         (
             UMBPClient,
             UMBPConfig,
@@ -242,6 +263,8 @@ class UMBPStore(HiCacheStorage):
             UMBPIoBackend,
             UMBPDurabilityMode,
             UMBPDistributedConfig,
+            UMBPStandaloneProcessConfig,
+            UMBPDeploymentMode,
         ) = _import_umbp_client()
 
         if storage_config is not None:
@@ -256,6 +279,7 @@ class UMBPStore(HiCacheStorage):
             self.pp_rank = 0
             self.pp_size = 1
             self.tp_size = 1
+        self._umbp_deployment_mode_enum = UMBPDeploymentMode
 
         cfg = UMBPConfig.from_environment()
         # UMBPStore owns role selection explicitly. Do not inherit LOCAL_RANK /
@@ -264,6 +288,12 @@ class UMBPStore(HiCacheStorage):
         # and skip writes.
         cfg.role = UMBPRole.Standalone
         extra = getattr(storage_config, "extra_config", None) or {}
+        prefix_parts = []
+        if extra.get("extra_backend_tag") is not None:
+            prefix_parts.append(str(extra["extra_backend_tag"]))
+        if storage_config is not None and storage_config.model_name:
+            prefix_parts.append("-".join(storage_config.model_name.split("/")))
+        self.config_prefix = "_".join(prefix_parts) if prefix_parts else None
         explicit_tenant_id = (
             os.getenv("UMBP_SPDK_PROXY_TENANT_ID") is not None
             or "spdk_proxy_tenant_id" in extra
@@ -357,8 +387,7 @@ class UMBPStore(HiCacheStorage):
             ssd_backend = str(extra["ssd_backend"]).strip().lower()
             if ssd_backend not in ("file", "spdk", "spdk_proxy"):
                 raise ValueError(
-                    "extra_config['ssd_backend'] must be one of: "
-                    "file, spdk, spdk_proxy"
+                    "extra_config['ssd_backend'] must be one of: file, spdk, spdk_proxy"
                 )
             cfg.ssd.ssd_backend = ssd_backend
         if "spdk_nvme_pci_addr" in extra:
@@ -458,6 +487,58 @@ class UMBPStore(HiCacheStorage):
         master_address = extra.get(
             "master_address", _optional_env_str("UMBP_MASTER_ADDRESS")
         )
+        standalone_extra_address = extra.get("standalone_address")
+        standalone_env_address = _optional_env_str("UMBP_STANDALONE_ADDRESS")
+        standalone_address = standalone_extra_address or standalone_env_address
+        # Verify the client did not silently fall back to local mode.
+        self._standalone_process_expected = bool(standalone_address)
+        if master_address and standalone_address:
+            raise ValueError(
+                "master_address and standalone_address are mutually exclusive "
+                "(distributed vs. standalone-process mode)."
+            )
+        if (
+            mem_pool_host is not None
+            and standalone_extra_address
+            and not standalone_env_address
+        ):
+            raise ValueError(
+                "standalone_address in hicache-storage-backend-extra-config is "
+                "not supported when a host KV pool is present. The host memory "
+                "pool allocator chooses Anonymous vs. AnonymousShm before "
+                "extra_config is parsed, so set UMBP_STANDALONE_ADDRESS in the "
+                "process environment instead."
+            )
+
+        # Both remote modes use the same worker identity.
+        def _resolve_node_address() -> str:
+            node_address = extra.get(
+                "node_address", _optional_env_str("UMBP_NODE_ADDRESS")
+            )
+            if node_address is None:
+                return _default_node_address()
+            return _select_rank_config_value(
+                node_address, unique_rank, "node_address", str
+            )
+
+        def _resolve_node_id(node_address: str) -> str:
+            node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
+            if node_id is None:
+                return (
+                    f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
+                    f":pp{self.pp_rank}:tp{self.local_rank}"
+                )
+            return _select_rank_config_value(node_id, unique_rank, "node_id", str)
+
+        def _resolve_node_tags() -> List[str]:
+            raw_tags = extra.get("node_tags", extra.get("tags"))
+            if raw_tags is None:
+                raw_tags = _optional_env_str("UMBP_NODE_TAGS")
+            if raw_tags is None:
+                return []
+            if isinstance(raw_tags, str):
+                return [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
+            return [str(tag) for tag in raw_tags]
 
         _warn_extra_config_scope(extra, distributed_enabled=bool(master_address))
         if master_address and UMBPDistributedConfig is not None:
@@ -467,33 +548,11 @@ class UMBPStore(HiCacheStorage):
             if "ssd_copy_worker_threads" not in extra:
                 cfg.copy_pipeline.worker_threads = 1
 
-            node_address = extra.get(
-                "node_address", _optional_env_str("UMBP_NODE_ADDRESS")
-            )
-            if node_address is None:
-                node_address = _default_node_address()
-            else:
-                node_address = _select_rank_config_value(
-                    node_address,
-                    unique_rank,
-                    "node_address",
-                    str,
-                )
+            node_address = _resolve_node_address()
             dist_cfg.master_config.node_address = node_address
-
-            node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
-            if node_id is None:
-                dist_cfg.master_config.node_id = (
-                    f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
-                    f":pp{self.pp_rank}:tp{self.local_rank}"
-                )
-            else:
-                dist_cfg.master_config.node_id = _select_rank_config_value(
-                    node_id,
-                    unique_rank,
-                    "node_id",
-                    str,
-                )
+            dist_cfg.master_config.node_id = _resolve_node_id(node_address)
+            if hasattr(dist_cfg.master_config, "tags"):
+                dist_cfg.master_config.tags = _resolve_node_tags()
 
             if "auto_heartbeat" in extra:
                 dist_cfg.master_config.auto_heartbeat = _strict_bool(
@@ -528,6 +587,10 @@ class UMBPStore(HiCacheStorage):
 
             if "staging_buffer_size" in extra:
                 dist_cfg.staging_buffer_size = int(extra["staging_buffer_size"])
+            if "ranged_scratch_size" in extra and hasattr(
+                dist_cfg, "ranged_scratch_size"
+            ):
+                dist_cfg.ranged_scratch_size = int(extra["ranged_scratch_size"])
 
             if "ssd_staging_buffer_size" in extra and hasattr(
                 dist_cfg, "ssd_staging_buffer_size"
@@ -573,6 +636,15 @@ class UMBPStore(HiCacheStorage):
             #      .default_dram_page_size (2 MiB by default). The
             #      partial-tail safety net in PoolClient handles any
             #      size mismatch.
+            #
+            # Logical-anchor host pools (the DeepSeek-V4 HiCache HostPoolGroup
+            # whose KV anchor is a LogicalHostPool that owns only page indices
+            # and no physical KV tensor) return None from get_page_buffer_meta()
+            # by design — the real per-page byte sizes live in the v2 side pools
+            # (SWA / compressed KV / indexer / state), which each carry their own
+            # dimensions. There is no single page size that fits all of them, so
+            # we leave dram_page_size at 0 and let the mori master use its
+            # default with the PoolClient partial-tail safety net.
             page_byte_size = None
             if "dram_page_size" in extra:
                 page_byte_size = int(extra["dram_page_size"])
@@ -584,14 +656,17 @@ class UMBPStore(HiCacheStorage):
                 # would over-count by the indexer buffer that is never put to UMBP).
                 dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
                 if self.is_mla_backend:
-                    _, esz = mem_pool_host.get_page_buffer_meta(dummy)
+                    meta = mem_pool_host.get_page_buffer_meta(dummy)
                 elif storage_config is not None and getattr(
                     storage_config, "should_split_heads", False
                 ):
                     sf = storage_config.tp_lcm_size // storage_config.tp_size
-                    _, esz = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
+                    meta = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
                 else:
-                    _, esz = mem_pool_host.get_page_buffer_meta(dummy)
+                    meta = mem_pool_host.get_page_buffer_meta(dummy)
+                # A hybrid logical anchor returns None here by design; leave
+                # dram_page_size at 0 and let the per-pool v2 sizes handle it.
+                esz = meta[1] if meta else None
                 page_byte_size = int(esz[0]) if esz else 0
 
             if (
@@ -632,6 +707,52 @@ class UMBPStore(HiCacheStorage):
                 dist_cfg.io_engine.port,
                 dist_cfg.peer_service_port,
             )
+        elif standalone_address:
+            if UMBPStandaloneProcessConfig is None:
+                raise RuntimeError(
+                    "Installed mori does not expose UMBPStandaloneProcessConfig"
+                )
+            standalone_cfg = UMBPStandaloneProcessConfig()
+            standalone_cfg.address = str(standalone_address)
+            auto_start = extra.get(
+                "standalone_auto_start",
+                _optional_env_str("UMBP_STANDALONE_AUTO_START"),
+            )
+            if auto_start is not None:
+                standalone_cfg.auto_start = _strict_bool(
+                    auto_start, "standalone_auto_start"
+                )
+            startup_timeout_ms = extra.get(
+                "standalone_startup_timeout_ms",
+                _optional_env_int("UMBP_STANDALONE_STARTUP_TIMEOUT_MS"),
+            )
+            if startup_timeout_ms is not None:
+                standalone_cfg.startup_timeout_ms = int(startup_timeout_ms)
+            if standalone_cfg.startup_timeout_ms <= 0:
+                raise ValueError("standalone_startup_timeout_ms must be > 0")
+            if all(
+                hasattr(standalone_cfg, field)
+                for field in ("worker_node_address", "worker_node_id", "tags")
+            ):
+                worker_node_address = _resolve_node_address()
+                standalone_cfg.worker_node_address = worker_node_address
+                standalone_cfg.worker_node_id = _resolve_node_id(worker_node_address)
+                standalone_cfg.tags = _resolve_node_tags()
+            else:
+                logger.warning(
+                    "UMBPStore standalone-process mode: installed mori does not "
+                    "expose worker identity on UMBPStandaloneProcessConfig; a "
+                    "distributed-backed standalone server cannot build per-worker "
+                    "external-KV identities."
+                )
+            cfg.standalone_process = standalone_cfg
+            logger.info(
+                "UMBPStore standalone-process mode: address=%s, auto_start=%s, "
+                "startup_timeout_ms=%s",
+                standalone_cfg.address,
+                standalone_cfg.auto_start,
+                standalone_cfg.startup_timeout_ms,
+            )
 
         self.storage_config = storage_config
 
@@ -642,8 +763,25 @@ class UMBPStore(HiCacheStorage):
         self.is_mla_follower = False
         tp_size = self.tp_size
         use_spdk = cfg.ssd.ssd_backend in ("spdk", "spdk_proxy")
-        distributed_enabled = cfg.distributed is not None
-        if not distributed_enabled and self.is_mla_backend and tp_size > 1:
+        remote_process_enabled = (
+            cfg.distributed is not None or cfg.standalone_process is not None
+        )
+        # Shared SSD exists to deduplicate MLA KV, which TP replicates: one
+        # rank owns the bytes and the others read them back. A caller that
+        # already keys per rank has nothing to deduplicate -- and would be
+        # broken by the scheme, because a follower would be sent looking for
+        # keys the leader never wrote under the follower's own suffix.
+        #
+        # It is also the reason embedded mode could not run: followers are the
+        # one role whose client reports no ranged multi-buffer I/O, which
+        # page-granular objects require. Standalone never hit this, not by
+        # design but because remote_process_enabled short-circuits it there.
+        if (
+            not remote_process_enabled
+            and not per_rank_keyspace
+            and self.is_mla_backend
+            and tp_size > 1
+        ):
             cfg.ssd.enabled = True
             if self.local_rank == 0:
                 # Leader: copy every DRAM write to shared SSD.
@@ -787,6 +925,11 @@ class UMBPStore(HiCacheStorage):
                 safe_cap = int(cfg.ssd.capacity_bytes * 0.95)
                 cfg.ssd.spdk_proxy_tenant_quota_bytes = max(1, safe_cap // dp_size_hint)
 
+        # Initialize before the optional constructor-time pool registration.
+        self.registered_pools: dict = {}
+        self._kv_anchor_is_logical = False
+        self._registered_regions: set = set()
+
         self.client = UMBPClient(cfg)
         if mem_pool_host is not None:
             self.register_mem_pool_host(mem_pool_host)
@@ -867,70 +1010,166 @@ class UMBPStore(HiCacheStorage):
             "page_head",
         ], "UMBP store only supports page_first, page_first_direct, or page_head layout"
 
-        # In distributed mode, pre-register the entire host KV buffer with the
-        # underlying RDMA IOEngine so PoolClient can take the zero-copy path
-        # for batch_get_into_ptr / batch_put_from_ptr (skips the staging
-        # buffer memcpy + lock and removes the per-call `staging_buffer_size`
-        # cap).  Standalone returns true as no-op by IUMBPClient contract;
-        # we still gate on is_distributed() below to avoid a pointless call.
+        # A logical anchor owns indices; side pools carry the data.
+        self._kv_anchor_is_logical = self.mem_pool_host.kv_buffer is None
         self._zero_copy_registered = False
-        if self.client is None:
+
+        # Side-pool registration needs the mode even for a logical anchor.
+        self._is_standalone_process = False
+        if self.client is not None:
+            deployment_mode = None
+            mode_enum = self._umbp_deployment_mode_enum
+            try:
+                deployment_mode = self.client.get_deployment_mode()
+                if mode_enum is not None:
+                    self._is_standalone_process = (
+                        deployment_mode == mode_enum.StandaloneProcess
+                    )
+            except Exception as exc:
+                if self._standalone_process_expected:
+                    raise RuntimeError(
+                        "UMBPStore expected standalone-process mode from "
+                        "UMBP_STANDALONE_ADDRESS, but get_deployment_mode() failed."
+                    ) from exc
+            if self._standalone_process_expected:
+                if mode_enum is None:
+                    raise RuntimeError(
+                        "UMBPStore expected standalone-process mode, but "
+                        "UMBPDeploymentMode is not exposed by mori.umbp."
+                    )
+                if deployment_mode != mode_enum.StandaloneProcess:
+                    raise RuntimeError(
+                        "UMBPStore expected standalone-process mode, but the "
+                        f"UMBP client reported deployment_mode={deployment_mode!r}."
+                    )
+
+        if self._kv_anchor_is_logical:
             return
+
+        self._zero_copy_registered = self._register_host_buffer_for_zero_copy(
+            mem_pool_host
+        )
+
+    @staticmethod
+    def _pool_physical_buffers(host_pool: HostKVCache) -> List[Any]:
+        """Return every non-empty physical tensor exposed by a host pool."""
+        getter = getattr(host_pool, "get_hybrid_pool_buffer", None)
+        buffers = getter() if getter is not None else None
+        if not buffers:
+            buffers = [getattr(host_pool, "kv_buffer", None)]
+        flat: List[Any] = []
+        for buffer in buffers:
+            if buffer is None:
+                continue
+            for tensor in buffer if isinstance(buffer, (list, tuple)) else [buffer]:
+                # Empty views may share storage; register_memory rejects zero bytes.
+                if tensor is not None and tensor.numel() > 0:
+                    flat.append(tensor)
+        return flat
+
+    @staticmethod
+    def _buffer_extent(buffer, allocator) -> tuple:
+        """Registerable (base pointer, size) of the allocation behind a tensor."""
+        storage = buffer.untyped_storage()
+        base = int(storage.data_ptr())
+        size = int(storage.nbytes())
+        # Hugepage-backed mmaps are rounded up to the hugepage boundary, and
+        # ibv_reg_mr on AINIC / ROCm needs whole hugepages covered.
+        mapped_size_fn = getattr(allocator, "mapped_size_for", None)
+        mapped_size = (
+            mapped_size_fn(base)
+            if mapped_size_fn is not None
+            else getattr(allocator, "mapped_size", 0)
+        )
+        return base, max(size, int(mapped_size or 0))
+
+    def _register_host_buffer_for_zero_copy(self, host_pool: HostKVCache) -> bool:
+        """Register host buffers; standalone failures are fatal without fallback."""
+        if self.client is None:
+            return False
+        is_standalone_process = getattr(self, "_is_standalone_process", False)
         try:
             is_distributed = bool(self.client.is_distributed())
         except Exception:
             is_distributed = False
-        if not is_distributed:
-            return
+        if not (is_distributed or is_standalone_process):
+            return False
         if not hasattr(self.client, "register_memory"):
-            return
+            return False
         if getattr(self, "_disable_zero_copy_register", False):
+            if is_standalone_process:
+                raise RuntimeError(
+                    "disable_zero_copy_register is not supported in UMBP "
+                    "standalone-process mode: there is no staging-buffer "
+                    "fallback path."
+                )
             logger.info(
                 "UMBPStore: skipping host KV buffer RDMA registration because "
                 "disable_zero_copy_register=true (UMBP_DISABLE_ZERO_COPY_REGISTER). "
                 "Falling back to the staging-buffer transfer path; per-transfer "
                 "size is capped by distributed.staging_buffer_size."
             )
-            return
-        try:
-            kv_buffer = mem_pool_host.kv_buffer
-            host_ptr = int(kv_buffer.data_ptr())
-            host_size = int(kv_buffer.numel() * kv_buffer.element_size())
-            # When the buffer is backed by hugepages the mmap region is
-            # rounded up to the hugepage boundary.  RDMA ibv_reg_mr on
-            # some NICs (AINIC / ROCm) requires the registered region to
-            # cover complete hugepages, so use the full mapped_size
-            # instead of the logical tensor size.
-            allocator = getattr(mem_pool_host, "allocator", None)
-            mapped_size_fn = getattr(allocator, "mapped_size_for", None)
-            if mapped_size_fn is not None:
-                mapped_size = mapped_size_fn(host_ptr)
-            else:
-                mapped_size = getattr(allocator, "mapped_size", 0)
-            if mapped_size > host_size:
-                host_size = mapped_size
-            ok = bool(self.client.register_memory(host_ptr, host_size))
-        except Exception as exc:
-            logger.warning(
-                "UMBPStore: register_memory failed (%s); falling back to staging "
-                "buffer path. Per-transfer size will be capped by "
-                "distributed.staging_buffer_size.",
-                exc,
-            )
-            return
-        if ok:
-            self._zero_copy_registered = True
+            return False
+        buffers = self._pool_physical_buffers(host_pool)
+        if not buffers:
+            if is_standalone_process:
+                raise RuntimeError(
+                    f"UMBPStore: {type(host_pool).__name__} exposes no host buffer "
+                    "to register; standalone-process mode has no fallback path."
+                )
+            return False
+
+        mode = "standalone-process" if is_standalone_process else "distributed"
+        allocator = getattr(host_pool, "allocator", None)
+        # Already registered storage counts as covered.
+        covered = 0
+        for buffer in buffers:
+            try:
+                host_ptr, host_size = self._buffer_extent(buffer, allocator)
+                if host_ptr in self._registered_regions:
+                    covered += 1
+                    continue
+                ok = bool(self.client.register_memory(host_ptr, host_size))
+            except Exception as exc:
+                if is_standalone_process:
+                    raise RuntimeError(
+                        "UMBPStore: register_memory failed in standalone-process "
+                        f"mode and cannot fall back: {exc}"
+                    ) from exc
+                logger.warning(
+                    "UMBPStore: register_memory failed (%s); falling back to staging "
+                    "buffer path. Per-transfer size will be capped by "
+                    "distributed.staging_buffer_size.",
+                    exc,
+                )
+                return False
+            if not ok:
+                if is_standalone_process:
+                    raise RuntimeError(
+                        "UMBPStore: register_memory returned false in "
+                        "standalone-process mode; no fallback path exists."
+                    )
+                logger.warning(
+                    "UMBPStore: register_memory returned false; staying on staging "
+                    "buffer fallback path."
+                )
+                return False
+            self._registered_regions.add(host_ptr)
+            covered += 1
             logger.info(
-                "UMBPStore: registered host KV buffer for RDMA zero-copy "
-                "(ptr=0x%x, size=%d MB)",
+                "UMBPStore: registered host buffer for zero-copy "
+                "(ptr=0x%x, size=%d MB, mode=%s)",
                 host_ptr,
                 host_size // (1024 * 1024),
+                mode,
             )
-        else:
-            logger.warning(
-                "UMBPStore: register_memory returned false; staying on staging "
-                "buffer fallback path."
-            )
+        return covered == len(buffers)
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if host_pool_name == PoolName.KV:
+            return
+        self.registered_pools[host_pool_name] = host_pool
+        self._register_host_buffer_for_zero_copy(host_pool)
 
     # ------------------------------------------------------------------
     # Key suffix generation — mirrors MooncakeStore
@@ -1007,6 +1246,9 @@ class UMBPStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self._kv_anchor_is_logical:
+            return [True] * len(keys)
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         # Normalize sizes to list of per-key sizes
@@ -1076,6 +1318,9 @@ class UMBPStore(HiCacheStorage):
             page_count = len(host_indices) // self.mem_pool_host.page_size
             return [True] * page_count
 
+        if self._kv_anchor_is_logical:
+            return [True] * len(keys)
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         if isinstance(buffer_sizes, int):
@@ -1137,6 +1382,188 @@ class UMBPStore(HiCacheStorage):
 
         hit_count = self.client.batch_exists_consecutive(query_keys)
         return hit_count // key_multiplier
+
+    # ------------------------------------------------------------------
+    # Multi-pool v2 interface
+    # ------------------------------------------------------------------
+    def _get_hybrid_page_component_keys(
+        self, page_keys, transfer: PoolTransfer, *, rank_suffix: Optional[str] = None
+    ):
+        """Expand logical page keys for one registered hybrid side pool."""
+        pool_name = transfer.name
+        host_pool = self.registered_pools.get(pool_name)
+        if host_pool is None:
+            raise ValueError(f"Unregistered UMBP hybrid pool: {pool_name}")
+
+        mla_suffix = self.mla_suffix if rank_suffix is None else rank_suffix
+        mha_suffix = (
+            getattr(self, "mha_suffix", mla_suffix)
+            if rank_suffix is None
+            else rank_suffix
+        )
+
+        components = getattr(host_pool, "components", None)
+        if pool_name == PoolName.MAMBA:
+            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
+            suffixes = [f"_{mha_suffix}_conv_{i}" for i in range(conv_num)]
+            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
+                suffixes = [f"_{mha_suffix}_temporal"] + suffixes
+        elif components is not None and len(components) == 1:
+            suffixes = [f"_{mla_suffix}_{pool_name}"]
+        elif components is not None and len(components) == 2:
+            # Packed DevicePoolEntry K/V components share one stored object.
+            suffixes = (
+                [f"_{mha_suffix}_{pool_name}"]
+                if host_pool.packed
+                else [
+                    f"_{mha_suffix}_{pool_name}_k",
+                    f"_{mha_suffix}_{pool_name}_v",
+                ]
+            )
+        elif components is not None:
+            raise ValueError(
+                f"Unsupported UMBP component count for pool {pool_name}: "
+                f"{len(components)}"
+            )
+        elif self.is_mla_backend:
+            suffixes = [f"_{mla_suffix}_{pool_name}"]
+        elif getattr(host_pool, "v_buffer", None) is not None:
+            suffixes = [
+                f"_{mha_suffix}_{pool_name}_k",
+                f"_{mha_suffix}_{pool_name}_v",
+            ]
+        else:
+            suffixes = [f"_{mha_suffix}_{pool_name}"]
+
+        component_keys = [
+            f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
+        ]
+        if self.config_prefix:
+            component_keys = [
+                f"{self.config_prefix}_{component_key}"
+                for component_key in component_keys
+            ]
+        return component_keys, len(suffixes)
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        kv_pages = (
+            len(keys)
+            if self._kv_anchor_is_logical
+            else self.batch_exists(keys, extra_info)
+        )
+        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            component_keys, multiplier = self._get_hybrid_page_component_keys(
+                keys[:final_pages], transfer
+            )
+            exists = list(self.client.batch_exists(component_keys))
+            if len(exists) != len(component_keys):
+                logger.error(
+                    "UMBP v2 batch_exists result-size mismatch for pool %s: "
+                    "expected=%d actual=%d; treating the storage prefix as a miss",
+                    transfer.name,
+                    len(component_keys),
+                    len(exists),
+                )
+                final_pages = 0
+                break
+            page_exists = [
+                all(exists[i * multiplier : (i + 1) * multiplier])
+                for i in range(final_pages)
+            ]
+            boundary = 0
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                boundary = (
+                    page_exists.index(False) if False in page_exists else final_pages
+                )
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(final_pages, 0, -1):
+                    if all(
+                        page_exists[i]
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+            if boundary:
+                hit_count[transfer.name] = boundary
+            final_pages = min(final_pages, boundary)
+
+        return PoolTransferResult(final_pages, hit_count)
+
+    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool) -> dict:
+        """Unified per-pool zero-copy I/O. Returns {pool_name: per-page bools}."""
+        results: dict = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools.get(transfer.name)
+            if host_pool is None:
+                raise ValueError(f"Unregistered UMBP hybrid pool: {transfer.name}")
+            keys = transfer.keys or []
+            host_indices = transfer.host_indices
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            if not keys or host_indices is None:
+                results[transfer.name] = [False] * len(keys)
+                continue
+            if len(keys) != len(host_indices) // page_size:
+                raise ValueError(
+                    f"UMBP v2 pool {transfer.name} has {len(keys)} keys for "
+                    f"{len(host_indices)} indices with page_size={page_size}."
+                )
+
+            key_strs, multiplier = self._get_hybrid_page_component_keys(keys, transfer)
+            ptrs, sizes = host_pool.get_page_buffer_meta(host_indices)
+            if not len(key_strs) == len(ptrs) == len(sizes):
+                raise ValueError(
+                    f"UMBP v2 buffer-meta mismatch for pool {transfer.name}: "
+                    f"keys={len(key_strs)} ptrs={len(ptrs)} sizes={len(sizes)}"
+                )
+
+            operation = (
+                self.client.batch_put_from_ptr
+                if is_set
+                else self.client.batch_get_into_ptr
+            )
+            io_results = [bool(value) for value in operation(key_strs, ptrs, sizes)]
+            if len(io_results) != len(key_strs):
+                logger.error(
+                    "UMBP v2 %s result-size mismatch for pool %s: "
+                    "expected=%d actual=%d; treating every page as failed",
+                    "set" if is_set else "get",
+                    transfer.name,
+                    len(key_strs),
+                    len(io_results),
+                )
+                results[transfer.name] = [False] * len(keys)
+                continue
+
+            results[transfer.name] = [
+                all(io_results[i * multiplier : (i + 1) * multiplier])
+                for i in range(len(keys))
+            ]
+        return results
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=False)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=True)
 
     # ------------------------------------------------------------------
     # Legacy ABC interface (required by HiCacheStorage)

@@ -59,5 +59,4 @@ class TestEagle3Basic(EagleServerBase):
 
 
 if __name__ == "__main__":
-
     unittest.main()

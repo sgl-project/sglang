@@ -25,10 +25,10 @@ uv venv --python 3.12 && source .venv/bin/activate
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 git fetch origin pull/27944/head && git checkout FETCH_HEAD
-uv pip install -e python
+uv pip install --prerelease=allow -e python
 ```
 
-Then run the **Python** output of the command panel below in that environment. The **Docker** tab is simpler — its image bundles the CUDA-13 runtime and the #27944 code. Once [PR #27944](https://github.com/sgl-project/sglang/pull/27944) is merged and released, `uv pip install sglang` will pull M3 support directly.
+Then run the **Python** output of the command panel below in that environment. The **Docker** tab is simpler — its image bundles the CUDA-13 runtime and the #27944 code. Once [PR #27944](https://github.com/sgl-project/sglang/pull/27944) is merged and released, `uv pip install --prerelease=allow sglang` will pull M3 support directly.
 
 </Tab>
 

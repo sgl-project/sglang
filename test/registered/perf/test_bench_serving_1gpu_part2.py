@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=968, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=909, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=900, suite="stage-b-test-1-gpu-large-amd")
 
 
@@ -94,9 +94,15 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             )
 
         self.assertEqual(res["successful_requests"], res["total_requests"])
-        self.assertLess(res["avg_latency_ms"], 48)
-        self.assertLess(res["p95_latency_ms"], 50)
-        self.assertGreater(res["throughput"], 20)
+        # relax for mi300x
+        if is_in_amd_ci():
+            self.assertLess(res["avg_latency_ms"], 60)
+            self.assertLess(res["p95_latency_ms"], 65)
+            self.assertGreater(res["throughput"], 16)
+        else:
+            self.assertLess(res["avg_latency_ms"], 48)
+            self.assertLess(res["p95_latency_ms"], 50)
+            self.assertGreater(res["throughput"], 20)
 
     def test_score_api_batch_scaling(self):
         """Test score API performance with different batch sizes"""

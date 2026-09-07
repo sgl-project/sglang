@@ -42,9 +42,10 @@ class AuxHiddenStatePacker:
 
     def finalize(self) -> torch.Tensor:
         """Return the packed buffer; callers guard the empty case on ``len()``."""
-        assert (
-            self._buffer is not None and self._idx == self._num_captures
-        ), f"captured {self._idx} of {self._num_captures} aux hidden states"
+        if self._buffer is None or self._idx != self._num_captures:
+            raise RuntimeError(
+                f"captured {self._idx} of {self._num_captures} aux hidden states"
+            )
         return self._buffer
 
 
@@ -55,4 +56,6 @@ AuxHiddenStateAccumulator = Union[List[torch.Tensor], AuxHiddenStatePacker]
 def pack_aux_hidden_states(aux_hidden_states: AuxHiddenStates) -> torch.Tensor:
     if isinstance(aux_hidden_states, torch.Tensor):
         return aux_hidden_states
+    if len(aux_hidden_states) == 1:
+        return aux_hidden_states[0]
     return torch.cat(aux_hidden_states, dim=-1)

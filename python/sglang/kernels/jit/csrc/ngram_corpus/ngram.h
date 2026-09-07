@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sglang {
+
 namespace ngram {
 
 class Ngram {
@@ -88,3 +90,5 @@ class Ngram {
 };
 
 }  // namespace ngram
+
+}  // namespace sglang

@@ -1,6 +1,8 @@
+"""Legacy prefill CP helpers retained for HIP, NPU, and MUSA callers."""
+
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Callable, List
+from typing import List
 
 import torch
 import torch.nn.functional as F
@@ -9,13 +11,18 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
+    _tbo_event,
     attn_cp_all_gather_into_tensor,
+    attn_cp_overlap_all_gather_into_tensor,
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_parallel,
+    uses_mla_backend,
+)
 
 
 @dataclass
@@ -61,16 +68,8 @@ def is_prefill_context_parallel_enabled():
     return get_parallel().enable_prefill_context_parallel
 
 
-def is_prefill_cp_in_seq_split():
-    return (
-        is_prefill_context_parallel_enabled()
-        and get_parallel().prefill_cp_mode == "in-seq-split"
-    )
-
-
 def is_mla_prefill_cp_enabled() -> bool:
-    sa = get_server_args()
-    return get_parallel().enable_prefill_context_parallel and sa.use_mla_backend()
+    return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
 
 
 def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
@@ -133,9 +132,9 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
     if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_parallel().attn_cp_size
-        assert (
-            input_.shape[0] % cp_size == 0
-        ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
+        assert input_.shape[0] % cp_size == 0, (
+            f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
+        )
         return dsa_cp_round_robin_split_data(input_)
 
     input_list = list(
@@ -284,6 +283,54 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
     return outputs
 
 
+def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
+    """Start a round-robin CP all-gather on `comm_stream`; do NOT wait for it.
+
+    Pair with cp_all_gather_rerange_finish(). Splitting launch from wait is the
+    only way an attention-side CP gather can overlap anything: the collectives
+    inside op_attn are consumed a few statements later, so issuing and waiting
+    at the same point just moves the queue (measured in perf_sweep_report §4.6).
+
+    The handle keeps both buffers alive until finish(); without that reference
+    the allocator can hand the input block back to the compute stream before the
+    comm-stream kernel has read it.
+    """
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_cp_group,
+        get_attn_cp_overlap_group,
+    )
+
+    group = get_attn_cp_overlap_group()
+    assert group is not get_attn_cp_group(), (
+        "the comm-stream path needs the duplicate attn_cp_overlap communicator; "
+        "driving one communicator from two streams deadlocks RCCL"
+    )
+
+    input_tensor = input_tensor.contiguous()
+    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+        output_tensor = input_tensor.new_empty(
+            (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
+        )
+    comm_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(comm_stream):
+        attn_cp_overlap_all_gather_into_tensor(output_tensor, input_tensor)
+        event = _tbo_event(event_key)
+        event.record(comm_stream)
+    return (output_tensor, input_tensor, event, cp_size)
+
+
+def cp_all_gather_rerange_finish(handle):
+    """Wait for a launched gather on the current stream, then rerange."""
+    output_tensor, _keepalive, event, cp_size = handle
+    torch.cuda.current_stream().wait_event(event)
+    out_shape = output_tensor.shape
+    return (
+        output_tensor.view(cp_size, -1, *out_shape[1:])
+        .transpose(0, 1)
+        .reshape(out_shape)
+    )
+
+
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
     # for in-seq-split
@@ -423,48 +470,6 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=
         layer.k_scale,
         layer.v_scale,
     )
-
-
-def cp_attn_forward_extend(
-    forward_batch,
-    q: torch.Tensor,
-    device: torch.device,
-    attn_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor],
-) -> torch.Tensor:
-    """
-    Split q into prev/next zigzag halves based on CP metadata, call the
-    backend-specific attention function twice with appropriate per-half
-    metadata, and concatenate the results.
-
-    For bs > 1, q is laid out as [all_prev_tokens_across_seqs,
-    all_next_tokens_across_seqs]; the split point is total_q_prev_tokens.
-    cu_seqlens_q_prev/next tensors have shape [bs+1] and carry the
-    per-sequence boundaries through FlashAttention's variable-length API.
-
-    attn_fn signature:
-        attn_fn(q, cu_seqlens_q, cache_seqlens, max_seqlen_q) -> result
-    where only these four CP-varying parameters differ between halves.
-    All other backend-specific args should be captured in the closure.
-    """
-    cp_meta = forward_batch.attn_cp_metadata
-
-    q_prev = q[: cp_meta.total_q_prev_tokens]
-    q_next = q[cp_meta.total_q_prev_tokens :]
-
-    result_prev = attn_fn(
-        q_prev,
-        cp_meta.cu_seqlens_q_prev_tensor,
-        cp_meta.kv_len_prev_tensor,
-        cp_meta.max_seqlen_q_prev,
-    )
-    result_next = attn_fn(
-        q_next,
-        cp_meta.cu_seqlens_q_next_tensor,
-        cp_meta.kv_len_next_tensor,
-        cp_meta.max_seqlen_q_next,
-    )
-
-    return torch.concat([result_prev, result_next], dim=0)
 
 
 def prepare_context_parallel_metadata(

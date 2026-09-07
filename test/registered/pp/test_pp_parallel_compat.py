@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=363, stage="extra-b", runner_config="4-gpu-h100")
 
 QWEN3_MOE_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
@@ -90,7 +90,6 @@ class TestQwen3MoePPxCP(_Qwen3MoePPCompatMixin, CustomTestCase):
         "--cp-strategy",
         "zigzag",
     ]
-    server_env = {"SGLANG_ENABLE_CP_V2": "1"}
 
 
 class TestQwen3MoePPxDP(_Qwen3MoePPCompatMixin, CustomTestCase):

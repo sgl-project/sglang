@@ -4,8 +4,8 @@ from typing import Optional, Union
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_capability, is_musa
 

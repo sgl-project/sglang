@@ -62,9 +62,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
@@ -112,6 +113,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
         )
 
     index = tl.load(initial_state_indices + i_n).to(tl.int32)
+    # Padded rows carry the -1 sentinel; without this guard the sentinel
+    # reaches pointer arithmetic and addresses before the state pool.
+    valid_state = index >= 0
     h0 = initial_state + index * stride_h
     ht = initial_state + index * stride_h
     if USE_INITIAL_STATE:
@@ -128,18 +132,20 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
         for k_blk in range(0, K, 64):
             # Load h: from initial_state (i_t==0) or scratch (i_t>0)
             if i_t == 0:
-                if USE_INITIAL_STATE:
+                if USE_INITIAL_STATE and valid_state:
                     p_hs = tl.make_block_ptr(
                         h0, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                     )
                     b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
                 else:
                     b_h = tl.zeros([BV, 64], dtype=tl.float32)
-            else:
+            elif valid_state:
                 p_hs = tl.make_block_ptr(
                     ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                 )
                 b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+            else:
+                b_h = tl.zeros([BV, 64], dtype=tl.float32)
 
             # Store pre-update h to output
             p_ho = tl.make_block_ptr(
@@ -181,18 +187,20 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
         for k_blk in range(0, K, 64):
             # Reload h (same source as Phase 1)
             if i_t == 0:
-                if USE_INITIAL_STATE:
+                if USE_INITIAL_STATE and valid_state:
                     p_hs = tl.make_block_ptr(
                         h0, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                     )
                     b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
                 else:
                     b_h = tl.zeros([BV, 64], dtype=tl.float32)
-            else:
+            elif valid_state:
                 p_hs = tl.make_block_ptr(
                     ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                 )
                 b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+            else:
+                b_h = tl.zeros([BV, 64], dtype=tl.float32)
 
             # Gate decay on h
             if USE_G:
@@ -215,7 +223,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             b_h += tl.trans(tl.dot(b_k, b_v))
 
             # Save updated h to scratch (initial_state) for next time step
-            if INPLACE_UPDATE:
+            if INPLACE_UPDATE and valid_state:
                 p_hs = tl.make_block_ptr(
                     ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                 )
@@ -235,9 +243,9 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert not (
-        use_exp2 and g is not None
-    ), "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
+    assert not (use_exp2 and g is not None), (
+        "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
+    )
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE

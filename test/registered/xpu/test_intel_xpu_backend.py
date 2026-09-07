@@ -57,7 +57,6 @@ def intel_xpu_benchmark(
 
 
 class TestIntelXPUBackend(CustomTestCase):
-
     @intel_xpu_benchmark(min_throughput=10, mem_fraction_static="0.3")
     def test_latency_qwen_model(self):
         return DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
@@ -75,6 +74,8 @@ class TestIntelXPUBackend(CustomTestCase):
             '{"num_hidden_layers": 4}',
             "--decode-attention-backend",
             "intel_xpu",
+            "--moe-runner-backend",
+            "triton",  # FP8 is not yet supported in sgl-kernel
         ],
         min_throughput=32,
     )

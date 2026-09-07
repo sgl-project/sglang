@@ -3,15 +3,10 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
 
 
 @dataclass
 class JoyImageArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [is_blocks_or_double_blocks]
-    )
-
     param_names_mapping: dict = field(
         default_factory=lambda: {
             # Condition embedder mappings

@@ -22,7 +22,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-namespace {
+namespace sglang {
 
 struct RMSNormHFParams {
   const void* input;
@@ -250,4 +250,4 @@ struct HFRMSNormKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

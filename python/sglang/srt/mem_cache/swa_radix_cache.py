@@ -42,7 +42,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.common import free_kv_row_segments
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 
@@ -55,7 +56,6 @@ logger = logging.getLogger(__name__)
 
 
 class TreeNode:
-
     counter = 0
     swa_uuid_counter = 1
     last_access_time_counter_float = float64(1.0)
@@ -80,6 +80,8 @@ class TreeNode:
         self.host_value = None
         # store hash values of each page
         self.hash_value: Optional[List[str]] = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -174,9 +176,9 @@ class LRUList:
         Move a (existing) node to most recently used position
         """
         assert node.id in self.cache, f"Resetting node {node.id=} not in lru list"
-        assert (
-            not self.is_swa_list or not node.swa_tombstone
-        ), f"Resetting swa tombstone node in swa lru list: {node.id=}"
+        assert not self.is_swa_list or not node.swa_tombstone, (
+            f"Resetting swa tombstone node in swa lru list: {node.id=}"
+        )
         self._remove_node(node)
         self._add_node(node)
 
@@ -189,9 +191,9 @@ class LRUList:
         while node != root_node:
             # for swa lru list, only reset non-tombstone nodes
             if not self.is_swa_list or not node.swa_tombstone:
-                assert (
-                    node.id in self.cache
-                ), f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
+                assert node.id in self.cache, (
+                    f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
+                )
                 self._remove_node(node)
                 self._add_node_after(prev_node, node)
                 prev_node = node
@@ -201,12 +203,12 @@ class LRUList:
         """
         Insert a (new) node as most recently used
         """
-        assert (
-            not self.is_swa_list or not node.swa_tombstone
-        ), f"Inserting swa tombstone node in swa lru list: {node.id=}"
-        assert (
-            node.id not in self.cache
-        ), f"Inserting node {node.id=} already in lru list, existing node: {self.cache[node.id].id=}"
+        assert not self.is_swa_list or not node.swa_tombstone, (
+            f"Inserting swa tombstone node in swa lru list: {node.id=}"
+        )
+        assert node.id not in self.cache, (
+            f"Inserting node {node.id=} already in lru list, existing node: {self.cache[node.id].id=}"
+        )
         self.cache[node.id] = node
         self._add_node(node)
 
@@ -215,9 +217,9 @@ class LRUList:
         Remove node from lru list
         """
         assert node.id in self.cache, f"Removing node {node.id=} not in lru list"
-        assert (
-            not self.is_swa_list or not node.swa_tombstone
-        ), f"Removing swa tombstone node from swa lru list: {node.id=}"
+        assert not self.is_swa_list or not node.swa_tombstone, (
+            f"Removing swa tombstone node from swa lru list: {node.id=}"
+        )
         del self.cache[node.id]
         self._remove_node(node)
 
@@ -240,9 +242,9 @@ class LRUList:
         Get the previous (i.e. more recently used) node that is not locked
         """
         if check_id:
-            assert (
-                node.id in self.cache
-            ), f"Getting prev of node {node.id=} not in lru list"
+            assert node.id in self.cache, (
+                f"Getting prev of node {node.id=} not in lru list"
+            )
         x = getattr(node, self.prv)  # x = node.prev
         while getattr(x, self.lock_ref) > 0:
             x = getattr(x, self.prv)  # x = x.prev
@@ -256,9 +258,9 @@ class LRUList:
         Get the previous (i.e. more recently used) leaf node that is not locked
         """
         if check_id:
-            assert (
-                node.id in self.cache
-            ), f"Getting prev of node {node.id=} not in lru list"
+            assert node.id in self.cache, (
+                f"Getting prev of node {node.id=} not in lru list"
+            )
         x = getattr(node, self.prv)  # x = node.prev
         while getattr(x, self.lock_ref) > 0 or len(x.children) > 0:
             x = getattr(x, self.prv)  # x = x.prev
@@ -303,9 +305,9 @@ class LRUList:
             # heapify based on last_access_time
             heapq.heapify(nodes)
             # the root node is not in the lru list
-            assert (
-                len(nodes) == len(self.cache) + 1
-            ), f"len(nodes): {len(nodes)} != len(self.cache) + 1: {len(self.cache) + 1}"
+            assert len(nodes) == len(self.cache) + 1, (
+                f"len(nodes): {len(nodes)} != len(self.cache) + 1: {len(self.cache) + 1}"
+            )
 
             x_lru = self._get_lru()
             while len(nodes):
@@ -313,15 +315,15 @@ class LRUList:
                 if x == tree_cache.root_node:
                     # root node is not in the lru list
                     continue
-                assert (
-                    x == x_lru
-                ), f"Incorrect LRU list, {self.is_swa_list=}, x: {x.id=} != x_lru: {x_lru.id=}"
-                assert (
-                    x_lru.full_lock_ref == 0
-                ), f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
-                assert (
-                    x_lru.swa_lock_ref == 0
-                ), f"x_lru should not be locked when idle, {x_lru.swa_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
+                assert x == x_lru, (
+                    f"Incorrect LRU list, {self.is_swa_list=}, x: {x.id=} != x_lru: {x_lru.id=}"
+                )
+                assert x_lru.full_lock_ref == 0, (
+                    f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
+                )
+                assert x_lru.swa_lock_ref == 0, (
+                    f"x_lru should not be locked when idle, {x_lru.swa_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
+                )
                 x_lru = getattr(x, self.prv)
 
             if self.is_swa_list:
@@ -331,16 +333,16 @@ class LRUList:
                 evictable_size = tree_cache.full_evictable_size()
                 lru_list_evictable_size = self.sanity_check_evictable_size()
 
-            assert (
-                evictable_size == lru_list_evictable_size
-            ), f"{self.is_swa_list=}, total nodes: {total_nodes}, total lru plus 1: {total_lru_plus_1}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
+            assert evictable_size == lru_list_evictable_size, (
+                f"{self.is_swa_list=}, total nodes: {total_nodes}, total lru plus 1: {total_lru_plus_1}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
+            )
         except Exception as e:
             msg = f"SWA Radix tree sanity check failed, ping @hanming-lu: {e}"
             logger.error(msg)
             raise Exception(msg)
 
 
-class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
+class SWARadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = params.req_to_token_pool
@@ -348,8 +350,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.is_eagle = params.is_eagle
-        self.enable_kv_cache_events = params.enable_kv_cache_events
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -365,9 +368,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     ##### Public API #####
 
     def supports_swa(self) -> bool:
-        assert (
-            self.sliding_window_size is not None
-        ), "sliding_window_size must be set for SWARadixCache"
+        assert self.sliding_window_size is not None, (
+            "sliding_window_size must be set for SWARadixCache"
+        )
         return True
 
     def swa_reprefill_tail_tokens(self) -> int:
@@ -405,7 +408,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(is_swa_list=False)
         self.swa_lru_list = LRUList(is_swa_list=True)
-        self._record_all_cleared_event()
+        self.kv_events.record_all_cleared()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -461,23 +464,23 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> None:
         """Cache request when it finishes."""
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.free_kv_row(req.kv, [(0, kv_len_to_handle)])
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
-        old_prefix_len = req.cache_protected_len
+        old_prefix_len = req.kv.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
@@ -491,12 +494,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
         else:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[old_prefix_len:page_aligned_len]
-            )
+            self.free_kv_row(req.kv, [(old_prefix_len, page_aligned_len)])
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        self.free_kv_row(req.kv, [(page_aligned_len, kv_len_to_handle)])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(
@@ -510,31 +511,37 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.extend_range.end
+                req.kv.req_pool_idx, : req.extend_range.end
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-            req.prefix_indices = kv_indices
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
-        old_prefix_len = req.cache_protected_len
+        old_prefix_len = req.kv.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
+        # The prefix below swa_evicted_seqlen has no SWA peers left; the insert
+        # tombstones it instead of claiming live SWA KV.
         result = self.insert(
             InsertParams(
                 key=radix_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
             )
         )
         new_prefix_len = result.prefix_len
@@ -549,11 +556,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
+            (req.kv.req_pool_idx, slice(old_prefix_len, len(new_indices))),
             new_indices[old_prefix_len:],
         )
 
-        req.cache_protected_len = len(new_indices)
+        req.kv.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(
             req.last_node,
@@ -582,6 +589,21 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
 
+    def _free_node_value(
+        self, node: TreeNode, value: Optional[torch.Tensor] = None
+    ) -> Tuple[int, int]:
+        if value is None:
+            value = node.value
+        num_tokens = len(value)
+        if node.swa_tombstone:
+            # SWA peers went back in `dec_swa_lock_only` or an SWA evict, so
+            # only the full side is still ours; `free` would hand the SWA pool
+            # mapping entries that read as the padding slot.
+            self.token_to_kv_pool_allocator.free_full(value)
+            return num_tokens, 0
+        self.token_to_kv_pool_allocator.free(value)
+        return num_tokens, num_tokens
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -595,18 +617,16 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             x = self.full_lru_list.get_leaf_lru_no_lock()
 
             while full_num_evicted < full_num_tokens and self.full_lru_list.in_list(x):
-                assert (
-                    x != self.root_node
-                ), f"root node should not exist in full lru list, {x.id=}"
+                assert x != self.root_node, (
+                    f"root node should not exist in full lru list, {x.id=}"
+                )
                 assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
 
                 # 1. free node kv indices, evict full and swa tokens
-                self._record_remove_event(x)
-                self.token_to_kv_pool_allocator.free(x.value)
-                full_num_evicted += len(x.value)
-                # Tombstoned leaves had their SWA freed earlier in `dec_swa_lock_only`
-                if not x.swa_tombstone:
-                    swa_num_evicted += len(x.value)
+                self.kv_events.record_remove(x)
+                node_full_evicted, node_swa_evicted = self._free_node_value(x)
+                full_num_evicted += node_full_evicted
+                swa_num_evicted += node_swa_evicted
 
                 # 2. get the next leaf, update the lru lists
                 x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
@@ -662,14 +682,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.swa_evictable_size_ -= len(x.value)
                     x.swa_tombstone = True
                 else:
-                    assert (
-                        x.full_lock_ref == 0
-                    ), f"leaf node with full lock must also have swa lock, {x.id=}"
+                    assert x.full_lock_ref == 0, (
+                        f"leaf node with full lock must also have swa lock, {x.id=}"
+                    )
                     # 1. a leaf node, free full and swa tokens
-                    self._record_remove_event(x)
-                    self.token_to_kv_pool_allocator.free(x.value)
-                    full_num_evicted += len(x.value)
-                    swa_num_evicted += len(x.value)
+                    self.kv_events.record_remove(x)
+                    node_full_evicted, node_swa_evicted = self._free_node_value(x)
+                    full_num_evicted += node_full_evicted
+                    swa_num_evicted += node_swa_evicted
 
                     # 2. get the next node, update the lru lists
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
@@ -703,9 +723,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         swa_uuid_for_lock = None
         while node != self.root_node:
             # lock full from node to root
-            assert (
-                node.full_lock_ref >= 0
-            ), f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            assert node.full_lock_ref >= 0, (
+                f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            )
             if node.full_lock_ref == 0:
                 self.full_evictable_size_ -= len(node.value)
                 self.full_protected_size_ += len(node.value)
@@ -715,9 +735,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             # When we reach the sliding window size, we will set the swa_uuid_for_lock.
             # caller needs to pass the swa_uuid_for_lock to dec_lock_ref
             if swa_lock_size < self.sliding_window_size:
-                assert (
-                    not node.swa_tombstone
-                ), f"inc_lock_swa on swa_tombstone node, {node.id=}"
+                assert not node.swa_tombstone, (
+                    f"inc_lock_swa on swa_tombstone node, {node.id=}"
+                )
                 if node.swa_lock_ref == 0:
                     self.swa_evictable_size_ -= len(node.value)
                     self.swa_protected_size_ += len(node.value)
@@ -752,21 +772,21 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         dec_lock_swa = not skip_swa
         while node != self.root_node:
-            assert (
-                node.full_lock_ref > 0
-            ), f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            assert node.full_lock_ref > 0, (
+                f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            )
             if node.full_lock_ref == 1:
                 self.full_evictable_size_ += len(node.value)
                 self.full_protected_size_ -= len(node.value)
             node.full_lock_ref -= 1
 
             if dec_lock_swa:
-                assert (
-                    not node.swa_tombstone
-                ), f"dec_lock_ref on swa_tombstone node, {node.id=}"
-                assert (
-                    node.swa_lock_ref > 0
-                ), f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
+                assert not node.swa_tombstone, (
+                    f"dec_lock_ref on swa_tombstone node, {node.id=}"
+                )
+                assert node.swa_lock_ref > 0, (
+                    f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
+                )
 
                 if node.swa_lock_ref == 1:
                     self.swa_evictable_size_ += len(node.value)
@@ -811,12 +831,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         while node != self.root_node:
-            assert (
-                not node.swa_tombstone
-            ), f"dec_swa_lock_only on swa_tombstone node, {node.id=}"
-            assert (
-                node.swa_lock_ref > 0
-            ), f"dec_swa_lock_only on node with {node.swa_lock_ref=}, {node.id=}"
+            assert not node.swa_tombstone, (
+                f"dec_swa_lock_only on swa_tombstone node, {node.id=}"
+            )
+            assert node.swa_lock_ref > 0, (
+                f"dec_swa_lock_only on node with {node.swa_lock_ref=}, {node.id=}"
+            )
 
             if node.swa_lock_ref == 1:
                 self.swa_protected_size_ -= len(node.value)
@@ -1020,6 +1040,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.key.token_ids + child.key.token_ids,
                 node.key.extra_key,
                 is_bigram=node.key.is_bigram,
+                cache_salt=node.key.cache_salt,
             )
             node.value = torch.cat([node.value, child.value])
             node.children = child.children
@@ -1033,6 +1054,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.hash_value = list(node.hash_value) + list(child.hash_value)
             else:
                 node.hash_value = None
+            if node.event_hash_value is not None and child.event_hash_value is not None:
+                node.event_hash_value = list(node.event_hash_value) + list(
+                    child.event_hash_value
+                )
+            else:
+                node.event_hash_value = None
 
             self.full_lru_list.remove_node(child)
             if not child.swa_tombstone:
@@ -1104,6 +1131,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
+        )
 
         # insert the new node and child into the lru lists, insert
         # parent first so that parent is after child in the lru list
@@ -1155,12 +1185,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 # For page_size > 1 and chunked prefill case, update_kv_after_len may be not page-aligned due to a trailing partial page
                 # (kept in the request but not inserted into the radix tree) appended to prefix_indices.
                 if node.swa_tombstone:
-                    assert (
-                        node.swa_lock_ref == 0
-                    ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
-                    assert (
-                        swa_evicted_seqlen % self.page_size == 0
-                    ), f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
+                    assert node.swa_lock_ref == 0, (
+                        f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
+                    )
+                    assert swa_evicted_seqlen % self.page_size == 0, (
+                        f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
+                    )
                     if swa_evicted_seqlen <= total_prefix_length:
                         # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
                         if node.full_lock_ref > 0:
@@ -1172,7 +1202,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                             )
                         else:
                             # Free full tokens in the original tree node.
-                            self.token_to_kv_pool_allocator.free(
+                            self.token_to_kv_pool_allocator.free_full(
                                 node.value[:prefix_len]
                             )
                             # Overwrite the new value in request to the tree node.
@@ -1190,18 +1220,18 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                             self._recover_tombstone_keeping_locked_full(
                                 node, value[start_update_idx:prefix_len]
                             )
-                            self.token_to_kv_pool_allocator.free(
+                            self.token_to_kv_pool_allocator.free_full(
                                 value[:start_update_idx]
                             )
                         else:
-                            self.token_to_kv_pool_allocator.free(
+                            self.token_to_kv_pool_allocator.free_full(
                                 node.value[start_update_idx:prefix_len]
                             )
                             self._split_node(node.key, node, start_update_idx)
                             # Here node is the new node after split, so we can overwrite the value to the new node.
                             # The old node is still swa tombstone and the full token is not freed.
                             node.value = value[start_update_idx:prefix_len].clone()
-                            self.token_to_kv_pool_allocator.free(
+                            self.token_to_kv_pool_allocator.free_full(
                                 value[:start_update_idx]
                             )
                             node.swa_tombstone = False
@@ -1209,10 +1239,16 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                             self.swa_evictable_size_ += len(node.value)
                     else:
                         # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.
-                        self.token_to_kv_pool_allocator.free(value[:prefix_len])
+                        self.token_to_kv_pool_allocator.free_full(value[:prefix_len])
                 else:
                     # The node is not tombstone, so we don't need to update the node.
-                    self.token_to_kv_pool_allocator.free(value[:prefix_len])
+                    # The incoming slice can still straddle this request's own
+                    # eviction floor, so split it there.
+                    free_kv_row_segments(
+                        self.token_to_kv_pool_allocator,
+                        [(value[:prefix_len], total_prefix_length)],
+                        swa_evicted_seqlen=swa_evicted_seqlen,
+                    )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -1239,7 +1275,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             #    occurring in normal operation. This check is a defensive guard
             #    against unexpected eviction states from other code paths.
             if swa_evicted_seqlen == total_prefix_length + len(key):
-                self.token_to_kv_pool_allocator.free(value)
+                self.token_to_kv_pool_allocator.free_full(value)
                 return total_prefix_length
 
             if (
@@ -1282,8 +1318,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         allocator = self.token_to_kv_pool_allocator
         swa_value = allocator.translate_loc_from_full_to_swa(incoming_full)
         allocator.set_full_to_swa_mapping(node.value, swa_value)
-        allocator.full_to_swa_index_mapping[incoming_full.to(torch.int64)] = 0
-        allocator.full_attn_allocator.free(incoming_full)
+        allocator.clear_full_to_swa_mapping(incoming_full)
+        allocator.free_full(incoming_full)
 
         node.swa_tombstone = False
         self.swa_lru_list.insert_mru(node)
@@ -1308,7 +1344,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if not swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
             self.swa_evictable_size_ += len(value)
-        self._record_store_event(new_node)
+        self.kv_events.record_store(new_node)
         return new_node
 
     def _iteratively_delete_tombstone_leaf(
@@ -1322,13 +1358,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             # if locked, means node is in use, skip
             if node.parent.full_lock_ref > 0:
                 break
-            assert (
-                node.parent.swa_lock_ref == 0
-            ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
+            assert node.parent.swa_lock_ref == 0, (
+                f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
+            )
             # delete tombstone node evicts full tokens
-            self._record_remove_event(node.parent)
-            self.token_to_kv_pool_allocator.free(node.parent.value)
-            full_num_evicted += len(node.parent.value)
+            self.kv_events.record_remove(node.parent)
+            node_full_evicted, _ = self._free_node_value(node.parent)
+            full_num_evicted += node_full_evicted
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)
             node = node.parent
@@ -1352,9 +1388,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.swa_evictable_size_ -= len(node.key)
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
-        assert (
-            node.swa_tombstone
-        ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
+        assert node.swa_tombstone, (
+            f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
+        )
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
@@ -1401,9 +1437,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
 
-                assert key == child.key.child_key(
-                    self.page_size
-                ), f"{key=}, {child.key.child_key(self.page_size)=}"
+                assert key == child.key.child_key(self.page_size), (
+                    f"{key=}, {child.key.child_key(self.page_size)=}"
+                )
 
     def _total_size_helper(self) -> Tuple[int, int]:
         total_size = 0

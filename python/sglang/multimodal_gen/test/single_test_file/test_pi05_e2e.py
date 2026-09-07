@@ -77,7 +77,7 @@ def pi05_generator():
     kwargs = {
         "model_path": _MODEL_PATH,
         "num_gpus": num_gpus,
-        "warmup": False,
+        "warmup_mode": "off",
         "trust_remote_code": False,
     }
     if num_gpus > 1:
