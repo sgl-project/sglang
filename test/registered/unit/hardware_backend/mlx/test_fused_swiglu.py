@@ -25,7 +25,7 @@ import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_mlx_ci(est_time=45, suite="stage-a-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
@@ -251,9 +251,9 @@ def test_fused_matches_unfused_synthetic():
 
         assert y_ref.shape == y_fused.shape
         # A broken kernel must not leak NaN/Inf into the downstream down_proj matmul.
-        assert bool(
-            mx.all(mx.isfinite(y_fused.astype(mx.float32))).item()
-        ), f"B={B} hi={hi}: non-finite fused output"
+        assert bool(mx.all(mx.isfinite(y_fused.astype(mx.float32))).item()), (
+            f"B={B} hi={hi}: non-finite fused output"
+        )
         # Same bf16 bound as the @requires_model kernel test.
         max_abs, rel = _max_rel_diff(y_ref, y_fused)
         assert rel < 2e-2, f"B={B} hi={hi}: max_abs={max_abs:.3e} rel={rel:.2%}"

@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=260, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=265, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=260, suite="stage-b-test-1-gpu-small-amd")
 
 SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
@@ -259,7 +259,6 @@ class TestSRTEndpoint(CustomTestCase):
                 for logprob_start_len in [0, 500, 2500, 5000, 25000]:
                     for return_logprob in [True, False]:
                         for top_logprobs_num in [0, 5]:
-
                             if logprob_start_len >= input_len:
                                 continue
 

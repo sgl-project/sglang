@@ -185,10 +185,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        page_aligned_only: bool = False,
     ):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
+        # A page row of the FP4 indexer buffers is a grouped slot layout rather
+        # than a flat token array, so the token-granular copy used for fused
+        # DSv4 C4 rows does not apply and only whole pages may move.
+        self.page_aligned_only = page_aligned_only
         self.num_host_pages = num_host_pages
         self.slot_page_size = slot_page_size
         self.dtype = torch.uint8
@@ -305,6 +310,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
 
+    def _unaligned_transfer_error(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> ValueError:
+        return ValueError(
+            f"{self.pool_name} expects page-aligned indices: got "
+            f"{host_indices.numel()} host and {device_indices.numel()} device "
+            f"indices for page size {self.slot_page_size}."
+        )
+
     def _has_transfer_indices(
         self, host_indices: torch.Tensor | None, device_indices: torch.Tensor | None
     ) -> bool:
@@ -375,6 +389,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             # Token-granular DSV4 C4 copy needs this helper because a token is
             # not one contiguous byte range in the paged row:
             # [value0..value63][scale0..scale63].
+            if self.page_aligned_only:
+                raise self._unaligned_transfer_error(host_indices, device_indices)
             transfer_cache_dsv4_mla(
                 src_ptrs=self.device_ptrs,
                 dst_ptrs=self.data_ptrs,
@@ -453,6 +469,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         ):
             # Same DSV4 C4 layout issue as backup: this is token-granular
             # preload, so it cannot use the normal HiCache page-row copy.
+            if self.page_aligned_only:
+                raise self._unaligned_transfer_error(host_indices, device_indices)
             transfer_cache_dsv4_mla(
                 src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
                 dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],

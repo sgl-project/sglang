@@ -261,9 +261,9 @@ async def async_request_openai_completions(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "completions"
-    ), "OpenAI Completions API URL must end with 'completions'."
+    assert api_url.endswith("completions"), (
+        "OpenAI Completions API URL must end with 'completions'."
+    )
 
     prompt = request_func_input.prompt
 
@@ -392,9 +392,9 @@ async def async_request_openai_chat_completions(
                            latency, TTFT, ITL, and success status.
     """
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "chat/completions"
-    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    assert api_url.endswith("chat/completions"), (
+        "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    )
 
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
@@ -1296,9 +1296,9 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
 
 
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
-    assert (
-        backend in MULTI_TURN_BACKENDS
-    ), f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+    assert backend in MULTI_TURN_BACKENDS, (
+        f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+    )
 
     async def f(
         request_func_input: RequestFuncInput,
@@ -1534,9 +1534,9 @@ async def benchmark(
                 lora_name = lora_names[lora_idx]
                 lora_idx = (lora_idx + 1) % len(lora_names)
             else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                assert lora_request_distribution == "skewed", (
+                    f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                )
 
                 lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
@@ -2000,9 +2000,9 @@ def run_benchmark(args_: argparse.Namespace):
         extra_request_body["bootstrap_room"] = 0
 
     if args.tokenize_prompt:
-        assert (
-            args.backend == "sglang"
-        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        assert args.backend == "sglang", (
+            "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        )
 
     # Set url
     if args.port is None:
@@ -2079,18 +2079,18 @@ def run_benchmark(args_: argparse.Namespace):
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
-        assert (
-            not args.tokenize_prompt
-        ), "`--tokenize-prompt` not compatible with image dataset"
+        assert not args.tokenize_prompt, (
+            "`--tokenize-prompt` not compatible with image dataset"
+        )
 
     if args.lora_request_distribution in ["distinct", "skewed"]:
-        assert (
-            args.lora_name is not None and len(args.lora_name) > 1
-        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+        assert args.lora_name is not None and len(args.lora_name) > 1, (
+            "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+        )
 
-    assert (
-        args.lora_zipf_alpha > 1
-    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    assert args.lora_zipf_alpha > 1, (
+        f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    )
 
     print(f"{args}\n")
 
@@ -2364,13 +2364,13 @@ def cli_main():
         "--image-format",
         type=str,
         default="jpeg",
-        help=("Format of images for image dataset. " "Supports jpeg and png."),
+        help=("Format of images for image dataset. Supports jpeg and png."),
     )
     parser.add_argument(
         "--image-content",
         type=str,
         default="random",
-        help=("Content for images for image dataset. " "Supports random and blank."),
+        help=("Content for images for image dataset. Supports random and blank."),
     )
     parser.add_argument(
         "--request-rate",

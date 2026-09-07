@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestHiddenStateGraphRecapture(CustomTestCase):
@@ -118,9 +118,12 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
         ):
             runner = self._make_runner(runner_cls, CaptureHiddenMode.NULL)
 
-            with self.subTest(runner_cls=runner_cls), self.assertRaisesRegex(
-                RuntimeError,
-                "exceeds the fixed (CUDA|CPU) graph capture mode",
+            with (
+                self.subTest(runner_cls=runner_cls),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "exceeds the fixed (CUDA|CPU) graph capture mode",
+                ),
             ):
                 runner._validate_capture_hidden_mode(
                     self._make_forward_batch(CaptureHiddenMode.LAST)

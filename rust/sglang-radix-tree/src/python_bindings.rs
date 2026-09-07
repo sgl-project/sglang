@@ -235,6 +235,7 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::Indexer => "indexer",
         PoolName::DeepseekV4C4 => "deepseek_v4_c4",
         PoolName::DeepseekV4C4Indexer => "deepseek_v4_c4_indexer",
+        PoolName::DeepseekV4C4IndexerScale => "deepseek_v4_c4_indexer_scale",
         PoolName::DeepseekV4C128 => "deepseek_v4_c128",
         PoolName::DeepseekV4C4State => "deepseek_v4_c4_state",
         PoolName::DeepseekV4C4IndexerState => "deepseek_v4_c4_indexer_state",
@@ -254,6 +255,7 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "indexer" => Ok(PoolName::Indexer),
         "deepseek_v4_c4" => Ok(PoolName::DeepseekV4C4),
         "deepseek_v4_c4_indexer" => Ok(PoolName::DeepseekV4C4Indexer),
+        "deepseek_v4_c4_indexer_scale" => Ok(PoolName::DeepseekV4C4IndexerScale),
         "deepseek_v4_c128" => Ok(PoolName::DeepseekV4C128),
         "deepseek_v4_c4_state" => Ok(PoolName::DeepseekV4C4State),
         "deepseek_v4_c4_indexer_state" => Ok(PoolName::DeepseekV4C4IndexerState),
@@ -1818,9 +1820,14 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         })
     }
 
-    /// Mark a node as having an in-flight write-through backup.
-    fn mark_write_through_pending(&self, py: Python<'_>, node_id: NodeId) {
-        py.allow_threads(|| self.core().mark_write_through_pending(node_id));
+    /// Mark the nodes one write-through backup covers; returns them ancestors first.
+    fn mark_write_through_pending(
+        &self,
+        py: Python<'_>,
+        node_ids: Vec<NodeId>,
+        ack_id: NodeId,
+    ) -> Vec<NodeId> {
+        py.allow_threads(|| self.core().mark_write_through_pending(node_ids, ack_id))
     }
 
     /// Clear the write-through-pending mark on the acked nodes.
@@ -2797,9 +2804,14 @@ macro_rules! tree_core_binding {
                 self.inner.drop_subtree_no_host(py, node_id)
             }
 
-            /// Mark a node as having an in-flight write-through backup.
-            fn mark_write_through_pending(&self, py: Python<'_>, node_id: NodeId) {
-                self.inner.mark_write_through_pending(py, node_id)
+            /// Mark the nodes one write-through backup covers; returns them ancestors first.
+            fn mark_write_through_pending(
+                &self,
+                py: Python<'_>,
+                node_ids: Vec<NodeId>,
+                ack_id: NodeId,
+            ) -> Vec<NodeId> {
+                self.inner.mark_write_through_pending(py, node_ids, ack_id)
             }
 
             /// Clear the write-through-pending mark on the acked nodes.

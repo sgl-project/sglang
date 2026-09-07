@@ -15,7 +15,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _RecordingVisual:
@@ -160,15 +160,19 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                     )
                     return encoded
 
-                with patch(
-                    "sglang.srt.models.qwen3_vl.run_dp_sharded_mrope_vision_model",
-                    side_effect=run_dp,
-                ), patch(
-                    "sglang.srt.models.qwen3_vl.materialize_multimodal_features",
-                    return_value=local_features,
-                ) as materialize, patch(
-                    "sglang.srt.models.qwen3_vl.get_parallel",
-                    return_value=SimpleNamespace(tp_size=8),
+                with (
+                    patch(
+                        "sglang.srt.models.qwen3_vl.run_dp_sharded_mrope_vision_model",
+                        side_effect=run_dp,
+                    ),
+                    patch(
+                        "sglang.srt.models.qwen3_vl.materialize_multimodal_features",
+                        return_value=local_features,
+                    ) as materialize,
+                    patch(
+                        "sglang.srt.models.qwen3_vl.get_parallel",
+                        return_value=SimpleNamespace(tp_size=8),
+                    ),
                 ):
                     output = feature_method(items)
 

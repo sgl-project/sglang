@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
@@ -51,7 +52,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
-
     from torch.distributed import ProcessGroup
 
     from sglang.srt.configs.model_config import ModelConfig
@@ -127,6 +127,7 @@ def uses_ssm_state(model_config) -> bool:
         or mamba2_config(model_config) is not None
         or (spec.uses_mamba_radix_cache if spec is not None else False)
         or kimi_linear_config(model_config) is not None
+        or glm5_next_config(model_config) is not None
         or hybrid_lightning_config(model_config) is not None
     )
 
@@ -307,6 +308,7 @@ def build_kv_cache(
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
         eviction_policy=get_memory().radix_eviction_policy,
+        eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
@@ -314,6 +316,8 @@ def build_kv_cache(
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
+        attn_cp_rank=ps.attn_cp_rank,
+        attn_cp_size=ps.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,

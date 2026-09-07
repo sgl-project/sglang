@@ -15,7 +15,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_target_verify_batch(bs: int) -> ForwardBatch:
@@ -36,9 +36,12 @@ def _make_target_verify_batch(bs: int) -> ForwardBatch:
 def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
     # filter_batch reads attention_backend (get_server_args) and
     # moe_dense_tp_size (get_parallel) from the published config.
-    with get_context().override_server_args(
-        attention_backend="fa3", moe_dense_tp_size=None
-    ), get_parallel().override(attn_tp_size=1):
+    with (
+        get_context().override_server_args(
+            attention_backend="fa3", moe_dense_tp_size=None
+        ),
+        get_parallel().override(attn_tp_size=1),
+    ):
         return TboForwardBatchPreparer.filter_batch(
             batch,
             start_token_index=lo,

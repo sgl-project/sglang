@@ -20,7 +20,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 
 flashinfer_fused_moe = pytest.importorskip("flashinfer.fused_moe")
 
@@ -345,15 +345,9 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     here we just verify that ``apply`` calls the kernel with the right
     arguments (incl. input padding + output trim)."""
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
-    import sglang.srt.layers.quantization.mxfp4 as mxfp4_mod
 
-    # Bypass symmetric-memory / TP-group in both the legacy quant_method and
-    # the new fused-func module (where the kernel call now lives).
-    monkeypatch.setattr(
-        mxfp4_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
-    )
-    monkeypatch.setattr(mxfp4_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(mxfp4_mod, "get_tp_group", lambda: None)
+    # Bypass symmetric-memory / TP-group in the fused-func module, which is where
+    # the kernel call lives.
     monkeypatch.setattr(
         fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
@@ -585,9 +579,9 @@ def test_humming_range_ignores_prerounded_hidden_tail():
         "w13 Humming residual changed with the never-written hidden tail; "
         "the _UE8M0_ONE fill leaked into the per-expert E8M0 range"
     )
-    assert torch.equal(
-        residuals[0][1], residuals[1][1]
-    ), "w2 Humming residual changed with the never-written hidden tail"
+    assert torch.equal(residuals[0][1], residuals[1][1]), (
+        "w2 Humming residual changed with the never-written hidden tail"
+    )
 
 
 @pytest.mark.skipif(

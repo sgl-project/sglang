@@ -2,8 +2,9 @@
 """SubBlock block-sparse attention backend.
 
 The schedule and adapter tests are pure CPU. The numerical tests need either
-an SM90 GPU with SGLang's CuTe-DSL dependencies or an SM100 GPU with
-FlashInfer's ``bsa_attn_blk64_fwd`` and are skipped otherwise.
+an SM90 GPU with SGLang's CuTe-DSL dependencies, an SM100 GPU with
+FlashInfer's ``bsa_attn_blk64_fwd``, or an SM120 GPU with FlashInfer's
+``bsa_attn_sm120_blk64_fwd`` and are skipped otherwise.
 
 The trick that makes the sparse kernel checkable against dense attention: at
 ``sparsity`` just above 0 every block is inside the budget, so the block-sparse
@@ -52,6 +53,12 @@ def _subblock_kernel_available() -> bool:
             )
 
             load_bsa_attn_blk64_fwd()
+        elif capability == (12, 0):
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+                load_bsa_attn_sm120_blk64_fwd,
+            )
+
+            load_bsa_attn_sm120_blk64_fwd()
         else:
             return False
     except Exception:
@@ -60,7 +67,8 @@ def _subblock_kernel_available() -> bool:
 
 
 requires_subblock_kernel = unittest.skipUnless(
-    _subblock_kernel_available(), "needs an SM90 or SM100 SubBlock attention kernel"
+    _subblock_kernel_available(),
+    "needs an SM90, SM100, or SM120 SubBlock attention kernel",
 )
 
 
@@ -489,6 +497,11 @@ class TestSubBlockNumerics(unittest.TestCase):
     def test_sm100_kernel_backed_mixed_query_mask(self):
         if torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("requires the SM100 SubBlock kernel")
+        self._assert_kernel_backed_mixed_query_mask()
+
+    def test_sm120_kernel_backed_mixed_query_mask(self):
+        if torch.cuda.get_device_capability() != (12, 0):
+            self.skipTest("requires the SM120 SubBlock kernel")
         self._assert_kernel_backed_mixed_query_mask()
 
     def test_skipped_step_is_bitwise_dense(self):

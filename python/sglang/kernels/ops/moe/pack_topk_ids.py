@@ -15,7 +15,6 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 
 
 class PackTopkIds:
-
     @classmethod
     def execute(
         cls, topk_ids: torch.Tensor, topk_weights: torch.Tensor
@@ -33,18 +32,18 @@ class PackTopkIds:
 
     @classmethod
     def triton(cls, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
-        assert (
-            topk_ids.shape == topk_weights.shape
-        ), f"shape mismatch: {topk_ids.shape=} vs {topk_weights.shape=}"
+        assert topk_ids.shape == topk_weights.shape, (
+            f"shape mismatch: {topk_ids.shape=} vs {topk_weights.shape=}"
+        )
         assert topk_ids.ndim >= 1, f"expected >=1D, got {topk_ids.shape=}"
 
         assert topk_ids.dtype in (
             torch.int32,
             torch.int64,
         ), f"topk_ids must be int32 or int64, got {topk_ids.dtype}"
-        assert (
-            topk_weights.dtype == torch.float32
-        ), f"topk_weights must be float32, got {topk_weights.dtype}"
+        assert topk_weights.dtype == torch.float32, (
+            f"topk_weights must be float32, got {topk_weights.dtype}"
+        )
 
         assert topk_ids.is_contiguous(), "topk_ids must be contiguous"
         assert topk_weights.is_contiguous(), "topk_weights must be contiguous"

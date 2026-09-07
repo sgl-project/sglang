@@ -12,7 +12,7 @@ import pytest
 import sglang.kernels as kernels
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 KERNELS_ROOT = REPO_ROOT / "python" / "sglang" / "kernels"
@@ -128,9 +128,9 @@ def test_registered_kernel_test_groups_are_known():
     registered_root = REPO_ROOT / "test" / "registered" / "kernels"
     for kind in ("ops", "benchmark"):
         unknown = _directory_names(registered_root / kind) - declared_groups
-        assert (
-            not unknown
-        ), f"Unknown {kind} kernel group directories: {sorted(unknown)}"
+        assert not unknown, (
+            f"Unknown {kind} kernel group directories: {sorted(unknown)}"
+        )
 
 
 def test_internal_registry_target_attributes_are_declared():
@@ -172,7 +172,9 @@ def test_jit_source_declarations_exist():
             function_name = (
                 call.func.id
                 if isinstance(call.func, ast.Name)
-                else call.func.attr if isinstance(call.func, ast.Attribute) else None
+                else call.func.attr
+                if isinstance(call.func, ast.Attribute)
+                else None
             )
             if function_name != "load_jit":
                 continue

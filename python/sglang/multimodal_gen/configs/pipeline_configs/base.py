@@ -201,6 +201,9 @@ class PipelineConfig:
     native_only_components: ClassVar[tuple[str, ...]] = ()
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
+    # False when changing component placement after a calibration request is
+    # known to alter the pipeline's numerical path.
+    supports_auto_residency: bool = True
     # Components that cannot fall back to a native Transformers/Diffusers
     # implementation because their pipeline requires SGLang-specific behavior.
     native_only_components: tuple[str, ...] = ()
@@ -1180,9 +1183,9 @@ class PipelineConfig:
                 elif isinstance(current_value, tuple) and all(
                     isinstance(v, ModelConfig) for v in current_value
                 ):
-                    assert len(current_value) == len(
-                        new_value
-                    ), "Users shouldn't delete or add text encoder config objects in your json"
+                    assert len(current_value) == len(new_value), (
+                        "Users shouldn't delete or add text encoder config objects in your json"
+                    )
                     for target_config, source_config in zip(
                         current_value, new_value, strict=True
                     ):

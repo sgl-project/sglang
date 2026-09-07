@@ -31,7 +31,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 _FIELDS = frozenset(field.name for field in dataclasses.fields(ServerArgs))
@@ -61,7 +61,9 @@ def _holders(fn):
             else (
                 annotation.id
                 if isinstance(annotation, ast.Name)
-                else annotation.attr if isinstance(annotation, ast.Attribute) else None
+                else annotation.attr
+                if isinstance(annotation, ast.Attribute)
+                else None
             )
         )
         if text == "ServerArgs":

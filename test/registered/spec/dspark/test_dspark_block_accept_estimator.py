@@ -12,7 +12,7 @@ from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator impo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _GAMMA = 3
 _VOCAB = 8
@@ -37,7 +37,6 @@ def _make_recorder(tmp_dir: str) -> tuple[BlockAcceptEstimateRecorder, Path]:
 
 
 class _FakeDelayed:
-
     def __init__(self):
         self._pending = None
 

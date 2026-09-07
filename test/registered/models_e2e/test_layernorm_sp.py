@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=74, stage="base-b", runner_config="2-gpu-large")
 
 # Qwen3 dense (architecture "Qwen3ForCausalLM") is the SP allowlist entry.
 LAYERNORM_SP_MODEL = "Qwen/Qwen3-8B"
