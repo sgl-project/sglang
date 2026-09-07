@@ -320,7 +320,7 @@ class TestSWA(unittest.TestCase):
         available_before_free = allocator.swa_available_size()
         allocator.free_group_begin()
         for indices in index_batches:
-            allocator.free_swa(indices, start_pos=0)
+            allocator.free_swa_segment(indices, start_pos=0)
 
         # The reps were gathered at enqueue time, not from these views.
         self.assertEqual(len(allocator.swa_page_reps_group), len(index_batches))
@@ -1151,11 +1151,14 @@ class TestSWAPeerMappedContract(CustomTestCase):
     def _strict(self):
         return envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT))
 
-    def _condition_checked_by(self, allocator, indices, **kwargs):
+    def _condition_checked_by(self, allocator, indices, start_pos=None):
         """The predicate free_swa hands the async assert, as a python bool."""
         with self._strict():
             with mock.patch.object(torch, "_assert_async") as assert_async:
-                allocator.free_swa(indices, **kwargs)
+                if start_pos is None:
+                    allocator.free_swa(indices)
+                else:
+                    allocator.free_swa_segment(indices, start_pos=start_pos)
         return bool(assert_async.call_args.args[0])
 
     def test_segment_free_flags_a_page_whose_peer_is_already_gone(self):
@@ -1176,12 +1179,12 @@ class TestSWAPeerMappedContract(CustomTestCase):
 
         def grouped(indices):
             allocator.free_group_begin()
-            allocator.free_swa(indices, start_pos=0)
+            allocator.free_swa_segment(indices, start_pos=0)
             allocator.free_group_end()
 
         # Warm up both paths outside the window: a first-time cudaMalloc can
         # synchronize on its own, which the detector would blame on this call.
-        allocator.free_swa(_swa_alloc(allocator, 2 * ps), start_pos=0)
+        allocator.free_swa_segment(_swa_alloc(allocator, 2 * ps), start_pos=0)
         grouped(_swa_alloc(allocator, 2 * ps))
         first = _swa_alloc(allocator, 3 * ps)
         second = _swa_alloc(allocator, 2 * ps)
@@ -1194,7 +1197,7 @@ class TestSWAPeerMappedContract(CustomTestCase):
         with self._strict():
             self.assertIsNone(
                 _sync_error(
-                    lambda: allocator.free_swa(first[: 3 * ps - 1], start_pos=0)
+                    lambda: allocator.free_swa_segment(first[: 3 * ps - 1], start_pos=0)
                 )
             )
             self.assertIsNone(_sync_error(lambda: grouped(second[: 2 * ps - 1])))
@@ -1254,7 +1257,7 @@ class TestSWAPageRepsFree(CustomTestCase):
                 expected = torch.unique(mapping[indices[:num_tokens]] // ps)
                 before = allocator.swa_attn_allocator.free_pages.numel()
 
-                allocator.free_swa(indices[:num_tokens], start_pos=0)
+                allocator.free_swa_segment(indices[:num_tokens], start_pos=0)
 
                 free_pages = allocator.swa_attn_allocator.free_pages
                 freed = free_pages[: free_pages.numel() - before]

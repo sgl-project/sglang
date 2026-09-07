@@ -407,7 +407,7 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
                 torch.Tensor, "item", side_effect=AssertionError("item = host sync")
             ),
         ):
-            alloc.free_swa(v[: 4 * self.PS], start_pos=0)
+            alloc.free_swa_segment(v[: 4 * self.PS], start_pos=0)
         self.assertEqual(alloc.verify_byte_accounting(), [])
 
     def test_fallback_free_swa_still_correct_for_radix_shapes(self):
@@ -416,7 +416,7 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
         a1, a2 = self._tri(), self._tri()
         v1, v2 = a1.alloc(6 * self.PS), a2.alloc(6 * self.PS)
         self.assertTrue(torch.equal(v1, v2))
-        a1.free_swa(v1[: 4 * self.PS], start_pos=0)
+        a1.free_swa_segment(v1[: 4 * self.PS], start_pos=0)
         a2.free_swa(v2[: 4 * self.PS])
         self.assertTrue(
             torch.equal(
@@ -715,7 +715,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         v = alloc.alloc(8 * self.PS)
         sa = alloc.swa_attn_allocator
         span = sa._span_pages()
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
+        alloc.free_swa_segment(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
         self.assertGreater(sa._hole_pages(), 0)  # deferred
         self.assertEqual(sa._span_pages(), span)
         moved = alloc.flush_opportunistic()
@@ -729,7 +729,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
         sa = alloc.swa_attn_allocator
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)
+        alloc.free_swa_segment(v[6 * self.PS :], start_pos=6 * self.PS)
         self.assertGreater(sa._hole_pages(), 0)
         moves_before = len(sa._inverse_history)
         from sglang.srt.mem_cache.allocator.unified_sub_pool import _relieve_for_alloc
@@ -743,7 +743,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         value -- under-reporting is safe, over-reporting would over-admit."""
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)
+        alloc.free_swa_segment(v[6 * self.PS :], start_pos=6 * self.PS)
         deferred = alloc.available_size()
         alloc.swa_attn_allocator._flush(urgent=False)
         absorbed = alloc.available_size()
@@ -759,7 +759,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
 
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        alloc.free_swa(v[2 * self.PS : 4 * self.PS], start_pos=2 * self.PS)
+        alloc.free_swa_segment(v[2 * self.PS : 4 * self.PS], start_pos=2 * self.PS)
         alloc.flush_opportunistic()  # consumes the dirty flag
         sa = alloc.swa_attn_allocator
         self.assertGreater(sa._hole_pages(), 0)  # interior holes remain
@@ -775,10 +775,10 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
         sa = alloc.swa_attn_allocator
-        alloc.free_swa(v[: 2 * self.PS], start_pos=0)  # low-edge holes
+        alloc.free_swa_segment(v[: 2 * self.PS], start_pos=0)  # low-edge holes
         n_after_free = sa._hole_pages()
         alloc.alloc(2 * self.PS)  # drains them back to live
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
+        alloc.free_swa_segment(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
         self.assertEqual(sa._hole_pages(), n_after_free)  # same COUNT as before
         span = sa._span_pages()
         self.assertGreater(alloc.flush_opportunistic(), 0)  # still absorbed
@@ -797,7 +797,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         with mock.patch.object(
             torch.Tensor, "tolist", side_effect=AssertionError("tolist = D2H")
         ):
-            alloc.free_swa(v, start_pos=0)
+            alloc.free_swa_segment(v, start_pos=0)
         self.assertTrue(sa._is_frontier_transparent())
         self.assertEqual(sa._hole_pages(), 0)
 

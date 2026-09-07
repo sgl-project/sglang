@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -350,15 +348,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # copies a host-resident scalar and blocks until the stream drains.
             self.full_to_swa_index_mapping.index_fill_(0, full_indices, 0)
 
-    def free_swa(self, free_index: torch.Tensor, *, start_pos: Optional[int] = None):
-        """Release the SWA peers and clear their mapping. ``start_pos`` follows the
-        free_segment() contract and keeps every op fixed-shape; without it the
-        set-shaped path synchronizes at page_size > 1."""
+    def free_swa(self, free_index: torch.Tensor):
+        """Release the SWA peers of an arbitrary slot set and clear their mapping.
+        Synchronizes at page_size > 1; kv-row segments go through free_swa_segment()."""
         if free_index.numel() == 0:
             return
 
-        if self.page_size == 1 or start_pos is not None:
-            self._free_swa_reps(free_index, start_pos=start_pos or 0)
+        if self.page_size == 1:
+            self._free_swa_reps(free_index, start_pos=0)
             return
 
         # The expansion gathers slots this caller never allocated, which read as
@@ -374,6 +371,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         self._release_swa(swa_indices)
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """free_swa() for a kv-row segment; same start-alignment contract as
+        free_segment(), and fixed-shape at every page size."""
+        if free_index.numel() == 0:
+            return
+        self._free_swa_reps(free_index, start_pos=start_pos)
 
     def _free_swa_reps(self, free_index: torch.Tensor, *, start_pos: int):
         ps = self.page_size
@@ -435,7 +439,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         # SWA first, as in free(): it reads the mapping that a later cache
         # action in this group may re-point.
-        self.free_swa(free_index, start_pos=start_pos)
+        self.free_swa_segment(free_index, start_pos=start_pos)
         self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
 
     def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
@@ -631,13 +635,16 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.free_group.append(self._copy_for_free_group(free_index))
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
-    def free_swa(self, free_index: torch.Tensor, *, start_pos: Optional[int] = None):
+    def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
         if self.free_group is None:
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        self.free_swa(free_index)
 
     def free_full(self, free_index: torch.Tensor):
         # All-SWA models have no full-attention pool, so there is nothing to

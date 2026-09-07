@@ -660,7 +660,9 @@ class SWARadixCache(BasePrefixCache):
 
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
-                    self.token_to_kv_pool_allocator.free_swa(x.value, start_pos=0)
+                    self.token_to_kv_pool_allocator.free_swa_segment(
+                        x.value, start_pos=0
+                    )
                     swa_num_evicted += len(x.value)
 
                     # 2. get the next node, update the lru lists
@@ -673,7 +675,9 @@ class SWARadixCache(BasePrefixCache):
                     # Leaf still holds a full-side lock (can happen when the
                     # SWA leaf-lock early-release optimization revived a
                     # tombstoned leaf. Treat it like an internal tombstone.
-                    self.token_to_kv_pool_allocator.free_swa(x.value, start_pos=0)
+                    self.token_to_kv_pool_allocator.free_swa_segment(
+                        x.value, start_pos=0
+                    )
                     swa_num_evicted += len(x.value)
 
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
@@ -845,7 +849,9 @@ class SWARadixCache(BasePrefixCache):
                     # swa_lru_list so SWA-eviction won't pick this tombstoned
                     # leaf (which still holds full_lock_ref > 0). The full kv
                     # stays alive until the request releases its full lock.
-                    self.token_to_kv_pool_allocator.free_swa(node.value, start_pos=0)
+                    self.token_to_kv_pool_allocator.free_swa_segment(
+                        node.value, start_pos=0
+                    )
                     self.swa_lru_list.remove_node(node)
                     node.swa_tombstone = True
                 else:

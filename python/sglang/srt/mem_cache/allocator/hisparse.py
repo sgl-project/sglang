@@ -1,5 +1,4 @@
 import weakref
-from typing import Optional
 
 import torch
 
@@ -356,8 +355,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
 
-    def free_swa(self, free_indices: torch.Tensor, *, start_pos: Optional[int] = None):
-        self.logical_attn_allocator.free_swa(free_indices, start_pos=start_pos)
+    def free_swa(self, free_indices: torch.Tensor):
+        self.logical_attn_allocator.free_swa(free_indices)
+
+    def free_swa_segment(self, free_indices: torch.Tensor, *, start_pos: int):
+        self.logical_attn_allocator.free_swa_segment(free_indices, start_pos=start_pos)
 
     def free_full(self, free_indices: torch.Tensor):
         if free_indices.numel() == 0:
