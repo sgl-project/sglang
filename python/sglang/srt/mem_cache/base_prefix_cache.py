@@ -73,6 +73,7 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
+    swa_branching_seqlen: Optional[int] = None
 
     # General
     chunked: bool = False
@@ -88,6 +89,7 @@ class InsertResult:
     total_len: int = 0
     last_device_node: Any = None
     mamba_exist: bool = False
+    swa_branch_inserted: bool = False
     inserted_host_node: Any = None
     host_insert_dropped: bool = False
     adopted_ranges: Optional[dict[ComponentType, list[tuple[int, int]]]] = None
@@ -201,6 +203,9 @@ class MatchResult(NamedTuple):
                             loaded back to device. Pure-KV cache semantics;
         swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
                             window) and will be load-back into the SWA device pool.
+        swa_branching_seqlen: The SWA radix cache branching point, which is the longest
+                              page-aligned position that could've been cache hit if there
+                              exists an SWA window.
         mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
                             into the Mamba device pool. Typically 0 or 1.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
@@ -216,6 +221,7 @@ class MatchResult(NamedTuple):
     best_match_node: Any
     host_hit_length: int = 0
     swa_host_hit_length: int = 0
+    swa_branching_seqlen: Optional[int] = None
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
@@ -240,6 +246,7 @@ def zero_match_result(
         best_match_node=root,
         host_hit_length=0,
         swa_host_hit_length=0,
+        swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
     )

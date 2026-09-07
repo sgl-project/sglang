@@ -72,9 +72,28 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
-JIT kernel correctness tests and benchmarks live under `test/registered/jit/`, same as other registered tests (their helpers stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path):
-- Correctness tests: `test/registered/jit/test_*.py` → `base-b-kernel-unit-test-1-gpu-large`
-- Benchmarks: `test/registered/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-large`
+New and renamed tests use this layout:
+
+```text
+test/registered/<kind>/<subsystem>/test_*.py
+```
+
+`<kind>` is one of `unit`, `kernel`, `e2e`, `accuracy`, `perf`, or `stress`.
+Hardware is expressed by one or more `register_*_ci` calls, never by creating a
+new top-level hardware directory. The admission checker applies the layout and
+kind/suite contract incrementally while legacy paths are migrated.
+
+Diffusion workflows also enter through `test/run_suite.py`; registered bridge
+files preserve their case-level pytest partitioning until the remaining
+diffusion cases are moved out of the package test-support tree.
+
+New JIT kernel correctness tests and benchmarks live under
+`test/registered/kernel/jit/`; legacy `test/registered/jit/` files are migrated
+incrementally. Helpers stay alongside the kernel source under
+`python/sglang/kernels/jit/` and are imported by absolute path:
+
+- Correctness tests: `test/registered/kernel/jit/test_*.py` → `base-b-kernel-unit-test-1-gpu-large`
+- Benchmarks: `test/registered/kernel/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-large`
 
 ## Choosing a Suite
 
@@ -94,6 +113,20 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 
 See the [write-sglang-test skill](../.claude/skills/write-sglang-test/SKILL.md) for templates, fixtures, model selection, and a complete checklist.
 
+Before adding a registered test, identify the production change that would make
+it fail. Prefer extending an existing fixture/server launch over adding another
+file. The incremental admission check applies these ratchets to new or modified
+registered tests:
+
+- Temporary `disabled=` registrations and unconditional skips must reference an
+  issue and include `until YYYY-MM-DD`; expired entries fail lint.
+- A file registered on CUDA plus another accelerator must place a nearby
+  `backend-specific:` comment above the extra registration and name the path or
+  failure mode that only that backend can catch.
+- Default PR registrations are limited to 1,200 estimated weighted accelerator-seconds
+  per backend (`est_time * GPU count`). Move larger matrices to extra/nightly,
+  or document a nearby `ci-cost-override:` rationale.
+
 ## Multi-Hardware Backends
 
 This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends (AMD, NPU) follow the same practices and use the multi-backend registry system. A scheduled job summarizes test coverage across all backends; [here is an example run](https://github.com/sgl-project/sglang/actions/runs/23424304300).
@@ -111,4 +144,4 @@ This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends
 
 ### Adding New Models to Nightly CI
 - **Text models**: Extend the [global model list variables](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/python/sglang/test/test_utils.py#L104) in `test_utils.py`.
-- **VLMs**: Extend the `MODEL_THRESHOLDS` dictionary in `test/registered/eval/test_vlms_mmmu_eval.py`.
+- **VLMs**: Extend the `MODEL_THRESHOLDS` dictionary in `test/registered/accuracy/models/test_vlms_mmmu_eval.py`.
