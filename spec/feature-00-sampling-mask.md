@@ -44,6 +44,12 @@ their output tokens normally.
 
 ## Capacity and failures
 
+Disaggregated sampling-mask metadata is off by default. Set
+`SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1` on both prefill and decode servers to
+allocate and transfer it. Without this setting, PD requests with
+`return_sampling_mask=true` receive HTTP 400 naming the required environment
+variable. Requests on a regular, non-disaggregated server do not need it.
+
 `--sampling-mask-max-tokens` defaults to `4096` and must be positive. Prefill and
 decode nodes use the same capacity. Requests require greedy `top_k=1` or finite
 `1 < top_k <= capacity` after sampling-parameter normalization.

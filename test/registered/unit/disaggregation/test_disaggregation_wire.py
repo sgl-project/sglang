@@ -46,6 +46,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -335,7 +336,7 @@ class TestMooncakePPStaging(unittest.TestCase):
         )
 
 
-class TestEagleDsaSeedTransfer(unittest.TestCase):
+class TestEagleDsaSeedTransfer(CustomTestCase):
     @staticmethod
     def _make_req(
         seed,
@@ -390,13 +391,40 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
 
+    def test_sampling_mask_metadata_is_opt_in(self):
+        """Disabled masks must not allocate or enter the PD transfer schema."""
+        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(False):
+            buffers = MetadataBuffers(
+                size=2,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=4096,
+            )
+        buffers.set_buf(self._make_req(None))
+        self.assertIsNone(buffers.output_token_sampling_mask_len)
+        self.assertIsNone(buffers.output_token_sampling_mask_idx)
+        self.assertIsNone(buffers.output_token_sampling_logprobs)
+        self.assertEqual(buffers.get_buf(0)[6:9], (None, None, None))
+        disabled_ptrs, _, disabled_sizes = buffers.get_buf_infos()
+        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+            enabled = MetadataBuffers(
+                size=2,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=4096,
+            )
+        enabled_ptrs, _, enabled_sizes = enabled.get_buf_infos()
+        self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 3)
+        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), 4096 * 4 + 128)
+
     def test_metadata_buffer_uses_explicit_sampling_mask_capacity(self):
-        buffers = MetadataBuffers(
-            size=1,
-            hidden_size=2,
-            hidden_states_dtype=torch.float32,
-            max_sampling_mask_tokens=3,
-        )
+        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+            buffers = MetadataBuffers(
+                size=1,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=3,
+            )
         buffers.set_buf(
             self._make_req(
                 None,
@@ -411,6 +439,12 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertAlmostEqual(
             buffers.output_token_sampling_logprobs[0, 0].item(), -1.25
         )
+        ptrs, _, _ = buffers.get_buf_infos()
+        self.assertEqual(ptrs[7], buffers.output_token_sampling_mask_idx.data_ptr())
+        length, mask, logprob = buffers.get_buf(0)[6:9]
+        self.assertEqual(length[0].item(), 3)
+        self.assertEqual(mask.tolist(), [7, 8, 9])
+        self.assertAlmostEqual(logprob[0].item(), -1.25)
 
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (

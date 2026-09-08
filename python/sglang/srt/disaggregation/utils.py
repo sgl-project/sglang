@@ -336,6 +336,7 @@ class MetadataBuffers:
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
+        self.enable_sampling_mask = envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -373,15 +374,19 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
-            self.output_token_sampling_mask_len = torch.zeros(
-                (size, 16), dtype=torch.int32, device=device
-            )
-            self.output_token_sampling_mask_idx = torch.zeros(
-                (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
-            )
-            self.output_token_sampling_logprobs = torch.zeros(
-                (size, 16), dtype=torch.float32, device=device
-            )
+            self.output_token_sampling_mask_len = None
+            self.output_token_sampling_mask_idx = None
+            self.output_token_sampling_logprobs = None
+            if self.enable_sampling_mask:
+                self.output_token_sampling_mask_len = torch.zeros(
+                    (size, 16), dtype=torch.int32, device=device
+                )
+                self.output_token_sampling_mask_idx = torch.zeros(
+                    (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
+                )
+                self.output_token_sampling_logprobs = torch.zeros(
+                    (size, 16), dtype=torch.float32, device=device
+                )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
                 (size, 16), dtype=torch.float32, device=device
@@ -424,6 +429,7 @@ class MetadataBuffers:
         if self.output_dsa_topk_indices is not None:
             bufs.append(self.output_dsa_topk_indices)
         bufs.append(self.bootstrap_room)
+        bufs = [buf for buf in bufs if buf is not None]
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
         item_lens = [buf[0].nbytes for buf in bufs]
@@ -437,9 +443,21 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx].clone(),
             self.output_top_logprobs_val[idx].clone(),
             self.output_top_logprobs_idx[idx].clone(),
-            self.output_token_sampling_mask_len[idx].clone(),
-            self.output_token_sampling_mask_idx[idx].clone(),
-            self.output_token_sampling_logprobs[idx].clone(),
+            (
+                self.output_token_sampling_mask_len[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            (
+                self.output_token_sampling_mask_idx[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            (
+                self.output_token_sampling_logprobs[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
