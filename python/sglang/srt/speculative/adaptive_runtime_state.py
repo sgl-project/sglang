@@ -134,6 +134,9 @@ class AdaptiveController:
         if new_step is not None:
             self._activate(new_step)
 
+    def run_profiling(self, tree_cache, *, max_running_requests: int) -> None:
+        """Startup profiling hook; policies without profiling leave it a no-op."""
+
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)
         if state is None:

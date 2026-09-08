@@ -219,6 +219,17 @@ class Spec:
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
+    speculative_adaptive_strategy: A[
+        Literal["ema", "throughput_aware"],
+        Arg(
+            help=(
+                "Adaptive speculative decoding strategy. 'ema' uses acceptance-rate "
+                "hysteresis; 'throughput_aware' combines per-position acceptance "
+                "rates with a startup-profiled cost table."
+            ),
+            choices=["ema", "throughput_aware"],
+        ),
+    ] = "ema"
     spec_trace_dir: A[
         Optional[str], "Directory to write decoupled speculative decoding trace files."
     ] = None

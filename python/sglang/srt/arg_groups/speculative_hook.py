@@ -172,7 +172,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if cfg.speculative_adaptive:
         _maybe_disable_adaptive(server_args)
         if cfg.speculative_adaptive:
-            _init_adaptive_speculative_params(server_args)
+            if cfg.speculative_adaptive_strategy == "throughput_aware":
+                _init_throughput_aware_adaptive_params(server_args)
+            else:
+                _init_adaptive_speculative_params(server_args)
 
     if algo is not None:
         # A registered algorithm's callback lives outside this tree and sets
@@ -1125,6 +1128,49 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
         server_args,
         "_init_adaptive_speculative_params",
         speculative_num_draft_tokens=cfg.speculative_num_steps + 1,
+    )
+
+
+def _init_throughput_aware_adaptive_params(server_args: ServerArgs) -> None:
+    """Validate and resolve throughput-aware adaptive parameters."""
+    cfg = resolving_view(server_args)
+    from sglang.srt.speculative.throughput_aware_controller import (
+        resolve_throughput_aware_candidate_steps,
+    )
+
+    candidate_steps = resolve_throughput_aware_candidate_steps(
+        cfg.speculative_adaptive_config
+    )
+    if cfg.speculative_eagle_topk is None:
+        declare_resolution(
+            server_args,
+            "_init_throughput_aware_adaptive_params",
+            speculative_eagle_topk=1,
+        )
+    if cfg.speculative_num_steps is None:
+        declare_resolution(
+            server_args,
+            "_init_throughput_aware_adaptive_params",
+            speculative_num_steps=candidate_steps[len(candidate_steps) // 2],
+        )
+    if cfg.speculative_num_steps not in candidate_steps:
+        raise ValueError(
+            f"--speculative-num-steps={cfg.speculative_num_steps} is not in the "
+            f"throughput-aware config candidate_steps {candidate_steps}. "
+            "Pass one of those values."
+        )
+    declare_resolution(
+        server_args,
+        "_init_throughput_aware_adaptive_params",
+        speculative_num_draft_tokens=cfg.speculative_num_steps + 1,
+    )
+    config_source = cfg.speculative_adaptive_config or "built-in default"
+    logger.info(
+        "throughput_aware adaptive: config loaded from %s, "
+        "candidate_steps=%s, initial_steps=%s",
+        config_source,
+        candidate_steps,
+        cfg.speculative_num_steps,
     )
 
 
