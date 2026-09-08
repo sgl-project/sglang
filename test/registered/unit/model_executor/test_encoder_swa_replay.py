@@ -87,6 +87,8 @@ class _Fixture:
             can_run_decode_cuda_graph=False,
             can_run_dp_draft_cuda_graph=False,
             dp_spec_prefill_coordination_applied=False,
+            head_staged_global_num_tokens=None,
+            head_staged_global_num_tokens_for_logprob=None,
         )
         self.folded = _fold_batch(
             batch=self.batch,
