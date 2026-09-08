@@ -51,6 +51,31 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
     )
 
 
+class TestSamplingMaskMaterialization(CustomTestCase):
+    def test_packed_ids_are_copied_before_per_request_slicing(self):
+        """Non-overlap capture must not perform one device copy per request."""
+        packed_ids = Mock()
+        packed_ids.shape = (2, 3)
+        packed_ids.cpu.return_value = torch.tensor([[7, 8, 0], [9, 0, 0]])
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=SimpleNamespace(
+                token_ids=packed_ids,
+                lengths=torch.tensor([2, 1]),
+                selected_logprobs=torch.tensor([-0.5, -0.25]),
+                statuses=torch.tensor([SamplingMaskStatus.OK, SamplingMaskStatus.OK]),
+            ),
+        )
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            reqs=[SimpleNamespace(return_sampling_mask=x) for x in (True, False, True)],
+            output=output,
+        )
+        packed_ids.cpu.assert_called_once_with()
+        self.assertEqual(output.next_token_sampling_mask_idx, [[7, 8], None, [9]])
+        self.assertEqual(output.next_token_sampling_logprobs, [-0.5, None, -0.25])
+        self.assertIsNone(output.sampling_mask_output)
+
+
 class _PrefillReq:
     def __init__(self, *, rid: str, inflight_middle_chunks: int, return_hidden_states):
         self.rid = rid

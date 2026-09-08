@@ -1189,7 +1189,8 @@ class SchedulerBatchResultProcessor:
         masks = [None] * batch_size
         logprobs = [None] * batch_size
         status_by_batch = [None] * batch_size
-        packed_width = sampling_output.token_ids.shape[1]
+        token_ids = sampling_output.token_ids.cpu()
+        packed_width = token_ids.shape[1]
         for row, batch_index in enumerate(batch_indices):
             status = int(statuses[row])
             length = int(lengths[row])
@@ -1197,7 +1198,7 @@ class SchedulerBatchResultProcessor:
                 status = SamplingMaskStatus.INVALID
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
-                masks[batch_index] = sampling_output.token_ids[row, :length].tolist()
+                masks[batch_index] = token_ids[row, :length].tolist()
                 logprobs[batch_index] = float(selected_logprobs[row])
 
         output.next_token_sampling_mask_idx = masks
