@@ -30,7 +30,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
@@ -46,6 +46,37 @@ logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+class _SharedEmbedding(nn.Module):
+    """Embedding wrapper that references the target model's weight tensor.
+
+    Used when the MTP draft model's embed_tokens was not allocated
+    (PPMissingLayer due to is_nextn patch). No new GPU memory is allocated;
+    the weight is a direct reference to the target's embedding.
+    """
+
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.embedding(input_ids, self.weight)
+
+
+class _SharedHead(nn.Module):
+    """LM head wrapper that references the target model's weight tensor.
+
+    Used when the MTP draft model's lm_head was not allocated
+    (PPMissingLayer). No new GPU memory is allocated.
+    """
+
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(hidden_states, self.weight)
 
 
 def _mtp_quant_config(quant_config):
@@ -132,12 +163,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+                # Do not allocate a separate lm_head; set_embed_and_head
+                # will replace it with a reference to the target's head.
+                self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
 
@@ -157,11 +185,19 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # A last-stage draft can share only the target lm_head under PP; retain its
         # own embedding for the first-stage half it cannot receive.
         if embed is not None:
-            del self.model.embed_tokens.weight
-            self.model.embed_tokens.weight = embed
+            # embed_tokens may be PPMissingLayer (is_nextn patch skips allocation)
+            if not hasattr(self.model.embed_tokens, "weight"):
+                self.model.embed_tokens = _SharedEmbedding(embed)
+            else:
+                del self.model.embed_tokens.weight
+                self.model.embed_tokens.weight = embed
         if head is not None and not self.config.tie_word_embeddings:
-            del self.lm_head.weight
-            self.lm_head.weight = head
+            # lm_head may be PPMissingLayer (patch skips allocation)
+            if not hasattr(self.lm_head, "weight"):
+                self.lm_head = _SharedHead(head)
+            else:
+                del self.lm_head.weight
+                self.lm_head.weight = head
         current_platform.empty_cache()
         current_platform.synchronize()
 

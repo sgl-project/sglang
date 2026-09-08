@@ -1571,7 +1571,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
-        if self.pp_group.is_first_rank:
+        if is_nextn:
+            self.embed_tokens = PPMissingLayer()
+            logger.info("ignore embedding layer for Qwen3.5 draft")
+        elif self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -1651,6 +1654,13 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Final normalization
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if config.tie_word_embeddings:
+                self.lm_head = self.embed_tokens
+            else:
+                self.lm_head = PPMissingLayer()
+                logger.info(
+                    "lm_head is not tied to embed_tokens; using PPMissingLayer for draft"
+                )
         else:
             self.norm = PPMissingLayer()
 
