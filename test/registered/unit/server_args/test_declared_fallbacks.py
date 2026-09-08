@@ -10,8 +10,16 @@ purpose:
 
 * the **record** still holds `None` -- so a model family asking "did anyone set
   this?" still gets an answer, and the wire format is unchanged;
-* the **views** a resolution pass reads still answer `None` -- so a family's
-  `if cfg.x is None` fires and its declaration lands;
+* `resolving_view` -- the view a resolution pass decides on -- still answers
+  `None`, so a family's `if cfg.x is None` fires and its declaration lands.
+  This is the half that carries the design: `model_overrides/inkling.py` and
+  `deepseek_v4.py` are the only `is None` readers of either declared field, and
+  both read this view. Pinned by the family-shaped test below rather than by
+  asserting the view directly, because the shape is what has to keep working.
+  `resolved_view` is a separate class and is not pinned here -- nothing reads a
+  declared field through it, and `with_fallback` is called from exactly one
+  place (`resolution_result`), which is what makes both views answer `None`
+  without either of them knowing about fallbacks;
 * the **effective** surface -- `resolution_result`, the projection, and the
   config bags every runtime reader goes through -- answers with the fallback.
 
