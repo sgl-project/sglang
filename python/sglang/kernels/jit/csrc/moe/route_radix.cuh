@@ -10,7 +10,7 @@
 #include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
-#include <sgl_kernel/warp.cuh>   // For warp::copy_bytes, elect_one_lane, inclusive_sum
+#include <sgl_kernel/warp.cuh>   // For warp::inclusive_sum, reduce_sum
 
 #include <tvm/ffi/container/tensor.h>
 
