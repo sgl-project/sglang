@@ -281,6 +281,31 @@ def _copy_req_for_output(
     return output_req
 
 
+@dataclass(frozen=True)
+class RequestOutput:
+    """Map one final sample to its request, metrics and output filename."""
+
+    request: Req
+    request_index: int
+    sample_index: int
+    sample_count: int
+
+    def output_file_path(self):
+        return self.request.output_file_path(self.sample_count, self.sample_index)
+
+
+def map_request_outputs(requests: list[Req]) -> list[RequestOutput]:
+    outputs = []
+    for request_index, req in enumerate(requests):
+        count = req.sampling_params.num_samples_per_request
+        if count < 1:
+            raise ValueError(f"num_samples_per_request must be positive, got {count}")
+        outputs.extend(
+            RequestOutput(req, request_index, index, count) for index in range(count)
+        )
+    return outputs
+
+
 def expand_request_outputs(
     req: Req,
     *,

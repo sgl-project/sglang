@@ -47,6 +47,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    map_request_outputs,
     materialize_output_sample,
     post_process_sample,
     save_outputs,
@@ -1192,9 +1193,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if not self.is_output_rank or output_batch.output is None:
             return
-        if len(output_batch.output) != len(reqs):
+        output_requests = map_request_outputs(reqs)
+        if len(output_batch.output) != len(output_requests):
             raise RuntimeError(
-                f"Expected {len(reqs)} grouped outputs, got {len(output_batch.output)}"
+                f"Expected {len(output_requests)} grouped outputs, got {len(output_batch.output)}"
             )
 
         first_req = reqs[0]
@@ -1203,7 +1205,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             first_req.data_type,
             first_req.fps,
             True,
-            lambda idx: reqs[idx].output_file_path(1, 0),
+            lambda idx: output_requests[idx].output_file_path(),
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
             output_compression=first_req.output_compression,

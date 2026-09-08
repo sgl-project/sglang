@@ -506,6 +506,11 @@ class SamplingParams:
 
         return frozenset()
 
+    @property
+    def num_samples_per_request(self) -> int:
+        """Number of final samples produced by one expanded scheduler request."""
+        return 1
+
     @classmethod
     def default_image_output_format(cls) -> str | None:
         """Return a model-owned default format for the image API, if any."""
