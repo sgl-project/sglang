@@ -230,7 +230,7 @@ POSITIONAL_FIELD_ORDER = (
     "cuda_graph_max_bs_prefill",
     "cuda_graph_bs_decode",
     "cuda_graph_bs_prefill",
-    "cuda_graph_context_bucket_prefill",
+    "cuda_graph_prefill_context_bucket",
     "cuda_graph_tc_compiler",
     "disable_prefill_cuda_graph",
     "disable_decode_cuda_graph",

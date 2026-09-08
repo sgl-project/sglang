@@ -44,7 +44,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
             "+",
         )
         self.assertIs(
-            self.actions_by_option["--cuda-graph-context-bucket-prefill"].type,
+            self.actions_by_option["--cuda-graph-prefill-context-bucket"].type,
             human_readable_int,
         )
         self.assertIsNone(self.actions_by_option["--context-bucket"].nargs)
@@ -72,14 +72,14 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
 
     def test_context_bucket_accepts_human_readable_values(self):
         for option in (
-            "--cuda-graph-context-bucket-prefill",
+            "--cuda-graph-prefill-context-bucket",
             "--context-bucket",
         ):
             with self.subTest(option=option):
                 args = self.parser.parse_args(["--model", "dummy", option, "200k"])
 
                 self.assertEqual(
-                    ServerArgs.from_cli_args(args).cuda_graph_context_bucket_prefill,
+                    ServerArgs.from_cli_args(args).cuda_graph_prefill_context_bucket,
                     200_000,
                 )
 

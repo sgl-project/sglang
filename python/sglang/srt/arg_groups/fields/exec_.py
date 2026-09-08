@@ -475,7 +475,7 @@ class ExecGraph:
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
     ] = None
-    cuda_graph_context_bucket_prefill: A[
+    cuda_graph_prefill_context_bucket: A[
         Optional[int],
         Arg(
             help=(

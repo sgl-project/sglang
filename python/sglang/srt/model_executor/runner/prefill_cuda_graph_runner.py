@@ -893,11 +893,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return None
         if isinstance(requested_size, bool) or not isinstance(requested_size, int):
             raise ValueError(
-                "--cuda-graph-context-bucket-prefill accepts exactly one integer"
+                "--cuda-graph-prefill-context-bucket accepts exactly one integer"
             )
         if requested_size <= 0:
             raise ValueError(
-                "--cuda-graph-context-bucket-prefill must be a positive integer"
+                "--cuda-graph-prefill-context-bucket must be a positive integer"
             )
 
         page_size = int(model_runner.page_size)
@@ -907,7 +907,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         aligned = _ceil_div(requested_size, page_size) * page_size
         if aligned > max_context_len:
             raise ValueError(
-                "--cuda-graph-context-bucket-prefill exceeds the maximum "
+                "--cuda-graph-prefill-context-bucket exceeds the maximum "
                 "addressable context: "
                 f"aligned size {aligned} > {max_context_len}"
             )
@@ -990,11 +990,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and self._select_prefix_capture_chunks(max_prefix_len) is None
         )
 
-    def _shape_key(
-        self,
-        num_tokens: int,
-        forward_batch: ForwardBatch,
-    ) -> ShapeKey:
+    def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = None
         if self._capture_chunked_prefix:
             prefix_lens = forward_batch.extend_prefix_lens_cpu
@@ -1011,10 +1007,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     "prefix batch has no captured FullCG variant"
                 )
                 variant = _chunked_prefix_variant(captured_n)
-        return ShapeKey(
-            size=num_tokens,
-            variant_label=variant,
-        )
+        return ShapeKey(size=num_tokens, variant_label=variant)
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
@@ -1555,12 +1548,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         prefix_num_chunks=captured_n,
                     )
 
-    def capture_one_shape(
-        self,
-        size: int,
-        *,
-        prefix_num_chunks: int = 0,
-    ) -> None:
+    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
