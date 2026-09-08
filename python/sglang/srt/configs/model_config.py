@@ -151,6 +151,14 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def is_glm_moe_dsa(config) -> bool:
+    """True for GLM-5.2, both the main arch and the NextN draft head."""
+    return _hf_arch(config) in (
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
+    )
+
+
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
@@ -682,7 +690,6 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
-
         cfg = resolving_view(server_args)
         quantization = (
             cfg.speculative_draft_model_quantization
@@ -2239,7 +2246,6 @@ def is_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
 ):
-
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
         "DeepseekV4ForCausalLM",
