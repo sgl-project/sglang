@@ -579,12 +579,8 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             )
         import torch_npu
 
-        if self.is_npu_arch35 or hasattr(torch_npu, "npu_mla_prolog_v3"):
-            prolog = torch_npu.npu_mla_prolog_v3
-        else:
-            prolog = torch.ops.custom.npu_mla_prolog_v3
-        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = prolog(
-            **mla_prolog_input_args
+        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = (
+            torch_npu.npu_mla_prolog_v3(**mla_prolog_input_args)
         )
         if self.weight_quant_mode == 0:
             dequant_q_norm = None

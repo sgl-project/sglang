@@ -258,7 +258,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             )
                             if use_c8
                             else (
-                                model_config.kv_lora_rank + model_config.qk_rope_head_dim
+                                model_config.kv_lora_rank
+                                + model_config.qk_rope_head_dim
                             )
                             * torch._utils._element_size(draft_dtype)
                         )
@@ -274,7 +275,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         )
 
                         target_kv_num_layers = (
-                            get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
+                            get_glm_dsa_layer_split_effective_num_layers(
+                                kvc, num_layers
+                            )
                         )
                         draft_kv_size = int(
                             target_kv_size * draft_num_layers / target_kv_num_layers

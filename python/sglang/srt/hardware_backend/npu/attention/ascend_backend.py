@@ -310,6 +310,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
@@ -1143,7 +1144,7 @@ class AscendAttnBackend(AttentionBackend):
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+            if self.kv_cache_dtype == torch.float8_e4m3fn:
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16
                 packed = k_nope.view(torch.float8_e4m3fn)
                 attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
