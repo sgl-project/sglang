@@ -2450,6 +2450,30 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
+    def test_partial_match_keeps_unmatched_suffix_lru_position(self):
+        if not self.cfg.has_swa and not self.cfg.has_mamba:
+            self.skipTest("requires an aux LRU")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cold_tokens = self._make_seq(1, 2)
+        hot_tokens = self._make_seq(100, 2)
+        cold = self._insert(cache, allocator, req_to_token_pool, cold_tokens)
+        hot = self._insert(cache, allocator, req_to_token_pool, hot_tokens)
+
+        cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", cold_tokens[: self.cfg.page_size]))
+            )
+        )
+
+        for ct in self.cfg.components:
+            if ct == ComponentType.FULL:
+                continue
+            order = cache.tree_core.get_component_device_lru_node_ids(ct)
+            self.assertLess(
+                order.index(hot.last_device_node), order.index(cold.last_device_node)
+            )
+        cache.sanity_check()
+
     def test_swa_lru_match_only_refreshes_window_cushion(self):
         if not self._swa_pinning_cfg_supported():
             self.skipTest("requires SWA-only config with node size >= cushion")

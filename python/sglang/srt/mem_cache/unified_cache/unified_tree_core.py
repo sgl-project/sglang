@@ -229,6 +229,12 @@ class UnifiedLRUList:
         self.cache[node.id] = node
         self._add_node(node)
 
+    def insert_after(self, prev_node: UnifiedTreeNode, node: UnifiedTreeNode):
+        assert prev_node.id in self.cache
+        assert node.id not in self.cache
+        self.cache[node.id] = node
+        self._add_node_after(prev_node, node)
+
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
         del self.cache[node.id]
@@ -1187,8 +1193,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
 
-        self._for_each_component_lru(child, UnifiedLRUList.remove_node)
-
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.hash_value, child.hash_value = split_node_hash_value(
@@ -1214,11 +1218,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 new_child_node_id=child.id,
             )
 
+        # Splitting does not access the suffix; retain its recency and place
+        # the inherited prefix beside it, in the same session partition.
         self._for_each_component_lru(
-            new_node, UnifiedLRUList.insert_mru, skip_existing=True
-        )
-        self._for_each_component_lru(
-            child, UnifiedLRUList.insert_mru, skip_existing=True
+            new_node,
+            lambda lru, node: lru.insert_after(child, node),
+            skip_existing=True,
         )
         child.last_access_time = get_and_increase_time_counter()
 
