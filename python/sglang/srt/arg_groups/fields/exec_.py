@@ -628,6 +628,10 @@ class ExecMoe(msgspec.Struct):
         fn="sglang.srt.arg_groups.model_override_base.ep_scale_joiner_of",
         doc="Whether it is a scale-up joiner specifically.",
     )
+    is_ep_offset_joiner = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.ep_offset_joiner_of",
+        doc="Whether it takes a specific global rank (scale, or recover at offset > 0).",
+    )
     enable_fused_moe_sum_all_reduce: A[
         bool,
         "Enable fused moe triton and sum all reduce.",
@@ -777,6 +781,12 @@ class ExecMoe(msgspec.Struct):
     elastic_ep_scale_timeout: A[
         float, "Timeout in seconds for a pending elastic EP scale operation."
     ] = 600
+    elastic_ep_retiree_lifecycle: A[
+        Literal["self_exit", "external"],
+        "Who ends a retired rank's process. 'self_exit' exits it once local cleanup "
+        "finishes. 'external' parks it instead, so an orchestrator can terminate it "
+        "after /is_scaling_elastic_ep reports the survivors committed.",
+    ] = "self_exit"
     elastic_ep_rejoin: A[
         bool,
         "[Deprecated] Alias for --elastic-ep-join-mode recover.",

@@ -480,6 +480,8 @@ def _make_tm_for_generate(case) -> TokenizerManager:
     tm.tokenizer = None
     tm.is_pause = False
     tm.is_pause_cond = asyncio.Condition()
+    tm._elastic_shrink_pause_event = asyncio.Event()
+    tm._elastic_shrink_pause_event.set()
     tm.model_update_lock = Mock()
     tm.model_update_lock.reader_lock = _DummyAsyncCM()
     tm._validate_and_resolve_lora = AsyncMock(return_value=None)

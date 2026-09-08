@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.arg_groups.model_override_base import (
-    ep_scale_joiner_of,
+    ep_offset_joiner_of,
     resolving_view,
 )
 from sglang.srt.distributed import (
@@ -400,7 +400,9 @@ def initialize_dp_attention(
         # `_init_distributed` -- and other callers reach it from processes
         # whose publish is not guaranteed to have happened yet. (The daemon
         # itself publishes first, at `daemon.py:284`, before `:320`.)
-        if ep_scale_joiner_of(resolving_view(server_args)):
+        # The offset arm also covers a recover joiner taking a retired slot,
+        # which skips the all-gather too.
+        if ep_offset_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
     _DpGatheredBufferWrapper.set_metadata(

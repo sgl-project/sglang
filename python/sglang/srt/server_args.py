@@ -53,7 +53,7 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
 )
-from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
+from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_offset_joiner_of
 from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
     resolution_result,
@@ -841,7 +841,8 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + cfg.dp_size
-            if ep_scale_joiner_of(resolving_view(server_args)):
+            if ep_offset_joiner_of(resolving_view(server_args)):
+                # Offset joiners co-locate with the primary; offset to avoid collision.
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
