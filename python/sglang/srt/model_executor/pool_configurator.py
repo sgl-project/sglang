@@ -229,9 +229,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
-        # Assumes draft and target share the same per-layer KV size (head_dim,
-        # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
-        # reuse the target architecture's attention config.
+        # Assumes draft and target share the same per-layer KV size, except
+        # that NPU DSA accounts for the draft's independently configured KV dtype.
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
@@ -242,50 +241,49 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
-                if _is_npu and is_deepseek_dsa(kvc.model_config.hf_config):
-                    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-                    from sglang.srt.mem_cache.kv_cache_configurator import (
-                        calculate_mla_kv_cache_dim,
-                    )
-
-                    draft_dtype = kvc.spec_aux_config.eagle_draft_kv_cache_dtype
-                    model_config = kvc.model_config
-                    use_c8 = draft_dtype == torch.float8_e4m3fn and is_npu_arch35()
-                    draft_main_bytes = (
-                        calculate_mla_kv_cache_dim(
-                            model_config=model_config, kv_cache_dtype=draft_dtype
+                if is_deepseek_dsa(kvc.model_config.hf_config):
+                    draft_dtype = None
+                    if _is_npu:
+                        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+                        from sglang.srt.mem_cache.kv_cache_configurator import (
+                            calculate_mla_kv_cache_dim,
                         )
-                        if use_c8
-                        else (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                        * torch._utils._element_size(draft_dtype)
-                    )
-                    self._cell_size += draft_num_layers * draft_main_bytes
-                    self._cell_size += self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=draft_num_layers,
-                        allocate_all_layers=True,
-                        kv_cache_dtype=draft_dtype,
-                    )
-                elif is_deepseek_dsa(kvc.model_config.hf_config):
-                    target_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=num_layers,
-                    )
-                    target_kv_size = self._cell_size - target_indexer_size
-                    from sglang.srt.layers.cp.utils import (
-                        get_glm_dsa_layer_split_effective_num_layers,
-                    )
 
-                    target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-                        kvc, num_layers
-                    )
-                    draft_kv_size = int(
-                        target_kv_size * draft_num_layers / target_kv_num_layers
-                    )
+                        draft_dtype = kvc.spec_aux_config.eagle_draft_kv_cache_dtype
+                        model_config = kvc.model_config
+                        use_c8 = draft_dtype == torch.float8_e4m3fn and is_npu_arch35()
+                        draft_main_bytes = (
+                            calculate_mla_kv_cache_dim(
+                                model_config=model_config, kv_cache_dtype=draft_dtype
+                            )
+                            if use_c8
+                            else (
+                                model_config.kv_lora_rank + model_config.qk_rope_head_dim
+                            )
+                            * torch._utils._element_size(draft_dtype)
+                        )
+                        draft_kv_size = draft_num_layers * draft_main_bytes
+                    else:
+                        target_indexer_size = self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=num_layers,
+                        )
+                        target_kv_size = self._cell_size - target_indexer_size
+                        from sglang.srt.layers.cp.utils import (
+                            get_glm_dsa_layer_split_effective_num_layers,
+                        )
+
+                        target_kv_num_layers = (
+                            get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
+                        )
+                        draft_kv_size = int(
+                            target_kv_size * draft_num_layers / target_kv_num_layers
+                        )
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
+                        kv_cache_dtype=draft_dtype,
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
