@@ -1,7 +1,7 @@
 from typing import List, Union
 
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
-from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM
+from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM, _is_ocr2
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -12,15 +12,11 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
     models = [DeepseekOCRForCausalLM]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        _processor.image_size = 640
-        _processor.ocr2_mode = (
-            str(
-                getattr(getattr(hf_config, "vision_config", None), "model_name", "")
-            ).lower()
-            == "deepencoderv2"
-            or getattr(getattr(hf_config, "projector_config", None), "input_dim", None)
-            == 896
-        )
+        # OCR-2 runs 768px local crops (144 query_768 tokens each); OCR-1 uses 640.
+        # The checkpoints only declare candidate_resolutions=[[1024, 1024]] (the
+        # global base), so the local crop size is not derivable from the config.
+        _processor.ocr2_mode = _is_ocr2(hf_config)
+        _processor.image_size = 768 if _processor.ocr2_mode else 640
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<image>", image_token_id=self._processor.image_token_id
