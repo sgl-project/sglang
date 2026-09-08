@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
 
 
@@ -129,9 +129,9 @@ class _FakeExternalTreeCore:
 
     def finish_external_linker_offload(self, node_ids, ack_id, success):
         nodes = [self.nodes[node_id] for node_id in node_ids]
-        assert all(
-            node.write_through_pending_id == ack_id for node in nodes
-        ), "invalid external offload state"
+        assert all(node.write_through_pending_id == ack_id for node in nodes), (
+            "invalid external offload state"
+        )
         for node in nodes:
             node.write_through_pending_id = None
             node.external_cache_stored |= success

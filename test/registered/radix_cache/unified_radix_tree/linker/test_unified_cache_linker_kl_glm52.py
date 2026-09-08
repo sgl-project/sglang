@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
     find_available_port,
     popen_launch_server,
     terminate_and_kill_process_tree,
+    unified_radix_tree_server_env,
 )
 
 GLM52_MODEL = os.environ.get("SGLANG_LINKER_GLM52_MODEL", "zai-org/GLM-5.2-FP8")
@@ -22,6 +23,7 @@ register_cuda_ci(est_time=383, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
+    tree_core_backend = "python"
     page_size = 64
     kl_threshold = 0.03
     sampling_temperature = 0
@@ -61,10 +63,10 @@ class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
                     "--hicache-storage-backend-extra-config",
                     json.dumps({"enable_group_semantics": True}),
                 ],
-                env={
+                env=unified_radix_tree_server_env(
+                    cls.tree_core_backend,
                     **cls.mooncake.server_env(),
-                    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-                },
+                ),
             )
             cls.input_ids = get_input_ids(cls.model, num_samples=18)
         except Exception:
