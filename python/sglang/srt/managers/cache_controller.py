@@ -811,7 +811,7 @@ class HiCacheController:
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
         # Rejoin the D2H stream onto the current scheduler stream so subsequent
-        # forward work cannot overtake the backup. Event waits are host-asynchronous.
+        # forward work starts only after this KV cache transfer completes.
         completion.finish_event.wait()
 
         self.ack_write_queue.append(
