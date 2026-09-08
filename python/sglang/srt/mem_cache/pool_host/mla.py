@@ -259,9 +259,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
         device_indices = self.maybe_dcp_kernel_indices(device_indices)
-        # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        device_layer_id = 0 if is_draft else layer_id
+        if is_draft:
+            # MTP draft layers do not participate in CP layer sharding.
+            # Place the draft offset after the padded local target layers.
+            host_layer_id = self.target_layer_num + (
+                layer_id - self.device_pool.layer_num
+            )
+            device_layer_id = 0
+        else:
+            host_layer_id = self._host_layer_index(layer_id)
+            device_layer_id = layer_id
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -354,9 +361,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         is_draft: bool = False,
     ):
         # Indices arrive already translated by backup_from_device_all_layer.
-        # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        device_layer_id = 0 if is_draft else layer_id
+        if is_draft:
+            # MTP draft layers do not participate in CP layer sharding.
+            # Place the draft offset after the padded local target layers.
+            host_layer_id = self.target_layer_num + (
+                layer_id - self.device_pool.layer_num
+            )
+            device_layer_id = 0
+        else:
+            host_layer_id = self._host_layer_index(layer_id)
+            device_layer_id = layer_id
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
