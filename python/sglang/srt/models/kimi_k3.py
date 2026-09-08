@@ -1193,11 +1193,19 @@ class KimiK3MoE(nn.Module):
                 shared.down_proj.weight, torch.Tensor
             )
         assert shared is not None
+        shared_act = shared.act_fn(gate_up)
         _k3_bf16_gemm(
-            shared.act_fn(gate_up),
+            shared_act,
             shared.down_proj.weight,
             out=shared_output,
         )
+        from sglang.srt.lora.layers import BaseLayerWithLoRA
+
+        down_proj = shared.down_proj
+        if isinstance(down_proj, BaseLayerWithLoRA) and down_proj.lora_active:
+            # the base GEMM bypassed the wrapper; LoRA B must land in the same buffer the tail add reads
+            lora_output = down_proj.apply_lora(shared_output, shared_act)
+            assert lora_output.data_ptr() == shared_output.data_ptr()
 
     def _get_fused_norm_params(self) -> tuple[torch.Tensor, float]:
         norm = self.routed_expert_norm
@@ -1233,6 +1241,12 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
+        from sglang.srt.lora.layers import BaseLayerWithLoRA
+
+        gate_up_proj = self.shared_experts.gate_up_proj
+        if isinstance(gate_up_proj, BaseLayerWithLoRA) and gate_up_proj.lora_active:
+            # the merged front GEMM read the base shared weight through the wrapper; add its delta
+            gate_up = gate_up_proj.apply_lora(gate_up.contiguous(), hidden_states)
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
