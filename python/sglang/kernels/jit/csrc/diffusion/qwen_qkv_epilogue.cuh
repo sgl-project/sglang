@@ -58,17 +58,15 @@ __global__ void qwen_qkv_epilogue_kernel(const Params __grid_constant__ params) 
   const uint32_t start = blockIdx.x * kWarps + warp;
   const uint32_t workers = gridDim.x * kWarps;
   const uint32_t total_tokens = params.txt_tokens + params.img_tokens;
-  const uint32_t token_head_works = total_tokens * params.num_heads;
+  const uint32_t kind = blockIdx.y;  // Q, K, and V have independent grids.
+  const bool is_value = kind == 2;
   const uint32_t v_heads = div_ceil(params.num_heads, uint32_t(2));
-  const uint32_t total_works = 2 * token_head_works + total_tokens * v_heads;
+  const uint32_t heads_per_token = is_value ? v_heads : params.num_heads;
+  const uint32_t total_works = total_tokens * heads_per_token;
 
   for (uint32_t work = start; work < total_works; work += workers) {
-    const bool is_value = work >= 2 * token_head_works;
-    const uint32_t kind = is_value ? 2 : work / token_head_works;
-    const uint32_t token_head = is_value ? work - 2 * token_head_works : work % token_head_works;
-    const uint32_t heads_per_token = is_value ? v_heads : params.num_heads;
-    const uint32_t joint_token = token_head / heads_per_token;
-    const uint32_t head = (token_head % heads_per_token) * (is_value ? 2 : 1);
+    const uint32_t joint_token = work / heads_per_token;
+    const uint32_t head = (work % heads_per_token) * (is_value ? 2 : 1);
     const bool is_text = joint_token < params.txt_tokens;
     const uint32_t source_token = is_text ? joint_token : joint_token - params.txt_tokens;
 
@@ -238,7 +236,7 @@ struct QwenQKVEpilogueKernel {
     const uint32_t img_tokens = static_cast<uint32_t>(NI.unwrap());
     const uint32_t txt_tokens = static_cast<uint32_t>(NT.unwrap());
     const uint32_t num_heads = static_cast<uint32_t>(H.unwrap());
-    const uint32_t total_works = (img_tokens + txt_tokens) * (2 * num_heads + div_ceil(num_heads, uint32_t(2)));
+    const uint32_t total_works = (img_tokens + txt_tokens) * num_heads;
     if (total_works == 0) return;
 
     const int64_t head_stride_bytes = kHeadDim * sizeof(bf16_t);
@@ -274,7 +272,7 @@ struct QwenQKVEpilogueKernel {
     static const uint32_t blocks_per_sm = runtime::get_blocks_per_sm(qwen_qkv_epilogue_kernel, kThreads);
     const uint32_t needed_blocks = div_ceil(total_works, uint32_t(kWarps));
     const uint32_t blocks = std::min(blocks_per_sm * sm_count, needed_blocks);
-    LaunchKernel(blocks, kThreads, device.unwrap())(qwen_qkv_epilogue_kernel, params);
+    LaunchKernel(dim3(blocks, 3), kThreads, device.unwrap())(qwen_qkv_epilogue_kernel, params);
   }
 };
 
