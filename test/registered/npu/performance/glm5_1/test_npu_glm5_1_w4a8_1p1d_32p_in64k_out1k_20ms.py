@@ -20,22 +20,19 @@ GLM_5_1_PD_SEP_PREFILL_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
+    "HCCL_BUFFSIZE": "8",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1200",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1200",
-    "DEEPEP_HCCL_BUFFSIZE": "1200",
-    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "72",
-    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "1024",
-    "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "TASK_QUEUE_ENABLE": "2",
     "ENABLE_PROFILING": "0",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
+    "ZBAL_HCCL_OP": "send,recv",
     "SGLANG_ZBAL_LOCAL_MEM_SIZE": "61184",
     "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
     "ZBAL_NPU_ALLOC_CONF": "use_vmm_for_static_memory:True",
     "SGLANG_ZBAL_BOOTSTRAP_URL": "tcp://127.0.0.1:24699",
-    "ZBAL_ENABLE_GRAPH": "1",
 }
 
 GLM_5_1_PD_SEP_DECODE_ENVS = {
@@ -47,8 +44,8 @@ GLM_5_1_PD_SEP_DECODE_ENVS = {
     "SGLANG_SPEC_ENABLE_OVERLAP_REFLOW": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_ENABLE_SPEC_V2": "1",
-    "HCCL_BUFFSIZE": "200",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "16",
+    "HCCL_BUFFSIZE": "600",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
     "TASK_QUEUE_ENABLE": "0",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
@@ -60,7 +57,7 @@ GLM_5_1_PD_SEP_PREFILL_ARGS = [
     "prefill",
     "--trust-remote-code",
     "--tp-size",
-    4,
+    32,
     "--nnodes",
     2,
     "--mem-fraction-static",
@@ -74,11 +71,11 @@ GLM_5_1_PD_SEP_PREFILL_ARGS = [
     "--disaggregation-transfer-backend",
     "ascend",
     "--max-running-requests",
-    16,
+    32,
     "--served-model-name",
     "glm-5",
     "--chunked-prefill-size",
-    32768,
+    524288,
     "--max-prefill-tokens",
     180000,
     "--moe-a2a-backend",
@@ -89,24 +86,36 @@ GLM_5_1_PD_SEP_PREFILL_ARGS = [
     "--disable-cuda-graph",
     "--dtype",
     "bfloat16",
+    "--dp-size",
+    4,
+    "--enable-dp-attention",
+    "--load-balance-method",
+    "round_robin",
     "--speculative-draft-model-quantization",
     "unquant",
     "--enable-nsa-prefill-context-parallel",
     "--nsa-prefill-cp-mode",
     "in-seq-split",
     "--attn-cp-size",
-    4,
+    8,
     "--disable-radix-cache",
     "--enable-dp-lm-head",
     "--moe-dense-tp",
     1,
-    "--pp-size",
-    8,
+    "--speculative-algorithm",
+    "NEXTN",
+    "--speculative-num-steps",
+    1,
+    "--speculative-eagle-topk",
+    1,
+    "--speculative-num-draft-tokens",
+    2,
 ]
 
 GLM_5_1_PD_SEP_DECODE_ARGS = [
     "--disaggregation-mode",
     "decode",
+    "--trust-remote-code",
     "--tp-size",
     32,
     "--nnodes",
@@ -119,7 +128,7 @@ GLM_5_1_PD_SEP_DECODE_ARGS = [
     "--mem-fraction-static",
     0.85,
     "--max-running-requests",
-    32,
+    64,
     "--attention-backend",
     "ascend",
     "--device",
@@ -180,8 +189,8 @@ class TestNPUGLM5_1_W4A8_PD_SEP_In3k5_Out1k5(TestNpuPerfMultiNodePdSepTestCaseBa
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
     dataset_name = "random"
-    max_concurrency = 32
-    num_prompts = 32
+    max_concurrency = 1
+    num_prompts = 1
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1

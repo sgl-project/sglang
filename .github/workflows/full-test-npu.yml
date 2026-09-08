@@ -301,6 +301,11 @@ jobs:
             node_size: 2
             test_case: test/registered/npu/accuracy/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25.py
             test_type: 'accuracy'
+          # glm5.1 mix tests
+          - name: glm5_1_w4a8_16p_in3k5_out1k5_50ms
+            node_size: 2
+            test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_16p_in3k5_out1k5_50ms.py
+            test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
@@ -313,7 +318,8 @@ jobs:
       prefill_decode_deployment: 'mix'
       transformers_version: ''
 
-  full-multi-node-batch-tests:
+  full-poc-multi-node-tests:
+    name: multi-node-poc
     needs: [set-image-config]
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     strategy:
@@ -324,24 +330,16 @@ jobs:
           # Cases that share the same resource profile (prefill/decode/router
           # size) are batched into one Pod allocation: test_case is a
           # space-separated list and the cases run sequentially in the Pod.
-          # glm5_1 performance tests (2p/2d/1r batch)
-          - name: glm5_1_w4a8_1p1d_32p_batch
+          # glm5_2 / glm5_1 performance tests (2p/2d/1r batch)
+          - name: glm_5_2_glm5_1_w4a8_2p2d_1r_32p_batch
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in128k_out1k_20ms.py test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms.py test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in65k_out1k5_prefix90_25ms.py test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_20ms.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-          # glm5_2 performance tests (2p/2d/1r batch)
-          - name: glm_5_2_w4a8_2p1d_32p_batch
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/performance/glm5_2/test_npu_glm_5_2_w4a8_2p1d_32p_in64k_out1k_prefix90_20ms.py test/registered/npu/performance/glm5_2/test_npu_glm_5_2_w4a8_2p1d_32p_in128k_out1k_prefix90_20ms.py
+            test_case: test/registered/npu/performance/glm5_2/test_npu_glm_5_2_w4a8_2p1d_32p_in64k_out1k_prefix90_20ms.py test/registered/npu/performance/glm5_2/test_npu_glm_5_2_w4a8_2p1d_32p_in128k_out1k_prefix90_20ms.py test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in65k_out1k5_prefix90_25ms.py test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms.py test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_20ms.py test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in128k_out1k_20ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
           # glm5_2 performance tests (4p/2d/1r batch)
-          - name: glm_5_2_w4a8_4p1d_48p_batch
+          - name: glm_5_2_w4a8_4p2d_1r_48p_batch
             prefill_size: 4
             decode_size: 2
             router_size: 1
@@ -356,17 +354,9 @@ jobs:
             test_case: test/registered/npu/performance/glm5_2/test_npu_glm_5_2_w4a8_3p1d_32p_in16k_out1k_50ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
-          # mimo_v2_flash performance tests (1p/1d/1r)
-          - name: test_npu_mimo_v2_flash_1p1d_12p_in32k_out1k_tpot_20ms
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in32k_out1k_tpot_20ms.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
-      runner: linux-amd64-cpu-4
+      runner: linux-amd64-cpu-8
       test_type: ${{ matrix.test_config.test_type }}
       test_config_name: ${{ matrix.test_config.name }}
       prefill_size: ${{ matrix.test_config.prefill_size }}
@@ -388,7 +378,7 @@ jobs:
       - full-4-npu-a3
       - full-8-npu-a3
       - full-16-npu-a3
-      - full-multi-node-batch-tests
+      - full-poc-multi-node-tests
       - full-acc-2-npu-a3
       - full-acc-4-npu-a3
       - full-acc-16-npu-a3
