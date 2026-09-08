@@ -234,7 +234,14 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
     otherwise the fused reduce covers half the peers and silently under-reduces.
     """
 
-    def _should_fuse(self, *, moe_ep_size, moe_tp_size, moe_dp_size=1):
+    def _should_fuse(
+        self,
+        *,
+        moe_ep_size,
+        moe_tp_size,
+        moe_dp_size=1,
+        mlp_mode=ScatterMode.TP_ATTN_FULL,
+    ):
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(8,))
         )
