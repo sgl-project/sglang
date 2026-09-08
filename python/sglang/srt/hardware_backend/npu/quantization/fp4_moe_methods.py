@@ -127,7 +127,7 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
             backend = MoeRunnerBackend.ASCEND
         if not backend.is_ascend():
             raise ValueError(
-                "NPU W4A8 MXFP4 requires the Ascend MoE runner, " f"got {backend.value}"
+                f"NPU W4A8 MXFP4 requires the Ascend MoE runner, got {backend.value}"
             )
 
         layer.w13_kernel = self.w13_kernel
