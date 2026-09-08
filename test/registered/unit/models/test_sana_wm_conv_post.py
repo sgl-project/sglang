@@ -125,6 +125,17 @@ class TestSanaWMConvPost(CustomTestCase):
             fused.assert_not_called()
         self.assertTrue(torch.equal(actual, expected))
 
+    def test_grad_enabled_uses_differentiable_reference(self):
+        module = wm.GLUMBConvTemp(32, 96).cuda().bfloat16()
+        x = torch.randn(
+            2, 32, 7, 11, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with patch.object(wm, "fused_bias_silu") as fused:
+            actual = module._spatial_glu(x)
+            actual.float().sum().backward()
+            fused.assert_not_called()
+        self.assertIsNotNone(x.grad)
+
 
 if __name__ == "__main__":
     unittest.main()

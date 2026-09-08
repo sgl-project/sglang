@@ -1054,6 +1054,7 @@ class GLUMBConvTemp(nn.Module):
             and x.dtype is torch.bfloat16
             and x.is_contiguous()
             and x.numel() > 0
+            and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
         ):
             conv = self.inverted_conv.conv
