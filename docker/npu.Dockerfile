@@ -55,6 +55,7 @@ RUN apt-get update -y && apt upgrade -y && apt-get install -y \
     clang \
     locales \
     ccache \
+    ffmpeg \
     openssl \
     libssl-dev \
     pkg-config \
@@ -70,12 +71,6 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-
-### Install MemFabric
-RUN ${PIP_INSTALL} memfabric-hybrid==1.0.8
-
-### Install zbal
-RUN ${PIP_INSTALL} memfabric-zbal==1.2.0
 
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router
@@ -115,7 +110,7 @@ RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
     && cd sgl-kernel-npu \
     && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
     && unzip sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
-    && ${PIP_INSTALL} deep_ep*.whl sgl_kernel_npu*.whl \
+    && ${PIP_INSTALL} deep_ep*.whl sgl_kernel_npu*.whl attentions*.whl \
     && cd .. && rm -rf sgl-kernel-npu \
     && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
 

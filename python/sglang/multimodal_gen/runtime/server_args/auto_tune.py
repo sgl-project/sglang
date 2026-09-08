@@ -4,11 +4,16 @@ ServerArgsAutoTuner tunes the ServerArgs based on the desired performance mode
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+    has_realtime_model_adapter,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
@@ -26,6 +31,49 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
+    """Return why args cannot use warmup-calibrated residency."""
+    if envs.SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY:
+        return "disabled via SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
+    if server_args.performance_mode != "auto":
+        return f"performance_mode={server_args.performance_mode}"
+    if (
+        server_args.pipeline_class_name == "LTX2TwoStagePipeline"
+        and server_args.ltx2_two_stage_device_mode is None
+    ):
+        return "legacy LTX-2 two-stage placement"
+    if server_args.ltx2_two_stage_device_mode == "original":
+        return "LTX-2 original two-stage placement"
+    if (
+        server_args.warmup_mode != "server"
+        or server_args.disagg_role != RoleType.MONOLITHIC
+    ):
+        return "no synthetic server warmup to calibrate from"
+    task_type = server_args.pipeline_config.task_type
+    if not (task_type.is_visual_gen() or task_type.is_mesh_gen()):
+        return "no synthetic server warmup to calibrate from"
+    if not server_args.pipeline_config.supports_auto_residency:
+        return "pipeline does not support post-warmup residency changes"
+    if has_realtime_model_adapter(server_args):
+        return "realtime serving has no representative synthetic warmup"
+    if server_args.backend == "diffusers":
+        return "diffusers backend"
+    if server_args.enable_breakable_cuda_graph:
+        return "breakable CUDA graph captures during warmup"
+    if server_args.enable_torch_compile:
+        # Compile warmup temporarily evicts resident auxiliaries and may
+        # layerwise-offload the DiT, so its peak is not a serving peak.
+        return "torch.compile warmup uses a stripped memory layout"
+    if envs.SGLANG_CACHE_DIT_ENABLED:
+        return "cache-dit enabled"
+    if server_args.batching_max_size > 1:
+        return "dynamic batching enabled"
+    if not current_platform.is_cuda():
+        return "requires CUDA"
+    return None
+
+
 PERFORMANCE_MODES = ("manual", "auto", "speed", "memory")
 
 DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
@@ -41,15 +89,34 @@ IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
 DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
 
 
+# torch's CPU allocator (mimalloc since 2.13) keeps freed pages in its arenas
+# and backs them with transparent huge pages, so the fused-weight copies the
+# loader frees once a component is promoted stayed resident: 18.2 GiB of
+# anonymous memory on a GB10 after the DiT went resident, 5.0 GiB with these.
+# Read at process start, so they are set for the workers to inherit; a torch
+# without mimalloc ignores them.
+SHARED_POOL_CPU_ALLOCATOR_DEFAULTS = {
+    "MIMALLOC_PURGE_DELAY": "0",
+    "MIMALLOC_ALLOW_LARGE_OS_PAGES": "0",
+}
+
+
+def apply_shared_pool_cpu_allocator_defaults(environ) -> list[str]:
+    """Set the CPU allocator defaults not already chosen; return the names set."""
+    applied = []
+    for name, value in SHARED_POOL_CPU_ALLOCATOR_DEFAULTS.items():
+        if name not in environ:
+            environ[name] = value
+            applied.append(name)
+    return applied
+
+
 class ServerArgsAutoTuner:
     """Auto-tunes the server-arg for the given performance-mode, based on practical deployment experience with different model architectures"""
 
     def __init__(self, server_args: ServerArgs):
         self.server_args = server_args
-        self._explicit_memory_policy = self._has_explicit_memory_policy()
-        self._explicit_layerwise_replacement_policy = (
-            self._has_explicit_layerwise_replacement_policy()
-        )
+        self._explicit_dit_residency = self._has_explicit_dit_residency()
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
@@ -127,12 +194,9 @@ class ServerArgsAutoTuner:
         if args.performance_mode != "auto" or current_platform.is_cpu():
             return
 
-        # Explicitness is component-scoped below.  For example, explicitly
-        # disabling DiT layerwise offload must not freeze an unrelated,
-        # implicit ``dit_cpu_offload=True`` default on a high-memory GPU.
-        # Each mutation below already preserves its own explicit CLI flag.
+        # Explicit placement is component-scoped; unmatched components still
+        # receive automatic defaults.
 
-        explicit_cpu_components = args.is_arg_explicitly_set("cpu_offload_components")
         explicit_layerwise_components = (
             normalize_layerwise_offload_components(args.layerwise_offload_components)
             if args.is_arg_explicitly_set("layerwise_offload_components")
@@ -180,8 +244,9 @@ class ServerArgsAutoTuner:
             if (
                 args.dit_cpu_offload
                 and "dit" in components
+                and args.explicit_residency_mode("transformer") is None
                 and not args.is_arg_explicitly_set("dit_cpu_offload")
-                and not explicit_cpu_components
+                and not args.is_arg_explicitly_set("dit_layerwise_offload")
                 and not explicit_dit_layerwise
             ):
                 args.dit_cpu_offload = False
@@ -189,24 +254,21 @@ class ServerArgsAutoTuner:
             if (
                 args.text_encoder_cpu_offload
                 and LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in components
-                and not args.is_arg_explicitly_set("text_encoder_cpu_offload")
-                and not explicit_cpu_components
+                and args.explicit_residency_mode("text_encoder") is None
             ):
                 args.text_encoder_cpu_offload = False
                 changed.append("text_encoder_cpu_offload=False")
             if (
                 args.image_encoder_cpu_offload
                 and LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in components
-                and not args.is_arg_explicitly_set("image_encoder_cpu_offload")
-                and not explicit_cpu_components
+                and args.explicit_residency_mode("image_encoder") is None
             ):
                 args.image_encoder_cpu_offload = False
                 changed.append("image_encoder_cpu_offload=False")
             if (
                 args.vae_cpu_offload
                 and LAYERWISE_OFFLOAD_VAE_GROUP in components
-                and not args.is_arg_explicitly_set("vae_cpu_offload")
-                and not explicit_cpu_components
+                and args.explicit_residency_mode("vae") is None
             ):
                 args.vae_cpu_offload = False
                 changed.append("vae_cpu_offload=False")
@@ -235,14 +297,21 @@ class ServerArgsAutoTuner:
 
         # high-memory resident mode keeps both DiTs on GPU; unset auxiliary
         # placement should stay resident instead of using default layerwise
-        for arg_name in (
-            "text_encoder_cpu_offload",
-            "image_encoder_cpu_offload",
-            "vae_cpu_offload",
+        if (
+            args.text_encoder_cpu_offload
+            and args.explicit_residency_mode("text_encoder") is None
         ):
-            if getattr(args, arg_name) and not args.is_arg_explicitly_set(arg_name):
-                setattr(args, arg_name, False)
-                changed.append(f"{arg_name}=False")
+            args.text_encoder_cpu_offload = False
+            changed.append("text_encoder_cpu_offload=False")
+        if (
+            args.image_encoder_cpu_offload
+            and args.explicit_residency_mode("image_encoder") is None
+        ):
+            args.image_encoder_cpu_offload = False
+            changed.append("image_encoder_cpu_offload=False")
+        if args.vae_cpu_offload and args.explicit_residency_mode("vae") is None:
+            args.vae_cpu_offload = False
+            changed.append("vae_cpu_offload=False")
 
         if changed:
             logger.info(
@@ -255,7 +324,7 @@ class ServerArgsAutoTuner:
         if (
             args.performance_mode == "auto"
             and args.num_gpus >= 2
-            and not self._explicit_memory_policy
+            and not self._explicit_dit_residency
             and self._auto_uses_dit_offload()
             and self._can_apply_fsdp_policy(require_memory_headroom=True)
         ):
@@ -280,7 +349,6 @@ class ServerArgsAutoTuner:
         if (
             args.layerwise_offload_components is not None
             or args.dit_layerwise_offload is True
-            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             return
         if not current_platform.is_cuda():
@@ -290,23 +358,79 @@ class ServerArgsAutoTuner:
         if not layerwise_components:
             return
 
+        min_available_gb = self._get_min_available_device_memory_gb()
         logger.info(
-            "Auto memory policy for %s selected layerwise offload components: %s",
+            "Auto memory policy for %s: %s of free device memory selects "
+            "layerwise offload for %s. Explicit placement flags always win, "
+            "and the per-component lines below say where each one's weights "
+            "landed -- see the model's cookbook page for what to expect from "
+            "your memory budget.",
             args.pipeline_config.__class__.__name__,
+            (
+                f"{min_available_gb:.1f} GiB"
+                if min_available_gb is not None
+                else "an unknown amount"
+            ),
             ", ".join(layerwise_components),
         )
         args.layerwise_offload_components = layerwise_components
+        self._warn_if_resident_dit_contradicts_its_own_threshold(layerwise_components)
+
+    def _warn_if_resident_dit_contradicts_its_own_threshold(
+        self, layerwise_components: list[str]
+    ) -> None:
+        """Name the missing declaration when the DiT stays resident on a small card.
+
+        A model that sets `keep_resident_min_available_gb` is saying to keep
+        components resident only above that much device memory. If the auto
+        policy nonetheless leaves the DiT resident on a card far below it, the
+        two statements disagree, and the cause is almost always that the model
+        never declared `dit_layerwise_offload_modes` -- its default is an empty
+        tuple, so the DiT is never selected in any mode. That surfaces as a
+        failure during load, and it is worth naming the missing knob rather than
+        leaving the allocator to report it.
+
+        A warning rather than an error: a small model's DiT can legitimately fit
+        below the threshold, which is about plenty and not about fit.
+        """
+        args = self.server_args
+        deployment_config = self._deployment_config()
+        threshold_gb = deployment_config.keep_resident_min_available_gb
+        if threshold_gb is None:
+            return
+        if LAYERWISE_OFFLOAD_DIT_GROUP in (
+            normalize_layerwise_offload_components(layerwise_components) or ()
+        ):
+            return
+        if args.performance_mode in deployment_config.dit_layerwise_offload_modes:
+            return
+        available_gb = self._get_min_available_device_memory_gb()
+        if available_gb is None or available_gb >= threshold_gb:
+            return
+        logger.warning(
+            "%s keeps its DiT resident with %.1f GiB of device memory available, "
+            "below the %.1f GiB this model declares as its threshold for keeping "
+            "components resident. The DiT is not in the automatic layerwise "
+            "selection because the model does not list %r in "
+            "dit_layerwise_offload_modes. If the DiT does not fit, pass "
+            "--layerwise-offload-components dit,... explicitly, or add the mode "
+            "to the model's deployment config.",
+            args.pipeline_config.__class__.__name__,
+            available_gb,
+            threshold_gb,
+            args.performance_mode,
+        )
 
     def maybe_replace_cpu_offloaded_components_with_layerwise(self) -> None:
         args = self.server_args
         if (
             not self.could_override_server_args()
-            or self._explicit_layerwise_replacement_policy
             or current_platform.is_cpu()
             or not current_platform.is_cuda()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.layerwise_offload_components is not None
+            or args.dit_layerwise_offload is True
         ):
             return
 
@@ -315,17 +439,19 @@ class ServerArgsAutoTuner:
             layerwise_components.append(LAYERWISE_OFFLOAD_DIT_GROUP)
 
         changed: list[str] = []
-        if args.text_encoder_cpu_offload and not args.is_arg_explicitly_set(
-            "text_encoder_cpu_offload"
+        if (
+            args.text_encoder_cpu_offload
+            and args.explicit_residency_mode("text_encoder") is None
         ):
             layerwise_components.append(LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP)
             changed.append(LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP)
-        if args.image_encoder_cpu_offload and not args.is_arg_explicitly_set(
-            "image_encoder_cpu_offload"
+        if (
+            args.image_encoder_cpu_offload
+            and args.explicit_residency_mode("image_encoder") is None
         ):
             layerwise_components.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
             changed.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
-        if args.vae_cpu_offload and not args.is_arg_explicitly_set("vae_cpu_offload"):
+        if args.vae_cpu_offload and args.explicit_residency_mode("vae") is None:
             layerwise_components.append(LAYERWISE_OFFLOAD_VAE_GROUP)
             changed.append(LAYERWISE_OFFLOAD_VAE_GROUP)
 
@@ -353,6 +479,104 @@ class ServerArgsAutoTuner:
             args.text_encoder_cpu_offload = False
         if args.image_encoder_cpu_offload is None:
             args.image_encoder_cpu_offload = False
+        if (
+            args.pin_cpu_memory
+            and not args.is_arg_explicitly_set("pin_cpu_memory")
+            and current_platform.device_shares_host_memory()
+        ):
+            # The device reads host pages directly on a shared pool, so a
+            # pinned copy of a mapped weight is the same bytes held twice.
+            args.pin_cpu_memory = False
+            logger.info(
+                "Host and device share one memory pool: pinned host weight "
+                "copies are disabled (pass --pin-cpu-memory true to override)."
+            )
+        if (
+            current_platform.device_shares_host_memory()
+            and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
+        ):
+            # Every byte the caching allocator keeps reserved is a byte the
+            # page cache -- the home of every mapped weight here -- cannot
+            # hold. Measured on a GB10: ~30 GiB of reserved-but-idle segments
+            # forced the encoder and the DiT to take turns being re-read from
+            # disk. Expandable segments let the reserve follow the live peak.
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            logger.info(
+                "Host and device share one memory pool: PYTORCH_CUDA_ALLOC_CONF="
+                "expandable_segments:True so the allocator's reserve does not "
+                "crowd out the page cache."
+            )
+        if current_platform.device_shares_host_memory():
+            applied = apply_shared_pool_cpu_allocator_defaults(os.environ)
+            if applied:
+                logger.info(
+                    "Host and device share one memory pool: %s so the CPU "
+                    "allocator returns freed weight copies to the pool.",
+                    " ".join(f"{name}={os.environ[name]}" for name in applied),
+                )
+        if current_platform.device_shares_host_memory():
+            try:
+                import psutil
+
+                swap_total = psutil.swap_memory().total
+            except Exception:
+                swap_total = 0
+            try:
+                # A cgroup with swap disabled (memory.swap.max = 0) protects
+                # this process whatever the host has mounted.
+                with open("/sys/fs/cgroup/memory.swap.max") as handle:
+                    if handle.read().strip() == "0":
+                        swap_total = 0
+            except OSError:
+                pass
+            try:
+                with open("/sys/fs/cgroup/memory.max") as handle:
+                    uncapped = handle.read().strip() == "max"
+            except OSError:
+                uncapped = True
+            if uncapped:
+                # The driver takes device memory from free pages and does not
+                # wait for the kernel to reclaim page cache: with the cache
+                # full and MemFree near zero, device growth fails outright
+                # (NVRM out-of-memory on a GB10, three runs). A cgroup limit a
+                # little under physical memory makes the kernel reclaim this
+                # process's cache ahead of its own allocations.
+                logger.warning(
+                    "Host and device share one memory pool and this process has "
+                    "no cgroup memory limit: device allocations may fail while "
+                    "the page cache holds the free memory. Run with a limit a few "
+                    "GiB under physical memory (for example docker --memory)."
+                )
+            if swap_total > 0:
+                # Under page-cache pressure the kernel prefers swapping idle
+                # anonymous memory -- here the DiT's fused weight copies --
+                # over dropping cache, and every denoise step then swaps them
+                # back in. Measured on a GB10: 128 s first steps and a 54 s
+                # text encoder with 143 GiB of swap enabled.
+                logger.warning(
+                    "Host and device share one memory pool and swap is enabled "
+                    "(%.0f GiB): the kernel may swap out weight copies under "
+                    "page-cache pressure. Run with swap off for this process "
+                    "(container --memory-swap equal to --memory, or "
+                    "vm.swappiness=0).",
+                    swap_total / 1024**3,
+                )
+            if args.dit_cpu_offload or args.text_encoder_cpu_offload:
+                # Whole-component offload holds a component twice while it
+                # moves: the device copy plus a host copy the size of the
+                # component. On a shared pool both come out of the same
+                # memory. Measured on a GB10: a 57 GiB DiT moving back to
+                # the host at the end of a denoise stage exhausted the pool.
+                logger.warning(
+                    "Host and device share one memory pool and whole-component "
+                    "CPU offload is enabled (dit_cpu_offload=%s, "
+                    "text_encoder_cpu_offload=%s): moving a component holds it "
+                    "twice while it moves. Prefer layerwise offload, where "
+                    "residency is armed layer by layer from the checkpoint "
+                    "mapping.",
+                    bool(args.dit_cpu_offload),
+                    bool(args.text_encoder_cpu_offload),
+                )
 
     def _normalize_performance_mode(self) -> str:
         args = self.server_args
@@ -438,7 +662,6 @@ class ServerArgsAutoTuner:
         if (
             args.is_arg_explicitly_set("layerwise_offload_components")
             or args.dit_layerwise_offload is True
-            or args.is_arg_explicitly_set("cpu_offload_components")
         ):
             # The legacy --dit-layerwise-offload flag is a DiT-only selector.
             # Do not merge implicit defaults into that explicit mode.
@@ -450,7 +673,7 @@ class ServerArgsAutoTuner:
         components = [
             component_name
             for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
-            if not args.is_arg_explicitly_set(arg_name)
+            if args.explicit_residency_mode(component_name) is None
         ]
         components = self._filter_high_memory_resident_components(components)
         if self._should_auto_enable_dit_layerwise_offload():
@@ -503,8 +726,7 @@ class ServerArgsAutoTuner:
             or not current_platform.enable_dit_layerwise_offload_by_default()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
-            or args.is_arg_explicitly_set("dit_cpu_offload")
-            or args.is_arg_explicitly_set("cpu_offload_components")
+            or args.explicit_residency_mode("transformer") is not None
         ):
             return False
 
@@ -544,28 +766,11 @@ class ServerArgsAutoTuner:
             )
         )
 
-    def _has_explicit_memory_policy(self) -> bool:
+    def _has_explicit_dit_residency(self) -> bool:
         args = self.server_args
-        return any(
-            args.is_arg_explicitly_set(arg_name)
-            for arg_name in (
-                "use_fsdp_inference",
-                "dit_cpu_offload",
-                "dit_layerwise_offload",
-                "layerwise_offload_components",
-                "cpu_offload_components",
-            )
-        )
-
-    def _has_explicit_layerwise_replacement_policy(self) -> bool:
-        args = self.server_args
-        return any(
-            args.is_arg_explicitly_set(arg_name)
-            for arg_name in (
-                "dit_layerwise_offload",
-                "layerwise_offload_components",
-                "cpu_offload_components",
-            )
+        return bool(
+            args.is_arg_explicitly_set("use_fsdp_inference")
+            or args.explicit_residency_mode("transformer") is not None
         )
 
     def _has_explicit_parallel_policy(self) -> bool:

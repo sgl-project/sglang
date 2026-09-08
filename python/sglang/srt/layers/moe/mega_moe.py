@@ -15,8 +15,8 @@
 
 from __future__ import annotations
 
-import os
-from contextlib import nullcontext
+import functools
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -42,26 +43,47 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
-_MEGA_MOE_DG_ENV_APPLIED = False
 
 
-def _apply_mega_moe_dg_env() -> None:
-    """Forward sglang's FP4/MXF4 opt-in flags to DeepGEMM via env vars.
+def _mega_moe_mma_type() -> str:
+    return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
 
-    DeepGEMM reads `DG_USE_FP4_ACTS` (and `DG_USE_MXF4_KIND`) at host-function
-    call time — both `get_symm_buffer_for_mega_moe` and `fp8_fp4_mega_moe`.
-    Forwarding once at first use is sufficient (these are static config
-    flags, not per-request state) and matches the `setdefault` pattern so
-    explicit `DG_USE_*` overrides from outside still win.
-    """
-    global _MEGA_MOE_DG_ENV_APPLIED
-    if _MEGA_MOE_DG_ENV_APPLIED:
+
+@functools.lru_cache(maxsize=1)
+def _mega_moe_max_num_sms() -> Optional[int]:
+    if _device_sm < 100:
+        # The SM90 MegaMoE implementation does not use the whole-grid clustered
+        # launch that needs a residency margin.
+        return None
+
+    # Physical count, not deep_gemm.get_num_sms(): two-batch overlap and the DSA
+    # indexer reconfigure that process-wide, so reserving on top would compound.
+    num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+    reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
+    return max(2, num_sms - reserved_num_sms)
+
+
+@contextmanager
+def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    max_num_sms = _mega_moe_max_num_sms()
+    if max_num_sms is None:
+        yield
         return
-    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
-        os.environ.setdefault("DG_USE_FP4_ACTS", "1")
-    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
-        os.environ.setdefault("DG_USE_MXF4_KIND", "1")
-    _MEGA_MOE_DG_ENV_APPLIED = True
+
+    current_num_sms = deep_gemm.get_num_sms()
+    # Stay under an outer context's budget instead of claiming SMs back from it.
+    target_num_sms = min(max_num_sms, current_num_sms)
+    # Round down: the clustered launch needs an even CTA count.
+    target_num_sms -= target_num_sms % 2
+    if target_num_sms == current_num_sms:
+        yield
+        return
+
+    deep_gemm.set_num_sms(target_num_sms)
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(current_num_sms)
 
 
 def _get_mega_moe_symm_buffer(
@@ -74,8 +96,7 @@ def _get_mega_moe_symm_buffer(
 ) -> SymmBuffer:
     import deep_gemm
 
-    _apply_mega_moe_dg_env()
-
+    mma_type = _mega_moe_mma_type()
     key = (
         id(group),
         num_max_tokens_per_rank,
@@ -83,6 +104,7 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        mma_type,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -93,7 +115,7 @@ def _get_mega_moe_symm_buffer(
             num_topk,
             hidden,
             intermediate_hidden,
-            use_fp8_dispatch=True,
+            mma_type=mma_type,
             activation="swiglu",
         )
         _MEGA_MOE_SYMM_BUFFER[key] = buf
@@ -232,8 +254,8 @@ def _run_mega_routed(
             num_tokens,
         )
 
-    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
-    if use_fp4_acts:
+    mma_type = _mega_moe_mma_type()
+    if mma_type == "mxf4xmxf4":
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
         # only emits FP8.
@@ -247,7 +269,7 @@ def _run_mega_routed(
             buf.topk_weights,
             num_tokens=num_tokens,
             group_size=32,
-            use_fp4_acts=True,
+            mma_type=mma_type,
         )
     else:
         mega_moe_pre_dispatch(
@@ -269,16 +291,17 @@ def _run_mega_routed(
         device=hidden_states.device,
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
-    deep_gemm.fp8_fp4_mega_moe(
-        y,
-        moe.experts.mega_l1_weights,
-        moe.experts.mega_l2_weights,
-        buf,
-        recipe=(1, 1, 32),
-        activation="swiglu",
-        activation_clamp=swiglu_limit,
-        fast_math=True,
-    )
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+        )
     y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -287,22 +310,30 @@ def _run_mega_routed(
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
-    # Match DeepGEMM's L1 gate/up layout:
-    # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...].
+    # Match DeepGEMM's L1 gate/up layouts. FP8 activations use contiguous
+    # gran-8 chunks; packed MXFP4 activations use even/odd gran-16 chunks.
     num_groups, n, *rest = t.shape
     half = n // 2
     gate = t[:, :half].reshape(num_groups, half // gran, gran, *rest)
     up = t[:, half:].reshape(num_groups, half // gran, gran, *rest)
-    result = torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
+    if gran == 16:
+        result = torch.cat(
+            [gate[:, :, 0::2], up[:, :, 0::2], gate[:, :, 1::2], up[:, :, 1::2]],
+            dim=2,
+        ).reshape(num_groups, n, *rest)
+    else:
+        result = torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
     return torch.empty_like(t).copy_(result)
 
 
 def _interleave_mega_moe_l1_weights(
     l1_weights: tuple[torch.Tensor, torch.Tensor],
+    mma_type: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    gran = 16 if mma_type == "mxf4xmxf4" else 8
     return (
-        _interleave_mega_moe_gate_up(l1_weights[0]),
-        _interleave_mega_moe_gate_up(l1_weights[1]),
+        _interleave_mega_moe_gate_up(l1_weights[0], gran=gran),
+        _interleave_mega_moe_gate_up(l1_weights[1], gran=gran),
     )
 
 
@@ -320,12 +351,12 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
 def build_mega_moe_experts_weights(experts) -> None:
     from deep_gemm import (
         transform_sf_into_required_layout,
-        transform_weights_for_mega_moe,
     )
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
 
+    mma_type = _mega_moe_mma_type()
     w13 = experts.w13_weight.data
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
     w2 = experts.w2_weight.data
@@ -353,31 +384,25 @@ def build_mega_moe_experts_weights(experts) -> None:
         disable_ue8m0_cast=False,
     )
 
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-        # Build the interleaved L1 weight + scale once; share the weight buffer
-        # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
-        # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
-        # the deep-ep path consumes the non-transposed interleaved scale and a
-        # swizzle-aware activation kernel. L2 weight is untouched by the mega
-        # transform, so the existing `w2_weight.data` is shared directly.
-        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
-            (w13, w13_sf)
-        )
-        w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
-        w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
+    # Build the interleaved L1 weight + scale once; share the weight buffer
+    # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
+    # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
+    # the deep-ep path consumes the non-transposed interleaved scale and a
+    # swizzle-aware activation kernel. L2 weight is untouched by the mega
+    # transform, so the existing `w2_weight.data` is shared directly.
+    w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
+        (w13, w13_sf), mma_type
+    )
+    w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
+    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
 
-        experts.w13_weight.data = w13_interleaved
-        experts.w13_weight_scale_inv.data = w13_sf_interleaved
-        experts.w2_weight_scale_inv.data = w2_sf
-        experts.w13_weight_scale_inv.format_ue8m0 = True
-        experts.w2_weight_scale_inv.format_ue8m0 = True
+    experts.w13_weight.data = w13_interleaved
+    experts.w13_weight_scale_inv.data = w13_sf_interleaved
+    experts.w2_weight_scale_inv.data = w2_sf
+    experts.w13_weight_scale_inv.format_ue8m0 = True
+    experts.w2_weight_scale_inv.format_ue8m0 = True
 
-        experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
-        experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
-    else:
-        l1_pair, l2_pair = transform_weights_for_mega_moe((w13, w13_sf), (w2, w2_sf))
-
-        experts.mega_l1_weights = l1_pair
-        experts.mega_l2_weights = l2_pair
+    experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
+    experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
 
     experts._mega_moe_weights_built = True

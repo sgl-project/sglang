@@ -18,23 +18,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.bitexact_gate import (
+from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    tensors_equal,
-)
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
-    fused_gelu_active,
-    fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
     can_use_fused_layernorm_modulate,
     can_use_fused_qk_head_layernorm,
+    can_use_linear_gelu,
+    fused_gelu_active,
     fused_layernorm_modulate,
+    fused_linear_gelu_tanh,
     fused_qk_head_layernorm,
     is_plain_layer_norm,
+    mark_fused_gelu_site,
+    residual_gate_add,
+    tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -451,12 +447,12 @@ class GlmImageGELU(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
-        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # extra-high/high fusion site: up-proj GEMM + tanh-GELU in cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -535,9 +531,9 @@ class GlmImageAttention(torch.nn.Module):
         self.out_dim = out_dim if out_dim is not None else query_dim
 
         tp_size = get_tp_world_size()
-        assert (
-            self.heads % tp_size == 0
-        ), f"heads ({self.heads}) must be divisible by tp_size ({tp_size})"
+        assert self.heads % tp_size == 0, (
+            f"heads ({self.heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.num_local_heads = self.heads // tp_size
         self.num_local_kv_heads = self.num_local_heads
 
@@ -677,9 +673,9 @@ class GlmImageAttention(torch.nn.Module):
         # 4. Attention
         if attention_mask is not None:
             text_attn_mask = attention_mask
-            assert (
-                text_attn_mask.dim() == 2
-            ), "the shape of text_attn_mask should be (batch_size, text_seq_length)"
+            assert text_attn_mask.dim() == 2, (
+                "the shape of text_attn_mask should be (batch_size, text_seq_length)"
+            )
         hidden_states = self.attn(
             query, key, value, num_replicated_prefix=text_seq_length
         )

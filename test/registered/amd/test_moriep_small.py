@@ -103,7 +103,6 @@ mtp_args = [
 
 
 class TestPureDP(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -148,7 +147,6 @@ class TestPureDP(CustomTestCase):
 
 
 class TestMTP(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -199,7 +197,6 @@ class TestMTP(CustomTestCase):
 
 
 class TestNormal(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -247,7 +244,6 @@ class TestNormal(CustomTestCase):
 
 
 class TestLowLatency(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -297,7 +293,6 @@ class TestLowLatency(CustomTestCase):
 
 
 class TestTBOwithNormal(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -346,7 +341,6 @@ class TestTBOwithNormal(CustomTestCase):
 
 
 class TestTBOwithLowLatency(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -397,7 +391,6 @@ class TestTBOwithLowLatency(CustomTestCase):
 
 
 class TestMTPwithTBONormal(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -457,7 +450,6 @@ class TestMTPwithTBONormal(CustomTestCase):
 
 
 class TestMTPwithTBOLowLatency(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
