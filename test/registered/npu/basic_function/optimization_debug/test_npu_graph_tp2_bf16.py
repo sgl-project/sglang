@@ -24,7 +24,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendGraphTp2Bf16(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
