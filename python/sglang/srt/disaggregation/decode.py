@@ -406,6 +406,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        if (
+            get_disagg().disaggregation_decode_enable_radix_cache
+            and self.scheduler.spec_algorithm.is_dspark()
+        ):
+            if self.tree_cache.supports_mamba():
+                raise RuntimeError(
+                    "Kimi-K3 DSPARK PD decode radix cache must not index "
+                    "Mamba/KDA checkpoints; prefill's prompt-end state is "
+                    "authoritative."
+                )
+            if (
+                hasattr(self.req_to_token_pool, "mamba_allocator")
+                and StateType.MAMBA not in self.kv_manager.kv_args.state_types
+            ):
+                raise RuntimeError(
+                    "Kimi-K3 DSPARK PD decode radix cache requires the PD "
+                    "connector to register the Mamba/KDA/conv state channel."
+                )
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -2159,6 +2177,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
+
+        # In the Kimi-K3 decode-radix layout the tree owns only per-token
+        # MLA/draft KV. The final PD transfer overwrites the request's freshly
+        # allocated recurrent slot with the prompt-end KDA/conv state, so it is
+        # initialized even when the MLA prefix was a full local hit.
+        if (
+            get_disagg().disaggregation_decode_enable_radix_cache
+            and self.spec_algorithm.is_dspark()
+            and decode_req.req.kv.holds_mamba
+        ):
+            decode_req.req.kv.mamba_needs_clear = False
 
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
