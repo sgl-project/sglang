@@ -61,6 +61,7 @@ from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    inspect_comfy_quant_markers,
     process_model_weights_after_loading,
 )
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
@@ -99,6 +100,10 @@ def test_comfy_embedding_checkpoint_lookup(tmp_path, backend, tensorwise, tp_siz
     }
     if backend == "nvfp4":
         tensors[f"{linear}.weight_scale_2"] = torch.tensor(0.5)
+    else:
+        tensors[f"{linear}.comfy_quant"] = torch.tensor(
+            list(json.dumps({**marker, "per_row": True}).encode()), dtype=torch.uint8
+        )
     checkpoint = tmp_path / "encoder.safetensors"
     save_file(
         tensors,
@@ -200,6 +205,23 @@ def test_comfy_scalar_embedding_matches_kitchen_kernel():
     torch.testing.assert_close(
         method.embedding(layer, indices), expected, rtol=0, atol=0
     )
+
+
+def test_comfy_marker_conflicting_values_rejected(tmp_path):
+    checkpoint = tmp_path / "encoder.safetensors"
+    marker = {"format": "int8_tensorwise", "convrot": True}
+    save_file(
+        {
+            "layer.comfy_quant": torch.tensor(
+                list(json.dumps({**marker, "convrot": False}).encode()),
+                dtype=torch.uint8,
+            )
+        },
+        checkpoint,
+        metadata={"_quantization_metadata": json.dumps({"layers": {"layer": marker}})},
+    )
+    with pytest.raises(ValueError, match="Conflicting Comfy quantization markers"):
+        inspect_comfy_quant_markers([str(checkpoint)])
 
 
 @pytest.mark.parametrize("missing", [False, True])
