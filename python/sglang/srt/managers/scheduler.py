@@ -212,6 +212,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    match_prefix_for_req,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -383,6 +384,11 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 STEP_MAX_US = 2_000_000
 
+# Internal defaults behind --enable-hicache-loadback-reorder.
+HICACHE_LOADBACK_REORDER_THRESHOLD = 1024
+HICACHE_LOADBACK_REORDER_MAX_DELAY_MS = 5000.0
+HICACHE_LOADBACK_REORDER_ADMISSION_DELAY_MS = 30.0
+
 # Min wall-clock between load publishes on the stalled no-batch path, which
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
 # DP-balancing writer and the router-facing socket.
@@ -492,6 +498,9 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
+        self.enable_hicache_loadback_reorder = (
+            get_schedule().enable_hicache_loadback_reorder
+        )
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
         )
@@ -3688,6 +3697,98 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _hicache_loadback_reorder_enabled_for_prefill(self) -> bool:
+        return (
+            self.enable_hicache_loadback_reorder
+            and self.enable_hierarchical_cache
+            and not self.enable_hicache_storage
+            and not self.enable_lora
+            and not self.enable_priority_scheduling
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and self.chunked_req is None
+            and get_memory().hicache_host_memory_mode == "cache"
+        )
+
+    def _match_hicache_loadback_reorder_prefixes(self) -> None:
+        if not self._hicache_loadback_reorder_enabled_for_prefill():
+            return
+
+        # Reorder decisions need host-hit lengths before add_one_req starts
+        # load-back. Refresh explicitly for this opt-in path so non-fast
+        # HiCache backends classify L2 hits before admission.
+        for req in self.waiting_queue:
+            match_prefix_for_req(self.tree_cache, req, include_req=True)
+
+    def _hicache_loadback_reorder_tokens(self, req: Req) -> int:
+        return req.host_hit_length + req.swa_host_hit_length + req.mamba_host_hit_length
+
+    def _should_defer_hicache_loadback_req_for_reorder(self, req: Req) -> bool:
+        loadback_tokens = self._hicache_loadback_reorder_tokens(req)
+        if loadback_tokens <= 0 or loadback_tokens < HICACHE_LOADBACK_REORDER_THRESHOLD:
+            return False
+
+        max_delay_ms = HICACHE_LOADBACK_REORDER_MAX_DELAY_MS
+        if max_delay_ms > 0 and req.time_stats.wait_queue_entry_time > 0:
+            wait_ms = (
+                time.perf_counter() - req.time_stats.wait_queue_entry_time
+            ) * 1000
+            if wait_ms >= max_delay_ms:
+                return False
+
+        return True
+
+    def _get_hicache_loadback_reordered_prefill_queue(self) -> List[Req]:
+        if (
+            len(self.waiting_queue) <= 1
+            or not self._hicache_loadback_reorder_enabled_for_prefill()
+        ):
+            return self.waiting_queue
+
+        deferred_reqs = []
+        candidate_reqs = []
+        for req in self.waiting_queue:
+            if self._should_defer_hicache_loadback_req_for_reorder(req):
+                deferred_reqs.append(req)
+            else:
+                candidate_reqs.append(req)
+
+        if deferred_reqs and candidate_reqs:
+            return candidate_reqs
+        return self.waiting_queue
+
+    def _should_delay_hicache_loadback_only_prefill(
+        self, running_batch: ScheduleBatch
+    ) -> bool:
+        if (
+            len(self.waiting_queue) == 0
+            or not self._hicache_loadback_reorder_enabled_for_prefill()
+        ):
+            return False
+
+        if not all(
+            self._should_defer_hicache_loadback_req_for_reorder(req)
+            for req in self.waiting_queue
+        ):
+            return False
+
+        if not running_batch.is_empty() and not running_batch.is_prefill_only:
+            return True
+
+        if HICACHE_LOADBACK_REORDER_ADMISSION_DELAY_MS <= 0:
+            return False
+
+        entry_times = [
+            req.time_stats.wait_queue_entry_time
+            for req in self.waiting_queue
+            if req.time_stats.wait_queue_entry_time > 0
+        ]
+        if not entry_times:
+            return False
+
+        oldest_entry_time = min(entry_times)
+        wait_ms = (time.perf_counter() - oldest_entry_time) * 1000
+        return wait_ms < HICACHE_LOADBACK_REORDER_ADMISSION_DELAY_MS
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3746,6 +3847,10 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
+        self._match_hicache_loadback_reorder_prefixes()
+
+        if self._should_delay_hicache_loadback_only_prefill(running_batch):
+            return None, running_batch
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -3805,11 +3910,13 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
+        prefill_queue = self._get_hicache_loadback_reordered_prefill_queue()
+
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+            mamba_allocator.alloc_group_begin(len(prefill_queue))
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in prefill_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
