@@ -92,11 +92,11 @@ class TestGLM53FlashHiCacheKL(unittest.TestCase):
         )
         cls.tokenizer = get_tokenizer(cls.model, trust_remote_code=True)
 
-    def _generate(self, ids, *, count=1, score_start=None, temperature=0, min_cached=0):
+    def _generate(self, ids, *, count=1, score_start=None, min_cached=0):
         payload = {
             "input_ids": ids,
             "sampling_params": {
-                "temperature": temperature,
+                "temperature": 0,
                 "max_new_tokens": count,
                 "ignore_eos": True,
             },
@@ -163,9 +163,11 @@ class TestGLM53FlashHiCacheKL(unittest.TestCase):
         bridge = encode("\n")
         self.assertTrue(bridge)
         _flush_cache(self.base_url)
-        continuation = self._generate(
-            prompt + bridge, count=OUTPUT_TOKENS, temperature=1
-        )["output_ids"]
+        # Remove stochastic token-selection variance from this fixed-token
+        # precision probe; it is not full-vocabulary KL.
+        continuation = self._generate(prompt + bridge, count=OUTPUT_TOKENS)[
+            "output_ids"
+        ]
         self.assertEqual(len(continuation), OUTPUT_TOKENS)
         pressure = [[rng.randint(1000, 25000) for _ in range(8192)] for _ in range(6)]
         self.assertEqual(len({ids[0] for ids in pressure}), len(pressure))
