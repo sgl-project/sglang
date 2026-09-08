@@ -44,12 +44,8 @@ def run_npu_pr_smoke(base_url):
 class NPUGSM8KMixin(GSM8KMixin):
     """NPU GSM8K accuracy mixin — 1% tolerance + up to 3 retries."""
 
-    # Set to True to run the full GSM8K evaluation even when the run is
-    # triggered by a pull_request (e.g. calibrating thresholds from a PR).
-    run_full_gsm8k_in_pr = False
-
     def test_gsm8k(self):
-        if _is_pr_pipeline and not self.run_full_gsm8k_in_pr:
+        if _is_pr_pipeline:
             run_npu_pr_smoke(self.base_url)
             return
         threshold = self.gsm8k_score_threshold

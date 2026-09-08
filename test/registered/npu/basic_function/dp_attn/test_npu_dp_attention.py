@@ -24,13 +24,7 @@ from sglang.test.test_utils import (
 )
 
 register_npu_ci(est_time=800, suite="base-b-test-4-npu-a3")
-register_npu_ci(est_time=800, suite="nightly-4-npu-a3", nightly=True)
-# Phase A calibration: dedicated suite so the PR-triggered nightly job
-# `calibrate-dp-attn-4-npu-a3` runs ONLY this file (full-1319 GSM8K mu
-# collection). Remove this registration after calibration.
-register_npu_ci(
-    est_time=2400, suite="nightly-calibrate-dp-attn-4-npu-a3", nightly=True
-)
+register_npu_ci(est_time=2400, suite="nightly-4-npu-a3", nightly=True)
 
 
 class TestDPAttentionDP2TP2(
@@ -80,13 +74,9 @@ class TestDPAttentionMixedChunk(
     CustomTestCase,
     NPUGSM8KMixin,
 ):
-    # Phase A calibration: evaluate the full GSM8K test set (1319 entries,
-    # minus 5 few-shot examples) with a deliberately low threshold so the
-    # actual accuracy can be captured from the [METRIC] log. Set the final
-    # threshold from the measured mean (mu - 3*sigma) afterwards.
-    run_full_gsm8k_in_pr = True  # Phase A: bypass PR smoke to collect calibration data
+    # Use full GSM8K dataset to avoid sampling variance.
     gsm8k_num_examples = 1319
-    gsm8k_accuracy_thres = 0.20
+    gsm8k_accuracy_thres = 0.333
 
     @classmethod
     def setUpClass(cls):

@@ -16,11 +16,6 @@ from sglang.test.test_utils import (
 
 register_npu_ci(est_time=400, suite="base-b-test-1-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
-# Phase A calibration: also run this file in the dedicated nightly calibration
-# job (nightly-calibrate-dp-attn-4-npu-a3) so the mmlu change is validated.
-register_npu_ci(
-    est_time=800, suite="nightly-calibrate-dp-attn-4-npu-a3", nightly=True
-)
 
 
 class TestAscendSamplingBackend(CustomTestCase):
@@ -49,7 +44,7 @@ class TestAscendSamplingBackend(CustomTestCase):
     def test_mmlu(self):
         if _is_pr_pipeline:
             run_npu_pr_smoke(self.base_url)
-            # return
+            return
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
