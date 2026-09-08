@@ -41,6 +41,7 @@ def harness(monkeypatch):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
     monkeypatch.setenv("SGLANG_SKIP_CONSISTENCY", "0")
     monkeypatch.setattr(test_server_common.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(test_server_common.current_platform, "is_hip", lambda: False)
     scenario = ScenarioConfig(
         stages_ms={"DenoisingStage": 10},
         denoise_step_ms={0: 5, 1: 5},
@@ -122,6 +123,31 @@ def test_each_request_failure_fails_case(harness, monkeypatch, bad_request, fail
     # Even failed performance measurements must survive in the report.
     expected = [i + 1 for i in range(2) if failure != "generation" or i != bad_request]
     assert [r["request_index"] for r in runner._perf_results] == expected
+
+
+@pytest.mark.parametrize("metric", ["performance", "load_peak", "runtime_peak"])
+def test_hip_performance_outliers_warn(harness, monkeypatch, caplog, metric):
+    _, case = harness
+    monkeypatch.setattr(test_server_common.current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(test_server_common.current_platform, "is_hip", lambda: True)
+    baseline = test_server_common.BASELINE_CONFIG
+    scenario = baseline.scenarios[case.id]
+    validator = test_server_common.PerformanceValidator(
+        scenario, baseline.tolerances, baseline.step_fractions
+    )
+    record = _perf_record()
+    if metric == "performance":
+        record.total_duration_ms = 10000
+        validator.validate(record, case.sampling_params.num_frames)
+    else:
+        record.memory_snapshots[metric]["peak_reserved_mb"] = 10000
+        validator.validate_peak_vram(
+            validator.collect_metrics(record),
+            scenario.load_peak_vram_mb,
+            scenario.runtime_peak_vram_mb,
+        )
+
+    assert "AMD PERF WARNING" in caplog.text
 
 
 def test_both_requests_pass(harness, monkeypatch):

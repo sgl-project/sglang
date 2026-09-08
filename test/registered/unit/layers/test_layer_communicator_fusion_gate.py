@@ -119,7 +119,7 @@ class TestFullReplicaMoE(CustomTestCase):
             ),
             patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
             patch.object(comm, "is_dsa_enable_prefill_cp", return_value=False),
-            patch.object(comm, "is_mla_prefill_cp_enabled", return_value=False),
+            patch.object(comm, "is_mla_cp_enabled", return_value=False),
             patch.object(
                 comm,
                 "get_parallel",
@@ -142,7 +142,7 @@ class TestFullReplicaMoE(CustomTestCase):
             ),
             patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
             patch.object(comm, "is_dsa_enable_prefill_cp", return_value=False),
-            patch.object(comm, "is_mla_prefill_cp_enabled", return_value=False),
+            patch.object(comm, "is_mla_cp_enabled", return_value=False),
             patch.object(
                 comm,
                 "get_parallel",
