@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import types
 import unittest
 from contextvars import ContextVar
 
@@ -42,6 +43,9 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
             tokenization_started, release_tokenization
         )
         manager.async_dynamic_batch_tokenizer = None
+        # `_tokenize_texts` consults model_config for the EmbeddingGemma EOS
+        # fix-up; this test builds a bare manager, so stub the flag it reads.
+        manager.model_config = types.SimpleNamespace(is_embedding_gemma=False)
         if hasattr(manager, "init_request_preprocessor"):
             manager.init_request_preprocessor()
 
