@@ -114,11 +114,18 @@ from sglang.multimodal_gen.runtime.models.dits.sana import (
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     sana_ln_modulate,
 )
+from sglang.multimodal_gen.runtime.models.vaes import (
+    autoencoder_kl_qwenimage as qwen_vae,
+)
 from sglang.multimodal_gen.runtime.models.vaes import flux2_vae_cuda_opt as vae_opt
+from sglang.multimodal_gen.runtime.models.vaes import (
+    wan_vae_cuda_opt,
+)
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
     FusedWanRMSNormSiLU,
+    GatedChannelsLastUpsample,
     VaeFastPathGate,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
@@ -1051,6 +1058,154 @@ def test_wan_vae_rejects_empty_input() -> None:
     )
     gamma = torch.ones(96, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
     assert not can_use_wan_rmsnorm_silu(x, gamma, None)
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image VAE (Wan 2.1 VAE) -- lossless causal-conv data movement and the
+# quality-gated RMSNorm+SiLU / channels_last upsample fast path
+# -------------------------------------------------------------------------
+
+
+def _qwen_causal_conv(cin, cout, channels_last=True):
+    conv = qwen_vae.QwenImageCausalConv3d(cin, cout, 3, padding=1).to(
+        "cuda", torch.bfloat16
+    )
+    if channels_last:
+        conv.weight.data = conv.weight.data.to(memory_format=torch.channels_last_3d)
+    return conv
+
+
+@torch.no_grad()
+def test_qwen_vae_causal_conv_cat_pad_is_bit_exact() -> None:
+    # Fused cat + pad + relayout must reproduce the aten chain for no cache,
+    # a one-frame cache (partial zero fill) and a full two-frame cache.
+    torch.manual_seed(0)
+    conv = _qwen_causal_conv(8, 16)
+    ref = _qwen_causal_conv(8, 16, channels_last=False)
+    ref.load_state_dict(conv.state_dict())
+    x = _wan_cl3d((1, 8, 1, 12, 10), torch.bfloat16)
+    for cache_t in (0, 1, 2):
+        cache = _wan_cl3d((1, 8, cache_t, 12, 10), torch.bfloat16) if cache_t else None
+        # The reference is the eager chain on the same (channels_last) weights.
+        expected = nn.Conv3d.forward(
+            conv,
+            qwen_vae.causal_conv3d_cat_pad(x, cache, list(conv._padding)).contiguous(
+                memory_format=torch.channels_last_3d
+            ),
+        )
+        assert qwen_vae._fused_conv_cache_supported(conv, x)
+        assert torch.equal(conv(x, cache), expected)
+    # Contiguous weights take the original path unchanged.
+    assert not qwen_vae._fused_conv_cache_supported(ref, x)
+
+
+@torch.no_grad()
+def test_qwen_vae_run_cached_causal_conv_matches_eager_bookkeeping() -> None:
+    # Stream three single-frame chunks (the image decode shape, and the first
+    # chunks of a clip) through one conv slot on the fused and the eager path;
+    # outputs and cache contents must agree, including the "Rep" slot.
+    torch.manual_seed(0)
+    fused = _qwen_causal_conv(8, 8)
+    eager = _qwen_causal_conv(8, 8, channels_last=False)
+    eager.load_state_dict(fused.state_dict())
+    chunks = [_wan_cl3d((1, 8, 1, 6, 6), torch.bfloat16) for _ in range(3)]
+    for first in (None, "Rep"):
+        fused_cache, eager_cache = [first], [first]
+        for x in chunks:
+            out_f = qwen_vae._run_cached_causal_conv(fused, x, fused_cache, 0)
+            out_e = qwen_vae._run_cached_causal_conv(eager, x, eager_cache, 0)
+            assert torch.equal(out_f, out_e)
+            # The fused path only ever stores tensors that the eager path would
+            # also consume: same values, possibly wider (never narrower).
+            fc, ec = fused_cache[0], eager_cache[0]
+            assert fc.shape[2] >= ec.shape[2]
+            assert torch.equal(fc[:, :, -ec.shape[2] :], ec)
+
+
+@torch.no_grad()
+def test_qwen_vae_upsample_skips_fp32_round_trip_bit_exactly() -> None:
+    up = qwen_vae.QwenImageUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact")
+    x = torch.randn(1, 8, 12, 10, device="cuda", dtype=torch.bfloat16).contiguous(
+        memory_format=torch.channels_last
+    )
+    assert torch.equal(up(x), nn.Upsample.forward(up, x.float()).type_as(x))
+
+
+@torch.no_grad()
+def test_qwen_vae_gate_dispatch() -> None:
+    torch.cuda.manual_seed(0)
+    norm = qwen_vae.QwenImageRMS_norm(96, images=False).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    norm.gamma.add_(torch.randn_like(norm.gamma))
+    gate = VaeFastPathGate()
+    fused = FusedWanRMSNormSiLU(norm, gate)
+    assert [n for n, _ in fused.named_parameters()] == ["gamma"]
+    x = _wan_cl3d((1, 96, 1, 10, 14), torch.bfloat16)
+    assert torch.equal(fused(x), nn.SiLU()(norm(x)))
+    gate.enabled = True
+    expected = wan_rmsnorm_silu(x, norm.gamma, rms_scale=float(norm.scale))
+    assert torch.equal(fused(x), expected)
+
+
+@torch.no_grad()
+def test_qwen_vae_channels_last_upsample_keeps_layout() -> None:
+    gate = VaeFastPathGate()
+    up = GatedChannelsLastUpsample(
+        qwen_vae.QwenImageUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+        gate,
+    )
+    x5 = _wan_cl3d((1, 8, 1, 6, 6), torch.bfloat16)
+    x = x5.permute(0, 2, 1, 3, 4).reshape(1, 8, 6, 6)  # degenerate batch stride
+    ref = nn.Upsample(scale_factor=(2.0, 2.0), mode="nearest-exact")(x)
+    off = up(x)
+    assert torch.equal(off, ref) and off.is_contiguous()  # NCHW, as today
+    gate.enabled = True
+    on = up(x)
+    assert torch.equal(on, ref)
+    assert on.is_contiguous(memory_format=torch.channels_last)
+    assert on.stride() == (12 * 12 * 8, 1, 12 * 8, 8)
+
+
+@torch.no_grad()
+def test_qwen_vae_decoder_install_is_gated_and_close() -> None:
+    torch.manual_seed(0)
+    dec = qwen_vae.QwenImageDecoder3d(
+        dim=16, z_dim=4, dim_mult=[1, 1], num_res_blocks=1, temperal_upsample=[False]
+    ).to("cuda", torch.bfloat16)
+    for m in dec.modules():
+        if isinstance(m, nn.Conv3d):
+            m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
+    for p in dec.parameters():
+        p.add_(0.1 * torch.randn_like(p))
+    keys = set(dec.state_dict())
+    z = _wan_cl3d((1, 4, 1, 6, 6), torch.bfloat16)
+    ref = dec(z, feat_cache=[None] * 64, feat_idx=[0])
+
+    gate = VaeFastPathGate()
+    n_norm = wan_vae_cuda_opt._install_norm_silu(
+        dec,
+        gate,
+        residual_block_cls=qwen_vae.QwenImageResidualBlock,
+        rms_norm_cls=qwen_vae.QwenImageRMS_norm,
+        label="test",
+    )
+    n_up = wan_vae_cuda_opt._install_channels_last_upsample(
+        dec, gate, qwen_vae.QwenImageUpsample
+    )
+    # mid block (2 resnets) + 2 up blocks x (num_res_blocks + 1) resnets
+    # -> 6 resnets x 2 norms + norm_out; only the first up block upsamples.
+    assert n_norm == 13 and n_up == 1
+    assert set(dec.state_dict()) == keys
+    assert torch.equal(dec(z, feat_cache=[None] * 64, feat_idx=[0]), ref)
+    gate.enabled = True
+    out = dec(z, feat_cache=[None] * 64, feat_idx=[0])
+    assert out.shape == ref.shape
+    # Not bit-exact (fp32 statistics in the fused norm), but a bf16-rounding
+    # level perturbation: bound the relative error energy over the whole
+    # output rather than per element (random weights, unnormalised scale).
+    rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 2e-2, rel
 
 
 # -------------------------------------------------------------------------

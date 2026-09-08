@@ -144,15 +144,26 @@ srt_hpu = ["sglang[runtime_common]"]
 
 # https://docs.sglang.io/platforms/mthreads_gpu.md
 srt_musa = [
-  "deep-gemm>=0.1.3",
-  "flash_attn_3>=0.1.4",
-  "mate>=0.2.0",
+  "apache-tvm-ffi==0.1.11.post1+musa.1",
+  "deep_ep==1.1.0+musa5.2.0torch2.11.0.post1",
+  "deep-gemm==0.2.6+musa",
+  "flash_attn_3==0.2.6+musa",
+  "flash_mla==0.2.6+musa",
+  "flashinfer-python==0.2.6+musa",
+  "mate==0.2.6",
+  "mate-mubin==0.2.6",
   "mthreads-ml-py",
   "numpy<2.0",
+  "sageattention==0.2.6+musa",
   "sglang[runtime_common]",
-  "torch",
-  "torch_musa",
-  "torchada>=0.1.74",
+  "tilelang_musa==0.1.12+musa.2",
+  "torch==2.11.0.post1+musa5.2.0",
+  "torch-c-dlpack-ext==0.1.5",
+  "torch_musa==2.11.0.post1+musa5.2.0",
+  "torchada>=0.1.86",
+  "torchaudio==2.11.0+musa5.2.0",
+  "torchvision==0.26.0.post1+musa5.2.0",
+  "triton==3.2.0",
 ]
 
 diffusion_musa = [

@@ -18,7 +18,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device, get_device_count
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
-register_cuda_ci(est_time=32, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="2-gpu-large")
 register_xpu_ci(est_time=60, suite="nightly-xpu-2-gpu", nightly=True)
 
 NUM_GPUS = 2
