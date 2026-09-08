@@ -2783,6 +2783,7 @@ class ServerArgs:
                 "simm",
                 "mori",
                 "shm",
+                "tensorcast",
             ],
         ),
         NS("memory"),
