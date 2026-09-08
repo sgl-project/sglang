@@ -83,6 +83,22 @@ message ChoiceConstraint {
   repeated string values = 1;
 }
 
+// Versioned, cache-neutral request metadata. Actions are transported without
+// being interpreted by the runtime.
+message KvHintAction {
+  optional string action_id = 1;
+  optional string action_type = 2;
+  optional string action_version = 3;
+  // UTF-8 JSON encoding of an object. The native bridge validates the shape.
+  optional bytes payload_json = 4;
+}
+
+message KvHints {
+  optional string protocol_version = 1;
+  optional string message_id = 2;
+  repeated KvHintAction actions = 3;
+}
+
 // ---- Text-based generate (text in, text out) ----
 
 message TextGenerateRequest {
@@ -103,6 +119,7 @@ message TextGenerateRequest {
   optional int32 priority = 15;
   optional bool require_reasoning = 16;
   optional uint32 max_thinking_tokens = 17;
+  optional KvHints kv_hints = 18;
 }
 
 message TextGenerateResponse {
@@ -130,6 +147,7 @@ message GenerateRequest {
   optional int32 priority = 14;
   optional bool require_reasoning = 15;
   optional uint32 max_thinking_tokens = 16;
+  optional KvHints kv_hints = 17;
 }
 
 message GenerateResponse {

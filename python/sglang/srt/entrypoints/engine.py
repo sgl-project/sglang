@@ -60,6 +60,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.environ import envs
+from sglang.srt.kv_hints import KvHintsRequest
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
@@ -431,6 +432,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        kv_hints: KvHintsRequest = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -450,6 +452,7 @@ class Engine(EngineScoreMixin, EngineBase):
             mm_hashes=mm_hashes,
             mm_content_hashes=mm_content_hashes,
             cache_salt=cache_salt,
+            kv_hints=kv_hints,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -544,6 +547,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        kv_hints: KvHintsRequest = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -563,6 +567,7 @@ class Engine(EngineScoreMixin, EngineBase):
             mm_hashes=mm_hashes,
             mm_content_hashes=mm_content_hashes,
             cache_salt=cache_salt,
+            kv_hints=kv_hints,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,

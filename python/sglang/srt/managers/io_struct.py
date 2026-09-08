@@ -52,6 +52,11 @@ from pydantic import PlainValidator
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
+from sglang.srt.kv_hints import (
+    KvHints,
+    KvHintsRequest,
+    normalize_kv_hints,
+)
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import (
@@ -351,6 +356,9 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
+    # Versioned, cache-neutral request metadata. Canonicalized during normalization.
+    kv_hints: KvHintsRequest = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -402,6 +410,8 @@ class GenerateReqInput:
 
         self._validate_inputs()
         self._determine_batch_size()
+        if self.kv_hints is not None:
+            self._canonicalize_kv_hints()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
@@ -412,6 +422,26 @@ class GenerateReqInput:
             self._normalize_batch_inputs()
 
         self._validate_rid_uniqueness()
+
+    def _canonicalize_kv_hints(self):
+        """Validate hints against the original logical batch."""
+        if self.is_single:
+            if isinstance(self.kv_hints, list):
+                raise ValueError(
+                    "kv_hints must be an object or None for a single request"
+                )
+            self.kv_hints = normalize_kv_hints(self.kv_hints)
+            return
+
+        if not isinstance(self.kv_hints, list):
+            raise ValueError(
+                "kv_hints must be a per-item list for a multi-request batch"
+            )
+        if len(self.kv_hints) != self.batch_size:
+            raise ValueError(
+                "The length of kv_hints should be equal to the batch size."
+            )
+        self.kv_hints = [normalize_kv_hints(item) for item in self.kv_hints]
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -560,7 +590,17 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
+        if self.kv_hints is not None:
+            self._expand_kv_hints(num)
         self._normalize_bootstrap_params(num)
+
+    def _expand_kv_hints(self, num):
+        """Fan out canonical hints without sharing mutable containers."""
+        if isinstance(self.kv_hints, list):
+            source = self.kv_hints * self.parallel_sample_num
+        else:
+            source = [self.kv_hints] * num
+        self.kv_hints = [normalize_kv_hints(item) for item in source]
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -952,6 +992,7 @@ class GenerateReqInput:
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
+            kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1067,6 +1108,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Canonical, versioned KV-hint metadata. Transport only.
+    kv_hints: Optional[KvHints] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

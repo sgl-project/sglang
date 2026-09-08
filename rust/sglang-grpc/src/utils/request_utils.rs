@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use crate::proto;
 
+const SUPPORTED_KV_HINTS_PROTOCOL_VERSION: &str = "0.1";
+
 fn regex_escape_literal(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -178,6 +180,68 @@ fn insert_disaggregated_params(
     }
 }
 
+fn required_string<'a>(value: &'a Option<String>, field: &str) -> Result<&'a str, String> {
+    value
+        .as_deref()
+        .ok_or_else(|| format!("kv_hints.{field} is required"))
+}
+
+fn kv_hints_to_json(hints: &Option<proto::KvHints>) -> Result<Option<serde_json::Value>, String> {
+    let Some(hints) = hints else {
+        return Ok(None);
+    };
+
+    let protocol_version = required_string(&hints.protocol_version, "protocol_version")?;
+    if protocol_version != SUPPORTED_KV_HINTS_PROTOCOL_VERSION {
+        return Err(format!(
+            "unsupported kv_hints protocol_version {protocol_version:?}; expected {SUPPORTED_KV_HINTS_PROTOCOL_VERSION:?}"
+        ));
+    }
+    let message_id = required_string(&hints.message_id, "message_id")?;
+
+    let actions = hints
+        .actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let action_id =
+                required_string(&action.action_id, &format!("actions[{index}].action_id"))?;
+            let action_type = required_string(
+                &action.action_type,
+                &format!("actions[{index}].action_type"),
+            )?;
+            let action_version = required_string(
+                &action.action_version,
+                &format!("actions[{index}].action_version"),
+            )?;
+            let payload_json = action
+                .payload_json
+                .as_deref()
+                .ok_or_else(|| format!("kv_hints.actions[{index}].payload_json is required"))?;
+            let payload = serde_json::from_slice::<serde_json::Value>(payload_json)
+                .map_err(|err| format!("invalid kv_hints.actions[{index}].payload_json: {err}"))?;
+            if !payload.is_object() {
+                return Err(format!(
+                    "kv_hints.actions[{index}].payload_json must encode a JSON object"
+                ));
+            }
+
+            Ok(serde_json::json!({
+                "action_id": action_id,
+                "action_type": action_type,
+                "action_version": action_version,
+                "payload": payload,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(Some(serde_json::json!({
+        "protocol_version": protocol_version,
+        "message_id": message_id,
+        "actions": actions,
+    })))
+}
+
 fn now_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -243,6 +307,9 @@ pub(crate) fn build_text_generate_dict(
     if let Some(ref session_id) = req.session_id {
         d.insert("session_id".into(), serde_json::json!(session_id));
     }
+    if let Some(kv_hints) = kv_hints_to_json(&req.kv_hints)? {
+        d.insert("kv_hints".into(), kv_hints);
+    }
     insert_generation_controls(
         &mut d,
         req.priority,
@@ -296,6 +363,9 @@ pub(crate) fn build_generate_dict(
     }
     if let Some(ref session_id) = req.session_id {
         d.insert("session_id".into(), serde_json::json!(session_id));
+    }
+    if let Some(kv_hints) = kv_hints_to_json(&req.kv_hints)? {
+        d.insert("kv_hints".into(), kv_hints);
     }
     insert_generation_controls(
         &mut d,
@@ -556,5 +626,68 @@ mod tests {
         for request in [conflicting, empty_choice, empty_legacy_regex] {
             assert!(build_generate_dict("request", &request).is_err());
         }
+    }
+
+    fn sample_kv_hints() -> proto::KvHints {
+        proto::KvHints {
+            protocol_version: Some(SUPPORTED_KV_HINTS_PROTOCOL_VERSION.into()),
+            message_id: Some("message-1".into()),
+            actions: vec![proto::KvHintAction {
+                action_id: Some("action-1".into()),
+                action_type: Some("future.action".into()),
+                action_version: Some("87.4".into()),
+                payload_json: Some(
+                    br#"{"unsigned":18446744073709551615,"nested":{"items":[1,2]}}"#.to_vec(),
+                ),
+            }],
+        }
+    }
+
+    #[test]
+    fn generate_dicts_lower_kv_hints_identically() {
+        let text_req = proto::TextGenerateRequest {
+            kv_hints: Some(sample_kv_hints()),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            kv_hints: Some(sample_kv_hints()),
+            ..Default::default()
+        };
+
+        let text = build_text_generate_dict("text", &text_req).unwrap();
+        let token = build_generate_dict("token", &token_req).unwrap();
+
+        assert_eq!(text["kv_hints"], token["kv_hints"]);
+        assert_eq!(
+            text["kv_hints"]["actions"][0]["payload"]["unsigned"],
+            serde_json::json!(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn generate_dicts_reject_malformed_kv_hints() {
+        let mut invalid_version = sample_kv_hints();
+        invalid_version.protocol_version = Some("0.2".into());
+        let mut non_object_payload = sample_kv_hints();
+        non_object_payload.actions[0].payload_json = Some(br#"[]"#.to_vec());
+        let mut missing_payload = sample_kv_hints();
+        missing_payload.actions[0].payload_json = None;
+
+        for kv_hints in [invalid_version, non_object_payload, missing_payload] {
+            let request = proto::GenerateRequest {
+                kv_hints: Some(kv_hints),
+                ..Default::default()
+            };
+            assert!(build_generate_dict("request", &request).is_err());
+        }
+    }
+
+    #[test]
+    fn generate_dicts_omit_kv_hints_when_absent() {
+        let text = build_text_generate_dict("text", &Default::default()).unwrap();
+        let token = build_generate_dict("token", &Default::default()).unwrap();
+
+        assert!(!text.contains_key("kv_hints"));
+        assert!(!token.contains_key("kv_hints"));
     }
 }
