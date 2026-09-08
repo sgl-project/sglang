@@ -652,6 +652,14 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         device_type = kv.device.type
         if from_indexer:
+            if ratio in (1, 2):
+                # V4.1 low-ratio indexer K lives in the per-ratio packed pool.
+                idx_pool = self.low_ratio_index_pools[ratio]
+                # compress_layer_id is already the pool-local index for the
+                # low-ratio pools (low_ratio_sources[ratio].index(source)).
+                _, compress_layer_id, _ = self.layer_mapping[layer_id]
+                idx_pool.set_index_k_scale(compress_layer_id, loc, kv, kv_scale)
+                return
             assert ratio == 4, f"indexer only on c4 layers, got ratio={ratio}"
             if device_type == "npu":
                 assert self.c4_indexer_kv_pool.has_npu_storage, (
@@ -667,6 +675,17 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             self.c4_indexer_kv_pool.set_index_k_scale_buffer(
                 compress_layer_id, loc, kv, kv_scale
             )
+            return
+        if ratio in (1, 2):
+            # V4.1 low-ratio latents live in their per-ratio pools; the
+            # layer_mapping already points at the owning source pool.
+            _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+            buf = compress_kv_pool.kv_buffer[compress_layer_id]
+            buf_flat = buf.flatten(0, 1) if buf.dim() > 2 else buf
+            kv_view = kv.to(buf_flat.dtype)
+            if kv_view.ndim == buf_flat.ndim - 1:
+                kv_view = kv_view.unsqueeze(1)
+            buf_flat[loc] = kv_view
             return
         compress_pool = self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
         if device_type == "npu":
