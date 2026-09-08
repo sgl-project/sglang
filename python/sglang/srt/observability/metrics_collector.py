@@ -2100,6 +2100,7 @@ KV_AGE_BUCKETS = (
     7200.0,
 )
 _KV_AGE_LABELS = tuple(str(int(b)) for b in KV_AGE_BUCKETS) + ("+Inf",)
+KV_REUSE_BUCKETS = (0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 
 
 def kv_age_bucket(age_seconds: float) -> str:
@@ -2240,6 +2241,28 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["event", "tier", "outcome", "age_le"],
         )
 
+        self.kv_lifetime_seconds = Histogram(
+            name="sglang:kv_lifetime_seconds",
+            documentation="Seconds since a radix node was created, observed once "
+            "per node when it is removed from a tier. Same tier/outcome labels "
+            'as sglang:kv_age_seconds{event="evict"}; that series is the idle '
+            "time since the last match, this one is the total residency.",
+            labelnames=list(labels.keys()) + ["tier", "outcome"],
+            buckets=list(KV_AGE_BUCKETS),
+        )
+
+        self.kv_reuses = Histogram(
+            name="sglang:kv_reuses",
+            documentation="TreeNode.hit_count at the moment a radix node is "
+            "removed from a tier: the number of non-chunked finished requests "
+            "that inserted the node, including the one that created it, so 1 "
+            "means cached and never reused. Under --hicache-write-policy "
+            "write_back HiRadixCache does not maintain hit_count and this "
+            "reads 0.",
+            labelnames=list(labels.keys()) + ["tier", "outcome"],
+            buckets=list(KV_REUSE_BUCKETS),
+        )
+
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
             documentation="GPU-stream span of a merged host-to-device load-back "
@@ -2352,6 +2375,23 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             outcome=outcome,
             age_le=kv_age_bucket(age_seconds),
         ).inc(num_tokens)
+
+    def observe_kv_eviction(
+        self,
+        age_seconds: float,
+        lifetime_seconds: float,
+        reuses: int,
+        num_tokens: int,
+        tier: str,
+        outcome: str,
+    ) -> None:
+        self.observe_kv_age(
+            age_seconds, num_tokens, event="evict", tier=tier, outcome=outcome
+        )
+        self.kv_lifetime_seconds.labels(
+            **self.labels, tier=tier, outcome=outcome
+        ).observe(lifetime_seconds)
+        self.kv_reuses.labels(**self.labels, tier=tier, outcome=outcome).observe(reuses)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):

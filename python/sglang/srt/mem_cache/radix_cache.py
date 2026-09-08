@@ -630,14 +630,7 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            if self.metrics_collector is not None:
-                self.metrics_collector.observe_kv_age(
-                    now - x.last_access_time,
-                    len(x.value),
-                    event="evict",
-                    tier="device",
-                    outcome="dropped",
-                )
+            self._observe_kv_eviction(x, len(x.value), "device", "dropped", now)
             # Tree values are page-aligned copies of a kv row: page-exact segment.
             self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
@@ -651,6 +644,28 @@ class RadixCache(BasePrefixCache):
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
+
+    def _observe_kv_eviction(
+        self,
+        node: TreeNode,
+        num_tokens: int,
+        tier: str,
+        outcome: str,
+        now: Optional[float] = None,
+    ) -> None:
+        """Record age / lifetime / reuse metrics for a node leaving a tier."""
+        if self.metrics_collector is None:
+            return
+        if now is None:
+            now = time.monotonic()
+        self.metrics_collector.observe_kv_eviction(
+            age_seconds=now - node.last_access_time,
+            lifetime_seconds=now - node.creation_time,
+            reuses=node.hit_count,
+            num_tokens=num_tokens,
+            tier=tier,
+            outcome=outcome,
+        )
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
