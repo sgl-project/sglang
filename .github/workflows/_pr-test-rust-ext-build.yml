@@ -27,7 +27,16 @@ on:
         type: string
         required: true
       restore_runs_on:
-        description: 'Runner label for the cache-hit path and the collect job. Wants free capacity and nothing else, since neither compiles nor imports the modules.'
+        description: >
+          Runner label for the cache-hit path. Only republishes bytes, so it wants
+          free capacity and is the one job here with no architecture requirement.
+        type: string
+        default: ubuntu-latest
+      collect_runs_on:
+        description: >
+          Runner label for the collect job. Must be runs_on's ARCHITECTURE: its GLIBC
+          gate reads the .so with objdump, and the hosted images ship a single-target
+          binutils.
         type: string
         default: ubuntu-latest
       artifact_name:
@@ -39,7 +48,10 @@ on:
         type: string
         default: rust-ext-x86_64-cp310-cp312
       max_glibc:
-        description: 'Highest GLIBC symbol version the built .so files may require. Set by the oldest test runner image, jammy at glibc 2.35 - the pools are not all on one image.'
+        description: >
+          Highest GLIBC symbol version the built .so files may require. A ceiling set
+          by the oldest image that has to LOAD them, not by whoever builds them; the
+          pools are not all on one image, and x86_64's oldest is jammy at 2.35.
         type: string
         default: '2.35'
       git_ref:
@@ -298,7 +310,7 @@ jobs:
   # entry both cover the whole set, so they join in one job that sees all of it.
   collect:
     needs: compile
-    runs-on: ${{ inputs.restore_runs_on }}
+    runs-on: ${{ inputs.collect_runs_on }}
     timeout-minutes: 15
     name: Collect Rust Ext
     outputs:

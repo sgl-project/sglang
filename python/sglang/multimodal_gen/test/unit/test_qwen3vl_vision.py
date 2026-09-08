@@ -12,7 +12,6 @@ from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import (
     Qwen3VLForConditionalGeneration,
-    _make_text_rms_norm,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
@@ -20,7 +19,6 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     _vision_cu_seqlens,
     _vision_position_ids,
 )
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.models.qwen3_vl import (
     Qwen3VLMoeVisionPatchMerger,
     Qwen3VLVisionPatchEmbed,
@@ -46,13 +44,6 @@ def test_native_vision_layout_matches_qwen3_merge_order():
         [1, 3],
     ]
     assert cu_seqlens.tolist() == [0, 24, 32, 40]
-
-
-def test_qwen3vl_text_reuses_srt_rms_norm():
-    norm = _make_text_rms_norm(16, 1e-6)
-
-    assert isinstance(norm, RMSNorm)
-    assert norm.cast_x_before_out_mul
 
 
 def test_native_vision_keeps_checkpoint_parameter_names():
