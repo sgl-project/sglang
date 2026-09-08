@@ -41,6 +41,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
@@ -897,7 +898,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     def _mark_dp_encoder_features_for_deferred_reconstruction(self, mm_items):
         if not (
             self.keep_mm_features_on_device
-            and self.server_args.mm_enable_dp_encoder
+            and get_mm().mm_enable_dp_encoder
             and self.model_type
             in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
         ):

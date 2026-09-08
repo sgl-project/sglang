@@ -286,6 +286,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "max_sequence_length": request.max_sequence_length,
         "flow_shift": request.flow_shift,
         "enable_teacache": request.enable_teacache,
+        "use_diffusion_decoder": _extra_value(request, "use_diffusion_decoder"),
         "enable_cache_dit": _extra_value(request, "enable_cache_dit"),
         "cache_dit_params": _extra_value(request, "cache_dit_params"),
         "cfg_gate_step": _extra_value(request, "cfg_gate_step"),
