@@ -5,8 +5,8 @@ This module is the **only** supported import surface for these kernels::
     from sglang.kernels.ops.diffusion import fused_rmsnorm_scale_shift_bitexact
 
 Importing a submodule directly (``...diffusion.norm.norm_triton``) couples the
-caller to the file layout; ``test_import_surface.py`` guards against it.  The
-one exception is a test that deliberately exercises a single backend.
+caller to the file layout. The one exception is a test that deliberately
+exercises a single backend.
 
 Layout -- ordinary implementations use one subpackage per **operator domain**
 (``norm``, ``modulate``, ``rope``, ``activation``, ``attention``, ``routing``,
@@ -587,6 +587,10 @@ _EXPORTS: dict[str, str] = {
     "mark_ltx2_rms_norm_modulate_site": "sites.ltx2_rmsnorm_modulate_site",
     "mount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
     "unmount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "ltx2_qknorm_split_rope_active": "sites.ltx2_qknorm_split_rope_site",
+    "mark_ltx2_qknorm_split_rope_site": "sites.ltx2_qknorm_split_rope_site",
+    "mount_ltx2_qknorm_split_rope": "sites.ltx2_qknorm_split_rope_site",
+    "unmount_ltx2_qknorm_split_rope": "sites.ltx2_qknorm_split_rope_site",
     "lingbot_video_rmsnorm_active": "sites.lingbot_video_rmsnorm_site",
     "mark_lingbot_video_rmsnorm_site": "sites.lingbot_video_rmsnorm_site",
     "mount_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",

@@ -102,7 +102,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=50, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
 
 # A dedicated test entry point overrides this without changing the process-wide
@@ -7860,13 +7860,15 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             indices, start_pos=0
         )
 
-    def test_apply_component_action_device_kv_swa_uses_free_swa(self):
+    def test_apply_component_action_device_kv_swa_uses_free_swa_segment(self):
         cache = mock.MagicMock()
         indices = torch.tensor([4, 5])
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.SWA)
         )
-        cache.token_to_kv_pool_allocator.free_swa.assert_called_once_with(indices)
+        cache.token_to_kv_pool_allocator.free_swa_segment.assert_called_once_with(
+            indices, start_pos=0
+        )
 
     def test_apply_component_action_device_kv_mamba_uses_mamba_allocator(self):
         cache = mock.MagicMock()

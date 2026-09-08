@@ -32,6 +32,7 @@ from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -41,6 +42,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
@@ -300,6 +302,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         InternS2MobiusForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
         Cosmos3ForConditionalGeneration,
+        Qwen4ExpForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -311,6 +314,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
         ):
@@ -521,6 +525,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
             "cosmos3_omni",
@@ -658,6 +663,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "qwen3_vl_moe",
                 "qwen3_5",
                 "qwen3_5_moe",
+                "qwen4_exp",
                 "intern_s2_preview",
                 "cosmos3_omni",
             ]
@@ -767,6 +773,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
             "cosmos3_omni",
@@ -897,7 +904,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     def _mark_dp_encoder_features_for_deferred_reconstruction(self, mm_items):
         if not (
             self.keep_mm_features_on_device
-            and self.server_args.mm_enable_dp_encoder
+            and get_mm().mm_enable_dp_encoder
             and self.model_type
             in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
         ):
