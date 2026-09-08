@@ -638,9 +638,7 @@ class DeepseekMHAForwardMixin:
 
         Returns: (kv_a, k_pe) both in BF16
         """
-        backend = get_attn_backend()
-        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
-            backend = backend.primary
+        backend = resolve_attn_backend(forward_batch)
         kv_indices = backend.forward_metadata.page_table_1_flattened
         assert kv_indices is not None, (
             "page_table_1_flattened should have been generated for FP8 MHA path"
