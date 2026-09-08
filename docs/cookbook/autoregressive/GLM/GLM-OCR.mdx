@@ -41,7 +41,7 @@ import { GLMOCRDeployment } from '/src/snippets/autoregressive/glm-ocr-deploymen
 
 ### 3.2 Configuration Tips
 
-- **CUDA IPC Transport**: The `SGLANG_USE_CUDA_IPC_TRANSPORT=1` environment variable enables CUDA IPC for transferring multimodal features, which significantly improves TTFT.
+- **CUDA IPC Transport**: Pass `--mm-feature-transport cuda_ipc` to enable CUDA IPC for transferring multimodal features, which significantly improves TTFT. (Replaces deprecated `SGLANG_USE_CUDA_IPC_TRANSPORT`.)
 - **MTP (Multi-Token Prediction)**: Enable MTP to use EAGLE speculative decoding for faster inference. This feature predicts multiple tokens at once to reduce latency.
 - **Memory Management**: For memory-constrained environments, you may need to adjust `--mem-fraction-static` and/or `--max-running-requests`.
 

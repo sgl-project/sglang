@@ -136,7 +136,7 @@ This section provides deployment configurations optimized for different hardware
 - The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
 - Context length defaults to 262,144 tokens. If you encounter OOM errors, consider reducing it, but maintain at least 128K to preserve thinking capabilities.
 - To speed up weight loading for this large model, add `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'` to the launch command.
-- **CUDA IPC Transport**: Add `SGLANG_USE_CUDA_IPC_TRANSPORT=1` as an environment variable to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`.
+- **CUDA IPC Transport**: Pass `--mm-feature-transport cuda_ipc` to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`. (Replaces deprecated `SGLANG_USE_CUDA_IPC_TRANSPORT`.)
 - **Multimodal Attention Backend**: Use `--mm-attention-backend fa3` on H100/H200 for better vision performance, or `--mm-attention-backend fa4` on B200/B300.
 - **B200 (FP8)**: Add `--enable-flashinfer-allreduce-fusion` for optimized throughput on Blackwell.
 - **B200 / B300 (FP8 MoE)**: Add `--moe-runner-backend flashinfer_trtllm` to route the fused MoE through the trtllm-gen kernels on Blackwell. This is not picked up automatically — SGLang's auto-selection of `flashinfer_trtllm` is limited to the DeepSeek architecture family, so an FP8 Qwen3.5 MoE run otherwise falls back to the Triton MoE runner. It applies to the MoE sizes (397B-A17B / 122B-A10B / 35B-A3B); the dense sizes have no MoE layers. The NVFP4 recipes already set it.
@@ -868,7 +868,7 @@ Overall accuracy: 0.978
 
 Server Launch Command:
 ```bash Command
-SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
+python -m sglang.launch_server \
   --model Qwen/Qwen3.5-397B-A17B \
   --tp 8 \
   --reasoning-parser qwen3 \
@@ -878,6 +878,7 @@ SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --mem-fraction-static 0.8 \
+  --mm-feature-transport cuda_ipc \
   --host 0.0.0.0 \
   --port 30000
 ```

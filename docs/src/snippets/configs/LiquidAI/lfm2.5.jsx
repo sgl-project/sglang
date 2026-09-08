@@ -244,11 +244,11 @@ sgl-eval run aime25 \\
       match: { hw: "h100", variant: "vl", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
         "--trust-remote-code",
+        "--mm-feature-transport cuda_ipc",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
         "--tool-call-parser lfm2",
@@ -260,11 +260,11 @@ sgl-eval run aime25 \\
       match: { hw: "h100", variant: "vl-450m", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
         "--trust-remote-code",
+        "--mm-feature-transport cuda_ipc",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
         "--tool-call-parser lfm2",
@@ -361,11 +361,11 @@ sgl-eval run aime25 \\
       match: { hw: "h200", variant: "vl", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
         "--trust-remote-code",
+        "--mm-feature-transport cuda_ipc",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
         "--tool-call-parser lfm2",
@@ -377,11 +377,11 @@ sgl-eval run aime25 \\
       match: { hw: "h200", variant: "vl-450m", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
         "--trust-remote-code",
+        "--mm-feature-transport cuda_ipc",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
         "--tool-call-parser lfm2",
@@ -486,11 +486,11 @@ sgl-eval run aime25 \\
       match: { hw: "b200", variant: "vl", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
         "--trust-remote-code",
+        "--mm-feature-transport cuda_ipc",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
         "--attention-backend flashinfer",
@@ -504,11 +504,11 @@ sgl-eval run aime25 \\
       match: { hw: "b200", variant: "vl-450m", quant: "bf16", strategy: "default", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_USE_CUDA_IPC_TRANSPORT=1",
         "SGLANG_USE_IPC_POOL_HANDLE_CACHE=1",
       ],
       flags: [
         "--trust-remote-code",
+        "--mm-feature-transport cuda_ipc",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
         "--attention-backend flashinfer",
