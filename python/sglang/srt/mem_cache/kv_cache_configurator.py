@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
+    is_swa_req_ring,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
@@ -336,6 +337,18 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
+        swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
+        alloc = pools.token_to_kv_pool_allocator
+        if not self.is_draft_worker and is_swa_req_ring(alloc):
+            # Per-request SWA ring: the sizer's swa token count describes the
+            # vestigial paged pool; the allocator knows the real ring total.
+            swa_max_total_num_tokens = alloc.size_swa
+            logger.info(
+                "SWA ring: swa_max_total_num_tokens "
+                f"{sizes.swa_max_total_num_tokens} -> {swa_max_total_num_tokens} "
+                "(fixed per-request SWA ring capacity)."
+            )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -345,7 +358,7 @@ class KVCacheConfigurator:
             max_total_num_tokens=sizes.max_total_num_tokens,
             max_running_requests=sizes.max_running_requests,
             full_max_total_num_tokens=sizes.full_max_total_num_tokens,
-            swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
             req_to_token_pool=pools.req_to_token_pool,
             token_to_kv_pool=pools.token_to_kv_pool,
             token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
@@ -1348,6 +1361,12 @@ class KVCacheConfigurator:
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
         )
+        if not self.is_draft_worker and token_to_kv_pool._unified_kv:
+            # The draft pool has no C4 layers and shares this req pool, so only
+            # the target registers the per-slot C4 reset.
+            req_to_token_pool.register_on_alloc_rows(
+                token_to_kv_pool.clear_c4_req_states
+            )
         return token_to_kv_pool
 
     def _build_oot_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -1979,6 +1998,7 @@ class KVCacheConfigurator:
                         device=self.device,
                         kvcache=token_to_kv_pool,
                         need_sort=need_sort,
+                        req_to_token_pool=req_to_token_pool,
                     )
                 else:
                     if get_memory().enable_hisparse:
@@ -2275,6 +2295,12 @@ class KVCacheConfigurator:
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
+        # calculate_pool_sizes_from_max_tokens takes a token count, not a byte
+        # budget; it cannot re-subtract the fixed pools, so capacity must not rise.
+        assert max_tokens <= config.max_total_num_tokens, (
+            f"token constraints must not raise capacity: {max_tokens} > "
+            f"{config.max_total_num_tokens}"
+        )
         if max_tokens != config.max_total_num_tokens:
             # Token-capped re-derivation: the profiled budget no longer
             # applies; the recalced config's unified_total_bytes stays None
