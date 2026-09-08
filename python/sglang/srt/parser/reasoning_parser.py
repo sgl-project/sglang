@@ -1043,6 +1043,63 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
         )
 
 
+class GraniteThinkingDetector(BaseReasoningFormatDetector):
+    """Detector for Granite 4.2 thinking models (ibm-granite/granite-4.2-*).
+
+    Strips leading newlines from content after </think> — the Granite chat
+    template writes ``\\n</think>\\n``, so content starts with ``\\n``.
+    Matches the behavior of the HF plugin ``granite_thinking_parser.py``.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+        self._content_started = False
+        self._reasoning_seen = False
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        ret = self._detect_and_parse_impl(text)
+        think_end_present = self.think_end_token in text
+        if think_end_present and ret.normal_text:
+            ret.normal_text = ret.normal_text.lstrip("\n")
+        # Match HF plugin: only swap reasoning→content when </think> was NOT
+        # found (content truly absent). When </think> IS present but content
+        # is empty after lstrip, do not swap.
+        if (
+            self._force_nonempty_content
+            and not ret.normal_text
+            and not think_end_present
+        ):
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        if self._in_reasoning:
+            self._reasoning_seen = True
+        ret = super().parse_streaming_increment(new_text)
+        if self._reasoning_seen and not self._content_started and ret.normal_text:
+            ret.normal_text = ret.normal_text.lstrip("\n")
+            if ret.normal_text:
+                self._content_started = True
+        return ret
+
+
 class MiniMaxM3Detector(BaseReasoningFormatDetector):
     """MiniMax-M3 detector. Format: (<mm:think>)*(.*)</mm:think>.
 
@@ -2123,6 +2180,7 @@ class ReasoningParser:
         "step3p5": DeepSeekR1Detector,
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
+        "granite_thinking_parser": GraniteThinkingDetector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
@@ -2176,6 +2234,10 @@ class ReasoningParser:
 
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
+
+        if model_type.lower() == "granite_thinking_parser":
+            if chat_template_kwargs.get("enable_thinking") is False:
+                kwargs["force_nonempty_content"] = True
 
         if model_type.lower() == "k2_horizon":
             # Template kwargs are the final values passed to Jinja and therefore

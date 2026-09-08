@@ -10,6 +10,7 @@ from sglang.srt.parser.reasoning_parser import (
     DeepSeekV4Detector,
     Gemma4Detector,
     Glm45Detector,
+    GraniteThinkingDetector,
     HunyuanDetector,
     InklingDetector,
     KimiDetector,
@@ -1593,6 +1594,154 @@ class TestCohereCommand4DetectorFinish(CustomTestCase):
         end = detector.finish()
         self.assertEqual(end.normal_text, "the answer")
         self.assertEqual(end.reasoning_text, "")
+
+
+class TestGraniteThinkingDetector(CustomTestCase):
+    def setUp(self):
+        self.detector = GraniteThinkingDetector()
+
+    def test_init(self):
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertEqual(self.detector.tool_start_token, "<tool_call>")
+        self.assertEqual(self.detector.reasoning_default, "enable_thinking")
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_leading_newline_stripped(self):
+        text = "<think>reasoning</think>\nHello"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "Hello")
+
+    def test_multiple_leading_newlines_stripped(self):
+        text = "<think>reasoning</think>\n\n\nHello"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "Hello")
+
+    def test_no_newline(self):
+        text = "<think>r</think>c"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "r")
+        self.assertEqual(result.normal_text, "c")
+
+    def test_reasoning_only(self):
+        text = "<think>reasoning</think>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "")
+
+    def test_whitespace_only_content_stripped(self):
+        text = "<think>reasoning</think>\n\n"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "")
+
+    def test_force_nonempty_no_swap_when_think_end_present(self):
+        """When </think> is present, force_nonempty_content does NOT swap
+        even if content is empty after lstrip. Matches HF plugin behavior."""
+        detector = GraniteThinkingDetector(force_nonempty_content=True)
+        text = "<think>reasoning</think>\n\n"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "")
+
+    def test_force_nonempty_swaps_truncated_reasoning(self):
+        """When </think> is NOT present (truncated), force_nonempty_content
+        swaps reasoning to content. Matches HF plugin behavior."""
+        detector = GraniteThinkingDetector(force_nonempty_content=True)
+        text = "<think>only reasoning no end token"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, "only reasoning no end token")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_force_nonempty_content_no_swap_when_content_exists(self):
+        detector = GraniteThinkingDetector(force_nonempty_content=True)
+        text = "<think>reasoning</think>\nreal answer"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "real answer")
+
+    def test_force_nonempty_content_truncated_reasoning(self):
+        detector = GraniteThinkingDetector(force_nonempty_content=True)
+        text = "<think>truncated reasoning"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, "truncated reasoning")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_plain_text_no_think_tags(self):
+        text = "Hello"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, "Hello")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_tool_interrupt(self):
+        text = "<think>reasoning<tool_call>get_weather</tool_call>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "<tool_call>get_weather</tool_call>")
+
+    def test_multiline_reasoning_and_content(self):
+        text = "<think>line1\nline2</think>\nresult1\nresult2"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "line1\nline2")
+        self.assertEqual(result.normal_text, "result1\nresult2")
+
+    def test_empty_think_block(self):
+        text = "<think></think>content"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "content")
+
+    def test_streaming_leading_newline_stripped(self):
+        self.detector.parse_streaming_increment("<think>")
+        result = self.detector.parse_streaming_increment("reason")
+        self.assertEqual(result.reasoning_text, "reason")
+        result = self.detector.parse_streaming_increment("</think>")
+        result = self.detector.parse_streaming_increment("\n")
+        self.assertEqual(result.normal_text, "")
+        result = self.detector.parse_streaming_increment("Hello")
+        self.assertEqual(result.normal_text, "Hello")
+
+    def test_streaming_multiple_newline_chunks_stripped(self):
+        self.detector.parse_streaming_increment("<think>")
+        self.detector.parse_streaming_increment("r")
+        self.detector.parse_streaming_increment("</think>")
+        r1 = self.detector.parse_streaming_increment("\n")
+        self.assertEqual(r1.normal_text, "")
+        r2 = self.detector.parse_streaming_increment("\n")
+        self.assertEqual(r2.normal_text, "")
+        r3 = self.detector.parse_streaming_increment("Hello")
+        self.assertEqual(r3.normal_text, "Hello")
+
+    def test_streaming_newlines_preserved_after_content_starts(self):
+        self.detector.parse_streaming_increment("<think>")
+        self.detector.parse_streaming_increment("r")
+        self.detector.parse_streaming_increment("</think>")
+        self.detector.parse_streaming_increment("\n")
+        self.detector.parse_streaming_increment("Hello")
+        result = self.detector.parse_streaming_increment("\nworld")
+        self.assertEqual(result.normal_text, "\nworld")
+
+    def test_streaming_think_end_with_newline_in_same_chunk(self):
+        self.detector.parse_streaming_increment("<think>")
+        r1 = self.detector.parse_streaming_increment("r")
+        self.assertEqual(r1.reasoning_text, "r")
+        result = self.detector.parse_streaming_increment("</think>\nHello")
+        self.assertEqual(result.normal_text, "Hello")
+
+    def test_streaming_no_strip_without_reasoning(self):
+        result = self.detector.parse_streaming_increment("\nHello")
+        self.assertEqual(result.normal_text, "\nHello")
+
+    def test_reasoning_parser_integration(self):
+        parser = ReasoningParser("granite_thinking_parser")
+        self.assertIsInstance(parser.detector, GraniteThinkingDetector)
+        reasoning, normal = parser.parse_non_stream(
+            "<think>thinking</think>\nThe answer"
+        )
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, "The answer")
 
 
 if __name__ == "__main__":
