@@ -115,20 +115,25 @@ class TestDFlashConfidence(unittest.TestCase):
         graph_config = SimpleNamespace(
             decode=SimpleNamespace(backend=Backend.FULL, bs=[1, 2, 4, 8, 16])
         )
-        with mock.patch(
-            "sglang.srt.speculative.dflash_worker_v2.get_spec",
-            return_value=SimpleNamespace(speculative_algorithm="DFLASH_CONFIDENCE"),
-        ), mock.patch(
-            "sglang.srt.speculative.dflash_worker_v2.ragged_verify_compact_enabled",
-            return_value=True,
-        ), mock.patch(
-            "sglang.srt.speculative.dflash_worker_v2.get_exec",
-            return_value=SimpleNamespace(
-                graph=SimpleNamespace(cuda_graph_config=graph_config)
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dflash_worker_v2.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="DFLASH_CONFIDENCE"),
             ),
-        ), mock.patch(
-            "sglang.srt.speculative.dflash_worker_v2.get_schedule",
-            return_value=SimpleNamespace(max_running_requests=32),
+            mock.patch(
+                "sglang.srt.speculative.dflash_worker_v2.ragged_verify_compact_enabled",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dflash_worker_v2.get_exec",
+                return_value=SimpleNamespace(
+                    graph=SimpleNamespace(cuda_graph_config=graph_config)
+                ),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dflash_worker_v2.get_schedule",
+                return_value=SimpleNamespace(max_running_requests=32),
+            ),
         ):
             with self.assertRaisesRegex(ValueError, "max_running_requests=32"):
                 _require_dflash_ragged_graph_coverage(None, block_size=8)
@@ -142,9 +147,7 @@ class TestDFlashConfidence(unittest.TestCase):
         )
         self.assertEqual(
             generate_decode_cuda_graph_batch_sizes(args, 80),
-            list(range(1, 17))
-            + list(range(18, 65, 2))
-            + list(range(68, 81, 4)),
+            list(range(1, 17)) + list(range(18, 65, 2)) + list(range(68, 81, 4)),
         )
 
     def test_other_speculative_algorithms_keep_generic_cuda_graph_tiers(self):
@@ -398,9 +401,7 @@ class TestDFlashConfidence(unittest.TestCase):
             stride=3,
         )
         self.assertEqual(layout.positions.tolist(), [1, 2, 3, 3, 4, 5])
-        self.assertEqual(
-            layout.cache_loc.tolist(), [301, 302, 303, 103, 104, 105]
-        )
+        self.assertEqual(layout.cache_loc.tolist(), [301, 302, 303, 103, 104, 105])
 
     def test_dflash_confidence_has_dflash_family_capabilities(self):
         algorithm = SpeculativeAlgorithm.DFLASH_CONFIDENCE
@@ -430,6 +431,7 @@ class TestDFlashConfidence(unittest.TestCase):
             record["verify_reason_counts"], {"confidence_ragged_lagged_budget": 1}
         )
         self.assertEqual(record["confidence"], {})
+
 
 if __name__ == "__main__":
     unittest.main()
