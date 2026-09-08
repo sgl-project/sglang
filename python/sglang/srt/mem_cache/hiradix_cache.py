@@ -1292,21 +1292,9 @@ class HiRadixCache(RadixCache):
         self._update_leaf_status(node.parent)
         return num_evicted
 
-    def _observe_evicted_age(
-        self, node: TreeNode, num_tokens: int, tier: str, outcome: str
-    ) -> None:
-        if self.metrics_collector is not None:
-            self.metrics_collector.observe_kv_age(
-                time.monotonic() - node.last_access_time,
-                num_tokens,
-                event="evict",
-                tier=tier,
-                outcome=outcome,
-            )
-
     def _evict_backuped(self, node: TreeNode):
         device_indices = node.value
-        self._observe_evicted_age(node, len(device_indices), "device", "demoted")
+        self._observe_kv_eviction(node, len(device_indices), "device", "demoted")
         num_evicted = self._detach_backuped(node)
         self.cache_controller.evict_device(device_indices)
         return num_evicted
@@ -1315,7 +1303,7 @@ class HiRadixCache(RadixCache):
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
-        self._observe_evicted_age(node, len(node.value), "device", "dropped")
+        self._observe_kv_eviction(node, len(node.value), "device", "dropped")
         self.kv_events.record_remove(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
@@ -1388,7 +1376,7 @@ class HiRadixCache(RadixCache):
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
-            self._observe_evicted_age(x, len(x.host_value), "host", "dropped")
+            self._observe_kv_eviction(x, len(x.host_value), "host", "dropped")
             self.kv_events.record_remove(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 

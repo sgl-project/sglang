@@ -2,9 +2,11 @@
 
 ``sglang:kv_age_seconds`` / ``sglang:kv_age_tokens_total`` record how long a
 radix node had gone untouched when it was matched again (``event="hit"``) or
-removed from a tier (``event="evict"``). These tests cover the collector-level
-contract: label routing, the token-weighted bucket label, and that the
-histogram sees one observation per call.
+removed from a tier (``event="evict"``); ``sglang:kv_lifetime_seconds`` and
+``sglang:kv_reuses`` record total residency and TreeNode.hit_count at removal.
+These tests cover the collector-level contract (label routing, the
+token-weighted bucket label, one observation per call) and an end-to-end CPU
+RadixCache insert / match / re-insert / evict sequence.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,6 +29,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.observability.metrics_collector import (
     KV_AGE_BUCKETS,
+    KV_REUSE_BUCKETS,
     RadixCacheMetricsCollector,
     kv_age_bucket,
 )
@@ -157,6 +160,34 @@ class TestObserveKvAge(unittest.TestCase):
         )
         self.assertEqual(len(self.collector.kv_age_seconds.observations), 3)
 
+    def test_eviction_records_age_lifetime_and_reuses(self):
+        self.collector.observe_kv_eviction(
+            age_seconds=30.0,
+            lifetime_seconds=900.0,
+            reuses=4,
+            num_tokens=256,
+            tier="device",
+            outcome="demoted",
+        )
+        want = {"cache_type": "RadixCache", "tier": "device", "outcome": "demoted"}
+        self.assertEqual(
+            self.collector.kv_age_seconds.observations,
+            [({**want, "event": "evict"}, 30.0)],
+        )
+        self.assertEqual(
+            self.collector.kv_age_tokens.increments,
+            [({**want, "event": "evict", "age_le": "30"}, 256)],
+        )
+        self.assertEqual(
+            self.collector.kv_lifetime_seconds.observations, [(want, 900.0)]
+        )
+        self.assertEqual(self.collector.kv_reuses.observations, [(want, 4)])
+        self.assertEqual(self.collector.kv_reuses.name, "sglang:kv_reuses")
+        self.assertEqual(
+            self.collector.kv_lifetime_seconds.name, "sglang:kv_lifetime_seconds"
+        )
+        self.assertEqual(KV_REUSE_BUCKETS[0], 0.0)
+
 
 class TestRadixCacheEmitsKvAge(unittest.TestCase):
     """End-to-end on a CPU RadixCache: a re-match records a hit age for the
@@ -221,6 +252,10 @@ class TestRadixCacheEmitsKvAge(unittest.TestCase):
         ]
         self.assertEqual(hit_tokens, [len(tokens)])
 
+        # hit_count counts inserts including the creating one: a second finished
+        # request re-inserting the same prefix takes it from 1 to 2.
+        cache.insert(InsertParams(key=RadixKey(token_ids=tokens), value=indices))
+
         cache.evict(EvictParams(num_tokens=len(tokens)))
         evicts = [
             (lab, v)
@@ -230,6 +265,13 @@ class TestRadixCacheEmitsKvAge(unittest.TestCase):
         self.assertEqual(len(evicts), 1)
         self.assertEqual(evicts[0][0]["tier"], "device")
         self.assertEqual(evicts[0][0]["outcome"], "dropped")
+        want = {"cache_type": "RadixCache", "tier": "device", "outcome": "dropped"}
+        self.assertEqual(len(collector.kv_lifetime_seconds.observations), 1)
+        self.assertEqual(collector.kv_lifetime_seconds.observations[0][0], want)
+        self.assertGreaterEqual(
+            collector.kv_lifetime_seconds.observations[0][1], evicts[0][1]
+        )
+        self.assertEqual(collector.kv_reuses.observations, [(want, 2)])
         evict_tokens = [
             v
             for lab, v in collector.kv_age_tokens.increments
