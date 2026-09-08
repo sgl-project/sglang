@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    take_kv_age_hit_observation,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -1744,7 +1745,12 @@ class HiRadixCache(RadixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        observe_kv_age = (
+            self.metrics_collector is not None and take_kv_age_hit_observation(params)
+        )
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, observe_kv_age=observe_kv_age
+        )
         if value:
             value = torch.cat(value)
         else:
@@ -1858,7 +1864,9 @@ class HiRadixCache(RadixCache):
 
         return matched_length
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _match_prefix_helper(
+        self, node: TreeNode, key: RadixKey, observe_kv_age: bool = False
+    ):
         node.last_access_time = time.monotonic()
         child_key = key.child_key(self.page_size)
         value = []
@@ -1866,7 +1874,7 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             prefix_len = child.key.match(key, page_size=self.page_size)
-            if self.metrics_collector is not None:
+            if observe_kv_age:
                 self.metrics_collector.observe_kv_age(
                     time.monotonic() - child.last_access_time,
                     prefix_len,

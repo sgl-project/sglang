@@ -18,6 +18,7 @@ from array import array
 
 import torch
 
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -35,7 +36,18 @@ from sglang.srt.observability.metrics_collector import (
     RadixCacheMetricsCollector,
     kv_age_bucket,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+
+def _req(rid: str, tokens) -> Req:
+    """A bare Req: hit ages are observed once per request, on its first match."""
+    return Req(
+        rid=rid,
+        origin_input_text="",
+        origin_input_ids=list(tokens),
+        sampling_params=SamplingParams(),
+    )
 
 
 class _BoundRecordingMetric:
@@ -240,6 +252,11 @@ class TestRadixCacheEmitsKvAge(unittest.TestCase):
         cache.insert(InsertParams(key=RadixKey(token_ids=tokens), value=indices))
         self.assertEqual(collector.kv_age_seconds.observations, [])
 
+        req = _req("r1", tokens)
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
+        # Re-matches of the same request (scheduling rounds, post-insert
+        # re-anchor) and request-less matches must not count again.
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
         cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens)))
         hits = [
             (lab, v)
@@ -337,6 +354,11 @@ class TestUnifiedRadixCacheEmitsKvAge(unittest.TestCase):
         cache.insert(InsertParams(key=RadixKey(token_ids=tokens), value=indices))
         self.assertEqual(collector.kv_age_seconds.observations, [])
 
+        req = _req("r1", tokens)
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
+        # Re-matches of the same request (scheduling rounds, post-insert
+        # re-anchor) and request-less matches must not count again.
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens), req=req))
         cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens)))
         hits = [
             (lab, v)

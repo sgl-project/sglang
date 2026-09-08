@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
     _dfs_weight_order,
+    take_kv_age_hit_observation,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
@@ -841,14 +842,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         cur_time = get_and_increase_time_counter()
         now_wall = time.monotonic()
+        observe_kv_age = (
+            self.kv_age_observer is not None and take_kv_age_hit_observation(params)
+        )
         while node_update:
-            self._emit_kv_age(
-                node_update,
-                "hit",
-                "host" if node_update.evicted else "device",
-                "hit",
-                now_wall,
-            )
+            if observe_kv_age:
+                self._emit_kv_age(
+                    node_update,
+                    "hit",
+                    "host" if node_update.evicted else "device",
+                    "hit",
+                    now_wall,
+                )
             node_update.last_access_time = cur_time
             node_update.last_access_wall = now_wall
             cur_time -= 0.00001

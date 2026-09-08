@@ -57,6 +57,21 @@ class MatchPrefixParams:
     req: Optional[Req] = None
 
 
+def take_kv_age_hit_observation(params: MatchPrefixParams) -> bool:
+    """Return True for the first match_prefix a request performs, False after.
+
+    Only that first match measures real reuse: the scheduler re-matches waiting
+    requests every round and the cache re-matches after each insert, and those
+    would all land in the sub-second age bucket. Matches without a request
+    (tests, probes) never observe.
+    """
+    req = params.req
+    if req is None or getattr(req, "kv_age_hit_observed", False):
+        return False
+    req.kv_age_hit_observed = True
+    return True
+
+
 @dataclasses.dataclass
 class InsertParams:
     """Unified parameters for insert across different cache types"""
