@@ -113,10 +113,23 @@ def _ltx2_reference(
     return q_ref.to(dtype=torch.bfloat16), k_ref.to(dtype=torch.bfloat16)
 
 
-def test_ltx2_qknorm_hopper_quality_path_matches_within_bf16() -> None:
+@pytest.mark.parametrize(
+    "batch,q_seq,k_seq,num_heads,head_dim",
+    [
+        (1, 17, 9, 32, 64),
+        (2, 1, 3, 32, 128),
+        (1, 1536, 1536, 32, 128),
+        (1, 1536, 1024, 32, 128),
+        (1, 126, 126, 32, 64),
+        (1, 126, 1024, 32, 64),
+        (1, 6144, 6144, 32, 128),
+    ],
+)
+def test_ltx2_qknorm_hopper_preserves_bf16_rounding(
+    batch, q_seq, k_seq, num_heads, head_dim
+) -> None:
     _require_sm90()
     torch.cuda.manual_seed(20260908)
-    batch, q_seq, k_seq, num_heads, head_dim = 1, 17, 9, 32, 64
     hidden = num_heads * head_dim
     eps = 1e-6
     q = torch.randn(batch, q_seq, hidden, device="cuda", dtype=torch.bfloat16)
@@ -171,8 +184,36 @@ def test_ltx2_qknorm_hopper_quality_path_matches_within_bf16() -> None:
         allow_sm90=True,
     )
     torch.cuda.synchronize()
-    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=BF16_FUSED_ATOL)
-    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=BF16_FUSED_ATOL)
+    assert torch.equal(q_out, q_ref)
+    assert torch.equal(k_out, k_ref)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_q, graph_k = ltx2_qknorm_split_rope_cuda(
+            q,
+            q_cos,
+            q_sin,
+            q_weight,
+            k,
+            k_cos,
+            k_sin,
+            k_weight,
+            eps=eps,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            allow_sm90=True,
+        )
+    q.mul_(0.5)
+    k.neg_()
+    graph.replay()
+    assert torch.equal(
+        graph_q,
+        _apply_split_rotary_ref(F.rms_norm(q, (hidden,), q_weight, eps), q_cos, q_sin),
+    )
+    assert torch.equal(
+        graph_k,
+        _apply_split_rotary_ref(F.rms_norm(k, (hidden,), k_weight, eps), k_cos, k_sin),
+    )
 
 
 @pytest.mark.parametrize(
