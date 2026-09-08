@@ -3,7 +3,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -20,6 +20,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_context, get_parallel
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -32,12 +33,7 @@ def _reply(success=True):
 
 def _manager():
     tm = TokenizerManager.__new__(TokenizerManager)
-    tm.server_args = SimpleNamespace(
-        enable_lora=True,
-        pp_size=1,
-        max_loaded_loras=None,
-        checkpoint_engine_wait_weights_before_ready=False,
-    )
+    tm.server_args = SimpleNamespace(max_loaded_loras=None)
     tm.elastic_worker_count = 1
     tm.init_weight_update()
     tm.auto_create_handle_loop = Mock()
@@ -85,12 +81,15 @@ def _end(**kwargs):
 
 class TestPublicationOverlap(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        parallel = patch(
-            "sglang.srt.managers.tokenizer_control_mixin.get_parallel",
-            return_value=SimpleNamespace(dp_size=1, enable_dp_attention=False),
+        config = get_context().override_server_args(
+            enable_lora=True,
+            pp_size=1,
+            dp_size=1,
+            enable_dp_attention=False,
+            checkpoint_engine_wait_weights_before_ready=False,
         )
-        parallel.start()
-        self.addCleanup(parallel.stop)
+        config.install()
+        self.addCleanup(config.restore)
         self.tm = _manager()
         result = await self.tm.register_lora_adapter(
             RegisterLoRAAdapterReqInput(
@@ -101,13 +100,13 @@ class TestPublicationOverlap(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.pending)
 
     async def test_pipeline_parallel_registration_fails_before_allocating(self):
-        self.tm.server_args.pp_size = 2
         self.tm.update_lora_adapter_communicator.reset_mock()
-        result = await self.tm.register_lora_adapter(
-            RegisterLoRAAdapterReqInput(
-                lora_name="A@3", config_dict={"r": 8}, defer_publish=True
+        with get_parallel().override(pp_size=2):
+            result = await self.tm.register_lora_adapter(
+                RegisterLoRAAdapterReqInput(
+                    lora_name="A@3", config_dict={"r": 8}, defer_publish=True
+                )
             )
-        )
         self.assertFalse(result.success)
         self.assertIn("pp_size=1", result.error_message)
         self.tm.update_lora_adapter_communicator.assert_not_awaited()

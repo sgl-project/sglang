@@ -825,7 +825,7 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
-            if obj.defer_publish and self.server_args.pp_size != 1:
+            if obj.defer_publish and get_parallel().pp_size != 1:
                 raise ValueError(
                     "Deferred LoRA publication requires pp_size=1; "
                     "cross-stage commit acknowledgement is not supported"
