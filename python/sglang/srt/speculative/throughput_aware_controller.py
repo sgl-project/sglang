@@ -68,7 +68,7 @@ import bisect
 import json
 import logging
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -84,9 +84,6 @@ from sglang.srt.speculative.throughput_aware_spec_params import (
     score_candidates,
 )
 from sglang.srt.utils.common import log_info_on_rank0
-
-if TYPE_CHECKING:
-    from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 
 logger = logging.getLogger(__name__)
 
