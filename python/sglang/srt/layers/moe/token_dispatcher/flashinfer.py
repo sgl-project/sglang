@@ -192,32 +192,38 @@ class FlashinferDispatcher(BaseDispatcher):
             get_spec().speculative_algorithm
         )
         can_use_quantized_dispatch = not speculative_algo.is_eagle()
+        topk_id_and_weight_bytes = self.router_topk * 4 + self.router_topk * 4
+        bf16_dispatch_payload_size_per_token = (
+            hidden_size * 2 + topk_id_and_weight_bytes  # bf16 hidden states
+        )
         if (
             self.dispatch_type == FlashinferA2ADispatchType.NVFP4
             and can_use_quantized_dispatch
         ):
-            total_dispatch_payload_size_per_token = (
+            quantized_dispatch_payload_size_per_token = (
                 hidden_size // 2  # nvfp4 hidden states
                 + hidden_size // 16  # uint8 scaling factors
-                + self.router_topk * 4  # int32 topks ids
-                + self.router_topk * 4  # float32 topk weights
+                + topk_id_and_weight_bytes
+            )
+            total_dispatch_payload_size_per_token = max(
+                quantized_dispatch_payload_size_per_token,
+                bf16_dispatch_payload_size_per_token,
             )
         elif (
             self.dispatch_type == FlashinferA2ADispatchType.MXFP8
             and can_use_quantized_dispatch
         ):
-            total_dispatch_payload_size_per_token = (
+            quantized_dispatch_payload_size_per_token = (
                 hidden_size  # fp8 hidden states
                 + hidden_size // 32  # ue8m0 scaling factors
-                + self.router_topk * 4  # int32 topks ids
-                + self.router_topk * 4  # float32 topk weights
+                + topk_id_and_weight_bytes
+            )
+            total_dispatch_payload_size_per_token = max(
+                quantized_dispatch_payload_size_per_token,
+                bf16_dispatch_payload_size_per_token,
             )
         else:
-            total_dispatch_payload_size_per_token = (
-                hidden_size * 2  # bf16 hidden states
-                + self.router_topk * 4  # int32 topks ids
-                + self.router_topk * 4  # float32 topk weights
-            )
+            total_dispatch_payload_size_per_token = bf16_dispatch_payload_size_per_token
         combine_payload_size_per_token = hidden_size * 2  # bf16 hidden states
         self.workspace_size = moe_a2a_get_workspace_size_per_rank(
             ep_size=self.ep_size,

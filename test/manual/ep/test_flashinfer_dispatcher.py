@@ -404,7 +404,7 @@ class TestFlashinferDispatcher(CustomTestCase):
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
         )
-        dispatcher.set_quant_config({"input_global_scale": None})
+        dispatcher.set_quant_config({"input_global_scale": None, "use_mxfp8": True})
 
         dispatch_output = dispatcher.dispatch(hidden_states, topk_output)
 
@@ -469,7 +469,7 @@ class TestFlashinferDispatcher(CustomTestCase):
             num_local_experts=1,
             hidden_size=hidden_size,
         )
-        dispatcher.set_quant_config({"input_global_scale": None})
+        dispatcher.set_quant_config({"input_global_scale": None, "use_mxfp8": True})
         self._zero_moe_a2a_dispatch_payloads()
         torch.distributed.barrier()
         dispatch_output = dispatcher.dispatch(
