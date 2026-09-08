@@ -227,6 +227,9 @@ class BaseMultimodalProcessor(ABC):
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
+    # Artifact-based processors may keep their prompt/M-RoPE fast path even
+    # when artifact retention is disabled.
+    uses_media_artifacts_without_cache = False
     # Processors opt out only when their preprocessing is not thread-safe. The
     # worker pool gives each thread its own `copy.deepcopy` of the HF processor
     # and injects it, and the single function it runs --
@@ -287,6 +290,7 @@ class BaseMultimodalProcessor(ABC):
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config)
             if self.mm_preprocess_cache.enabled
+            or self.uses_media_artifacts_without_cache
             else None
         )
         if self.mm_preprocess_cache.enabled:
@@ -1975,6 +1979,24 @@ class BaseMultimodalProcessor(ABC):
         # and releases each successful pool slice.
         updates = []
         try:
+            # encoder-DP assigns images to different consumers, so keep its leases separate
+            candidates = [
+                (item, item.feature)
+                for item in mm_items
+                if isinstance(item.feature, torch.Tensor)
+                and item.feature.is_cuda
+                and item.feature.numel() > 0
+            ]
+            if len(candidates) > 1 and not get_mm().mm_enable_dp_encoder:
+                packed = self.cudaipc_mmfeature_pool.wrap_tensors(
+                    [tensor for _, tensor in candidates],
+                    use_pool_handle_cache=self.use_ipc_pool_handle_cache,
+                )
+                if packed is not None:
+                    for (item, tensor), proxy in zip(candidates, packed, strict=True):
+                        item.feature = proxy
+                        updates.append((item, "feature", tensor, proxy))
+
             for item in mm_items:
                 fields = (
                     ("feature", item.feature),

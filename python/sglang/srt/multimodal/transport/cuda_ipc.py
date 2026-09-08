@@ -152,6 +152,10 @@ class MmItemMemoryPool:
 
     def cancel_proxy(self, proxy: "CudaIpcTensorTransportProxy") -> None:
         """Return a published slice when its request was never dispatched."""
+        if isinstance(proxy, CudaIpcPackedTensorTransportProxy):
+            proxy = proxy.owner
+        if proxy._producer_cancelled:
+            return
         ipc_extra = proxy.proxy_state["ipc_extra"]
         if tuple(ipc_extra["pool_handle"]) != tuple(self._pool_ipc_handle):
             raise RuntimeError("CUDA IPC proxy does not belong to this pool")
@@ -160,6 +164,47 @@ class MmItemMemoryPool:
             ack_byte_offset=proxy.ack_byte_offset,
             generation=proxy.generation,
         )
+        proxy._producer_cancelled = True
+
+    def wrap_tensors(
+        self, tensors: list[torch.Tensor], *, use_pool_handle_cache: bool
+    ) -> Optional[list["CudaIpcPackedTensorTransportProxy"]]:
+        """pack tensors with the same request and consumer lifetime"""
+        if not tensors:
+            return []
+        lease, destinations = self._pool.copy_tensors(tensors)
+        if lease is None:
+            return None
+        try:
+            packed = self.memory_pool[lease.start : lease.start + lease.nbytes]
+            owner = CudaIpcTensorTransportProxy(
+                data=packed,
+                info_data=packed,
+                pool_ipc_handle=self._pool_ipc_handle,
+                pool_byte_offset=lease.start,
+                ready_byte_offset=lease.ready_byte_offset,
+                ack_byte_offset=lease.ack_byte_offset,
+                generation=lease.generation,
+                total_consumer_count=self.consumer_count,
+                use_pool_handle_cache=use_pool_handle_cache,
+            )
+            return [
+                CudaIpcPackedTensorTransportProxy(
+                    owner=owner,
+                    offset=destination.data_ptr() - packed.data_ptr(),
+                    shape=tensor.shape,
+                    dtype=tensor.dtype,
+                    nbytes=destination.numel(),
+                )
+                for tensor, destination in zip(tensors, destinations, strict=True)
+            ]
+        except BaseException:
+            self._pool.cancel_lease(
+                ready_byte_offset=lease.ready_byte_offset,
+                ack_byte_offset=lease.ack_byte_offset,
+                generation=lease.generation,
+            )
+            raise
 
     def _warn_pool_full_once(self, nbytes: int):
         if self._pool_full_warned:
@@ -186,6 +231,8 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
     the producer copy, consumer copy, and pool reuse without CPU shared memory
     or device-wide synchronization.
     """
+
+    supports_deferred_reconstruction = True
 
     def __init__(
         self,
@@ -230,6 +277,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             "tensor_data": None,
         }
         self.reconstruct_tensor = None
+        self._producer_cancelled = False
         # Keep uncached mappings alive until the work enqueued on the consumer
         # stream has completed.
         self._pool_storage = None
@@ -359,3 +407,72 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         self._retain_storage_until_stream_completes(storage, rebuild_device_idx)
         self.reconstruct_tensor = reconstructed_tensor
         return self.reconstruct_tensor
+
+
+class CudaIpcPackedTensorTransportProxy(CudaIpcTensorTransportProxy):
+    """typed request-owned view of one shared IPC reconstruction
+
+    reconstructing any child copies the complete payload before acknowledging
+    its lease; subsequent children and re-prefills reuse that owned copy
+    """
+
+    supports_deferred_reconstruction = False
+
+    def __init__(
+        self,
+        *,
+        owner: CudaIpcTensorTransportProxy,
+        offset: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        nbytes: int,
+    ):
+        self.owner = owner
+        self.offset = offset
+        self.shape = shape
+        self.dtype = dtype
+        self.nbytes = nbytes
+        self.total_consumer_count = owner.total_consumer_count
+        self.reconstruct_tensor = None
+
+    def reconstruct_on_target_device(
+        self,
+        rebuild_device_idx: int,
+        consumer_count: int = 1,
+        consumer_rank: Optional[int] = None,
+    ) -> torch.Tensor:
+        device = torch.device(f"cuda:{rebuild_device_idx}")
+        if (
+            self.reconstruct_tensor is not None
+            and self.reconstruct_tensor.device == device
+        ):
+            return self.reconstruct_tensor
+        if self.owner._producer_cancelled or (
+            self.owner._consumer_acknowledged
+            and (
+                self.owner.reconstruct_tensor is None
+                or self.owner.reconstruct_tensor.device != device
+            )
+        ):
+            raise RuntimeError("Packed CUDA IPC payload has already released its lease")
+        packed = self.owner.reconstruct_on_target_device(
+            rebuild_device_idx,
+            consumer_count=consumer_count,
+            consumer_rank=consumer_rank,
+        )
+        self.reconstruct_tensor = (
+            packed.narrow(0, self.offset, self.nbytes)
+            .view(self.dtype)
+            .reshape(self.shape)
+        )
+        return self.reconstruct_tensor
+
+    def acknowledge_consumption(
+        self, consumer_count: int = 1, consumer_rank: Optional[int] = None
+    ) -> None:
+        raise RuntimeError(
+            "Packed CUDA IPC features must be reconstructed before release"
+        )
+
+    def release_without_reconstruction(self, consumer_count: int = 1) -> None:
+        self.owner.release_without_reconstruction(consumer_count)

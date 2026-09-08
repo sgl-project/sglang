@@ -909,6 +909,33 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
+            # Keep the prompt as an independent radix node. Finished requests
+            # append a short, request-specific output to a much longer prompt;
+            # without this split the prompt and output form one leaf and are
+            # evicted together. Re-inserting the prompt only changes topology:
+            # prev_prefix_len prevents the overlapping KV indices from being
+            # treated as duplicate allocations and freed.
+            prompt_key = RadixKey(
+                req.origin_input_ids,
+                req.extra_key,
+                is_bigram=self.tree_core.is_eagle,
+                cache_salt=req.cache_salt,
+            ).page_aligned(self.page_size)
+            if (
+                len(self._components_tuple) == 1
+                and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
+                and 0 < len(prompt_key) < len(radix_key)
+            ):
+                self.insert(
+                    replace(
+                        insert_params,
+                        key=prompt_key,
+                        value=values[: len(prompt_key)],
+                        prev_prefix_len=len(prompt_key),
+                        priority=insert_params.priority + 1,
+                    )
+                )
+
             # Free unaligned tail (+ deferred truncation tail)
             ranges = [(page_aligned_len, len(kv_indices))]
             if tail_free_start is not None:
