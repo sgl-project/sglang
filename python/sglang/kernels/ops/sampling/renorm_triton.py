@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.sampling.renorm import top_p_pivots
+
 _BLOCK_SIZE = 1024
 
 
@@ -94,9 +96,9 @@ def top_p_renorm_probs_triton(
 ) -> torch.Tensor:
     """Apply exact top-p thresholding and renormalize each probability row.
 
-    Sorting and prefix sums use PyTorch's device kernels because a vocabulary-sized
-    in-register Triton sort does not scale to 100K+ vocabularies. Triton performs
-    the bandwidth-heavy masking, partial reduction, and normalization.
+    Pivot selection lives in :func:`~sglang.kernels.ops.sampling.renorm.top_p_pivots`,
+    which picks between a sort and a bounded prefix search by row count. Triton
+    performs the bandwidth-heavy masking, partial reduction, and normalization.
     """
     probs_fp32 = _prepare_probs(probs)
     batch_size, vocab_size = probs_fp32.shape
@@ -119,15 +121,7 @@ def top_p_renorm_probs_triton(
             (batch_size,), float(top_p), device=probs.device, dtype=torch.float32
         )
 
-    # Match FlashInfer's threshold semantics: sort ascending, discard the prefix
-    # whose cumulative mass is below 1 - p, and retain all ties at the pivot.
-    sorted_probs = torch.sort(probs_fp32, dim=-1).values
-    cdf = torch.cumsum(sorted_probs, dim=-1)
-    cutoff = torch.searchsorted(cdf, (1.0 - top_ps).unsqueeze(1), right=False).squeeze(
-        1
-    )
-    cutoff.clamp_(max=vocab_size - 1)
-    pivots = sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
+    pivots = top_p_pivots(probs_fp32, top_ps).contiguous()
 
     return _renorm_from_pivots(probs_fp32, pivots)
 
