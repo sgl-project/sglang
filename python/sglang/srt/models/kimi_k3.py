@@ -33,6 +33,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers import (
     k3_ar_fusion,
     k3_gemm_ar,
+    k3_sp,
     k3_sp_collective,
     zero_copy_context,
 )
@@ -1334,6 +1335,24 @@ class KimiK3MoE(nn.Module):
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        #  Row-parallel tail (SGLANG_K3_TAIL_SHARD): the norm, the replicated
+        #  up_proj and the add3 are token-local, so run them on this rank's
+        #  T/w rows and all-gather in exact bf16 instead of every rank
+        #  computing all T. Not under fused_norm: that path already consumed
+        #  the latent inside the fused AR+norm kernel. Under SP-MoE the caller
+        #  has already handed the MoE a T/w shard, so this shards the shard --
+        #  correct, because the divisibility gate still holds, but redundant
+        #  with the layer's own all-gather.
+        if not fused_norm and k3_sp.tail_shard_eligible(num_tokens):
+            rows = k3_sp.tail_shard_rows(num_tokens)
+            out, _ = self.routed_expert_up_proj(self._latent_norm(latent[rows]))
+            return k3_sp.tail_shard_all_gather(
+                _add3(
+                    out,
+                    shared_output[rows],
+                    None if prefix_sum is None else prefix_sum[rows],
+                )
+            )
         if not fused_norm:
             latent = self._latent_norm(latent)
         out, _ = self.routed_expert_up_proj(latent)

@@ -1887,6 +1887,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token count above which <code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code> stops applying and the split projection runs instead. The merged shape is only faster while the projection is bandwidth bound.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_K3_TAIL_SHARD</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3: compute the LatentMoE tail (latent RMSNorm, <code>routed_expert_up_proj</code>, add3) row-parallel across the TP group and all-gather the result, instead of every rank computing all tokens and keeping 1/TP. The tail is token-local, so this is exact up to the GEMM's accumulation order. Saves the replicated GEMM, which is the largest term; the all-gather is too costly at short sequences, so it is off below <code>SGLANG_K3_TAIL_SHARD_MIN_TOKENS</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_K3_TAIL_SHARD_MIN_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token count below which <code>SGLANG_K3_TAIL_SHARD</code> stops applying and the replicated tail runs instead. This is a performance threshold, not an accuracy threshold: it sits at the measured crossover where the all-gather's fixed cost exceeds the saving. Below it the sharded path is slower.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>4096</code></td>
+    </tr>
   </tbody>
 </table>
 

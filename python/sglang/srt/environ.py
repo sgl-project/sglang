@@ -1681,6 +1681,20 @@ class Envs:
     # kernel computes the TP-local o_proj partial and the cross-rank sum over
     # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.
     SGLANG_K3_GEMM_AR = EnvBool(False)
+    # Token-shard ONLY the LatentMoE tail math (the latent RMSNorm, the
+    # replicated routed_expert_up_proj GEMM, the add3), leaving the existing
+    # all-reduce exactly as it is, then all-gather the result in exact bf16
+    # over the TP group. The tail is token-local -- no cross-token reduction --
+    # so rank r computes its own T/w rows instead of every rank computing all
+    # T and discarding 7/8. Needs no split collectives and so no aiter
+    # quickreduce rebuild, and it moves no value through a codec the
+    # replicated path does not: the AR is untouched and the all-gather is
+    # unquantized. Prefill-only by token count. See srt/layers/k3_sp.py.
+    SGLANG_K3_TAIL_SHARD = EnvBool(False)
+    # Token count below which the tail keeps the replicated path: under it the
+    # all-gather's fixed cost exceeds the saving (0.525x at T=32, 1.574x at
+    # T=16384).
+    SGLANG_K3_TAIL_SHARD_MIN_TOKENS = EnvInt(4096)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
