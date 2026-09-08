@@ -232,6 +232,7 @@ class TestTextEncoderClassResolution(unittest.TestCase):
             component_precisions={},
             pipeline_config=SimpleNamespace(text_encoder_precisions=["bf16"]),
             explicit_residency_mode=mock.Mock(return_value=None),
+            should_start_component_on_cpu=mock.Mock(return_value=False),
             require_component_resident=mock.Mock(),
             should_use_fsdp_for_component=mock.Mock(return_value=False),
             revision=None,
@@ -285,6 +286,70 @@ class TestTextEncoderClassResolution(unittest.TestCase):
 
 
 class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
+
+    def test_bitsandbytes_native_load_honors_cpu_offload(self):
+        loaded_encoder = nn.Linear(1, 1)
+        transformers_model_class = SimpleNamespace(
+            from_pretrained=mock.Mock(return_value=loaded_encoder)
+        )
+        server_args = SimpleNamespace(
+            component_precisions={},
+            pipeline_config=SimpleNamespace(text_encoder_precisions=["bf16"]),
+            explicit_residency_mode=mock.Mock(return_value=None),
+            should_start_component_on_cpu=mock.Mock(return_value=True),
+            require_component_resident=mock.Mock(),
+            should_use_fsdp_for_component=mock.Mock(return_value=False),
+            revision=None,
+            trust_remote_code=False,
+        )
+        component_config = {
+            "quantization_config": {
+                "load_in_4bit": True,
+                "quant_method": "bitsandbytes",
+            }
+        }
+
+        loader = TextEncoderLoader()
+        with (
+            mock.patch.object(
+                TextEncoderLoader,
+                "resolve_native_transformers_model_class",
+                return_value=transformers_model_class,
+            ),
+            mock.patch.object(
+                loader,
+                "target_device",
+                side_effect=lambda component_starts_on_cpu: (
+                    torch.device("cpu")
+                    if component_starts_on_cpu
+                    else torch.device("cuda:0")
+                ),
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_hf_config",
+                return_value=component_config,
+            ),
+        ):
+            encoder = loader.load_native(
+                "/model/text_encoder",
+                server_args,
+                "transformers",
+                "text_encoder",
+            )
+
+        self.assertIs(encoder, loaded_encoder)
+        server_args.require_component_resident.assert_not_called()
+        transformers_model_class.from_pretrained.assert_called_once_with(
+            "/model/text_encoder",
+            config=component_config,
+            trust_remote_code=False,
+            revision=None,
+            torch_dtype=torch.bfloat16,
+            device_map={"": torch.device("cpu")},
+        )
+
+
     def test_only_known_unconsumed_weights_are_filtered(self):
         encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
         encoder.selected_lm_layer = 50
