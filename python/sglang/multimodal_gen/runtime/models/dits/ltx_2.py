@@ -19,9 +19,11 @@ from sglang.kernels.ops.diffusion import (
     fused_gelu_active,
     fused_linear_gelu_tanh,
     fused_ltx2_rms_norm_modulate,
+    ltx2_qknorm_split_rope_active,
     ltx2_qknorm_split_rope_cuda,
     ltx2_rms_norm_modulate_active,
     mark_fused_gelu_site,
+    mark_ltx2_qknorm_split_rope_site,
     mark_ltx2_rms_norm_modulate_site,
     modulate_scale_shift_cuda,
     residual_gate_add,
@@ -83,6 +85,7 @@ def _ltx2_try_fused_qknorm_split_rope(
     eps: float,
     num_heads: int,
     head_dim: int,
+    allow_sm90: bool,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     global _LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED
 
@@ -104,6 +107,7 @@ def _ltx2_try_fused_qknorm_split_rope(
             k_norm.weight,
             num_heads=num_heads,
             head_dim=head_dim,
+            allow_sm90=allow_sm90,
         )
     ):
         return None
@@ -121,6 +125,7 @@ def _ltx2_try_fused_qknorm_split_rope(
             eps=eps,
             num_heads=num_heads,
             head_dim=head_dim,
+            allow_sm90=allow_sm90,
         )
     except Exception as exc:
         if torch.compiler.is_compiling():
@@ -753,6 +758,7 @@ class LTX2Attention(nn.Module):
         self.apply_gated_attention = bool(apply_gated_attention)
         self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
         self.prefix = prefix
+        mark_ltx2_qknorm_split_rope_site(self)
 
         tp_size = get_tp_world_size()
         if tp_size <= 0:
@@ -910,6 +916,7 @@ class LTX2Attention(nn.Module):
                         eps=self.norm_eps,
                         num_heads=self.local_heads,
                         head_dim=self.dim_head,
+                        allow_sm90=ltx2_qknorm_split_rope_active(self),
                     )
 
             if fused_qk is not None:
