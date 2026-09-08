@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -55,7 +56,6 @@ if TYPE_CHECKING:
         DispatchOutput,
         StandardDispatchOutput,
     )
-    from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
@@ -76,7 +76,6 @@ if _use_aiter:
 class Bf16GemmBackend(Enum):
     AUTO = "auto"
     CUTEDSL = "cutedsl"
-    FLASHINFER_PR4266 = "flashinfer_pr4266"
     GEMV = "gemv"
     TORCH = "torch"
 
@@ -89,28 +88,22 @@ class Bf16GemmBackend(Enum):
     def is_gemv(self) -> bool:
         return self == Bf16GemmBackend.GEMV
 
-    def is_flashinfer_pr4266(self) -> bool:
-        return self == Bf16GemmBackend.FLASHINFER_PR4266
-
-    def is_optimized(self) -> bool:
-        return self.is_cutedsl() or self.is_flashinfer_pr4266()
-
 
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
 _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
 _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
-_flashinfer_pr4266_splitk_tactic = None
-_flashinfer_pr4266_run_splitk_dense = None
-_flashinfer_pr4266_direct_default_tactic = None
-_flashinfer_pr4266_prefer_direct = None
-_flashinfer_pr4266_run_direct_dense = None
+_splitk_tactic = None
+_run_splitk_dense = None
+_direct_default_tactic = None
+_prefer_direct = None
+_run_direct_dense = None
 _enable_bf16_splitk_gemm = False
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
-_FLASHINFER_PR4266_TUNED_TACTICS = {
+_BF16_SPLITK_TUNED_TACTICS = {
     (1, 256, 8192): (64, 8, 4, 11),
     (2, 256, 8192): (64, 8, 4, 11),
     (4, 256, 8192): (64, 8, 4, 11),
@@ -142,26 +135,26 @@ _FLASHINFER_PR4266_TUNED_TACTICS = {
 }
 
 
-def use_flashinfer_pr4266_bf16_gemm(m: int, n: int, k: int) -> bool:
-    return (m, n, k) in _FLASHINFER_PR4266_TUNED_TACTICS
+def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
+    return (m, n, k) in _BF16_SPLITK_TUNED_TACTICS
 
 
 def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
     """Return whether the optional Split-K path should be initialized."""
-    return backend.is_optimized() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
+    return backend.is_cutedsl() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
 
 
-def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
-    global _flashinfer_pr4266_splitk_tactic
-    global _flashinfer_pr4266_run_splitk_dense
-    global _flashinfer_pr4266_direct_default_tactic
-    global _flashinfer_pr4266_prefer_direct
-    global _flashinfer_pr4266_run_direct_dense
+    global _splitk_tactic
+    global _run_splitk_dense
+    global _direct_default_tactic
+    global _prefer_direct
+    global _run_direct_dense
     global _enable_bf16_splitk_gemm
 
-    backend_str = server_args.bf16_gemm_backend
+    backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
         backend_str = (
             "torch"
@@ -183,7 +176,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
         _hopper_bf16_gemv = hopper_bf16_gemv
         _use_hopper_bf16_gemv = use_hopper_bf16_gemv
-    elif backend.is_optimized():
+    elif backend.is_cutedsl():
         if get_exec().deterministic.enable_deterministic_inference:
             raise ValueError(
                 "--bf16-gemm-backend cutedsl is batch-size dependent and cannot "
@@ -191,8 +184,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
             )
         if not get_platform().is_sm100:
             raise ValueError(
-                f"--bf16-gemm-backend {backend.value} requires "
-                "SM100/SM103 (Blackwell)"
+                f"--bf16-gemm-backend {backend.value} requires SM100/SM103 (Blackwell)"
             )
 
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
@@ -205,21 +197,21 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
     _enable_bf16_splitk_gemm = False
     if should_enable_bf16_splitk_gemm(backend):
-        from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_direct import (
+        from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
             default_tactic,
             prefer_direct_bf16_gemm_sm100,
             run_direct_dense,
         )
-        from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_splitk import (
+        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
             SplitKTactic,
             run_splitk_dense,
         )
 
-        _flashinfer_pr4266_splitk_tactic = SplitKTactic
-        _flashinfer_pr4266_run_splitk_dense = run_splitk_dense
-        _flashinfer_pr4266_direct_default_tactic = default_tactic
-        _flashinfer_pr4266_prefer_direct = prefer_direct_bf16_gemm_sm100
-        _flashinfer_pr4266_run_direct_dense = run_direct_dense
+        _splitk_tactic = SplitKTactic
+        _run_splitk_dense = run_splitk_dense
+        _direct_default_tactic = default_tactic
+        _prefer_direct = prefer_direct_bf16_gemm_sm100
+        _run_direct_dense = run_direct_dense
         _enable_bf16_splitk_gemm = True
 
     _BF16_GEMM_BACKEND = backend
@@ -231,20 +223,18 @@ def _bf16_gemm_dispatch_fake(
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
-def _flashinfer_pr4266_bf16_gemm(
+def _bf16_splitk_gemm(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     x_2d = x.view(-1, x.shape[-1])
     out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
     m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
-    if bias is None and _flashinfer_pr4266_prefer_direct(m, n, k):
-        tactic = _flashinfer_pr4266_direct_default_tactic(m, n, k)
-        _flashinfer_pr4266_run_direct_dense(x_2d, weight.T, out, True, tactic)
+    if bias is None and _prefer_direct(m, n, k):
+        tactic = _direct_default_tactic(m, n, k)
+        _run_direct_dense(x_2d, weight.T, out, True, tactic)
     else:
-        tactic = _flashinfer_pr4266_splitk_tactic(
-            *_FLASHINFER_PR4266_TUNED_TACTICS[(m, n, k)]
-        )
-        _flashinfer_pr4266_run_splitk_dense(
+        tactic = _splitk_tactic(*_BF16_SPLITK_TUNED_TACTICS[(m, n, k)])
+        _run_splitk_dense(
             x_2d,
             weight.T,
             bias,
@@ -256,28 +246,41 @@ def _flashinfer_pr4266_bf16_gemm(
 
 
 def _bf16_gemm_dispatch_impl(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
-    if _enable_bf16_splitk_gemm and use_flashinfer_pr4266_bf16_gemm(
+    if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
-        return _flashinfer_pr4266_bf16_gemm(x, weight, bias)
-    if (
+        output = _bf16_splitk_gemm(x, weight, bias)
+    elif (
         _use_hopper_bf16_gemv is not None
         and bias is None
         and _use_hopper_bf16_gemv(m, weight.shape[0], weight.shape[1])
     ):
-        return _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
+        output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
-    if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
+    elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
-        return _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
+        output = _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
             *x.shape[:-1], -1
         )
-    return F.linear(x, weight, bias)
+    elif addend is not None:
+        # cuBLAS folds the addend in through the GEMM beta input;
+        # a bias would need a third operand, so callers must exclude it.
+        assert bias is None
+        return torch.addmm(addend, x, weight.t(), out=addend)
+    else:
+        return F.linear(x, weight, bias)
+
+    if addend is not None:
+        output.add_(addend)
+    return output
 
 
 @register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
@@ -285,6 +288,32 @@ def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     return _bf16_gemm_dispatch_impl(x, weight, bias)
+
+
+def _can_accumulate_into_addend(
+    *,
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    addend: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> bool:
+    if not _is_cuda or torch.compiler.is_compiling():
+        return False
+    # Batch-invariant mode overrides aten::mm and aten::addmm,
+    # but not aten::addmm.out, so deterministic inference keeps a separate add.
+    if is_batch_invariant_mode_enabled():
+        return False
+    # x.is_cuda also keeps the CPU AMX route in apply().
+    if bias is not None or x.ndim != 2 or not x.is_cuda:
+        return False
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return False
+    return (
+        addend.dtype == torch.bfloat16
+        and addend.is_contiguous()
+        and addend.shape == (x.shape[0], weight.shape[0])
+        and not (x.requires_grad or addend.requires_grad or weight.requires_grad)
+    )
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -385,7 +414,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
-            get_bf16_gemm_backend().is_optimized()
+            get_bf16_gemm_backend().is_cutedsl()
             and x.is_cuda
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
@@ -402,6 +431,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
+
+    def apply_with_addend(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        addend: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run an inference-only BF16 linear and add ``addend`` to the result.
+
+        Only the cuBLAS route accumulates through the GEMM beta input,
+        returning ``addend`` itself; the other routes add separately,
+        leaving it untouched. Callers must treat it as consumed either way.
+        """
+        if _can_accumulate_into_addend(
+            weight=layer.weight, x=x, addend=addend, bias=bias
+        ):
+            return _bf16_gemm_dispatch_impl(x, layer.weight, bias, addend=addend)
+        return self.apply(layer, x, bias).add_(addend)
 
     def apply_into(
         self,
@@ -1079,11 +1127,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             return StandardCombineInput(hidden_states=output)
         else:
             assert backend.is_triton()
-            assert (
-                moe_runner_config.activation == "silu"
-            ), f"activation = {moe_runner_config.activation} is not supported \
+            assert moe_runner_config.activation == "silu", (
+                f"activation = {moe_runner_config.activation} is not supported \
             for Triton PATH, please drop --moe-runner-backend triton to use \
             the sgl-kernel-xpu path, which supports more activations."
+            )
 
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
