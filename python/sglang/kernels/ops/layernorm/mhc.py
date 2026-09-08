@@ -18,7 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.common import is_gfx1250_supported, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -2373,10 +2373,24 @@ def hc_mix_stats_sinkhorn(
     return pre, post, comb
 
 
+def _hc_combine_torch(
+    x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """Pure-torch mirror of _hc_combine_kernel: fp32 accumulation, cast at the end."""
+    m, h = x_flat.shape[0], x_flat.shape[1] // hc
+    # [m, HC, H]; x_flat must be contiguous for the view (callers pass row-major).
+    x = x_flat.view(m, hc, h)
+    # Broadcast pre[m, k] over h and accumulate in fp32, like the Triton acc.
+    y = torch.einsum("mk,mkh->mh", pre.to(torch.float32), x.to(torch.float32))
+    return y.to(out_dtype)
+
+
 def hc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
+    if is_npu():
+        return _hc_combine_torch(x_flat, pre, hc, out_dtype)
     m = x_flat.shape[0]
     h = x_flat.shape[1] // hc
     y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
