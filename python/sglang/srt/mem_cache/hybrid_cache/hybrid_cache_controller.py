@@ -356,9 +356,10 @@ class HybridCacheController(BaseHiCacheController):
     def _uses_shared_host_domain(
         self, extra_pools: Optional[list[PoolTransfer]]
     ) -> bool:
-        domain = self.mem_pool_host.anchor_entry.host_pool.shared_allocation_domain
-        if domain is None:
+        anchor_pool = self.mem_pool_host.anchor_entry.host_pool
+        if not self._uses_shared_host_layout(anchor_pool):
             return False
+        domain = anchor_pool.shared_allocation_domain
         for transfer in extra_pools or []:
             if (
                 transfer.indices_from_pool is not None
@@ -367,9 +368,9 @@ class HybridCacheController(BaseHiCacheController):
             ):
                 continue
             entry = self.mem_pool_host.entry_map.get(transfer.name)
-            if (
-                entry is not None
-                and entry.host_pool.shared_allocation_domain is not domain
+            if entry is not None and (
+                not self._uses_shared_host_layout(entry.host_pool)
+                or entry.host_pool.shared_allocation_domain is not domain
             ):
                 return False
         return True
@@ -403,6 +404,7 @@ class HybridCacheController(BaseHiCacheController):
             entry
             for entry in self.mem_pool_host.entries
             if entry.name not in requested_names
+            and self._uses_shared_host_layout(entry.host_pool)
             and entry.host_pool.shared_allocation_domain is domain
         )
 
@@ -793,7 +795,7 @@ class HybridCacheController(BaseHiCacheController):
         with self.mem_pool_host.layout_lease():
             return self._page_transfer_with_stable_layout(operation)
 
-    def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> bool:
+    def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
         # KV pools and KV-derived pools first — determines actual completed page count
         kv_completed_pages = super()._page_transfer(operation)
 

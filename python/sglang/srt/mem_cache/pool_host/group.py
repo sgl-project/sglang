@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 
 
 @dataclass
@@ -77,6 +78,8 @@ class HostPoolGroup:
         domains = []
         seen = set()
         for entry in self.entries:
+            if not isinstance(entry.host_pool, HostKVCache):
+                continue
             domain = entry.host_pool.shared_allocation_domain
             if domain is None or id(domain) in seen:
                 continue
