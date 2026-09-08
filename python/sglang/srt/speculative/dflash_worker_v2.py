@@ -308,10 +308,7 @@ class _DominoDraftSampler:
         self.block_size = int(block_size)
         self.shift_label = bool(shift_label)
         self.candidate_pool_size = int(candidate_pool_size)
-        self.num_proposals = (
-            self.block_size if self.shift_label else self.block_size - 1
-        )
-        max_tokens = int(max_bs) * self.num_proposals
+        max_tokens = int(max_bs) * (self.block_size - 1)
         self.out = torch.empty(
             (max_tokens,), dtype=torch.int64, device=lm_head_weight.device
         )
@@ -333,7 +330,7 @@ class _DominoDraftSampler:
             shift_label=self.shift_label,
             candidate_pool_size=self.candidate_pool_size,
         )
-        self.out[: bs * self.num_proposals].copy_(proposals.reshape(-1))
+        self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -419,21 +416,29 @@ class DFlashWorkerV2(BaseSpecWorker):
                 prefix_gru=prefix_gru,
                 embed_proj=embed_proj,
             )
-        self.draft_block_size, self.block_size = draft_config.resolve_block_sizes(
-            draft_block_size=get_spec().speculative_dflash_block_size,
-            verify_window=get_spec().speculative_num_draft_tokens,
-        )
-        if (
-            draft_config.block_size is not None
-            and self.draft_block_size != draft_config.block_size
-        ):
-            logger.warning(
-                "DFLASH draft block size override: using %s, checkpoint has %s.",
-                self.draft_block_size,
-                draft_config.block_size,
+        if get_spec().speculative_num_draft_tokens is None:
+            # Should not happen (ServerArgs should have inferred it), but keep a fallback.
+            self.block_size = int(draft_config.resolve_block_size(default=16))
+        else:
+            self.block_size = int(get_spec().speculative_num_draft_tokens)
+            model_block_size = draft_config.block_size
+            if model_block_size is None:
+                model_block_size = getattr(self.draft_model, "block_size", None)
+            if model_block_size is not None and int(model_block_size) != int(
+                self.block_size
+            ):
+                logger.warning(
+                    "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
+                    self.block_size,
+                    model_block_size,
+                )
+        self.draft_model.set_block_size(self.block_size)
+        self.speculative_num_draft_tokens = int(self.block_size)
+        if self._is_domino and self.block_size <= 1:
+            raise ValueError(
+                "DFLASH Domino requires speculative_num_draft_tokens > 1, "
+                f"got {self.block_size}."
             )
-        self.draft_model.set_block_size(self.draft_block_size)
-        self.speculative_num_draft_tokens = self.block_size
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -458,10 +463,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if self._is_domino:
                 logger.info(
-                    "DFLASH Domino rollout enabled: draft_block_size=%s, num_proposals=%s, verify_window=%s, candidate_pool_size=%s.",
-                    self.draft_block_size,
-                    self.block_size - 1,
-                    self.block_size,
+                    "DFLASH Domino rollout enabled (eager BF16, TP=1, block-shared candidate pool size=%s).",
                     self.domino_candidate_pool_size,
                 )
             logger.info(
@@ -489,7 +491,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=self.draft_block_size, device=self.device
+            draft_token_num=int(self.block_size), device=self.device
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
@@ -769,7 +771,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 prefix_gru=prefix_gru,
                 embed_proj=embed_proj,
                 vocab_size=int(self.model_runner.model_config.vocab_size),
-                block_size=self.draft_block_size,
+                block_size=self.block_size,
                 shift_label=self.draft_model.shift_label,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 candidate_pool_size=self.domino_candidate_pool_size,
@@ -2193,8 +2195,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        draft_block_ids = block_ids[:, : self.draft_block_size]
-        noise_embedding = embed_module(draft_block_ids)
+        noise_embedding = embed_module(block_ids)
         if self._noise_embed_scale != 1.0:
             noise_embedding = noise_embedding * self._noise_embed_scale
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
@@ -2243,15 +2244,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
-            input_ids=draft_block_ids.reshape(-1),
+            input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc_2d[:, : self.draft_block_size].reshape(
-                -1
-            ),
+            out_cache_loc=verify_out_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
-            positions=positions_2d[:, : self.draft_block_size].reshape(-1),
+            positions=positions,
             input_embeds=input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
@@ -2282,7 +2281,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, self.draft_block_size, -1)
+            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
             prefix_gru = self.draft_model.prefix_gru
             embed_proj = self.draft_model.embed_proj
             if prefix_gru is None or embed_proj is None:

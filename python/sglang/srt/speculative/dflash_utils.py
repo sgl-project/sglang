@@ -559,31 +559,6 @@ class DFlashDraftConfig:
     def resolve_block_size(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.block_size if self.block_size is not None else default
 
-    def resolve_block_sizes(
-        self,
-        *,
-        draft_block_size: Optional[int] = None,
-        verify_window: Optional[int] = None,
-    ) -> Tuple[int, int]:
-        extra = int(self.is_domino and self.shift_label)
-        if draft_block_size is None:
-            draft_block_size = (
-                int(verify_window) - extra
-                if verify_window is not None
-                else self.resolve_block_size(default=16)
-            )
-        draft_block_size = int(draft_block_size)
-        if draft_block_size < 1 or (self.is_domino and draft_block_size < 2):
-            raise ValueError(f"Invalid DFLASH draft block size: {draft_block_size}.")
-        expected_verify_window = draft_block_size + extra
-        if verify_window is not None and int(verify_window) != expected_verify_window:
-            raise ValueError(
-                "DFLASH --speculative-num-draft-tokens must equal the draft block "
-                "size plus one for shift-label Domino, or the draft block size "
-                f"otherwise: expected {expected_verify_window}, got {verify_window}."
-            )
-        return draft_block_size, expected_verify_window
-
     def resolve_target_layer_ids(
         self,
         *,

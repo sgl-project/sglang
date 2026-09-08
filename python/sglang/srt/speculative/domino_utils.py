@@ -131,7 +131,7 @@ def domino_greedy_rollout(
             f"bonus_tokens must have shape ({batch_size},), got {tuple(bonus_tokens.shape)}."
         )
 
-    num_proposals = int(block_size) if shift_label else int(block_size) - 1
+    num_proposals = int(block_size) - 1
     if num_proposals < 1:
         raise ValueError(f"Domino requires block_size > 1, got {block_size}.")
     candidate_pool_size = int(candidate_pool_size)
@@ -142,7 +142,11 @@ def domino_greedy_rollout(
         )
     candidate_pool_size = min(candidate_pool_size, int(vocab_size))
     start = 0 if shift_label else 1
-    z = draft_hidden[:, start:, :]
+    z = draft_hidden[:, start : start + num_proposals, :]
+    if int(z.shape[1]) != num_proposals:
+        raise ValueError(
+            "Domino draft hidden states do not contain enough proposal positions."
+        )
 
     weight = lm_head_weight[: int(vocab_size)]
     z_for_logits = z.to(weight.dtype) if z.dtype != weight.dtype else z

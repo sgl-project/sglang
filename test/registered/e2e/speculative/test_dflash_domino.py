@@ -69,16 +69,15 @@ class TestDFlashDomino(CustomTestCase, GSM8KMixin):
         response = requests.get(self.base_url + "/server_info", timeout=10)
         response.raise_for_status()
         state = response.json()["internal_states"][0]
-        self.assertEqual(state["speculative_dflash_block_size"], 16)
-        self.assertEqual(state["speculative_num_draft_tokens"], 17)
+        self.assertEqual(state["speculative_num_draft_tokens"], 16)
         self.assertFalse(state["disable_overlap_schedule"])
         self.assertEqual(
             state["speculative_domino_candidate_pool_size"], self.candidate_pool_size
         )
         log = Path(self.server_log.name).read_text()
         self.assertIn(
-            "DFLASH Domino rollout enabled: draft_block_size=16, num_proposals=16, "
-            f"verify_window=17, candidate_pool_size={self.candidate_pool_size}.",
+            "DFLASH Domino rollout enabled (eager BF16, TP=1, "
+            f"block-shared candidate pool size={self.candidate_pool_size}).",
             log,
         )
         self.assertIn("Domino rollout folded into the draft cuda graph", log)
@@ -87,7 +86,7 @@ class TestDFlashDomino(CustomTestCase, GSM8KMixin):
             log,
         )
         self.assertIn(
-            "Capture target verify CUDA graph begin. backend=full, num_tokens_per_req=17,",
+            "Capture target verify CUDA graph begin. backend=full, num_tokens_per_req=16,",
             log,
         )
 

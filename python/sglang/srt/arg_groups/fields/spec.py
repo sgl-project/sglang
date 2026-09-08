@@ -71,7 +71,7 @@ class Spec:
     ] = None
     speculative_dflash_block_size: A[
         Optional[int],
-        "DFLASH only. Draft forward block size. The verify window (--speculative-num-draft-tokens) is one larger for shift-label Domino and equal otherwise.",
+        "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
     speculative_domino_candidate_pool_size: A[
         int,
