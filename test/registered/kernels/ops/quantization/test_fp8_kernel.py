@@ -2,10 +2,13 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+    sglang_per_token_quant_fp8,
+)
 from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kernels.fp8 import TestFP8Base
+from sglang.test.kernels.fp8 import TestFP8Base, device
 
 register_cuda_ci(est_time=4, stage="base-b", runner_config="1-gpu-large")
 
@@ -14,6 +17,15 @@ _is_cuda = is_cuda()
 
 
 class TestPerTokenGroupQuantFP8(TestFP8Base):
+    def test_per_token_quant_fp8_empty_input(self):
+        x = torch.empty((0, 3072), dtype=torch.bfloat16, device=device)
+
+        x_q, x_s = sglang_per_token_quant_fp8(x)
+        torch.cuda.synchronize()
+
+        self.assertEqual(x_q.shape, x.shape)
+        self.assertEqual(x_s.shape, (0, 1))
+
     def test_per_token_group_quant_fp8(self):
         if _is_cuda and torch.cuda.get_device_capability()[0] < 9:
             return

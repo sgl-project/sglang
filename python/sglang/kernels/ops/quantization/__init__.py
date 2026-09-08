@@ -79,6 +79,8 @@ def sgl_per_token_quant_fp8(
     output_s: torch.Tensor,
 ) -> None:
     """Per-token FP8 quantization, writing into ``output_q`` / ``output_s``."""
+    if input.shape[0] == 0:
+        return
     return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.JIT)(
         input, output_q, output_s
     )
