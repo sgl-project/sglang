@@ -227,7 +227,10 @@ def test_hybrid_override_loads_ref_config_and_admits_all_native_tasks(weights):
     }
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
     pipeline.server_args = SimpleNamespace(
-        model_variant="hybrid", model_subfolder=None, transformer_weights_path=weights
+        model_variant="hybrid",
+        model_subfolder=None,
+        component_weights_paths={"transformer": weights} if weights else {},
+        transformer_weights_path=None,
     )
     with patch.object(
         ComposedPipelineBase, "_load_config", return_value=model_index

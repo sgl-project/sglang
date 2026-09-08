@@ -93,9 +93,9 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         model_variant = self.server_args.model_variant
         if model_variant is not None:
             semantic_subfolder = self.model_subfolder_for_variant(model_variant)
-            if (
-                model_variant.strip().lower() == "hybrid"
-                and not self.server_args.transformer_weights_path
+            if model_variant.strip().lower() == "hybrid" and not (
+                self.server_args.component_weights_paths.get("transformer")
+                or self.server_args.transformer_weights_path
             ):
                 raise ValueError(
                     "MiniMax H3 --model-variant hybrid requires explicit merged "
