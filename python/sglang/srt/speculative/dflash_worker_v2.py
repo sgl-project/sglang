@@ -320,19 +320,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_probs_buf = None
         self._logged_first_verify = False
         self._full_embed_gpu: Optional[torch.Tensor] = None
-        # Under dp attention the spec broadcasts must stay within the attn-TP
-        # group: peer DP ranks run different (idle) paths, so a full-TP
-        # broadcast either mismatches sizes (prefill) or waits forever on
-        # ranks that already returned (decode).
+        # Under dp attention, peer DP ranks run different (idle) paths, so
+        # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(
             get_parallel().attn_tp_group
             if get_parallel().enable_dp_attention
             else get_tp_group()
         )
 
-        # Under dp attention, the draft worker runs on the per-DP attn-TP group so
-        # its tensor-parallel plumbing (head sharding, draft-token sampling
-        # all-gather) stays within one DP group, independent of idle peer DP ranks.
+        # Under dp attention, the draft worker runs on the per-DP attn-TP
+        # group, independent of idle peer DP ranks.
         self.draft_tp_context = (
             draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
@@ -390,9 +387,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             if hasattr(target_model, "get_dflash_noise_embedding_scale")
             else 1.0
         )
-        # Merge the trained mask embedding (mask_embedding.pt) into the target
-        # embedding table before snapshotting it, so the draft's MASK block positions
-        # use the learned vector instead of the target's untrained mask-token row.
         self._maybe_merge_trained_mask_embedding()
         self._cache_full_embed_weight()
         if self.ps.tp_rank == 0:
@@ -512,10 +506,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             )
             if get_parallel().enable_dp_attention and capture_decode_cuda_graph:
-                # The dense DFLASH draft's collectives live inside the per-DP
-                # attn-TP group; idle DP ranks skip the draft step, so they
-                # cannot join a shared graph capture/replay. Keep the draft
-                # eager under dp attention.
+                # Idle DP ranks skip the draft step, so they cannot join a
+                # shared graph capture/replay; keep the draft eager under dp
+                # attention.
                 capture_decode_cuda_graph = False
                 if self.ps.tp_rank == 0:
                     logger.warning(
@@ -1048,16 +1041,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
     def _maybe_merge_trained_mask_embedding(self) -> None:
-        """Merge a trained mask embedding into the target model's embedding table.
+        """Merge a trained mask embedding (mask_embedding.pt) into the target table.
 
-        During DFlash training the mask-token embedding can be trained separately and
-        saved as ``mask_embedding.pt`` in the draft checkpoint directory. If present,
-        overwrite the corresponding row in the target embedding table so inference uses
-        the learned representation (the target's own mask-token row is typically an
-        untrained added-vocab slot ~= 0).
-
-        Handles VocabParallelEmbedding TP sharding: each rank only updates the row if
-        the mask token falls within its local shard range.
+        The target's own mask-token row is typically an untrained added-vocab
+        slot; overwrite it with the learned vector. VocabParallelEmbedding-aware:
+        each rank only updates the row if the token falls within its shard.
         """
         draft_model_path = self.server_args.speculative_draft_model_path
         if draft_model_path is None:
@@ -1115,12 +1103,10 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _cache_full_embed_weight(self) -> None:
         """Cache the full target embedding replicated on GPU during init.
 
-        With dp attention the active and idle DP groups run different code
-        paths, so the attn-TP all_reduce inside VocabParallelEmbedding gets
-        mismatched calls (idle DP ranks skip the draft step) and corrupts
-        results. Gather the full embedding once during init (all ranks sync)
-        and keep it replicated on GPU, so the draft block-id lookup is a
-        collective-free, sync-free on-device ``F.embedding``.
+        Under dp attention, idle DP ranks skip the draft step, so the attn-TP
+        all_reduce inside VocabParallelEmbedding gets mismatched calls. Gather
+        the full embedding once during init and keep it replicated, making
+        the draft block-id lookup a collective-free on-device F.embedding.
         """
         if not get_parallel().enable_dp_attention:
             return
@@ -1605,11 +1591,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
             )
         num_tokens = int(target_hidden.shape[0])
-        # Downstream collectives can round the token count up to a TP/EP-size
-        # multiple, leaving trailing alignment padding rows in target_hidden
-        # that are not real tokens. Drop them before materializing into the
-        # draft KV; otherwise the padding rows write into slots belonging to
-        # other requests and corrupt their cache.
+        # Drop trailing alignment-padding rows (from TP/EP-size rounding)
+        # before materializing into the draft KV; they would corrupt other
+        # requests' cache slots.
         expected_tokens = int(cache_loc.numel())
         if num_tokens > expected_tokens:
             if not getattr(self, "_logged_padding_trim", False):
@@ -1762,8 +1746,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if _is_npu:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
-                # Match forward()/kv_proj_only(): scale ctx V so ctx and
-                # self-generated V stay aligned in the draft KV cache.
+                # Keep V scaling consistent with forward().
                 if attn.v_scale is not None:
                     v = v * attn.v_scale
             else:
@@ -2082,10 +2065,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
-            # Under dp attention, is_extend_in_batch is aggregated across DP
-            # ranks: an idle DP rank (no requests; extend_lens/prefix_lens stay
-            # None) still runs the empty target prefill above to stay in the
-            # DP collective, but must skip the DFlash draft KV materialization,
+            # An idle DP rank runs the empty target prefill above to stay in
+            # the DP collective, but must skip the draft KV materialization,
             # which needs per-request extend info.
             if batch.forward_mode.is_idle():
                 batch_output.next_draft_input = DFlashDraftInputV2.create_idle_input(
@@ -2149,10 +2130,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_idle():
-            # Under dp attention an idle DP rank must still run the target verify
-            # forward (in IDLE mode) so its cross-DP collectives (MoE all-to-all,
-            # attention gather) stay in lockstep with the active DP group. The draft
-            # block is skipped here: the draft forward's collectives are within-rank.
+            # Under dp attention an idle DP rank must still run the target
+            # verify forward (IDLE mode) so its cross-DP collectives stay in
+            # lockstep with the active DP group; the draft block's
+            # collectives are within-rank and skipped.
             if get_parallel().enable_dp_attention:
                 idle_verify_input = DFlashVerifyInput(
                     draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
@@ -2164,14 +2145,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
                     batch, self._target_worker
                 )
-                # Symmetric eager fallback: when any DP rank is idle, the
-                # active ranks run an EAGER verify (see the idle-guard below).
-                # An IDLE batch votes True for the decode graph, so the idle
-                # rank would otherwise replay the graph and assume the padded
-                # bucket layout ([bucket]*dp_size) while the eager active rank
-                # uses the raw SUM_LEN counts — the DP-gather segment offsets
-                # disagree and the active rank gathers garbage (permanent KV
-                # pollution). Force the idle rank to eager as well.
+                # Force eager: the active ranks run eager verify when any DP
+                # rank is idle (see the idle-guard below); a graph-replaying
+                # idle rank would disagree with them on DP-gather segment
+                # offsets (padded bucket vs raw counts).
                 idle_verify_forward_batch.can_run_decode_cuda_graph = False
                 self._target_worker.forward_batch_generation(
                     batch=None,
@@ -2291,9 +2268,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
         if self._full_embed_gpu is not None:
-            # dp attention: replicated full-embedding lookup avoids the mismatched
-            # attn-TP all_reduce inside VocabParallelEmbedding when idle DP ranks
-            # skip the draft step.
+            # Replicated lookup avoids the mismatched attn-TP all_reduce
+            # inside VocabParallelEmbedding under dp attention.
             noise_embedding = torch.nn.functional.embedding(
                 block_ids, self._full_embed_gpu
             )
@@ -2462,15 +2438,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        # DP-attention correctness guard: an idle DP rank runs a 0-token
-        # EAGER verify (see the is_idle branch above), so its DP-gather
-        # contribution follows the raw scheduler counts (MAX_LEN/SUM_LEN
-        # padding), while a graph-replaying rank assumes every rank
-        # contributes the padded bucket ([bucket]*dp_size in fill_from).
-        # The two views disagree on segment offsets, so any rank whose
-        # data sits after the idle segment gathers garbage. Fall back to
-        # eager verify (symmetric, known-good) whenever any DP rank is
-        # idle this round.
+        # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
+        # counts while a graph-replaying rank assumes the padded bucket, so
+        # their DP-gather segment offsets disagree. Fall back to eager verify
+        # whenever any DP rank is idle this round.
         if (
             get_parallel().enable_dp_attention
             and verify_forward_batch.original_global_num_tokens_cpu is not None
@@ -2478,11 +2449,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             verify_forward_batch.can_run_decode_cuda_graph = False
 
-        # Mixed-round guard: when any DP rank runs prefill/extend this round
-        # (is_extend_in_batch is aggregated across DP ranks), the verify
-        # batch's spec-scaled global_num_tokens disagree with the extend
-        # rank's raw scheduler counts on the DP-gather layout. Replay is
-        # disabled so verify runs eager, symmetric with the idle guard above.
+        # Mixed-round guard: an extend rank's raw token counts disagree with
+        # the verify batch's spec-scaled counts on the DP-gather layout; run
+        # eager, symmetric with the idle guard above.
         if get_parallel().enable_dp_attention and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 

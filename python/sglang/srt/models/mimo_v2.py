@@ -1105,9 +1105,9 @@ class MiMoV2Model(nn.Module):
                     ),
                 )
 
-        # A draft may target the final layer ("after layer num_hidden_layers-1"),
-        # which maps to capture index num_hidden_layers, past the layer loop.
-        # Capture the pre-norm output on the last PP rank to keep the count.
+        # A draft targeting the final layer ("after layer
+        # num_hidden_layers-1") maps to capture index num_hidden_layers,
+        # past the layer loop; capture the pre-norm output here instead.
         if (
             self.pp_group.is_last_rank
             and self.config.num_hidden_layers in self.layers_to_capture

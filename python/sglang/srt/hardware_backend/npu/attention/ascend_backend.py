@@ -452,11 +452,8 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.spec_algorithm is not None
                 and forward_batch.spec_algorithm.is_dflash()
             ):
-                # dflash_worker_v2 already publishes the CPU seq length as
-                # committed prefix + one verify block (seq_lens_cpu = prefix +
-                # block_size), so it already covers the draft block. Use it
-                # as-is to build the block-table width (must not add
-                # draft_token_num again).
+                # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
+                # one verify block, which already covers the draft block.
                 seq_lens_max = forward_batch.seq_lens_cpu.max().item()
             else:
                 # Overlap scheduling can publish the CPU sequence length one
@@ -508,11 +505,9 @@ class AscendAttnBackend(AttentionBackend):
             ).int()
 
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
-        # Graph-mode replay rebinds actual_seq_kvlen via graph.update, which
-        # only works when it was captured as a Python list; a CPU tensor gets
-        # baked as a constant. Leaving seq_lens_cpu_int as None here (and in
-        # _init_cuda_graph_metadata) makes forward_mtp fall back to binding
-        # seq_lens_cpu_list instead.
+        # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
+        # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
+        # only rebind the Host-side IntArray when captured as a Python list.
 
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
@@ -666,8 +661,8 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
-        # Deliberately no seq_lens_cpu_int here: see init_forward_metadata —
-        # forward_mtp must bind seq_lens_cpu_list so graph.update can rebind it.
+        # Deliberately no seq_lens_cpu_int here: forward_mtp must bind
+        # seq_lens_cpu_list so graph.update can rebind it.
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -764,9 +759,8 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[bs:, :].fill_(0)
 
             # Update SWA mask: True = masked out (don't attend), False = attend.
-            # DFlash verify seq_lens stays prefix-only (unlike other spec
-            # algorithms), so use seq_lens_cpu (= prefix + block_size) to
-            # keep the draft token KV positions inside the mask window.
+            # DFlash verify seq_lens is prefix-only, so use seq_lens_cpu
+            # (= prefix + block_size) to keep draft KV inside the mask window.
             if (
                 forward_mode.is_target_verify()
                 and _is_dflash_verify(spec_info)
@@ -795,10 +789,7 @@ class AscendAttnBackend(AttentionBackend):
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
             # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
-            # length: the draft model just wrote block_size tokens, and
-            # actual_seq_kvlen (fed to graph.update via seq_lens_cpu_list)
-            # must cover them. For other spec algorithms seq_lens above
-            # already includes speculative_num_draft_tokens (same as main).
+            # length; other spec algorithms already added the draft tokens above.
             if _is_dflash_verify(spec_info) and seq_lens_cpu is not None:
                 kv_lens = seq_lens_cpu[:bs]
             else:
@@ -2070,19 +2061,15 @@ class AscendAttnBackend(AttentionBackend):
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
                 query = query[: forward_batch.global_num_token_non_padded_cpu]
-                # DP padding leaves padded rows in seq_lens_cpu while q is
-                # trimmed to real tokens above. Trim the kv lens to the real
-                # batch so actualSeqLengthsKv matches the operator's
-                # batchSize (TND layout). Only target_verify has a uniform
-                # per-request width; draft_extend_v2 keeps padded rows.
+                # Trim DP padding rows so actualSeqLengthsKv matches the
+                # operator's batchSize (TND layout); only target_verify has a
+                # uniform per-request width.
                 if forward_batch.forward_mode.is_target_verify():
                     real_bs = query.shape[0] // self.speculative_num_draft_tokens
 
             if self.forward_metadata.seq_lens_cpu_int is None:
-                # Graph-mode target_verify path: the v2 operator's
-                # actual_seq_kvlen is a Host-side IntArray, and graph.update
-                # can only rebind it when captured as a Python list
-                # (seq_lens_cpu_list), not a CPU tensor.
+                # Graph mode: bind the Python list, which graph.update can
+                # rebind (a captured CPU tensor would be baked as constant).
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
                 actual_seq_lengths_kv = (
@@ -2103,9 +2090,7 @@ class AscendAttnBackend(AttentionBackend):
                     ]
                 actual_seq_lengths = np.array(extend_seq_lens_cpu).cumsum().tolist()
             else:
-                # actual_seq_qlen is static across replays ([spec_draft,
-                # 2*spec_draft, ...]), so a numpy array is safe here (a
-                # device tensor would sync the stream during capture).
+                # Static across replays ([spec_draft, 2*spec_draft, ...]).
                 actual_seq_lengths = np.arange(
                     self.speculative_num_draft_tokens,
                     self.speculative_num_draft_tokens + query.shape[0],

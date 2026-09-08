@@ -2401,9 +2401,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self._owns_moe_runner = False
         self.moe_runner_config = moe_runner_config
 
-        # MXFP4 experts on NPU run through the ASCEND runner, whose kernel
-        # quantizes activations internally (incompatible with the Triton
-        # runner's pre-quantised activation workflow).
+        # MXFP4 experts on NPU run through the ASCEND runner, which
+        # quantizes activations internally.
         if _is_npu and self.is_fp4_expert:
             from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
                 NPUW4A8MXFP4MoEMethod,
@@ -2489,11 +2488,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 input_dtype=fp4_dtype,
             ).transpose(-1, -2)
 
-            # Two e8m0 storage conventions in the fp32 scales: (a) the value IS
-            # the e8m0 byte (int in 0..255, MiMo-V2.5-Pro) -> cast directly;
-            # (b) the value is 2^(e-127) -> recover e from the exponent field.
-            # Never re-encode with round(log2)+127: it re-biases the exponent
-            # (116 -> 134 -> 2^7) and inflates every scale by ~2^17.
+            # Two e8m0 storage conventions in the fp32 scales: (a) the value
+            # IS the e8m0 byte (int in 0..255, MiMo-V2.5-Pro); (b) the value
+            # is 2^(e-127) -> recover e from the exponent field. Never
+            # re-encode with round(log2)+127: it re-biases the exponent.
             scale_inv = getattr(layer, f"{prefix}_weight_scale_inv")
             scale = scale_inv.data.to(torch.float32)
             s_flat = scale.detach().float().flatten()

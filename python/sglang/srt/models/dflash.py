@@ -247,8 +247,8 @@ class DFlashAttention(nn.Module):
                 {"weight_loader": sharded_weight_loader(0)},
             )
         elif draft_cfg.attention_sink_bias:
-            # MiMo DFlash drafts train a per-head attention sink bias; each TP
-            # rank owns its slice of the all-heads checkpoint tensor.
+            # Per-head sink bias; each TP rank owns its slice of the
+            # all-heads checkpoint tensor.
             self.attention_sink_bias = nn.Parameter(
                 torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
             )
@@ -353,8 +353,8 @@ class DFlashAttention(nn.Module):
             # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
             qkv, _ = self.qkv_proj(hidden_states)
             _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Keep V scaling consistent with forward(): ctx K/V materialized into the
-        # draft cache must use the same value_scale so ctx and self-generated V align.
+        # Keep V scaling consistent with forward() so ctx and self-generated V
+        # align in the draft cache.
         if self.v_scale is not None:
             v = v * self.v_scale
         return k, v
