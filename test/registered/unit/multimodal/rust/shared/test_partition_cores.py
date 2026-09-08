@@ -15,6 +15,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.rust_server.config import _partition_cores  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def partition(node_cores, **kwargs):

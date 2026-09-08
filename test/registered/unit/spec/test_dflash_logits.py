@@ -13,6 +13,7 @@ from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=38, suite="base-a-test-cpu")
+register_cpu_ci(est_time=55, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def test_dflash_unary_logit_transform():

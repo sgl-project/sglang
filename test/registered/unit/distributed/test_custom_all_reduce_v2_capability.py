@@ -6,6 +6,7 @@ from sglang.srt.distributed.device_communicators import custom_all_reduce_v2
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _patch_group(monkeypatch, *, world_size, same_node):

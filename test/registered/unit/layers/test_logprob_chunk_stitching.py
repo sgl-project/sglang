@@ -17,6 +17,7 @@ from sglang.test.logprob_test_utils import coverage_cases
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 VOCAB = 11
 # Heterogeneous per-sequence parameters; uniform ones hide misalignment.

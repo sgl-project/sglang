@@ -12,9 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cuda_ci(est_time=62, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=348, suite="nightly-intel-cpu-gnr", nightly=True)
 
 import multiprocessing as mp
 

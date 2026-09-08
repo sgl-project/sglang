@@ -14,10 +14,11 @@ from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.server_args import LINEAR_ATTN_KERNEL_BACKEND_CHOICES
-from sglang.test.ci.ci_register import register_xpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_xpu_ci(est_time=5, suite="stage-b-test-1-gpu-xpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestIntelXpuGDNDispatch(CustomTestCase):

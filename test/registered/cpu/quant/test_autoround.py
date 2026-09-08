@@ -25,6 +25,7 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=183, suite="stage-a-tp-test-cpu-intel")
+register_cpu_ci(est_time=391, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestAutoRoundCPUConfig(CustomTestCase):

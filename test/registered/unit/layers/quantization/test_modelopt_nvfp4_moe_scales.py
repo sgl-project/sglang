@@ -19,6 +19,7 @@ sizes, so a failure looks like one a real checkpoint would hit.
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 import unittest
 

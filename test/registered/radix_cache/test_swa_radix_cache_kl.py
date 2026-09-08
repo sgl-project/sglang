@@ -8,6 +8,7 @@ MODEL = "openai/gpt-oss-20b"
 
 register_cuda_ci(est_time=198, stage="base-b", runner_config="1-gpu-large")
 register_cpu_ci(est_time=1602, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=1589, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestSWARadixCacheKL(KLDivergenceMixin, DefaultServerBase):

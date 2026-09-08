@@ -26,6 +26,7 @@ from sglang.srt.model_executor.step_span_utils import (
 from sglang.srt.utils.profile_utils import build_step_span_name
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class _CpuMirror:

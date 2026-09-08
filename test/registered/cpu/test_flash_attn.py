@@ -9,6 +9,7 @@ from sglang.test.cpu_test_utils import parametrize, precision
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=54, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=57, suite="nightly-intel-cpu-gnr", nightly=True)
 
 flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
 

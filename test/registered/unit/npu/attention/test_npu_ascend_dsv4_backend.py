@@ -10,9 +10,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_npu_ci
 
 register_npu_ci(est_time=4, suite="base-a-test-1-npu-a2")
+register_cpu_ci(est_time=8, suite="nightly-intel-cpu-gnr", nightly=True)
 
 for mod in (
     "torch_npu",

@@ -14,6 +14,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class CustomTokenizerWorker(TokenizerWorker):

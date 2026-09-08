@@ -38,6 +38,7 @@ register_cpu_ci(2.0, "base-a-test-cpu")
 
 
 register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):

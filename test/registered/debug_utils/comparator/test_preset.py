@@ -4,6 +4,7 @@ from sglang.srt.debug_utils.comparator.preset import PRESETS, expand_preset
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, stage="weekly", runner_config="cpu")
+register_cpu_ci(est_time=1, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestExpandPreset:

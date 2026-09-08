@@ -15,6 +15,7 @@ from sglang.srt.speculative.spec_utils import GrammarTree, traverse_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):

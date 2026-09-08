@@ -14,7 +14,7 @@ import unittest
 import openai
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_xpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 from sglang.test.kits.cache_hit_kit import run_multiturn_cache_hit_test
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -25,6 +25,7 @@ from sglang.test.test_utils import (
 )
 
 register_xpu_ci(est_time=300, suite="stage-b-test-1-gpu-xpu")
+register_cpu_ci(est_time=208, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestXPUServingFeatures(CustomTestCase):

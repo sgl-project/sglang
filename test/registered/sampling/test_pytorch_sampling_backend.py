@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -17,6 +21,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=108, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=66, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=789, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestPyTorchSamplingBackend(CustomTestCase):

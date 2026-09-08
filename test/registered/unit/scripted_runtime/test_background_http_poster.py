@@ -12,6 +12,7 @@ from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPo
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class _FakeResponse:

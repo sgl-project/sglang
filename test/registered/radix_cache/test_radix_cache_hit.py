@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=71, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=55, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=113, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=281, suite="nightly-intel-cpu-gnr", nightly=True)
 
 MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 

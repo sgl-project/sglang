@@ -31,6 +31,7 @@ from sglang.srt.debug_utils.comparator.output_types import ReplicatedCheckResult
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, stage="weekly", runner_config="cpu")
+register_cpu_ci(est_time=1, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _name_tensors(

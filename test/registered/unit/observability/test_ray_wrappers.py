@@ -26,6 +26,7 @@ from sglang.test.observability.fake_ray import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 # ---------------------------------------------------------------------------

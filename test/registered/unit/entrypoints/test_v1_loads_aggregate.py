@@ -32,6 +32,7 @@ maybe_stub_sgl_kernel()
 
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _temp_path() -> str:

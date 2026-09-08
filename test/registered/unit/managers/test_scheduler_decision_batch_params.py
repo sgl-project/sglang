@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixi
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 FORBIDDEN_TOKENS = ("self.running_batch", "self.last_batch", "self.cur_batch")
 

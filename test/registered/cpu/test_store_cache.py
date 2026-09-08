@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=14, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=13, suite="nightly-intel-cpu-gnr", nightly=True)
 
 torch.manual_seed(42)
 

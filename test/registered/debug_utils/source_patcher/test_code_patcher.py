@@ -11,6 +11,7 @@ from sglang.srt.debug_utils.source_patcher.types import EditSpec, PatchSpec
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, stage="weekly", runner_config="cpu")
+register_cpu_ci(est_time=7, suite="nightly-intel-cpu-gnr", nightly=True)
 
 SAMPLE_MODULE_NAME = "_source_patcher_test_fixtures.sample_module"
 

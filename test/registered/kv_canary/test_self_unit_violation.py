@@ -15,11 +15,16 @@ from sglang.srt.kv_canary.runner.violation_reporter import (
     ViolationReporter,
     _format_violation,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, suite="extra-a-test-1-gpu-small-amd")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _make_row(

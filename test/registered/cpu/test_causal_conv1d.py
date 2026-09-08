@@ -10,6 +10,7 @@ from sglang.test.cpu_test_utils import parametrize, precision
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 causal_conv1d_weight_pack = torch.ops.sgl_kernel.causal_conv1d_weight_pack
 causal_conv1d_fwd = torch.ops.sgl_kernel.causal_conv1d_fwd_cpu

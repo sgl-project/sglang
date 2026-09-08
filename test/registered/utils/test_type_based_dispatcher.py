@@ -13,6 +13,7 @@ from sglang.utils import TypeBasedDispatcher
 
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestTypeBasedDispatcher(unittest.TestCase):
