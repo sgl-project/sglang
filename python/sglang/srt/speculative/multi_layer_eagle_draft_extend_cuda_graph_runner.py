@@ -738,6 +738,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             b
             for b in self.draft_extend_attn_backend_list
             if b.supports_draft_extend_metadata_staging
+            and not b.draft_extend_metadata_captured_in_graph()
         ]
         if not backends:
             return

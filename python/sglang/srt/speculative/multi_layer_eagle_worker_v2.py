@@ -725,11 +725,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             "Draft graphs require initialized attention backends"
         )
         target_graph = self.target_worker.model_runner.decode_cuda_graph_runner
+        # In-graph mapping reads still require the final draft fence.
         if (
             batch.forward_mode.is_idle()
             or getattr(target_graph, "in_graph_metadata_prep_done", None) is None
             or not all(
                 b.supports_draft_extend_metadata_staging
+                and not b.draft_extend_metadata_captured_in_graph()
                 for b in self.draft_extend_attn_backend_list
             )
             or runner.require_mlp_tp_gather

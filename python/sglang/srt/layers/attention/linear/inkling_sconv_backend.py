@@ -43,7 +43,6 @@ import torch
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
 )
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     ShortConvHybridAttnBackend,
 )
@@ -557,12 +556,8 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
 
     @property
     def supports_draft_extend_metadata_staging(self) -> bool:
-        full = self.full_attn_backend
         return (
-            isinstance(full, FlashAttentionBackend)
-            and full.topk == 1
-            and not full._unified_dense
-            and full.draft_extend_metadata_captured_in_graph()
+            self.full_attn_backend.supports_draft_extend_metadata_staging
             and self.short_conv_backend._slot_gather_recordable
         )
 

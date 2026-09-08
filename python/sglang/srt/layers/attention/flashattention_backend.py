@@ -451,6 +451,14 @@ class FlashAttentionBackend(AttentionBackend):
             ),
         )
 
+    @property
+    def supports_draft_extend_metadata_staging(self) -> bool:
+        return (
+            self.topk == 1
+            and not self._unified_dense
+            and self.draft_extend_metadata_captured_in_graph()
+        )
+
     def stage_draft_extend_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self.draft_extend_metadata[forward_batch.batch_size]
         self.forward_metadata.max_seq_len_k = self.max_context_len
