@@ -565,9 +565,6 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     """
     backend = get_fp8_gemm_runner_backend()
 
-    if _is_xpu:
-        return torch_w8a8_block_fp8_linear
-
     # Handle explicit backend selection via --fp8-gemm-backend
     if not backend.is_auto():
         return _dispatch_explicit_backend(backend)
@@ -824,7 +821,8 @@ def _dispatch_auto_backend() -> Callable:
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. NPU (Ascend)
-    # 6. Triton (fallback)
+    # 6. XPU (Intel GPU, PyTorch torch._scaled_mm)
+    # 7. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -840,6 +838,8 @@ def _dispatch_auto_backend() -> Callable:
         )
 
         return npu_w8a8_mxfp8_linear
+    elif _is_xpu:
+        return torch_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
 
@@ -2079,20 +2079,17 @@ def apply_fp8_linear(
     # When the number of token is 1,
     # per-token scale has shape (1, 1), per-tensor scale has shape (1) or ().
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
-    rowwise_torch_scaled_mm = (
-        USE_ROWWISE_TORCH_SCALED_MM
-        and (
-            not _is_xpu
-            or (
-                x_scale.ndim == 2
-                and x_scale.shape[1] == 1
-                and x_scale.is_contiguous()
-                and weight_scale.ndim == 2
-                and weight_scale.shape[1] == 1
-                and weight_scale.t().is_contiguous()
-                # XPU fused rowwise scaled_mm is slower for decode and small prefills.
-                and qinput.shape[0] >= 64
-            )
+    rowwise_torch_scaled_mm = USE_ROWWISE_TORCH_SCALED_MM and (
+        not _is_xpu
+        or (
+            x_scale.ndim == 2
+            and x_scale.shape[1] == 1
+            and x_scale.is_contiguous()
+            and weight_scale.ndim == 2
+            and weight_scale.shape[1] == 1
+            and weight_scale.t().is_contiguous()
+            # XPU fused rowwise scaled_mm is slower for decode and small prefills.
+            and qinput.shape[0] >= 64
         )
     )
     if (
