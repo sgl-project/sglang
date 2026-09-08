@@ -8,6 +8,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
+import msgspec
 
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
@@ -457,18 +458,28 @@ class TokenizerControlMixin:
         return FanOutCommunicator.merge_results(results)
 
     async def _weight_update_session_call(
-        self: TokenizerManager, communicator, obj
+        self: TokenizerManager, communicator, obj, staged: bool = False
     ) -> Tuple[bool, str]:
         """Run one weight-update session RPC under the same pause-aware locking as
         update_weights_from_distributed: while the engine is paused the writer lock
-        is already held by whoever paused it, so taking it again would deadlock."""
+        is already held by whoever paused it, so taking it again would deadlock.
+
+        A staged session runs under the reader lock, concurrent with generation:
+        it touches nothing a running forward reads — deferred names are not
+        servable and base tensors are rejected. Base and fixed-name sessions
+        keep the writer lock."""
         self.auto_create_handle_loop()
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
                 results = await communicator(obj)
         if not is_paused:
-            async with self.model_update_lock.writer_lock:
+            lock = (
+                self.model_update_lock.reader_lock
+                if staged
+                else self.model_update_lock.writer_lock
+            )
+            async with lock:
                 results = await communicator(obj)
         return FanOutCommunicator.merge_results(results)
 
@@ -477,11 +488,13 @@ class TokenizerControlMixin:
         obj: BeginWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        staged = not obj.sync_base and bool(self._pending_lora_publications)
         success, message = await self._weight_update_session_call(
-            self.begin_weight_update_communicator, obj
+            self.begin_weight_update_communicator, obj, staged=staged
         )
         if success:
             self._weight_update_session_open = True
+            self._weight_update_staged_session = staged
             self._weight_update_pending_version = None
         return success, message
 
@@ -499,9 +512,12 @@ class TokenizerControlMixin:
             if missing:
                 obj.abort = True
                 await self._weight_update_session_call(
-                    self.end_weight_update_communicator, obj
+                    self.end_weight_update_communicator,
+                    obj,
+                    staged=self._weight_update_staged_session,
                 )
                 self._weight_update_session_open = False
+                self._weight_update_staged_session = False
                 self._weight_update_pending_version = None
                 await self._discard_pending_publications()
                 return False, (
@@ -509,9 +525,12 @@ class TokenizerControlMixin:
                     "manifest; session aborted"
                 )
         success, message = await self._weight_update_session_call(
-            self.end_weight_update_communicator, obj
+            self.end_weight_update_communicator,
+            obj,
+            staged=self._weight_update_staged_session,
         )
         self._weight_update_session_open = False
+        self._weight_update_staged_session = False
         if success and not obj.abort:
             self._update_weight_version_if_provided(self._weight_update_pending_version)
         self._weight_update_pending_version = None
@@ -567,6 +586,13 @@ class TokenizerControlMixin:
             get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
+        staged = self._weight_update_staged_session
+        if staged and (
+            obj.flush_cache or obj.abort_all_requests or obj.weight_version is not None
+        ):
+            # The reader lock lets generation run through the update; anything
+            # that mutates serving state needs the writer lock it gave up.
+            return False, "a staged adapter session cannot change serving state"
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -577,7 +603,12 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_distributed_communicator(obj)
 
         if not is_paused:
-            async with self.model_update_lock.writer_lock:
+            lock = (
+                self.model_update_lock.reader_lock
+                if staged
+                else self.model_update_lock.writer_lock
+            )
+            async with lock:
                 results = await self.update_weights_from_distributed_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
@@ -627,6 +658,13 @@ class TokenizerControlMixin:
             get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
+        staged = self._weight_update_staged_session
+        if staged and (
+            obj.flush_cache or obj.abort_all_requests or obj.weight_version is not None
+        ):
+            # The reader lock lets generation run through the update; anything
+            # that mutates serving state needs the writer lock it gave up.
+            return False, "a staged adapter session cannot change serving state"
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -640,7 +678,12 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
         if not is_paused:
-            async with self.model_update_lock.writer_lock:
+            lock = (
+                self.model_update_lock.reader_lock
+                if staged
+                else self.model_update_lock.writer_lock
+            )
+            async with lock:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
@@ -841,6 +884,11 @@ class TokenizerControlMixin:
                     pinned=obj.pinned,
                     reloadable=obj.lora_path is not None,
                 )
+                if not obj.defer_publish and obj.lora_name in self._pending_lora_publications:
+                    raise ValueError(
+                        f"LoRA adapter '{obj.lora_name}' is awaiting publication; "
+                        "it cannot be re-registered until its session commits or aborts."
+                    )
                 if obj.defer_publish:
                     if (
                         await self.lora_registry.get_lora_id(obj.lora_name) is not None
@@ -882,6 +930,7 @@ class TokenizerControlMixin:
                 if result.success:
                     if obj.defer_publish:
                         self._pending_lora_publications[obj.lora_name] = new_adapter
+                        result = msgspec.structs.replace(result, pending=True)
                     else:
                         if reused:
                             await self.lora_registry.refresh(new_adapter)
@@ -920,6 +969,11 @@ class TokenizerControlMixin:
                 "Start unload Lora adapter. Lora name=%s",
                 obj.lora_name,
             )
+            if obj.lora_name in self._pending_lora_publications:
+                raise ValueError(
+                    f"LoRA adapter '{obj.lora_name}' is awaiting publication; "
+                    "abort its weight-update session instead of unloading it."
+                )
 
             async with self.lora_update_lock:
                 result = await self._unload_lora_adapter_locked(obj)

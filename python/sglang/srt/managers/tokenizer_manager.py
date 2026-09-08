@@ -656,6 +656,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
         self._weight_update_session_open = False
+        # A staged session (adapter-only, deferred publications pending) runs
+        # under the reader lock, concurrent with generation.
+        self._weight_update_staged_session = False
         self._weight_update_pending_version: Optional[str] = None
 
     def init_lora(self):
@@ -3459,6 +3462,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if lora_path is None:
                 continue
 
+            if lora_path in self._pending_lora_publications:
+                # A staged session is streaming this name; loading it from disk
+                # now would give one name two identities at commit time.
+                raise ValueError(
+                    f"LoRA adapter '{lora_path}' is awaiting publication and "
+                    "cannot be served or backfilled yet."
+                )
             if lora_path not in self.lora_ref_cache:
                 # A request-carried backfill path makes the request
                 # self-sufficient: a fresh or restarted engine can serve any

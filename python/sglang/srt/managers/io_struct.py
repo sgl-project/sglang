@@ -2407,6 +2407,10 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
+    # Acknowledges a defer_publish registration. The trainer fails closed on a
+    # missing ack: an engine that ignored defer_publish would serve the name
+    # while its weights stream.
+    pending: bool = False
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = RegisterLoRAAdapterReqOutput = (
