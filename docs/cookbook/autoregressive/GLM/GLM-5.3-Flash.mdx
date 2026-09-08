@@ -25,9 +25,9 @@ Choose your hardware, then choose the operating point that matches your workload
 - **Low Latency** starts with adaptive MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
 
-Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
+Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
-The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, and HiCache tiers. Changing an option that was not part of the measured command changes the badge to **Not Verified** without hiding the option.
+The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, context parallelism, and HiCache tiers. Changing an option that was not part of the measured command changes the badge to **Not Verified** without hiding the option.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/zai-org/glm-5.3-flash.jsx";
@@ -41,7 +41,7 @@ Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which
 
 ## Playground
 
-Use the Playground for lower-level tuning such as attention parallelism, MoE communication, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff.
+Use the Playground for lower-level tuning such as attention parallelism, MoE communication, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff. The CP knob enables prefill context parallelism, which is experimental for this model and measured slower at input lengths up to 8k — validate it on your workload before adopting.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -102,7 +102,7 @@ The **Speculative** card in the Playground changes the algorithm without leaving
 
 - **EAGLE / Adaptive MTP 5-1-6** is exactly what Low Latency serves, so a Low Latency base starts on this chip. Pick it from a High Throughput base to keep that recipe's other settings and add the MTP head.
 - **Off (greedy)** strips the whole `--speculative-*` family, which is what High Throughput already starts from.
-- **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. It needs a build that carries the GLM-5.3-Flash hidden-state capture from [PR #36708](https://github.com/sgl-project/sglang/pull/36708), which is merged into the [PR #36507](https://github.com/sgl-project/sglang/pull/36507) support branch (`xinyuan/glm-5.3-flash-support`) rather than into `main`, so the image pinned above is not enough on its own — pull that branch at its current head, or add #36708's commit on top of an older checkout. The draft repository is also access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware, so treat it as a starting point.
+- **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. The image pinned above carries the GLM-5.3-Flash hidden-state capture from [PR #36708](https://github.com/sgl-project/sglang/pull/36708), so no custom build is needed. The draft repository is access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware and is still being shaken out upstream, so treat it as a starting point.
 
 Neither algorithm runs with DP-Attention; the card disables the affected chips and names the reason.
 
@@ -116,11 +116,11 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 ### Keep the KV and DSA backends paired
 
-On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
+On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput under sustained batches and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
 
 ### Decode context parallelism
 
-Decode context parallelism (DCP) shards the KV across GPUs during decode to cut long-context latency. The **Context Parallelism** row offers DCP4, validated on 4x GB300 (TP4/EP4) with both KV pairings and adaptive MTP 5/1/6; it requires the current release image, which carries the TileLang LSE fix. Other platforms and attention backends are unvalidated, and draft-extend v2 is unsupported under DCP.
+Decode context parallelism (DCP) shards the KV across GPUs during decode to cut long-context latency. The **Context Parallelism** row offers DCP4, validated on 4x GB300 with adaptive MTP 5/1/6: on the FP8 recipe (TP4/EP4) with both KV pairings, and on the NVFP4 recipe (TP4) with BF16 KV + TileLang DSA. It requires the published lmsysorg/sglang:glm-5.3-flash image, which carries the TileLang LSE fix. Other platforms and attention backends are unvalidated, and draft-extend v2 is unsupported under DCP.
 
 ### Extend the cache hierarchy
 
@@ -222,6 +222,7 @@ sglang serve \
   --disaggregation-mode prefill \
   --disaggregation-bootstrap-port 8998 \
   --disaggregation-transfer-backend nixl \
+  --nccl-port 29501 \
   --host 0.0.0.0 \
   --port 31000
 ```
@@ -237,6 +238,7 @@ sglang serve \
   --moe-runner-backend triton \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend nixl \
+  --nccl-port 29502 \
   --host 0.0.0.0 \
   --port 32000
 ```
