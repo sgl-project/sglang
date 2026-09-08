@@ -94,8 +94,7 @@ class Step3TextMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -604,7 +603,6 @@ class Step3VisionAttention(nn.Module):
 
 
 class Step3VisionEmbeddings(nn.Module):
-
     def __init__(self, config: Step3VisionEncoderConfig):
         super().__init__()
         self.config = config
@@ -731,7 +729,6 @@ class Step3VisionEncoder(nn.Module):
 
 
 class Step3VLForConditionalGeneration(nn.Module):
-
     def __init__(
         self,
         config: Step3VLConfig,

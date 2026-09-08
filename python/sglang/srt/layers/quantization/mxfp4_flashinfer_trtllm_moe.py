@@ -7,22 +7,24 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_platform,
+)
 from sglang.srt.utils import (
     is_flashinfer_available,
     log_info_on_rank0,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
+from sglang.srt.utils.common import next_power_of_2
 
-_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
+_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 
 if is_flashinfer_available():
     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
@@ -46,21 +48,26 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 
 
 class Mxfp4FlashinferTrtllmMoEMethod:
+    fuse_routed_scaling_factor_in_topk = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+        # precision=fp8 is an SM90 knob (Humming W4A8); this SM100 trtllm path
+        # already runs MXFP8 activations, so the flag is inert here rather than
+        # an error -- one config can move across hardware.
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
+        # Applies flashinfer trtllm directly instead of going through a
+        # MoeRunner; FusedMoE still reads `.runner`, and this class is not a
+        # FusedMoEMethodBase subclass so it inherits no default.
+        self.runner = None
 
         swiglu_limit = moe_runner_config.swiglu_limit
-        assert (
-            swiglu_limit is not None
-        ), f"swiglu_limit must be non-None for DeepSeek V4 (got {swiglu_limit!r})"
         self._gemm1_clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),
@@ -287,8 +294,6 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         else:
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
-        packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
-
         precision = self.flashinfer_mxfp4_moe_precision
         if precision == "bf16":
             assert hidden_states.dtype == torch.bfloat16
@@ -319,6 +324,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         else:
             raise NotImplementedError(f"Unsupported mxfp4 moe precision: {precision}")
 
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            trtllm_moe_enable_pdl,
+        )
+
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -333,7 +342,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             )
 
         output = trtllm_fp4_block_scale_routed_moe(
-            topk_ids=packed_topk,
+            topk_ids=(topk_ids, topk_weights),
             routing_bias=None,
             hidden_states=x_quant,
             hidden_states_scale=x_scale,
@@ -350,7 +359,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
             output2_scale_scalar=layer.output2_scale_scalar,
             num_experts=layer.num_experts,
-            top_k=packed_topk.shape[1],
+            top_k=topk_ids.shape[1],
             n_group=1,
             topk_group=1,
             intermediate_size=intermediate_size,
@@ -361,6 +370,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             do_finalize=True,
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=symm_output,
+            enable_pdl=trtllm_moe_enable_pdl(num_tokens),
         )[0]
 
         return StandardCombineInput(hidden_states=output)
@@ -377,6 +387,7 @@ def maybe_fuse_routed_scale_and_shared_add(
     # alpha=scale)`. With no shared output, the missing scale is applied
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
+    from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         Mxfp4FlashinferCutlassMoEMethod,
     )
@@ -390,11 +401,16 @@ def maybe_fuse_routed_scale_and_shared_add(
             Mxfp4FlashinferTrtllmMoEMethod,
             Mxfp4FlashinferCutlassMoEMethod,
             Mxfp4MarlinMoEMethod,
+            ExpertPackMoEMethod,
         ),
     )
     if fused:
+        already_scaled = experts.should_fuse_routed_scaling_factor_in_topk
         if shared is not None:
-            return shared.add_(routed, alpha=routed_scaling_factor)
+            alpha = 1.0 if already_scaled else routed_scaling_factor
+            return shared.add_(routed, alpha=alpha)
+        if already_scaled:
+            return routed
         return routed.mul_(routed_scaling_factor)
     if shared is not None:
         routed += shared

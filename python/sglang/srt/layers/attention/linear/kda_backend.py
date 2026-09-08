@@ -3,23 +3,24 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+    build_fused_accept_indices,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
-    get_linear_attn_decode_backend,
-    get_linear_attn_prefill_backend,
-    get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -34,6 +35,12 @@ elif is_cpu():
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_spec,
+)
 
 
 class KDAKernelDispatcher:
@@ -47,9 +54,26 @@ class KDAKernelDispatcher:
     ):
         self.verify_backend = verify_backend
         triton_kernel = TritonKDAKernel()
+        self.triton_kernel = triton_kernel
+        helion_kernel = None
+        if decode_backend.is_helion() or prefill_backend.is_helion():
+            if not is_cuda():
+                raise ValueError("KDA Helion backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_helion import (
+                HelionKDAKernel,
+            )
+
+            helion_kernel = HelionKDAKernel(
+                triton_fallback=triton_kernel,
+                enable_decode=decode_backend.is_helion(),
+                enable_prefill=prefill_backend.is_helion(),
+            )
 
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_helion():
+            assert helion_kernel is not None
+            self.decode_kernel = helion_kernel
         elif decode_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("KDA CuTe DSL backend requires CUDA")
@@ -71,7 +95,7 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA supports 'triton', 'cutedsl', or 'flashinfer'."
+                "KDA supports 'triton', 'helion', 'cutedsl', or 'flashinfer'."
             )
 
         # target_verify kernel, selected via --linear-attn-verify-backend (defaults
@@ -110,6 +134,9 @@ class KDAKernelDispatcher:
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
+        elif prefill_backend.is_helion():
+            assert helion_kernel is not None
+            self.extend_kernel = helion_kernel
         elif prefill_backend.is_flashkda():
             from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
                 FlashKDAKernel,
@@ -124,7 +151,7 @@ class KDAKernelDispatcher:
             )
 
             cutedsl_kernel = CuteDSLKDAKernel()
-            if getattr(cutedsl_kernel, "supports_prefill", False):
+            if cutedsl_kernel.supports_prefill:
                 # SM100 chunk prefill pipeline.
                 self.extend_kernel = cutedsl_kernel
             else:
@@ -166,8 +193,9 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'flashkda', 'cutedsl', 'nvidia_kda', or "
-                "'ptx_kda' (cutedsl/nvidia_kda prefill need SM100, ptx_kda SM103)."
+                "KDA supports 'triton', 'helion', 'flashkda', 'cutedsl', "
+                "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
+                "SM100, ptx_kda SM103)."
             )
 
         self.supports_packed_decode = getattr(
@@ -227,8 +255,16 @@ class KDAKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if lower_bound is not None and not isinstance(
+            self.decode_kernel, TritonKDAKernel
+        ):
+            raise NotImplementedError(
+                f"lower_bound (safe gate) is only supported by TritonKDAKernel; "
+                f"got {self.decode_kernel.__class__.__name__}."
+            )
         return self.decode_kernel.decode(
             q,
             k,
@@ -240,6 +276,7 @@ class KDAKernelDispatcher:
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            lower_bound=lower_bound,
             **kwargs,
         )
 
@@ -259,13 +296,20 @@ class KDAKernelDispatcher:
         intermediate_states_buffer: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
-        retrieve_parent_token: torch.Tensor,
+        retrieve_parent_token: Optional[torch.Tensor],
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         """MTP / speculative-decode verify, routed to ``self.verify_kernel``
         (FlashInfer decode -> recurrent_kda; Triton / CuTe DSL decode -> the Triton
         fused KDA verify)."""
+        if lower_bound is not None and not isinstance(
+            self.verify_kernel, TritonKDAKernel
+        ):
+            raise NotImplementedError(
+                "lower_bound (safe gate) target verify is only supported by "
+                f"TritonKDAKernel; got {self.verify_kernel.__class__.__name__}."
+            )
         return self.verify_kernel.target_verify(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -298,8 +342,13 @@ class KDAKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         **kwargs,
-    ) -> torch.Tensor:
-        return self.extend_kernel.extend(
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        kernel = self.extend_kernel
+        if kwargs.get("lower_bound") is not None and not getattr(
+            kernel, "supports_safe_gate", True
+        ):
+            kernel = self.triton_kernel
+        return kernel.extend(
             q,
             k,
             v,
@@ -342,10 +391,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
 
-    # Read by decide_needs_cpu_seq_lens. Decode/verify metadata is GPU-only
-    # (graph replay already passes seq_lens_cpu=None), extend reads
-    # extend_seq_lens_cpu from schedule, mamba track indices rebuild from req
-    # objects, and the replayssm seq_lens_cpu force-flush is GDN-only.
+    # KDA gets graph padding explicitly and never uses ReplaySSM's host-seqlen
+    # force-flush path.
     needs_cpu_seq_lens: bool = False
 
     def __init__(self, model_runner: ModelRunner):
@@ -359,14 +406,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             .transpose(-1, -2)
             .shape
         )
-        decode_backend = get_linear_attn_decode_backend()
-        prefill_backend = get_linear_attn_prefill_backend()
-        verify_backend = get_linear_attn_verify_backend()
+        backends = model_runner.linear_attn_backends
+        decode_backend = backends.decode
+        prefill_backend = backends.prefill
+        verify_backend = backends.verify
         # KDA FlashInfer target_verify (recurrent_kda) is chain-only (no tree-ancestor
         # traversal). Reject EAGLE tree verify (topk > 1) early at setup, keyed on the
         # verify backend (not decode). The kernel keeps a per-call
         # retrieve_parent_token backstop that also covers ngram tree.
-        speculative_topk = model_runner.server_args.speculative_eagle_topk or 1
+        speculative_topk = get_spec().speculative_eagle_topk or 1
         if verify_backend.is_flashinfer() and speculative_topk > 1:
             raise ValueError(
                 "KDA FlashInfer speculative decoding only supports topk=1 "
@@ -381,15 +429,100 @@ class KDAAttnBackend(MambaAttnBackendBase):
             f"{decode_backend} only picks the fallback kernel for shapes "
             "the fused kernel does not cover."
         )
+        self._fused_chain_verify_fn = None
+        if (
+            envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
+            and verify_backend.is_triton()
+            and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
+        ):
+            from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+                fused_kda_conv_gating_verify,
+            )
+
+            self._fused_chain_verify_fn = fused_kda_conv_gating_verify
+            rank0_log("KDA fused chain-verify kernel enabled (topk==1 path).")
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
                 self.req_to_token_pool.size,
-                model_runner.server_args,
                 model_runner.device,
             )
+        )
+        # Fused-accept spec path (flashinfer recurrent_kda): the next verify
+        # seeds itself in-kernel from the accepted checkpoint slot
+        # (num_accepted_tokens), so the per-round SSM commit scatter is skipped.
+        # accept_lens_pool holds last round's accept length per mamba slot;
+        # extend stages fresh requests with 1 (read slot 0). Its presence is the
+        # signal that switches the post-verify commit to conv-only.
+        if self._can_fuse_accept_state(verify_backend):
+            self.accept_lens_pool = torch.ones(
+                self.req_to_token_pool.size + 1,
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+
+    @staticmethod
+    def _can_fuse_accept_state(verify_backend) -> bool:
+        """Whether the verify kernel can seed itself from the accepted checkpoint.
+
+        The seed comes from recurrent_kda's ``num_accepted_tokens``, which makes
+        the previous round's accepted state addressable in-kernel so the SSM
+        state never has to round-trip through the committed pool (`temporal`).
+        Hence the keying on the verify backend -- the one that selects the
+        target_verify kernel -- and not on decode, which is set separately.
+
+        `temporal` then goes stale between verifies, which is what the remaining
+        conditions rule out: each is a reader of the committed state that the
+        skipped scatter would starve. Falling short of the contract falls back to
+        the commit scatter rather than raising -- this is a capability, not a
+        mode. Every condition reads its namespace bag rather than the record:
+        these are fields resolution decides, so the record would answer with
+        what the operator typed instead of what was decided.
+        """
+        if not verify_backend.is_flashinfer():
+            return False  # only recurrent_kda takes num_accepted_tokens
+        if get_spec().speculative_algorithm is None:
+            return False  # no verify round, and no intermediate scratch
+        if not get_memory().disable_radix_cache:
+            return False  # mamba radix tracking snapshots `temporal`
+        if get_exec().mamba.enable_linear_replayssm_spec:
+            return False  # the ring already owns the verify-round commitment
+        if get_disagg().disaggregation_mode != "null":
+            return False  # the PD hand-off transfers `temporal`
+        return True
+
+    def _fused_accept_indices(
+        self,
+        *,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        draft_token_num: int,
+    ):
+        """Slot-indexed verify rows + accept lengths for this forward.
+
+        Every KDA layer of a forward verifies the same requests over the same
+        draft window, so the build is hoisted onto the shared forward metadata:
+        layer 0 builds, the rest reuse. Under cuda graph the capture then holds
+        a single build reading the static slot buffer, instead of one per layer.
+        """
+        metadata = self.forward_metadata
+        if metadata.fused_accept_state_indices is None:
+            batch_size = query_start_loc.shape[0] - 1
+            (
+                metadata.fused_accept_state_indices,
+                metadata.fused_accept_num_accepted,
+            ) = build_fused_accept_indices(
+                slots=cache_indices[:batch_size],
+                scratch_steps=intermediate_state_cache.shape[1],
+                draft_token_num=draft_token_num,
+                accept_lens_pool=self.accept_lens_pool,
+            )
+        return (
+            metadata.fused_accept_state_indices,
+            metadata.fused_accept_num_accepted,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -430,6 +563,92 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_d = layer_cache.replayssm_d
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
+
+        deferred_f_b = bool(getattr(layer, "_k3_deferred_f_b", False))
+        if replayssm_d is None and deferred_f_b and is_gfx95_supported():
+            fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
+            fused_backend = getattr(layer, "_k3_hip_fused_decode_backend", "")
+            onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+            if fused_static is not None and onorm_gate is not None:
+                f_b_weight, norm_weight, norm_eps, a_log = fused_static
+                conv_state_view = conv_states.transpose(-1, -2)
+                output_gate = onorm_gate.view(
+                    onorm_gate.shape[0], layer.num_v_heads, layer.head_v_dim
+                )
+                out = mixed_qkv.new_empty(
+                    (1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim)
+                )
+                if fused_backend == "aiter" and kda_fused_decode_aiter_hip.covered(
+                    a,
+                    f_b_weight,
+                    mixed_qkv,
+                    b,
+                    conv_state_view,
+                    ssm_states,
+                    cache_indices,
+                    output_gate,
+                    norm_weight,
+                ):
+                    core_attn_out = kda_fused_decode_aiter_hip.run(
+                        f_a=a,
+                        f_b_weight=f_b_weight,
+                        mixed_qkv=mixed_qkv,
+                        conv_weight=layer.conv_weights,
+                        conv_state=conv_state_view,
+                        raw_beta=b,
+                        A_log=a_log,
+                        dt_bias=layer.dt_bias,
+                        lower_bound=float(layer.lower_bound),
+                        state=ssm_states,
+                        state_indices=cache_indices,
+                        output_gate=output_gate,
+                        norm_weight=norm_weight,
+                        norm_eps=norm_eps,
+                        out=out,
+                    )
+                else:
+                    core_attn_out = None
+                    if not getattr(KDAAttnBackend, "_hip_fused_reject_logged", False):
+                        KDAAttnBackend._hip_fused_reject_logged = True
+                        rank0_log(
+                            "K3 HIP fused KDA rejected: "
+                            f"backend={fused_backend}, "
+                            f"f_a={tuple(a.shape)}/{a.dtype}/{a.stride()}, "
+                            f"mixed={tuple(mixed_qkv.shape)}/{mixed_qkv.dtype}/"
+                            f"{mixed_qkv.stride()}, beta={tuple(b.shape)}/{b.dtype}/"
+                            f"{b.stride()}, conv={tuple(conv_state_view.shape)}/"
+                            f"{conv_state_view.dtype}/{conv_state_view.stride()}, "
+                            f"state={tuple(ssm_states.shape)}/{ssm_states.dtype}/"
+                            f"{ssm_states.stride()}, indices={cache_indices.dtype}/"
+                            f"{cache_indices.stride()}, gate={tuple(output_gate.shape)}/"
+                            f"{output_gate.dtype}/{output_gate.stride()}, "
+                            f"norm={norm_weight.dtype}/{norm_weight.stride()}"
+                        )
+
+                if core_attn_out is not None:
+                    layer._k3_onorm_consumed = True
+                    self._track_mamba_state_decode(
+                        forward_batch,
+                        conv_states,
+                        ssm_states,
+                        cache_indices,
+                        layer.layer_id,
+                    )
+                    return core_attn_out
+
+            # The model deferred f_b only after publishing static fallback
+            # weights. Materialize the original gate before entering the
+            # unchanged conv + packed-KDA fallback chain.
+            from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm
+
+            if fused_static is None:
+                raise RuntimeError("K3 deferred f_b is missing fallback weights")
+            a = kimi_k3_tiny_gemm(
+                a,
+                fused_static[0].view(
+                    layer.num_v_heads * layer.head_v_dim, layer.head_v_dim
+                ),
+            )
 
         # Fully fused decode step: conv1d update + delta-rule recurrence +
         # gated RMSNorm in one kernel. Engages only when the model handed off
@@ -511,9 +730,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             conv_state_indices=cache_indices,
         )
 
-        # The packed kernel assumes one token per request. Assert the dispatch
-        # invariant before taking the fused path.
-        if self.kernel_dispatcher.supports_packed_decode:
+        # The packed kernel assumes one token per request.
+        if (
+            self.kernel_dispatcher.supports_packed_decode
+            and getattr(layer, "lower_bound", None) is None
+        ):
             assert qkv.shape[0] == cache_indices.shape[0], (
                 "KDA packed decode requires one token per sequence (T=1): "
                 f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."
@@ -595,6 +816,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
+        physical_num_tokens = mixed_qkv.shape[0]
+        logical_num_tokens = int(query_start_loc[-1])
+        if logical_num_tokens < physical_num_tokens:
+            mixed_qkv = mixed_qkv[:logical_num_tokens]
+            a = a[:, :logical_num_tokens]
+            b = b[:, :logical_num_tokens]
+
         if self.forward_metadata.has_mamba_track_mask:
             # Snapshot the conv sliding window at the last track-aligned chunk
             # boundary into the ping-pong track slots (the prefix-cache restore
@@ -605,54 +833,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
-        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
-            splits, dim=0
-        )
-        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
-        if layer.bias is not None:
-            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
-        else:
-            q_bias, k_bias, v_bias = None, None, None
-
-        q = causal_conv1d_fn(
-            q,
-            q_conv_weight,
-            q_bias,
+        # Depthwise conv is channel-independent, so one packed call over the
+        # full qkv width matches the decode path and saves two kernel launches.
+        qkv = causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
             activation="silu",
-            conv_states=q_conv_state,
+            conv_states=conv_states,
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
-        k = causal_conv1d_fn(
-            k,
-            k_conv_weight,
-            k_bias,
-            activation="silu",
-            conv_states=k_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        v = causal_conv1d_fn(
-            v,
-            v_conv_weight,
-            v_bias,
-            activation="silu",
-            conv_states=v_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+
+        gate_was_flat = a.ndim == 3
+        if gate_was_flat:
+            a = a.unflatten(-1, (-1, layer.head_k_dim))
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
         core_attn_out = self.kernel_dispatcher.extend(
@@ -667,6 +869,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
+            beta_is_raw=gate_was_flat,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
@@ -687,6 +890,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, self.forward_metadata
             )
+
+        if logical_num_tokens < physical_num_tokens:
+            pad = core_attn_out.new_zeros(
+                (1, physical_num_tokens - logical_num_tokens)
+                + tuple(core_attn_out.shape[2:])
+            )
+            core_attn_out = torch.cat((core_attn_out, pad), dim=1)
+
+        if (
+            self.accept_lens_pool is not None
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # Fused-accept staging: the extend kernel just wrote this request's
+            # committed state; copy it into scratch slot 0 and reset the accept
+            # length to 1 so the first verify reads slot 0. Runs once per KDA
+            # layer (the nat write is idempotent; the scratch copy is per-layer).
+            slots = cache_indices.to(torch.int64)
+            intermediate_ssm = mamba_cache_params.intermediate_ssm
+            intermediate_ssm[slots, 0] = ssm_states[slots].to(intermediate_ssm.dtype)
+            self.accept_lens_pool[slots] = 1
 
         return core_attn_out
 
@@ -765,6 +988,58 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
+            conv_state_indices = cache_indices[:batch_size]
+            # Fused chain-verify fast path: one kernel replaces the transpose-copy +
+            # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
+            # retrieve_* are None there; the tree path and any unsupported shape keep
+            # the reference kernels.
+            if self._can_run_fused_chain_verify(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                draft_token_num=draft_token_num,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                intermediate_state_cache=intermediate_state_cache,
+                intermediate_conv_window_cache=intermediate_conv_window_cache,
+                cache_indices=conv_state_indices,
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+                replayssm_rawv=replayssm_rawv,
+            ):
+                return self._fused_chain_verify_fn(
+                    mixed_qkv=mixed_qkv,
+                    conv_weight=layer.conv_weights,
+                    conv_bias=layer.bias,
+                    # Same [.., dim, width] view the reference causal_conv1d_update
+                    # call below takes: upstream stores the persistent conv state
+                    # width-major, and the kernel asserts the dim axis is
+                    # contiguous. (intermediate_conv_window is transposed on both
+                    # the fork and upstream, so it needs no extra adjustment.)
+                    conv_state=conv_states.transpose(-1, -2),
+                    conv_state_indices=conv_state_indices,
+                    intermediate_conv_window=(
+                        intermediate_conv_window_cache.transpose(-1, -2)
+                    ),
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    a=a,
+                    b=b,
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    ssm_states=ssm_states,
+                    cache_indices=conv_state_indices,
+                    intermediate_states_buffer=intermediate_state_cache,
+                    scale=layer.head_k_dim**-0.5,
+                    T=draft_token_num,
+                    num_q_heads=layer.num_q_heads,
+                    num_v_heads=layer.num_v_heads,
+                    head_k_dim=layer.head_k_dim,
+                    head_v_dim=layer.head_v_dim,
+                    lower_bound=layer.lower_bound,
+                )
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
         else:
@@ -855,6 +1130,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
             **ring_kwargs,
+            **(
+                dict(
+                    zip(
+                        ("fused_accept_state_indices", "fused_accept_num_accepted"),
+                        self._fused_accept_indices(
+                            cache_indices=cache_indices,
+                            query_start_loc=query_start_loc,
+                            intermediate_state_cache=intermediate_state_cache,
+                            draft_token_num=draft_token_num,
+                        ),
+                    )
+                )
+                if self.accept_lens_pool is not None
+                else {}
+            ),
         )
         if dense_token_indices is not None:
             # Kernel output is empty-allocated and the capped qsl skips the
@@ -863,6 +1153,147 @@ class KDAAttnBackend(MambaAttnBackendBase):
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out
+
+    def _can_run_fused_chain_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        draft_token_num: int,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        intermediate_state_cache: Optional[torch.Tensor],
+        intermediate_conv_window_cache: torch.Tensor,
+        cache_indices: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        retrieve_next_token: Optional[torch.Tensor],
+        retrieve_next_sibling: Optional[torch.Tensor],
+        retrieve_parent_token: Optional[torch.Tensor],
+        replayssm_rawv: Optional[torch.Tensor],
+    ) -> bool:
+        if self._fused_chain_verify_fn is None or not mixed_qkv.is_cuda:
+            return False
+        if replayssm_rawv is not None or any(
+            value is not None
+            for value in (
+                retrieve_next_token,
+                retrieve_next_sibling,
+                retrieve_parent_token,
+            )
+        ):
+            return False
+        if draft_token_num < 3 or mixed_qkv.shape[0] % draft_token_num != 0:
+            return False
+        if (
+            not isinstance(layer.conv_weights, torch.Tensor)
+            or layer.conv_weights.ndim != 2
+            or layer.conv_weights.shape[1] != 4
+            or layer.conv_weights.stride(1) != 1
+        ):
+            return False
+        if (
+            layer.num_q_heads != layer.num_k_heads
+            or layer.head_q_dim != layer.head_k_dim
+            or layer.head_k_dim & (layer.head_k_dim - 1)
+        ):
+            return False
+
+        seq_len, dim = mixed_qkv.shape
+        batch_size = seq_len // draft_token_num
+        expected_dim = (
+            2 * layer.num_q_heads * layer.head_k_dim
+            + layer.num_v_heads * layer.head_v_dim
+        )
+        if dim != expected_dim or layer.conv_weights.shape[0] != dim:
+            return False
+        if layer.bias is not None and (
+            not isinstance(layer.bias, torch.Tensor)
+            or layer.bias.ndim != 1
+            or layer.bias.shape[0] != dim
+        ):
+            return False
+        if not isinstance(layer.A_log, torch.Tensor) or not isinstance(
+            layer.dt_bias, torch.Tensor
+        ):
+            return False
+        if (
+            a.ndim == 0
+            or b.ndim == 0
+            or mixed_qkv.dtype not in (torch.bfloat16, torch.float16)
+            or a.dtype != mixed_qkv.dtype
+            or b.dtype != mixed_qkv.dtype
+            or conv_states.dtype != mixed_qkv.dtype
+            or intermediate_conv_window_cache.dtype != mixed_qkv.dtype
+            or layer.conv_weights.dtype
+            not in (torch.bfloat16, torch.float16, torch.float32)
+            or (layer.bias is not None and layer.bias.dtype != layer.conv_weights.dtype)
+        ):
+            return False
+        if (
+            layer.A_log.dtype != torch.float32
+            or layer.dt_bias.dtype != torch.float32
+            or ssm_states.dtype != torch.float32
+            or intermediate_state_cache is None
+            or intermediate_state_cache.dtype != torch.float32
+        ):
+            return False
+        if (
+            mixed_qkv.stride(-1) != 1
+            or a.stride(-1) != 1
+            or b.stride(-1) != 1
+            or not conv_states.is_contiguous()
+            or not ssm_states.is_contiguous()
+            or not intermediate_state_cache.is_contiguous()
+        ):
+            return False
+        if (
+            a.numel() != seq_len * layer.num_v_heads * layer.head_k_dim
+            or b.numel() != seq_len * layer.num_v_heads
+            or layer.A_log.numel() != layer.num_v_heads
+            or layer.dt_bias.numel() != layer.num_v_heads * layer.head_k_dim
+        ):
+            return False
+        if (
+            conv_states.ndim != 3
+            or tuple(conv_states.shape[-2:]) != (3, dim)
+            or intermediate_conv_window_cache.ndim != 4
+            or tuple(intermediate_conv_window_cache.shape[-2:]) != (3, dim)
+            or ssm_states.ndim != 4
+            or tuple(ssm_states.shape[-3:])
+            != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
+            or intermediate_state_cache.ndim != 5
+            or intermediate_state_cache.shape[1] < draft_token_num
+            or tuple(intermediate_state_cache.shape[-3:])
+            != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
+        ):
+            return False
+        if (
+            cache_indices.ndim != 1
+            or intermediate_state_indices.ndim != 1
+            or cache_indices.numel() != batch_size
+            or intermediate_state_indices.numel() != batch_size
+            or cache_indices.dtype != torch.int32
+            or intermediate_state_indices.dtype != torch.int32
+        ):
+            return False
+        tensors = (
+            layer.conv_weights,
+            layer.A_log,
+            layer.dt_bias,
+            a,
+            b,
+            conv_states,
+            ssm_states,
+            intermediate_state_cache,
+            intermediate_conv_window_cache,
+            cache_indices,
+            intermediate_state_indices,
+        )
+        if layer.bias is not None:
+            tensors += (layer.bias,)
+        return all(tensor.device == mixed_qkv.device for tensor in tensors)
 
     def _can_run_dspark_cutedsl_mtp(
         self,

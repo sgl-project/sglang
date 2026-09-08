@@ -34,9 +34,9 @@ from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 # (highest test volume historically), then accelerators that have been
 # wired into the registry more recently (XPU, MUSA, MLX).
 BACKEND_DISPLAY_ORDER = ("CUDA", "AMD", "NPU", "CPU", "XPU", "MUSA", "MLX")
-assert set(BACKEND_DISPLAY_ORDER) == {
-    b.name for b in HWBackend
-}, "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+assert set(BACKEND_DISPLAY_ORDER) == {b.name for b in HWBackend}, (
+    "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+)
 
 # --------------------------------------------------------------------------- #
 # multimodal_gen test coverage
@@ -64,9 +64,9 @@ _MM_GEN_SUBDIR_BACKENDS = {
     "server/musa": ("MUSA",),
     "server/ascend": ("NPU",),
     "layers": ("CUDA",),
-    # unit/ are portable CPU-style unit tests. pr-test-amd now runs the `unit`
-    # suite on ROCm (multimodal-gen-unit-test-amd, both 7.0.0 and 7.2.0), so
-    # they are AMD-covered too, not CUDA-only.
+    # unit/ are portable CPU-style unit tests. The `unit` suite also runs on
+    # ROCm (both 7.0.0 and 7.2.0), as a step of multimodal-gen-test-1-gpu-amd
+    # part 0, so they are AMD-covered too, not CUDA-only.
     "unit": ("CUDA", "AMD"),
     "cli": ("CUDA",),
     "manual": ("CUDA",),

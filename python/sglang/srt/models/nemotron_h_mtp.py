@@ -231,9 +231,9 @@ class NemotronHMultiTokenPredictor(nn.Module):
 
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1)
-        assert (
-            self.num_mtp_layers == 1
-        ), "Only one MTP layer is supported for NemotronH-MTP"
+        assert self.num_mtp_layers == 1, (
+            "Only one MTP layer is supported for NemotronH-MTP"
+        )
 
         self.pattern_str = config.mtp_hybrid_override_pattern
         self.pattern_len = len(self.pattern_str)
@@ -280,9 +280,9 @@ class NemotronHMultiTokenPredictor(nn.Module):
                 )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        assert (
-            self.embed_tokens is not None
-        ), "embed_tokens not initialized - must be shared from target model"
+        assert self.embed_tokens is not None, (
+            "embed_tokens not initialized - must be shared from target model"
+        )
         return self.embed_tokens(input_ids)
 
     def forward(

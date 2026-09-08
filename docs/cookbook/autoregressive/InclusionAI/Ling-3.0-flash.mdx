@@ -20,7 +20,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 Pick your hardware + recipe to generate the launch command. Three serving strategies are covered:
 
-- **Low-Latency** — fastest reply for a single user. Pick for chat. These recipes run NEXTN speculative decoding.
+- **Low-Latency** — fastest reply for a single user. Pick for chat. These recipes run speculative decoding: pick **NEXTN** (built-in MTP layer, no extra checkpoint) or **DSPARK** (external draft model) in the **Spec Decode** selector of the Deploy panel.
 - **High-Throughput** — most tokens per second across many users. Best for batch jobs. These recipes turn speculative decoding off, since at saturation the draft/verify overhead outweighs the speedup.
 - **HiCache + Mooncake** — writes reusable prefixes to Mooncake L3 storage. Start the Mooncake services in §3.3 before launching the generated server command.
 
@@ -50,6 +50,7 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 - **FP8** (blockwise E4M3): [inclusionAI/Ling-3.0-flash-fp8](https://huggingface.co/inclusionAI/Ling-3.0-flash-fp8)
 - **INT4** (compressed-tensors W4A16): [inclusionAI/Ling-3.0-flash-int4](https://huggingface.co/inclusionAI/Ling-3.0-flash-int4)
 - **MXFP4**: [inclusionAI/Ling-3.0-flash-fp4](https://huggingface.co/inclusionAI/Ling-3.0-flash-fp4)
+- **DSPARK draft**: [inclusionAI/Ling-3.0-flash-dspark](https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark) — 5-layer DSpark draft checkpoint for DSPARK speculative decoding
 
 **License:** MIT
 
@@ -64,7 +65,8 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 - `--reasoning-parser ling3` and `--tool-call-parser ling3` enable Ling-3.0-specific reasoning and structured tool-call parsing; toggle them in the **Parsers** card of the [Playground](#playground).
 - Both the chat template and the `ling3` reasoning parser default to thinking on. A single request can turn it off with `"chat_template_kwargs": {"enable_thinking": false}` (see §3.1).
 - The BF16/FP8 recipes use `--mem-fraction-static 0.8`; INT4/MXFP4 use `0.85`. These values reserve the headroom used by the validated graph-enabled runs.
-- The checkpoint ships a built-in MTP layer (`num_nextn_predict_layers: 1`); enable it with `--speculative-algorithm NEXTN` — no separate draft model is needed. The Low-Latency recipes have it on; toggle it in the **Speculative Decoding** card of the [Playground](#playground).
+- The checkpoint ships a built-in MTP layer (`num_nextn_predict_layers: 1`); enable it with `--speculative-algorithm NEXTN` — no separate draft model is needed. The Low-Latency recipes default to it via the **Spec Decode** selector; toggle it in the **Speculative Decoding** card of the [Playground](#playground).
+- DSPARK is the alternative speculative path: it drafts with the external [inclusionAI/Ling-3.0-flash-dspark](https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark) checkpoint instead of the built-in MTP layer. Pick **DSPARK** in the Deploy panel's **Spec Decode** selector (also available in the [Playground](#playground)); it composes `--speculative-algorithm DSPARK`, the draft path, and `--enable-linear-replayssm-spec`, the KDA verify path that folds per-draft intermediate states onto a fixed ring instead of snapshotting full states. The draft block size auto-infers from the checkpoint; tune it with `--speculative-dspark-block-size`. The draft's block size of 8 makes the verify window 9 tokens, and the KDA ReplaySSM ring must be a power of two at least twice the window — the recipe therefore pins `--linear-replayssm-cache-len 32`, since the 16 default fails startup validation. MXFP4 requires `--moe-runner-backend flashinfer_mxfp4`; the mixed checkpoint does not auto-select it.
 - Native context is 256K; SGLang reads it from the checkpoint's `max_position_embeddings`, so no `--context-length` flag is needed.
 - The **HiCache** card in the [Playground](#playground) exposes the validated Mooncake L3 path. It adds the hybrid-KDA scheduler and prefix-key settings together; see §3.3 for the required services.
 

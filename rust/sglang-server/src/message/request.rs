@@ -1,7 +1,5 @@
 //! The `/generate` request path: the HTTP body and its per-request fan-out
-//! ([`GenerateBody`] → [`GenerateRequest`]s), the variant bodies, and the
-//! scheduler ingress encodings (`TokenizedGenerateReqInput` header,
-//! control/abort, `IngressMsg`).
+//! ([`GenerateBody`] → [`GenerateRequest`]s).
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -11,10 +9,13 @@ use itertools::izip;
 use serde::Deserialize;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
-use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
-use crate::environ::env_u64;
-use crate::error::Error;
-use crate::ids::Rid;
+use super::multimodal::{self, MmDataInput, MmItem};
+use super::response::ResponseSink;
+use super::sampling::{SamplingParams, SamplingParamsInput};
+use super::types::{OneOrMany, OneOrManyItem, TokenIds};
+use crate::message::ids::Rid;
+use crate::utils::fsm::RequestState;
+use crate::utils::{environ::env_i64, error::Error};
 
 /// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
 /// into. Every column below is allocated per item before anything is dispatched,
@@ -27,8 +28,12 @@ use crate::ids::Rid;
 /// `python/sglang/srt/environ.py`, which owns the default). Memoized because the
 /// value is process-static — Python sets it before launching this server — and a
 /// per-request `env::var` would take a lock on the hot path for a constant.
-static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<usize> =
-    LazyLock::new(|| env_u64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096) as usize);
+static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<i64> =
+    LazyLock::new(|| env_i64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096));
+
+fn batch_size_exceeds_limit(batch_size: usize, limit: i64) -> bool {
+    limit >= 0 && batch_size as u128 > limit as u128
+}
 
 /// Hard cap on the total bytes a broadcast value may clone into the batch (see
 /// the `One` arms of the fan-out).
@@ -55,77 +60,66 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 pub struct GenerateBody {
     /// Optional client-supplied request id(s): a single string (a batch fans it
     /// out as `{rid}_{i}`, mirroring Python `_normalize_batch`) or one per item.
-    #[serde(default)]
     pub rid: Option<OneOrMany<String>>,
-    #[serde(default)]
     pub text: Option<OneOrMany<String>>,
-    #[serde(default)]
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub stream: bool,
     /// One params object (broadcast) or a list of them (per item); see
     /// [`SamplingParamsInput`].
-    #[serde(default)]
     pub sampling_params: Option<SamplingParamsInput>,
     /// Logprob / hidden-state options: a scalar broadcasts to every prompt, a
     /// list is per-prompt (Python `_normalize_logprob_params`).
-    #[serde(default)]
     pub return_logprob: Option<OneOrMany<bool>>,
-    #[serde(default)]
     pub logprob_start_len: Option<OneOrMany<i64>>,
-    #[serde(default)]
     pub top_logprobs_num: Option<OneOrMany<i64>>,
     /// Token ids to report logprobs for: one list (broadcast to every prompt) or
     /// one list per prompt, mirroring Python's
     /// `Union[List[int], List[List[int]]]` fan-out in `_normalize_batch`.
-    #[serde(default)]
     pub token_ids_logprob: Option<OneOrMany<TokenIds>>,
-    #[serde(default)]
     pub return_hidden_states: Option<OneOrMany<bool>>,
     /// Scalar-only in Python too (`return_text_in_logprobs: bool`).
-    #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
     // PD-disaggregation routing, injected per request by the PD router
     // (mini_lb / sgl-model-gateway): a scalar for a single prompt, one-per-item
     // lists for a batch. Elements are nullable (`List[Optional[...]]` in
     // Python) — the router sends `bootstrap_port: [null, …]` when deferring to
     // the scheduler's `--disaggregation-bootstrap-port` default.
-    #[serde(default)]
     pub bootstrap_host: Option<OneOrMany<Option<String>>>,
-    #[serde(default)]
     pub bootstrap_port: Option<OneOrMany<Option<i64>>>,
     /// `bootstrap_room` fits in i64: the PD routers draw it from `[0, 2^63)`.
-    #[serde(default)]
     pub bootstrap_room: Option<OneOrMany<Option<i64>>>,
-    #[serde(default)]
     pub bootstrap_pair_key: Option<OneOrMany<Option<String>>>,
-    #[serde(default)]
     pub decode_tp_size: Option<OneOrMany<Option<i64>>>,
     /// DP routing hints — per-request scalars even for batches, as in Python.
-    #[serde(default)]
     pub routed_dp_rank: Option<i64>,
-    #[serde(default)]
     pub disagg_prefill_dp_rank: Option<i64>,
-    // Multimodal inputs, permissive `Value` so any shape Python's
-    // `GenerateReqInput` accepts (URL / base64 / list / list-of-lists) parses.
-    // `into_requests` fans them out per the Python
-    // `_normalize_{image,video,audio}_data` batch rules.
-    #[serde(default)]
-    pub image_data: Option<rmpv::Value>,
+    // Multimodal inputs (Python `MultimodalDataInputFormat`), fanned out per
+    // request by `multimodal::fan_out`.
+    pub image_data: Option<MmDataInput>,
     /// Caller-supplied per-item content hashes (hex) overriding the computed
     /// ones, so an external router's keys align with the prefix cache. Single
-    /// requests only: Python declares the batched shapes but `__getitem__` never
-    /// forwards them, so a batch is rejected here rather than answered with
-    /// hashes it did not ask for.
-    #[serde(default)]
-    pub mm_hashes: Option<rmpv::Value>,
-    #[serde(default)]
-    pub video_data: Option<rmpv::Value>,
-    #[serde(default)]
-    pub audio_data: Option<rmpv::Value>,
+    /// requests only: Python declares the batched (nested) shape but
+    /// `__getitem__` never forwards it, so a batch is rejected here rather than
+    /// answered with hashes it did not ask for.
+    pub mm_hashes: Option<OneOrMany<Vec<String>>>,
+    pub video_data: Option<MmDataInput>,
+    pub audio_data: Option<MmDataInput>,
 }
 
 impl GenerateBody {
+    /// Merge operator-provided sampling defaults beneath request values,
+    /// matching Python TokenizerManager's preferred/request precedence.
+    pub fn apply_preferred_sampling(&mut self, preferred: &serde_json::Value) -> Result<(), Error> {
+        match &mut self.sampling_params {
+            Some(params) => params.apply_preferred(preferred),
+            None => SamplingParamsInput::from_preferred(preferred).map(|params| {
+                self.sampling_params = Some(params);
+            }),
+        }
+        .map_err(|e| Error::Validation(format!("invalid preferred_sampling_params: {e}")))
+    }
+
     /// Validate, normalize and fan the body into one [`GenerateRequest`] per
     /// prompt + `is_batch` (list form — a 1-element list is still a batch → JSON
     /// array response). The Rust counterpart of Python
@@ -170,7 +164,7 @@ impl GenerateBody {
             (None, Some(OneOrMany::Many(v))) => v.len(),
             _ => 1,
         };
-        if declared_n > *MAX_BATCH_REQS_PER_HTTP_REQ {
+        if batch_size_exceeds_limit(declared_n, *MAX_BATCH_REQS_PER_HTTP_REQ) {
             return Err(Error::Validation(format!(
                 "batch size {declared_n} exceeds the maximum of {}",
                 *MAX_BATCH_REQS_PER_HTTP_REQ
@@ -345,18 +339,26 @@ impl GenerateBody {
         // servers different prefix-cache keys for the same body. Reject instead of
         // dropping it silently as Python does — the field exists to align a
         // caller's keys, so ignoring it returns subtly wrong ones.
-        if is_batch && mm_value_present(&mm_hashes) {
-            return Err(Error::Validation(
-                "mm_hashes is not supported for batch requests; send one request per prompt".into(),
-            ));
-        }
-        // Multimodal columns; see `split_mm_column` for the Python parity rules.
-        let images = split_mm_column(image_data, n, is_batch, MmBroadcast::WrapInList)
-            .map_err(|e| Error::Validation(format!("image_data: {e}")))?;
-        let videos = split_mm_column(video_data, n, is_batch, MmBroadcast::AsIs)
-            .map_err(|e| Error::Validation(format!("video_data: {e}")))?;
-        let audios = split_mm_column(audio_data, n, is_batch, MmBroadcast::AsIs)
-            .map_err(|e| Error::Validation(format!("audio_data: {e}")))?;
+        let mm_hashes: Vec<String> = match mm_hashes {
+            None => Vec::new(),
+            Some(OneOrMany::One(hashes)) if hashes.is_empty() => Vec::new(),
+            Some(_) if is_batch => {
+                return Err(Error::Validation(
+                    "mm_hashes is not supported for batch requests; send one request per prompt"
+                        .into(),
+                ));
+            }
+            Some(OneOrMany::One(hashes)) => hashes,
+            Some(OneOrMany::Many(_)) => {
+                return Err(Error::Validation(
+                    "mm_hashes must be a flat list of hex strings for a single request".into(),
+                ));
+            }
+        };
+        // Multimodal columns; see `multimodal::fan_out` for the Python parity rules.
+        let images = multimodal::fan_out(image_data, n, is_batch, "image_data")?;
+        let videos = multimodal::fan_out(video_data, n, is_batch, "video_data")?;
+        let audios = multimodal::fan_out(audio_data, n, is_batch, "audio_data")?;
 
         // Every column above is exactly `n` long, so zip them by value: each
         // request takes ownership of its cell, with no indexing or bounds checks.
@@ -430,14 +432,8 @@ impl GenerateBody {
         .collect();
         // Single requests only (batches rejected above). Malformed entries are
         // dropped here and warned about in `mm::apply_caller_hashes`, never a 400.
-        if !is_batch
-            && let (Some(rmpv::Value::Array(vals)), Some(req)) = (mm_hashes, requests.first_mut())
-            && let Some(mm) = req.mm.as_deref_mut()
-        {
-            mm.mm_hashes = vals
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
+        if let Some(mm) = requests.first_mut().and_then(|req| req.mm.as_deref_mut()) {
+            mm.mm_hashes = mm_hashes;
         }
         Ok((requests, is_batch))
     }
@@ -446,11 +442,11 @@ impl GenerateBody {
 /// Box the per-item mm values, `None` when the item has none — the common
 /// text-only case keeps `GenerateRequest` slim.
 fn pack_mm(
-    image_data: Option<rmpv::Value>,
-    video_data: Option<rmpv::Value>,
-    audio_data: Option<rmpv::Value>,
+    image_data: Vec<MmItem>,
+    video_data: Vec<MmItem>,
+    audio_data: Vec<MmItem>,
 ) -> Option<Box<MmData>> {
-    if image_data.is_none() && video_data.is_none() && audio_data.is_none() {
+    if image_data.is_empty() && video_data.is_empty() && audio_data.is_empty() {
         return None;
     }
     Some(Box::new(MmData {
@@ -461,97 +457,59 @@ fn pack_mm(
     }))
 }
 
-/// How a scalar mm value broadcasts across a batch: images become a one-image
-/// list per item (`[[img]] * num` in Python `_normalize_image_data`),
-/// video/audio broadcast bare (`[v] * num` in `_normalize_video_data`).
-#[derive(Clone, Copy)]
-enum MmBroadcast {
-    WrapInList,
-    AsIs,
-}
-
-/// Fan one mm field into per-item values, mirroring Python's
-/// `_normalize_{image,video,audio}_data`:
-///   * `None` / empty list → `None` for every item;
-///   * single request → the raw value passes through (the processor wraps a
-///     non-list into a one-element list);
-///   * batch + scalar → broadcast to every item, per `MmBroadcast`;
-///   * batch + list → per item, length must equal the batch size.
-fn split_mm_column(
-    v: Option<rmpv::Value>,
-    n: usize,
-    is_batch: bool,
-    broadcast: MmBroadcast,
-) -> Result<Vec<Option<rmpv::Value>>, String> {
-    let Some(v) = v else {
-        return Ok(vec![None; n]);
-    };
-    if v.is_nil() {
-        return Ok(vec![None; n]);
-    }
-    if !is_batch {
-        return Ok(vec![Some(v)]);
-    }
-    match v {
-        rmpv::Value::Array(items) if items.is_empty() => Ok(vec![None; n]),
-        rmpv::Value::Array(items) => {
-            if items.len() != n {
-                return Err(format!(
-                    "list length {} does not match batch size {n}",
-                    items.len()
-                ));
-            }
-            Ok(items.into_iter().map(Some).collect())
-        }
-        scalar => {
-            // A broadcast deep-clones once per prompt — same blow-up as
-            // sampling_params above, so bound the product before any clone.
-            check_broadcast_budget(scalar.heap_bytes(), n, "value").map_err(|e| e.to_string())?;
-            Ok(match broadcast {
-                MmBroadcast::WrapInList => vec![Some(rmpv::Value::Array(vec![scalar])); n],
-                MmBroadcast::AsIs => vec![Some(scalar); n],
-            })
-        }
-    }
-}
-
 /// One request handed to the MM worker pool: the rid to correlate the result,
 /// plus the owned inputs from [`GenerateRequest::take_mm_work`].
 #[derive(Debug)]
 pub struct MmRequest {
-    pub rid: crate::ids::Rid,
+    pub rid: Rid,
     pub work: MmWorkItem,
 }
 
 /// The parked request's fields the MM worker owns; converted to the driver input
-/// by [`super::mm_payload::to_mm_input`].
+/// by [`crate::multi_modality::payload::to_mm_input`].
 #[derive(Debug, Default)]
 pub struct MmWorkItem {
     pub text: Option<String>,
     pub input_ids: Option<Vec<i32>>,
-    pub image_data: Option<rmpv::Value>,
-    pub video_data: Option<rmpv::Value>,
-    pub audio_data: Option<rmpv::Value>,
+    pub image_data: Vec<MmItem>,
+    pub video_data: Vec<MmItem>,
+    pub audio_data: Vec<MmItem>,
     /// See [`MmData::prefetched`].
     pub prefetched: Vec<Bytes>,
     /// See [`GenerateBody::mm_hashes`].
     pub mm_hashes: Vec<String>,
 }
 
-/// Whether an optional mm field counts as multimodal input, via the same
-/// `value_present` the MM worker's payload parser uses.
-fn mm_value_present(v: &Option<rmpv::Value>) -> bool {
-    v.as_ref().is_some_and(super::mm_payload::value_present)
+/// The owned request as it travels request stages (single owner, so `state` is
+/// mutated lock-free). Common fields here; variant data in [`RequestKind`].
+#[derive(Debug)]
+pub struct Request {
+    /// Client-visible request id (uuid hex) — what the scheduler wire and
+    /// `meta_info.id` carry.
+    pub rid: Rid,
+    pub state: RequestState,
+    /// Back-channel to the client connection for response frames.
+    pub sink: ResponseSink,
+    /// Discriminant + variant body (generate vs control).
+    pub kind: RequestKind,
 }
 
-/// Request variant — selects the ingress branch, scheduler wire message, and
-/// egress shape. Each owns its body, so generate/control fields stay type-separate.
+/// One to_scheduler channel entry, split columnar: the scalar `header` (msgpack, `input_ids`
+/// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
+#[derive(Debug)]
+pub struct SchedulerRequest {
+    pub header: Bytes,
+    pub ids: Bytes,
+}
+
+/// Request variant — selects the request branch, scheduler wire message, and
+/// response shape. Each owns its body, so generate/control fields stay type-separate.
 #[derive(Debug)]
 pub enum RequestKind {
     /// `/generate`: tokenize (if needed) then push a `TokenizedGenerateReqInput`.
     Generate(Box<GenerateRequest>),
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
-    /// the egress is a single non-streamed JSON result.
+    /// the response is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
     /// Internal service call: decode a complete token-id sequence to text. Walks
     /// the same FSM as every request (validate → register → Queued), but the
@@ -595,7 +553,7 @@ pub struct GenerateRequest {
     /// by the pool before the header is built; never reaches the scheduler wire.
     pub skip_special_tokens: bool,
     /// Sampling params (defaults when the client sent none, as in Python);
-    /// normalized + verified at ingress, then serialized into the header.
+    /// normalized + verified, then serialized into the header.
     pub sampling_params: SamplingParams,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
@@ -631,21 +589,25 @@ pub struct GenerateRequest {
     /// so these are pure passthrough for the scheduler/LB protocol.
     pub routed_dp_rank: Option<i64>,
     pub disagg_prefill_dp_rank: Option<i64>,
-    /// Multimodal inputs, carried opaquely. Consumed by the Encoding stage,
-    /// which ships them to the MM worker pool; never read by the tokenizer or
-    /// serialized onto the scheduler header. Boxed so the common text-only
-    /// request doesn't grow every `Request` moved between stages.
+    /// Multimodal inputs. Consumed by the Encoding stage, which ships them to
+    /// the MM worker pool; never read by the tokenizer or serialized onto the
+    /// scheduler header. Boxed so the common text-only request doesn't grow
+    /// every `Request` moved between stages.
     pub mm: Option<Box<MmData>>,
 }
 
-/// The opaque multimodal fields of one request (see [`GenerateRequest::mm`]).
+/// The multimodal fields of one request (see [`GenerateRequest::mm`]), each
+/// modality already fanned out to this request's own item list.
+///
+/// Constructed directly only by tests: `api_server::prefetch` fills its
+/// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
 #[derive(Debug, Default)]
 pub struct MmData {
-    pub image_data: Option<rmpv::Value>,
-    pub video_data: Option<rmpv::Value>,
-    pub audio_data: Option<rmpv::Value>,
+    pub image_data: Vec<MmItem>,
+    pub video_data: Vec<MmItem>,
+    pub audio_data: Vec<MmItem>,
     /// Bytes of `image_data`'s I/O-backed sources, resolved by
-    /// `api_server::prefetch` in `mm_payload::io_sources` order so MM workers
+    /// `api_server::prefetch` in `payload::io_sources` order so MM workers
     /// never block on I/O. Out-of-band: the values above stay as the client
     /// sent them.
     pub prefetched: Vec<bytes::Bytes>,
@@ -663,9 +625,7 @@ impl GenerateRequest {
     /// Python `GenerateReqInput.contains_mm_input()`.
     pub fn has_multimodal(&self) -> bool {
         self.mm.as_ref().is_some_and(|mm| {
-            mm_value_present(&mm.image_data)
-                || mm_value_present(&mm.video_data)
-                || mm_value_present(&mm.audio_data)
+            !mm.image_data.is_empty() || !mm.video_data.is_empty() || !mm.audio_data.is_empty()
         })
     }
 
@@ -679,9 +639,9 @@ impl GenerateRequest {
             ..Default::default()
         };
         if let Some(m) = self.mm.as_deref_mut() {
-            work.image_data = m.image_data.take();
-            work.video_data = m.video_data.take();
-            work.audio_data = m.audio_data.take();
+            work.image_data = std::mem::take(&mut m.image_data);
+            work.video_data = std::mem::take(&mut m.video_data);
+            work.audio_data = std::mem::take(&mut m.audio_data);
             work.prefetched = std::mem::take(&mut m.prefetched);
             work.mm_hashes = std::mem::take(&mut m.mm_hashes);
         }
@@ -693,8 +653,8 @@ impl GenerateRequest {
     }
 
     /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
-    /// `array("q")` columnar cell — rides the ingress ring outside msgpack). Empty
-    /// when not tokenized.
+    /// `array("q")` columnar cell — rides the to-scheduler channel outside
+    /// msgpack). Empty when not tokenized.
     pub fn encode_data_buf(&self) -> Bytes {
         let ids = self.input_ids.as_deref().unwrap_or(&[]);
         let mut buf = Vec::with_capacity(ids.len() * 8);
@@ -709,7 +669,7 @@ impl GenerateRequest {
 /// each, a scalar broadcasts, a list must match the batch size.
 /// Bytes a broadcast value costs per clone. Only the heap matters — the inline
 /// part is bounded by the type.
-trait HeapBytes {
+pub(super) trait HeapBytes {
     fn heap_bytes(&self) -> usize;
 }
 impl HeapBytes for bool {
@@ -737,23 +697,6 @@ impl<T: HeapBytes> HeapBytes for Option<T> {
         self.as_ref().map_or(0, HeapBytes::heap_bytes)
     }
 }
-impl HeapBytes for rmpv::Value {
-    fn heap_bytes(&self) -> usize {
-        use rmpv::Value;
-        const NODE: usize = std::mem::size_of::<rmpv::Value>();
-        match self {
-            Value::String(s) => s.as_bytes().len(),
-            Value::Binary(b) => b.len(),
-            Value::Ext(_, b) => b.len(),
-            Value::Array(items) => items.iter().map(|v| NODE + v.heap_bytes()).sum(),
-            Value::Map(entries) => entries
-                .iter()
-                .map(|(k, v)| 2 * NODE + k.heap_bytes() + v.heap_bytes())
-                .sum(),
-            _ => 0,
-        }
-    }
-}
 
 /// Collapse `fan_out`'s nullable-element output: outer `None` (field absent /
 /// scalar broadcast of nothing) and inner `None` (an explicit `null` list
@@ -763,7 +706,7 @@ fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
 }
 
 /// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].
-fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
+pub(super) fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
     // `n == 1` is not a broadcast — there is one value and one prompt, so nothing
     // is duplicated. Charging it here rejected ordinary single requests with a
     // message about a batch they never sent.
@@ -882,7 +825,7 @@ mod tests {
         assert!(requests(r#"{"text": "a", "input_ids": [1]}"#).is_err());
         assert!(requests(r#"{"stream": true}"#).is_err());
         // Parallel sampling is rejected where Python reads it — in the params,
-        // at normalization (the ingress step), not here.
+        // at normalization, not here.
         let (mut ps, _) = requests(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
         assert!(ps[0].sampling_params.normalize(false, TEST_VOCAB).is_err());
     }
@@ -978,32 +921,43 @@ mod tests {
     }
 
     /// Mm columns fan out per Python `_normalize_{image,video}_data`: a single
-    /// request passes the raw value through; a batch broadcasts a scalar image as
-    /// `[img]` per item, maps a list per item with matching lengths, and treats
-    /// `null`/`[]` as absent.
+    /// request keeps its items; a batch broadcasts a scalar to every item, maps
+    /// a list per item with matching lengths, and treats `null`/`[]` as absent.
     #[test]
     fn split_mm_fanout_matches_python_normalize() {
-        let image_of = |p: &GenerateRequest| p.mm.as_ref().unwrap().image_data.clone().unwrap();
+        let src = |s: &str| MmItem::Source(s.to_owned());
+        let images_of = |p: &GenerateRequest| p.mm.as_ref().unwrap().image_data.clone();
 
-        // Single request: raw value passes through untouched.
+        // Single request: one item, or a flat list, kept as sent.
         let (ps, _) = requests(r#"{"text": "a", "image_data": "http://x/i.jpg"}"#).unwrap();
-        assert_eq!(image_of(&ps[0]).as_str(), Some("http://x/i.jpg"));
+        assert_eq!(images_of(&ps[0]), vec![src("http://x/i.jpg")]);
         assert!(ps[0].has_multimodal());
+        let (ps, _) = requests(r#"{"text": "a", "image_data": ["u1", {"url": "u2"}]}"#).unwrap();
+        assert_eq!(
+            images_of(&ps[0]),
+            vec![src("u1"), MmItem::Ref { url: "u2".into() }]
+        );
 
-        // Batch + scalar image: broadcast, wrapped as a one-image list per item.
+        // Batch + scalar image: broadcast, one image per item.
         let (ps, _) = requests(r#"{"text": ["a", "b"], "image_data": "u"}"#).unwrap();
         for p in &ps {
-            assert_eq!(image_of(p).as_array().unwrap().len(), 1);
+            assert_eq!(images_of(p), vec![src("u")]);
             assert!(p.has_multimodal());
         }
 
-        // Batch + per-item list: element i goes to item i.
+        // Batch + per-item list: element i goes to item i; nested lists are
+        // per-item lists.
         let (ps, _) = requests(r#"{"text": ["a", "b"], "image_data": ["u1", "u2"]}"#).unwrap();
-        assert_eq!(image_of(&ps[0]).as_str(), Some("u1"));
-        assert_eq!(image_of(&ps[1]).as_str(), Some("u2"));
+        assert_eq!(images_of(&ps[0]), vec![src("u1")]);
+        assert_eq!(images_of(&ps[1]), vec![src("u2")]);
+        let (ps, _) =
+            requests(r#"{"text": ["a", "b"], "image_data": [["u1", "u2"], null]}"#).unwrap();
+        assert_eq!(images_of(&ps[0]), vec![src("u1"), src("u2")]);
+        assert!(!ps[1].has_multimodal());
 
-        // Batch + wrong-length list is a 400.
+        // Batch + wrong-length list is a 400, as is the batch shape on a single.
         assert!(requests(r#"{"text": ["a", "b"], "image_data": ["u1"]}"#).is_err());
+        assert!(requests(r#"{"text": "a", "image_data": [["u1"]]}"#).is_err());
 
         // null / [] mean "no multimodal input".
         let (ps, _) = requests(r#"{"text": "a", "image_data": null}"#).unwrap();
@@ -1011,11 +965,10 @@ mod tests {
         let (ps, _) = requests(r#"{"text": "a", "image_data": []}"#).unwrap();
         assert!(!ps[0].has_multimodal());
 
-        // Batch + scalar video: broadcast bare (not wrapped), per Python
-        // `_normalize_video_data`.
+        // Batch + scalar video broadcasts too (Python leaves it unwrapped, but
+        // every request's input is an item list here).
         let (ps, _) = requests(r#"{"text": ["a", "b"], "video_data": "v"}"#).unwrap();
-        let video = ps[1].mm.as_ref().unwrap().video_data.clone().unwrap();
-        assert_eq!(video.as_str(), Some("v"));
+        assert_eq!(ps[1].mm.as_ref().unwrap().video_data, vec![src("v")]);
         assert!(ps[1].has_multimodal());
     }
 
@@ -1024,17 +977,17 @@ mod tests {
     /// and are never charged.
     #[test]
     fn oversized_mm_broadcast_rejected() {
-        let big = rmpv::Value::from("x".repeat(MAX_BROADCAST_CLONE_BYTES / 2 + 1));
-        let err = split_mm_column(Some(big.clone()), 2, true, MmBroadcast::WrapInList)
+        let big = MmItem::Source("x".repeat(MAX_BROADCAST_CLONE_BYTES / 2 + 1));
+        let err = multimodal::fan_out(Some(MmDataInput::One(big.clone())), 2, true, "image_data")
             .err()
             .unwrap();
-        assert!(err.contains("broadcast"), "{err}");
+        assert!(err.to_string().contains("broadcast"), "{err}");
         // A per-item list of the same total size moves, not clones: accepted.
-        let list = rmpv::Value::Array(vec![big, rmpv::Value::from("y")]);
-        assert!(split_mm_column(Some(list), 2, true, MmBroadcast::WrapInList).is_ok());
+        let list = MmDataInput::Many(vec![Some(big), Some(MmItem::Source("y".into()))]);
+        assert!(multimodal::fan_out(Some(list), 2, true, "image_data").is_ok());
         // Small scalars broadcast fine.
-        let small = rmpv::Value::from("u1");
-        assert!(split_mm_column(Some(small), 2, true, MmBroadcast::AsIs).is_ok());
+        let small = MmDataInput::One(MmItem::Source("u1".into()));
+        assert!(multimodal::fan_out(Some(small), 2, true, "audio_data").is_ok());
     }
 
     /// `mm_hashes` rides only on single requests (Python `__getitem__`
@@ -1047,10 +1000,12 @@ mod tests {
         assert_eq!(ps[0].take_mm_work().mm_hashes, vec!["a1b2", "0xff"]);
         assert!(ps[0].mm.as_ref().unwrap().mm_hashes.is_empty());
 
-        // A batch cannot carry hashes (Python drops them), so it is rejected...
+        // A batch cannot carry hashes (Python drops them), so it is rejected,
+        // as is the nested batch shape on a single request...
         for body in [
             r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": [["x"], ["y"]]}"#,
             r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": ["x", "y"]}"#,
+            r#"{"text": "a", "image_data": "u", "mm_hashes": [["x"]]}"#,
         ] {
             let err = requests(body).err().unwrap();
             assert!(matches!(err, Error::Validation(_)), "{body}: {err:?}");
@@ -1073,11 +1028,11 @@ mod tests {
         let work = ps[0].take_mm_work();
         assert_eq!(work.text.as_deref(), Some("hi"));
         assert!(work.input_ids.is_none());
-        assert_eq!(work.image_data.unwrap().as_array().unwrap().len(), 2);
-        assert!(work.video_data.is_none());
-        assert_eq!(work.audio_data.unwrap().as_str(), Some("a"));
+        assert_eq!(work.image_data.len(), 2);
+        assert!(work.video_data.is_empty());
+        assert_eq!(work.audio_data, vec![MmItem::Source("a".into())]);
         // Moved out, not cloned; `text` survives for the header.
-        assert!(ps[0].mm.as_ref().unwrap().image_data.is_none());
+        assert!(ps[0].mm.as_ref().unwrap().image_data.is_empty());
         assert_eq!(ps[0].text.as_deref(), Some("hi"));
     }
 
@@ -1089,19 +1044,16 @@ mod tests {
     /// capped before any column is built.
     #[test]
     fn oversized_batches_are_rejected_before_allocating() {
-        let texts: Vec<String> = (0..*MAX_BATCH_REQS_PER_HTTP_REQ + 1)
-            .map(|i| i.to_string())
-            .collect();
+        let cap = usize::try_from(*MAX_BATCH_REQS_PER_HTTP_REQ).unwrap();
+        let texts: Vec<String> = (0..cap + 1).map(|i| i.to_string()).collect();
         let body = serde_json::json!({ "text": texts }).to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("exceeds the maximum"), "{err}");
 
         // At the cap it is accepted.
-        let texts: Vec<String> = (0..*MAX_BATCH_REQS_PER_HTTP_REQ)
-            .map(|i| i.to_string())
-            .collect();
+        let texts: Vec<String> = (0..cap).map(|i| i.to_string()).collect();
         let (reqs, _) = requests(&serde_json::json!({ "text": texts }).to_string()).unwrap();
-        assert_eq!(reqs.len(), *MAX_BATCH_REQS_PER_HTTP_REQ);
+        assert_eq!(reqs.len(), cap);
 
         // A small batch with a huge broadcast `custom_params` is the quadratic case:
         // few items, but each clone carries the whole blob. The item count is a
@@ -1116,6 +1068,13 @@ mod tests {
         .to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("would allocate more than"), "{err}");
+    }
+
+    #[test]
+    fn negative_batch_limit_disables_the_item_cap() {
+        assert!(!batch_size_exceeds_limit(usize::MAX, -1));
+        assert!(batch_size_exceeds_limit(11, 10));
+        assert!(!batch_size_exceeds_limit(10, 10));
     }
 
     /// `token_ids_logprob` mirrors Python `_normalize_batch`'s nested-structure
