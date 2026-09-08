@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -10,6 +11,7 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
@@ -33,6 +35,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     mamba_cache_chunk_size,
+    mamba_extra_buffer_enabled,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
@@ -44,6 +47,13 @@ logger = logging.getLogger(__name__)
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # RecoverSSM (--gdn-mtp-cache-mode=none) is a GDN-only verify protocol.
+    #
+    # GDNAttnBackend overrides this from the resolved mode. It lives on the class so the hybrid
+    # wrapper can copy it off the linear attention backend it wraps, test doubles
+    # included: MagicMock(spec=...) only serves attributes that exist on the class.
+    _recover_ssm: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -53,10 +63,9 @@ class MambaAttnBackendBase(AttentionBackend):
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = model_runner.server_args.enable_unified_memory
-        # Fused replay-prep state-indices fast path (fused_replay_state_indices):
-        # requires the static hybrid pool whose v2p translate is the identity —
-        # the unified pool overrides translate_mamba_indices with an allocator
-        # lookup that is not a flat table gather.
+        # Fused replay-prep state-indices fast path (fused_replay_state_indices): requires
+        # the static hybrid pool whose v2p translate is the identity. The unified pool
+        # overrides translate_mamba_indices with an allocator lookup that is not a flat table gather.
         self._fused_state_indices_ok = (
             str(self.device).startswith("cuda")
             and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
@@ -65,11 +74,12 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
-        # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
-        # each replay; the captured track-save reads this, not the InputBuffer slot.
+        # Holds the (max_bs,) track destination indices. The eager path passes track indices
+        # per call. Graph capture binds this buffer by pointer and refreshes it in place
+        # before each replay.
         self.mamba_track_indices_buf = None
-        # Per-bs static write-cursor / force-flush buffers for cuda-graph; None
-        # unless --enable-linear-replayssm is set.
+        # Per-bs static write-cursor / force-flush buffers for cuda-graph. None unless
+        # --enable-linear-replayssm is set.
         self.replayssm_write_pos_list = None
         self.replayssm_force_flush_list = None
         self.query_start_loc_list = []
@@ -101,8 +111,8 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
-        # Translate virtual->physical BEFORE the padding sentinel below, so the
-        # gather reads only real ids; padded rows are then poisoned to -1 (skipped).
+        # Translate virtual->physical BEFORE the padding sentinel below, so the gather reads
+        # only real ids. Padded rows are then poisoned to -1 (skipped).
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
         if forward_batch.mamba_track_indices is not None:
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
@@ -148,8 +158,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 # KDA has no radix coordination: flush only on the natural write_pos
                 # == L-1 wrap. GDN adds the radix-aligned force-flush below.
                 is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
-                # Force-flush on the radix track's seq_lens % mamba_track_interval
-                # == 0 boundary so the ring folds into temporal[slot] when read.
+                # Force-flush on the radix track's seq_lens % mamba_track_interval == 0 boundary
+                # so the ring folds into temporal[slot] when read.
                 if not is_kda:
                     force_flush_bool = self._replayssm_track_flush_mask(
                         forward_batch.seq_lens_cpu, bs
@@ -170,8 +180,8 @@ class MambaAttnBackendBase(AttentionBackend):
                         torch.zeros_like(replayssm_write_pos),
                         (replayssm_write_pos + 1) % L,
                     )
-                    # Dedup: rows sharing a slot share write_pos/flush, so the
-                    # scattered value is identical regardless of which row wins.
+                    # Dedup: rows sharing a slot share write_pos/flush, so the scattered value
+                    # is identical regardless of which row wins.
                     uniq_slots, inv = torch.unique(valid_slots, return_inverse=True)
                     next_for_valid = next_pos[valid_mask]
                     new_vals = torch.empty(
@@ -183,8 +193,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     write_pos_buf[uniq_slots] = new_vals
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
-                # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
-                # skip mamba metadata.
+                # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model. Skip mamba metadata.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
                 ragged_layout = forward_batch.spec_info.ragged_verify_layout
@@ -302,8 +311,7 @@ class MambaAttnBackendBase(AttentionBackend):
         the last complete chunk boundary, mamba_track_mask rows only)."""
         conv_state_len = self.conv_states_shape[-1]
 
-        # Shared with the Qwen4-Exp PLE side states so the boundary can never
-        # drift between them.
+        # Shared with the Qwen4-Exp PLE side states so the boundary can never drift between them.
         aligned_len = forward_batch.mamba_track_aligned_lens()
         assert aligned_len is not None, (
             "conv-state tracking requires mamba_track_seqlens and extend_prefix_lens; "
@@ -323,9 +331,9 @@ class MambaAttnBackendBase(AttentionBackend):
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
     ):
-        """src/dst indices to track SSM states for prefix caching: aligned seqs
-        cache last_recurrent_state, unaligned cache intermediate `h` at the last
-        chunk boundary."""
+        """src/dst indices to track SSM states for prefix caching: aligned seqs cache
+        last_recurrent_state, unaligned cache intermediate `h` at the last chunk boundary.
+        """
         chunk_size = mamba_cache_chunk_size()
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
@@ -354,8 +362,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
         track_ssm_final_dst = dst_masked[is_aligned]
 
-        # Unaligned: intermediate state from h.
-        # TODO: handle chunk_size % page size != 0
+        # Unaligned: intermediate state from h. TODO: handle chunk_size % page size != 0
         not_aligned = ~is_aligned
         track_ssm_h_src = offset_masked[not_aligned] + (
             lens_masked[not_aligned] // chunk_size
@@ -420,12 +427,12 @@ class MambaAttnBackendBase(AttentionBackend):
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         draft_token_num = max_num_tokens // max_bs
-        # Per-bs static write-cursor / force-flush buffers, captured by pointer +
-        # refreshed in-place each replay; sized like state_indices_list. None when off.
+        # Per-bs static write-cursor / force-flush buffers, captured by pointer + refreshed
+        # in-place each replay. Sized like state_indices_list. None when off.
         self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
         self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
-        # int64 to match DecodeInputBuffers.mamba_track_indices + the track-save
-        # kernel's int64 index load. Refreshed in-place by _replay_metadata.
+        # int64 to match DecodeInputBuffers.mamba_track_indices + the track-save kernel's
+        # int64 index load. Refreshed in-place by _replay_metadata.
         self.mamba_track_indices_buf = torch.zeros(
             (max_bs,), dtype=torch.int64, device=self.device
         )
@@ -519,8 +526,8 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_indices = self._translate_mamba_indices(mamba_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
-        # Capture records the pointer to the static per-bs buffers; their zeros are
-        # overwritten in-place by _replay_metadata before each replay. None when off.
+        # Capture records the pointer to the static per-bs buffers. Their zeros are overwritten
+        # in-place by _replay_metadata before each replay. None when off.
         replayssm_write_pos = (
             self.replayssm_write_pos_list[bs - 1]
             if self.replayssm_write_pos_list is not None
@@ -570,9 +577,8 @@ class MambaAttnBackendBase(AttentionBackend):
                     seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
                 )
         if self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
-            # Single-launch fast path: mapping gather + padding sentinel + store
-            # into the static buffer, plus zeroing padded req_pool_indices rows —
-            # bit-identical to the reference chain below.
+            # Single-launch fast path: mapping gather + padding sentinel + store into the static
+            # buffer, plus zeroing padded req_pool_indices rows. Bit-identical to the reference chain below.
             mamba_indices = fused_replay_state_indices(
                 req_pool_indices=req_pool_indices,
                 mamba_index_mapping=self.req_to_token_pool.req_index_to_mamba_index_mapping,
@@ -584,15 +590,15 @@ class MambaAttnBackendBase(AttentionBackend):
             # Make sure forward metadata is correctly handled for padding reqs
             req_pool_indices[bs - num_padding :] = 0
             mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-            # Translate using the LIVE v2p table BEFORE the padding sentinel below;
-            # captured Mamba kernels read state_indices_list as PHYSICAL ids.
+            # Translate using the LIVE v2p table BEFORE the padding sentinel below. Captured
+            # Mamba kernels read state_indices_list as PHYSICAL ids.
             mamba_indices = self._translate_mamba_indices(mamba_indices)
             mamba_indices[bs - num_padding :] = -1
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
-        # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices
-        # [-num_decodes:], which on the full max_bs buffer binds the stale tail.
+        # Hand out only the refreshed [:bs] prefix. Mamba2's track-save slices [-num_decodes:], which
+        # on the full max_bs buffer binds the stale tail.
         track_buf = None
         if mamba_track_indices is not None:
             assert (
@@ -640,8 +646,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 # TARGET_VERIFY replay must never advance the cursor.
                 if not in_capture and forward_mode.is_decode_or_idle():
                     L = mamba_pool.linear_replayssm_cache_len
-                    # Advance only valid (non-padded) slots; a forced flush empties
-                    # the ring -> next write_pos 0, like the natural L-1 wrap.
+                    # Advance only valid (non-padded) slots. A forced flush empties the ring
+                    # -> next write_pos 0, like the natural L-1 wrap.
                     valid_mask = slots >= 0
                     valid_slots = slots[valid_mask]
                     if valid_slots.numel() > 0:
@@ -975,12 +981,43 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+        # The verify-commit path reads self._recover_ssm, so the wrapper carries the same value
+        # the wrapped GDN backend resolved.
+        self._recover_ssm = linear_attn_backend._recover_ssm
+        # Recovery overlap: eager recovery runs on a dedicated side stream behind
+        # the next step's draft compute. The join ordering is enforced in _no_cache_mtp_recompute.
+        self._recovery_stream: Optional[torch.cuda.Stream] = None
+        self._recovery_event: Optional[torch.cuda.Event] = None
+        self._recovery_event_pending: bool = False
+        # Created with _recovery_stream and reused every step: this is the bs=1
+        # host-latency critical path, where torch.cuda.current_stream() costs ~40us
+        # of interpreter time and torch.cuda.stream() builds a new StreamContext per call.
+        self._recovery_join_event: Optional[torch.cuda.Event] = None
+        self._recovery_stream_ctx: Optional[torch.cuda.StreamContext] = None
+        # One graph replay replaces the per-layer kernel launches. Captured and replayed on
+        # _recovery_stream, so it still overlaps draft_extend and the next draft.
+        # Fixed-address buffers hold the per-step indices. Contents are refreshed
+        # before each replay.
+        self._rec_state_idx_buf: Optional[torch.Tensor] = None
+        self._rec_acc_steps_buf: Optional[torch.Tensor] = None
+        # Interval-checkpoint (mamba radix track) recovery buffers, used only with tracking
+        # (extra_buffer) on: a second pass reconstructs the state at the track boundary
+        # and writes it to the ping-pong track slot.
+        self._rec_track_idx_buf: Optional[torch.Tensor] = None
+        self._rec_track_steps_buf: Optional[torch.Tensor] = None
+        self._rec_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        # Boundary-pass graphs, captured alongside _rec_graphs only with tracking
+        # on. Empty means the boundary runs eager on the side stream.
+        self._rec_boundary_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        # Sorted bucket sizes captured at warmup. None until capture_recovery_graphs() succeeds.
+        # While None, recovery runs eagerly on the side stream.
+        self._rec_capture_bs: Optional[list[int]] = None
 
     @property
     def data_type(self):
-        # KV-cache dtype readers (e.g. the trtllm_mla fused-rope check) reach the
-        # wrapper since split backends are wrapped once (#31439); the full-attn
-        # side owns the KV cache, so its dtype is authoritative.
+        # KV-cache dtype readers (e.g. the trtllm_mla fused-rope check) reach the wrapper since
+        # split backends are wrapped once (#31439). The full-attn side owns the KV cache,
+        # so its dtype is authoritative.
         return self.full_attn_backend.data_type
 
     @property
@@ -998,18 +1035,44 @@ class HybridLinearAttnBackend(AttentionBackend):
         assert layer_id is not None, "either layer or layer_id must be provided"
         return layer_id in self.full_attn_layers
 
+    def _ensure_recovery_stream(self):
+        """Lazily create the recovery side stream and its per-step helpers.
+
+        Both the warmup capture and the serving path enter through here so the cached join event
+        / stream context can never be left unset by whichever one runs first.
+        """
+        if self._recovery_stream is not None:
+            return
+        self._recovery_stream = torch.cuda.Stream()
+        self._recovery_event = torch.cuda.Event()
+        self._recovery_join_event = torch.cuda.Event()
+        self._recovery_stream_ctx = torch.cuda.stream(self._recovery_stream)
+
+    def _wait_recovery_if_pending(self):
+        """Join the side-stream gdn_mtp_cache_mode=none SSM recovery before a target forward reads
+        the SSM pool. The wait also prevents the upcoming forward from overwriting
+        the per-layer recovery stash while the side-stream recovery is still reading it.
+        """
+        if self._recovery_event_pending:
+            # Event.wait() resolves the current stream in C++, ordering
+            # the same as current_stream().wait_event() without the Python wrapper.
+            self._recovery_event.wait()
+            self._recovery_event_pending = False
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
         if forward_batch.forward_mode.is_draft_extend_v2():
-            # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
+            # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model.
             # skip linear/mamba metadata (mirrors init_forward_metadata).
             self.full_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
             return
+        if not in_capture:
+            self._wait_recovery_if_pending()
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
@@ -1022,8 +1085,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
-            # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
-            # skip linear/mamba metadata (mirrors init_forward_metadata).
+            # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model. Skip linear/mamba metadata (mirrors init_forward_metadata).
             self.full_attn_backend.init_forward_metadata_in_graph(forward_batch)
             return
         for attn_backend in self.attn_backend_list:
@@ -1047,8 +1109,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
         # Plan-stream fixup after draft completes: forward to both children.
-        # Sub-backends that cannot run under the plan stream keep the fail-loud
-        # NotImplementedError base behavior.
+        # Sub-backends that cannot run under the plan stream keep
+        # the fail-loud NotImplementedError base behavior.
         for attn_backend in self.attn_backend_list:
             attn_backend.update_verify_buffers_to_fill_after_draft(
                 spec_info=spec_info, cuda_graph_bs=cuda_graph_bs
@@ -1060,6 +1122,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             # linear/mamba metadata (it requires query_start_loc).
             self.full_attn_backend.init_forward_metadata(forward_batch)
             return
+        self._wait_recovery_if_pending()
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
 
@@ -1225,9 +1288,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """Update mamba states after MTP verify via a fused gather-scatter kernel.
 
-        ``req_pool_indices`` serves implementations that must re-derive the state
-        slot ids instead of reusing this step's ``forward_metadata``; the scatter
-        below reads the metadata it just planned.
+        ``req_pool_indices`` serves implementations that must re-derive the state slot ids
+        instead of reusing this step's ``forward_metadata``; the scatter below reads
+        the metadata it just planned.
         """
         del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
@@ -1271,20 +1334,561 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        scatter_mamba_states_after_mtp_verify(
-            mamba_caches,
-            state_indices_tensor,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-        )
+        # RecoverSSM (gdn_mtp_cache_mode=none) skips the per-draft SSM snapshots, so rerun the recurrence from h_0 over
+        # the accepted prefix and roll back the conv state.
+        # Every other mode (full, ReplaySSM) takes the upstream fused gather-scatter.
+        # The dispatch keys on the resolved mode: server_args rejects none-mode alongside
+        # ReplaySSM, so the modes never share buffer sets.
+        if self._recover_ssm:
+            conv_states = mamba_caches.conv[0]
+            intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+            # Mamba radix tracking is supported on both recovery paths
+            # (FI native output_state_indices, Triton output-index arg): a second boundary pass
+            # recomputes the tracked prefix state, which none-mode does not cache.
+            self._no_cache_mtp_recompute(
+                accepted_steps=last_correct_step_indices,
+                state_indices_tensor=state_indices_tensor,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+            )
+            # Conv-state rollback reads the cached deduplicated sliding-window conv entries.
+            fused_conv_window_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+            # Conv boundary checkpoint: mirror the SSM boundary pass by writing the tracked
+            # prefix conv window to the ping-pong track slot
+            # (same masked scatter as full mode. Step == -1 rows skip).
+            if mamba_track_indices is not None:
+                fused_conv_window_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
+        else:
+            scatter_mamba_states_after_mtp_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
 
+        # Qwen4 PLE keeps its own speculative short-conv and n-gram side states.
+        # RecoverSSM replaces only the GDN state commit, so PLE commits its accepted state and radix
+        # boundary snapshot as in full mode.
         self._update_ple_state_after_mtp_verify(
             state_indices_tensor,
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
         )
+
+    def _persist_kv(self, layer_id, conv_dims, b_rows, cache_steps):
+        """
+        Return post-conv (k, v) as strided views
+        of the persistent conv-out buffer, for the FlashInfer recovery path.
+
+        The buffer is ``_conv_out_persist[layer_id]``, allocated once during verify
+        as [pool_size, cache_steps, conv_dim]. The target verify's conv fills it through
+        its out= argument. Rows [0, b_rows) hold this step's tokens, the row index varying
+        slowest. k covers columns [q_dim, q_dim + k_dim).
+        v covers [q_dim + k_dim, q_dim + k_dim + v_dim). The reshape and slices build shape
+        and stride metadata only. k is [1, n_tok, Hk, Dk] and v is [1, n_tok, Hv, Dv].
+        Here n_tok = b_rows * cache_steps. Every row keeps its features contiguous in the one
+        shared storage, so no tensor data is copied.
+
+        The recovery kernel consumes the views directly. The buffer address never changes
+        after allocation, and the views add no device state, so a captured recovery graph keeps
+        launching against the same memory on every replay.
+        """
+        persist = self.linear_attn_backend._conv_out_persist[layer_id]
+        q_dim, k_dim, v_dim, Hk, Dk, Hv, Dv = conv_dims
+        n_tok = b_rows * cache_steps
+        mixed = persist[:b_rows].reshape(n_tok, q_dim + k_dim + v_dim)
+        k = mixed[:, q_dim : q_dim + k_dim].view(1, n_tok, Hk, Dk)
+        v = mixed[:, q_dim + k_dim : q_dim + k_dim + v_dim].view(1, n_tok, Hv, Dv)
+        return k, v
+
+    def _fi_recovery_launch(
+        self,
+        n,
+        stash_per_layer,
+        pool,
+        gated_delta_rule_mtp,
+        init_idx_buf=None,
+        out_idx_buf=None,
+        acc_steps_buf=None,
+    ):
+        """
+        Launch FlashInfer recovery on the first ``n`` rows of every layer
+        in ``stash_per_layer``. Call sites: warm-compile and graph capture
+        in ``capture_recovery_graphs``, and the eager paths in ``_no_cache_mtp_recompute``.
+
+        Kernel inputs come from two places. a and b are the stash slices ``[:n]``
+        of the [pool_size, T, H] per-layer stash, so the slice is a view. k and v come from
+        ``_persist_kv``, strided views of the persistent conv-out buffer. q and k receive
+        the same view because the kernel l2-norms both sides itself.
+
+        With the default buffers the recovery reconstructs h_K in place: initial and output
+        state share one buffer, the request's working SSM slot, sized by the accepted length.
+        The interval-checkpoint boundary pass overrides ``out_idx_buf``
+        (ping-pong track slot) and ``acc_steps_buf``
+        (the per-request boundary step) while keeping ``init_idx_buf``
+        at the working slot, since h_0 lives there. It must therefore run
+        before the in-place working recovery overwrites h_0 with h_K.
+        """
+        init_idx_buf = self._rec_state_idx_buf if init_idx_buf is None else init_idx_buf
+        out_idx_buf = self._rec_state_idx_buf if out_idx_buf is None else out_idx_buf
+        acc_steps_buf = (
+            self._rec_acc_steps_buf if acc_steps_buf is None else acc_steps_buf
+        )
+        _init_idx = init_idx_buf[:n]
+        # Reuse the SAME slice object when read and write indices alias: the FI kernel picks
+        # its single-pool fast path
+        # by identity: `output_state_indices is initial_state_indices`. A second `buf[:n]`
+        # is a distinct view that silently forces the slower split-pool codegen.
+        _out_idx = _init_idx if out_idx_buf is init_idx_buf else out_idx_buf[:n]
+        _acc_steps = acc_steps_buf[:n]
+        _T = self.linear_attn_backend._no_cache_draft_token_num
+        for layer_id, stash in stash_per_layer.items():
+            layer_ssm_states = pool.mamba2_layer_cache(layer_id).temporal
+            # The FI path always stashes conv_dims (never k/v), so k/v come from the persistent conv-out buffer, reshaped [1, n*T, H, D]
+            # to the [n, T, H, D] the kernel expects (q == k: the kernel l2-norms both).
+            conv_dims = stash["conv_dims"]
+            k_pv, v_pv = self._persist_kv(layer_id, conv_dims, n, _T)
+            q_k = k_pv.view(n, _T, k_pv.shape[2], k_pv.shape[3])
+            v_bat = v_pv.view(n, _T, v_pv.shape[2], v_pv.shape[3])
+            gated_delta_rule_mtp(
+                A_log=stash["A_log_f32"],
+                a=stash["a"][:n],
+                dt_bias=stash["dt_bias"],
+                q=q_k,
+                k=q_k,
+                v=v_bat,
+                b=stash["b"][:n],
+                initial_state_source=layer_ssm_states,
+                initial_state_indices=_init_idx,
+                output_state_indices=_out_idx,
+                accepted_steps=_acc_steps,
+                disable_state_update=False,
+                disable_output=True,
+                use_qk_l2norm_in_kernel=True,
+                scale=None,
+                output=None,
+            )
+
+    def _rec_pad_to_bucket(self, batch_size: int) -> Optional[int]:
+        """Smallest captured bucket >= batch_size, or None when no warmup graphs exist
+        or batch_size exceeds the largest captured bucket (eager fallback).
+        """
+        if not self._rec_capture_bs:
+            return None
+        i = bisect.bisect_left(self._rec_capture_bs, batch_size)
+        if i == len(self._rec_capture_bs):
+            return None
+        return self._rec_capture_bs[i]
+
+    def capture_recovery_graphs(self, capture_bs):
+        """
+        Warmup: capture one FlashInfer recovery graph per batch-size bucket, on the side
+        stream, into a single shared mempool. Serving then pads the real batch up to a bucket
+        and replays (no live capture → no per-step stall / global-mode crash). Must run
+        AFTER a target_verify forward has allocated the per-layer stash at its final addresses (else this is a no-op and recovery falls back to eager side-stream launches).
+
+        Replaying a bucket graph runs the kernel over the whole bucket, writing rows beyond
+        the real batch too. Those rows point at reserved SSM slot 0, which no request can hold
+        (the free list starts at 1), and nothing reads those rows back.
+        """
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            fi_recovery_kernel,
+        )
+
+        use_fi_recovery = fi_recovery_kernel(self.linear_attn_backend) is not None
+        if not use_fi_recovery:
+            # Triton recovery or non-FI backend: no recovery graphs to capture.
+            # Recovery runs eager on the side stream.
+            return
+        stash_per_layer = getattr(self.linear_attn_backend, "_no_cache_stash", {})
+        if not stash_per_layer:
+            logger.warning(
+                "[mratsim's sm120-turbo r22] gdn recovery: stash not allocated at capture time; "
+                "recovery will run eagerly on the side stream (no cuda graph)."
+            )
+            return
+
+        pool = self.linear_attn_backend.req_to_token_pool
+        from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
+
+        dev = pool.mamba2_layer_cache(next(iter(stash_per_layer))).temporal.device
+        if self._rec_state_idx_buf is None:
+            self._rec_state_idx_buf = torch.empty(
+                pool.size, dtype=torch.int32, device=dev
+            )
+            self._rec_acc_steps_buf = torch.empty(
+                pool.size, dtype=torch.int32, device=dev
+            )
+            # Boundary-pass buffers, allocated here so the eager launch reuses
+            # the address-stable ping-pong output slots and boundary steps.
+            self._rec_track_idx_buf = torch.empty(
+                pool.size, dtype=torch.int32, device=dev
+            )
+            self._rec_track_steps_buf = torch.empty(
+                pool.size, dtype=torch.int32, device=dev
+            )
+        # During capture the index buffers hold zeros: only their shape is recorded,
+        # and the real per-step indices are copied in before replay.
+        self._rec_state_idx_buf.fill_(0)
+        self._rec_acc_steps_buf.fill_(0)
+        self._rec_track_idx_buf.fill_(0)
+        self._rec_track_steps_buf.fill_(0)
+
+        # Capture boundary graphs too when mamba radix tracking is on: a server-level decision
+        # made once here. Batches without track indices skip the replay.
+        capture_boundary = mamba_extra_buffer_enabled()
+
+        self._ensure_recovery_stream()
+
+        buckets = sorted({int(b) for b in capture_bs if 0 < int(b) <= pool.size})
+        if not buckets:
+            return
+        try:
+            shared_pool = torch.cuda.graph_pool_handle()
+            # Capture largest first so smaller graphs reuse the shared pool.
+            for B in reversed(buckets):
+                # Warm-compile this bucket's kernel + populate the kernel's per-B argument
+                # defaults OUTSIDE capture (writes to reserved slot 0, so harmless),
+                # so the capture itself is JIT-free and alloc-free.
+                with torch.cuda.stream(self._recovery_stream):
+                    self._fi_recovery_launch(
+                        B, stash_per_layer, pool, gated_delta_rule_mtp
+                    )
+                self._recovery_stream.synchronize()
+
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(
+                    g,
+                    pool=shared_pool,
+                    stream=self._recovery_stream,
+                    capture_error_mode="thread_local",
+                ):
+                    self._fi_recovery_launch(
+                        B, stash_per_layer, pool, gated_delta_rule_mtp
+                    )
+                self._rec_graphs[B] = g
+
+                if capture_boundary:
+                    # Boundary variant: distinct output indices select the kernel's
+                    # split-pool codegen, so it is a separate compiled
+                    # variant, warm-compiled outside capture as well.
+                    with torch.cuda.stream(self._recovery_stream):
+                        self._fi_recovery_launch(
+                            B,
+                            stash_per_layer,
+                            pool,
+                            gated_delta_rule_mtp,
+                            init_idx_buf=self._rec_state_idx_buf,
+                            out_idx_buf=self._rec_track_idx_buf,
+                            acc_steps_buf=self._rec_track_steps_buf,
+                        )
+                    self._recovery_stream.synchronize()
+
+                    gb = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(
+                        gb,
+                        pool=shared_pool,
+                        stream=self._recovery_stream,
+                        capture_error_mode="thread_local",
+                    ):
+                        self._fi_recovery_launch(
+                            B,
+                            stash_per_layer,
+                            pool,
+                            gated_delta_rule_mtp,
+                            init_idx_buf=self._rec_state_idx_buf,
+                            out_idx_buf=self._rec_track_idx_buf,
+                            acc_steps_buf=self._rec_track_steps_buf,
+                        )
+                    self._rec_boundary_graphs[B] = gb
+            self._rec_capture_bs = buckets
+            logger.info(
+                "[mratsim's sm120-turbo r22] gdn recovery: captured %d recovery cuda graphs (buckets=%s, "
+                "boundary=%s)",
+                len(buckets),
+                buckets,
+                capture_boundary,
+            )
+        except RuntimeError as e:
+            # CUDA graph capture raises RuntimeError for every documented decline
+            # (unsupported op in capture, cross-stream misuse). A different exception type
+            # is a bug in this capture body and must crash: falling through to eager would hide it.
+            logger.warning(
+                "[mratsim's sm120-turbo r22] gdn recovery: recovery cuda graph capture failed (%s); "
+                "falling back to eager side-stream recovery.",
+                e,
+            )
+            self._rec_graphs.clear()
+            self._rec_boundary_graphs.clear()
+            self._rec_capture_bs = None
+
+    def _no_cache_mtp_recompute(
+        self,
+        accepted_steps: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        mamba_steps_to_track: Optional[torch.Tensor] = None,
+    ):
+        """Recover accepted GDN SSM state for gdn_mtp_cache_mode=none.
+
+        Replays the state-update recurrence over stashed post-conv k/v/a/b and writes
+        h_{accepted_step} directly to the request's SSM state slot.
+
+        When mamba radix tracking is active (extra_buffer), a request's accepted draft window
+        may cross a track boundary. none-mode caches no intermediate state, so it also runs
+        a second FlashInfer boundary pass that folds only ``mamba_steps_to_track`` steps
+        from h_0 and writes the boundary state to the ping-pong track
+        slot ``mamba_track_indices``. That pass reads h_0 from the working slot, so it must run
+        before the in-place working recovery overwrites h_0 with h_K. Requests that cross
+        no boundary carry step == -1 and are redirected to reserved slot 0 / step 0, a slot
+        no request holds.
+        """
+        # Local imports to avoid a circular dependency at module load time.
+        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_recover_final_state,
+        )
+
+        stash_per_layer: dict = getattr(self.linear_attn_backend, "_no_cache_stash", {})
+        if not stash_per_layer:
+            # No GDN layer ran in cache_mode=none for this batch.
+            return
+
+        pool = self.linear_attn_backend.req_to_token_pool
+
+        # Recovery runs outside the captured graph. Derive per-call sizes from current tensors
+        # because the stash spans multiple batch-size captures.
+        batch_size = accepted_steps.shape[0]
+        draft_token_num = self.linear_attn_backend._no_cache_draft_token_num
+        assert draft_token_num is not None, (
+            "draft_token_num not cached — forward_extend was never called "
+            "in target_verify mode before _mamba_verify_update."
+        )
+        actual_seq_len = batch_size * draft_token_num
+        cache_steps = draft_token_num
+
+        # SM100+ with a bf16 state pool recovers via the FlashInfer MTP kernel, reading k/v
+        # as strided views of the persistent conv-out buffer. Everything else uses the Triton
+        # recurrence with a flat stash.
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            fi_recovery_kernel,
+        )
+
+        use_fi_recovery = fi_recovery_kernel(self.linear_attn_backend) is not None
+
+        # The Triton kernel takes materialized int32 tensors as arguments
+        # (and keeps them alive via record_stream below). The FI path only copies them
+        # into the stable _rec_* buffers, where copy_ narrows int64 on the way in: two
+        # eager dispatches of pure overhead that bs=1 would pay in wall clock.
+        state_idx_i32 = None
+        accepted_steps_i32 = None
+        if not use_fi_recovery:
+            state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
+            accepted_steps_i32 = accepted_steps.to(torch.int32).contiguous()
+
+        # The boundary pass runs on both paths: FI uses native output_state_indices, the Triton
+        # kernel a separate output-index arg. Per-step Triton tensors are built below. FI reuses _rec_track_*.
+        do_boundary = mamba_track_indices is not None
+        track_out_i32 = None
+        track_steps_i32 = None
+
+        # One launch per GDN layer, factored into a closure so it runs inline (graph capture)
+        # or on the side stream (eager overlap).
+        B_bucket = None
+        if use_fi_recovery:
+            from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                gated_delta_rule_mtp,
+            )
+
+            B = batch_size
+            # Stable fixed-address index buffers. capture_recovery_graphs allocates them
+            # at warmup. Allocate here for the no-warmup path.
+            if self._rec_state_idx_buf is None:
+                pool_size = pool.size
+                dev = state_indices_tensor.device
+                self._rec_state_idx_buf = torch.empty(
+                    pool_size, dtype=torch.int32, device=dev
+                )
+                self._rec_acc_steps_buf = torch.empty(
+                    pool_size, dtype=torch.int32, device=dev
+                )
+                self._rec_track_idx_buf = torch.empty(
+                    pool_size, dtype=torch.int32, device=dev
+                )
+                self._rec_track_steps_buf = torch.empty(
+                    pool_size, dtype=torch.int32, device=dev
+                )
+            B_bucket = self._rec_pad_to_bucket(B)
+            # Refresh stable buffers on the main stream before the side-stream read
+            # (the join event below orders after these copies), batched into one
+            # _foreach_copy_: copy_ narrows the int64 sources itself.
+            from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+                _grouped_foreach_copy_,
+            )
+
+            refresh_dsts = [self._rec_state_idx_buf[:B], self._rec_acc_steps_buf[:B]]
+            refresh_srcs = [state_indices_tensor, accepted_steps]
+            crossed = None
+            if do_boundary:
+                # Boundary output slots come from mamba_track_indices, fold counts
+                # from mamba_steps_to_track. Requests crossing no boundary carry step ==
+                # -1 and redirect to reserved slot 0 / step 0.
+                # clamp(min=0) suffices for the fold count. The output slot still needs masking
+                # (an unmasked non-crossing request would clobber a live ping-pong checkpoint with h_0), applied
+                # in place on the stable buffer to avoid torch.where's alloc.
+                crossed = mamba_steps_to_track >= 0
+                refresh_dsts += [
+                    self._rec_track_idx_buf[:B],
+                    self._rec_track_steps_buf[:B],
+                ]
+                refresh_srcs += [
+                    mamba_track_indices,
+                    mamba_steps_to_track.clamp(min=0),
+                ]
+            _grouped_foreach_copy_(refresh_dsts, refresh_srcs)
+            if do_boundary:
+                self._rec_track_idx_buf[:B].mul_(crossed)
+            if B_bucket is not None and B_bucket > B:
+                # Pad rows [B:bucket] → reserved slot 0 (never a real request, so their recovery output is discarded harmlessly).
+                self._rec_state_idx_buf[B:B_bucket].fill_(0)
+                self._rec_acc_steps_buf[B:B_bucket].fill_(0)
+                if do_boundary:
+                    # The boundary graph is captured at bucket size, so its pad rows need
+                    # a destination too → reserved slot 0.
+                    self._rec_track_idx_buf[B:B_bucket].fill_(0)
+                    self._rec_track_steps_buf[B:B_bucket].fill_(0)
+        elif do_boundary:
+            # Triton boundary: regular per-step tensors. The recover kernel skips negative
+            # output indices, so non-crossing requests get -1 rather
+            # than a discard-slot redirect. The working slot supplies h_0.
+            track_steps_i32 = mamba_steps_to_track.to(torch.int32).contiguous()
+            track_out_i32 = torch.where(
+                track_steps_i32 >= 0,
+                mamba_track_indices.to(torch.int32),
+                torch.full_like(track_steps_i32, -1),
+            ).contiguous()
+
+        def _triton_recover_launch(init_indices, out_indices, acc_steps):
+            # One recover launch per GDN layer: h_0 from init_indices, folded state
+            # to out_indices (in-place, or the track slot for the boundary pass).
+            for layer_id, stash in stash_per_layer.items():
+                layer_cache = pool.mamba2_layer_cache(layer_id)
+                layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
+
+                conv_dims = stash.get("conv_dims")
+                if conv_dims is not None:
+                    # k/v are strided views of the persistent conv-out buffer, no stash copy.
+                    k_recov, v_recov = self._persist_kv(
+                        layer_id, conv_dims, batch_size, cache_steps
+                    )
+                else:
+                    k_recov = stash["k"][:, :actual_seq_len]
+                    v_recov = stash["v"][:, :actual_seq_len]
+
+                fused_sigmoid_gating_delta_rule_recover_final_state(
+                    A_log=stash["A_log"],
+                    a=stash["a"][:actual_seq_len],
+                    dt_bias=stash["dt_bias"],
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    k=k_recov,
+                    v=v_recov,
+                    b=stash["b"][:actual_seq_len],
+                    initial_state_source=layer_ssm_states,
+                    initial_state_indices=init_indices,
+                    accepted_steps=acc_steps,
+                    cache_steps=cache_steps,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=False,
+                    output_state_indices=out_indices,
+                )
+
+        def _run_boundary():
+            # Interval-checkpoint recovery: fold mamba_steps_to_track steps from h_0
+            # (working slot) and write the boundary state to the ping-pong track slot.
+            # Must run before _run_recovery() overwrites h_0 with h_K.
+            if use_fi_recovery:
+                self._fi_recovery_launch(
+                    B,
+                    stash_per_layer,
+                    pool,
+                    gated_delta_rule_mtp,
+                    init_idx_buf=self._rec_state_idx_buf,
+                    out_idx_buf=self._rec_track_idx_buf,
+                    acc_steps_buf=self._rec_track_steps_buf,
+                )
+                return
+            _triton_recover_launch(state_idx_i32, track_out_i32, track_steps_i32)
+
+        def _run_recovery():
+            if use_fi_recovery:
+                # One launch per GDN layer, reading the stable index buffers.
+                self._fi_recovery_launch(B, stash_per_layer, pool, gated_delta_rule_mtp)
+                return
+
+            # In-place working recovery: out == init == the working SSM slot.
+            _triton_recover_launch(state_idx_i32, state_idx_i32, accepted_steps_i32)
+
+        # Recovery normally runs eagerly, outside the graph. During CUDA graph capture
+        # the recovery launch must stay on the capture stream with it.
+        if torch.cuda.is_current_stream_capturing():
+            if do_boundary:
+                _run_boundary()
+            _run_recovery()
+            return
+
+        # Eager path: recovery overlaps on a dedicated side stream behind the next step's draft
+        # compute. The next target forward joins on _recovery_event before touching the SSM pool and stash.
+        self._ensure_recovery_stream()
+        # Recovery must observe this step's verify-forward writes: record() resolves the current
+        # stream in C++, so this pair is wait_stream().
+        self._recovery_join_event.record()
+        self._recovery_stream.wait_event(self._recovery_join_event)
+
+        if use_fi_recovery and B_bucket is not None:
+            # Replay this bucket's graph on the side stream
+            # (pure async launch. Capture never happens on the live path). The boundary graph
+            # replays BEFORE the working one, so it reads h_0 before h_K overwrites it.
+            with self._recovery_stream_ctx:
+                if do_boundary:
+                    boundary_graph = self._rec_boundary_graphs.get(B_bucket)
+                    if boundary_graph is not None:
+                        boundary_graph.replay()
+                    else:
+                        _run_boundary()
+                self._rec_graphs[B_bucket].replay()
+        else:
+            # No warmup graph
+            # (Triton fallback, oversized bucket, or capture disabled/failed): eager recovery
+            # on the side stream.
+            with self._recovery_stream_ctx:
+                if do_boundary:
+                    _run_boundary()
+                _run_recovery()
+
+        self._recovery_event.record(self._recovery_stream)
+        # The FI path reads only long-lived stable buffers. The Triton path reads
+        # the per-step tensors on the side stream, where wait_stream orders but does not extend
+        # lifetime, so pin them until recovery is done.
+        if not use_fi_recovery:
+            state_idx_i32.record_stream(self._recovery_stream)
+            accepted_steps_i32.record_stream(self._recovery_stream)
+            if do_boundary:
+                # Triton boundary reads these per-step tensors on the side stream.
+                track_out_i32.record_stream(self._recovery_stream)
+                track_steps_i32.record_stream(self._recovery_stream)
+        self._recovery_event_pending = True
 
     @staticmethod
     def _scatter_speculative_state_with_mask(
@@ -1373,16 +1977,15 @@ class HybridLinearAttnBackend(AttentionBackend):
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
-    """HybridLinearAttnBackend variant for short-conv hybrid models (ZAYA1 CCA,
-    LFM2 short conv).
+    """HybridLinearAttnBackend variant for short-conv hybrid models (ZAYA1 CCA, LFM2 short conv).
 
     The linear sidecar is a :class:`ShortConvAttnBackend
-    <sglang.srt.layers.attention.linear.short_conv_backend.ShortConvAttnBackend>`
-    that owns the per-request conv-state plumbing. The model's conv module
-    reaches it via :meth:`conv_state_metadata` (``get_attn_backend()`` returns
-    this wrapper) and runs its own conv kernel against the returned handle, so
-    the model definition holds no pool access. The sidecar is never reached
-    through the full-vs-linear ``forward_decode`` / ``forward_extend`` dispatch.
+    <sglang.srt.layers.attention.linear.short_conv_backend.ShortConvAttnBackend>` that owns
+    the per-request conv-state plumbing. The model's conv module reaches it via
+    :meth:`conv_state_metadata` (``get_attn_backend()`` returns this wrapper) and runs
+    its own conv kernel against the returned handle, so the model definition holds no pool
+    access. The sidecar is never reached through the full-vs-linear ``forward_decode``
+    / ``forward_extend`` dispatch.
     """
 
     def __init__(
@@ -1391,8 +1994,8 @@ class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
         short_conv_backend: MambaAttnBackendBase,
         full_attn_layers: list,
     ):
-        # Register short_conv_backend as the linear sidecar so it rides in
-        # attn_backend_list and inherits the metadata / cuda-graph fan-out.
+        # Register short_conv_backend as the linear sidecar so it rides in attn_backend_list
+        # and gets the metadata build and cuda-graph capture every list entry gets.
         super().__init__(full_attn_backend, short_conv_backend, full_attn_layers)
         self.short_conv_backend = short_conv_backend
 
