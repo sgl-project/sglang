@@ -59,10 +59,15 @@ class DecodeKVCacheOffloadManager:
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
             raise ValueError("Unsupported KV cache type for decode offload")
+        use_mla = isinstance(kv_cache, MLATokenToKVPool)
         self.decode_host_mem_pool = build_kv_host_pool(
             kv_pool=kv_cache,
             page_size=self.page_size,
-            use_mla=isinstance(kv_cache, MLATokenToKVPool),
+            use_mla=use_mla,
+            # Host rows must have the device pool's row geometry; a packed DSA
+            # row is wider than the width the MLA host pool assumes without
+            # the override.
+            override_kv_cache_dim=kv_cache.kv_cache_dim if use_mla else None,
         )
 
         self.tp_group = tp_group
