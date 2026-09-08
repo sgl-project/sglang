@@ -391,6 +391,11 @@ def _apply_sparda_config(hf_config, cfg) -> None:
             "--enable-sparda currently requires --pp-size 1 because the "
             "Forecast state is local to one model forward pass."
         )
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--enable-sparda does not support speculative decoding in this "
+            "phase; unset --speculative-algorithm."
+        )
 
     indexer_path = getattr(cfg, "sparda_indexer_path", None)
     if not indexer_path:

@@ -251,6 +251,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
+        # Optional one-layer SparDA coordinator.  It is installed only when
+        # the feature flag is enabled and is deliberately kept outside the
+        # normal cache state machine.
+        self.sparda_prefetcher = None
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
@@ -359,6 +363,15 @@ class UnifiedRadixCache(BasePrefixCache):
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
+    def register_sparda_prefetcher(self, prefetcher) -> None:
+        """Attach the optional request-scoped SparDA prefetch coordinator."""
+        self.sparda_prefetcher = prefetcher
+
+    def _cleanup_sparda_request(self, request_id: str) -> None:
+        """Release lookahead leases before a request's cache row is recycled."""
+        if self.sparda_prefetcher is not None:
+            self.sparda_prefetcher.cleanup_request(request_id)
+
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
@@ -366,6 +379,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if self.sparda_prefetcher is not None:
+            self.sparda_prefetcher.cleanup_all()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -937,6 +952,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        self._cleanup_sparda_request(req.rid)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 

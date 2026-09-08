@@ -24,7 +24,12 @@ from torch import nn
 
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.lookahead import get_forecast_state
+from sglang.srt.layers.attention.lookahead import (
+    get_forecast_state,
+    get_sparda_generation,
+    get_sparda_prefetcher,
+    get_sparda_request_context,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -104,6 +109,7 @@ class MiniCPMAttention(nn.Module):
         use_output_gate: bool = False,
         attention_bias: bool = False,
         sparda_enabled: bool = False,
+        num_layers: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -133,6 +139,7 @@ class MiniCPMAttention(nn.Module):
         self.attn_use_rope = attn_use_rope
         self.use_output_gate = use_output_gate
         self.sparda_enabled = sparda_enabled
+        self.num_layers = num_layers
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -226,6 +233,84 @@ class MiniCPMAttention(nn.Module):
             start = tp_rank // self.qkv_proj.num_kv_head_replicas
         return forecast[:, start : start + self.num_kv_heads, :].contiguous()
 
+    def _submit_forecast_prefetch(
+        self,
+        next_forecast: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Submit this layer's one-step forecast to the optional cache adapter."""
+        if next_forecast is None:
+            return
+        target_layer = self.attn.layer_id + 1
+        if self.num_layers is not None and target_layer >= self.num_layers:
+            return
+        prefetcher = get_sparda_prefetcher(forward_batch)
+        if prefetcher is None or not forward_batch.rids:
+            return
+
+        if forward_batch.forward_mode.is_decode_or_idle():
+            query_spans = [(i, i + 1) for i in range(len(forward_batch.rids))]
+        else:
+            lengths = forward_batch.extend_seq_lens_cpu
+            if lengths is None or sum(lengths) != next_forecast.shape[0]:
+                return
+            query_spans = []
+            start = 0
+            for length in lengths:
+                query_spans.append((start, start + length))
+                start += length
+
+        request_contexts = get_sparda_request_context(forward_batch)
+        for request_index, request_id in enumerate(forward_batch.rids):
+            start, end = query_spans[request_index]
+            if start == end:
+                continue
+            context = forward_batch
+            if request_contexts is not None and request_index < len(request_contexts):
+                context = request_contexts[request_index]
+            prefetcher.prefetch_forecast_query(
+                request_id,
+                get_sparda_generation(forward_batch, request_index),
+                target_layer,
+                next_forecast[start:end],
+                context=context,
+            )
+
+    def _wait_for_forecast_prefetch(self, forward_batch: ForwardBatch) -> bool:
+        """Make the next-layer attention stream observe completed H2D copies."""
+        prefetcher = get_sparda_prefetcher(forward_batch)
+        if prefetcher is None or not forward_batch.rids:
+            return True
+        wait_for_layer = getattr(prefetcher, "wait_for_layer", None)
+        if wait_for_layer is None:
+            return True
+        ready = True
+        for request_index, request_id in enumerate(forward_batch.rids):
+            ready = (
+                wait_for_layer(
+                    request_id,
+                    get_sparda_generation(forward_batch, request_index),
+                    self.attn.layer_id,
+                )
+                and ready
+            )
+        return ready
+
+    def _consume_forecast_prefetch(self, forward_batch: ForwardBatch) -> None:
+        """Release the page lease after this layer has consumed its KV pages."""
+        prefetcher = get_sparda_prefetcher(forward_batch)
+        if prefetcher is None or not forward_batch.rids:
+            return
+        consume_for_layer = getattr(prefetcher, "consume_for_layer", None)
+        if consume_for_layer is None:
+            return
+        for request_index, request_id in enumerate(forward_batch.rids):
+            consume_for_layer(
+                request_id,
+                get_sparda_generation(forward_batch, request_index),
+                self.attn.layer_id,
+            )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -248,6 +333,12 @@ class MiniCPMAttention(nn.Module):
             forecast_state = get_forecast_state(forward_batch)
             forecast_for_attention = forecast_state.for_layer(self.attn.layer_id)
             next_forecast = self._project_forecast(positions, hidden_states)
+            self._submit_forecast_prefetch(next_forecast, forward_batch)
+            if not self._wait_for_forecast_prefetch(forward_batch):
+                # A cancelled or failed ticket must never make the attention
+                # kernel consume a page whose H2D event was not observed.
+                # Revert to the current-query/full loading path instead.
+                forecast_for_attention = None
 
         if forecast_for_attention is None:
             # Preserve the existing backend path for the first layer (and for
@@ -265,6 +356,7 @@ class MiniCPMAttention(nn.Module):
 
         if forecast_state is not None:
             forecast_state.publish(self.attn.layer_id, next_forecast)
+            self._consume_forecast_prefetch(forward_batch)
 
         if self.use_output_gate:
             o_gate_output, _ = self.o_gate(hidden_states)
@@ -470,6 +562,7 @@ class MiniCPMDecoderLayer(nn.Module):
                 use_output_gate=attn_use_output_gate,
                 attention_bias=attention_bias,
                 sparda_enabled=getattr(config, "sparda_enabled", False),
+                num_layers=config.num_hidden_layers,
                 prefix=add_prefix("self_attn", prefix),
             )
         elif self.mixer_type == "lightning-attn":

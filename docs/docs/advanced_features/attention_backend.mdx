@@ -500,9 +500,19 @@ names, and shapes during startup and fails with an actionable error when the
 checkpoint is missing or incompatible.
 
 This option is disabled by default and does not change MiniCPM-SALA, DeepSeek
-DSA, or ordinary attention paths. The current implementation provides Forecast
-selection only; host KV offload, asynchronous prefetch, eviction management,
-and prefetch performance gains are not included yet.
+DSA, or ordinary attention paths. When a HiCache implementation provides the
+optional logical-page resolver, the runtime also supports a single lookahead
+prefetch from layer `l` to layer `l+1`. Each prefetch is scoped by request ID,
+generation, and layer ID. Its completion event is observed before the target
+layer can consume the staged KV pages; cancellation, eviction, batch reorder,
+and request cleanup release the page lease only after that synchronization.
+
+The prefetch resolver is deliberately optional: an unknown prediction, host
+miss, unsupported cache layout, or invalid generation falls back to the
+existing full loading/attention path. This phase does not add a remote storage
+protocol, multi-layer prediction, pipeline parallelism, speculative decoding,
+or general CPU KV offload. It also does not claim a performance improvement;
+benchmark results depend on the cache-side resolver and hardware setup.
 
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
 

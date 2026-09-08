@@ -1,29 +1,8 @@
 from __future__ import annotations
 
 import logging
-
-from sglang.srt.runtime_context import get_exec
-
-logger = logging.getLogger(__name__)
-
 from dataclasses import dataclass
-from typing import Optional
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class KVCacheBuildResult:
-    is_hybrid_swa: bool
-    is_hybrid_ssm: bool
-    sliding_window_size: Optional[int]
-    full_tokens_per_layer: Optional[int]
-    swa_tokens_per_layer: Optional[int]
-    req_to_token_pool: object
-    token_to_kv_pool_allocator: object
-    disable_radix_cache: bool
-    tree_cache: object
-
-
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
@@ -47,11 +26,28 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import is_hip
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class KVCacheBuildResult:
+    is_hybrid_swa: bool
+    is_hybrid_ssm: bool
+    sliding_window_size: Optional[int]
+    full_tokens_per_layer: Optional[int]
+    swa_tokens_per_layer: Optional[int]
+    req_to_token_pool: object
+    token_to_kv_pool_allocator: object
+    disable_radix_cache: bool
+    tree_cache: object
+
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -343,6 +339,39 @@ def build_kv_cache(
             tp_group=tp_group,
         )
     )
+
+    if get_memory().enable_sparda:
+        cache_controller = getattr(tree_cache, "cache_controller", None)
+        transfer_engine = getattr(cache_controller, "l2_transfer_engine", None)
+        if transfer_engine is not None:
+            from sglang.srt.mem_cache.sparda_prefetch import (
+                SparDAKVPrefetcher,
+                TreeCachePrefetchResolver,
+            )
+
+            # The resolver is deliberately a public cache hook.  Only attach
+            # the Phase2 coordinator when both prediction and resolution are
+            # implemented; otherwise --enable-sparda remains the Phase1
+            # selection path with no change to its behavior.
+            resolver = TreeCachePrefetchResolver(tree_cache)
+            if resolver.is_available():
+                prefetcher = SparDAKVPrefetcher(transfer_engine, resolver=resolver)
+                tp_worker.register_sparda_prefetcher(prefetcher)
+                register_cache_prefetcher = getattr(
+                    tree_cache, "register_sparda_prefetcher", None
+                )
+                if register_cache_prefetcher is not None:
+                    register_cache_prefetcher(prefetcher)
+            else:
+                logger.info(
+                    "SparDA KV prefetch resolver is unavailable; forecast "
+                    "selection remains enabled."
+                )
+        else:
+            logger.info(
+                "SparDA KV prefetch is unavailable without a HiCache transfer "
+                "engine; forecast selection remains enabled."
+            )
 
     if (
         enable_hierarchical_cache or retraction_backup == "host_pool"

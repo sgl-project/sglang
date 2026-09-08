@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 
 _FORECAST_STATE_KEY = "lookahead_forecast_state"
+_SPARDA_PREFETCHER_KEY = "sparda_prefetcher"
+_SPARDA_GENERATIONS_KEY = "sparda_request_generations"
+_SPARDA_REQUESTS_KEY = "sparda_request_context"
 
 
 @dataclass
@@ -59,3 +62,44 @@ def get_forecast_state(forward_batch: ForwardBatch) -> ForecastState:
             f"{type(state).__name__}, expected ForecastState"
         )
     return state
+
+
+def attach_sparda_prefetcher(
+    forward_batch: ForwardBatch,
+    prefetcher: object,
+    generations: tuple[int, ...],
+    request_context: Optional[tuple[object, ...]] = None,
+) -> None:
+    """Attach request-local SparDA prefetch state to a forward batch."""
+    if forward_batch.model_specific_states is None:
+        forward_batch.model_specific_states = {}
+    forward_batch.model_specific_states[_SPARDA_PREFETCHER_KEY] = prefetcher
+    forward_batch.model_specific_states[_SPARDA_GENERATIONS_KEY] = generations
+    if request_context is not None:
+        forward_batch.model_specific_states[_SPARDA_REQUESTS_KEY] = request_context
+
+
+def get_sparda_prefetcher(forward_batch: ForwardBatch) -> Optional[object]:
+    """Return the prefetcher attached to this forward, if any."""
+    if forward_batch.model_specific_states is None:
+        return None
+    return forward_batch.model_specific_states.get(_SPARDA_PREFETCHER_KEY)
+
+
+def get_sparda_generation(forward_batch: ForwardBatch, request_index: int) -> int:
+    """Return the generation for a request row in this forward batch."""
+    if forward_batch.model_specific_states is None:
+        return 0
+    generations = forward_batch.model_specific_states.get(_SPARDA_GENERATIONS_KEY)
+    if generations is None or request_index >= len(generations):
+        return 0
+    return generations[request_index]
+
+
+def get_sparda_request_context(
+    forward_batch: ForwardBatch,
+) -> Optional[tuple[object, ...]]:
+    """Return the scheduler request objects for cache-side page resolution."""
+    if forward_batch.model_specific_states is None:
+        return None
+    return forward_batch.model_specific_states.get(_SPARDA_REQUESTS_KEY)

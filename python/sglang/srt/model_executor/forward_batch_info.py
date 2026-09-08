@@ -42,6 +42,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
+from sglang.srt.layers.attention.lookahead import attach_sparda_prefetcher
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -861,6 +862,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         ret._maybe_init_non_generation_fields(batch)
+
+        # The prefetcher is installed after the cache pools are built.  Keep
+        # its generation and request context on this ForwardBatch so model
+        # layers never read mutable scheduler-global state.
+        sparda_prefetcher = getattr(model_runner, "sparda_prefetcher", None)
+        if sparda_prefetcher is not None:
+            generations = tuple(
+                sparda_prefetcher.begin_request(req.rid) for req in batch.reqs
+            )
+            attach_sparda_prefetcher(
+                ret,
+                sparda_prefetcher,
+                generations,
+                request_context=tuple(batch.reqs),
+            )
 
         device = model_runner.device
 

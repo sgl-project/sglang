@@ -18,6 +18,7 @@ from sglang.srt.configs.minicpm import (
     MiniCPMConfig,
     MiniCPMHybridConfig,
 )
+from sglang.srt.configs.model_config import _apply_sparda_config
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
@@ -93,6 +94,22 @@ def test_minicpm_sparda_defaults_match_official_sparse_layout():
     assert config.sparse_config["window_size"] == 2048
     assert config.sparse_config["topk"] == 64
     assert config.sparse_config["dense_len"] == 8192
+
+
+def test_sparda_rejects_speculative_decoding():
+    with pytest.raises(ValueError, match="does not support speculative decoding"):
+        _apply_sparda_config(
+            SimpleNamespace(
+                architectures=["MiniCPMForCausalLM"],
+                model_type="minicpm",
+            ),
+            SimpleNamespace(
+                enable_sparda=True,
+                pp_size=1,
+                speculative_algorithm="EAGLE",
+                sparda_indexer_path=None,
+            ),
+        )
 
 
 def test_minicpm_short_mixer_pattern_repeats_to_layer_count():
