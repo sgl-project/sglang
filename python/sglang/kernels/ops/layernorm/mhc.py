@@ -362,7 +362,7 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
-    if is_gfx1250_supported():
+    if is_gfx1250_supported() or True:
         # TileLang's CK-backed addressing doesn't compile on gfx1250; use the
         # Triton port. _hc_split_sinkhorn_torch is kept as a reference fallback.
         return _hc_split_sinkhorn_triton(
