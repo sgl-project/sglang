@@ -49,6 +49,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+# AITER's fp8_mqa_logits stores through buffer_store below 2 GiB of fp32 logits
+# and above it takes a gl.store that fails to compile and abort()s the process;
+# drop once ROCm/aiter#5114 ships.
+_MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
+_MQA_LOGITS_BYTES_PER_ELEM = 4
+
+
 class IndexerKPool(MultiPlatformOp):
     def __init__(
         self,
@@ -787,6 +794,31 @@ class IndexerKPool(MultiPlatformOp):
         """
         if is_hip():
             from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+            num_q, num_k = q_fp8.shape[0], k_fp8.shape[0]
+            rows_per_call = max(
+                1,
+                _MQA_LOGITS_MAX_BYTES_ROCM
+                // max(num_k * _MQA_LOGITS_BYTES_PER_ELEM, 1),
+            )
+            if num_q > rows_per_call:
+                # Row i of the logits depends only on q_fp8[i], weights[i],
+                # starts[i] and ends[i], so blocking the query rows is exact.
+                logits = torch.empty(
+                    (num_q, num_k), dtype=torch.float32, device=q_fp8.device
+                )
+                for i in range(0, num_q, rows_per_call):
+                    rows = slice(i, i + rows_per_call)
+                    logits[rows] = fp8_mqa_logits(
+                        q_fp8[rows],
+                        k_fp8,
+                        k_scale,
+                        weights[rows],
+                        starts[rows],
+                        ends[rows],
+                        clean_logits=clean_logits,
+                    )
+                return logits
 
             return fp8_mqa_logits(
                 q_fp8, k_fp8, k_scale, weights, starts, ends, clean_logits=clean_logits
