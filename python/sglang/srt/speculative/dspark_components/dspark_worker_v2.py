@@ -39,6 +39,9 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
 )
+from sglang.srt.speculative.dspark_components.acceptance_policy import (
+    DSparkAcceptancePolicy,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
@@ -346,6 +349,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._simulate_acc_len}."
             )
 
+        self._acceptance_policy = self._build_acceptance_policy()
+
         self._verify_executor = TargetVerifyExecutor(
             target_worker=self.target_worker,
             gamma=self.gamma,
@@ -355,6 +360,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
+            acceptance_policy=self._acceptance_policy,
         )
 
         self._forced_budget_frac: Optional[float] = None
@@ -506,6 +512,23 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
+        if self._acceptance_policy is not None:
+            self._acceptance_policy.note_request_finished(
+                rid=rid, natural_stop=natural_stop
+            )
+
+    def _build_acceptance_policy(self) -> Optional[DSparkAcceptancePolicy]:
+        """Hook: override to substitute DSpark's greedy acceptance rule.
+
+        Returning ``None`` (the default) keeps DSpark's native strict greedy
+        verification with zero overhead. The intended pattern is a custom
+        speculative algorithm registered via ``SpeculativeAlgorithm.register``
+        whose worker subclasses ``DSparkWorkerV2`` and returns a
+        ``DSparkAcceptancePolicy`` here to replace acceptance (e.g. with a
+        relaxed or approximate rule). The policy's outputs must keep the
+        native ``(correct_len, bonus, cap_trim_lens)`` contract.
+        """
+        return None
 
     def forward_batch_generation(
         self,
@@ -516,6 +539,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
+            if self._acceptance_policy is not None:
+                self._acceptance_policy.bind_batch(batch)
             return self._forward_prefill(batch, on_publish)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
@@ -816,6 +841,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+            req_pool_indices=batch.req_pool_indices,
         )
         if batch.return_logprob:
             compute_spec_logprobs(
