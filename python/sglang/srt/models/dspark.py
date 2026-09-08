@@ -9,7 +9,7 @@ from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.models.dflash import DFlashDecoderLayer, DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
@@ -22,6 +22,380 @@ from sglang.srt.speculative.ragged_verify import (
 logger = logging.getLogger(__name__)
 
 StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
+
+
+def _dspark_method_config(config) -> dict:
+    """Return SpecForge's nested DFlash/DSpark method configuration."""
+
+    text_config = getattr(config, "text_config", None) or config
+    raw = getattr(text_config, "dflash_config", None)
+    if raw is None:
+        raw = getattr(config, "dflash_config", None)
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        return dict(raw)
+    except (TypeError, ValueError):
+        return dict(vars(raw))
+
+
+class DFlashGroupedConv(nn.Module):
+    """SpecForge-compatible dynamic grouped convolution for DSpark blocks.
+
+    SGLang flattens the request and proposal dimensions before entering the
+    draft model.  Grouping the leading token dimension into consecutive
+    ``block_size`` chunks restores the exact per-proposal layout used during
+    SpecForge training without mixing requests.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        block_size: int,
+        taps: int,
+        group_size: int,
+        mode: str = "legacy",
+        apply_input: bool = True,
+        apply_output: bool = True,
+        residual_scale: float = 0.1,
+        gate_bias: float = 2.0,
+        freeze_identity: bool = False,
+    ) -> None:
+        super().__init__()
+        if taps < 1 or taps > block_size:
+            raise ValueError(
+                "DSpark dynamic conv taps must be in [1, block_size], got "
+                f"taps={taps}, block_size={block_size}."
+            )
+        if group_size < 1 or hidden_size % group_size:
+            raise ValueError(
+                f"DSpark dynamic conv group_size={group_size} must divide "
+                f"hidden_size={hidden_size}."
+            )
+        if mode not in {"legacy", "survival-gated"}:
+            raise ValueError(
+                "DSpark dynamic conv mode must be legacy or survival-gated, "
+                f"got {mode!r}."
+            )
+        if not apply_input and not apply_output:
+            raise ValueError(
+                "DSpark dynamic conv must enable its input or output side."
+            )
+        if mode == "survival-gated" and taps < 2:
+            raise ValueError("DSpark survival-gated dynamic conv requires taps >= 2.")
+        if residual_scale < 0:
+            raise ValueError("DSpark dynamic conv residual_scale must be non-negative.")
+
+        self.block_size = int(block_size)
+        self.taps = int(taps)
+        self.group_size = int(group_size)
+        self.num_groups = int(hidden_size) // self.group_size
+        self.mode = mode
+        self.apply_input = bool(apply_input)
+        self.apply_output = bool(apply_output)
+        self.residual_scale = float(residual_scale)
+        self.gate_bias = float(gate_bias)
+
+        base_kernel = torch.zeros(2, self.taps, int(hidden_size))
+        base_kernel[:, 0] = 1.0
+        self.base_kernel = nn.Parameter(
+            base_kernel, requires_grad=not bool(freeze_identity)
+        )
+        self.kernel_projection = nn.Linear(
+            int(hidden_size),
+            2 * self.taps * self.num_groups,
+            bias=False,
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Restore the identity initialization used by SpecForge."""
+
+        with torch.no_grad():
+            self.base_kernel.zero_()
+            self.base_kernel[:, 0].fill_(1.0)
+            self.kernel_projection.weight.zero_()
+
+    def _convolve(
+        self,
+        hidden_states: torch.Tensor,
+        delta: torch.Tensor,
+        *,
+        side: int,
+        block_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        if hidden_states.ndim < 2:
+            raise ValueError(
+                "DSpark dynamic conv expects [..., tokens, hidden] or "
+                "[tokens, hidden] input."
+            )
+        active_block_size = int(block_size or self.block_size)
+        if active_block_size < self.taps:
+            raise ValueError(
+                "DSpark dynamic conv runtime block size must be at least its "
+                f"number of taps={self.taps}, got {active_block_size}."
+            )
+        sequence_length = int(hidden_states.shape[-2])
+        if sequence_length % active_block_size:
+            raise ValueError(
+                "DSpark dynamic conv token count must be divisible by runtime "
+                f"block_size={active_block_size}, got {sequence_length}."
+            )
+
+        original_shape = hidden_states.shape
+        blocks = hidden_states.reshape(
+            -1,
+            active_block_size,
+            self.num_groups,
+            self.group_size,
+        )
+        dynamic = delta.reshape(
+            -1,
+            active_block_size,
+            self.taps,
+            self.num_groups,
+        )
+        base = self.base_kernel[side].reshape(
+            1,
+            1,
+            self.taps,
+            self.num_groups,
+            self.group_size,
+        )
+
+        if self.mode == "survival-gated":
+            gate = torch.sigmoid(dynamic[..., 0, :] + self.gate_bias).unsqueeze(-1)
+            output = blocks
+            for tap in range(1, self.taps):
+                shifted = F.pad(
+                    blocks[:, : active_block_size - tap],
+                    (0, 0, 0, 0, tap, 0),
+                )
+                lag = torch.tanh(dynamic[..., tap, :]).unsqueeze(-1)
+                output = output + self.residual_scale * gate * lag * shifted
+            return output.reshape(original_shape)
+
+        coefficients = base + dynamic.unsqueeze(-1)
+        output = coefficients[:, :, 0] * blocks
+        for tap in range(1, self.taps):
+            shifted = F.pad(
+                blocks[:, : active_block_size - tap],
+                (0, 0, 0, 0, tap, 0),
+            )
+            output = output + coefficients[:, :, tap] * shifted
+        return output.reshape(original_shape)
+
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        block_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            *hidden_states.shape[:-1],
+            2,
+            self.taps,
+            self.num_groups,
+        )
+        prepared = hidden_states
+        if self.apply_input:
+            prepared = self._convolve(
+                hidden_states,
+                coefficients[..., 0, :, :],
+                side=0,
+                block_size=block_size,
+            )
+        return prepared, coefficients[..., 1, :, :]
+
+    def finish(
+        self,
+        hidden_states: torch.Tensor,
+        coefficients: torch.Tensor,
+        *,
+        block_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        if not self.apply_output:
+            return hidden_states
+        return self._convolve(
+            hidden_states,
+            coefficients,
+            side=1,
+            block_size=block_size,
+        )
+
+
+class DSparkDecoderLayer(DFlashDecoderLayer):
+    """DFlash decoder layer with SpecForge-compatible DynamicConv wrappers."""
+
+    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+        super().__init__(config=config, layer_id=layer_id, quant_config=quant_config)
+        method_config = _dspark_method_config(config)
+        taps = int(method_config.get("conv_kernel_size", 0) or 0)
+        group_size = int(method_config.get("conv_group_size", 0) or 0)
+        transition_rank = int(method_config.get("local_transition_rank", 0) or 0)
+        if transition_rank > 0:
+            raise NotImplementedError(
+                "This SGLang DSpark implementation supports DynamicConv but not "
+                "SpecForge LocalTransitionAttention yet."
+            )
+        if bool(taps) != bool(group_size):
+            raise ValueError(
+                "DSpark dynamic conv requires dflash_config.conv_kernel_size and "
+                "conv_group_size together."
+            )
+
+        text_config = getattr(config, "text_config", None) or config
+        num_hidden_layers = int(getattr(text_config, "num_hidden_layers"))
+        last_n_layers = int(method_config.get("conv_last_n_layers", 0) or 0)
+        if last_n_layers < 0 or last_n_layers > num_hidden_layers:
+            raise ValueError(
+                "dflash_config.conv_last_n_layers must be in "
+                f"[0, {num_hidden_layers}], got {last_n_layers}."
+            )
+        layer_enabled = taps > 0 and (
+            last_n_layers == 0 or layer_id >= num_hidden_layers - last_n_layers
+        )
+        apply_to = str(method_config.get("conv_apply_to", "attention-mlp"))
+        if apply_to not in {"attention-output", "attention", "attention-mlp"}:
+            raise ValueError(
+                "dflash_config.conv_apply_to must be attention-output, attention, "
+                f"or attention-mlp; got {apply_to!r}."
+            )
+        output_only = apply_to == "attention-output"
+        draft_config = parse_dspark_draft_config(draft_hf_config=config)
+        block_size = draft_config.resolve_gamma(
+            default=method_config.get("block_size")
+        )
+        if block_size is None:
+            raise ValueError(
+                "DSpark DynamicConv requires block_size in the checkpoint config."
+            )
+
+        def grouped_conv() -> Optional[DFlashGroupedConv]:
+            if not layer_enabled:
+                return None
+            return DFlashGroupedConv(
+                hidden_size=int(getattr(text_config, "hidden_size")),
+                block_size=int(block_size),
+                taps=taps,
+                group_size=group_size,
+                mode=str(method_config.get("conv_mode", "legacy")),
+                apply_input=not output_only,
+                apply_output=True,
+                residual_scale=float(method_config.get("conv_residual_scale", 0.1)),
+                gate_bias=float(method_config.get("conv_gate_bias", 2.0)),
+                freeze_identity=bool(
+                    method_config.get("conv_freeze_identity", False)
+                ),
+            )
+
+        self.attention_conv = grouped_conv()
+        self.mlp_conv = grouped_conv() if apply_to == "attention-mlp" else None
+        dynamic_conv_scale = float(
+            method_config.get("local_transition_conv_scale", 1.0)
+        )
+        self.register_buffer(
+            "_dynamic_conv_scale",
+            torch.tensor(dynamic_conv_scale, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def _prepare_conv(
+        self,
+        hidden_states: torch.Tensor,
+        conv: Optional[DFlashGroupedConv],
+        *,
+        block_size: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if conv is None:
+            return hidden_states, None
+        prepared, kernel = conv.prepare(hidden_states, block_size=block_size)
+        scale = self._dynamic_conv_scale.to(dtype=hidden_states.dtype)
+        prepared = hidden_states + scale * (prepared - hidden_states)
+        return prepared, kernel
+
+    def _finish_conv(
+        self,
+        hidden_states: torch.Tensor,
+        kernel: Optional[torch.Tensor],
+        conv: Optional[DFlashGroupedConv],
+        *,
+        block_size: int,
+    ) -> torch.Tensor:
+        if kernel is None or conv is None:
+            return hidden_states
+        finished = conv.finish(hidden_states, kernel, block_size=block_size)
+        scale = self._dynamic_conv_scale.to(dtype=hidden_states.dtype)
+        return hidden_states + scale * (finished - hidden_states)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hidden_states.numel() == 0:
+            if residual is None:
+                residual = hidden_states
+            return hidden_states, residual
+
+        dynamic_conv = self.attention_conv or self.mlp_conv
+        spec_info = getattr(forward_batch, "spec_info", None)
+        runtime_block_size = getattr(spec_info, "draft_token_num", None)
+        active_block_size = (
+            int(runtime_block_size)
+            if runtime_block_size is not None
+            else (dynamic_conv.block_size if dynamic_conv is not None else 1)
+        )
+        if dynamic_conv is not None and active_block_size > dynamic_conv.block_size:
+            raise ValueError(
+                "DSpark DynamicConv can serve a shorter proposal horizon but cannot "
+                "exceed the checkpoint block size: "
+                f"checkpoint={dynamic_conv.block_size}, runtime={active_block_size}."
+            )
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states, attention_kernel = self._prepare_conv(
+            hidden_states,
+            self.attention_conv,
+            block_size=active_block_size,
+        )
+        attention_output = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        attention_output = self._finish_conv(
+            attention_output,
+            attention_kernel,
+            self.attention_conv,
+            block_size=active_block_size,
+        )
+        hidden_states, residual = self.post_attention_layernorm(
+            attention_output, residual
+        )
+        hidden_states, mlp_kernel = self._prepare_conv(
+            hidden_states,
+            self.mlp_conv,
+            block_size=active_block_size,
+        )
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self._finish_conv(
+            hidden_states,
+            mlp_kernel,
+            self.mlp_conv,
+            block_size=active_block_size,
+        )
+        return hidden_states, residual
 
 
 def gather_and_crop_vocab(
@@ -161,6 +535,128 @@ class GatedMarkovHead(VanillaMarkov):
         return self.project_bias(gate * prev_embeddings)
 
 
+class ContextAwareCausalResidualHead(VanillaMarkov):
+    """SpecForge CARH proposal head used by the Tri-Alignment checkpoints."""
+
+    markov_head_type = "carh"
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        block_size: int,
+        gate_bias: float = 0.0,
+    ) -> None:
+        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+        self.block_size = int(block_size)
+        if self.block_size <= 0:
+            raise ValueError("CARH requires block_size > 0.")
+        self.hidden_proj = nn.Linear(hidden_size, self.markov_rank, bias=False)
+        self.depth_embedding = nn.Embedding(self.block_size, self.markov_rank)
+        self.fusion_norm = nn.LayerNorm(self.markov_rank)
+        self.gate_proj = nn.Linear(self.markov_rank, 1)
+        nn.init.constant_(self.gate_proj.bias, float(gate_bias))
+
+    def _causal_latent(
+        self,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        depth_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden_states is None:
+            raise ValueError("CARH requires current draft hidden_states.")
+        fused = (
+            self.get_prev_embeddings(token_ids)
+            + self.hidden_proj(hidden_states)
+            + self.depth_embedding(depth_ids.long())
+        )
+        latent = F.silu(self.fusion_norm(fused))
+        gate = torch.sigmoid(self.gate_proj(latent)).to(dtype=latent.dtype)
+        return gate * latent
+
+    def compute_step_bias(
+        self,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        *,
+        depth_idx: int = 0,
+    ) -> torch.Tensor:
+        depth_ids = torch.full_like(token_ids, int(depth_idx), dtype=torch.long)
+        latent = self._causal_latent(token_ids, hidden_states, depth_ids)
+        return self.project_bias(latent)
+
+    def apply_block_logits(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if base_logits.size(-2) == 0:
+            return base_logits
+        if hidden_states is None:
+            raise ValueError("CARH block logits require hidden_states.")
+        block_size = token_ids.size(-1)
+        if block_size > self.block_size:
+            raise ValueError(
+                "CARH runtime block size cannot exceed its checkpoint depth "
+                f"embedding size: checkpoint={self.block_size}, runtime={block_size}."
+            )
+        depth_ids = torch.arange(
+            block_size,
+            device=token_ids.device,
+            dtype=torch.long,
+        ).view(*((1,) * (token_ids.ndim - 1)), block_size)
+        depth_ids = depth_ids.expand_as(token_ids)
+        latent = self._causal_latent(token_ids, hidden_states, depth_ids)
+        return base_logits + self.project_bias(latent)
+
+    def sample_block(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        sampler: StepSampler,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hidden_states is None:
+            raise ValueError("CARH sampling requires hidden_states.")
+        batch_size, proposal_len = base_logits.shape[:2]
+        if proposal_len > self.block_size:
+            raise ValueError(
+                "CARH runtime proposal length cannot exceed its checkpoint depth "
+                f"embedding size: checkpoint={self.block_size}, runtime={proposal_len}."
+            )
+        if proposal_len == 0:
+            empty = torch.empty(
+                batch_size,
+                0,
+                dtype=torch.long,
+                device=base_logits.device,
+            )
+            return empty, base_logits
+
+        sampled_tokens = []
+        corrected_logits = []
+        prev_tokens = first_prev_tokens.long()
+        for step_idx in range(proposal_len):
+            step_logits = base_logits[:, step_idx, :] + self.compute_step_bias(
+                prev_tokens,
+                hidden_states[:, step_idx, :],
+                depth_idx=step_idx,
+            )
+            next_tokens = sampler(step_logits, step_idx)
+            sampled_tokens.append(next_tokens)
+            corrected_logits.append(step_logits.unsqueeze(1))
+            prev_tokens = next_tokens
+        return (
+            torch.stack(sampled_tokens, dim=1),
+            torch.cat(corrected_logits, dim=1),
+        )
+
+
 class RNNHead(VanillaMarkov):
 
     markov_head_type = "rnn"
@@ -279,6 +775,20 @@ def build_markov_head(config) -> Optional[nn.Module]:
         return GatedMarkovHead(
             vocab_size=vocab_size, markov_rank=markov_rank, hidden_size=hidden_size
         )
+    if markov_head_type == "carh":
+        draft_config = parse_dspark_draft_config(draft_hf_config=config)
+        block_size = draft_config.resolve_gamma(
+            default=getattr(config, "block_size", None)
+        )
+        if block_size is None:
+            raise ValueError("CARH requires block_size in the draft config.")
+        return ContextAwareCausalResidualHead(
+            vocab_size=int(getattr(config, "draft_vocab_size", vocab_size)),
+            markov_rank=markov_rank,
+            hidden_size=hidden_size,
+            block_size=int(block_size),
+            gate_bias=float(getattr(config, "carh_gate_bias", 0.0)),
+        )
     if markov_head_type == "rnn":
         return RNNHead(
             vocab_size=vocab_size, markov_rank=markov_rank, hidden_size=hidden_size
@@ -377,6 +887,22 @@ class DSparkDraftMixin:
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
 
+        dynamic_convs = [
+            conv
+            for layer in self.layers
+            for conv in (
+                getattr(layer, "attention_conv", None),
+                getattr(layer, "mlp_conv", None),
+            )
+            if conv is not None
+        ]
+        self.dynamic_conv_enabled = bool(dynamic_convs)
+        self.dynamic_conv_module_count = len(dynamic_convs)
+        self.dynamic_conv_block_size = (
+            dynamic_convs[0].block_size if dynamic_convs else None
+        )
+        self.dynamic_conv_mode = dynamic_convs[0].mode if dynamic_convs else None
+
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
@@ -432,6 +958,9 @@ class DSparkDraftMixin:
             else:
                 backbone_weights.append((name, loaded_weight))
 
+        self._validate_dynamic_conv_weights(
+            weights=backbone_weights, params_dict=params_dict
+        )
         super().load_weights(backbone_weights)
 
         for name, loaded_weight in markov_weights:
@@ -447,6 +976,50 @@ class DSparkDraftMixin:
         self._load_confidence_weights(
             confidence_weights=confidence_weights, params_dict=params_dict
         )
+
+    @staticmethod
+    def _validate_dynamic_conv_weights(
+        *,
+        weights: list[Tuple[str, torch.Tensor]],
+        params_dict: dict[str, nn.Parameter],
+    ) -> None:
+        """Reject train/serve DynamicConv mismatches instead of skipping them."""
+
+        markers = (".attention_conv.", ".mlp_conv.")
+        expected = {name for name in params_dict if any(m in name for m in markers)}
+        provided = set()
+        unexpected = []
+        for raw_name, _ in weights:
+            if not any(marker in raw_name for marker in markers):
+                continue
+            candidates = [raw_name]
+            if raw_name.startswith("model."):
+                candidates.append(raw_name[len("model.") :])
+            else:
+                candidates.append(f"model.{raw_name}")
+            resolved = next((name for name in candidates if name in params_dict), None)
+            if resolved is None:
+                unexpected.append(raw_name)
+            else:
+                provided.add(resolved)
+
+        if unexpected:
+            raise ValueError(
+                "DSpark checkpoint contains DynamicConv weights but the runtime "
+                "model did not construct matching modules. Check dflash_config: "
+                f"{sorted(unexpected)}"
+            )
+        missing = expected - provided
+        if missing:
+            raise ValueError(
+                "DSpark DynamicConv is enabled but the checkpoint is missing "
+                f"weights: {sorted(missing)}"
+            )
+        if expected:
+            logger.info(
+                "Validated DSpark DynamicConv checkpoint contract with %d parameters.",
+                len(expected),
+            )
 
     def _load_confidence_weights(
         self,
@@ -710,6 +1283,8 @@ class DSparkDraftMixin:
 
 
 class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
+
+    decoder_layer_cls = DSparkDecoderLayer
 
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None

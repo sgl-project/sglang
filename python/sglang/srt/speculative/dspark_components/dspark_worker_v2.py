@@ -157,13 +157,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
                 "gamma=%s, verify_num_draft_tokens=%s, mask_token_id=%s, "
-                "markov_head=%s",
+                "markov_head=%s, dynamic_conv=%s, dynamic_conv_modules=%s, "
+                "dynamic_conv_block_size=%s, dynamic_conv_mode=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.gamma,
                 self.verify_num_draft_tokens,
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
+                self.draft_model.dynamic_conv_enabled,
+                self.draft_model.dynamic_conv_module_count,
+                self.draft_model.dynamic_conv_block_size,
+                self.draft_model.dynamic_conv_mode,
             )
 
         self._block_pos_offsets = build_block_pos_offsets(

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_DSPARK_GAMMA = 7
-SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
+SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "carh", "rnn")
 
 # The dsv4 self-drafting checkpoint runs its draft attention on the dedicated
 # DeepSeek-V4 backend instead of the generic draft-backend fallback.
