@@ -1070,13 +1070,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # layout as-is: packed e2m1 [E, N, K/2] uint8 plus N-outer ue8m0
             # scales [E, N, K/32] uint8, with GPT-OSS's interleaved
             # [gate_0, up_0, gate_1, up_1, ...] w13 row order (which is exactly
-            # what the swiglu epilogue expects). The kernel takes the packed
-            # bytes as either int8 or uint8 and always reads them as uint8, and
-            # apply() passes use_mxfp4_w4a16=True explicitly rather than keying
-            # on the weight dtype, so no reinterpretation is needed. Biases stay
-            # bf16 (the launcher promotes them to fp32, which is how the kernel
-            # accumulates them). Crucially there is no bf16 upcast of the
-            # weights -- the whole point of MXFP4 on XPU.
+            # what the swiglu epilogue expects). A packed byte holds two e2m1
+            # nibbles rather than an integer, so the torch dtype is only a
+            # container label: the op accepts int8 or uint8, always casts to
+            # uint8_t*, and decodes each nibble (sign bit included) as
+            # float_e2m1_t -- a path selected by the explicit
+            # use_mxfp4_w4a16=True that apply() passes, not by the weight dtype.
+            # Biases stay bf16 (the launcher promotes them to fp32, which is how
+            # the kernel accumulates them). Crucially there is no bf16 upcast of
+            # the weights -- the whole point of MXFP4 on XPU.
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
