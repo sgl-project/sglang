@@ -168,6 +168,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_elastic_ep,
         handle_eplb_and_dispatch,
         handle_expert_distribution_metrics,
+        handle_shared_experts_tp,
     )
 
     validate_prefill_only_disable_kv_cache_args(server_args)
@@ -308,6 +309,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_moe_kernel_config(server_args)
     handle_a2a_moe(server_args)
+    handle_shared_experts_tp(server_args)
     handle_eplb_and_dispatch(server_args)
     handle_expert_distribution_metrics(server_args)
     handle_elastic_ep(server_args)

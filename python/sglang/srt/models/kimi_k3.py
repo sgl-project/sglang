@@ -22,6 +22,7 @@ from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
+    get_shared_experts_tp_group,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -40,8 +41,6 @@ from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
-    attn_tp_all_gather_into_tensor,
-    attn_tp_reduce_scatter_tensor,
     dp_gather_replicate,
     dp_scatter,
     get_global_dp_buffer,
@@ -568,32 +567,42 @@ class KimiK3MoE(nn.Module):
             and config.hidden_act == "situ"
         )
 
-        # Shared experts (operate in original hidden_size space).
-        # Replicate the shared-expert weights (tp1, DSv2 convention) under EP
-        # a2a: the block runs on partial batches (shard / DP-local rows), and
-        # a TP-sharded partial sum could never be reduced across ranks that
-        # hold different tokens.
-        self._shared_experts_tp1 = (
-            self._ep_a2a and not get_parallel().enable_shared_experts_attn_tp
+        # Shared experts operate on original hidden states. EP a2a gives each
+        # rank a token shard: either replicate the weights, or gather within
+        # the shared-expert TP subgroup and reduce-scatter back to those rows.
+        parallel = get_parallel()
+        requested_shared_tp = parallel.shared_experts_tp_size
+        shared_tp = requested_shared_tp
+        if shared_tp is None and parallel.enable_shared_experts_attn_tp:
+            shared_tp = parallel.attn_tp_size
+        if requested_shared_tp is not None and not self._ep_a2a:
+            raise ValueError("Independent shared-expert TP requires an EP a2a backend.")
+        self._shared_experts_tp1 = self._ep_a2a and shared_tp in (None, 1)
+        self._shared_experts_tp_comm = (
+            self._ep_a2a and shared_tp is not None and shared_tp > 1
         )
-        # NPU compatibility mode keeps DeepEP's DP-local token dispatch but
-        # uses the original TP-sharded shared MLP. Gather only that branch's
-        # inputs, then reduce-scatter its output back to the DP-local rows.
-        self._shared_experts_attn_tp_comm = (
-            get_parallel().enable_shared_experts_attn_tp
-            and self._ep_a2a
-            and get_parallel().attn_tp_size > 1
-        )
+        self._shared_experts_tp_group = None
         shared_experts_tp_kwargs = {}
         if self._shared_experts_tp1:
             shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
-        elif self._shared_experts_attn_tp_comm:
+        elif self._shared_experts_tp_comm:
+            group = (
+                get_shared_experts_tp_group()
+                if requested_shared_tp is not None
+                else parallel.attn_tp_group
+            )
+            assert group.world_size == shared_tp
+            self._shared_experts_tp_group = group
             shared_experts_tp_kwargs = dict(
-                tp_rank=get_parallel().attn_tp_rank,
-                tp_size=get_parallel().attn_tp_size,
+                tp_rank=group.rank_in_group, tp_size=group.world_size
             )
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
+            if shared_tp is not None and shared_intermediate_size % shared_tp != 0:
+                raise ValueError(
+                    f"Shared-expert intermediate size ({shared_intermediate_size}) "
+                    f"must be divisible by shared-expert TP size ({shared_tp})."
+                )
             self.shared_experts = KimiK3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=shared_intermediate_size,
@@ -618,12 +627,12 @@ class KimiK3MoE(nn.Module):
         # (TP8/EP8 MegaMoE + SP-MoE): +4~5% output tok/s and −5% ITL over
         # bs 1–32, GSM8K unchanged — so it is on whenever the shape allows,
         # no flag.
-        # NPU attention-TP compatibility mode can also overlap the shared
+        # NPU shared-expert TP can also overlap the shared
         # collectives using SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM. Otherwise
         # the collectives stay on the current stream.
         self._sbo_shared_overlap = (
             self._ep_a2a
-            and (not self._shared_experts_attn_tp_comm or _is_npu)
+            and (not self._shared_experts_tp_comm or _is_npu)
             and self.shared_experts is not None
             and self.alt_stream is not None
         )
@@ -1007,28 +1016,41 @@ class KimiK3MoE(nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
+    def _gather_shared_expert_inputs(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        group = self._shared_experts_tp_group
+        # The attention DP buffer spans the entire attention-TP replica.
+        # Size this buffer from the subgroup's actual token shards instead.
+        with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+            gathered = hidden_states.new_empty(
+                (hidden_states.shape[0] * group.world_size, *hidden_states.shape[1:])
+            )
+        group.all_gather_into_tensor(gathered, hidden_states)
+        return gathered
+
+    def _reduce_scatter_shared_experts(
+        self, shared_output: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        output = torch.empty_like(hidden_states)
+        self._shared_experts_tp_group.reduce_scatter_tensor(output, shared_output)
+        return output
+
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
-        if not self._shared_experts_attn_tp_comm:
+        if not self._shared_experts_tp_comm:
             return self.shared_experts(hidden_states)
 
-        group = get_parallel().attn_tp_group
-        # SP-MoE presents one contiguous token shard per attention-TP rank;
-        # the DP local buffer is the full reassembled per-replica batch.
-        gathered_hidden_states = get_local_dp_buffer(group)
-        attn_tp_all_gather_into_tensor(gathered_hidden_states, hidden_states)
-
+        gathered_hidden_states = self._gather_shared_expert_inputs(hidden_states)
         gathered_shared_output = self.shared_experts(gathered_hidden_states)
-        shared_output = torch.empty_like(hidden_states)
-        attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
-        return shared_output
+        return self._reduce_scatter_shared_experts(
+            gathered_shared_output, hidden_states
+        )
 
     def _can_overlap_shared_experts_npu(self, hidden_states: torch.Tensor) -> bool:
         if not (
             _is_npu
             and envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get()
             and self._sbo_shared_overlap
-            and self._shared_experts_attn_tp_comm
+            and self._shared_experts_tp_comm
             and self.use_latent_moe
             and hidden_states.shape[0] > 0
             and get_moe_a2a_backend().is_deepep()
@@ -1088,19 +1110,16 @@ class KimiK3MoE(nn.Module):
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 hidden_states.record_stream(self.alt_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_input = get_local_dp_buffer(get_parallel().attn_tp_group)
+                    shared_input = self._gather_shared_expert_inputs(hidden_states)
                     shared_input.record_stream(self.alt_stream)
-                    attn_tp_all_gather_into_tensor(shared_input, hidden_states)
                 return
             if self._sbo_shared_overlap:
                 current_stream = torch.cuda.current_stream()
                 # Keep HCCL collectives on the current stream. The alternate
                 # stream only executes the shared-expert MLP.
                 shared_input = hidden_states
-                if self._shared_experts_attn_tp_comm:
-                    group = get_parallel().attn_tp_group
-                    shared_input = get_local_dp_buffer(group)
-                    attn_tp_all_gather_into_tensor(shared_input, hidden_states)
+                if self._shared_experts_tp_comm:
+                    shared_input = self._gather_shared_expert_inputs(hidden_states)
                 shared_input.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
@@ -1134,9 +1153,9 @@ class KimiK3MoE(nn.Module):
                 # only for the MLP (not for RS).
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    gathered_shared_output = shared_output
-                    shared_output = torch.empty_like(hidden_states)
-                    attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
+                    shared_output = self._reduce_scatter_shared_experts(
+                        shared_output, hidden_states
+                    )
                     shared_event = self.alt_stream.record_event()
                 current_stream.wait_event(shared_compute_event)
 
@@ -1162,10 +1181,10 @@ class KimiK3MoE(nn.Module):
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
             shared_output.record_stream(current_stream)
-            if self._shared_experts_attn_tp_comm and not fine_grained_overlap:
-                gathered_shared_output = shared_output
-                shared_output = torch.empty_like(hidden_states)
-                attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
+            if self._shared_experts_tp_comm and not fine_grained_overlap:
+                shared_output = self._reduce_scatter_shared_experts(
+                    shared_output, hidden_states
+                )
 
         # Give the NPU shared-expert branch a head start. At this point
         # hidden_states is the decoder layer's post-attention RMSNorm output.
@@ -1196,7 +1215,9 @@ class KimiK3MoE(nn.Module):
             wait_and_finalize_shared_experts()
             if shared_output is not None:
                 expert_output = expert_output + shared_output
-            if self.tp_size > 1:
+            # EP combine and the shared-expert subgroup have already completed
+            # each source token. A global TP reduction would mix token shards.
+            if self.tp_size > 1 and not self._ep_a2a:
                 expert_output = tensor_model_parallel_all_reduce(expert_output)
             if prefix_sum is not None:
                 expert_output = expert_output + prefix_sum
@@ -1235,7 +1256,7 @@ class KimiK3MoE(nn.Module):
             if (
                 self.tp_size > 1
                 and not self._shared_experts_tp1
-                and not self._shared_experts_attn_tp_comm
+                and not self._shared_experts_tp_comm
             ):
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             out = _add3(out, shared_output, prefix_sum)
