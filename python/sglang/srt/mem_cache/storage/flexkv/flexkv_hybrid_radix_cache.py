@@ -707,62 +707,38 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         # flush, whose connector reset fences H2D before freeing them.
 
     def prefetch_request(self, req: Req) -> None:
-        """Start queued prefetch without a foreground lookup or H2D allocation."""
-        # Foreground lookup runs after stop-and-drain, otherwise it could fetch
-        # the whole remote prefix before the prefetch policy gets a chance to stop.
+        """Wait-complete FlexKV prefetch; see FlexKVRadixCache.prefetch_request."""
         req.init_next_round_input(tree_cache=None, cow_mamba=False)
         fill_ids = req.full_untruncated_fill_ids
         if not fill_ids:
             return
         match_end = req._compute_max_prefix_len(len(fill_ids))
-        self.prefetch_from_storage(
-            req.rid,
-            None,
-            fill_ids[:match_end],
-            extra_key=req.extra_key,
-            cache_salt=req.cache_salt,
-        )
+        self.prefetch_from_storage(req.rid, None, fill_ids[:match_end])
 
     def prefetch_from_storage(
         self,
         rid: str,
-        last_host_node=None,
+        last_host_node: Any = None,
         token_ids=None,
         last_hash=None,
         prefix_keys=None,
-        *,
-        matched_prefix_tokens=None,
-        extra_key=None,
-        cache_salt=None,
     ) -> None:
-        """Pass the complete token hash chain and the candidate's absolute offset."""
         del last_host_node, last_hash, prefix_keys
-        # The foreground adapter does not yet propagate namespace/salt.
-        # Skip this optional path until both lookup and prefetch use the same key.
-        if extra_key is not None or cache_salt is not None or not token_ids:
+        if not token_ids:
             return
-        prefix = [] if matched_prefix_tokens is None else list(matched_prefix_tokens)
-        ids = prefix + list(token_ids)
-        ids = ids[: len(ids) // self.page_size * self.page_size]
-        if len(ids) <= len(prefix):
+        ids = list(token_ids)
+        if self.page_size > 1:
+            aligned = (len(ids) // self.page_size) * self.page_size
+            ids = ids[:aligned]
+        if not ids:
             return
-        if getattr(self.flexkv_connector, "_chunked_prefetch", False):
-            self.flexkv_connector.prefetch_async(
-                rid, ids, sglang_req_id=rid, candidate_start_token=len(prefix)
-            )
-        else:
-            self.flexkv_connector.prefetch_async(rid, ids, sglang_req_id=rid)
+        self.flexkv_connector.prefetch_async(rid, ids, sglang_req_id=rid)
 
     def check_prefetch_progress(self, rid: str) -> bool:
         return self.flexkv_connector.check_prefetch_progress(rid)
 
     def terminate_prefetch(self, rid: str) -> None:
         self.flexkv_connector.cancel_prefetch(rid)
-
-    def pop_prefetch_loaded_span(self, rid: str) -> tuple[int, Optional[int]]:
-        if getattr(self.flexkv_connector, "_chunked_prefetch", False):
-            return self.flexkv_connector.pop_prefetch_loaded_span(rid)
-        return self.pop_prefetch_loaded_tokens(rid), None
 
     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
         pop = getattr(self.flexkv_connector, "pop_prefetch_loaded_tokens", None)

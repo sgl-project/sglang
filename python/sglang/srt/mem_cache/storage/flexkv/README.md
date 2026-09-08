@@ -10,26 +10,6 @@ Remote offload). Same integration pattern as
 
 ---
 
-## Optional chunked prefetch
-
-Pair this integration with [FlexKV #291](https://github.com/taco-project/FlexKV/pull/291)
-to enable `wait_complete`, `timeout`, or `best_effort` in FlexKV's
-`prefetch_options`. The new mode is disabled by default; use
-`enable_chunked_prefetch=true` in the existing FlexKV JSON configuration.
-`chunk_max_blocks` is the single chunk-size control. Configuration, interfaces,
-resource limits, sequence diagrams and monitoring boundaries are described in
-FlexKV's `docs/design/chunked_prefetch_reference.md`.
-
-Queue entry passes the complete token hash chain without a foreground remote
-lookup or GPU allocation. Scheduler candidacy signals demand through
-`check_prefetch_progress`; the connector stops new chunks according to the
-policy, drains already claimed work, and hands the protected CPU prefix to the
-existing restore path. This does not require a HiCache storage backend. Timeout
-limits further submissions, so the final response also includes drain time.
-Requests with `extra_key` or `cache_salt` skip this optional prefetch path until
-the foreground adapter carries the same namespace. Existing legacy prefetch
-remains available when chunked prefetch is disabled.
-
 ## Quick start (single H20, single GPU, Qwen3-8B)
 
 This walks through everything the verification on H20-GPU-11 actually

@@ -3117,7 +3117,7 @@ class Scheduler(
                 )
         elif self.enable_flexkv:
             logger.info(f"[FlexKV] sglang startprefetch: request={req.rid}")
-            # The adapter starts either legacy or chunked prefetch from its config.
+            # Wait-complete FlexKV prefetch: tree_cache owns token selection.
             self.tree_cache.prefetch_request(req)
 
     def _retry_missed_storage_prefetches(self):
@@ -3886,11 +3886,9 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
-                        or self.enable_flexkv
                         or self.enable_unified_cache_external_linker
                     ):
-                        # An idle FlexKV batch must retry when host-cache pressure
-                        # clears; no running decode can reset batch_is_full for it.
+                        # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
                         )
