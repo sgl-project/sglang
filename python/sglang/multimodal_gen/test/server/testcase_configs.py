@@ -312,11 +312,7 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
-    # Send the request this many times in one server session; performance and
-    # consistency are validated on the last one. >1 asserts a warm second
-    # request meets the same baselines -- a leak in residency arming, courier
-    # in-flight tracking, or host copies shows up as the second request
-    # degrading or dying.
+    # Validate every repetition against the same baseline and GT.
     perf_repeat_requests: int = 1
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
@@ -326,8 +322,12 @@ class DiffusionTestCase:
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
     run_multi_lora_api_check: bool = False
+    # Scheduling budget for functional cases without a performance baseline
+    estimated_full_test_time_s: float | None = None
 
     def __post_init__(self) -> None:
+        if self.perf_repeat_requests < 1:
+            raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
         if self.sampling_params is None:
             object.__setattr__(
                 self,
@@ -358,6 +358,14 @@ class DiffusionTestCase:
             raise ValueError(
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
+
+
+def get_case_full_test_time_estimate(
+    case: DiffusionTestCase | None, scenario: ScenarioConfig | None
+) -> float | None:
+    if scenario is not None and scenario.estimated_full_test_time_s is not None:
+        return scenario.estimated_full_test_time_s
+    return case.estimated_full_test_time_s if case is not None else None
 
 
 _REALTIME_MODEL_COMMON_EXTRAS = {

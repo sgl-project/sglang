@@ -11,9 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.multimodal_gen.test import run_suite
 from sglang.multimodal_gen.test.partitioning import PartitionItem, assign_partition
-from sglang.multimodal_gen.test.run_suite import (
+from sglang.multimodal_gen.test.runner import diffusion_suite_runner as run_suite
+from sglang.multimodal_gen.test.runner.diffusion_suite_runner import (
     PartitionAssignment,
     build_local_partition_assignment,
 )
@@ -117,19 +117,40 @@ def test_failing_cases_do_not_skip_the_shards_standalone_files(monkeypatch, tmp_
     assert exit_code == 1
 
 
-def test_two_gpu_cases_have_h100_full_test_time_estimates():
-    """Every 2-gpu case must have an h100 estimated_full_test_time_s.
-
-    NVIDIA LPT sharding falls back to 300s when the field is missing, which
-    unbalances the three 2-gpu partitions.
-    """
+def test_two_gpu_cases_have_full_test_time_estimates():
+    """Every two-GPU case needs a baseline or explicit scheduling estimate."""
     scenarios = json.loads(_H100_BASELINE_PATH.read_text())["scenarios"]
     missing = [
         case.id
         for case in TWO_GPU_CASES
         if scenarios.get(case.id, {}).get("estimated_full_test_time_s") is None
+        and case.estimated_full_test_time_s is None
     ]
     assert missing == []
+
+
+@pytest.mark.parametrize("scenario_estimate", [None, 420.0])
+def test_explicit_case_estimate_is_used_without_a_performance_baseline(
+    monkeypatch, scenario_estimate
+):
+    case = SimpleNamespace(id="functional", estimated_full_test_time_s=600.0)
+    scenarios = (
+        {}
+        if scenario_estimate is None
+        else {case.id: SimpleNamespace(estimated_full_test_time_s=scenario_estimate)}
+    )
+    monkeypatch.setattr(
+        run_suite, "BASELINE_CONFIG", SimpleNamespace(scenarios=scenarios)
+    )
+    monkeypatch.setattr(
+        run_suite,
+        "PARAMETRIZED_CASE_GROUPS",
+        {"1-gpu": [("test_functional.py", [case])]},
+    )
+
+    expected = 600.0 if scenario_estimate is None else scenario_estimate
+    assert run_suite.get_case_est_time(case.id) == expected
+    assert run_suite.get_case_est_time("unknown") == run_suite.DEFAULT_EST_TIME_SECONDS
 
 
 def test_qwen_quality_variants_use_the_same_generation_request():

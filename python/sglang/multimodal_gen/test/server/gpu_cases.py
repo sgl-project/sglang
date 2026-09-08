@@ -69,9 +69,54 @@ from sglang.multimodal_gen.test.test_utils import (
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
 
 
+def _make_llada_image_ci_cases(sp_degree: int) -> list[DiffusionTestCase]:
+    if current_platform.is_hip() or current_platform.is_xpu():
+        return []
+
+    return [
+        DiffusionTestCase(
+            f"llada_image_turbo_fp8_{mode}_sp{sp_degree}",
+            DiffusionServerArgs(
+                model_path="inclusionAI/LLaDA-Image-Turbo-FP8",
+                modality="image",
+                num_gpus=sp_degree,
+                tp_size=1,
+                ulysses_degree=sp_degree,
+                ring_degree=1,
+                cfg_parallel=False,
+                extras=[
+                    "--trust-remote-code",
+                    "--revision",
+                    "2b822499be3f33a6f83c988dafab7986ebd1f733",
+                ],
+            ),
+            DiffusionSamplingParams(
+                prompt=(
+                    "Convert 2D style to 3D style"
+                    if mode == "edit"
+                    else "A red fox sitting on a snowy hill"
+                ),
+                image_path=(
+                    "https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg"
+                    if mode == "edit"
+                    else None
+                ),
+                output_size="512x512",
+                extras={"num_inference_steps": 4, "guidance_scale": 1.0, "seed": 42},
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+            estimated_full_test_time_s=600.0,
+        )
+        for mode in ("t2i", "edit")
+    ]
+
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES: list[DiffusionTestCase] = [
+    *_make_llada_image_ci_cases(1),
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         "qwen_image_t2i",
@@ -734,6 +779,7 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
 ]
 
 TWO_GPU_CASES = [
+    *_make_llada_image_ci_cases(2),
     DiffusionTestCase(
         "minimax_h3_t2va_2gpu_h100",
         DiffusionServerArgs(
@@ -747,9 +793,9 @@ TWO_GPU_CASES = [
                 "--performance-mode",
                 "memory",
                 "--layerwise-offload-components",
-                "dit,text_encoder",
-                "--component-residency",
-                "vae=resident",
+                "dit,text_encoder,vae",
+                "--layerwise-resident-layers",
+                "video_vae=36",
                 "--dit-offload-prefetch-size",
                 "1",
                 "--dit-layerwise-resident-layers",
@@ -787,6 +833,7 @@ TWO_GPU_CASES = [
             },
         ),
         run_perf_check=True,
+        perf_repeat_requests=2,
         run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
@@ -853,7 +900,7 @@ TWO_GPU_CASES = [
                 "seed": 42,
             },
         ),
-        run_perf_check=False,
+        perf_repeat_requests=2,
         run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
@@ -1046,6 +1093,31 @@ TWO_GPU_CASES = [
             ],
         ),
         DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
+        run_component_accuracy_check=False,
+    ),
+    # LTX-2.5's diffusion decoder
+    DiffusionTestCase(
+        "ltx_2_5_diffusion_decoder_2gpus",
+        DiffusionServerArgs(
+            model_path="Lightricks/LTX-2.5-Diffusers",
+            modality="video",
+            ulysses_degree=2,
+            # Offload both the DiT and text encoder between stages to leave
+            # decoder headroom on 80 GB GPUs.
+            extras=[
+                "--load-diffusion-decoder",
+                "--component-residency "
+                "transformer=component-offload,text_encoder=component-offload",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="768x448",
+            num_frames=49,
+            expect_audio_output=True,
+            extras={"seed": 42, "use_diffusion_decoder": True},
+        ),
+        run_perf_check=False,
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case

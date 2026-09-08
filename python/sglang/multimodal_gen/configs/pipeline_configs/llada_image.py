@@ -56,6 +56,7 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
             raise ValueError("LLaDA-Image height must be divisible by 16")
         if batch.width % self.latent_scale_factor != 0:
             raise ValueError("LLaDA-Image width must be divisible by 16")
+        self._validate_spatial_rope_bounds(batch.width, batch.height)
         return (
             batch_size,
             self.dit_config.num_channels_latents,
@@ -82,6 +83,20 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
 
     def validate_server_args(self, server_args) -> None:
         super().validate_server_args(server_args)
+        for argument in (
+            "component_weights_paths",
+            "component_precisions",
+            "component_quantizations",
+            "component_quantization_ignored_layers",
+            "component_attention_backends",
+            "component_direct_gpu_weight_loading",
+        ):
+            if "text_encoder" in (getattr(server_args, argument, None) or {}):
+                raise ValueError(
+                    f"LLaDA-Image embedded text_encoder does not support {argument} "
+                    "overrides. Use --component-paths.text_encoder with a complete "
+                    "model directory containing its config and weights"
+                )
         if envs.SGLANG_CACHE_DIT_ENABLED:
             raise ValueError("LLaDA-Image does not support SGLANG_CACHE_DIT_ENABLED")
         # Replicated condition suffixes are currently de-duplicated only by the
@@ -174,6 +189,9 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
     def supports_hot_weight_updates(self) -> bool:
         return False
 
+    def supports_disaggregation(self) -> bool:
+        return False
+
     def validate_num_outputs_per_prompt(
         self, num_outputs_per_prompt: int, server_args
     ) -> None:
@@ -229,6 +247,7 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
                 f"LLaDA-Image output height must be divisible by "
                 f"{sp_height_multiple} at SP degree {server_args.sp_degree}"
             )
+        self._validate_spatial_rope_bounds(width, height)
         area_cap = (
             server_args.llada_image_max_pixel_area
             if server_args.llada_image_max_pixel_area is not None
@@ -266,6 +285,17 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
             # prepare_request later overrides the request value from this channel.
             self._validate_max_sequence_length(
                 extra_kwargs["max_sequence_length"], tokens_cap
+            )
+
+    def _validate_spatial_rope_bounds(self, width: int, height: int) -> None:
+        # The served DiT uses patch size 1 and SP preserves global height positions.
+        axes_lens = self.dit_config.arch_config.axes_lens
+        max_height = axes_lens[1] * self.latent_scale_factor
+        max_width = axes_lens[2] * self.latent_scale_factor
+        if height > max_height or width > max_width:
+            raise ValueError(
+                f"LLaDA-Image output size {width}x{height} exceeds spatial RoPE "
+                f"bounds of {max_width}x{max_height} pixels"
             )
 
     @staticmethod

@@ -486,6 +486,7 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
 
 class TestLLaDAImageRuntimeContext(unittest.TestCase):
     def test_encoder_preserves_diffusion_runtime(self):
+        """The embedded DP encoder must retain its topology inside the TP scope."""
         import sglang.multimodal_gen.runtime.distributed.parallel_state as mm_state
         import sglang.srt.distributed.parallel_state as srt_state
         from sglang.srt import runtime_context as rc
@@ -517,6 +518,9 @@ class TestLLaDAImageRuntimeContext(unittest.TestCase):
                 def check_encoder_context():
                     context = rc.assert_published(observed["args"], role="scheduler")
                     self.assertEqual(rc.get_parallel().tp_size, 2)
+                    self.assertEqual(rc.get_parallel().attn_tp_size, 1)
+                    self.assertEqual(rc.get_parallel().attn_dp_size, 2)
+                    self.assertEqual(rc.get_parallel().moe_tp_size, 1)
                     self.assertEqual(rc.get_schedule().max_running_requests, 4)
                     return context
 
@@ -552,6 +556,9 @@ class TestLLaDAImageRuntimeContext(unittest.TestCase):
                     self.assertEqual(rc.get_context().overrides_log(), diffusion_log)
                     self.assertEqual(rc.get_exec().kernel.grammar_backend, "none")
                     self.assertEqual(rc.get_parallel().tp_size, 1)
+                    self.assertEqual(rc.get_parallel().attn_tp_size, 1)
+                    self.assertEqual(rc.get_parallel().attn_dp_size, 1)
+                    self.assertEqual(rc.get_parallel().moe_tp_size, 1)
                     self.assertIs(
                         rc.get_buffer("conditioning", object), diffusion_buffer
                     )

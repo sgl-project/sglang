@@ -241,10 +241,11 @@ class LLaDAImageTextEncoderRunner:
         import sglang.srt.distributed.parallel_state as srt_parallel_state
         from sglang.srt.runtime_context import use_context
 
-        # The worker serializes stages so encoder state can follow its groups.
+        # The TP scope belongs to diffusion. Install the encoder context after it
+        # so replicated attention and MoE keep the encoder's derived widths.
         with (
-            use_context(self.runtime_context),
             mm_parallel_state.use_tensor_parallel_group(self.encoder_tp_group),
+            use_context(self.runtime_context),
         ):
             saved_attn_tp = srt_parallel_state._ATTN_TP
             try:
