@@ -110,6 +110,10 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
 - `--scheduler-rpc-timeout {SECONDS}`: optional end-to-end deadline for an internal scheduler RPC, including scheduler queue time. It is unset by default so valid long-running and queued video jobs are not failed by the transport layer. Set it only when the deployment requires a bounded request deadline; caller cancellation and server shutdown remain effective without it.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
+- `--pe-backend {chat_completions}`: wire format for a remote OpenAI-compatible PE endpoint (e.g., for SenseNova-U1, which has no local PE model). Currently only `chat_completions` is supported.
+- `--pe-endpoint {URL}`: full `/chat/completions` URL of the remote PE API. Defaults to Gemini's OpenAI-compatible endpoint.
+- `--pe-model-name {NAME}`: model name sent in the remote PE API request body. Defaults to `gemini-3.1-pro`.
+- `--pe-api-key {KEY}`: bearer API key for the remote PE API. Prompt enhancement stays disabled until this is set. See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 
 ### Sampling and output
 
