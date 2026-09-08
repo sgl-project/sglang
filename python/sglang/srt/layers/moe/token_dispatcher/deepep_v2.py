@@ -34,22 +34,7 @@ _EXPERT_ALIGNMENT = 128
 _deepep_v2_import_error: Optional[BaseException] = None
 _fp8_quant_import_error: Optional[BaseException] = None
 sglang_per_token_group_quant_fp8 = None
-
-try:
-    from deep_ep import ElasticBuffer
-
-    use_deepep_v2 = True
-except (ImportError, OSError) as exc:
-    use_deepep_v2 = False
-    _deepep_v2_import_error = exc
-
-if use_deepep_v2:
-    try:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
-    except (ImportError, OSError) as exc:
-        _fp8_quant_import_error = exc
+use_deepep_v2: Optional[bool] = None
 
 
 class DeepEPv2DispatchOutput(NamedTuple):
@@ -93,10 +78,31 @@ def _raise_deepep_v2_import_error() -> None:
     raise ImportError(
         "DeepEP v2 (ElasticBuffer) is not available. Install DeepEP v2 from "
         "https://github.com/deepseek-ai/DeepEP." + detail
-    )
+    ) from _deepep_v2_import_error
 
 
 def _ensure_deepep_v2_available() -> None:
+    global use_deepep_v2, ElasticBuffer, _deepep_v2_import_error
+    global sglang_per_token_group_quant_fp8, _fp8_quant_import_error
+
+    # Defer both imports until this backend is used, including on CUDA hosts.
+    if use_deepep_v2 is None:
+        try:
+            from deep_ep import ElasticBuffer
+
+            use_deepep_v2 = True
+        except (ImportError, OSError) as exc:
+            use_deepep_v2 = False
+            _deepep_v2_import_error = exc
+
+        if use_deepep_v2:
+            try:
+                from sglang.kernels.ops.quantization.fp8_kernel import (
+                    sglang_per_token_group_quant_fp8,
+                )
+            except (ImportError, OSError) as exc:
+                _fp8_quant_import_error = exc
+
     if not use_deepep_v2:
         _raise_deepep_v2_import_error()
 
@@ -112,7 +118,7 @@ def _ensure_fp8_quant_available() -> None:
         raise ImportError(
             "DeepEP v2 FP8 dispatch requires the SGLang FP8 quantization kernel."
             + detail
-        )
+        ) from _fp8_quant_import_error
 
 
 def _get_allow_hybrid_mode() -> bool:
@@ -429,6 +435,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
         params_dtype: torch.dtype,
     ):
         super().__init__()
+        _ensure_deepep_v2_available()
         if params_dtype != torch.bfloat16:
             raise NotImplementedError(
                 "DeepEP v2 dispatch adapter currently expects BF16 model activations, "
