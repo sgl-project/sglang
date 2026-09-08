@@ -7,6 +7,7 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.lilicorr import (
     lilicorr_greedy_path,
+    lilicorr_sample_path,
     lilicorr_topk_lse,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -665,3 +666,107 @@ def test_a_partial_conv_checkpoint_raises():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --- sampled commit --------------------------------------------------------
+
+
+def _sampled_lattice(bs=2, slots=3, k=4, seed=0):
+    torch.manual_seed(seed)
+    return (
+        torch.randn(bs, k),
+        torch.randn(bs, slots - 1, k, k),
+        torch.arange(bs * slots * k).view(bs, slots, k),
+    )
+
+
+def test_a_greedy_masked_row_walks_the_greedy_path_bit_identically():
+    """The claim every published acceptance number rests on: with the mask set the
+    sampled kernel must commit the same tokens as ``lilicorr_greedy_path``, not
+    merely similar ones."""
+    log_start, log_pair, tokens = _sampled_lattice()
+    picked, _ = lilicorr_sample_path(
+        log_start,
+        log_pair,
+        tokens,
+        uniforms=torch.rand(2, 3),
+        temperatures=torch.full((2,), 0.7),
+        greedy_mask=torch.ones(2, dtype=torch.bool),
+    )
+    assert torch.equal(picked, lilicorr_greedy_path(log_start, log_pair, tokens))
+
+
+def test_the_sampled_commit_converges_on_the_greedy_path_as_temperature_vanishes():
+    """Same claim by the other route, with the mask off: the proposal is
+    ``softmax(psi / T)``, so a vanishing temperature must reproduce the argmax. This
+    is what makes the sampled path a superset rather than a different drafter."""
+    log_start, log_pair, tokens = _sampled_lattice(seed=1)
+    picked, _ = lilicorr_sample_path(
+        log_start,
+        log_pair,
+        tokens,
+        uniforms=torch.full((2, 3), 0.5),
+        temperatures=torch.full((2,), 1e-4),
+        greedy_mask=torch.zeros(2, dtype=torch.bool),
+    )
+    assert torch.equal(picked, lilicorr_greedy_path(log_start, log_pair, tokens))
+
+
+def test_a_greedy_row_reports_a_point_mass_on_the_token_it_committed():
+    """Verify computes ``min(1, p/q)``. Handing a greedy row its temperature softmax
+    instead of a point mass would make that the wrong test for that row and would
+    perturb the output distribution."""
+    log_start, log_pair, tokens = _sampled_lattice(bs=1, seed=2)
+    picked, q = lilicorr_sample_path(
+        log_start,
+        log_pair,
+        tokens,
+        uniforms=torch.rand(1, 3),
+        temperatures=torch.full((1,), 1.0),
+        greedy_mask=torch.ones(1, dtype=torch.bool),
+    )
+    torch.testing.assert_close(q.sum(-1), torch.ones(1, 3))
+    assert torch.equal(q.max(-1).values, torch.ones(1, 3))
+    committed = q.argmax(-1)
+    assert torch.equal(torch.gather(tokens, 2, committed.unsqueeze(-1)).squeeze(-1), picked)
+
+
+def test_the_proposal_is_a_distribution_over_that_slots_candidates():
+    """Rejection sampling is only lossless if ``q`` is the distribution the token was
+    actually drawn from. A ``q`` correct only up to a renormalization would accept at
+    the wrong rate, silently and in the flattering direction."""
+    log_start, log_pair, tokens = _sampled_lattice(bs=3, slots=4, seed=3)
+    _, q = lilicorr_sample_path(
+        log_start,
+        log_pair,
+        tokens,
+        uniforms=torch.rand(3, 4),
+        temperatures=torch.tensor([0.5, 1.0, 2.0]),
+        greedy_mask=torch.zeros(3, dtype=torch.bool),
+    )
+    torch.testing.assert_close(q.sum(-1), torch.ones(3, 4))
+    assert (q >= 0).all()
+
+
+def test_a_sampling_row_leaves_a_greedy_row_in_the_same_batch_unchanged():
+    """Rows are independent, and a kernel leaking the committed predecessor or the
+    temperature across programs would still look correct on a uniform batch."""
+    log_start, log_pair, tokens = _sampled_lattice(bs=2, seed=4)
+    mixed_tokens, mixed_q = lilicorr_sample_path(
+        log_start,
+        log_pair,
+        tokens,
+        uniforms=torch.full((2, 3), 0.9),
+        temperatures=torch.full((2,), 1.5),
+        greedy_mask=torch.tensor([True, False]),
+    )
+    alone_tokens, alone_q = lilicorr_sample_path(
+        log_start[:1],
+        log_pair[:1],
+        tokens[:1],
+        uniforms=torch.full((1, 3), 0.9),
+        temperatures=torch.full((1,), 1.5),
+        greedy_mask=torch.ones(1, dtype=torch.bool),
+    )
+    assert torch.equal(mixed_tokens[:1], alone_tokens)
+    torch.testing.assert_close(mixed_q[:1], alone_q)
