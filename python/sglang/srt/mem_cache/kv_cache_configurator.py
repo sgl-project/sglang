@@ -1246,7 +1246,7 @@ class KVCacheConfigurator:
         elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
-                max_running_requests=sizes.max_running_requests,
+                req_to_token_pool=req_to_token_pool,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
@@ -1542,7 +1542,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_dsa_kv_pool(
-        self, *, max_total_num_tokens: int, max_running_requests: int
+        self, *, max_total_num_tokens: int, req_to_token_pool: ReqToTokenPool
     ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
@@ -1597,7 +1597,9 @@ class KVCacheConfigurator:
                 self.model_config.hf_config
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
-            max_running_requests=max_running_requests,
+            # Tail buffers use req_pool_idx, including PD decode's extra slots
+            # in a shared target/draft request pool. The KV pool adds row 0 back.
+            max_running_requests=req_to_token_pool.req_to_token.shape[0] - 1,
             **pool_kwargs,
         )
         return token_to_kv_pool
