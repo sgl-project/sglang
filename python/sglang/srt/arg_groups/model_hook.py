@@ -284,9 +284,7 @@ def handle_model_specific_adjustments(server_args: Any):
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split requires "
-                    "--enable-prefill-cp and --cp-strategy interleave "
-                    "(or legacy --enable-nsa-prefill-context-parallel with "
-                    "--nsa-prefill-cp-mode round-robin-split)."
+                    "--enable-prefill-cp and --cp-strategy interleave."
                 )
             # Layer split relies on the mooncake all-CP-rank KV/indexer
             # transfer path. mori/nixl support is a temporary limitation
