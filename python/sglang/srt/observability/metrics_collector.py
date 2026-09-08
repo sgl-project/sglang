@@ -551,6 +551,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
+        self.admission_lookahead_total = Counter(
+            name="sglang:admission_lookahead_total",
+            documentation=(
+                "Outcomes of the NO_TOKEN admission lookahead "
+                "(SGLANG_PREFILL_NO_TOKEN_LOOKAHEAD). admitted counts "
+                "requests let past a KV-blocked queue head. denied_budget "
+                "counts candidates that add_one_req rejected with NO_TOKEN "
+                "while the head's prefix was pinned. aging_hold counts passes "
+                "where lookahead was withheld because the head had been "
+                "starved for too many consecutive passes. denied_capacity "
+                "counts passes where pinning the head's prefix would have "
+                "left the allocator less than one reserve "
+                "(SGLANG_PREFILL_HEADLOCK_RESERVE_TOKENS, default "
+                "max_prefill_tokens) of headroom, so the pin was skipped and "
+                "lookahead withheld for that pass."
+            ),
+            labelnames=list(labels.keys()) + ["result"],
+        )
         self.kv_transfer_bootstrap_ms = Histogram(
             name="sglang:kv_transfer_bootstrap_ms",
             documentation="Histogram of KV transfer bootstrap time in ms.",
@@ -1188,6 +1206,32 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
+
+    def increment_admission_lookahead(
+        self,
+        admitted: int = 0,
+        denied: int = 0,
+        aging_hold: bool = False,
+        denied_capacity: bool = False,
+    ) -> None:
+        if admitted:
+            self.admission_lookahead_total.labels(**self.labels, result="admitted").inc(
+                admitted
+            )
+        if denied:
+            self.admission_lookahead_total.labels(
+                **self.labels, result="denied_budget"
+            ).inc(denied)
+        if aging_hold:
+            self.admission_lookahead_total.labels(
+                **self.labels, result="aging_hold"
+            ).inc(1)
+        if denied_capacity:
+            # One per pass, not per candidate: the gate is consulted once, for
+            # the head, and refusing its pin withholds the whole pass.
+            self.admission_lookahead_total.labels(
+                **self.labels, result="denied_capacity"
+            ).inc(1)
 
     def observe_kv_transfer_metrics(
         self,

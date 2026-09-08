@@ -34,7 +34,7 @@ import random
 from collections import Counter
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -477,6 +477,43 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
+def full_pool_available_and_evictable(
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    tree_cache: BasePrefixCache,
+) -> Tuple[int, int]:
+    """`(allocator-free, tree-evictable)` tokens of the pool an extend allocates
+    from, kept as two halves so a caller can report both.
+
+    Mirrors `PrefillAdder.rem_total_tokens`' pool selection with the admission
+    offsets left out: this is the raw pair `evict_from_tree_cache` weighs an
+    allocation against when the batch actually runs. It lives outside
+    `PrefillAdder` because the head prefix lock is reconciled at the top of an
+    admission pass, before an adder exists; the two selections must stay in step.
+    """
+    if isinstance(token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator):
+        return (
+            token_to_kv_pool_allocator.swa_available_size(),
+            tree_cache.swa_evictable_size(),
+        )
+    if isinstance(
+        token_to_kv_pool_allocator,
+        (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
+    ):
+        return (
+            token_to_kv_pool_allocator.full_available_size(),
+            tree_cache.full_evictable_size(),
+        )
+    if tree_cache.supports_mamba():
+        return (
+            token_to_kv_pool_allocator.available_size(),
+            tree_cache.full_evictable_size(),
+        )
+    return (
+        token_to_kv_pool_allocator.available_size(),
+        tree_cache.evictable_size(),
+    )
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -815,6 +852,22 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def charge_head_prefix_pin(self, tokens: int) -> None:
+        """Charge a head prefix pinned mid-pass to both full-KV budgets, so the
+        candidates scanned after it cannot sell KV the head now owns.
+
+        Takes only what the tree did not already account for: every cache in
+        mem_cache/ moves the newly-locked tokens out of `evictable_size()` inside
+        `inc_lock_ref`, and `rem_total_tokens` reads that live, so the usual
+        charge is 0 (see `HeadPrefixLock._record_pin`). The offsets only ever
+        grow, and a budget driven negative reads as NO_TOKEN in `budget_state`,
+        which is the intended refusal, not a broken counter.
+        """
+        if tokens <= 0:
+            return
+        self.rem_total_token_offset += tokens
+        self.cur_rem_token_offset += tokens
 
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
