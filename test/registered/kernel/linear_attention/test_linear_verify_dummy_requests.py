@@ -6,6 +6,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+    fused_kda_conv_gating_verify,
+)
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -152,6 +155,77 @@ def test_recurrent_dummy_skips_inputs_and_short_metadata(is_kda, tree, real_requ
         rtol=0,
     )
     torch.testing.assert_close(state, before, atol=0, rtol=0)
+    torch.testing.assert_close(scratch, reference_scratch, atol=0, rtol=0)
+
+
+def test_fused_kda_dummy_output_and_state():
+    torch.manual_seed(29)
+    # TP8 / verify width 6 pads one real request to four complete groups.
+    requests, steps, heads, dim = 4, 6, 2, 128
+    tokens = requests * steps
+    channels = 3 * heads * dim
+    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+    mixed = torch.randn(tokens, channels, **kwargs) * 0.2
+    a = torch.randn(tokens, heads * dim, **kwargs) * 0.2
+    b = torch.randn(tokens, heads, **kwargs)
+    for tensor in (mixed, a, b):
+        tensor[steps:].fill_(float("nan"))
+    conv = torch.randn(5, 3, channels, **kwargs)
+    state = torch.randn(5, heads, dim, dim, device="cuda") * 0.2
+    before = state.clone()
+    window = torch.full((5, steps, 3, channels), 73.0, **kwargs)
+    scratch = torch.full((5, steps, heads, dim, dim), 73.0, device="cuda")
+    indices = torch.tensor([2, -1, -1, -1], device="cuda", dtype=torch.int32)
+    intermediate_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    weight = torch.randn(channels, 4, **kwargs) * 0.2
+    a_log = torch.randn(heads, device="cuda") * 0.2
+    dt_bias = torch.randn(heads * dim, device="cuda") * 0.2
+
+    def run(count, conv_cache, conv_window, ssm_scratch):
+        n = count * steps
+        return fused_kda_conv_gating_verify(
+            mixed_qkv=mixed[:n],
+            conv_weight=weight,
+            conv_bias=None,
+            conv_state=conv_cache.transpose(-1, -2),
+            conv_state_indices=indices[:count],
+            intermediate_conv_window=conv_window.transpose(-1, -2),
+            intermediate_state_indices=intermediate_indices,
+            a=a[:n],
+            b=b[:n],
+            A_log=a_log,
+            dt_bias=dt_bias,
+            ssm_states=state,
+            cache_indices=indices[:count],
+            intermediate_states_buffer=ssm_scratch,
+            scale=dim**-0.5,
+            T=steps,
+            num_q_heads=heads,
+            num_v_heads=heads,
+            head_k_dim=dim,
+            head_v_dim=dim,
+        )
+
+    reference_conv = conv.clone()
+    reference_window = window.clone()
+    reference_scratch = scratch.clone()
+    reference = run(1, reference_conv, reference_window, reference_scratch)
+    new_empty = torch.Tensor.new_empty
+
+    def poison_allocation(tensor, *args, **kwargs):
+        return new_empty(tensor, *args, **kwargs).fill_(float("nan"))
+
+    # Make the missing dummy stores fail deterministically, independent of
+    # caching-allocator contents. The production fused kernel still runs.
+    with patch.object(torch.Tensor, "new_empty", new=poison_allocation):
+        output = run(requests, conv, window, scratch)
+    torch.testing.assert_close(output[:, :steps], reference, atol=0, rtol=0)
+    torch.testing.assert_close(
+        output[:, steps:], torch.zeros_like(output[:, steps:]), atol=0, rtol=0
+    )
+    torch.testing.assert_close(conv, reference_conv, atol=0, rtol=0)
+    torch.testing.assert_close(state, before, atol=0, rtol=0)
+    torch.testing.assert_close(window, reference_window, atol=0, rtol=0)
     torch.testing.assert_close(scratch, reference_scratch, atol=0, rtol=0)
 
 
