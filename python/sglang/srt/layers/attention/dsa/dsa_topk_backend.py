@@ -7,9 +7,12 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -163,8 +166,13 @@ class DSATopKBackend(Enum):
         # kernel's 16B-aligned row stride, but an extend row stride is the batch's
         # total KV length, which is only a multiple of 4 by luck. A row stride
         # that does not fit the vectorized load must fall back, not raise.
+        #
+        # ROCm-only: the packed-row addressing this relies on is compiled into
+        # the paged v2 kernel under USE_ROCM. CUDA gets the same fusion from the
+        # RAGGED branch above, so it keeps its existing route.
         if (
-            self.should_use_topk_v2()
+            _is_hip
+            and self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
             and batch_idx_list is None
             and 0 < topk <= 2048

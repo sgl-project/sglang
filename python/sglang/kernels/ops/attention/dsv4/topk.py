@@ -11,7 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_hip, is_xpu
 
 from .utils import make_name
 
@@ -168,12 +168,16 @@ def topk_transform_paged_v2(
     the valid way to express "no tokens": the row takes the trivial path and
     the output is all -1.
     """
-    if is_xpu():
-        # The XPU op predates the packed-row layout; callers that need it are
-        # gated on the JIT path, so this is an invariant, not a fallback.
-        assert row_starts is None and row_to_batch is None, (
-            "topk_transform_paged_v2 packed rows are not supported on XPU"
+    if row_starts is not None or row_to_batch is not None:
+        # Packed rows are compiled into the paged kernel only under USE_ROCM
+        # (CUDA reaches the same shape through topk_transform_ragged_v2, XPU
+        # has no such op at all), and every caller of them is ROCm-gated, so
+        # this is an invariant rather than a fallback.
+        assert is_hip(), (
+            "topk_transform_paged_v2 packed rows (row_starts / row_to_batch) "
+            "are only supported on ROCm"
         )
+    if is_xpu():
         torch.ops.sgl_kernel.topk_transform_paged(
             scores,
             seq_lens,

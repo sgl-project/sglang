@@ -72,19 +72,30 @@ struct alignas(8) PlanItem {
 static_assert(sizeof(GlobalMetadata) == 2 * sizeof(int32_t) && sizeof(PlanItem) == sizeof(GlobalMetadata));
 
 struct TopKPagedParams {
-  float* __restrict__ scores;  // NOTE: may write (see head_residue / mask_head)
+#ifdef USE_ROCM
+  // Non-const only on ROCm: the packed-row path masks the <= 3 columns the
+  // 16-byte-aligned read base pulls in ahead of the window (see mask_head).
+  // Nothing is written when row_starts is null, which is every CUDA caller.
+  float* __restrict__ scores;
+#else
+  const float* __restrict__ scores;
+#endif
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
-  // Both optional, and both null for the decode shape this kernel was written
-  // for (one row per request, scores starting at column 0). DSA extend packs
-  // every request's scores into one row-major buffer, so a row's window starts
-  // at a per-row column offset and many rows share one request's page-table
-  // row; these two indirections express that without materializing either a
-  // row-local score copy or a per-row expansion of the page table.
+#ifdef USE_ROCM
+  // ROCm-only. Both optional, and both null for the decode shape this kernel
+  // was written for (one row per request, scores starting at column 0). DSA
+  // extend packs every request's scores into one row-major buffer, so a row's
+  // window starts at a per-row column offset and many rows share one request's
+  // page-table row; these two indirections express that without materializing
+  // either a row-local score copy or a per-row expansion of the page table.
+  // CUDA reaches the same shape through transform_ragged, so the fields (and
+  // every branch on them below) are compiled out there.
   const int32_t* __restrict__ row_starts;    // per-row score column offset; null => 0
   const int32_t* __restrict__ row_to_batch;  // per-row page-table row; null => identity
+#endif
   int64_t score_stride;
   int64_t page_table_stride;
   uint32_t topk;
@@ -103,6 +114,7 @@ struct TopKPagedParams {
   SGL_DEVICE int32_t* get_output_ptr(uint32_t batch_id) const {
     return page_indices + batch_id * static_cast<int64_t>(topk);
   }
+#ifdef USE_ROCM
   /// Columns the 16-byte-aligned read base pulls in ahead of the row's window.
   /// A window start is an arbitrary token offset, so it is only a multiple of
   /// kVecSize by luck; zero whenever row_starts is absent.
@@ -124,28 +136,37 @@ struct TopKPagedParams {
       row[tx] = -std::numeric_limits<float>::max();
     }
   }
+#endif  // USE_ROCM
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
-    // Offsetting `in` makes the index the kernel selects row-local, which is
-    // what the page-table transform already expects, so the emit path needs no
-    // change beyond undoing the round-down (index_shift).
-    const int64_t score_offset = row_starts != nullptr ? static_cast<int64_t>(row_starts[batch_id]) : 0;
-    const int64_t table_row =
-        row_to_batch != nullptr ? static_cast<int64_t>(row_to_batch[batch_id]) : static_cast<int64_t>(batch_id);
-    const auto residue = head_residue(batch_id);
-    // seq_len grows by the residue, but never past the score row: the window
-    // end is unchanged, and the host picks the dispatch level from the score
-    // column count, so the level's seq_len bound still holds.
-    return TopKProblem{
-        .in = scores + batch_id * score_stride + score_offset - residue,
+    auto problem = TopKProblem{
+        .in = scores + batch_id * score_stride,
         .out = page_indices + batch_id * k,
-        .page_table = page_table + table_row * page_table_stride,
+        .page_table = page_table + static_cast<int64_t>(batch_id) * page_table_stride,
         .topk = topk,
-        .seq_len = seq_len + residue,
+        .seq_len = seq_len,
         .page_bits = page_bits,
         .bias = 0,
-        .index_shift = -static_cast<int32_t>(residue),
     };
+#ifdef USE_ROCM
+    // Packed rows: re-point at this row's window and at the request's
+    // page-table row. Offsetting `in` makes the index the kernel selects
+    // row-local, which is what the page-table transform already expects, so
+    // the emit path needs no change beyond undoing the round-down
+    // (index_shift). seq_len grows by the residue, but never past the score
+    // row: the window end is unchanged, and the host picks the dispatch level
+    // from the score column count, so the level's seq_len bound still holds.
+    if (row_starts != nullptr) {
+      const auto residue = head_residue(batch_id);
+      problem.in += static_cast<int64_t>(row_starts[batch_id]) - residue;
+      problem.seq_len = seq_len + residue;
+      problem.index_shift = -static_cast<int32_t>(residue);
+    }
+    if (row_to_batch != nullptr) {
+      problem.page_table = page_table + static_cast<int64_t>(row_to_batch[batch_id]) * page_table_stride;
+    }
+#endif
+    return problem;
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
     return this->problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
@@ -320,9 +341,10 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   constexpr bool kPDLEarly = kPDL && !kHandleCluster;
   constexpr bool kPDLFinal = kPDL && kHandleCluster;
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  // The residue only widens the read window; every decision below is made on
-  // the row's real length, and the trivial path reads no scores at all, so it
-  // takes the un-rounded problem.
+#ifdef USE_ROCM
+  // Packed rows: the residue only widens the read window; every decision below
+  // is made on the row's real length, and the trivial path reads no scores at
+  // all, so it takes the un-rounded problem.
   const auto residue = static_cast<uint32_t>(-problem.index_shift);
   const auto row_seq_len = problem.seq_len - residue;
   if (row_seq_len <= problem.topk) {
@@ -332,9 +354,16 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
     return trivial_transform<kPDLEarly, kMode>(problem);
   }
   if (residue != 0) {
+    // The mask has to land after the indexer has retired.
     device::PDLWaitPrimary<kPDL>();
     params.mask_head(blockIdx.x, residue);
   }
+#else
+  const auto row_seq_len = problem.seq_len;
+  if (row_seq_len <= problem.topk) {
+    return trivial_transform<kPDLEarly, kMode>(problem);
+  }
+#endif
 
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
   __shared__ int32_t s_topk_indices[kNeedStaging ? kMaxTopK : 1];
@@ -597,6 +626,7 @@ struct TopKKernel {
         .with_device(device_)
         .verify(metadata);
 
+#ifdef USE_ROCM
     const int32_t* row_starts_ptr = nullptr;
     if (row_starts.has_value()) {
       TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_starts.value());
@@ -608,6 +638,15 @@ struct TopKKernel {
       TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_to_batch.value());
       row_to_batch_ptr = static_cast<const int32_t*>(row_to_batch.value().data_ptr());
     }
+#else
+    // Packed-row addressing is a ROCm-only extension of this entry point: on
+    // ROCm the paged transform is the only route DSA extend has, while CUDA
+    // reaches the same shape through transform_ragged. Rejecting it here keeps
+    // every CUDA path below byte-identical to the unpacked one.
+    RuntimeCheck(
+        !row_starts.has_value() && !row_to_batch.has_value(),
+        "topk_transform_paged: row_starts / row_to_batch are only supported on ROCm");
+#endif
 
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
@@ -633,8 +672,10 @@ struct TopKKernel {
         .page_table = page_table_ptr,
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
+#ifdef USE_ROCM
         .row_starts = row_starts_ptr,
         .row_to_batch = row_to_batch_ptr,
+#endif
         .score_stride = S.unwrap(),
         .page_table_stride = page_table_stride,
         .topk = topk,
@@ -643,12 +684,11 @@ struct TopKKernel {
     };
 
 #ifndef USE_ROCM
-    // Packed rows stay off the cluster path: there one row is split across the
-    // blocks of a cluster, so the head mask would need a cluster-wide barrier to
-    // be visible. Only DSA extend passes row_starts, and its rows are short
-    // enough that the cluster path was never the fast one anyway.
-    const bool use_cluster =
-        (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch) && row_starts_ptr == nullptr;
+    // Packed rows would have to stay off the cluster path (there one row is
+    // split across the blocks of a cluster, so the head mask would need a
+    // cluster-wide barrier to be visible), but they are rejected above on this
+    // build, so there is nothing extra to exclude here.
+    const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
 #endif
     constexpr bool kUsePDL = true;
     const auto mode = page_table.has_value() ? TopKMode::PAGE_TABLE : TopKMode::INDICES;

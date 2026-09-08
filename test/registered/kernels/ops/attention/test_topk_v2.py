@@ -38,6 +38,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -381,6 +382,11 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
 
 
+@pytest.mark.skipif(
+    not is_hip(),
+    reason="packed rows (row_starts / row_to_batch) are compiled into the paged "
+    "kernel under USE_ROCM only; CUDA uses the ragged transform instead",
+)
 @pytest.mark.parametrize("k", [512, 2048])
 @pytest.mark.parametrize(
     "extend_lens",
