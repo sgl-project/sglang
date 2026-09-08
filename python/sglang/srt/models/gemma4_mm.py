@@ -139,21 +139,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     config_class = Gemma4Config
     """Gemma4 multimodal model for conditional generation."""
 
-    # Quant configs list the vision/audio towers' *unfused* projections under
-    # the clippable wrapper's inner module (`...q_proj.linear`), but we fuse
-    # those into `qkv_proj`/`gate_up_proj` and expand a fused name back to
-    # bare shard names (`...q_proj`) when testing the ignore list. Dropping
-    # the `.linear` suffix here lets the expansion match, so quantized-text /
-    # bf16-vision checkpoints (e.g. gemma-4-31B-it-qat-w4a16-ct) keep the
-    # towers unquantized instead of looking for absent packed weights.
-    hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_suffix={
-            ".linear": "",
-            ".linear.weight": ".weight",
-            ".linear.bias": ".bias",
-        },
-    )
-
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -183,6 +168,34 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             "up_proj",
         ],
     }
+
+    # Quant configs name the vision/audio towers' projections under the
+    # clippable wrapper's inner module (`...self_attn.q_proj.linear`,
+    # `...mlp.down_proj.linear`).  Two cases, and only one needs rewriting:
+    #
+    #   * Non-fused (`o_proj`, `down_proj`, ...) — the wrapper's inner module
+    #     really does live at `.linear`, so the config name already equals the
+    #     sglang layer name.  Leave it alone.
+    #   * Fused (`{q,k,v}_proj` -> `qkv_proj`, `{gate,up}_proj` ->
+    #     `gate_up_proj`) — the inner module is named after the fused
+    #     projection, so there is no `.linear` in the sglang name.  The ignore
+    #     check expands a fused layer name back into bare shard names
+    #     (`...self_attn.q_proj`), which cannot match a `.linear`-suffixed
+    #     config entry, so drop the suffix on exactly these shards.
+    #
+    # Without this, quantized-text / bf16-vision checkpoints (e.g.
+    # gemma-4-31B-it-qat-w4a16-ct) route the towers to a packed scheme and
+    # fail looking for absent packed weights.  A blanket `.linear` -> ``
+    # rewrite fixes the fused case but breaks the non-fused one: the shortened
+    # entry is then a *prefix* of the real layer name, which the ignore check
+    # deliberately refuses to match.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_suffix={
+            f"{shard}.linear": shard
+            for shards in packed_modules_mapping.values()
+            for shard in shards
+        },
+    )
 
     # LoRA specific attributes
     supported_lora_modules = [
