@@ -3,7 +3,7 @@
 Guards the correctness contract of the ROCm fix in
 ``eagle_utils._verify_uses_greedy``: on every non-HIP platform the gate must
 reduce byte-for-byte to the pre-patch predicate
-(``is_all_greedy or is_cpu or is_npu or is_hip or is_xpu``), and HIP may take the
+(``is_all_greedy or is_cpu or is_hip or is_xpu``), and HIP may take the
 sampling path only when rejection sampling is on and the batch isn't all-greedy.
 A regression that forced greedy on CUDA, or that let HIP sample without rejection
 sampling, would turn a case here red. Pure-boolean logic, so it runs on CPU CI.
@@ -19,9 +19,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _pre_patch_gate(is_all_greedy, is_cpu, is_npu, is_hip, is_xpu):
+def _pre_patch_gate(is_all_greedy, is_cpu, is_hip, is_xpu):
     # eagle_utils.py gate before this PR. Non-HIP behavior must match this exactly.
-    return is_all_greedy or is_cpu or is_npu or is_hip or is_xpu
+    return is_all_greedy or is_cpu or is_hip or is_xpu
 
 
 # (name, is_cpu, is_npu, is_hip, is_xpu); CUDA == no platform flag set.
@@ -36,11 +36,10 @@ _PLATFORMS = {
 
 class TestEagleGateRouting(CustomTestCase):
     def _gate(self, is_all_greedy, platform, use_rej):
-        is_cpu, is_npu, is_hip, is_xpu = _PLATFORMS[platform]
+        is_cpu, _, is_hip, is_xpu = _PLATFORMS[platform]
         return _verify_uses_greedy(
             is_all_greedy=is_all_greedy,
             is_cpu=is_cpu,
-            is_npu=is_npu,
             is_hip=is_hip,
             is_xpu=is_xpu,
             use_rejection_sampling=use_rej,
@@ -50,11 +49,11 @@ class TestEagleGateRouting(CustomTestCase):
         for platform, is_all_greedy, use_rej in itertools.product(
             _PLATFORMS, (False, True), (False, True)
         ):
-            is_cpu, is_npu, is_hip, is_xpu = _PLATFORMS[platform]
+            is_cpu, _, is_hip, is_xpu = _PLATFORMS[platform]
             if is_hip:
                 continue
             got = self._gate(is_all_greedy, platform, use_rej)
-            expected = _pre_patch_gate(is_all_greedy, is_cpu, is_npu, is_hip, is_xpu)
+            expected = _pre_patch_gate(is_all_greedy, is_cpu, is_hip, is_xpu)
             self.assertEqual(
                 got,
                 expected,
@@ -70,15 +69,16 @@ class TestEagleGateRouting(CustomTestCase):
         self.assertTrue(self._gate(True, "hip", False))
         self.assertTrue(self._gate(False, "hip", False))
 
-    def test_cuda_keyed_on_all_greedy_only(self):
-        # CUDA samples whenever the batch isn't all-greedy, regardless of the flag.
-        self.assertFalse(self._gate(False, "cuda", False))
-        self.assertFalse(self._gate(False, "cuda", True))
-        self.assertTrue(self._gate(True, "cuda", False))
-        self.assertTrue(self._gate(True, "cuda", True))
+    def test_cuda_and_npu_keyed_on_all_greedy_only(self):
+        # Both sample whenever the batch isn't all-greedy, regardless of the flag.
+        for platform in ("cuda", "npu"):
+            self.assertFalse(self._gate(False, platform, False))
+            self.assertFalse(self._gate(False, platform, True))
+            self.assertTrue(self._gate(True, platform, False))
+            self.assertTrue(self._gate(True, platform, True))
 
-    def test_cpu_npu_xpu_always_greedy(self):
-        for platform in ("cpu", "npu", "xpu"):
+    def test_cpu_xpu_always_greedy(self):
+        for platform in ("cpu", "xpu"):
             for is_all_greedy in (False, True):
                 for use_rej in (False, True):
                     self.assertTrue(

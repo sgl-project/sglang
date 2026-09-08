@@ -689,7 +689,6 @@ def _verify_uses_greedy(
     *,
     is_all_greedy: bool,
     is_cpu: bool,
-    is_npu: bool,
     is_hip: bool,
     is_xpu: bool,
     use_rejection_sampling: bool,
@@ -701,13 +700,7 @@ def _verify_uses_greedy(
     sampler instead, so only a HIP run without that still has to go greedy. Every
     other platform reduces to the original predicate.
     """
-    return (
-        is_all_greedy
-        or is_cpu
-        or is_npu
-        or is_xpu
-        or (is_hip and not use_rejection_sampling)
-    )
+    return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
 
 
 def _can_use_sparse_uno_tree_target_sampling(
@@ -810,7 +803,6 @@ def eagle_sample(
     if _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
-        is_npu=_is_npu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
