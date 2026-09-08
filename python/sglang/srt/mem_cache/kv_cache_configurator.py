@@ -113,6 +113,13 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     )
 
 
+def _target_verify_num_draft_tokens() -> int | None:
+    """Return the draft width only for workers that can run target verify."""
+    if get_disagg().disaggregation_mode == "prefill":
+        return None
+    return max_speculative_num_draft_tokens()
+
+
 _is_hip = is_hip()
 
 
@@ -1117,14 +1124,8 @@ class KVCacheConfigurator:
             mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-            # A PD prefill server never runs TARGET_VERIFY, so skip the
-            # verify-only per-draft-token state snapshots (see the draft-head
-            # case above: None => the pool skips SpeculativeState).
-            speculative_num_draft_tokens=(
-                None
-                if get_disagg().disaggregation_mode == "prefill"
-                else max_speculative_num_draft_tokens()
-            ),
+            # None skips verify-only per-draft-token state snapshots.
+            speculative_num_draft_tokens=_target_verify_num_draft_tokens(),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
@@ -2335,16 +2336,21 @@ class KVCacheConfigurator:
             config.mamba2_cache_params.mamba_cache_per_req * pp_layer_scale
         )
 
-        has_spec_dec = not self.spec_algorithm.is_none()
+        target_verify_num_draft_tokens = _target_verify_num_draft_tokens()
+        has_target_verify = target_verify_num_draft_tokens is not None
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
         # freed ~9GB turns into higher max_running.
         # The ring is not part of mamba_cache_per_req. GDN replay is fixed-size
         # request scratch; KDA replay remains attached to each mamba slot.
-        replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
-            self.hybrid_gdn_config is not None
-            or kimi_linear_config(self.model_config) is not None
+        replayssm_active = (
+            has_target_verify
+            and get_exec().mamba.enable_linear_replayssm_spec
+            and (
+                self.hybrid_gdn_config is not None
+                or kimi_linear_config(self.model_config) is not None
+            )
         )
         if replayssm_active:
             record_len = get_exec().mamba.linear_replayssm_cache_len
@@ -2365,8 +2371,7 @@ class KVCacheConfigurator:
         else:
             replayssm_fixed_bytes = 0
             replayssm_ring_per_slot = replayssm_ring_per_req
-        if has_spec_dec:
-            assert get_spec().speculative_num_draft_tokens is not None
+        if has_target_verify:
             assert get_schedule().max_running_requests is not None
 
         if get_schedule().max_mamba_cache_size is not None:
@@ -2379,16 +2384,14 @@ class KVCacheConfigurator:
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
             # (no intermediate_ssm allocated).
-            if has_spec_dec and not replayssm_active:
+            if has_target_verify and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    stage_per_req
-                    * (capped_reqs + 1)
-                    * get_spec().speculative_num_draft_tokens
+                    stage_per_req * (capped_reqs + 1) * target_verify_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -2403,11 +2406,11 @@ class KVCacheConfigurator:
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.
-            if has_spec_dec and not replayssm_active:
+            if has_target_verify and not replayssm_active:
                 intermediate_size = (
                     stage_per_req
                     * (get_schedule().max_mamba_cache_size + 1)
-                    * get_spec().speculative_num_draft_tokens
+                    * target_verify_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -2425,9 +2428,9 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec and not replayssm_active:
+            if has_target_verify and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
-                D = get_spec().speculative_num_draft_tokens
+                D = target_verify_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
