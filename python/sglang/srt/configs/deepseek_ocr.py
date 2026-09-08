@@ -548,7 +548,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
             else:
                 if cropping:
                     images_crop_raw, crop_ratio = dynamic_preprocess(
-                        image, image_size=IMAGE_SIZE
+                        image, image_size=self.image_size
                     )
                 else:
                     crop_ratio = [1, 1]
