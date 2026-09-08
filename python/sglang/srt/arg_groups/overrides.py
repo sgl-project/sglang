@@ -41,7 +41,11 @@ import math
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups import model_override_base
-from sglang.srt.arg_groups.arg_utils import field_names, resolvable_fields
+from sglang.srt.arg_groups.arg_utils import (
+    field_names,
+    resolvable_fields,
+    with_fallback,
+)
 
 # Re-exported for the callers that already import these names from here; the
 # declarations under ``model_overrides/`` import them from the base directly.
@@ -246,7 +250,13 @@ def declare_direct_writes(
         for field in dataclasses.fields(server_args)
     }
     already = len(getattr(server_args, "_resolved_overrides", None) or ())
-    result = resolve(server_args)
+    # The one place the input seal comes off. The plugin writes the record;
+    # the diff below captures what it moved into the stash so the projection
+    # and the bags carry it.
+    from sglang.srt.server_args import record_writable
+
+    with record_writable(server_args):
+        result = resolve(server_args)
     stash = getattr(server_args, "_resolved_overrides", None)
     if stash is None:
         stash = []
@@ -268,7 +278,13 @@ def declare_direct_writes(
 
 def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     """What resolution decided for ``field``: the declaration if there is one,
-    otherwise what the caller supplied.
+    otherwise what the caller supplied, otherwise the field's declared
+    fallback.
+
+    The fallback is last because it is what the field means when nobody said
+    anything -- an operator who types a value and a pass that decides one both
+    sit above it. It is read from the declaration rather than filled in by a
+    pass, so there is no slot to place and no second call to make idempotent.
 
     This is what the config projection reads. Reading the field instead would
     work whatever the caller passed onto the record -- and
@@ -283,8 +299,8 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
             return declared[field]
     raw = getattr(server_args, "_raw_input", None)
     if raw is not None and field in raw:
-        return raw[field]
-    return getattr(server_args, field, default)
+        return with_fallback(type(server_args), field, raw[field])
+    return with_fallback(type(server_args), field, getattr(server_args, field, default))
 
 
 def resolution_projection(server_args: Any) -> Dict[str, Any]:
@@ -548,6 +564,8 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
+    if get_platform().is_xpu:
+        return False
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
         return view.linear_attn_backend == "triton"
     return False
@@ -1400,14 +1418,13 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 @register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
-    _, decode_backend = attention_backends_of(view)
-    if decode_backend == "intel_xpu":
+    prefill_backend, decode_backend = attention_backends_of(view)
+    if "intel_xpu" in (prefill_backend, decode_backend):
+        supported_page_sizes = [64, 128]
+        msg = "Intel XPU attention backend"
         if use_mla_backend(view):
-            supported_page_sizes = [16, 32, 64, 128]
-            msg = "Intel XPU attention backend for MLA Decode"
-        else:
-            supported_page_sizes = [64, 128]
-            msg = "Intel XPU attention backend"
+            supported_page_sizes.extend([16, 32])
+            msg = msg + " for MLA"
         if view.page_size not in supported_page_sizes:
             logger.warning(
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
