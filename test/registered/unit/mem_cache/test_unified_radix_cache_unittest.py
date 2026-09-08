@@ -9391,6 +9391,13 @@ class TestFailedLinkerChainWithASecondOwner(CustomTestCase):
     CHAIN = 12
     TAIL = 4
 
+    def _skip_external_load_recovery_on_rust(self) -> None:
+        # detach_external_load_chain and the reclaim it feeds read the Python
+        # core's node arena directly; the Rust core inherits the interface's
+        # raising defaults instead.
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("external-linker load-failure recovery is Python-core only")
+
     def _fixture(self):
         return build_fixture(
             CacheConfig(
@@ -9470,6 +9477,7 @@ class TestFailedLinkerChainWithASecondOwner(CustomTestCase):
         return other, other_lock, chain, tail_pages
 
     def test_the_second_owner_is_visible_as_holding_the_failed_chain(self):
+        self._skip_external_load_recovery_on_rust()
         cache, allocator, req_to_token_pool = self._fixture()
         other, _lock, _chain, _tail = self._publish_chain_and_a_second_owner(
             cache, allocator, req_to_token_pool
@@ -9483,6 +9491,7 @@ class TestFailedLinkerChainWithASecondOwner(CustomTestCase):
         )
 
     def test_the_chain_is_freed_when_its_last_owner_releases(self):
+        self._skip_external_load_recovery_on_rust()
         cache, allocator, req_to_token_pool = self._fixture()
         total = self._accounting(cache, allocator)
         other, lock, chain, tail_pages = self._publish_chain_and_a_second_owner(
