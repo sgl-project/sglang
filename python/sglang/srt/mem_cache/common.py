@@ -149,7 +149,12 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None,
+    num_tokens: int,
+    *,
+    swa_num_tokens: int | None = None,
+):
     if tree_cache is None:
         return
 
@@ -163,9 +168,10 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         full_available_size = allocator.full_available_size()
         swa_available_size = allocator.swa_available_size()
 
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
+        swa_need = num_tokens if swa_num_tokens is None else swa_num_tokens
+        if full_available_size < num_tokens or swa_available_size < swa_need:
             full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
+            swa_num_tokens = max(0, swa_need - swa_available_size)
             tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )

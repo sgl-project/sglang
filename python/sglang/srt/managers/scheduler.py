@@ -609,6 +609,10 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.enable_flexkv_prefetch = bool(
+            get_memory().enable_flexkv
+            and getattr(self.tree_cache, "supports_storage_prefetch", False)
+        )
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
@@ -3066,6 +3070,21 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        if self.enable_flexkv_prefetch:
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            matched_len = len(req.prefix_indices) + req.host_hit_length
+            match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
+            if matched_len >= match_end:
+                return
+            self.tree_cache.prefetch_from_storage(
+                req.rid,
+                req.last_host_node,
+                req.full_untruncated_fill_ids[matched_len:match_end],
+                matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
+            )
+            return
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -3197,6 +3216,7 @@ class Scheduler(
         if (
             self.enable_hierarchical_cache
             or self.enable_hicache_storage
+            or self.enable_flexkv_prefetch
             or self.enable_unified_cache_external_linker
         ):
             self.tree_cache.release_aborted_request(rid)
@@ -3788,7 +3808,12 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        if self.chunked_req is not None:
+        has_uncommitted_restore = getattr(
+            self.tree_cache, "has_uncommitted_restore", None
+        )
+        if self.chunked_req is not None and not (
+            has_uncommitted_restore and has_uncommitted_restore(self.chunked_req)
+        ):
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -3810,6 +3835,10 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # Preserve the request's detached slots until cache completion publishes them.
+            if has_uncommitted_restore and has_uncommitted_restore(req):
+                continue
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3835,7 +3864,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_flexkv_prefetch:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
@@ -3892,9 +3921,11 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
+                        or get_memory().enable_flexkv
                         or self.enable_unified_cache_external_linker
                     ):
-                        # Set batch_is_full after making sure there are requests that can be served
+                        # An empty batch must retry after host-cache admission
+                        # pressure clears; no running decode can clear this flag.
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
                         )
@@ -3906,6 +3937,11 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    if has_uncommitted_restore and has_uncommitted_restore(req):
+                        raise RuntimeError(
+                            f"Request rejected after FlexKV restore: {req.rid}"
+                        )
+
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.kv.mamba_cow_src_index = None

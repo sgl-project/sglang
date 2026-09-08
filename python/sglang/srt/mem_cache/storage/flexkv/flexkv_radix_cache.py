@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
+from flexkv.integration.sglang.connector import FlexKVConnector
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -41,7 +42,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -496,14 +496,42 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector.release_pending(rid)
         self.flexkv_connector.cancel_prefetch(rid)
 
+    @property
+    def supports_storage_prefetch(self) -> bool:
+        return bool(getattr(self.flexkv_connector, "_chunked_prefetch", False))
+
     def prefetch_from_storage(
-        self, rid: str, last_host_node: TreeNode, token_ids
+        self,
+        rid: str,
+        last_host_node: TreeNode,
+        token_ids,
+        last_hash=None,
+        prefix_keys=None,
+        *,
+        matched_prefix_tokens=None,
+        extra_key=None,
+        cache_salt=None,
     ) -> None:
-        """Kick off an opportunistic prefetch (SSD/Remote → CPU)."""
-        try:
-            self.flexkv_connector.prefetch_async(rid, list(token_ids))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[FlexKV] prefetch_from_storage: %s", exc)
+        """Pass the full hash-chain input, including the scheduler's prefix."""
+        # FlexKV's foreground adapter does not yet propagate namespace/salt.
+        # Do not prefetch cross-namespace data through this optional path.
+        if extra_key is not None or cache_salt is not None:
+            return
+        if matched_prefix_tokens is not None:
+            full_tokens = list(matched_prefix_tokens) + list(token_ids)
+            candidate_start = len(matched_prefix_tokens)
+        else:
+            marker = self._load_markers.get(rid)
+            full_tokens = (
+                list(marker.key.raw_token_ids()) if marker else list(token_ids)
+            )
+            candidate_start = max(0, len(full_tokens) - len(token_ids))
+        if getattr(self.flexkv_connector, "_chunked_prefetch", False):
+            self.flexkv_connector.prefetch_async(
+                rid, full_tokens, candidate_start_token=candidate_start
+            )
+        else:
+            self.flexkv_connector.prefetch_async(rid, full_tokens)
 
     def check_prefetch_progress(self, rid: str) -> bool:
         return self.flexkv_connector.check_prefetch_progress(rid)
@@ -512,8 +540,10 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector.cancel_prefetch(rid)
 
     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
-        # FlexKV doesn't expose per-rid prefetched token counts yet.
-        return 0
+        return self.flexkv_connector.pop_prefetch_loaded_tokens(rid)
+
+    def pop_prefetch_loaded_span(self, rid: str):
+        return self.flexkv_connector.pop_prefetch_loaded_span(rid)
 
     @property
     def hicache_storage_pass_prefix_keys(self) -> bool:
