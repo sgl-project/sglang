@@ -2254,11 +2254,12 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.kv_reuses = Histogram(
             name="sglang:kv_reuses",
             documentation="TreeNode.hit_count at the moment a radix node is "
-            "removed from a tier: the number of non-chunked finished requests "
-            "that inserted the node, including the one that created it, so 1 "
-            "means cached and never reused. Under --hicache-write-policy "
-            "write_back HiRadixCache does not maintain hit_count and this "
-            "reads 0.",
+            "removed from a tier: the number of non-chunked inserts that "
+            "touched the node. One request inserts twice (end of prefill and "
+            "at finish), so a node cached by one request and never reused "
+            "reads 2; each additional request that reuses it adds 2. Under "
+            "--hicache-write-policy write_back the HiCache paths do not "
+            "maintain hit_count and this reads 0.",
             labelnames=list(labels.keys()) + ["tier", "outcome"],
             buckets=list(KV_REUSE_BUCKETS),
         )
