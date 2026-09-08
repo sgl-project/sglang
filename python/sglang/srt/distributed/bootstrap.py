@@ -27,6 +27,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -38,7 +39,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
-    is_hip,
     is_host_cpu_arm64,
     is_npu,
     monkey_patch_p2p_access_check,
@@ -80,19 +80,22 @@ def init_torch_distributed(
     tic = time.perf_counter()
     logger.info("Init torch distributed begin.")
 
-    backend = _resolve_backend(device=device, server_args=server_args)
+    backend = _resolve_backend(device=device)
 
     before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
     if not get_parallel().enable_p2p_check:
         monkey_patch_p2p_access_check()
 
     dist_init_method = _resolve_dist_init_method(dist_port=dist_port)
-    _set_all_reduce_flags(server_args=server_args)
+    _set_all_reduce_flags()
 
     if not is_draft_worker:
         if device == "cpu":
             _init_cpu_threads_env(
-                tp_size=ps.tp_size, tp_rank=ps.tp_rank, local_omp_cpuid=local_omp_cpuid
+                tp_size=ps.tp_size,
+                tp_rank=ps.tp_rank,
+                local_omp_cpuid=local_omp_cpuid,
+                dist_init_method=dist_init_method,
             )
 
         # Only initialize the distributed environment on the target model worker.
@@ -169,9 +172,9 @@ def init_torch_distributed(
     )
 
 
-def _resolve_backend(*, device: str, server_args: ServerArgs) -> str:
+def _resolve_backend(*, device: str) -> str:
     backend = get_default_distributed_backend(device)
-    if device == "cuda" and server_args.elastic_ep_backend == "mooncake":
+    if device == "cuda" and get_exec().moe.elastic_ep_backend == "mooncake":
         backend = "mooncake"
     return backend
 
@@ -194,17 +197,34 @@ def _resolve_dist_init_method(*, dist_port: int) -> str:
     return dist_init_method
 
 
-def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
+def _set_all_reduce_flags() -> None:
     set_custom_all_reduce(not get_exec().comm.disable_custom_all_reduce)
-    set_mscclpp_all_reduce(server_args.enable_mscclpp)
+    set_mscclpp_all_reduce(get_exec().comm.enable_mscclpp)
     set_torch_symm_mem_all_reduce(get_exec().comm.enable_torch_symm_mem)
     set_flashinfer_allreduce_only(
         get_exec().comm.flashinfer_allreduce_fusion_backend is not None
     )
 
 
+def _set_shm_master_env(dist_init_method: Optional[str]) -> None:
+    # setdefault so an explicit user-provided MASTER_ADDR/MASTER_PORT wins.
+    prefix = "tcp://"
+    if (
+        dist_init_method
+        and dist_init_method.startswith(prefix)
+        and ":" in dist_init_method[len(prefix) :]
+    ):
+        host, port = dist_init_method[len(prefix) :].rsplit(":", 1)
+        os.environ.setdefault("MASTER_ADDR", host)
+        os.environ.setdefault("MASTER_PORT", port)
+
+
 def _init_cpu_threads_env(
-    *, tp_size: int, tp_rank: int, local_omp_cpuid: Optional[List[int]]
+    *,
+    tp_size: int,
+    tp_rank: int,
+    local_omp_cpuid: Optional[List[int]],
+    dist_init_method: Optional[str] = None,
 ) -> None:
     if _is_cpu_amx_available or _is_cpu_arm64:
         # Bind OpenMP threads to CPU cores
@@ -212,6 +232,13 @@ def _init_cpu_threads_env(
 
         # Set local size to hint SGLang to use shared memory based AllReduce
         os.environ["LOCAL_SIZE"] = str(tp_size)
+
+        # shm.cpp names its /dev/shm segments from MASTER_ADDR/MASTER_PORT.
+        # Feed each engine's unique dist_init_method (tcp://host:port) into
+        # these env vars so co-located engines get distinct segment names and
+        # don't collide.
+        _set_shm_master_env(dist_init_method)
+
         torch.ops.sgl_kernel.initialize(tp_size, tp_rank)
 
     else:
@@ -237,8 +264,8 @@ def _init_parallel_groups(
     moe_dp_size: int,
     dcp_size: int,
 ) -> None:
-    is_ep_joiner = server_args.is_ep_joiner
-    is_scale_joiner = server_args.is_ep_scale_joiner
+    is_ep_joiner = get_exec().moe.is_ep_joiner
+    is_scale_joiner = get_exec().moe.is_ep_scale_joiner
     rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
@@ -265,11 +292,6 @@ def _init_parallel_groups(
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
-        duplicate_attn_cp_group=(
-            is_hip()
-            and server_args.enable_two_batch_overlap
-            and get_parallel().enable_dsa_prefill_context_parallel
-        ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,
@@ -280,6 +302,7 @@ def _init_parallel_groups(
         server_args=server_args,
         model_config=model_config,
     )
+    initialize_layernorm_sp(model_config=model_config)
     if is_npu():
         register_sgl_tp_rank(gpu_id)
 

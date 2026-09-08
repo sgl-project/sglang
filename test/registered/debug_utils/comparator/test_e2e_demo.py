@@ -26,7 +26,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
 from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="default", nightly=True)
+register_cpu_ci(est_time=10, stage="weekly", runner_config="cpu")
 
 _EXP_NAME = "demo_exp"
 
