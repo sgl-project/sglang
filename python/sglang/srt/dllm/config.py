@@ -69,10 +69,7 @@ class DllmConfig:
 
         algorithm_cls = get_algorithm_cls(cfg.dllm_algorithm)
         required_algorithm = params.get("algorithm")
-        if (
-            required_algorithm is not None
-            and required_algorithm != cfg.dllm_algorithm
-        ):
+        if required_algorithm is not None and required_algorithm != cfg.dllm_algorithm:
             raise ValueError(
                 f"{arch} requires the {required_algorithm} diffusion algorithm"
             )

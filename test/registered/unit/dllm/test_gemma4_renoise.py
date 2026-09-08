@@ -6,9 +6,13 @@ import torch
 
 from sglang.srt.arg_groups.overrides import _dllm_attention_backend, resolving_view
 from sglang.srt.dllm.algorithm import get_algorithm
-from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
+from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise, _sample_denoiser
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -107,6 +111,21 @@ class TestGemma4Renoise(unittest.TestCase):
         algorithm.prepare_inputs(runner, batch, states)
         return states
 
+    def test_sampling_matches_multinomial_and_advances_request_rng(self):
+        probabilities = torch.randn(64, 128).softmax(dim=-1)
+        for seed in (0, 42, 12345):
+            with self.subTest(seed=seed):
+                generator = torch.Generator().manual_seed(seed)
+                reference_generator = torch.Generator().manual_seed(seed)
+                actual = _sample_denoiser(probabilities, generator)
+                expected = torch.multinomial(
+                    probabilities, num_samples=1, generator=reference_generator
+                ).squeeze(-1)
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(
+                    generator.get_state(), reference_generator.get_state()
+                )
+
     def test_defaults_and_validation(self):
         algorithm = Gemma4Renoise(_config())
         self.assertEqual(algorithm.max_denoising_steps, 48)
@@ -188,7 +207,7 @@ class TestGemma4Renoise(unittest.TestCase):
         self.assertIsNone(server_args.decode_attention_backend)
         resolved = resolving_view(server_args)
         self.assertTrue(resolved.disable_radix_cache)
-        self.assertEqual(resolved.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(resolved.cuda_graph_config.decode.backend, Backend.FULL)
         self.assertEqual(resolved.cuda_graph_config.prefill.backend, Backend.DISABLED)
         self.assertEqual(resolved.chunked_prefill_size, -1)
         self.assertFalse(server_args.disable_radix_cache)

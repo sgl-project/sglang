@@ -90,9 +90,10 @@ class TestGemma4DiffusionImageMasks(unittest.TestCase):
         )
         input_ids = torch.arange(6)
 
-        with patch.object(
-            gemma4_mm, "TritonAttnBackend", _FakeTritonBackend
-        ), patch.object(gemma4_mm, "get_attn_backend", return_value=backend):
+        with (
+            patch.object(gemma4_mm, "TritonAttnBackend", _FakeTritonBackend),
+            patch.object(gemma4_mm, "get_attn_backend", return_value=backend),
+        ):
             Gemma4ForConditionalGeneration.prepare_attn_masks(
                 None, forward_batch, input_ids, torch.bool
             )

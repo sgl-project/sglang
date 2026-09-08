@@ -105,8 +105,8 @@ class ReqDllmMixin:
         if self.dllm_config.requires_separate_context_encoding:
             assert prefix_len <= self.dllm_block_offset
         else:
-            assert (
-                prefix_len % self.dllm_config.block_size == 0
-            ), f"Unexpected prefix len: {prefix_len}"
+            assert prefix_len % self.dllm_config.block_size == 0, (
+                f"Unexpected prefix len: {prefix_len}"
+            )
             if prefix_len > self.dllm_block_offset:
                 self.dllm_block_offset = prefix_len

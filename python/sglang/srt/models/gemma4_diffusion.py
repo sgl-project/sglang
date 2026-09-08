@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from transformers import PreTrainedModel
 
+from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_qkv_rmsnorm
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -36,6 +37,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -51,7 +53,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
+from sglang.srt.models.gemma3_causal import Gemma3MLP
 from sglang.srt.models.gemma4_causal import Gemma4MoE, Gemma4Router
 from sglang.srt.models.gemma4_mm import (
     Gemma4ForConditionalGeneration,
@@ -163,15 +165,28 @@ class DiffusionGemmaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = self.q_norm(q.unflatten(-1, (self.num_heads, self.head_dim))).flatten(
-            -2, -1
-        )
-        k = self.k_norm(k.unflatten(-1, (self.num_kv_heads, self.head_dim))).flatten(
-            -2, -1
-        )
-        v = self.v_norm(v.unflatten(-1, (self.num_kv_heads, self.head_dim))).flatten(
-            -2, -1
-        )
+        if q.is_cuda:
+            gemma_qkv_rmsnorm(
+                q,
+                k,
+                v,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                eps=self.q_norm.eps,
+            )
+        else:
+            q = self.q_norm(q.unflatten(-1, (self.num_heads, self.head_dim))).flatten(
+                -2, -1
+            )
+            k = self.k_norm(
+                k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            ).flatten(-2, -1)
+            v = self.v_norm(
+                v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            ).flatten(-2, -1)
 
         q, k = self.rotary_emb(positions, q, k)
 
@@ -314,6 +329,19 @@ class DiffusionGemmaDecoderLayer(nn.Module):
         return hidden_states * scalar
 
 
+class DiffusionGemmaTextEmbedding(VocabParallelEmbedding):
+    """Tied, vocabulary-parallel embeddings and output projection."""
+
+    def __init__(self, config, prefix: str = ""):
+        super().__init__(config.vocab_size, config.hidden_size, prefix=prefix)
+        self.register_buffer(
+            "embed_scale", torch.tensor(config.hidden_size**0.5), persistent=False
+        )
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
+
+
 class DiffusionGemmaModel(nn.Module):
     """Shared transformer stack (stored under `model.decoder.*`) + the decoder's
     self-conditioning block."""
@@ -323,11 +351,8 @@ class DiffusionGemmaModel(nn.Module):
         text_config = config.text_config
         self.config = text_config
 
-        self.embed_tokens = Gemma3TextScaledWordEmbedding(
-            text_config.vocab_size,
-            text_config.hidden_size,
-            text_config.pad_token_id,
-            embed_scale=text_config.hidden_size**0.5,
+        self.embed_tokens = DiffusionGemmaTextEmbedding(
+            text_config, prefix=add_prefix("embed_tokens", prefix)
         )
         self.self_conditioning = DiffusionGemmaSelfConditioning(
             text_config,
@@ -423,10 +448,9 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
                 prefix=add_prefix("embed_vision", prefix),
             )
         self.lm_head = self.model.embed_tokens
-        # Softcapping is handled by LogitsProcessor. skip_all_gather: the tied
-        # lm_head is replicated, every TP rank already has full-vocab logits.
+        # Gather the tied vocabulary shards before applying the renoise sampler.
         self.logits_processor = LogitsProcessor(
-            self.text_config, skip_all_gather=True, return_full_logits=True
+            self.text_config, return_full_logits=True
         )
         self.post_init()
 

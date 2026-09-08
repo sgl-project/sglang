@@ -7,8 +7,10 @@ import torch
 
 from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm, DllmRunOutput
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -16,6 +18,25 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import ServerArgs
+
+
+def _denoiser_statistics(logits: torch.Tensor, temperatures: torch.Tensor):
+    processed_logits = logits / temperatures[:, None, None]
+    log_probabilities = torch.log_softmax(processed_logits, dim=-1, dtype=torch.float32)
+    probabilities = log_probabilities.exp()
+    token_entropies = -(log_probabilities * probabilities).sum(dim=-1)
+    return probabilities, token_entropies, logits.argmax(dim=-1)
+
+
+_compiled_denoiser_statistics = torch.compile(_denoiser_statistics, dynamic=True)
+
+
+def _sample_denoiser(probabilities: torch.Tensor, generator: torch.Generator):
+    # The exponential-race formulation samples the same categorical distribution
+    # as multinomial. Probabilities come from softmax, so multinomial's repeated
+    # validation and device-to-host synchronization are unnecessary here.
+    noise = torch.empty_like(probabilities).exponential_(1.0, generator=generator)
+    return (probabilities / noise).argmax(dim=-1)
 
 
 class Gemma4Renoise(DllmAlgorithm):
@@ -51,7 +72,7 @@ class Gemma4Renoise(DllmAlgorithm):
             disable_radix_cache=True,
             chunked_prefill_size=-1,
             cuda_graph_config=with_phase(
-                with_phase(cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED),
+                cfg.cuda_graph_config,
                 Phase.PREFILL,
                 backend=Backend.DISABLED,
             ),
@@ -241,11 +262,21 @@ class Gemma4Renoise(DllmAlgorithm):
 
     def _soft_embeddings(self, probabilities: torch.Tensor) -> torch.Tensor:
         weight = self.embed_tokens.weight
+        sharded = isinstance(self.embed_tokens, VocabParallelEmbedding)
+        if sharded:
+            shard = self.embed_tokens.shard_indices
+            start, end = shard.org_vocab_start_index, shard.org_vocab_end_index
+            # Slice before casting: only materialize this rank's vocabulary.
+            probabilities = probabilities[..., start:end]
+            weight = weight[: end - start]
         probabilities = probabilities.to(weight.dtype)
+        soft_embeds = torch.matmul(probabilities, weight)
+        if sharded and self.embed_tokens.tp_size > 1:
+            soft_embeds = tensor_model_parallel_all_reduce(soft_embeds)
         scale = torch.as_tensor(
             self.embed_tokens.embed_scale, dtype=weight.dtype, device=weight.device
         )
-        return torch.matmul(probabilities, weight) * scale
+        return soft_embeds * scale
 
     def step(
         self,
@@ -256,61 +287,75 @@ class Gemma4Renoise(DllmAlgorithm):
         logits = full_logits.view(
             forward_batch.batch_size, self.block_size, self.vocab_size
         )
-        done = []
+        if all(state["finished"] for state in states):
+            self._write_input_ids(forward_batch, states)
+            return [True] * len(states)
 
+        temperatures = logits.new_tensor(
+            [self._temperature(state["step"]) for state in states]
+        )
+        statistics = (
+            _compiled_denoiser_statistics if logits.is_cuda else _denoiser_statistics
+        )
+        probabilities, token_entropies, argmax_tokens = statistics(logits, temperatures)
+        sorted_entropy, indices = torch.sort(token_entropies, dim=-1)
+        cumulative_entropy = torch.cumsum(sorted_entropy, dim=-1)
+        sorted_selected = cumulative_entropy - sorted_entropy <= self.entropy_bound
+        selected = torch.zeros_like(sorted_selected).scatter(
+            -1, indices, sorted_selected
+        )
+        confident = token_entropies.mean(dim=-1) < self.confidence_threshold
+        finished = []
+        active = []
         for index, state in enumerate(states):
             if state["finished"]:
-                done.append(True)
                 continue
-
-            processed_logits = logits[index] / self._temperature(state["step"])
-            log_probabilities = torch.log_softmax(
-                processed_logits, dim=-1, dtype=torch.float32
-            )
-            probabilities = log_probabilities.exp()
-            generator = torch.Generator(device=processed_logits.device)
+            active.append(index)
+            generator = torch.Generator(device=logits.device)
             generator.set_state(state["rng_state"])
-            denoiser = torch.multinomial(
-                probabilities, num_samples=1, generator=generator
-            ).squeeze(-1)
-            # Reuse the log-probability buffer for p*log(p); a canvas-wide
-            # full-vocabulary temporary is hundreds of MB for this model.
-            token_entropy = -log_probabilities.mul_(probabilities).sum(dim=-1)
-            sorted_entropy, indices = torch.sort(token_entropy)
-            cumulative_entropy = torch.cumsum(sorted_entropy, dim=-1)
-            selected = cumulative_entropy - sorted_entropy <= self.entropy_bound
-            selected = torch.zeros_like(selected).scatter(-1, indices, selected)
+            denoiser = _sample_denoiser(probabilities[index], generator)
             random_canvas = torch.randint(
                 self.vocab_size,
                 (self.block_size,),
-                device=processed_logits.device,
+                device=logits.device,
                 generator=generator,
             )
-            current = torch.where(selected, denoiser, random_canvas)
-            argmax = torch.argmax(processed_logits, dim=-1)
-
+            state["current"] = torch.where(selected[index], denoiser, random_canvas)
+            argmax = argmax_tokens[index]
             history = state["history"]
-            stable = self.stability_threshold == 0 or (
-                len(history) == self.stability_threshold
-                and all(torch.equal(previous, argmax) for previous in history)
-            )
+            if self.stability_threshold == 0:
+                stable = torch.ones((), dtype=torch.bool, device=logits.device)
+            elif len(history) == self.stability_threshold:
+                stable = (torch.stack(history) == argmax).all()
+            else:
+                stable = torch.zeros((), dtype=torch.bool, device=logits.device)
             history.append(argmax)
             if len(history) > self.stability_threshold:
                 history.pop(0)
-            confident = bool(token_entropy.mean() < self.confidence_threshold)
-
             state["step"] -= 1
             state["argmax"] = argmax
             state["rng_state"] = generator.get_state()
-            state["finished"] = (stable and confident) or state["step"] == 0
+            finished.append((stable & confident[index]) | (state["step"] == 0))
+
+        # One device-to-host synchronization for the whole batch. In particular,
+        # stability checks must not call torch.equal once per request/history.
+        done = [state["finished"] for state in states]
+        for index, value in zip(active, torch.stack(finished).tolist()):
+            states[index]["finished"] = value
+            done[index] = value
+
+        soft_embeds = None
+        if not all(done):
+            soft_embeds = self._soft_embeddings(
+                probabilities.reshape(-1, self.vocab_size)
+            ).view(len(states), self.block_size, -1)
+        for index in active:
+            state = states[index]
             if state["finished"]:
-                state["current"] = argmax
+                state["current"] = state["argmax"]
                 state["self_conditioning"] = None
             else:
-                state["current"] = current
-                state["self_conditioning"] = self._soft_embeddings(probabilities)
-            done.append(state["finished"])
-
+                state["self_conditioning"] = soft_embeds[index]
         self._write_input_ids(forward_batch, states)
         return done
 
