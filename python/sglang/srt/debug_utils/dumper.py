@@ -1176,7 +1176,7 @@ def _get_default_exp_name(timeout_seconds: int = 60):
 
     if dist.is_initialized():
         _collective_with_timeout(
-            lambda: dist.broadcast_object_list(object_list, device=get_device(rank)),
+            lambda: dist.broadcast_object_list(object_list, device=get_device()),
             operation_name="broadcast_object_list in _get_default_exp_name",
             timeout_seconds=timeout_seconds,
         )
