@@ -1,15 +1,17 @@
 """Boundary tests for the scheduler's waiting / running request timeouts.
 
-Both paths are pure bookkeeping over timestamps -- no model, no GPU, no draft
-worker -- so they are driven here directly instead of through a server. The
-e2e side (503 reaching the client, server stays up) is covered by
-scheduler/test_scheduler_control.py.
+The poll is pure bookkeeping over timestamps -- no model, no GPU, no draft
+worker -- so it is driven here directly instead of through a server. The 503
+reaching the client is covered by scheduler/test_scheduler_control.py.
 """
 
 import time
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,14 +19,24 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import mm_schedule
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.multimodal_cache import (
+    MM_EMBEDDING_CACHE_LEASE_ID_KEY,
+    EmbeddingResult,
+    MultiModalStaticCache,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _FakeReq:
-    """Must stay hashable: the waiting-timeout path collects drops in a set."""
-
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
         self.to_finish = None
@@ -34,6 +46,7 @@ class _FakeReq:
         self.session = None
         self.output_ids = []
         self.weight_version_events = []
+        self.kv = SimpleNamespace(holds_mamba=False)
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,
@@ -50,7 +63,11 @@ def _req(
     return _FakeReq(rid, wait_entry, forward_entry, finished)
 
 
-def _scheduler(waiting_queue):
+def _batch(reqs):
+    return SimpleNamespace(reqs=reqs, is_empty=lambda: not reqs)
+
+
+def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
     s.waiting_queue = waiting_queue
     s.enable_hierarchical_cache = False
@@ -58,6 +75,14 @@ def _scheduler(waiting_queue):
     s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
+    s.ps = SimpleNamespace(pp_size=1)
+    s.running_batch = _batch(list(running_reqs))
+    s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
+    s.chunked_req = None
+    s.mm_receiver = None
+    s.disaggregation_mode = DisaggregationMode.NULL
+    s.dllm_config = None
+    s.grammar_manager = MagicMock()
     return s
 
 
@@ -90,87 +115,118 @@ class TestQueuedLimitAbort(CustomTestCase):
 
 
 class TestWaitingTimeout(CustomTestCase):
-    def setUp(self):
-        patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
-            return_value=SimpleNamespace(weight_version="v0"),
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_drops_only_reqs_past_the_deadline(self):
+    def test_emits_only_reqs_past_the_deadline_and_keeps_queue_intact(self):
         now = time.perf_counter()
         stale = _req("stale", wait_entry=now - 10)
         fresh = _req("fresh", wait_entry=now)
         s = _scheduler([stale, fresh])
 
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
-            s._abort_on_waiting_timeout()
+            aborts = s._poll_timeout_aborts()
 
-        self.assertEqual([r.rid for r in s.waiting_queue], ["fresh"])
-        self.assertEqual(s.ipc_channels.send_to_tokenizer.send_output.call_count, 1)
+        self.assertEqual([a.rid for a in aborts], ["stale"])
+        self.assertEqual(aborts[0].finished_reason["type"], "abort")
+        # The poll emits only; removal happens on every rank via the broadcast.
+        self.assertEqual([r.rid for r in s.waiting_queue], ["stale", "fresh"])
 
-    def test_dropped_request_releases_multimodal_lease(self):
+    def test_timeout_abort_releases_multimodal_lease_after_poll(self):
         stale = _req("stale", wait_entry=time.perf_counter() - 10)
-        mm_inputs = MagicMock()
+        cache = MultiModalStaticCache(max_size=1024)
+        cache.set(11, EmbeddingResult(embedding=torch.tensor([1])))
+        self.assertEqual(cache.acquire_many("lease", [11], ttl_s=300), [True])
+        mm_inputs = MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    model_specific_data={MM_EMBEDDING_CACHE_LEASE_ID_KEY: "lease"},
+                )
+            ]
+        )
         stale.multimodal_inputs = mm_inputs
         s = _scheduler([stale])
 
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
-            s._abort_on_waiting_timeout()
+            aborts = s._poll_timeout_aborts()
 
-        mm_inputs.release_features.assert_called_once_with()
+        self.assertEqual([a.rid for a in aborts], ["stale"])
+        self.assertEqual(s.waiting_queue, [stale])
+        self.assertIs(stale.multimodal_inputs, mm_inputs)
+        self.assertTrue(cache.lease_contains("lease", 11))
+
+        with (
+            patch.object(mm_schedule, "embedding_cache", cache),
+            patch.object(cache, "release_lease", wraps=cache.release_lease) as release,
+            patch(
+                "sglang.srt.managers.scheduler.get_serving",
+                return_value=SimpleNamespace(weight_version="v0"),
+            ),
+        ):
+            s.abort_request(aborts[0])
+            s.abort_request(aborts[0])
+            release.assert_called_once_with("lease")
+
+        self.assertFalse(cache.lease_contains("lease", 11))
         self.assertIsNone(stale.multimodal_inputs)
+        self.assertEqual(s.waiting_queue, [])
+        output = s.ipc_channels.send_to_tokenizer.send_output
+        output.assert_called_once()
+        self.assertEqual(
+            output.call_args.args[0].finished_reason, aborts[0].finished_reason
+        )
+        self.assertEqual(
+            output.call_args.args[0].finished_reason["status_code"],
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
 
-    def test_unset_entry_time_is_never_dropped(self):
+    def test_unset_entry_time_is_never_emitted(self):
         # 0 is the "not yet stamped" sentinel; the guard is `0 < entry_time`.
         s = _scheduler([_req("unstamped", wait_entry=0.0)])
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1e-9):
-            s._abort_on_waiting_timeout()
-        self.assertEqual(len(s.waiting_queue), 1)
-        s.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+            self.assertEqual(s._poll_timeout_aborts(), [])
 
     def test_disabled_timeout_is_a_no_op(self):
         s = _scheduler([_req("stale", wait_entry=time.perf_counter() - 100)])
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0):
-            s._abort_on_waiting_timeout()
-        self.assertEqual(len(s.waiting_queue), 1)
+            self.assertEqual(s._poll_timeout_aborts(), [])
 
 
 class TestRunningTimeout(CustomTestCase):
-    @staticmethod
-    def _batch(reqs):
-        return SimpleNamespace(reqs=reqs, is_empty=lambda: not reqs)
-
-    def test_marks_only_stale_unfinished_reqs(self):
+    def test_emits_only_stale_unfinished_reqs_without_marking(self):
         now = time.perf_counter()
         stale = _req("stale", forward_entry=now - 10)
         fresh = _req("fresh", forward_entry=now)
         done = _req("done", forward_entry=now - 10, finished=True)
-        s = _scheduler([])
+        s = _scheduler([], running_reqs=[stale, fresh, done])
 
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
-            s._abort_on_running_timeout(self._batch([stale, fresh, done]))
+            aborts = s._poll_timeout_aborts()
 
-        self.assertIsNotNone(stale.to_finish)
+        self.assertEqual([a.rid for a in aborts], ["stale"])
+        # to_finish is set by abort_request() on every rank, not by the poll.
+        self.assertIsNone(stale.to_finish)
         self.assertIsNone(fresh.to_finish)
         self.assertIsNone(done.to_finish, "a finished req must not be aborted")
 
-    def test_unset_forward_entry_time_is_never_marked(self):
-        s = _scheduler([])
-        req = _req("unstamped", forward_entry=0.0)
+    def test_req_in_both_running_and_last_batch_is_emitted_once(self):
+        stale = _req("stale", forward_entry=time.perf_counter() - 10)
+        s = _scheduler([], running_reqs=[stale], last_batch_reqs=[stale])
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
+            aborts = s._poll_timeout_aborts()
+        self.assertEqual([a.rid for a in aborts], ["stale"])
+
+    def test_unset_forward_entry_time_is_never_emitted(self):
+        s = _scheduler([], running_reqs=[_req("unstamped", forward_entry=0.0)])
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1e-9):
-            s._abort_on_running_timeout(self._batch([req]))
-        self.assertIsNone(req.to_finish)
+            self.assertEqual(s._poll_timeout_aborts(), [])
 
     def test_empty_batch_and_disabled_timeout_are_no_ops(self):
         s = _scheduler([])
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
-            s._abort_on_running_timeout(self._batch([]))
-        req = _req("stale", forward_entry=time.perf_counter() - 100)
+            self.assertEqual(s._poll_timeout_aborts(), [])
+        stale = _req("stale", forward_entry=time.perf_counter() - 100)
+        s = _scheduler([], running_reqs=[stale])
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(0):
-            s._abort_on_running_timeout(self._batch([req]))
-        self.assertIsNone(req.to_finish)
+            self.assertEqual(s._poll_timeout_aborts(), [])
 
 
 if __name__ == "__main__":
