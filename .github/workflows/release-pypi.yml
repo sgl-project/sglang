@@ -63,7 +63,7 @@ jobs:
           cp ../README.md ../LICENSE .
           pip install \
             build wheel "setuptools>=61.0" "setuptools-rust>=1.11" \
-            "setuptools-scm>=8.0" "torch==2.13.0"
+            "setuptools-scm>=8.0" "torch==2.14.0"
           if [ -n "$RELEASE_VERSION" ]; then
             export SETUPTOOLS_SCM_PRETEND_VERSION="${RELEASE_VERSION#v}"
             echo "Pinning wheel version to $SETUPTOOLS_SCM_PRETEND_VERSION"

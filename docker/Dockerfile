@@ -499,9 +499,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
-# PyTorch 2.13 requires nvidia-nccl-cu13==2.29.7, so keep that version while
-# resolving dependencies and generating constraints.txt. DeepEP needs 2.30.7
-# at runtime; apply the override only after the constrained dependency solve.
+# DeepEP needs nvidia-nccl-cu13==2.30.7 at runtime. PyTorch 2.14 happens to pin
+# the same version, but pin it explicitly so SGL_NCCL_VERSION can move ahead of
+# torch; the override runs after the constrained dependency solve so it is not
+# resolved away again.
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --force-reinstall --no-deps \
         "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"

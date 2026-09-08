@@ -212,7 +212,7 @@ jobs:
           uv venv "${venv}" --python "${{ steps.py.outputs.python-path }}" --seed
           # shellcheck disable=SC1091
           source "${venv}/bin/activate"
-          uv pip install "setuptools>=61.0" "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.13.0" wheel
+          uv pip install "setuptools>=61.0" "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.14.0" wheel
           # torch-sys resolves libtorch from the active interpreter and bakes that
           # path into the cargo cache. venv is per-run and deleted on exit, so a
           # persistent target dir would reuse a "Fresh torch-sys" whose -L points at

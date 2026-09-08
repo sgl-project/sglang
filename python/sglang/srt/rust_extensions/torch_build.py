@@ -13,7 +13,7 @@ from types import ModuleType
 from typing import Mapping
 
 _MIN_SUPPORTED_TORCH = (2, 11)
-_MAX_SUPPORTED_TORCH = (2, 13)
+_MAX_SUPPORTED_TORCH = (2, 14)
 
 
 @dataclass(frozen=True)
@@ -80,7 +80,7 @@ def torch_build_configuration(
     environment["LIBTORCH_LIB"] = os.fspath(torch_root)
     environment["LIBTORCH_CXX11_ABI"] = "1" if cxx11_abi else "0"
     # tch 0.24 targets Torch 2.11. The compatibility header below covers the
-    # API removals in the supported 2.12/2.13 builds, after this explicit gate.
+    # API removals in the supported 2.12-2.14 builds, after this explicit gate.
     environment["LIBTORCH_BYPASS_VERSION_CHECK"] = "1"
     environment["PYO3_PYTHON"] = sys.executable
     environment["PATH"] = os.pathsep.join(

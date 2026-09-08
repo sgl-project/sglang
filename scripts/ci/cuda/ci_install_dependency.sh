@@ -526,8 +526,9 @@ install_sglang() {
 }
 
 install_nccl() {
-    # PyTorch pins 2.29.7, so this override must run after every command
-    # that resolves Python dependencies (including lmms-eval).
+    # PyTorch 2.14 pins the same version, but keep the explicit override so a
+    # dependency resolve cannot move it; it must run after every command that
+    # resolves Python dependencies (including lmms-eval).
     $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
         --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
