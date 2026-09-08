@@ -1945,3 +1945,23 @@ fn iter_yields_all_members() {
     members.sort_unstable();
     assert_eq!(members, vec![NodeIdx_(10), NodeIdx_(30)]);
 }
+
+// Pin storage hashes shared with Python.
+#[test]
+fn storage_hashes_match_python() -> Result<(), TreeCoreRuntimeError> {
+    let mut arena: NodeArena<Vec<i64>> = NodeArena::new(vec![FULL], 2);
+    let root = arena.root();
+    let parent = arena.alloc_child(root, vec![1, 2], 0, Some("lora-a"))?;
+    let hashes = arena.compute_node_hash_values(parent, 2);
+    assert_eq!(
+        hashes,
+        vec!["90c897f275cb3d14264966133c8d9e1053265aed8aacbe6b7e8543b0df8e9040"]
+    );
+    arena.node_mut(parent).hash_value = Some(hashes);
+    let child = arena.alloc_child(parent, vec![3, 4], 0, None)?;
+    assert_eq!(
+        arena.compute_node_hash_values(child, 2),
+        vec!["4542fadd7007b94d68a46e922eddfd9dbffa4a8332e16e8fb63db8740344b347"]
+    );
+    Ok(())
+}

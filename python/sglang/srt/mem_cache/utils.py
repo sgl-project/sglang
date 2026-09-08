@@ -120,6 +120,26 @@ def get_hash_str(
     return get_native_hash(token_ids, prior_digest, page_size)
 
 
+def extra_key_hash_seed(extra_key: Optional[str]) -> Optional[str]:
+    """Return the Rust-compatible storage seed; None keeps token-only keys."""
+    if extra_key is None:
+        return None
+    return hashlib.sha256(
+        b"sglang-extra-key-v1\0" + extra_key.encode("utf-8")
+    ).hexdigest()
+
+
+def get_storage_hash_str(
+    key: Any,
+    prior_hash: Optional[str] = None,
+    page_size: Optional[int] = None,
+) -> str | List[str]:
+    """Hash storage pages; seed only new chains with extra_key."""
+    if prior_hash is None:
+        prior_hash = extra_key_hash_seed(getattr(key, "extra_key", None))
+    return get_hash_str(key, prior_hash, page_size=page_size)
+
+
 def hash_str_to_int64(hash_str: str) -> int:
     """Convert SHA256 hex string to signed 64-bit integer for events.
 
@@ -138,7 +158,7 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
             parent_hash = node.parent.hash_value[-1]
 
-    hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
+    hash_values = get_storage_hash_str(node.key, parent_hash, page_size=page_size)
     assert isinstance(hash_values, list)
     return hash_values
 

@@ -56,7 +56,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
 
         self.assertEqual(prefix_match.l3_storage_hit_length, 2)
         tree_cache.query_storage_hit_length.assert_called_once_with(
-            22, [4, 5, 6, 7], "h2", ["h0", "h1"]
+            22, [4, 5, 6, 7], "h2", ["h0", "h1"], extra_key="model"
         )
 
         DecodeHiCachePreallocMixin._start_hicache_prefetch(harness, req, prefix_match)

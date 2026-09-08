@@ -26,6 +26,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.utils import extra_key_hash_seed, get_hash_str
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -44,6 +45,7 @@ def _make_mock_req(
     """Create a mock Req with the KV cache state needed for testing."""
     req = MagicMock()
     req.rid = rid
+    req.extra_key = None  # base traffic: storage hashes chain from tokens alone
     req.origin_input_ids = list(range(origin_len))
     req.kv = ReqKvInfo(
         req_pool_idx=req_pool_idx,
@@ -120,6 +122,22 @@ class _FinishedEvent:
 
 class TestReleaseFinishedReq(unittest.TestCase):
     """Tests for _release_finished_req overallocation cleanup."""
+
+    def test_decode_offload_hash_chain_matches_prefill(self):
+        """Decode pages must keep the prefill namespace across offload chunks."""
+        manager, _ = _make_manager(pool_size=8, page_size=2)
+        manager.cache_controller = MagicMock(get_hash_str=get_hash_str)
+        tokens = [1, 2, 3, 4, 5, 6]
+        for extra_key in (None, "lora-a"):
+            with self.subTest(extra_key=extra_key):
+                prefix = manager._compute_prefix_hash(tokens[:4], extra_key=extra_key)
+                tail = manager._compute_prefix_hash(
+                    tokens[4:], prefix[-1], extra_key=extra_key
+                )
+                self.assertEqual(
+                    prefix + tail,
+                    get_hash_str(tokens, extra_key_hash_seed(extra_key), page_size=2),
+                )
 
     def test_no_overallocation(self):
         """Without spec v2, kv_committed == kv_allocated; no extra free."""

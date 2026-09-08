@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.evict_policy import (
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
+    extra_key_hash_seed,
     get_eviction_strategy,
     get_hash_str,
     hash_str_to_int64,
@@ -56,10 +57,11 @@ def _legacy_page_hashes(key, page_size, prior_hash=None):
 
 
 class _HashKey:
-    def __init__(self, token_ids, is_bigram=False, cache_salt=None):
+    def __init__(self, token_ids, is_bigram=False, cache_salt=None, extra_key=None):
         self.token_ids = token_ids
         self.is_bigram = is_bigram
         self.cache_salt = cache_salt
+        self.extra_key = extra_key
 
     def __len__(self):
         if self.is_bigram:
@@ -75,8 +77,13 @@ class _HashKey:
                     self.token_ids[start : stop + 1],
                     is_bigram=True,
                     cache_salt=self.cache_salt,
+                    extra_key=self.extra_key,
                 )
-            return _HashKey(self.token_ids[start:stop], cache_salt=self.cache_salt)
+            return _HashKey(
+                self.token_ids[start:stop],
+                cache_salt=self.cache_salt,
+                extra_key=self.extra_key,
+            )
         if self.is_bigram:
             return (self.token_ids[index], self.token_ids[index + 1])
         return self.token_ids[index]
@@ -264,6 +271,45 @@ class TestGetHashStr(unittest.TestCase):
         self.assertEqual(
             key.hash_page(1, 4, prior_hash),
             get_hash_str(key[1:4], prior_hash),
+        )
+
+
+class TestStorageHashNamespace(unittest.TestCase):
+    def test_extra_key_seed_matches_rust(self):
+        # Must match extra_key_hash_seed in rust/sglang-radix-tree/src/node.rs.
+        self.assertEqual(
+            extra_key_hash_seed("lora-a"),
+            "15cfd7eca1d0db419fdeed65060b86f42cae66878af294d4675a36a42f7ed22d",
+        )
+
+    def test_node_hashes_isolate_namespaces_and_continue_the_chain(self):
+        root = SimpleNamespace(parent=None, key=_HashKey(array("q")), hash_value=None)
+        tokens = array("q", range(1, 129))
+
+        def child(extra_key):
+            return SimpleNamespace(
+                parent=root,
+                key=_HashKey(tokens, extra_key=extra_key),
+                hash_value=None,
+            )
+
+        plain = compute_node_hash_values(child(None), page_size=64)
+        lora = compute_node_hash_values(child("lora-a"), page_size=64)
+        other = compute_node_hash_values(child("lora-b"), page_size=64)
+        for i in range(len(plain)):
+            self.assertEqual(len({plain[i], lora[i], other[i]}), 3)
+
+        # Continue the parent chain without re-seeding.
+        parent = child("lora-a")
+        parent.hash_value = lora
+        grand = SimpleNamespace(
+            parent=parent,
+            key=_HashKey(array("q", range(200, 264)), extra_key="lora-a"),
+            hash_value=None,
+        )
+        self.assertEqual(
+            compute_node_hash_values(grand, page_size=64),
+            get_hash_str(array("q", range(200, 264)), lora[-1], page_size=64),
         )
 
 
