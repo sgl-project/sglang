@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import create_autospec
+from unittest.mock import Mock, call, create_autospec
 
 import pytest
 
@@ -35,6 +35,7 @@ def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
         spec_algorithm=spec_algorithm,
         attn_backend=attn_backend,
         shared_read_done_event=None,
+        prefill_shared_read_stager=None,
     )
 
 
@@ -65,10 +66,52 @@ def test_disabled_when_flag_is_false():
 )
 def test_dflash_family_target_prefill_publishes(algorithm):
     runner = _model_runner(spec_algorithm=algorithm)
+    runner.prefill_shared_read_stager = Mock(return_value=False)
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
         maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
     published = runner.shared_read_done_event
     assert isinstance(published, _Event) and published.recorded
+    runner.prefill_shared_read_stager.assert_not_called()
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_speculative_prefill_publishes_only_after_staging(staged):
+    runner, batch = _model_runner(spec_algorithm=SpeculativeAlgorithm.EAGLE), _batch()
+    calls = Mock()
+    runner.prefill_shared_read_stager = calls.stage
+    calls.stage.return_value = staged
+    calls.Event.side_effect = _Event
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
+        maybe_publish_prefill_shared_read_done(
+            runner, batch, SimpleNamespace(Event=calls.Event)
+        )
+    assert calls.mock_calls == [call.stage(batch)] + ([call.Event()] if staged else [])
+    published = runner.shared_read_done_event
+    if staged:
+        assert isinstance(published, _Event) and published.recorded
+    else:
+        assert published is None
+
+
+@pytest.mark.parametrize(
+    "enabled,mode,compliant",
+    [
+        (False, ForwardMode.EXTEND, True),
+        (True, ForwardMode.TARGET_VERIFY, True),
+        (True, ForwardMode.MIXED, True),
+        (True, ForwardMode.DECODE, True),
+        (True, ForwardMode.EXTEND, False),
+    ],
+)
+def test_prefill_gates_skip_staging(enabled, mode, compliant):
+    runner = _model_runner(
+        spec_algorithm=SpeculativeAlgorithm.EAGLE, compliant=compliant
+    )
+    runner.prefill_shared_read_stager = Mock(return_value=True)
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(enabled):
+        maybe_publish_prefill_shared_read_done(runner, _batch(mode), _DEVICE_MODULE)
+    runner.prefill_shared_read_stager.assert_not_called()
+    assert runner.shared_read_done_event is None
 
 
 def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backend():
