@@ -2046,11 +2046,10 @@ class Scheduler(
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
     def ingest_requests(self) -> List:
-        """Inject this iteration's external input: receive, broadcast, dispatch.
+        """Receive, broadcast and dispatch this iteration's external input.
 
-        The single place per-iteration input handling belongs, so a new source
-        reaches every event loop instead of only the ones edited by hand.
-        Returns the requests for the pipeline stages that relay them onward.
+        The one place a new per-iteration input source belongs; the return
+        value exists for the pipeline stages that relay requests onward.
         """
         recv_reqs = self.request_receiver.recv_requests(
             local_reqs=self._poll_timeout_aborts()

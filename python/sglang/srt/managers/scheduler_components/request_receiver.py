@@ -91,8 +91,8 @@ class SchedulerRequestReceiver:
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks.
 
-        local_reqs are aborts the caller decided on this rank (request
-        timeouts); they join the same broadcast as the pulled requests.
+        local_reqs are aborts the caller decided on this rank; they ride the
+        same broadcast as the pulled requests.
         """
 
         if self.scripted_scheduler_hook is not None:
