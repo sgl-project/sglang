@@ -303,6 +303,30 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     return with_fallback(type(server_args), field, getattr(server_args, field, default))
 
 
+def input_of(server_args: Any, field: str) -> Any:
+    """What the operator typed for ``field``, before any handler ran.
+
+    The one question the resolved surfaces cannot answer. Once a handler has
+    declared a value -- draft quantization inheriting the target model's, say --
+    ``resolution_result`` and the config bags answer with that decision, so a
+    caller asking "did anyone actually ask for this?" has to read the input
+    snapshot. ``None`` means nobody typed it, the same spelling the record uses.
+
+    Only for that question. A reader that wants the value in effect wants its
+    config bag; one that wants the value a resolution pass is deciding on wants
+    ``resolving_view``. Reading the record directly would answer this correctly
+    today and silently go stale the day resolution starts writing the field,
+    which is what the supplied-instance ratchet is for.
+
+    A config that never ran the pipeline carries no snapshot; its own fields are
+    then the closest thing to an input, as in ``resolution_result``.
+    """
+    raw = getattr(server_args, "_raw_input", None)
+    if raw is not None and field in raw:
+        return raw[field]
+    return getattr(server_args, field, None)
+
+
 def resolution_projection(server_args: Any) -> Dict[str, Any]:
     """Every field's resolved value, nested dataclasses expanded.
 

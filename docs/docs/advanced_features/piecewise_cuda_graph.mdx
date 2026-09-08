@@ -10,7 +10,7 @@ Standard CUDA graphs capture the entire model forward pass as a single graph. Th
 
 Piecewise CUDA Graph (PCG) solves this by splitting the model's computation graph into pieces (roughly one per layer) at "split points" (e.g., MoE dispatch ops). Each piece is captured as a separate CUDA graph for a set of pre-defined token lengths. At runtime, the input is padded to the nearest captured size, and each piece is replayed. This eliminates kernel launch overhead for prefill/extend while still supporting dynamic shapes.
 
-Recently we **enabled PCG by default**, which means that the old `--enable-piecewise-cuda-graph` flag is deprecated. Use `--cuda-graph-backend-prefill=disabled` to turn it off.
+PCG is **enabled by default**. Pass `--cuda-graph-backend-prefill=disabled` to turn it off.
 
 ## Usage
 
@@ -72,11 +72,6 @@ python3 -m sglang.launch_server \
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cuda-graph-tc-compiler</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>"eager"</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Compiler backend for the captured subgraphs. Choices: <code>eager</code>, <code>inductor</code>.</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><del><code>--enable-piecewise-cuda-graph</code></del></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Deprecated.</strong> PCG is now enabled by default. Use <code>--cuda-graph-backend-prefill=tc_piecewise</code> to skip auto-disable conditions.</td>
     </tr>
   </tbody>
 </table>

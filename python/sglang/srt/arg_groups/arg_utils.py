@@ -220,6 +220,19 @@ def fallbacks_of(cls) -> dict:
     for field in dataclasses.fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
         if arg is not None and arg.fallback is not None:
+            # Two things `with_fallback` relies on and cannot check itself,
+            # asserted where a new declaration passes through. This function is
+            # cached, so a mutable fallback would hand one shared object to
+            # every reader; and a field whose dataclass default is not `None`
+            # can never reach the fallback, which makes the declaration dead.
+            assert not isinstance(arg.fallback, (list, dict, set)), (
+                f"{cls.__name__}.{field.name}: a mutable fallback would be "
+                "shared by every reader -- use a scalar"
+            )
+            assert field.default is None, (
+                f"{cls.__name__}.{field.name}: declares a fallback but defaults "
+                f"to {field.default!r}, so the fallback is unreachable"
+            )
             out[field.name] = arg.fallback
     return out
 

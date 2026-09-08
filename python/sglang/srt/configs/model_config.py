@@ -25,7 +25,7 @@ from typing import Any, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.overrides import input_of, resolving_view
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
@@ -715,12 +715,14 @@ class ModelConfig:
             language_model_only=cfg.language_model_only,
             encoder_only=cfg.encoder_only,
             is_draft_model=is_draft_model,
-            # The record, not `cfg`: "did the operator type a draft
-            # quantization" is a question about the input, and resolution
-            # answers `cfg` with the target model's value when they did not.
+            # The input, not `cfg`: "did the operator type a draft
+            # quantization" is a question about what was asked for, and
+            # resolution answers `cfg` with the target model's value when
+            # they did not.
             is_draft_quantization_explicit=(
                 is_draft_model
-                and server_args.speculative_draft_model_quantization is not None
+                and input_of(server_args, "speculative_draft_model_quantization")
+                is not None
             ),
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,

@@ -250,15 +250,29 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         self.assertIs(get_server_args(), sentinel)
         self.assertIs(get_context().server_args, sentinel)
 
-    def test_the_retired_accessor_warns_before_it_raises(self):
+    def test_the_retired_accessor_raises_and_names_the_replacement(self):
         """`get_global_server_args` is retired: it answered with the record,
         so a caller reading a field resolution had decided got a stale value
-        and no error at all."""
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        and no error at all.
+
+        `RuntimeError` unconditionally, not a warning first: a
+        `DeprecationWarning` is filtered by default outside `__main__`, so no
+        production caller would have seen it, and under
+        `-W error::DeprecationWarning` it would have changed the exception a
+        caller catches. The message has to name where to read instead, since
+        the answer differs by what the caller wanted.
+        """
+        with self.assertRaises(RuntimeError) as cm:
+            server_args_module.get_global_server_args()
+        message = str(cm.exception)
+        self.assertIn("runtime_context", message)
+        self.assertIn("get_server_args()", message)
+
+        # And the type does not change when warnings are errors.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             with self.assertRaises(RuntimeError):
                 server_args_module.get_global_server_args()
-        self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
 
     def test_tokenizer_alias_is_distinct_role_shim(self):
         # Deliberately NOT an alias: the two legacy setters publish with

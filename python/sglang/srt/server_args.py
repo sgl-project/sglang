@@ -39,9 +39,8 @@ import dataclasses
 import logging
 import tempfile
 import uuid
-import warnings
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, NoReturn
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import (
@@ -606,9 +605,10 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 
 
 # NOTE: The process-wide ServerArgs is owned by the runtime context
-# (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
-# for the existing call-sites; they publish/read the same live object by
-# reference. Do not add new call-sites.
+# (sglang.srt.runtime_context). The two publish functions below are LEGACY
+# shims kept for the existing call-sites; they hand over the same live object
+# by reference. Do not add new call-sites. The third function is retired and
+# only raises.
 # Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
@@ -624,21 +624,16 @@ def set_global_server_args_for_tokenizer(server_args: ServerArgs):
     publish(server_args, role="tokenizer")
 
 
-def get_global_server_args() -> ServerArgs:
-    """Retired. Read the configuration from its namespace bag.
+def get_global_server_args() -> NoReturn:
+    """Retired. It raises, because what it used to return is the problem: the
+    record answers with the operator's *input*, so a caller reading a field
+    resolution decided got a stale value and no error.
 
-    It raises rather than returning, because what it returns is the problem:
-    the record answers with the operator's *input*, so a caller reading a field
-    resolution decided gets a stale value and no error. The name is kept so an
-    out-of-tree caller lands here instead of on an ImportError.
+    The name survives so that a caller importing it from this module lands on
+    a message instead of an ImportError. Annotated ``NoReturn`` so a type
+    checker rejects the call rather than accepting the attribute access after
+    it. The message lives once, in the exception.
     """
-    warnings.warn(
-        "get_global_server_args() is retired; read the config bag instead "
-        "(sglang.srt.runtime_context.get_<namespace>()). If you genuinely need "
-        "the operator's raw input, use get_server_args().",
-        DeprecationWarning,
-        stacklevel=2,
-    )
     raise RuntimeError(
         "get_global_server_args() is retired. Read the value that is in effect "
         "from its namespace bag -- `get_exec().kernel.attention_backend`, "

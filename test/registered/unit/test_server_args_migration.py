@@ -162,7 +162,10 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         half; asserting the dest alone would not.
         """
         from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
-        from sglang.srt.model_executor.cuda_graph_config import Backend
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            default_prefill_backend,
+        )
 
         def backends(argv):
             sa = self._parse(argv)
@@ -170,7 +173,9 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             config = resolution_result(sa, "cuda_graph_config")
             return sa.disable_cuda_graph, config.decode.backend, config.prefill.backend
 
-        self.assertEqual(backends([]), (False, Backend.FULL, Backend.BREAKABLE))
+        # Not a literal: the prefill default is BREAKABLE on CUDA and
+        # TC_PIECEWISE elsewhere, and this file runs on the CPU runner.
+        self.assertEqual(backends([]), (False, Backend.FULL, default_prefill_backend()))
         self.assertEqual(
             backends(["--disable-cuda-graph"]),
             (True, Backend.DISABLED, Backend.DISABLED),

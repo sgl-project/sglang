@@ -22,6 +22,7 @@ from sglang.srt.arg_groups.overrides import (
     _mla_kv_cache_dtype_checks,
     attention_backends_of,
     declare_resolution,
+    input_of,
     mamba_extra_buffer_of,
     model_config_of,
     resolved_view,
@@ -177,8 +178,8 @@ def handle_attention_backend_compatibility(server_args: Any):
     if resolved_view(server_args).attention_backend == "aiter":
         if model_config.context_len > 8192:
             explicit_mem_fraction = (
-                getattr(server_args, "_raw_input", None) or {}
-            ).get("mem_fraction_static") is not None
+                input_of(server_args, "mem_fraction_static") is not None
+            )
             if (
                 explicit_mem_fraction
                 and envs.SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION.get()
