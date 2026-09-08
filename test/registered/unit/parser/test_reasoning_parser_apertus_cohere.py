@@ -25,7 +25,7 @@ from sglang.srt.parser.reasoning_parser import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 APERTUS_START = "<|inner_prefix|>"
 APERTUS_END = "<|inner_suffix|>"
@@ -153,6 +153,28 @@ class TestApertus2509DetectAndParse(CustomTestCase):
         self.assertEqual(ret.reasoning_text, "")
         self.assertEqual(ret.normal_text, "more text")
 
+    def test_bare_tools_prefix_without_bracket_is_reasoning(self):
+        detector = Apertus2509Detector()
+        bare = "<|tools_prefix|>"
+        text = APERTUS_START + "before " + bare + " after" + APERTUS_END + "final"
+        ret = detector.detect_and_parse(text)
+        self.assertEqual(ret.reasoning_text, "before " + bare + " after")
+        self.assertEqual(ret.normal_text, "final")
+
+    def test_force_reasoning_defaults_to_false(self):
+        detector = Apertus2509Detector()
+        self.assertFalse(detector.force_reasoning)
+        self.assertFalse(detector._in_reasoning)
+
+    def test_force_reasoning_true_respected(self):
+        detector = Apertus2509Detector(force_reasoning=True)
+        self.assertTrue(detector.force_reasoning)
+        self.assertTrue(detector._in_reasoning)
+        text = "starts inside reasoning" + APERTUS_END + "answer"
+        ret = detector.detect_and_parse(text)
+        self.assertEqual(ret.reasoning_text, "starts inside reasoning")
+        self.assertEqual(ret.normal_text, "answer")
+
 
 class TestApertus2509Streaming(CustomTestCase):
     def test_streaming_char_by_char(self):
@@ -229,6 +251,77 @@ class TestApertus2509Streaming(CustomTestCase):
         )
         self.assertEqual(reasoning, "cut short")
         self.assertEqual(normal, "")
+
+    def test_unterminated_tool_call_finish_flushes_as_normal_text(self):
+        detector = Apertus2509Detector()
+        for chunk in chunked(
+            APERTUS_START + "pre" + APERTUS_TOOL_START + '{"x":1}', size=4
+        ):
+            detector.parse_streaming_increment(chunk)
+        fin = detector.finish()
+        self.assertEqual(fin.reasoning_text, "")
+        self.assertEqual(fin.normal_text, "")
+
+    def test_unterminated_tool_call_holdback_finish_flushes_normal(self):
+        detector = Apertus2509Detector()
+        detector.parse_streaming_increment(
+            APERTUS_START + "pre" + APERTUS_TOOL_START + "data<|tools_suf"
+        )
+        fin = detector.finish()
+        self.assertEqual(fin.reasoning_text, "")
+        self.assertEqual(fin.normal_text, "<|tools_suf")
+
+    def test_stream_reasoning_false_flushes_before_tool(self):
+        detector = Apertus2509Detector(stream_reasoning=False)
+        tool_block = APERTUS_TOOL_START + "[]" + APERTUS_TOOL_END
+        text = APERTUS_START + "before" + tool_block + APERTUS_END + "after"
+        seen_reasoning = []
+        seen_normal = []
+        for chunk in chunked(text, size=4):
+            ret = detector.parse_streaming_increment(chunk)
+            if ret.reasoning_text:
+                seen_reasoning.append(ret.reasoning_text)
+            if ret.normal_text:
+                seen_normal.append(ret.normal_text)
+        fin = detector.finish()
+        if fin.reasoning_text:
+            seen_reasoning.append(fin.reasoning_text)
+        if fin.normal_text:
+            seen_normal.append(fin.normal_text)
+        self.assertEqual("".join(seen_reasoning), "before")
+        self.assertEqual("".join(seen_normal), tool_block + "after")
+
+    def test_partial_tool_start_marker_held_back(self):
+        detector = Apertus2509Detector()
+        r1 = detector.parse_streaming_increment(
+            APERTUS_START + "re<|tools_pr"
+        )
+        self.assertEqual(r1.reasoning_text, "re")
+        self.assertEqual(r1.normal_text, "")
+        r2 = detector.parse_streaming_increment(
+            "efix|>[x" + APERTUS_TOOL_END + APERTUS_END + "z"
+        )
+        self.assertEqual(r2.reasoning_text, "")
+        self.assertEqual(
+            r2.normal_text, APERTUS_TOOL_START + "x" + APERTUS_TOOL_END + "z"
+        )
+        fin = detector.finish()
+        self.assertEqual(fin.reasoning_text, "")
+        self.assertEqual(fin.normal_text, "")
+
+    def test_partial_end_marker_held_back(self):
+        detector = Apertus2509Detector()
+        r1 = detector.parse_streaming_increment(
+            APERTUS_START + "text<|inner_suf"
+        )
+        self.assertEqual(r1.reasoning_text, "text")
+        self.assertEqual(r1.normal_text, "")
+        r2 = detector.parse_streaming_increment("fix|>after")
+        self.assertEqual(r2.reasoning_text, "")
+        self.assertEqual(r2.normal_text, "after")
+        fin = detector.finish()
+        self.assertEqual(fin.reasoning_text, "")
+        self.assertEqual(fin.normal_text, "")
 
 
 class TestCohereCommand4DetectAndParse(CustomTestCase):
@@ -459,7 +552,17 @@ class TestReasoningParserConstruction(CustomTestCase):
     def test_tokenizer_ignored_by_unsupporting_detector(self):
         tokenizer = SimpleNamespace(get_vocab=lambda: {})
         parser = ReasoningParser("qwen3", tokenizer=tokenizer)
-        self.assertEqual(parser.detector.think_start_token, "<think>")
+        self.assertEqual(parser.detector.think_start_token, " thinking")
+
+    def test_apertus2509_force_reasoning_defaults_to_false(self):
+        parser = ReasoningParser("apertus2509")
+        self.assertFalse(parser.detector.force_reasoning)
+        self.assertFalse(parser.detector._in_reasoning)
+
+    def test_apertus2509_force_reasoning_true(self):
+        parser = ReasoningParser("apertus2509", force_reasoning=True)
+        self.assertTrue(parser.detector.force_reasoning)
+        self.assertTrue(parser.detector._in_reasoning)
 
 
 class TestReasoningParserParsingAPIs(CustomTestCase):

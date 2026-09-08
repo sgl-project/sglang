@@ -1429,13 +1429,12 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
         super().__init__(
             "<|inner_prefix|>",
             "<|inner_suffix|>",
-            force_reasoning=False,
+            force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             force_nonempty_content=force_nonempty_content,
         )
-        self._force_reasoning = force_reasoning
         self._tool_start_token = "<|tools_prefix|>["
         self._tool_end_token = "<|tools_suffix|>"
         self._reasoning_acc: str = ""
@@ -1611,9 +1610,18 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
                 out_reasoning += reasoning_chunk
             else:
                 self._reasoning_acc += reasoning_chunk
+                out_reasoning += self._reasoning_acc
+                self._reasoning_acc = ""
             self._buffer = self._buffer[pos_tool:]
             self._in_inner_tool = True
             continue
+
+    def finish(self) -> StreamingParseResult:
+        if self._in_inner_tool:
+            leftover = self._buffer
+            self._buffer = ""
+            return StreamingParseResult(normal_text=leftover)
+        return super().finish()
 
 
 class CohereCommand4Detector(BaseReasoningFormatDetector):
