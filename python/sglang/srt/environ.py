@@ -762,6 +762,13 @@ class Envs:
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
+    # Run the host->device load-back *enqueue* on a dedicated loader thread
+    # instead of inline on the scheduler thread. With io_backend='direct' every
+    # layer's submission builds a batched-copy descriptor on the CPU (hundreds
+    # of milliseconds per burst on deep models), so by the time the forward
+    # launches every copy has already landed and the layer-wise pipeline
+    # overlaps nothing. Off keeps the synchronous path unchanged.
+    SGLANG_HICACHE_ASYNC_LOAD_ENQUEUE = EnvBool(False)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
