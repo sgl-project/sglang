@@ -88,13 +88,21 @@ class PrefillBudget:
         """Prepare pools whose admission depends on movable shared space."""
         return True
 
-    def _available_and_evictable(self):
+    def headroom(self) -> tuple[int, int]:
+        """(allocator-free, tree-evictable) tokens of the pool an extend
+        allocates from, before any offset. Kept as two halves so a caller that
+        pins cache (the scheduler's head prefix lock) can tell which half a lock
+        moved."""
         evictable = (
             self.tree_cache.full_evictable_size()
             if self.tree_cache.supports_mamba()
             else self.tree_cache.evictable_size()
         )
-        return self.allocator.available_size() + evictable
+        return self.allocator.available_size(), evictable
+
+    def _available_and_evictable(self):
+        available, evictable = self.headroom()
+        return available + evictable
 
     @property
     def remaining_total(self):
@@ -176,14 +184,15 @@ class SWAPrefillBudget(PrefillBudget):
         self.all_swa = all_swa
         self.req_ring = is_swa_req_ring(self.allocator)
 
-    def _available_and_evictable(self):
+    def headroom(self) -> tuple[int, int]:
         if self.all_swa:
             return (
-                self.allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size()
+                self.allocator.swa_available_size(),
+                self.tree_cache.swa_evictable_size(),
             )
         return (
-            self.allocator.full_available_size() + self.tree_cache.full_evictable_size()
+            self.allocator.full_available_size(),
+            self.tree_cache.full_evictable_size(),
         )
 
     @property

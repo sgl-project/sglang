@@ -22,6 +22,7 @@ NUM_ROWS = 4
 
 class _Req:
     def __init__(self, holds_row):
+        self.rid = f"req-{id(self)}"
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
         self.token_indices_to_pool = None
@@ -68,6 +69,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.policy = Mock()
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
+        s.init_prefill_lookahead()
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
         s.tp_worker = SimpleNamespace(
