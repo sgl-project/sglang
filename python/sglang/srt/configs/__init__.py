@@ -16,6 +16,7 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.hy_v4 import HYV4Config
 from sglang.srt.configs.inkling import (
@@ -102,6 +103,8 @@ __all__ = [
     "Olmo3Config",
     "MuseGlimmerConfig",
     "MuseGlimmerAssistantConfig",
+    "Glm5NextConfig",
+    "Glm5NextTextConfig",
     "KimiLinearConfig",
     "KimiK3Config",
     "KimiK25Config",

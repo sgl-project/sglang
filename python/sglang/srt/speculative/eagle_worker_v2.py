@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -38,7 +39,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -267,8 +272,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
+        self.dsa_seed_topk_width = (
+            get_dsa_mtp_topk_width(hf_config)
+            if self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+            else None
+        )
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+            self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
         )
 
     def init_token_map(self):
@@ -799,16 +809,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+
             new_input_ids = torch.empty_like(batch.input_ids)
+            if mm_input_embeds is not None:
+                # Rotate mm embeddings the same way as input_ids: shift left by
+                # one per request so they stay aligned with the rotated ids. The
+                # last position per request is filled by the draft model's own
+                # embed_tokens lookup on next_token_ids (see DeepseekModelNextN).
+                rotated_mm = torch.empty_like(mm_input_embeds)
             pt = 0
             for i, extend_len in enumerate(batch.extend_lens):
                 input_ids = batch.input_ids[pt : pt + extend_len]
                 new_input_ids[pt : pt + extend_len].copy_(
                     torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
                 )
+                if mm_input_embeds is not None:
+                    rotated_mm[pt : pt + extend_len - 1].copy_(
+                        mm_input_embeds[pt + 1 : pt + extend_len]
+                    )
                 pt += extend_len
             assert pt == batch.input_ids.numel()
             batch.input_ids = new_input_ids
+            if mm_input_embeds is not None:
+                mm_input_embeds = rotated_mm
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
@@ -895,11 +918,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
-        """Lazily-grown int32 [num_tokens, index_topk] eager draft-extend seed buffer."""
         buf = self.dsa_extend_topk_buf
         if buf is None or buf.shape[0] < num_tokens:
             buf = torch.full(
-                (num_tokens, self.dsa_index_topk),
+                (num_tokens, self.dsa_seed_topk_width),
                 -1,
                 dtype=torch.int32,
                 device=self.device,
@@ -1170,7 +1192,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
-        pp_proxy_tensors=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill

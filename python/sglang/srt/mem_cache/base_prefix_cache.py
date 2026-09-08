@@ -266,25 +266,32 @@ def _dfs_weight_order(
         node: len(indices) for node, indices in last_node_to_indices.items()
     }
 
-    def calc_weight(node: Any) -> None:
-        for child in node.children.values():
-            calc_weight(child)
-            node_to_weight[node] = node_to_weight.get(node, 0) + node_to_weight.get(
-                child, 0
-            )
-
-    calc_weight(root_node)
+    stack: list[tuple[Any, bool]] = [(root_node, False)]
+    while stack:
+        node, visited = stack.pop()
+        if visited:
+            weight = node_to_weight.get(node, 0)
+            for child in node.children.values():
+                weight += node_to_weight.get(child, 0)
+            node_to_weight[node] = weight
+            continue
+        stack.append((node, True))
+        for child in reversed(list(node.children.values())):
+            stack.append((child, False))
 
     order: list[int] = []
 
-    def append_dfs(node: Any) -> None:
+    stack = [(root_node, False)]
+    while stack:
+        node, visited = stack.pop()
+        if visited:
+            order.extend(last_node_to_indices.get(node, ()))
+            continue
         children = list(node.children.values())
         children.sort(key=lambda child: -node_to_weight.get(child, 0))
-        for child in children:
-            append_dfs(child)
-        order.extend(last_node_to_indices.get(node, ()))
-
-    append_dfs(root_node)
+        stack.append((node, True))
+        for child in reversed(children):
+            stack.append((child, False))
     return order
 
 

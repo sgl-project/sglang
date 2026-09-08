@@ -9,12 +9,13 @@ from sglang.srt.arg_groups.platform_hook import handle_cpu_backends
 from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="stage-a-test-cpu-intel")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 
-class TestServerArgsCPUBackend(unittest.TestCase):
+class TestServerArgsCPUBackend(CustomTestCase):
     def _make_server_args(self, attention_backend=None):
         server_args = ServerArgs.__new__(ServerArgs)
         server_args.device = "cpu"
@@ -45,7 +46,7 @@ class TestServerArgsCPUBackend(unittest.TestCase):
         self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
 
 
-class TestServerArgsIBDeviceValidation(unittest.TestCase):
+class TestServerArgsIBDeviceValidation(CustomTestCase):
     def _validate_ib_devices(self, device_str, available_devices=None):
         available_devices = available_devices or [
             "mlx5_0",
