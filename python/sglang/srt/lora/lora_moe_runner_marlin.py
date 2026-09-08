@@ -89,6 +89,15 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         N = quant_info.w2_qweight.shape[1] * 16
         topk = topk_ids.shape[1]
         num_bits = quant_info.weight_bits
+        # same rule as fused_experts_none_to_marlin: the E8M0 marlin kernels have no atomic-add path
+        is_mxfp4_marlin = (
+            num_bits == 4
+            and quant_info.w13_qzeros is None
+            and quant_info.w2_qzeros is None
+            and quant_info.w13_scales.dtype == torch.float8_e8m0fnu
+            and quant_info.w2_scales.dtype == torch.float8_e8m0fnu
+        )
+        use_atomic_add = not is_mxfp4_marlin
 
         for block_size_m in [8, 16, 32, 48, 64]:
             if M * topk / E / block_size_m < 0.9:
@@ -150,7 +159,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             size_n=2 * N,
             size_k=K,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
         )
@@ -212,7 +221,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             size_n=K,
             size_k=N,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
         )
