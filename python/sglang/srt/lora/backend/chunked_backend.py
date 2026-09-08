@@ -370,6 +370,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
         batch_info.req_seg_indptr[: bs + 1].copy_(req_seg_indptr_cpu, non_blocking=True)
         batch_info.req_weight_indices[:bs].copy_(req_wi_tensor, non_blocking=True)
+        if use_prefill_cuda_graph:
+            # Captured MoE kernels read every request slot; keep the tail empty.
+            batch_info.req_seg_indptr[bs + 1 :].fill_(int(req_seg_indptr_cpu[-1]))
+            batch_info.req_weight_indices[bs:].zero_()
 
         batch_info = self._add_moe_lora_info(forward_batch, batch_info)
 

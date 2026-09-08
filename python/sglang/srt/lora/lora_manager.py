@@ -149,21 +149,38 @@ class LoRAManager:
         # ===== END TO BE REFACTORED ====
 
     def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
-        """Allocate the static prefill-CUDA-graph LoRA metadata, sized by the
-        largest captured token bucket. Called before capture."""
+        """Allocate static LoRA metadata and MoE scratch before prefill capture."""
         self.lora_backend.init_prefill_cuda_graph_batch_info(
             max_num_tokens=max_num_tokens
         )
+        for module in self.base_model.modules():
+            if isinstance(module, FusedMoEWithLoRA):
+                self.lora_backend.init_cuda_graph_moe_buffers(
+                    max_bs=max_num_tokens,
+                    max_loras=self.max_loras_per_batch,
+                    compute_dtype=self.dtype,
+                    moe_layer=module,
+                    prefill=True,
+                )
+                break
 
     @property
     def supports_prefill_cuda_graph(self) -> bool:
-        """Whether LoRA kernels can be captured into the prefill CUDA graph;
-        excludes MoE LoRA and DP attention."""
-        return (
-            self.lora_backend.supports_prefill_cuda_graph
-            and not self.lora_backend.is_moe_lora
-            and not self.enable_dp_attention
+        """MoE LoRA needs breakable capture's hook flag; DP attention is unsupported."""
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            Phase,
+            check_cuda_graph_backend,
         )
+
+        if (
+            self.enable_dp_attention
+            or not self.lora_backend.supports_prefill_cuda_graph
+        ):
+            return False
+        if self.lora_backend.is_moe_lora:
+            return check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+        return True
 
     @property
     def prefill_cuda_graph_max_bs(self) -> Optional[int]:
