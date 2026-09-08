@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -170,8 +171,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), draft_pp_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+            ctx,
+            draft_pp_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            draft_model_build_scope(),
+        ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -265,8 +270,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
+        self.dsa_seed_topk_width = (
+            get_dsa_mtp_topk_width(hf_config)
+            if self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+            else None
+        )
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+            self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
         )
 
     def init_token_map(self):
@@ -797,16 +807,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+
             new_input_ids = torch.empty_like(batch.input_ids)
+            if mm_input_embeds is not None:
+                # Rotate mm embeddings the same way as input_ids: shift left by
+                # one per request so they stay aligned with the rotated ids. The
+                # last position per request is filled by the draft model's own
+                # embed_tokens lookup on next_token_ids (see DeepseekModelNextN).
+                rotated_mm = torch.empty_like(mm_input_embeds)
             pt = 0
             for i, extend_len in enumerate(batch.extend_lens):
                 input_ids = batch.input_ids[pt : pt + extend_len]
                 new_input_ids[pt : pt + extend_len].copy_(
                     torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
                 )
+                if mm_input_embeds is not None:
+                    rotated_mm[pt : pt + extend_len - 1].copy_(
+                        mm_input_embeds[pt + 1 : pt + extend_len]
+                    )
                 pt += extend_len
             assert pt == batch.input_ids.numel()
             batch.input_ids = new_input_ids
+            if mm_input_embeds is not None:
+                mm_input_embeds = rotated_mm
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
@@ -893,11 +916,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
-        """Lazily-grown int32 [num_tokens, index_topk] eager draft-extend seed buffer."""
         buf = self.dsa_extend_topk_buf
         if buf is None or buf.shape[0] < num_tokens:
             buf = torch.full(
-                (num_tokens, self.dsa_index_topk),
+                (num_tokens, self.dsa_seed_topk_width),
                 -1,
                 dtype=torch.int32,
                 device=self.device,
@@ -978,7 +1000,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_ctx:
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch
+                    forward_batch, select_index
                 )
             else:
                 draft_logits_output = self.draft_runner.forward(
@@ -999,24 +1021,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         dsa_seed_topk_indices = None
         if self.seed_dsa_topk_from_draft_extend:
             if can_run_decode_cuda_graph:
-                dsa_extend_topk_capture = (
-                    self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
-                )
+                dsa_extend_topk_capture = self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
             else:
                 dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
-            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-                select_index
-            ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
+        if not can_run_decode_cuda_graph:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+            if draft_logits_output.hidden_states is not None:
+                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                    select_index
+                ]
+        # Selected-row top-k remains worker-owned for both graph and eager
+        # paths; the graph runner only moves the row selection before lm_head.
         if get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,

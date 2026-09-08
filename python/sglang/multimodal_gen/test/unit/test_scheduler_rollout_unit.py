@@ -427,9 +427,9 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
 
         def _mock_variance_noise(_batch, *_args, **_kwargs):
             variance_noise_call_count["n"] += 1
-            scheduler._get_rollout_session_data(_batch).noise_buffer = (
-                variance_noise_ref
-            )
+            scheduler._get_rollout_session_data(
+                _batch
+            ).noise_buffer = variance_noise_ref
             return variance_noise_ref
 
         scheduler._rollout_variance_noise = (  # type: ignore[method-assign]
