@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_device,
     get_model,
@@ -544,6 +545,8 @@ def run_detokenizer_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
+    # Load plugins so hooks can override the tokenizer loaders used below.
+    load_plugins()
     publish(server_args, role="detokenizer")
     parent_process = psutil.Process().parent()
 

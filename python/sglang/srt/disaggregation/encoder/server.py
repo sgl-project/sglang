@@ -57,6 +57,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     resolve_encoder_media_processor_config,
 )
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
+from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     assert_published,
     get_device,
@@ -2470,6 +2471,9 @@ async def _handle_encoder_worker_request(encoder: MMEncoder, request):
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
+    # Load plugins so hooks can override the model config and weight loaders
+    # used by MMEncoder below.
+    load_plugins()
     publish(server_args, role="encoder")
     try:
         asyncio.run(run_encoder(server_args, schedule_path, dist_init_method, rank))

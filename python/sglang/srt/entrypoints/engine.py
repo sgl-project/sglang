@@ -1071,13 +1071,14 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Configure global environment
         configure_logger(server_args)
+
+        # Defensive: ensure plugins loaded before resolution builds the model
+        # config (may already be loaded by Engine.__init__ or CLI entry; a
+        # record that arrived by pickle never ran __post_init__ here).
+        load_plugins()
         server_args.resolve_once()
 
         _set_envs_and_config(server_args)
-
-        # Defensive: ensure plugins loaded (may already be loaded by
-        # Engine.__init__ or CLI entry).
-        load_plugins()
 
         # Not read-only: the LoRA checks normalize adapter paths through late
         # resolution, which a published config refuses. Hence before publish --
