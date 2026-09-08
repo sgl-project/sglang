@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 from PIL import Image
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan_image3 import (
     HunyuanImage3PipelineConfig,
 )
@@ -124,19 +125,39 @@ def test_generation_saves_requested_ratio_before_selecting_native_bucket(monkeyp
     }
 
 
-def test_native_crop_is_maximum_area_strict_ratio_and_preserves_pixels():
+def test_native_crop_is_maximum_area_within_pixel_rounding_and_preserves_pixels():
     geometry = build_hunyuan_image3_output_geometry(1000, 700)
     frames = torch.arange(1216 * 832, dtype=torch.float32).reshape(1, 1, 832, 1216)
 
     plan, metadata = _build_spatial_plan((1216, 832), geometry)
     cropped = apply_hunyuan_image3_spatial_plan(frames, plan)
 
-    assert metadata["crop_box"] == [18, 3, 1198, 829]
-    assert metadata["output_size"] == [1180, 826]
-    assert metadata["relative_ratio_error"] == 0.0
+    assert plan.crop_box == (14, 0, 1203, 832)
+    assert metadata["crop_box"] == [14, 0, 1203, 832]
+    assert metadata["output_size"] == [1189, 832]
+    assert metadata["relative_ratio_error"] < 0.0005
     assert metadata["resampled"] is False
-    assert cropped.shape == (1, 1, 826, 1180)
-    assert torch.equal(cropped, frames[..., 3:829, 18:1198])
+    assert cropped.shape == (1, 1, 832, 1189)
+    assert torch.equal(cropped, frames[..., 0:832, 14:1203])
+
+
+def test_native_crop_handles_coprime_ratios_without_discarding_pixels():
+    # gcd(1000, 701) == 1: a strict 1000:701-multiple crop would collapse to
+    # 1000x701 and discard ~30% of the decoded image (or raise when the
+    # reduced ratio exceeds the bucket). The crop must stay near-exact and
+    # near-maximum-area instead.
+    geometry = build_hunyuan_image3_output_geometry(1000, 701)
+    frames = torch.arange(1216 * 832, dtype=torch.float32).reshape(1, 1, 832, 1216)
+
+    plan, metadata = _build_spatial_plan((1216, 832), geometry)
+    cropped = apply_hunyuan_image3_spatial_plan(frames, plan)
+
+    assert plan.crop_box == (15, 0, 1202, 832)
+    assert metadata["output_size"] == [1187, 832]
+    assert metadata["relative_ratio_error"] < 0.0005
+    retained = metadata["retained_pixel_fraction"]
+    assert retained > 0.97
+    assert cropped.shape == (1, 1, 832, 1187)
 
 
 def test_native_crop_reuses_the_same_plan_for_trajectory_frames():
@@ -146,10 +167,10 @@ def test_native_crop_reuses_the_same_plan_for_trajectory_frames():
 
     plan, _ = _build_spatial_plan((1216, 832), geometry)
 
-    assert apply_hunyuan_image3_spatial_plan(image, plan).shape == (2, 3, 1, 826, 1180)
+    assert apply_hunyuan_image3_spatial_plan(image, plan).shape == (2, 3, 1, 832, 1189)
     assert torch.equal(
         apply_hunyuan_image3_spatial_plan(trajectory, plan),
-        trajectory[..., 3:829, 18:1198],
+        trajectory[..., 0:832, 14:1203],
     )
 
 
@@ -169,10 +190,34 @@ def test_decoding_stage_crops_images_and_trajectories_with_one_plan(monkeypatch)
 
     output = stage.forward(batch, SimpleNamespace())
 
-    assert output.output.shape == (2, 3, 1, 826, 1180)
-    assert output.trajectory_decoded[0].shape == (2, 3, 1, 826, 1180)
-    assert (batch.width, batch.height) == (1180, 826)
-    assert batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY]["crop_box"] == [18, 3, 1198, 829]
+    assert output.output.shape == (2, 3, 1, 832, 1189)
+    assert output.trajectory_decoded[0].shape == (2, 3, 1, 832, 1189)
+    assert (batch.width, batch.height) == (1189, 832)
+    assert batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY]["crop_box"] == [14, 0, 1203, 832]
+
+
+def test_output_crop_env_disable_returns_full_native_bucket(monkeypatch):
+    frames = torch.zeros(2, 3, 1, 832, 1216)
+
+    def fake_decode(_stage, _batch, _server_args):
+        return OutputBatch(output=frames, trajectory_decoded=None)
+
+    monkeypatch.setattr(DecodingStage, "forward", fake_decode)
+    assert envs.SGLANG_HI3_OUTPUT_CROP is True
+    monkeypatch.setenv("SGLANG_HI3_OUTPUT_CROP", "0")
+    assert envs.SGLANG_HI3_OUTPUT_CROP is False
+    stage = object.__new__(HunyuanImage3DecodingStage)
+    batch = Req(sampling_params=SamplingParams(prompt="test", width=1000, height=700))
+    batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY] = build_hunyuan_image3_output_geometry(
+        1000, 700
+    )
+
+    output = stage.forward(batch, SimpleNamespace())
+
+    # Full bucket untouched; the geometry contract stays in extra.
+    assert output.output.shape == (2, 3, 1, 832, 1216)
+    assert (batch.width, batch.height) == (1216, 832)
+    assert "crop_box" not in batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY]
 
 
 def test_exact_size_performs_one_uniform_final_resample():
@@ -182,7 +227,7 @@ def test_exact_size_performs_one_uniform_final_resample():
     plan, metadata = _build_spatial_plan((1216, 832), geometry)
     output = apply_hunyuan_image3_spatial_plan(frames, plan)
 
-    assert plan.crop_box == (18, 3, 1198, 829)
+    assert plan.crop_box == (14, 0, 1203, 832)
     assert plan.resize_size == (1000, 700)
     assert output.shape == (1, 3, 1, 700, 1000)
     assert metadata["resampled"] is True

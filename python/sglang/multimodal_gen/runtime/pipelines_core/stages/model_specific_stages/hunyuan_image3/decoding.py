@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -45,12 +46,28 @@ def _crop_box(
 def _maximum_exact_crop_size(
     width: int, height: int, p: int, q: int
 ) -> tuple[int, int]:
-    multiplier = min(width // p, height // q)
-    if multiplier == 0:
+    """Largest integer crop whose ratio matches p:q within pixel rounding.
+
+    A strict p:q-multiple crop degenerates whenever the reduced ratio does
+    not divide the decoded bucket -- the common case for edit requests whose
+    reference size is coprime (e.g. 1361x907 -> ratio 1361:907): the
+    multiplier collapses to 0 (ValueError) or discards most of the image
+    even though a near-exact crop with sub-pixel ratio error exists.
+    Anchoring on the limiting dimension and rounding keeps the maximum area
+    with at most half a pixel of ratio deviation per axis.
+    """
+    ratio = p / q
+    if width / height >= ratio:
+        crop_height = height
+        crop_width = min(width, _round_half_up(crop_height * ratio))
+    else:
+        crop_width = width
+        crop_height = min(height, _round_half_up(crop_width / ratio))
+    if crop_width <= 0 or crop_height <= 0:
         raise ValueError(
-            f"Cannot crop decoded {width}x{height} pixels to exact ratio {p}:{q}"
+            f"Cannot crop decoded {width}x{height} pixels to ratio {p}:{q}"
         )
-    return multiplier * p, multiplier * q
+    return crop_width, crop_height
 
 
 def _maximum_approximate_crop_size(
@@ -246,6 +263,12 @@ class HunyuanImage3DecodingStage(DecodingStage):
         output_batch = super().forward(batch, server_args)
         geometry = batch.extra.get(OUTPUT_GEOMETRY_EXTRA_KEY)
         if geometry is None or not isinstance(output_batch.output, torch.Tensor):
+            return output_batch
+        if not envs.SGLANG_HI3_OUTPUT_CROP:
+            # Env-gated escape hatch: return the full decoded native bucket
+            # without any crop/pad/resample. batch.width/height already hold
+            # the bucket dims, and the geometry contract stays in extra for
+            # introspection.
             return output_batch
 
         source_size = output_batch.output.shape[-1], output_batch.output.shape[-2]

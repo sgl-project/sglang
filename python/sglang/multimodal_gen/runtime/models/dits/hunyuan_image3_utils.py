@@ -7,7 +7,6 @@ Ported from the official HunyuanImage-3 model repository
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-from einops import repeat
 
 import torch
 import torch.nn.functional as F
@@ -54,25 +53,22 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
-    if cos.dim() == 3:
-        cos = cos[0]
-        sin = sin[0]
-    ro_dim = cos.shape[-1] * 2
-    cos = repeat(cos, "... d -> ... 1 (2 d)")
-    sin = repeat(sin, "... d -> ... 1 (2 d)")
-    return torch.cat(
-        [
-            q[..., :ro_dim] * cos + rotate_half(q[..., :ro_dim]) * sin,
-            q[..., ro_dim:],
-        ],
-        dim=-1,
-    ), torch.cat(
-        [
-            k[..., :ro_dim] * cos + rotate_half(k[..., :ro_dim]) * sin,
-            k[..., ro_dim:],
-        ],
-        dim=-1,
-    )
+    """Apply 2D RoPE with the official tiled angle layout.
+
+    ``cos``/``sin`` come from ``build_2d_rope`` already expanded to the full
+    head dimension (its trailing ``.repeat(1, 2)``), shaped [seq, head_dim] or
+    [batch, seq, head_dim]. ``rotate_half`` pairs dim ``i`` with dim
+    ``i + head_dim/2`` and both carry the same angle, exactly like the
+    reference implementation. ``q``/``k`` are [batch, seq, heads, head_dim];
+    batched cos/sin broadcast per row so requests with different image layouts
+    in one batch keep their own positions.
+    """
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    cos = cos.unsqueeze(2)  # broadcast over heads: [b, s, 1, head_dim]
+    sin = sin.unsqueeze(2)
+    return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
 
 
 class HunYuanRotary2DEmbedder:
@@ -172,7 +168,11 @@ def build_2d_rope(
     y_pos = y_pos[:seq_len]
     all_pos = torch.stack((y_pos, x_pos), dim=1).unsqueeze(1).to(device)  # [seq_len, 1, 2]
 
-    idx_theta = (all_pos * theta).reshape(all_pos.shape[0], n_elem // 2)
+    # Tile the half-dim angle table up to head_dim (official layout):
+    # rotate_half pairs dim i with dim i + n_elem/2 and both must carry the
+    # SAME angle; expanding by interleaving instead pairs mismatched
+    # frequencies and garbles positional encoding.
+    idx_theta = (all_pos * theta).reshape(all_pos.shape[0], n_elem // 2).repeat(1, 2)
     cos = torch.cos(idx_theta)
     sin = torch.sin(idx_theta)
     return cos, sin
