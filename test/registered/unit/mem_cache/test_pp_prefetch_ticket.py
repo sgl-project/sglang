@@ -496,13 +496,28 @@ class TestPPTicketAdmission(unittest.TestCase):
 
     def test_admitted_ticket_enters_existing_buffer_result_path(self):
         cache = self.cache
-        ticket = make_ticket()
-        operation = PrefetchOperation("hit", ticket.token_ids)
+        ticket = make_ticket(is_bigram=True, token_ids=list(range(9)))
+        transfers = [
+            PoolTransfer(name=PoolName.SWA),
+            PoolTransfer(name=PoolName.DEEPSEEK_V4_C4, indices_from_pool=PoolName.KV),
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C4_STATE, indices_from_pool=PoolName.SWA
+            ),
+        ]
+        operation = PrefetchOperation("hit", ticket.token_ids, pool_transfers=transfers)
         operation.host_indices = torch.arange(8)
         operation.completed_tokens = 4
         cache.cache_controller.take_ready_pp_prefetch.return_value = PPPrefetchState(
             ticket, operation
         )
+
+        def check_anchor_registration(rid):
+            # Bigram anchor matching needs the suffix's boundary token here.
+            key = cache.ongoing_prefetch[rid].prefetch_key
+            self.assertTrue(key.is_bigram)
+            self.assertEqual(key.token_ids[0], ticket.token_ids[0])
+
+        cache.buffer_pipeline.try_lock_anchor.side_effect = check_anchor_registration
         cache._all_reduce.side_effect = lambda tensor, _: tensor.fill_(1)
         self.assertTrue(cache.check_prefetch_progress("hit"))
         cache.cache_controller.take_ready_pp_prefetch.assert_called_once_with("hit")
@@ -517,6 +532,10 @@ class TestPPTicketAdmission(unittest.TestCase):
         self.assertIs(ongoing.operation, operation)
         self.assertEqual(ongoing.prefetch_key.extra_key, "adapter")
         self.assertEqual(ongoing.prefetch_key.cache_salt, "tenant")
+        # Buffer mode appends derived sidecars from operation.pool_transfers itself.
+        self.assertEqual(
+            [t for xfers in ongoing.comp_xfers.values() for t in xfers], [transfers[0]]
+        )
         tail = cache.cache_controller.append_host_mem_release.call_args.args[0]
         self.assertEqual(tail.tolist(), [4, 5, 6, 7])
         cache._handle_prefetch_result.assert_called_once_with(operation)
