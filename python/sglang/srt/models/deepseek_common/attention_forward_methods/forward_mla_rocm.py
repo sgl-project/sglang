@@ -385,9 +385,14 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
 
     The caller adds one more term it alone can see: DCP q replication splits the
     absorb across a different weight, which this kernel does not carry.
+
+    DCP is excluded outright: its decode phase all-gathers q_nope_out and q_pe
+    before core runs, and this path has no q_nope_out to hand it -- the absorb
+    has not happened yet.
     """
     return (
         _use_aiter_gfx95
+        and not get_parallel().dcp_enabled
         and attn.w_kc.dtype == torch.float8_e4m3fn
         and attn.rotary_emb is not None
         and attn._skip_rope_for_dsa_tilelang_fused()
