@@ -1308,7 +1308,7 @@ class IndexerKPool(MultiPlatformOp):
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
         def _compress_write() -> None:
-            # Draft extend plans before MLP-sync padding, whereas target verify
+            # Draft extend plans before TP padding, whereas target verify
             # plans complete request groups after padding. The plan owns the
             # write domain in both cases; graph capture also uses a full bucket.
             num_plan_tokens = plan.req.shape[0] * num_draft_tokens
