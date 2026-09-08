@@ -119,12 +119,29 @@ class TestSparDAPrefetcher(CustomTestCase):
         ticket = prefetcher.prefetch_forecast("request-a", 0, 1, [4])
         prefetcher.cancel(ticket)
         self.assertEqual(lease.releases, 0)
+        self.assertFalse(ticket.done)
         self.assertEqual(prefetcher.active_tickets(), (ticket,))
 
         prefetcher.cancel(ticket)
         self.assertTrue(engine.finish_event.synchronized)
         self.assertEqual(lease.releases, 1)
+        self.assertTrue(ticket.done)
         self.assertEqual(prefetcher.active_tickets(), ())
+
+    def test_unknown_completion_event_fails_closed(self):
+        engine = _TransferEngine()
+        engine.finish_event = object()
+        lease = CallbackPageLease(lambda: None)
+        prefetcher = SparDAKVPrefetcher(
+            engine,
+            CallbackPrefetchResolver(lambda *_args: _resolved(engine, lease)),
+        )
+
+        ticket = prefetcher.prefetch_forecast("request-a", 0, 1, [4])
+        with self.assertRaisesRegex(RuntimeError, "completion event"):
+            prefetcher.wait(ticket)
+        self.assertFalse(ticket.completion_synchronized)
+        self.assertIs(ticket.lease, lease)
 
     def test_synchronous_completion_without_event_releases_lease(self):
         engine = _SynchronousTransferEngine()

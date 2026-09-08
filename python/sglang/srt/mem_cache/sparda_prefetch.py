@@ -92,12 +92,18 @@ class PrefetchTicket:
     @property
     def done(self) -> bool:
         """Return whether the ticket has reached a terminal state."""
-        return self.state in {
-            PrefetchTicketState.READY,
-            PrefetchTicketState.CONSUMED,
-            PrefetchTicketState.CANCELLED,
-            PrefetchTicketState.RELEASED,
-        }
+        with self._lock:
+            if self.state in {
+                PrefetchTicketState.READY,
+                PrefetchTicketState.CONSUMED,
+                PrefetchTicketState.RELEASED,
+            }:
+                return True
+            # A failed cancellation keeps the lease and ticket reachable so
+            # cleanup can retry the event synchronization.
+            return (
+                self.state is PrefetchTicketState.CANCELLED and self.lease is None
+            )
 
 
 class PrefetchResolver(Protocol):
@@ -409,6 +415,11 @@ class SparDAKVPrefetcher:
                         wait = getattr(finish_event, "wait", None)
                         if wait is not None:
                             wait()
+                        else:
+                            raise RuntimeError(
+                                "transfer completion event must expose "
+                                "synchronize() or wait()"
+                            )
                     with ticket._lock:
                         ticket.completion_synchronized = True
         except BaseException as exc:
