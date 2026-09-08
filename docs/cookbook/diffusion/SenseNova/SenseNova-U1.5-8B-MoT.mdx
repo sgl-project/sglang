@@ -78,6 +78,45 @@ with open("output_sensenova_u15.png", "wb") as f:
     f.write(image_bytes)
 ```
 
+### 4.2 Prompt Enhancement (Optional)
+
+SenseNova-U1.5-8B-MoT ships no local prompt-enhancement (PE) model. PE is an
+optional, off-by-default feature that rewrites a short prompt into a more
+detailed one by calling a remote OpenAI-compatible chat/completions endpoint
+before generation.
+
+Enable it by launching the server with a PE endpoint and API key:
+
+```bash Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --pe-backend chat_completions \
+  --pe-endpoint https://token.sensenova.cn/v1/chat/completions \
+  --pe-model-name sensenova-6.8-flash-lite \
+  --pe-api-key "$SENSENOVA_PE_API_KEY" \
+  --port 30000
+```
+
+Then opt in per request with `use_pe`:
+
+```bash Command
+curl -X POST http://127.0.0.1:30000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a cat sitting on a windowsill",
+    "height": 2048,
+    "width": 2048,
+    "use_pe": true
+  }'
+```
+
+The response's `revised_prompt` field returns the actual enhanced prompt used
+for generation. `--pe-endpoint`/`--pe-model-name` default to Gemini's
+OpenAI-compatible endpoint (`gemini-3.1-pro`) if omitted; only
+`--pe-api-key` is required to activate PE. See
+[Models with Prompt Enhancement](../../../docs/sglang-diffusion/models_with_pe)
+for the full option reference.
+
 ## 5. Benchmark
 
 ### 5.1 Speedup Benchmark
