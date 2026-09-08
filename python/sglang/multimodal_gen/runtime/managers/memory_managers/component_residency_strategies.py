@@ -189,12 +189,15 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             # of the weights next to the device copy still being read from
             # -- a 57 GiB DiT took 43 GiB of shared memory in under a minute
             # and exhausted a GB10. Take the synchronous, pageable path there.
-            _non_blocking=not current_platform.device_shares_host_memory()
-            # XPU: an async copy into pageable host memory can reach the backend
-            # memcpy with a null argument, and cannot overlap anything anyway.
-            if current_platform.is_xpu():
-              _non_blocking = False
-            module.to("cpu", non_blocking=_non_blocking)
+            # XPU: an async pageable-host D2H can reach a null-argument backend
+            # memcpy; the prefetch stream above is CUDA-only, so nothing overlaps.
+            module.to(
+                "cpu",
+                non_blocking=not (
+                    current_platform.device_shares_host_memory()
+                    or current_platform.is_xpu()
+                ),
+            )
         self._ready_events.pop(use.component_name, None)
 
     def finish_request(
