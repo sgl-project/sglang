@@ -312,11 +312,7 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
-    # Send the request this many times in one server session; performance and
-    # consistency are validated on the last one. >1 asserts a warm second
-    # request meets the same baselines -- a leak in residency arming, courier
-    # in-flight tracking, or host copies shows up as the second request
-    # degrading or dying.
+    # Validate every repetition against the same baseline and GT.
     perf_repeat_requests: int = 1
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
@@ -328,6 +324,8 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
 
     def __post_init__(self) -> None:
+        if self.perf_repeat_requests < 1:
+            raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
         if self.sampling_params is None:
             object.__setattr__(
                 self,
