@@ -259,12 +259,12 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--context-length 262144",
         '--json-model-override-args {"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}',
         "--reasoning-parser auto",
@@ -280,7 +280,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--context-length 262144",
         '--json-model-override-args {"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}',
         "--reasoning-parser auto",
@@ -296,7 +296,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--context-length 262144",
         '--json-model-override-args {"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}',
         "--reasoning-parser auto",
@@ -312,7 +312,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--context-length 262144",
         '--json-model-override-args {"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}',
         "--reasoning-parser auto",
@@ -328,7 +328,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 8",
+        "--tp 2",
         "--context-length 262144",
         '--json-model-override-args {"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}',
         "--reasoning-parser auto",
@@ -339,12 +339,12 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--moe-runner-backend flashinfer_mxfp4",
         "--context-length 262144",
         '--json-model-override-args {"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}',
@@ -361,7 +361,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--moe-runner-backend flashinfer_mxfp4",
         "--context-length 262144",
         '--json-model-override-args {"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}',
@@ -378,7 +378,7 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--moe-runner-backend flashinfer_mxfp4",
         "--context-length 262144",
         '--json-model-override-args {"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}',
@@ -390,13 +390,29 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
         "--moe-runner-backend flashinfer_mxfp4",
+        "--context-length 262144",
+        '--json-model-override-args {"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}',
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
         "--context-length 262144",
         '--json-model-override-args {"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}',
         "--reasoning-parser auto",
