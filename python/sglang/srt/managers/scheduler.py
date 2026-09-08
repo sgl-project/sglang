@@ -1895,10 +1895,7 @@ class Scheduler(
                 break
 
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            if recv_reqs:
-                self.metrics_reporter.record_scheduler_active()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -1942,10 +1939,7 @@ class Scheduler(
                 break
 
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            if recv_reqs:
-                self.metrics_reporter.record_scheduler_active()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2050,6 +2044,25 @@ class Scheduler(
         """
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
+
+    def ingest_requests(self) -> List:
+        """Receive, broadcast and dispatch this iteration's external input.
+
+        The one place a new per-iteration input source belongs; the return
+        value exists for the pipeline stages that relay requests onward.
+        """
+        local_reqs = []
+        if (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            local_reqs = self._poll_timeout_aborts()
+        recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        if recv_reqs:
+            self.metrics_reporter.record_scheduler_active()
+        self.process_input_requests(recv_reqs)
+        return recv_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
@@ -2278,7 +2291,6 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
-            poll_timeout_aborts=self._poll_timeout_aborts,
         )
 
     def init_dp_attn_adapter(self) -> None:
