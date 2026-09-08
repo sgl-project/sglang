@@ -52,6 +52,37 @@ def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     return kv_indices
 
 
+def dcp_local_kv_block_table(loc_rows: torch.Tensor, page_size: int) -> torch.Tensor:
+    """The rank-local KV page table, from the same ``req_to_token`` slice.
+
+    Under DCP the attention backend needs *two* page tables over one allocation,
+    because the indexer and sparse attention read different pools:
+
+        indexer   replicated, pages of ``page_size`` over the full virtual span
+        latent KV sharded,     pages of ``page_size`` over this rank's rows
+
+    The existing expression in the backend --
+    ``req_to_token[reqs, :n][:, ::page_size] // page_size`` -- already produces
+    the **indexer's** table under DCP and needs no change. This produces the
+    other one.
+
+    The derivation, writing P for page_size and c for dcp_size. The allocator
+    pages in *virtual* space at ``P * c``, so allocator page number k of a
+    request has some physical id q_k and covers virtual locations
+    ``q_k * P * c + i`` for ``i`` in ``[0, P*c)``. Rank r owns the ones with
+    ``v % c == r``; since ``q_k * P * c`` is divisible by c that is ``i % c == r``,
+    and those map under ``// c`` to ``q_k * P + i // c`` -- physical page q_k,
+    offset ``i // c``. So a rank-local page is exactly an allocator page, and
+    reading the location at every ``P * c``-th position and dividing by ``P * c``
+    recovers its physical id.
+
+    At ``c == 1`` this is character-for-character the existing expression, which
+    is what makes it safe to route both through here.
+    """
+    stride = page_size * get_parallel().attn_dcp_size
+    return loc_rows[:, ::stride] // stride
+
+
 def remap_dcp_local_topk_indices(
     topk_indices: torch.Tensor, invalid: int = -1
 ) -> torch.Tensor:
