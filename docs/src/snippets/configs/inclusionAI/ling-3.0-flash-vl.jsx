@@ -39,11 +39,11 @@ export const config = {
 }'`,
 
   dockerImages: {
-    gb300: "lmsysorg/sglang:dev",
-    b300:  "lmsysorg/sglang:dev",
-    b200:  "lmsysorg/sglang:dev",
-    h200:  "lmsysorg/sglang:dev",
-    h100:  "lmsysorg/sglang:dev",
+    gb300: "lmsysorg/sglang:dev-Ling-3.0-flash-VL",
+    b300:  "lmsysorg/sglang:dev-Ling-3.0-flash-VL",
+    b200:  "lmsysorg/sglang:dev-Ling-3.0-flash-VL",
+    h200:  "lmsysorg/sglang:dev-Ling-3.0-flash-VL",
+    h100:  "lmsysorg/sglang:dev-Ling-3.0-flash-VL",
   },
 
   benchmarkCommands: {
