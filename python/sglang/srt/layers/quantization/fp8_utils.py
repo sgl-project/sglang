@@ -565,7 +565,7 @@ def dispatch_w8a8_block_fp8_linear(
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
     """
-    if weight_block_size is not None and weight_block_size != [128, 128]:
+    if weight_block_size is not None and weight_block_size != [128, 128] and not is_npu_arch35():
         # DeepGEMM, FlashInfer groupwise and CUTLASS take 128x128 blocks only;
         # the Triton kernel reads the block size at launch. With an explicit
         # --fp8-gemm-backend flashinfer_* on Blackwell, Fp8LinearMethod routes 32-wide K
