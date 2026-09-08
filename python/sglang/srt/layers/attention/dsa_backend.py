@@ -76,8 +76,6 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
-    dsa_cp_round_robin_split_data,
-    dsa_cp_round_robin_split_q_seqs,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     pad_dsa_cache_seqlens,
@@ -89,10 +87,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_position,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
@@ -122,24 +116,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-def _all_gather_dsa_trtllm_fp8_kv(
-    forward_batch: ForwardBatch,
-    k: torch.Tensor,
-    k_rope: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    kv_lora_rank = k.shape[-1]
-    qk_rope_head_dim = k_rope.shape[-1]
-    kv_dtype = k.dtype
-    kv = torch.cat((k, k_rope), dim=-1).view(torch.uint8)
-    kv = cp_all_gather_rerange_output(
-        kv,
-        get_parallel().attn_cp_size,
-        forward_batch,
-        torch.cuda.current_stream(),
-    ).view(kv_dtype)
-    return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
-
-
 def prepare_kv_for_attention(
     attn_mla,
     forward_batch: ForwardBatch,
@@ -163,28 +139,6 @@ def prepare_kv_for_attention(
         k_nope,
         k_pe,
     )
-
-
-def materialize_full_kv_cp(
-    attn_mla,
-    forward_batch: ForwardBatch,
-    latent_cache: torch.Tensor,
-    k_nope: torch.Tensor,
-    k_pe: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize generic CP KV, retaining the ROCm DSA fallback."""
-    if is_cp_v2_active(forward_batch):
-        strategy = get_cp_strategy()
-        assert strategy is not None
-        return strategy.materialize_full_mla_kv(
-            forward_batch,
-            attn_mla.attn_mqa,
-            k_nope,
-            k_pe,
-        )
-
-    assert is_hip(), "Legacy DSA KV materialization is HIP-only"
-    return attn_mla.rebuild_cp_kv_cache(latent_cache, forward_batch, k_nope, k_pe)
 
 
 _is_hip = is_hip()
@@ -1052,19 +1006,11 @@ class DeepseekSparseAttnBackend(
                 kpool_inputs.full_seqlens_expanded = seqlens_expanded
 
             if can_dsa_prefill_cp_round_robin_split(forward_batch):
-                if is_cp_v2_active(forward_batch):
-                    strategy = get_cp_strategy()
-                    seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
-                    extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                        strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
-                    )
-                else:
-                    seqlens_expanded = dsa_cp_round_robin_split_data(seqlens_expanded)
-                    extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                        dsa_cp_round_robin_split_q_seqs(
-                            extend_seq_lens_cpu, extend_seq_lens
-                        )
-                    )
+                strategy = get_cp_strategy()
+                seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
+                extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
+                    strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
+                )
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
@@ -1277,11 +1223,7 @@ class DeepseekSparseAttnBackend(
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
             assert can_dsa_prefill_cp_round_robin_split(forward_batch)
-            split_per_token = (
-                get_cp_strategy().shard_local_tokens
-                if is_cp_v2_active(forward_batch)
-                else dsa_cp_round_robin_split_data
-            )
+            split_per_token = get_cp_strategy().shard_local_tokens
             ks = split_per_token(ks)
             ke = split_per_token(ke)
             token_to_batch_idx = split_per_token(token_to_batch_idx)
@@ -3500,14 +3442,9 @@ class DeepseekSparseAttnBackend(
             else:
                 rope_positions = forward_batch.positions
                 if dsa_use_prefill_cp(forward_batch):
-                    if is_cp_v2_active(forward_batch):
-                        rope_positions = get_cp_strategy().shard_position_ids(
-                            rope_positions, forward_batch
-                        )
-                    else:
-                        rope_positions = cp_split_and_rebuild_position(
-                            forward_batch, rope_positions
-                        )
+                    rope_positions = get_cp_strategy().shard_position_ids(
+                        rope_positions, forward_batch
+                    )
 
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -3521,14 +3458,9 @@ class DeepseekSparseAttnBackend(
                     self.qk_rope_head_dim,
                 )
                 if save_kv_cache and dsa_use_prefill_cp(forward_batch):
-                    if is_cp_v2_active(forward_batch):
-                        k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
-                            forward_batch, k, k_rope
-                        )
-                    else:
-                        k, k_rope = _all_gather_dsa_trtllm_fp8_kv(
-                            forward_batch, k, k_rope
-                        )
+                    k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
+                        forward_batch, k, k_rope
+                    )
             merge_query = False
 
             # Save KV cache if requested
