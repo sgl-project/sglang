@@ -191,7 +191,7 @@ are comparable.
 | `../subblock_sparse_attn.py` | the `AttentionBackend`: schedule, gating, dense fallback |
 
 Tests: `test/unit/test_subblock_sparse_attention.py` and
-`test/registered/kernels/ops/attention/test_subblock_sage_fp8_sm90.py`. The GPU
+`test/registered/kernel/attention/test_subblock_sage_fp8_sm90.py`. The GPU
 test covers the native production dispatch. Running at a full block budget must
 reproduce dense attention up to the expected quantization error, pinning routing
 indices, ragged tails, scale domains and the softmax scale in one check.
