@@ -1256,7 +1256,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self,
         node: UnifiedTreeNode,
         fresh_value: torch.Tensor,
-        *,
         session_id: Optional[str] = None,
     ) -> None:
         """Restore an evicted node's Full device value from fresh KV indices
