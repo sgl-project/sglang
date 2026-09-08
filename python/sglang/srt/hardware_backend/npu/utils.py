@@ -47,7 +47,7 @@ def use_npu_arch35_mxfp8_wo_a(quant_config) -> bool:
     if not getattr(quant_config, "is_checkpoint_fp8_serialized", False):
         return False
     weight_block_size = getattr(quant_config, "weight_block_size", None)
-    return tuple(weight_block_size or ()) == (128, 128)
+    return tuple(weight_block_size or ()) in ((128, 128), (32, 32))
 
 
 class NPUACLFormat(IntEnum):
