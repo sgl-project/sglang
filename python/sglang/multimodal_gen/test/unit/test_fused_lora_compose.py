@@ -3,11 +3,14 @@
 
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
-import torch.nn.functional as F
+import torch.distributed as dist
 
+from sglang.multimodal_gen.runtime.layers.linear import (
+    MergedColumnParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
 )
@@ -37,6 +40,16 @@ def _make_ab_lists(ranks: list[int]):
         a_list.append(torch.randn(rank, IN_DIM))
         b_list.append(torch.randn(OUTPUT_SIZES[index], rank))
     return a_list, b_list
+
+
+def _make_mock_process_group() -> dist.ProcessGroup:
+    # Create a mock object that mimics a ProcessGroup
+    mock_process_group = MagicMock(spec=dist.ProcessGroup)
+
+    mock_process_group.rank.return_value = 0
+    mock_process_group.size.return_value = 1
+
+    return mock_process_group
 
 
 def _reference_delta(x, a_list, b_list, adapter_alpha):
@@ -102,7 +115,7 @@ def test_stack_kept_for_equal_sections():
     torch.testing.assert_close(b[1], b_list[1])
 
 
-class _FakeMergedLinear(torch.nn.Module):
+class _FakeMergedLinear(MergedColumnParallelLinear):
     def __init__(
         self,
         output_sizes: list[int],
@@ -110,25 +123,23 @@ class _FakeMergedLinear(torch.nn.Module):
         weight: torch.Tensor | None = None,
         output_partition_sizes: list[int] | None = None,
     ):
-        super().__init__()
+
+        super().__init__(
+            in_dim, output_sizes, False, tp_group=_make_mock_process_group()
+        )
         self.output_sizes = output_sizes
         self.output_partition_sizes = (
             output_partition_sizes
             if output_partition_sizes is not None
             else output_sizes
         )
+
         if weight is None:
             weight = torch.randn(sum(output_sizes), in_dim)
         self.weight = torch.nn.Parameter(weight)
-        self.bias = None
-        self.skip_bias_add = False
-        self.gather_output = False
-        self.quant_method = SimpleNamespace(
-            apply=lambda layer, x, bias=None: F.linear(x, layer.weight, bias)
-        )
 
 
-def _make_layer() -> MergedColumnParallelLinearWithLoRA:
+def _make_layer() -> MergedColumnParallelLinear:
     torch.manual_seed(0)
     return MergedColumnParallelLinearWithLoRA(_FakeMergedLinear(OUTPUT_SIZES, IN_DIM))
 
