@@ -95,6 +95,26 @@ class TestFlashInferSparseMLARunnerCompatibility(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "glm53_nope"):
                 self._create()
 
+    def test_nope_rejects_legacy_and_compact_only_capabilities(self):
+        for config in (
+            None,
+            SimpleNamespace(),
+            SimpleNamespace(compact_bytes_per_token=528),
+            SimpleNamespace(glm53_nope_contract_version=0),
+        ):
+            with (
+                self.subTest(config=config),
+                patch("flashinfer.mla.SparseMLASm120Wrapper", create=True) as wrapper,
+                patch(
+                    "flashinfer.mla.supported_sparse_mla_sm120_configs",
+                    return_value={"glm53_nope": config},
+                    create=True,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "contract version 1"):
+                    self._create()
+                wrapper.assert_not_called()
+
     def test_native_wrapper_is_sized_before_capture(self):
         marker = object()
         with (
@@ -103,7 +123,11 @@ class TestFlashInferSparseMLARunnerCompatibility(unittest.TestCase):
             ) as wrapper,
             patch(
                 "flashinfer.mla.supported_sparse_mla_sm120_configs",
-                return_value={"glm53_nope": object()},
+                # Corrected 656-byte implementations need not advertise compact
+                # rows. The execution contract is independent of row capacity.
+                return_value={
+                    "glm53_nope": SimpleNamespace(glm53_nope_contract_version=1)
+                },
                 create=True,
             ),
         ):

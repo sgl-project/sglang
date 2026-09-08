@@ -754,10 +754,16 @@ def create_flashinfer_sparse_mla_runner(
 
     wrapper = getattr(mla, "SparseMLASm120Wrapper", None)
     configs = getattr(mla, "supported_sparse_mla_sm120_configs", None)
-    if wrapper is None or configs is None or "glm53_nope" not in configs():
+    config = configs().get("glm53_nope") if configs is not None else None
+    # The initial NoPE API advertises the family but still reads mutable slot
+    # zero for masked candidates and uses incompatible eight-head scratch.
+    # Row-width support alone does not establish either correctness contract.
+    if wrapper is None or getattr(config, "glm53_nope_contract_version", 0) < 1:
         raise RuntimeError(
             "GLM NoPE sparse MLA requires FlashInfer native SM120 support "
-            "with the glm53_nope configuration."
+            "with glm53_nope contract version 1 or later "
+            "(masked candidate reads and eight-head decode scratch). "
+            "Upgrade FlashInfer to a build advertising this contract."
         )
     return wrapper(
         max_num_tokens=max_num_tokens,
