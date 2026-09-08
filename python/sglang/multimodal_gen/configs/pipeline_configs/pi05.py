@@ -47,8 +47,12 @@ class Pi05PipelineConfig(PipelineConfig):
 
     enable_global_prefix_cache: bool = False
     enable_prefix_cuda_graph: bool = True
+    # Opt-in prompt buckets shared by prefix and action CUDA graphs. Padding
+    # changes reduction shapes, so exact prompt lengths remain the default.
+    prompt_token_buckets: list[int] = field(default_factory=list)
     prefix_cuda_graph_max_entries: int = 1
     enable_action_cuda_graph: bool = True
+    action_cuda_graph_max_entries: int = 4
     prefix_cache_max_entries: int = 1
     prefix_cache_layout_version: str = "pi05-prefix-v1"
     offload_prefix_image_encoder: bool = False
@@ -85,6 +89,64 @@ class Pi05PipelineConfig(PipelineConfig):
             ),
         }
     )
+
+    def __post_init__(self) -> None:
+        self._validate_cuda_graph_config()
+
+    def _validate_cuda_graph_config(self) -> None:
+        try:
+            buckets = list(self.prompt_token_buckets)
+        except TypeError as exc:
+            raise ValueError("prompt_token_buckets must contain integers") from exc
+        if not all(
+            isinstance(bucket, int) and not isinstance(bucket, bool)
+            for bucket in buckets
+        ):
+            raise ValueError("prompt_token_buckets must contain integers")
+        if any(bucket <= 0 for bucket in buckets):
+            raise ValueError("prompt_token_buckets must contain positive lengths")
+        if sorted(set(buckets)) != buckets:
+            raise ValueError(
+                "prompt_token_buckets must be strictly increasing and unique"
+            )
+        if buckets and buckets[-1] > self.max_token_len:
+            raise ValueError(
+                "prompt_token_buckets cannot exceed max_token_len "
+                f"({self.max_token_len}), got {buckets[-1]}"
+            )
+        if self.prefix_cuda_graph_max_entries < 0:
+            raise ValueError("prefix_cuda_graph_max_entries must be non-negative")
+        if self.action_cuda_graph_max_entries < 0:
+            raise ValueError("action_cuda_graph_max_entries must be non-negative")
+        self.prompt_token_buckets = buckets
+
+    def check_pipeline_config(self) -> None:
+        super().check_pipeline_config()
+        self._validate_cuda_graph_config()
+
+    def prefix_cuda_graph_available(self) -> bool:
+        return bool(
+            self.enable_prefix_cuda_graph
+            and self.prefix_cuda_graph_max_entries > 0
+            and not any(
+                (
+                    self.offload_prefix_image_encoder,
+                    self.offload_prefix_image_encoder_after_embed,
+                    self.offload_prefix_token_embedding,
+                    self.offload_prefix_language_layers,
+                    self.offload_prefix_language_layers_after_prefix,
+                    self.offload_prefix_language_layer_count_after_prefix > 0,
+                    self.empty_cache_after_prefix,
+                )
+            )
+        )
+
+    def action_cuda_graph_available(self) -> bool:
+        return bool(
+            self.enable_action_cuda_graph
+            and self.action_cuda_graph_max_entries > 0
+            and not self.offload_action_expert_after_denoise
+        )
 
     def supports_dynamic_batching(self):
         return True

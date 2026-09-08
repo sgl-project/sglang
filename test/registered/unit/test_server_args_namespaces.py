@@ -1,9 +1,14 @@
 """Coverage lint for the ServerArgs -> RuntimeContext namespace split.
 
-Every ServerArgs field must carry an ``NS("<path>")`` marker in its ``Annotated``
-metadata, and every path must be one of the known domains. This is the guardrail
-that fails when an upstream PR adds a ServerArgs field without assigning it a
-namespace (the property that retires the old hand-maintained mirror file).
+Every ServerArgs field must resolve to a namespace, and every path must be one of
+the known domains. A field gets its namespace from the ``arg_groups/fields/``
+class that declares it -- each carries the ``_NS_PATH`` it stands for, so the
+module a declaration lives in *is* the answer, and there is no per-field marker
+to forget. (``NS("<path>")`` survives for the one shape a class cannot express:
+an ad-hoc dataclass spanning namespaces, which the config-bag tests build.)
+
+This is the guardrail that fails when an upstream PR adds a field to a namespace
+class that has no ``_NS_PATH``, or adds one outside the taxonomy below.
 """
 
 import dataclasses
@@ -14,7 +19,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=31, suite="base-a-test-cpu")
 
 # Locked taxonomy (global_context/11-server-args-namespace-split.md).
 VALID_NAMESPACES = {
@@ -72,17 +77,19 @@ class TestServerArgsNamespaces(CustomTestCase):
         accessors = {
             node.name
             for node in context_module.body
-            if isinstance(node, ast.FunctionDef)
-            and (node.name.startswith("get_") or node.name.startswith("configured_"))
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("get_")
         }
-        self.assertGreater(len(accessors), 20, "the accessor derivation broke")
+        self.assertGreater(len(accessors), 15, "the accessor derivation broke")
 
         shadowed = []
         for path in sorted(srt.rglob("*.py")):
             if path.name == "runtime_context.py":
                 continue
+            source = path.read_text(encoding="utf-8-sig")
+            if "runtime_context" not in source:
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 self.fail(f"unparsable module in the census: {path}")
             bindings = collections.defaultdict(set)
@@ -155,8 +162,11 @@ class TestServerArgsNamespaces(CustomTestCase):
         sites = 0
         disagreements = []
         for path in sorted(srt.rglob("*.py")):
+            source = path.read_text(encoding="utf-8-sig")
+            if not any(name in source for name in accessors):
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 self.fail(f"unparsable module in the census: {path}")
             for node in ast.walk(tree):
@@ -178,6 +188,10 @@ class TestServerArgsNamespaces(CustomTestCase):
                     continue
                 sites += 1
                 read = [cursor.func.id[len("get_") :]] + chain[:-1]
+                if read[:2] == ["parallel", "config"]:
+                    # `config` on `get_parallel()` is the tier hop, not a
+                    # sub-namespace: bare names there are the live topology.
+                    del read[1]
                 if mapping[field].split(".") != read:
                     disagreements.append(
                         f"{path.relative_to(srt)}:{node.lineno} reads "

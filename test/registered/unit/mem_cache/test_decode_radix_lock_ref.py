@@ -20,9 +20,12 @@ Usage:
     python -m pytest test/registered/unit/mem_cache/test_decode_radix_lock_ref.py -v
 """
 
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_override
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from array import array
@@ -75,15 +78,18 @@ class MockReq:
             "q", fill_ids[:-1] if len(fill_ids) > 1 else fill_ids
         )
         self.output_ids = array("q", [fill_ids[-1]] if len(fill_ids) > 1 else [])
-        self.req_pool_idx = req_pool_idx
-        self.cache_protected_len = cache_protected_len
         self.last_node = last_node
         self.extra_key = None
         self.cache_salt = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
-        self.kv_committed_len = len(fill_ids)
-        self.kv = SimpleNamespace(kv_allocated_len=len(fill_ids))
+        self.kv = SimpleNamespace(
+            req_pool_idx=req_pool_idx,
+            kv_committed_len=len(fill_ids),
+            kv_allocated_len=len(fill_ids),
+            cache_protected_len=cache_protected_len,
+            swa_evicted_seqlen=0,
+        )
 
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]
@@ -94,14 +100,26 @@ def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
 
 
 class TestDecodeLockRefScenarios(unittest.TestCase):
+    def setUp(self):
+        # The decode queue reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
+
     """Test lock_ref balance across decode transfer scenarios."""
 
     def test_swa_tail_len_keeps_page_aligned_matchable_window(self):
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=True
+            ),
+        )
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue.scheduler = SimpleNamespace(
             sliding_window_size=127,
-            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=True),
+            server_args=SimpleNamespace(),
         )
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
 
@@ -144,7 +162,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         error = queue._reclaim_swa_tail_capacity(129, "req-1")
 
         self.assertIsNone(error)
-        params = queue.tree_cache.evict.call_args.args[0]
+        params = queue.tree_cache.evict_for_alloc.call_args.args[0]
         self.assertEqual(params.num_tokens, 0)
         self.assertEqual(params.swa_num_tokens, 128)
 
@@ -210,7 +228,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req with is_insert=True (dec lock)
-        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv.kv_committed_len)
 
         # Verify: all non-root nodes should have lock_ref == 0
         # (root always has lock_ref == 1)
@@ -259,7 +277,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         cache.cache_unfinished_req(req)
 
         # Step 3: cache_finished_req (dec leaf)
-        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv.kv_committed_len)
 
         # Root lock unchanged, all nodes unlocked
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
@@ -303,7 +321,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         # Transfer fails -> cache_finished_req with is_insert=False
         # This frees delta tokens and dec_lock_ref on last_node
         cache.cache_finished_req(
-            req, is_insert=False, kv_len_to_handle=req.kv_committed_len
+            req, is_insert=False, kv_len_to_handle=req.kv.kv_committed_len
         )
 
         # The prefix node should be unlocked (back to evictable)
@@ -350,7 +368,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         # Transfer fails -> cache_finished_req with is_insert=False
         # dec_lock_ref(root) is a no-op
         cache.cache_finished_req(
-            req, is_insert=False, kv_len_to_handle=req.kv_committed_len
+            req, is_insert=False, kv_len_to_handle=req.kv.kv_committed_len
         )
 
         # Root lock unchanged, nothing protected or evictable
@@ -368,7 +386,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.output_ids = [99]
         req.last_node = object()
         req.finished_reason = None
-        req.cache_protected_len = 0
+        req.kv.cache_protected_len = 0
         req.swa_uuid_for_lock = 123
         req.swa_prefix_lock_released = False
         req.pd_rebootstrap_in_progress = False
@@ -417,7 +435,12 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         running_batch = MagicMock()
         running_batch.reqs = []
         server_args = MagicMock()
-        server_args.disaggregation_decode_enable_radix_cache = True
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=True
+            ),
+        )
         scheduler = MagicMock()
         scheduler.running_batch = running_batch
         scheduler.server_args = server_args
@@ -481,7 +504,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             )
 
             cache.cache_unfinished_req(req)
-            cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
+            cache.cache_finished_req(req, kv_len_to_handle=req.kv.kv_committed_len)
 
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)

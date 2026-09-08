@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_schedule,
     get_spec,
 )
@@ -24,7 +25,13 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size, merge_state_v2
+from sgl_kernel import (
+    flash_mla_decode,
+    flash_mla_decode_get_workspace_size,
+    flash_mla_prefill,
+    flash_mla_prefill_get_workspace_size,
+    merge_state_v2,
+)
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
@@ -35,7 +42,6 @@ class XPUAttentionBackend(AttentionBackend):
     - Prefill and Decode disaggregation, currently only chunked prefill is supported
     - Speculative Decoding support
     - XPU Graph support, see https://github.com/pytorch/pytorch/issues/162143
-    - MLA Prefill support
     """
 
     def __init__(
@@ -106,9 +112,24 @@ class XPUAttentionBackend(AttentionBackend):
         # when deterministic inference is enabled to keep attention reduction
         # order fixed. This mirrors the flash-attention (fa3) backend.
         self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
+            1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+        if self.is_encoder_decoder:
+            from sglang.srt.model_executor.cuda_graph_config import (
+                cuda_graph_fully_disabled,
+            )
+
+            # Encoder-decoder cross-/self-attention below uses a dynamic-shape
+            # varlen KV gather (page_size=1 semantics) that cannot be captured.
+            # XPU disables CUDA graph by default, so this holds; the guard fails
+            # loudly if a future XPU graph path is force-enabled instead of
+            # silently mis-indexing through the paged graph-metadata path.
+            assert cuda_graph_fully_disabled(), (
+                "Encoder-decoder models (e.g. Whisper) on the intel_xpu attention "
+                "backend require CUDA graph disabled (off by default on XPU); the "
+                "graph decode path cannot run the varlen KV gather."
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -120,9 +141,9 @@ class XPUAttentionBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
-                assert (
-                    False
-                ), "XPUAttentionBackend doesn't support speculative decoding yet, please use --attention-backend triton instead."
+                assert False, (
+                    "XPUAttentionBackend doesn't support speculative decoding yet, please use --attention-backend triton instead."
+                )
                 if self.topk <= 1:
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
@@ -272,9 +293,7 @@ class XPUAttentionBackend(AttentionBackend):
                 # create expand page table
                 offsets = torch.arange(
                     self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(
-                    0
-                )  # shape: (1, self.speculative_num_draft_tokens)
+                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
                 cols = offsets.expand(
                     forward_batch.seq_lens.numel(), -1
                 ) + forward_batch.seq_lens.unsqueeze(1)
@@ -362,10 +381,6 @@ class XPUAttentionBackend(AttentionBackend):
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
-            assert (
-                forward_batch.encoder_lens.numel() == 1
-            ), "Only encoder size 1 is supported for now"
-
             metadata.encoder_lens_int32 = forward_batch.encoder_lens.to(torch.int32)
             metadata.encoder_cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
@@ -376,12 +391,18 @@ class XPUAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
 
-            # Currently only support forward_batch.encoder_lens.numel() == 1
+            # Decoder self-attn KV: per-request token-granular slice starting at
+            # each request's own encoder offset encoder_lens[i], not a single max.
+            text_max = metadata.max_seq_len_k
+            arange_text = torch.arange(
+                text_max, device=forward_batch.req_pool_indices.device
+            )
+            text_col = forward_batch.encoder_lens.long().unsqueeze(
+                1
+            ) + arange_text.unsqueeze(0)
+            text_row = forward_batch.req_pool_indices.unsqueeze(1).expand(-1, text_max)
             metadata.page_table = self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices,
-                metadata.encoder_max_seq_len_k : (
-                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
-                ),
+                text_row, text_col
             ]
 
         # Translate full-pool indices to SWA-pool indices for hybrid models
@@ -401,23 +422,40 @@ class XPUAttentionBackend(AttentionBackend):
                 )
 
         if self.use_mla:
-            workspace_size = flash_mla_get_workspace_size(
+            workspace_kwargs = dict(
                 max_seq_len=self.max_context_len,
                 num_batches=batch_size,
                 num_heads=self.num_local_heads,
                 page_size=self.page_size,
                 num_kv_splits=-1,
             )
+
+            workspace_decode_size = flash_mla_decode_get_workspace_size(
+                **workspace_kwargs
+            )
             if (
-                not hasattr(self, "workspace")
-                or self.workspace.numel() < workspace_size
+                not hasattr(self, "workspace_decode")
+                or self.workspace_decode.numel() < workspace_decode_size
             ):
-                self.workspace = torch.empty(
-                    workspace_size, device=self.device, dtype=torch.uint8
+                self.workspace_decode = torch.empty(
+                    workspace_decode_size, device=self.device, dtype=torch.uint8
                 )
 
-        # Convert the page table to a strided format which is needed by FA3 API
-        if self.page_size > 1:
+            workspace_prefill_size = flash_mla_prefill_get_workspace_size(
+                **workspace_kwargs
+            )
+            if (
+                not hasattr(self, "workspace_prefill")
+                or self.workspace_prefill.numel() < workspace_prefill_size
+            ):
+                self.workspace_prefill = torch.empty(
+                    workspace_prefill_size, device=self.device, dtype=torch.uint8
+                )
+
+        # Convert the page table to a strided format which is needed by FA3 API.
+        # Encoder-decoder page_table holds token-slot indices for the varlen
+        # kernel (page_size=1 semantics), so it must not be page-strided.
+        if self.page_size > 1 and forward_batch.encoder_lens is None:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
@@ -573,6 +611,22 @@ class XPUAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+            if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
+                page_table, cache_seqlens, causal = self._encoder_decoder_page_table(
+                    layer, metadata
+                )
+                o = self._forward_attn_flat_page_table(
+                    q=q,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    layer=layer,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    max_seqlen_q=metadata.max_seq_len_q,
+                    causal=causal,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
@@ -644,6 +698,9 @@ class XPUAttentionBackend(AttentionBackend):
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
             ):
+                q = q.contiguous()
+                k = k.contiguous()
+                v = v.contiguous()
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
                     assert not get_schedule().disable_chunked_prefix_cache
@@ -688,21 +745,20 @@ class XPUAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
+                assert not use_cascade_attn, (
+                    "Cascade attention is not supported with MLA"
+                )
+                assert causal, "Non-causal MLA prefill is not supported"
+                # flash_mla_prefill has no softcap argument, unlike the
+                # flash_attn_with_kvcache call it replaced. No MLA model sets a
+                # logit cap today; fail loudly rather than ignore one silently.
+                assert not layer.logit_cap, "MLA prefill does not support logit_cap"
+
                 # Do absorbed multi-latent attention
                 kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                     q.dtype
                 )
-                k_rope = kv_cache[:, :, layer.v_head_dim :]
-                c_kv = kv_cache[:, :, : layer.v_head_dim]
-                k_rope_cache = k_rope.view(
-                    -1,
-                    self.page_size,
-                    layer.tp_k_head_num,
-                    layer.head_dim - layer.v_head_dim,
-                )
-                c_kv_cache = c_kv.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                )
+
                 if q_rope is not None:
                     q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
                     q_rope = q_rope.view(
@@ -713,57 +769,80 @@ class XPUAttentionBackend(AttentionBackend):
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
-                result = flash_attn_with_kvcache(
-                    q=q_rope,
-                    k_cache=k_rope_cache,
-                    v_cache=c_kv_cache,
-                    qv=q_nope,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
+                o = flash_mla_prefill(
+                    q_nope=q_nope,
+                    q_pe=q_rope,
+                    kv_c_and_k_pe_cache=kv_cache.view(
+                        -1, self.page_size, layer.head_dim
+                    ),
                     cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k_new=None,
+                    seq_lens_k=cache_seqlens,
                     max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
+                    page_table=page_table,
+                    workspace=self.workspace_prefill,
+                    sm_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
-                    softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
                 )
-                if use_cascade_attn:
-                    o, softmax_lse, *rest = result
-                    o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
-                            q=q_rope,
-                            k_cache=k_rope_cache,
-                            v_cache=c_kv_cache,
-                            qv=q_nope,
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
-                            cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                            cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=None,
-                            max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                            softmax_scale=layer.scaling,
-                            causal=False,
-                            window_size=window_size,
-                            softcap=layer.logit_cap,
-                            k_descale=k_descale,
-                            v_descale=v_descale,
-                            return_softmax_lse=True,
-                            num_splits=self.num_splits,
-                        )
-                    )
-                    o, _ = merge_state_v2_wrapper(
-                        o,
-                        softmax_lse.T.contiguous(),
-                        o_expand,
-                        softmax_lse_expand.T.contiguous(),
-                    )
-                else:
-                    o = result
 
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return out
+
+    @staticmethod
+    def _encoder_decoder_page_table(layer, metadata):
+        """Pick (page_table, cache_seqlens, causal) for an encoder-decoder layer:
+        cross-attention reads the encoder KV region (non-causal), decoder
+        self-attention reads the decoder KV region (causal)."""
+        if layer.is_cross_attention:
+            return metadata.encoder_page_table, metadata.encoder_lens_int32, False
+        return metadata.page_table, metadata.cache_seqlens_int32, True
+
+    def _forward_attn_flat_page_table(
+        self,
+        *,
+        q,
+        key_cache,
+        value_cache,
+        layer,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        max_seqlen_q,
+        causal,
+    ):
+        """MHA on XPU via flash_attn_with_kvcache with a page_size=1 (flat
+        token-slot) page table. sgl-kernel-xpu PR #454 detects a page_size==1
+        k_cache + page_table and gathers + runs varlen internally, so the backend
+        calls it like the FA (CUDA) path. Eager-only. A request with
+        cache_seqlens==0 attends to no keys and the kernel returns NaN for its
+        rows, so those rows are zeroed (an all-empty batch skips the launch).
+        """
+        q_rows = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        # If the maximum cache_seqlens is 0, there are no keys to attend to.
+        if int(cache_seqlens.max().item()) == 0:
+            return q_rows.new_zeros(
+                (q_rows.shape[0], q_rows.shape[1], value_cache.shape[-1])
+            )
+        # page_size=1 view of the KV pool: PR #454 detects if page size dim is 1
+        # i.e. k_cache.shape[1] == 1 and routes flash_attn_with_kvcache to varlen gather.
+        k_cache = key_cache.reshape(-1, 1, layer.tp_k_head_num, layer.head_dim)
+        v_cache = value_cache.reshape(-1, 1, layer.tp_v_head_num, layer.head_dim)
+        out = flash_attn_with_kvcache(
+            q=q_rows,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=layer.scaling,
+            causal=causal,
+            softcap=layer.logit_cap,
+        )
+        # Mixed batch: requests with cache_seqlens==0 attend to no keys and come
+        # back as NaN, so zero their query rows (mapped via cu_seqlens_q).
+        if int(cache_seqlens.min().item()) == 0:
+            seg = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            out[(cache_seqlens == 0).repeat_interleave(seg)] = 0
         return out
 
     def forward_decode(
@@ -870,6 +949,23 @@ class XPUAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+
+            if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
+                page_table, cache_seqlens, causal = self._encoder_decoder_page_table(
+                    layer, metadata
+                )
+                o = self._forward_attn_flat_page_table(
+                    q=q,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    layer=layer,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    max_seqlen_q=1,
+                    causal=causal,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
@@ -1005,7 +1101,7 @@ class XPUAttentionBackend(AttentionBackend):
                 kv_cache.view(-1, self.page_size, layer.head_dim),
                 metadata.cache_seqlens_int32,
                 metadata.page_table,
-                self.workspace,
+                self.workspace_decode,
                 layer.scaling,
                 # flash_mla_decode's heuristic only kicks in when num_kv_splits
                 # < 1, and it derives the split count from batch * num_heads and
@@ -1083,12 +1179,12 @@ class XPUAttentionBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        assert (
-            spec_info is None
-        ), "XPUAttentionBackend does not support speculative decoding in XPU graph"
-        assert (
-            forward_mode.is_decode_or_idle()
-        ), "XPUAttentionBackend XPU graph only supports decode mode"
+        assert spec_info is None, (
+            "XPUAttentionBackend does not support speculative decoding in XPU graph"
+        )
+        assert forward_mode.is_decode_or_idle(), (
+            "XPUAttentionBackend XPU graph only supports decode mode"
+        )
 
         if in_capture:
             # Bind static-shape slices of the pre-allocated buffers so the
@@ -1289,9 +1385,9 @@ class XPUAttentionBackend(AttentionBackend):
         metadata_swa: Optional[FlashAttentionMetadata] = None,
     ):
         # TODO: support page_size > 1 for swa spec
-        assert (
-            self.page_size == 1
-        ), "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
+        assert self.page_size == 1, (
+            "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
+        )
 
         cache_seqlens_int32 = (
             metadata.cache_seqlens_int32.repeat_interleave(

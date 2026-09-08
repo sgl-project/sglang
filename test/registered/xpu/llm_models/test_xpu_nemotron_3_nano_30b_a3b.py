@@ -27,7 +27,6 @@ class TestNemotron3Nano30BA3BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     max_tokens = 8192
     # Client-side eval concurrency (mixin default is 1).
     num_threads = 4
-    env = {"SGLANG_USE_SGL_XPU": "1"}
 
     # Hybrid-mamba layout needs --model-impl sglang, a fixed page size, and
     # the nemotron_3 reasoning / qwen3_coder tool-call parsers.

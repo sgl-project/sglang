@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,7 +38,21 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-_A2A_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
+_A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+
+
+def drop_a2a_staging_buffers() -> None:
+    """Release the cached all-to-all staging buffers on this rank.
+
+    The cache only ever grows to the largest message seen, so a warmup probe
+    at the full serving shape leaves buffers sized for it behind; the caller
+    releases them at a point every rank reaches together.
+    """
+    if not _A2A_STAGING_BUFFERS:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _A2A_STAGING_BUFFERS.clear()
 
 
 def _a2a_staging_buffer(
@@ -46,8 +61,10 @@ def _a2a_staging_buffer(
     """Reusable staging buffer for a Ulysses collective.
 
     A buffer of a given role is fully consumed (in stream order) before the
-    next collective with the same role overwrites it, so caching by
-    (role, shape, dtype) is exact and removes per-block allocator churn.
+    next collective with the same role overwrites it. Keep one grow-only
+    backing allocation per (role, dtype, device), then return an exact-shape
+    view into that allocation. This removes per-block allocator churn without
+    retaining one CUDA tensor for every request shape seen by the worker.
     Bypassed under autograd and CUDA graph capture: a buffer first allocated
     while capturing would live in the graph's private memory pool and must
     not be shared with eager replays.
@@ -59,12 +76,22 @@ def _a2a_staging_buffer(
         or torch.cuda.is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
-    key = (role, tuple(shape), dtype, device.index)
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (role, dtype, device_index)
+    required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
-    if buffer is None:
-        buffer = torch.empty(shape, dtype=dtype, device=device)
+    if buffer is None or buffer.numel() < required_numel:
+        # The previous same-role collective is fully consumed by contract, so
+        # drop its cache reference before allocating a larger backing buffer.
+        # Any outstanding tensor view still keeps the old storage alive.
+        _A2A_STAGING_BUFFERS.pop(key, None)
+        del buffer
+        buffer = torch.empty(required_numel, dtype=dtype, device=device)
         _A2A_STAGING_BUFFERS[key] = buffer
-    return buffer
+    return buffer[:required_numel].view(shape)
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
@@ -299,9 +326,9 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    assert h_global % world_size == 0, (
+        f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    )
 
     h_local, s_global = h_global // world_size, s_local * world_size
 
@@ -475,9 +502,9 @@ def _usp_input_all_to_all_varlen(
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    assert (
-        len(seq_lens) == world_size
-    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    assert len(seq_lens) == world_size, (
+        f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    )
 
     rank = get_ulysses_parallel_rank()
 
@@ -491,12 +518,12 @@ def _usp_input_all_to_all_varlen(
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
-    assert (
-        s_local == seq_lens[rank]
-    ), f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    assert s_local == seq_lens[rank], (
+        f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
+    )
+    assert h_global % world_size == 0, (
+        f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    )
 
     h_local = h_global // world_size
 
@@ -565,9 +592,9 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         # Shape transition: [b, s_global, h_local, d] -> [s_global, b, h_local, d]
         permute_order = (1, 0, 2, 3)
 
-    assert (
-        s_global % world_size == 0
-    ), f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+    assert s_global % world_size == 0, (
+        f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+    )
 
     s_local, h_global = s_global // world_size, h_local * world_size
 
@@ -619,9 +646,9 @@ def _usp_output_all_to_all_varlen(
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    assert (
-        len(seq_lens) == world_size
-    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    assert len(seq_lens) == world_size, (
+        f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    )
 
     rank = get_ulysses_parallel_rank()
 
@@ -635,9 +662,9 @@ def _usp_output_all_to_all_varlen(
         # Shape transition: [b, s_global, h_local, d] -> [h_local, b, s_global, d]
         permute_order = (2, 0, 1, 3)
 
-    assert s_global == sum(
-        seq_lens
-    ), f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+    assert s_global == sum(seq_lens), (
+        f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+    )
 
     s_local = seq_lens[rank]
 

@@ -126,6 +126,7 @@ def minimax_h3_packed_sequence(
     include_keyframe_cond: bool,
     keyframe_frame_indices: list[int] | tuple[int, ...] | None = None,
     frame_count: int | None = None,
+    include_video_pos: bool = False,
 ) -> dict[str, Any]:
     """Build the packed-sequence structural fields for one CFG branch.
 
@@ -204,10 +205,23 @@ def minimax_h3_packed_sequence(
     token_tags = torch.full((seq_len,), -1, dtype=torch.long)  # PADDING
     token_tags[text_sl] = 1  # TEXT (fl2va image-segment override happens upstream)
     token_tags[audio_sl] = 2  # AUDIO
-    token_tags[img_pos] = 0  # VIDEO
+    token_tags[img_pos] = 0  # VISUAL (condition images + target video)
 
     cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
-    return {
+    # Cube-sparse-attention segment shapes; every other field is per-token.
+    stream_layout = {
+        "target_shape": (latent_t, ph, pw),
+        "cond_image_shapes": tuple((1, ph, pw) for _ in resolved_cond_frame_indices),
+        # FL2VA keyframes live on the target timeline.  The attention
+        # metadata builder must fold them into the target's 3D cube grid
+        # instead of inferring a dense image role from their T=1 shape.
+        "cond_image_roles": tuple("joint_cube" for _ in resolved_cond_frame_indices),
+        "cond_event_orders": tuple(
+            ("imgvid", index) for index in range(len(resolved_cond_frame_indices))
+        ),
+        "cond_audio_stream_lens": (),
+    }
+    packed = {
         "seq_len": seq_len,
         "img_pos": img_pos,
         "audio_pos": audio_pos,
@@ -216,7 +230,13 @@ def minimax_h3_packed_sequence(
         "img_position_ids": g,
         "token_tags": token_tags,
         "cu_seqlens": cu,
+        "stream_layout": stream_layout,
     }
+    if include_video_pos:
+        # Conditioning keyframes are images. Only generated video rows are
+        # eligible for SubBlock sparsity.
+        packed["video_pos"] = target_img_pos
+    return packed
 
 
 def _positive_int(
@@ -283,6 +303,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     frame_count: int | None = None,
     audio_channel: int = 2,
     seq_len: int | None = None,
+    include_video_pos: bool = False,
 ) -> dict[str, Any]:
     """General ref2va-family packed layout.
 
@@ -398,6 +419,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     audio_sl = slice(cursor, cursor + audio_rows)
     video_sl = slice(audio_sl.stop, audio_sl.stop + video_rows)
     ref_img_pos_parts: list[torch.Tensor] = []
+    ref_video_pos_parts: list[torch.Tensor] | None = [] if include_video_pos else None
     ref_audio_pos_parts: list[torch.Tensor] = []
     g = torch.zeros(seq_len, 3, dtype=torch.float64)
     g[text_sl, 0] = torch.arange(text_len, dtype=torch.float64)
@@ -448,7 +470,10 @@ def minimax_h3_packed_sequence_ref2va_blocks(
             vh = int(item["latent_h"])
             vw = int(item["latent_w"])
             ref_audio_pos_parts.append(_range_for_slice(audio_ref_sl))
-            ref_img_pos_parts.append(_range_for_slice(visual_sl))
+            visual_pos = _range_for_slice(visual_sl)
+            ref_img_pos_parts.append(visual_pos)
+            if ref_video_pos_parts is not None:
+                ref_video_pos_parts.append(visual_pos)
 
             ref_area = np.sqrt(vh * vw)
             rv_h_grid = _axis_from_sqrt_area(vh, _PATCH_H, ref_area)
@@ -512,10 +537,51 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     token_tags = torch.full((seq_len,), -1, dtype=torch.long)  # PADDING
     token_tags[text_sl] = 1  # TEXT
     token_tags[audio_pos] = 2  # AUDIO (refs + target)
-    token_tags[img_pos] = 0  # VIDEO (refs + target)
+    token_tags[img_pos] = 0  # VISUAL (reference images/videos + target video)
 
     cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
-    return {
+    # Cube-sparse-attention segment shapes; streams listed in ref-block order,
+    # matching the img_pos/audio_pos concatenation above (audio rows precede
+    # video rows within a video-bearing block).
+    cond_image_shapes: list[tuple[int, int, int]] = []
+    cond_image_roles: list[str] = []
+    cond_event_orders: list[tuple[str, int]] = []
+    cond_audio_stream_lens: list[int] = []
+    for item in parsed:
+        kind = str(item["kind"])
+        if kind == "image":
+            cond_event_orders.append(("imgvid", len(cond_image_shapes)))
+            cond_image_shapes.append(
+                (
+                    1,
+                    int(item["latent_h"]) // _PATCH_H,
+                    int(item["latent_w"]) // _PATCH_W,
+                )
+            )
+            cond_image_roles.append("dense_prefix")
+        elif kind == "audio":
+            cond_event_orders.append(("audio", len(cond_audio_stream_lens)))
+            cond_audio_stream_lens.append(int(item["audio_rows"]))
+        else:
+            cond_event_orders.append(("audio", len(cond_audio_stream_lens)))
+            cond_audio_stream_lens.append(int(item["audio_rows"]))
+            cond_event_orders.append(("imgvid", len(cond_image_shapes)))
+            cond_image_shapes.append(
+                (
+                    int(item["latent_t"]),
+                    int(item["latent_h"]) // _PATCH_H,
+                    int(item["latent_w"]) // _PATCH_W,
+                )
+            )
+            cond_image_roles.append("independent_cube")
+    stream_layout = {
+        "target_shape": (latent_t, ph, pw),
+        "cond_image_shapes": tuple(cond_image_shapes),
+        "cond_image_roles": tuple(cond_image_roles),
+        "cond_event_orders": tuple(cond_event_orders),
+        "cond_audio_stream_lens": tuple(cond_audio_stream_lens),
+    }
+    packed = {
         "seq_len": seq_len,
         "img_pos": img_pos,
         "audio_pos": audio_pos,
@@ -525,7 +591,13 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "img_position_ids": g,
         "token_tags": token_tags,
         "cu_seqlens": cu,
+        "stream_layout": stream_layout,
     }
+    if ref_video_pos_parts is not None:
+        # Reference image blocks remain dense; reference videos and the
+        # generated target video are eligible for SubBlock sparsity.
+        packed["video_pos"] = _cat_ranges(ref_video_pos_parts + [target_img_pos])
+    return packed
 
 
 __all__ = [
