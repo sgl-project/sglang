@@ -20,6 +20,149 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDSAMultiStepDecode(unittest.TestCase):
+    def test_eager_flashmla_scheduler_stays_on_live_query_axis(self):
+        flashmla_metadata = object()
+        backend = SimpleNamespace(
+            speculative_num_draft_tokens=4,
+            use_mha=False,
+            dsa_decode_impl="flashmla_kv",
+            dsa_index_topk=16,
+            real_page_size=1,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(64, dtype=torch.int32).view(4, 16)
+            ),
+            set_dsa_prefill_impl=MagicMock(),
+            get_topk_transform_method=MagicMock(),
+            _draft_decode_seq_len_offset=MagicMock(return_value=1),
+            _cal_indexer_k_start_end=MagicMock(return_value=(None, None)),
+            get_device_int32_arange=lambda size: torch.arange(size, dtype=torch.int32),
+            _compute_flashmla_metadata=MagicMock(return_value=flashmla_metadata),
+            _transform_table_1_to_real=MagicMock(
+                return_value=torch.zeros((1, 16), dtype=torch.int32)
+            ),
+            _build_topk_v2_plan=MagicMock(return_value=None),
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            seq_lens=torch.tensor([7]),
+            seq_lens_cpu=torch.tensor([7]),
+            req_pool_indices=torch.tensor([0]),
+            spec_info=object(),
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_sum=7,
+        )
+        physical_dsa_lengths = torch.tensor([8, 0, 0, 0], dtype=torch.int32)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.pad_dsa_cache_seqlens",
+                return_value=physical_dsa_lengths,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.is_cuda",
+                return_value=False,
+            ),
+        ):
+            DeepseekSparseAttnBackend.init_forward_metadata(backend, forward_batch)
+
+        flashmla_lengths = backend._compute_flashmla_metadata.call_args.kwargs[
+            "cache_seqlens"
+        ]
+        self.assertEqual(flashmla_lengths.tolist(), [8])
+        self.assertIs(backend.forward_metadata.flashmla_metadata, flashmla_metadata)
+        self.assertTrue(
+            torch.equal(
+                backend.forward_metadata.dsa_cache_seqlens_int32,
+                physical_dsa_lengths,
+            )
+        )
+
+    def test_flashmla_decode_trims_physical_lengths_to_live_query_rows(self):
+        captured = {}
+        flashmla = ModuleType("sgl_kernel.flash_mla")
+
+        def fake_flash_mla_with_kvcache(**kwargs):
+            captured.update(kwargs)
+            return torch.ones((1, 1, 2, 2)), None
+
+        flashmla.flash_mla_with_kvcache = fake_flash_mla_with_kvcache
+        sgl_kernel = ModuleType("sgl_kernel")
+        sgl_kernel.flash_mla = flashmla
+        backend = SimpleNamespace(
+            flashmla_kv_num_q_heads=2,
+            real_page_size=64,
+            kv_cache_dim=3,
+            dsa_kv_cache_store_fp8=True,
+            dsa_index_topk=2,
+        )
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.tensor([8, 0, 0, 0], dtype=torch.int32),
+            flashmla_metadata=SimpleNamespace(
+                flashmla_metadata=torch.empty((1,), dtype=torch.int32),
+                num_splits=torch.empty((2,), dtype=torch.int32),
+            ),
+        )
+        layer = SimpleNamespace(tp_q_head_num=2, head_dim=3)
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "sgl_kernel": sgl_kernel,
+                "sgl_kernel.flash_mla": flashmla,
+            },
+        ):
+            output = DeepseekSparseAttnBackend._forward_flashmla_kv(
+                backend,
+                q_all=torch.empty((1, 2, 3)),
+                kv_cache=torch.empty((64, 3)),
+                v_head_dim=2,
+                sm_scale=1.0,
+                layer=layer,
+                metadata=metadata,
+                page_table_1=torch.zeros((1, 2), dtype=torch.int32),
+            )
+
+        self.assertEqual(captured["q"].shape[0], 1)
+        self.assertEqual(captured["cache_seqlens"].tolist(), [8])
+        self.assertEqual(captured["indices"].shape[0], 1)
+        self.assertEqual(captured["num_splits"].shape[0], 2)
+        self.assertEqual(output.shape, (1, 1, 2, 2))
+
+    def test_flashmla_decode_rejects_scheduler_row_mismatch(self):
+        flashmla = ModuleType("sgl_kernel.flash_mla")
+        flashmla.flash_mla_with_kvcache = MagicMock()
+        sgl_kernel = ModuleType("sgl_kernel")
+        sgl_kernel.flash_mla = flashmla
+        backend = SimpleNamespace()
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.tensor([8, 0, 0, 0], dtype=torch.int32),
+            flashmla_metadata=SimpleNamespace(
+                flashmla_metadata=torch.empty((1,), dtype=torch.int32),
+                num_splits=torch.empty((5,), dtype=torch.int32),
+            ),
+        )
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "sgl_kernel": sgl_kernel,
+                    "sgl_kernel.flash_mla": flashmla,
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "q_tokens=1, num_splits=5"),
+        ):
+            DeepseekSparseAttnBackend._forward_flashmla_kv(
+                backend,
+                q_all=torch.empty((1, 2, 3)),
+                kv_cache=torch.empty((64, 3)),
+                v_head_dim=2,
+                sm_scale=1.0,
+                layer=SimpleNamespace(tp_q_head_num=2, head_dim=3),
+                metadata=metadata,
+                page_table_1=torch.zeros((1, 2), dtype=torch.int32),
+            )
+
     def test_draft_children_advance_visible_kv_length(self):
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         backend.speculative_num_steps = 3

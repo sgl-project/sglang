@@ -1057,12 +1057,12 @@ class DeepseekSparseAttnBackend(
             forward_batch, bs_idx_cpu
         )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
-        dsa_cache_seqlens_int32 = compute_dsa_seqlens(
+        raw_dsa_cache_seqlens_int32 = compute_dsa_seqlens(
             original_seq_lens=seqlens_expanded,
             dsa_index_topk=self.dsa_index_topk,
         )
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
-            forward_batch, dsa_cache_seqlens_int32
+            forward_batch, raw_dsa_cache_seqlens_int32
         )
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
@@ -1099,7 +1099,10 @@ class DeepseekSparseAttnBackend(
             page_table_1_flattened=page_table_1_flattened,
             flashmla_metadata=(
                 self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens_int32,
+                    # Eager DP/CP padding belongs to the indexer/MLP physical
+                    # axis. FlashMLA consumes the live query axis, which is
+                    # trimmed back to the request rows in ``forward_decode``.
+                    cache_seqlens=raw_dsa_cache_seqlens_int32,
                     seq_len_q=1,
                 )
                 if use_flashmla_kv
@@ -2887,8 +2890,20 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
-        cache_seqlens = metadata.dsa_cache_seqlens_int32
+        live_num_tokens = q_all.shape[0]
+        cache_seqlens = metadata.dsa_cache_seqlens_int32[:live_num_tokens]
         assert metadata.flashmla_metadata is not None
+        num_splits = metadata.flashmla_metadata.num_splits
+        if num_splits.shape[0] != live_num_tokens + 1:
+            raise RuntimeError(
+                "FlashMLA scheduler rows must match the live DSA query axis: "
+                f"q_tokens={live_num_tokens}, num_splits={num_splits.shape[0]}"
+            )
+        if page_table_1.shape[0] != live_num_tokens:
+            raise RuntimeError(
+                "FlashMLA index rows must match the live DSA query axis: "
+                f"q_tokens={live_num_tokens}, index_rows={page_table_1.shape[0]}"
+            )
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
@@ -2921,7 +2936,7 @@ class DeepseekSparseAttnBackend(
             cache_seqlens=cache_seqlens,
             head_dim_v=v_head_dim,
             tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
+            num_splits=num_splits,
             softmax_scale=sm_scale,
             indices=indices,
             # doc says it is not used, but if pass in None then error
