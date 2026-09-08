@@ -599,8 +599,7 @@ class SchedulerDisaggregationPrefillMixin:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -639,8 +638,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
