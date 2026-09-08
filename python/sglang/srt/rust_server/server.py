@@ -23,7 +23,7 @@ from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
-from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
     RUST_MM_FAMILIES,
@@ -83,8 +83,14 @@ class RustServer:
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         if dp_rank is not None:
-            nnodes_per_pp_rank = max(get_parallel().nnodes // scheduler.ps.pp_size, 1)
-            tp_size_per_node = scheduler.ps.tp_size // nnodes_per_pp_rank
+            if get_exec().moe.is_ep_scale_joiner:
+                # The joining TP group is entirely local to this node.
+                tp_size_per_node = scheduler.ps.tp_size
+            else:
+                nnodes_per_pp_rank = max(
+                    get_parallel().nnodes // scheduler.ps.pp_size, 1
+                )
+                tp_size_per_node = scheduler.ps.tp_size // nnodes_per_pp_rank
             dp_group_width = scheduler.ps.attn_tp_size * scheduler.ps.attn_cp_size
             # Count DP leaders within this node's TP range. The first leader must
             # use the base port even when a DP group spans multiple nodes.

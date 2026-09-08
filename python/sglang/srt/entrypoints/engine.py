@@ -1887,10 +1887,17 @@ def node_hosts_rust_server() -> bool:
     if 0 not in pp_rank_range:
         return False
 
-    # Matches Scheduler._hosts_rust_server: attention CP and TP ranks are both
-    # zero exactly at multiples of their combined group width.
-    dp_group_width = parallel.attn_tp_size * parallel.attn_cp_size
-    return any(tp_rank % dp_group_width == 0 for tp_rank in tp_rank_range)
+    if get_exec().moe.is_ep_scale_joiner:
+        # Scale joiners launch the full local TP group, including its first rank.
+        return True
+
+    # Each attention DP group hosts a listener on its first rank (CP=TP=0).
+    ranks_per_dp_group = parallel.attn_tp_size * parallel.attn_cp_size
+    for tp_rank in tp_rank_range:
+        rank_within_dp_group = tp_rank % ranks_per_dp_group
+        if rank_within_dp_group == 0:
+            return True
+    return False
 
 
 def _compute_parallelism_ranks(tp_rank: int) -> Tuple[int, int, int]:
