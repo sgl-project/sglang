@@ -242,5 +242,6 @@ jobs:
               /glm53-community/sglang/test/registered/unit/managers/scheduler_components/test_dp_attn.py \
               /glm53-community/sglang/test/registered/unit/spec/test_eagle_draft_dp_padding.py \
               /glm53-community/sglang/test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py \
-              /glm53-community/sglang/test/registered/unit/spec/test_eagle_draft_cuda_graph_runner.py
+              /glm53-community/sglang/test/registered/unit/spec/test_eagle_draft_cuda_graph_runner.py \
+              /glm53-community/sglang/test/registered/kernels/ops/attention/test_dsa_transform_index.py::TestDSATransformIndexReference
           ' -- "$SOURCE_COMMIT" "$SOURCE_TREE" "$SGL_DEEP_GEMM_COMMIT" "$SOURCE_ARCHIVE_SHA256" "$SGLANG_KERNEL_VERSION" "$KERNEL_AOT_TREE"
