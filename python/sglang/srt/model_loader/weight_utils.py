@@ -56,7 +56,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
@@ -242,7 +242,9 @@ def _resolve_explicit_draft_quant_config(
     model_config: ModelConfig,
     quant_config: QuantizationConfig,
 ) -> QuantizationConfig:
-    if not (model_config.is_draft_model and get_spec().is_draft_quantization_explicit):
+    if not (
+        model_config.is_draft_model and model_config.is_draft_quantization_explicit
+    ):
         return quant_config
 
     if model_config.quantization == "modelopt_fp4" and (

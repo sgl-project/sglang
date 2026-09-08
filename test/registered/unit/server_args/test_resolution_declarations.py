@@ -73,6 +73,7 @@ _SHAPES = (
 # a shape that stops reaching a field fails here. Add to it when adding a shape.
 _REACHED_BY_SHAPES = frozenset(
     {
+        "_speculative_draft_quantization_explicitly_set",
         "allowed_media_domains",
         "attention_backend",
         "chunked_prefill_size",

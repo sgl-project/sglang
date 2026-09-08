@@ -287,6 +287,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_moe_runner_backend",
     "speculative_moe_a2a_backend",
     "speculative_draft_model_quantization",
+    "_speculative_draft_quantization_explicitly_set",
     "speculative_skip_dp_mlp_sync",
     "enable_multi_layer_eagle",
     "speculative_adaptive",

@@ -618,6 +618,13 @@ def handle_missing_default_values(server_args: Any):
     # In speculative scenario:
     # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
     # - Otherwise, the draft model defaults to the same quantization as the target model.
+    if cfg._speculative_draft_quantization_explicitly_set is None:
+        declare_resolution(
+            server_args,
+            "_handle_missing_default_values",
+            _speculative_draft_quantization_explicitly_set=cfg.speculative_draft_model_quantization
+            is not None,
+        )
     if cfg.speculative_draft_model_quantization is None:
         declare_resolution(
             server_args,

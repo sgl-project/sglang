@@ -18,7 +18,6 @@ from typing import (
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
-    Derived,
 )
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
@@ -32,12 +31,6 @@ class Spec:
     """Namespace ``spec``."""
 
     _NS_PATH = "spec"
-
-    is_draft_quantization_explicit = Derived(
-        fn="sglang.srt.runtime_context.is_draft_quantization_explicit_of",
-        doc="Whether the operator asked for a draft-model quantization, as "
-        "opposed to resolution inheriting the target model's.",
-    )
     # -------------------------------------------------------------------------
     # Speculative decoding
     # -------------------------------------------------------------------------
@@ -199,6 +192,13 @@ class Spec:
             help="The quantization method for speculative model.",
             choices=QUANTIZATION_CHOICES,
         ),
+    ] = None
+    # Internal provenance used after the public draft quantization inherits the
+    # target value. It is a dataclass field so ServerArgs round-trips preserve
+    # whether the user explicitly set the draft option; it has no CLI surface.
+    _speculative_draft_quantization_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
     ] = None
     speculative_skip_dp_mlp_sync: A[
         bool,

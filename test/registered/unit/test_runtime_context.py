@@ -425,25 +425,27 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         )
         self.assertEqual(mamba_cache_chunk_size_of(published), 64)
 
-    def test_no_field_starts_with_an_underscore(self):
-        """What lets the record's write seal test the spelling.
+    def test_an_underscore_field_is_declared_like_any_other(self):
+        """The split is fields vs not-fields, not the leading underscore.
 
-        `__setattr__` seals every name that does not start with an underscore,
-        because the underscore ones are the record's own bookkeeping and
-        resolution writes them on purpose. That is only sufficient while no
-        *field* is spelled that way -- one that is would be silently writable
-        during resolution, which is the single thing the seal exists to stop.
+        `_speculative_draft_quantization_explicitly_set` is a real field
+        published under `spec`. Seeding it as a raw attribute instead of
+        declaring it would leave the earlier resolution authoritative, so both
+        the resolution and the bag would keep answering the pre-override value
+        while the record said otherwise.
         """
-        underscore_fields = sorted(
-            n for n in ServerArgs.__dataclass_fields__ if n.startswith("_")
-        )
-        self.assertEqual(
-            underscore_fields,
-            [],
-            "a field now starts with an underscore, so the write seal in "
-            "ServerArgs.__setattr__ no longer covers it; seal on field-ness "
-            "rather than spelling, or rename the field",
-        )
+        from sglang.srt.arg_groups.overrides import resolution_result
+        from sglang.srt.runtime_context import get_spec
+
+        name = "_speculative_draft_quantization_explicitly_set"
+        self.assertIn(name, ServerArgs.__dataclass_fields__)
+
+        published = get_context().override_server_args(**{name: True}).install()
+        # The record keeps the operator's input, as it does for every other
+        # field; the override travels as a declaration.
+        self.assertIsNone(getattr(published, name))
+        self.assertIs(resolution_result(published, name), True)
+        self.assertIs(getattr(get_spec(), name), True)
 
     def test_installed_config_arms_the_strict_guard(self):
         # The published dummy must behave like a resolved config: bare writes
