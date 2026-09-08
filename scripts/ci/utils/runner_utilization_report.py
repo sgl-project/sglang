@@ -500,9 +500,7 @@ def queue_timeline(
     peaks = [0] * len(starts)
 
     def bucket_index(when: datetime) -> int:
-        """Bucket `when` falls in, or None when it predates the first bucket."""
-        if when < origin:
-            return None
+        """Bucket `when` falls in. Callers drop anything before origin."""
         offset = (when - origin).total_seconds() // (bucket_minutes * 60)
         return min(len(starts) - 1, int(offset))
 
