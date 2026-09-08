@@ -99,9 +99,8 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
-    def test_hip_dsa_cp_uses_protected_legacy_runtime_flag(self):
+    def test_hip_dsa_cp_is_disabled(self):
         parallel = SimpleNamespace(
-            enable_dsa_prefill_context_parallel=False,
             attn_cp_size=2,
         )
         model_config = SimpleNamespace(hf_config=SimpleNamespace())
@@ -597,17 +596,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             max_rank_len=[7, 7],
         )
 
-        with (
-            get_parallel().override(attn_cp_size=cp_size),
-            patch(
-                "sglang.srt.layers.utils.cp_utils.is_prefill_cp_in_seq_split",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_in_seq_split",
-                return_value=False,
-            ),
-        ):
+        with get_parallel().override(attn_cp_size=cp_size):
             align_size = get_cp_padding_align_size()
             pad_logical_token_to_physical(metadata)
 

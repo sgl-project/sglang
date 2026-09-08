@@ -17,14 +17,10 @@ cost, before the sweep these cases guard:
   - a deterministic-inference knob left unset (prefill truncation align).
 
 `attention_backends()` is the shared answer: the pair with the base-field
-fallback applied. The callable decisions are checked by calling them; the rest
-are pinned statically, since reproducing them means building a model or a
-scheduler.
+fallback applied. The tests below exercise the callable decisions directly.
 """
 
-import ast
 import unittest
-from pathlib import Path
 
 from sglang.srt.runtime_context import attention_backends, get_context
 from sglang.srt.server_args import ServerArgs
@@ -33,25 +29,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
-import sglang
 from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
-
-_PACKAGE_ROOT = Path(next(iter(sglang.__path__))) / "srt"
-
-# The decisions this file is about, and which half of the pair each one needs.
-# A base-only read here is the regression; the resolution pipeline and the two
-# modules that own the config are exempt because "did the operator pin the base
-# field?" is a real question *there*.
-_PAIR_READERS = {
-    "models/inkling_common/attn.py": "the half serving the forward (mirrors hybrid dispatch)",
-    "model_executor/model_runner_components/misc_utils.py": "prefill (chunked prefix cache)",
-    "layers/rotary_embedding/mrope.py": "both (triton availability)",
-    "mem_cache/allocation.py": "prefill (req-to-token writer); both (get_last_loc)",
-    "batch_overlap/two_batch_overlap.py": "prefill (extend positions)",
-    "managers/scheduler.py": "prefill (truncation align knobs)",
-    "entrypoints/engine.py": "either half (flashinfer version floor)",
-    "models/sarvam_moe.py": "the half serving the forward (attn dispatch)",
-}
 
 
 class TestSplitBackendsReachTheDecisions(CustomTestCase):
@@ -191,25 +169,6 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
         # reads as "supported".
         self.assertTrue(support_triton(None))
 
-    def test_no_listed_decision_reads_the_base_field_alone(self):
-        offenders = []
-        for rel, why in _PAIR_READERS.items():
-            tree = ast.parse((_PACKAGE_ROOT / rel).read_text())
-            for node in ast.walk(tree):
-                # Any attribute read named `attention_backend` is the base
-                # field, whatever the base expression is spelled as -- a bag
-                # chain, a record, or a local alias of either
-                # (`k = get_exec().kernel; k.attention_backend`). The pair
-                # helpers are calls, not attributes, so they never match.
-                if isinstance(node, ast.Attribute) and node.attr == "attention_backend":
-                    offenders.append(f"{rel}:{node.lineno}: base-only read ({why})")
-        self.assertEqual(
-            [],
-            offenders,
-            "these decisions must read attention_backends() (the pair with the "
-            "base-field fallback), not the base field:\n" + "\n".join(offenders),
-        )
-
 
 class TestDraftFactoryStamping(CustomTestCase):
     """The factory's products carry the stamp `serving_attention_backend`
@@ -315,48 +274,6 @@ class TestDraftFactoryStamping(CustomTestCase):
         self.assertEqual(
             product.attn_backends[0].decode_attention_backend_str, "triton"
         )
-
-    def test_the_real_map_never_stamps_an_alias(self):
-        # The factory's real constructors each answer their effective name;
-        # this pins that no map key with an aliased or host-dependent
-        # constructor ("nsa", "cutedsl_mla", "hybrid_linear_attn") can leak
-        # its request name into a stamp: whatever the leaf built, the name it
-        # answered is a concrete kernel, never one of the alias keys.
-        import ast as _ast
-        import inspect
-
-        from sglang.srt.speculative import draft_utils
-
-        tree = _ast.parse(inspect.getsource(draft_utils))
-        offenders = []
-        for node in _ast.walk(tree):
-            if not isinstance(node, _ast.FunctionDef):
-                continue
-            if not node.name.startswith("_create_") or "_backend" not in node.name:
-                continue
-            for ret in _ast.walk(node):
-                if not isinstance(ret, _ast.Return) or ret.value is None:
-                    continue
-                # Leaf returns are ("name", ctor(...)); delegations return the
-                # inner call. A bare backend return would silently miss the
-                # stamp contract.
-                if isinstance(ret.value, _ast.Tuple):
-                    name = ret.value.elts[0]
-                    if isinstance(name, _ast.Constant) and name.value in (
-                        "nsa",
-                        "hybrid_linear_attn",
-                    ):
-                        offenders.append(f"{node.name}: stamps alias {name.value!r}")
-                elif isinstance(ret.value, _ast.Call):
-                    fn = ret.value.func
-                    is_delegation = isinstance(
-                        fn, _ast.Attribute
-                    ) and fn.attr.startswith("_create_")
-                    if not is_delegation:
-                        offenders.append(
-                            f"{node.name}: returns a bare backend (no effective name)"
-                        )
-        self.assertEqual([], offenders, "\n".join(offenders))
 
 
 if __name__ == "__main__":

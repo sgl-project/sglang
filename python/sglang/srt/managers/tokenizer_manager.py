@@ -143,6 +143,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -1258,6 +1259,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
+                )
+            if (
+                obj.return_sampling_mask
+                and obj.custom_logit_processor
+                and not supports_sampling_mask(obj.custom_logit_processor)
+            ):
+                # Reject before scheduling so aborted requests cannot execute
+                # unsupported processors during sampling batch preparation.
+                raise ValueError(
+                    "return_sampling_mask only supports DisallowedTokensLogitsProcessor "
+                    "among custom logit processors."
                 )
 
     def _validate_mm_limits(
