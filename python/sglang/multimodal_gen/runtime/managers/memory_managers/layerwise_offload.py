@@ -1044,8 +1044,9 @@ class LayerwiseOffloadManager:
             try:
                 torch.cuda.set_device(self.device)
                 observed_generation = 0
-                with self._prefetch_submission_lock, torch.cuda.stream(
-                    self.copy_stream
+                with (
+                    self._prefetch_submission_lock,
+                    torch.cuda.stream(self.copy_stream),
                 ):
                     for dtype, cpu_buffer in cpu_buffers.items():
                         gpu_buffer = gpu_buffers[dtype]
