@@ -86,6 +86,7 @@ class TestSpecKvIndicesGrid(CustomTestCase):
                     inputs = _draft_inputs(seqs, topk, steps, "cuda", idx_dtype)
                     ref = _run_draft(inputs, topk, steps, page_size, 1, {})
                     for nb in [
+                        1,
                         kv_indices_num_token_blocks(POOL_LEN, steps * len(seqs) * topk),
                         triton.cdiv(POOL_LEN, 8192),
                     ]:
@@ -164,10 +165,11 @@ class TestSpecKvIndicesGrid(CustomTestCase):
                 )
                 n = int(indptr[-1]) + (7 * bs if use_start else 0) + 8
                 outs = []
-                for grid in [
-                    (bs,),
-                    (bs, kv_indices_num_token_blocks(POOL_LEN, bs)),
-                    (bs, triton.cdiv(POOL_LEN, 8192)),
+                for grid, parallel in [
+                    ((bs,), False),
+                    ((bs, 1), True),
+                    ((bs, kv_indices_num_token_blocks(POOL_LEN, bs)), True),
+                    ((bs, triton.cdiv(POOL_LEN, 8192)), True),
                 ]:
                     kv_i = torch.full((n,), SENTINEL, dtype=torch.int32, device=dev)
                     create_flashinfer_kv_indices_triton[grid](
@@ -179,6 +181,7 @@ class TestSpecKvIndicesGrid(CustomTestCase):
                         kv_i,
                         r2t.shape[1],
                         ENTRY_PAGE_SIZE=entry_page_size,
+                        TOKEN_BLOCK_PARALLEL=parallel,
                     )
                     torch.cuda.synchronize()
                     outs.append(kv_i)

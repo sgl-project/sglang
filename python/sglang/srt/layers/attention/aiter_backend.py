@@ -1372,7 +1372,8 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens_sum, device
                 )
 
-                create_flashinfer_kv_indices_triton[(bs, self._kv_index_blocks(bs))](
+                num_token_blocks = self._kv_index_blocks(bs)
+                create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
@@ -1380,6 +1381,7 @@ class AiterAttnBackend(AttentionBackend):
                     None,
                     kv_indices,
                     self.req_to_token.stride(0),
+                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
 
                 if _use_mla_ps_kernel:
@@ -1465,7 +1467,8 @@ class AiterAttnBackend(AttentionBackend):
                     kv_lens_sum,
                     device,
                 )
-                create_flashinfer_kv_indices_triton[(bs, self._kv_index_blocks(bs))](
+                num_token_blocks = self._kv_index_blocks(bs)
+                create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     kv_lens,
@@ -1473,6 +1476,7 @@ class AiterAttnBackend(AttentionBackend):
                     None,
                     kv_indices,
                     self.req_to_token.stride(0),
+                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
 
                 # if self.kv_cache_dtype == fp8_dtype:
@@ -1562,9 +1566,8 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices = torch.empty(
                         kv_indptr[-1], dtype=torch.int64, device=self.device
                     )
-                    create_flashinfer_kv_indices_triton[
-                        (bs, self._kv_index_blocks(bs))
-                    ](
+                    num_token_blocks = self._kv_index_blocks(bs)
+                    create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                         self.req_to_token,
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
@@ -1572,6 +1575,7 @@ class AiterAttnBackend(AttentionBackend):
                         None,
                         kv_indices,
                         self.req_to_token.stride(0),
+                        TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                     )
 
                     custom_mask = spec_info.custom_mask
@@ -2018,7 +2022,8 @@ class AiterAttnBackend(AttentionBackend):
                     bs=bs,
                     seq_lens_sum=seq_lens_sum,
                 )
-            create_flashinfer_kv_indices_triton[(bs, self._kv_index_blocks(bs))](
+            num_token_blocks = self._kv_index_blocks(bs)
+            create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                 self.req_to_token,
                 req_pool_indices,
                 kv_lens,
@@ -2026,6 +2031,7 @@ class AiterAttnBackend(AttentionBackend):
                 None,
                 kv_indices,
                 self.req_to_token.stride(0),
+                TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
             )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
@@ -2144,7 +2150,8 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs, self._kv_index_blocks(bs))](
+            num_token_blocks = self._kv_index_blocks(bs)
+            create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                 self.req_to_token,
                 req_pool_indices,
                 seq_lens,
@@ -2152,6 +2159,7 @@ class AiterAttnBackend(AttentionBackend):
                 None,
                 kv_indices,
                 self.req_to_token.stride(0),
+                TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
             )
 
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
@@ -3489,7 +3497,9 @@ class AiterMultiStepDraftBackend:
             triton.next_power_of_2(self.speculative_num_steps),
             triton.next_power_of_2(bs),
             self.page_size,
-            NUM_STEPS=self.speculative_num_steps,
+            # A single token block is the historical launch; NUM_STEPS=0 keeps
+            # its 128-wide program instead of the token-block specialization.
+            NUM_STEPS=self.speculative_num_steps if num_token_blocks > 1 else 0,
         )
 
         for i in range(self.speculative_num_steps - 1):
