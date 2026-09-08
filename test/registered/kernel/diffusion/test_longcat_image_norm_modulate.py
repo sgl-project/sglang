@@ -11,7 +11,7 @@ from sglang.kernels.ops.diffusion import BitExactFusionGate, modulate_scale_shif
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 class TestLongCatNormModulation(CustomTestCase):
@@ -63,6 +63,24 @@ class TestLongCatNormModulation(CustomTestCase):
         norm = torch.nn.LayerNorm(3072, elementwise_affine=False, eps=1e-6).cuda()
         return norm, x, scale, shift
 
+    def test_grad_enabled_uses_differentiable_reference(self):
+        norm, x, scale, shift = self.inputs(seq=17)
+        with torch.inference_mode():
+            longcat._longcat_norm_modulate(norm, x, scale, shift)
+        self.assertTrue(longcat._LONGCAT_LN_MOD.verified)
+        leaves = [t.detach().clone().requires_grad_() for t in (x, scale, shift)]
+        refs = [t.detach().clone().requires_grad_() for t in leaves]
+        with patch.object(longcat.diffusion_ops, "fused_layernorm_modulate") as fused:
+            actual = longcat._longcat_norm_modulate(norm, *leaves)
+            actual.float().sum().backward()
+            fused.assert_not_called()
+        expected = norm(refs[0]) * (1 + refs[1][:, None]) + refs[2][:, None]
+        expected.float().sum().backward()
+        self.assertTrue(torch.equal(actual, expected))
+        for a, b in zip(leaves, refs, strict=True):
+            self.assertIsNotNone(a.grad)
+            self.assertTrue(torch.equal(a.grad, b.grad))
+
     @torch.inference_mode()
     def test_changed_inputs_are_used_by_graph_replay(self):
         norm, x, scale, shift = self.inputs()
@@ -82,7 +100,7 @@ class TestLongCatNormModulation(CustomTestCase):
     def test_unverified_capture_uses_eager_reference(self):
         norm, x, scale, shift = self.inputs(seq=17)
         expected = modulate_scale_shift(norm(x), scale, shift)
-        with patch.object(longcat, "fused_layernorm_modulate") as fused:
+        with patch.object(longcat.diffusion_ops, "fused_layernorm_modulate") as fused:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 actual = longcat._longcat_norm_modulate(norm, x, scale, shift)
@@ -96,12 +114,14 @@ class TestLongCatNormModulation(CustomTestCase):
         norm, x, scale, shift = self.inputs(seq=17)
         expected = norm(x) * (1 + scale[:, None]) + shift[:, None]
         with patch.object(
-            longcat, "fused_layernorm_modulate", return_value=torch.zeros_like(x)
+            longcat.diffusion_ops,
+            "fused_layernorm_modulate",
+            return_value=torch.zeros_like(x),
         ):
             actual = longcat._longcat_norm_modulate(norm, x, scale, shift)
         self.assertTrue(longcat._LONGCAT_LN_MOD.disabled)
         self.assertTrue(torch.equal(actual, expected))
-        with patch.object(longcat, "fused_layernorm_modulate") as fused:
+        with patch.object(longcat.diffusion_ops, "fused_layernorm_modulate") as fused:
             actual = longcat._longcat_norm_modulate(norm, x, scale, shift)
             fused.assert_not_called()
         self.assertTrue(torch.equal(actual, expected))

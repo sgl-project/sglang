@@ -32,17 +32,14 @@ from diffusers.models.normalization import (
     AdaLayerNormZeroSingle,
 )
 
+from sglang.kernels.ops import diffusion as diffusion_ops
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_inplace_qknorm_rope,
-    can_use_fused_layernorm_modulate,
     can_use_linear_gelu,
     fused_gelu_active,
-    fused_layernorm_modulate,
     fused_linear_gelu_tanh,
-    is_plain_layer_norm,
     mark_fused_gelu_site,
-    modulate_scale_shift,
     residual_gate_add,
     tensors_equal,
 )
@@ -75,12 +72,15 @@ def _longcat_norm_modulate(
     scale: torch.Tensor,
     shift: torch.Tensor,
 ) -> torch.Tensor:
+    if torch.is_grad_enabled() or torch.compiler.is_compiling():
+        return norm(x) * (1 + scale[:, None]) + shift[:, None]
     # LayerNorm's reduction depends on the live aten dispatch. Verify each
     # shape/stride before using the bit-exact fused kernel, outside capture.
     if (
         not _LONGCAT_LN_MOD.disabled
-        and is_plain_layer_norm(norm, x.shape[-1])
-        and can_use_fused_layernorm_modulate(x, scale, shift)
+        and x.is_cuda
+        and diffusion_ops.is_plain_layer_norm(norm, x.shape[-1])
+        and diffusion_ops.can_use_fused_layernorm_modulate(x, scale, shift)
     ):
         sig = (
             x.shape,
@@ -94,21 +94,19 @@ def _longcat_norm_modulate(
             x.device,
         )
         verified = _LONGCAT_LN_MOD.is_verified(sig)
-        if verified or not (
-            torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
-        ):
+        if verified or not torch.cuda.is_current_stream_capturing():
             try:
-                out = fused_layernorm_modulate(x, scale, shift, norm.eps)
+                out = diffusion_ops.fused_layernorm_modulate(x, scale, shift, norm.eps)
             except Exception as exc:
                 _LONGCAT_LN_MOD.on_exception(exc, logger=logger)
             else:
                 if verified:
                     return out
-                reference = modulate_scale_shift(norm(x), scale, shift)
+                reference = norm(x) * (1 + scale[:, None]) + shift[:, None]
                 return _LONGCAT_LN_MOD.accept_or_fallback(
                     out, reference, sig=sig, logger=logger
                 )
-    return modulate_scale_shift(norm(x), scale, shift)
+    return norm(x) * (1 + scale[:, None]) + shift[:, None]
 
 
 class _LongCatAdaLayerNormZero(AdaLayerNormZero):
@@ -341,9 +339,9 @@ class _LongCatJointAttention(nn.Module):
         super().__init__()
         tp_size = get_tp_world_size()
         self.num_local_heads = num_attention_heads // tp_size
-        assert (
-            num_attention_heads % tp_size == 0
-        ), f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        assert num_attention_heads % tp_size == 0, (
+            f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -502,9 +500,9 @@ class _LongCatSingleAttention(nn.Module):
         super().__init__()
         tp_size = get_tp_world_size()
         self.num_local_heads = num_attention_heads // tp_size
-        assert (
-            num_attention_heads % tp_size == 0
-        ), f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        assert num_attention_heads % tp_size == 0, (
+            f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
 
