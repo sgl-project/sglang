@@ -590,6 +590,15 @@ class ServerArgs(DisaggServerArgsMixin):
     # SGLang server for PE model inference
     pe_server_url: str | None = None
 
+    # Remote OpenAI-compatible chat/completions PE endpoint (e.g. SenseNova-U1,
+    # which ships no local PE checkpoint of its own)
+    pe_backend: str = "chat_completions"
+    pe_endpoint: str = (
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    )
+    pe_model_name: str = "gemini-3.1-pro"
+    pe_api_key: str | None = None
+
     @property
     def broker_port(self) -> int:
         return self.port + 1
@@ -2946,6 +2955,34 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.pe_server_url,
             help="URL of SGLang server for PE model",
+        )
+
+        # Remote OpenAI-compatible chat/completions PE endpoint
+        parser.add_argument(
+            "--pe-backend",
+            type=str,
+            default=ServerArgs.pe_backend,
+            help="Backend format for the remote PE chat/completions API "
+            "(e.g., for SenseNova-U1). Currently only 'chat_completions' is supported.",
+        )
+        parser.add_argument(
+            "--pe-endpoint",
+            type=str,
+            default=ServerArgs.pe_endpoint,
+            help="Full /chat/completions URL of the remote PE API.",
+        )
+        parser.add_argument(
+            "--pe-model-name",
+            type=str,
+            default=ServerArgs.pe_model_name,
+            help="Model name sent in the remote PE API request body.",
+        )
+        parser.add_argument(
+            "--pe-api-key",
+            type=str,
+            default=ServerArgs.pe_api_key,
+            help="Bearer API key for the remote PE API. Prompt enhancement is "
+            "disabled unless this is set.",
         )
 
         return parser

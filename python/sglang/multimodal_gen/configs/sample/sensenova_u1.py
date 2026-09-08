@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
+    DEFAULT_USE_PE,
     SENSENOVA_U1_CFG_NORM_CHOICES,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
     SENSENOVA_U1_RESOLUTION_ALIGNMENT,
@@ -33,6 +34,7 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "output_quality",
     "output_compression",
     "quality",
+    "use_pe",
 }
 
 
@@ -52,10 +54,15 @@ class SenseNovaU1SamplingParams(SamplingParams):
     t_eps: float = DEFAULT_T_EPS
     think_mode: bool = DEFAULT_THINK_MODE
     negative_prompt: None = field(default=None, init=False)
+    use_pe: bool = DEFAULT_USE_PE
 
     @classmethod
     def supported_override_fields(cls) -> set[str]:
         return set(_PUBLIC_OVERRIDE_FIELDS)
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset({"use_pe"})
 
     @classmethod
     def get_cli_args(cls, args):
@@ -108,5 +115,6 @@ class SenseNovaU1SamplingParams(SamplingParams):
             "cfg_interval": tuple(self.cfg_interval),
             "t_eps": self.t_eps,
             "think_mode": self.think_mode,
+            "use_pe": self.use_pe,
         }
         return extra

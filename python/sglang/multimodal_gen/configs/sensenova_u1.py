@@ -27,6 +27,24 @@ DEFAULT_ENABLE_TIMESTEP_SHIFT = True
 DEFAULT_CFG_INTERVAL = (0.0, 1.0)
 DEFAULT_T_EPS = 0.02
 DEFAULT_THINK_MODE = False
+# Off by default, matching upstream: OpenSenseNova/SenseNova-U1's own
+# examples/t2i/inference.py gates PE behind `--enhance` (action="store_true"),
+# not a default-on flag.
+DEFAULT_USE_PE = False
+
+# The official SenseNova-U1 checkpoint ships no local prompt-enhancement (PE)
+# component -- unlike ERNIE-Image's bundled `pe/` subfolder, PE is always a
+# remote call to an OpenAI-compatible chat/completions endpoint (mirroring
+# OpenSenseNova/SenseNova-U1's own U1_ENHANCE_* contract), configured via the
+# generic server_args.pe_backend/pe_endpoint/pe_model_name/pe_api_key fields.
+# It only activates when the caller supplies an API key.
+DEFAULT_PE_SYSTEM_PROMPT = (
+    "You are a prompt engineer for a text-to-image model. Expand the user's "
+    "prompt into a detailed, vivid, well-structured English description "
+    "suitable for image generation. Preserve the user's intent and any "
+    "explicit constraints. Return only the expanded prompt, with no extra "
+    "commentary."
+)
 
 
 def is_sensenova_u1_model(model_path: str) -> bool:
