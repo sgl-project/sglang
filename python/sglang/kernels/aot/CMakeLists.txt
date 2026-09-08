@@ -46,6 +46,21 @@ endif()
 find_package(Torch REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
 
+option(SGL_KERNEL_DSV4_INT4_ONLY "Configure only FlashMLA dependencies for the private INT4 target" OFF)
+if(SGL_KERNEL_DSV4_INT4_ONLY)
+    include_directories(${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/csrc)
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
+        OUTPUT_VARIABLE TORCH_CXX11_ABI
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY
+    )
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI}")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI}")
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+    return()
+endif()
+
 # Third Party repos
 # cutlass
 FetchContent_Declare(
