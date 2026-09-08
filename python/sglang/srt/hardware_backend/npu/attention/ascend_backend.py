@@ -1213,16 +1213,11 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
-        mla_preprocess_saved_kv_cache = (
-            topk_indices is None or forward_batch.forward_mode.is_decode()
-        )
-        if (
-            is_mla_preprocess_enabled()
-            and self.use_mla
-            and mla_preprocess_saved_kv_cache
-        ):
-            # MLAPO and MLAPROLOG do save kv_cache
-            save_kv_cache = False
+        if is_mla_preprocess_enabled() and self.use_mla:
+            # DSA callers set save_kv_cache based on whether preprocessing was used.
+            # Only override it for the existing non-sparse MLA path.
+            if topk_indices is None:
+                save_kv_cache = False
         if self.is_dllm_model:
             return self.forward_dllm(
                 q,
@@ -2584,9 +2579,11 @@ class AscendAttnBackend(AttentionBackend):
         slopes: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        if is_mla_preprocess_enabled() and self.use_mla and topk_indices is None:
-            # MLAPO does saving kv_cache
-            save_kv_cache = False
+        if is_mla_preprocess_enabled() and self.use_mla:
+            # DSA callers set save_kv_cache based on whether preprocessing was used.
+            # Only override it for the existing non-sparse MLA path.
+            if topk_indices is None:
+                save_kv_cache = False
         if topk_indices is not None:
             return self.forward_sparse(
                 q,
