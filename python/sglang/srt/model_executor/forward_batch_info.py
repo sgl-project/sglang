@@ -559,6 +559,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _dsa_topk_shadow_step: Optional[int] = field(
         default=None, repr=False, compare=False
     )
+    _eagle_numerical_probe_callback: Optional[Callable[..., None]] = field(
+        default=None, repr=False, compare=False
+    )
+    _eagle_numerical_probe_phase: Optional[str] = field(
+        default=None, repr=False, compare=False
+    )
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 

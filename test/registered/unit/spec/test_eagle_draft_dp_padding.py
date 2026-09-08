@@ -14,6 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.speculative.eagle_worker_v2 import (
+    _draft_extend_terminal_select_index,
     _slice_draft_output_to_local_tokens,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
@@ -23,6 +24,55 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestEagleDraftDPPadding(unittest.TestCase):
+    def test_draft_extend_terminal_row_identity_is_shared(self):
+        """Token, hidden, position, KV slot, logits, and seed select one row."""
+        width = 4
+        accept_lens = torch.tensor([1, 3, 4], dtype=torch.int64)
+        prefix_lens = torch.tensor([10, 20, 30], dtype=torch.int64)
+        req_pool_indices = torch.tensor([2, 0, 3], dtype=torch.int64)
+        select = _draft_extend_terminal_select_index(accept_lens, width)
+
+        row = torch.arange(accept_lens.numel() * width).reshape(-1)
+        request = torch.arange(accept_lens.numel()).repeat_interleave(width)
+        offset = torch.arange(width).repeat(accept_lens.numel())
+        positions = prefix_lens.repeat_interleave(width) + offset
+
+        # Model the compacted verify output and every draft-extend row-domain
+        # consumer with distinct values derived from the same dense row id.
+        input_ids = 10_000 + row
+        hidden_states = torch.stack((request, positions), dim=1)
+        logits = 20_000 + row
+        dsa_seed = torch.stack((30_000 + row, 40_000 + row), dim=1)
+        req_to_token = torch.empty((4, 64), dtype=torch.int64)
+        for req in range(req_to_token.shape[0]):
+            req_to_token[req] = req * 100_000 + torch.arange(64)
+        out_cache_loc = req_to_token[
+            req_pool_indices.repeat_interleave(width), positions
+        ]
+
+        expected_offset = accept_lens - 1
+        expected_position = prefix_lens + expected_offset
+        expected_row = torch.arange(accept_lens.numel()) * width + expected_offset
+        self.assertEqual(select.dtype, torch.int64)
+        torch.testing.assert_close(select, expected_row)
+        torch.testing.assert_close(request[select], torch.arange(3))
+        torch.testing.assert_close(positions[select], expected_position)
+        torch.testing.assert_close(
+            out_cache_loc[select],
+            req_to_token[req_pool_indices, expected_position],
+        )
+        torch.testing.assert_close(input_ids[select], 10_000 + expected_row)
+        torch.testing.assert_close(hidden_states[select, 0], torch.arange(3))
+        torch.testing.assert_close(hidden_states[select, 1], expected_position)
+        torch.testing.assert_close(logits[select], 20_000 + expected_row)
+        torch.testing.assert_close(dsa_seed[select, 0], 30_000 + expected_row)
+
+    def test_draft_extend_terminal_select_rejects_invalid_domain(self):
+        with self.assertRaisesRegex(ValueError, "must be 1-D"):
+            _draft_extend_terminal_select_index(torch.ones((2, 1)), 4)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            _draft_extend_terminal_select_index(torch.ones(2), 0)
+
     def test_idle_eagle_megamoe_materializes_collective_valid_dummy(self):
         algorithm = SimpleNamespace(is_eagle=lambda: True)
         draft_info = SimpleNamespace(spec_input_type=SpecInputType.EAGLE_DRAFT)

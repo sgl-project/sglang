@@ -200,6 +200,61 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertTrue(layer._mega_moe_sm90_fp4_weights)
         self.assertTrue(layer._mega_moe_weights_built)
 
+    def test_sm90_fp4_compat_transform_preserves_packed_byte_layout(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        deep_gemm.mega_moe_pre_dispatch_sm90 = MagicMock()
+        deep_gemm._C = SimpleNamespace(fp8_fp4_mega_moe_sm90=MagicMock())
+        transform = mega_moe_sm90._resolve_sm90_fp4_weight_transform(deep_gemm)
+
+        l1_weight = torch.arange(32 * 4, dtype=torch.uint8).reshape(1, 32, 4)
+        l2_weight = torch.arange(8 * 4, dtype=torch.uint8).reshape(1, 8, 4)
+        l1_scale = (
+            torch.pow(2.0, torch.arange(32, dtype=torch.float32))
+            .reshape(1, 32, 1)
+            .expand(-1, -1, 4)
+            .contiguous()
+        )
+        l2_scale = (
+            torch.pow(2.0, torch.arange(8, dtype=torch.float32))
+            .reshape(1, 8, 1)
+            .expand(-1, -1, 4)
+            .contiguous()
+        )
+
+        (l1_weight_out, l1_scale_out), (l2_weight_out, l2_scale_out) = transform(
+            (l1_weight, l1_scale), (l2_weight, l2_scale)
+        )
+
+        row_order = torch.tensor(
+            list(range(0, 8))
+            + list(range(16, 24))
+            + list(range(8, 16))
+            + list(range(24, 32))
+        )
+        torch.testing.assert_close(
+            l1_weight_out, l1_weight.index_select(1, row_order).view(torch.int8)
+        )
+        torch.testing.assert_close(l2_weight_out, l2_weight.view(torch.int8))
+        torch.testing.assert_close(
+            l1_scale_out.view(torch.uint8),
+            (127 + row_order)
+            .to(torch.uint8)
+            .reshape(1, 32, 1)
+            .expand(-1, -1, 4),
+        )
+        torch.testing.assert_close(
+            l2_scale_out.view(torch.uint8),
+            (127 + torch.arange(8))
+            .to(torch.uint8)
+            .reshape(1, 8, 1)
+            .expand(-1, -1, 4),
+        )
+        self.assertEqual(l1_scale_out.dtype, torch.int32)
+        self.assertEqual(l2_scale_out.dtype, torch.int32)
+        self.assertTrue(l1_scale_out.is_contiguous())
+        self.assertTrue(l2_scale_out.is_contiguous())
+
     def test_mxf4_pre_dispatch_uses_typed_api(self):
         deep_gemm = ModuleType("deep_gemm")
         deep_gemm.mega_moe_pre_dispatch = MagicMock()

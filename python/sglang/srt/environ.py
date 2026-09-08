@@ -1493,6 +1493,11 @@ class Envs:
     # the probe.  The matching request is forced off the draft CUDA graph and
     # the probe seals itself when that request finishes.
     SGLANG_DSA_TOPK_SHADOW_RID = EnvStr(None)
+    # Diagnostic-only exact request id for one eager decode draft-extend
+    # numerical fingerprint. Empty disables the probe. The matching request
+    # captures logical rows at the NextN input/embed/decoder/norm/logits/token
+    # boundaries and is never eligible for performance conclusions.
+    SGLANG_EAGLE_NUMERICAL_PROBE_RID = EnvStr(None)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

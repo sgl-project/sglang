@@ -61,6 +61,9 @@ from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_t
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_model, get_parallel, get_spec
+from sglang.srt.speculative.eagle_numerical_probe import (
+    maybe_record_eagle_numerical_stage,
+)
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 from sglang.srt.utils.async_probe import maybe_sync_eagle_cuda_debug
 
@@ -253,6 +256,9 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
             maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_embed")
+            maybe_record_eagle_numerical_stage(
+                forward_batch, "nextn_embed", hidden_states=hidden_states
+            )
 
             # CP-v2 shards/gathers hidden states at the eager-runner boundary.
             cp_v2_active = is_cp_v2_active(forward_batch)
@@ -275,12 +281,21 @@ class DeepseekModelNextN(nn.Module):
                     prev_topk_indices=index_topk_share.topk_indices,
                 )
             maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_decoder")
+            maybe_record_eagle_numerical_stage(
+                forward_batch,
+                "nextn_decoder",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
                     hidden_states, _ = self.shared_head.norm(hidden_states, residual)
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
                 maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_norm")
+                maybe_record_eagle_numerical_stage(
+                    forward_batch, "nextn_norm", hidden_states=hidden_states
+                )
 
                 if use_cp_v1:
                     local_num_tokens = hidden_states.shape[0]
@@ -411,6 +426,12 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
         maybe_sync_eagle_cuda_debug(forward_batch, "after_nextn_logits")
+        maybe_record_eagle_numerical_stage(
+            forward_batch,
+            "nextn_logits",
+            logits=output.next_token_logits,
+            hidden_states=output.hidden_states,
+        )
         return output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

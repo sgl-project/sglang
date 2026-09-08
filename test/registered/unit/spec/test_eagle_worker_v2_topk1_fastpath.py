@@ -349,6 +349,22 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             )
         )
 
+    def test_dp_attention_eager_vote_for_exact_numerical_probe_rid(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        probe = SimpleNamespace(needs_eager_for_schedule_batch=lambda batch: True)
+        worker._draft_worker = SimpleNamespace(
+            dsa_topk_shadow_probe=None,
+            eagle_numerical_probe=probe,
+            seed_dsa_topk_from_draft_extend=True,
+            dsa_seed_cuda_graph_compatible=True,
+        )
+
+        self.assertTrue(
+            worker.requires_dp_attention_eager_forward(
+                SimpleNamespace(reqs=[SimpleNamespace(rid="probe-rid")])
+            )
+        )
+
     def test_dp_attention_eager_vote_for_recurrent_topk_refresh(self):
         worker = object.__new__(EAGLEWorkerV2)
         worker._draft_worker = SimpleNamespace(
@@ -372,7 +388,8 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker = object.__new__(EAGLEWorkerV2)
         finish = MagicMock()
         worker._draft_worker = SimpleNamespace(
-            dsa_topk_shadow_probe=SimpleNamespace(finish=finish)
+            dsa_topk_shadow_probe=SimpleNamespace(finish=finish),
+            eagle_numerical_probe=None,
         )
 
         worker.note_request_finished(
@@ -380,6 +397,24 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         )
 
         finish.assert_called_once_with(rid="probe-rid", natural_stop=True)
+
+    def test_note_request_finished_delegates_to_numerical_probe(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        finish = MagicMock()
+        worker._draft_worker = SimpleNamespace(
+            dsa_topk_shadow_probe=None,
+            eagle_numerical_probe=SimpleNamespace(finish=finish),
+        )
+
+        worker.note_request_finished(
+            rid="probe-rid", natural_stop=False, normal_completion=True
+        )
+
+        finish.assert_called_once_with(
+            rid="probe-rid",
+            natural_stop=False,
+            normal_completion=True,
+        )
 
     def test_missing_seed_cuda_graph_fallback(self):
         graph_result = (

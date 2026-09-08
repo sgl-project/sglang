@@ -222,6 +222,7 @@ jobs:
             PYTHONPATH=/glm53-community/sglang/python python3 -c '"'"'import importlib.machinery, pathlib; expected = pathlib.Path("/glm53-community/sglang/python/sglang/__init__.py"); actual = pathlib.Path(importlib.machinery.PathFinder.find_spec("sglang").origin).resolve(); assert actual == expected'"'"'
             python3 -c '"'"'import deep_gemm; assert callable(getattr(deep_gemm, "fp8_fp4_mega_moe", None)); assert callable(getattr(deep_gemm, "mega_moe_pre_dispatch_sm90", None)); assert callable(getattr(deep_gemm._C, "fp8_fp4_mega_moe_sm90", None))'"'"'
             PYTHONPATH=/glm53-community/sglang/python python3 -m pytest -q /glm53-community/sglang/test/registered/unit/model_loader/test_mxfp4_packed_expert_names.py
+            PYTHONPATH=/glm53-community/sglang/python python3 -m pytest -q /glm53-community/sglang/test/registered/unit/spec/test_eagle_numerical_probe.py
             PYTHONPATH=/glm53-community/sglang/python python3 -m pytest -q /glm53-community/sglang/test/registered/unit/models/test_deepseek_nextn_embedding_loading.py
             PYTHONPATH=/glm53-community/sglang/python python3 -m pytest -q /glm53-community/sglang/test/registered/unit/layers/quantization/test_compressed_tensors_mixed_precision.py
             PYTHONPATH=/glm53-community/sglang/python python3 -m pytest -q /glm53-community/sglang/test/registered/unit/layers/moe/test_mega_moe_deepgemm_api.py

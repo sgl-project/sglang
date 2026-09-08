@@ -83,6 +83,7 @@ from sglang.srt.speculative.eagle_info import (
     EaglePPVerifyInputRaw,
     EagleVerifyInput,
 )
+from sglang.srt.speculative.eagle_numerical_probe import EagleNumericalProbe
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
@@ -238,6 +239,37 @@ def _slice_draft_output_to_local_tokens(
     )
 
 
+def _draft_extend_terminal_select_index(
+    accept_lens: torch.Tensor, num_draft_tokens: int
+) -> torch.Tensor:
+    """Select each request's terminal accepted row from dense tree blocks.
+
+    Target verify compacts accepted tokens and hidden states to the front of
+    every ``num_draft_tokens``-wide request block.  Draft extend preserves that
+    block layout for tokens, positions, KV slots, logits, and DSA seed capture.
+    Keeping this index construction in one helper makes their shared row domain
+    explicit.
+    """
+    if accept_lens.ndim != 1:
+        raise ValueError(
+            f"accept_lens must be 1-D, got shape={tuple(accept_lens.shape)}"
+        )
+    if num_draft_tokens <= 0:
+        raise ValueError(
+            f"num_draft_tokens must be positive, got {num_draft_tokens}"
+        )
+    return (
+        torch.arange(
+            0,
+            accept_lens.numel() * num_draft_tokens,
+            num_draft_tokens,
+            device=accept_lens.device,
+        )
+        + accept_lens
+        - 1
+    )
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -304,6 +336,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.dsa_topk_shadow_probe = DSATopKShadowProbe.from_runtime(
             envs.SGLANG_DSA_TOPK_SHADOW_RID.get(),
             seed_enabled=self.seed_dsa_topk_from_draft_extend,
+        )
+        self.eagle_numerical_probe = EagleNumericalProbe(
+            envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get()
         )
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
@@ -1136,6 +1171,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        numerical_probe_requested = (
+            self.eagle_numerical_probe.needs_eager_for_schedule_batch(batch)
+        )
+        numerical_probe_rows = (
+            len(batch.seq_lens) * self.speculative_num_draft_tokens
+        )
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -1147,15 +1188,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
-            )
-            + batch_result.accept_lens
-            - 1
+        select_index = _draft_extend_terminal_select_index(
+            batch_result.accept_lens, self.speculative_num_draft_tokens
         )
 
         # Cast to int64 before entering plan stream to avoid cross-stream
@@ -1170,7 +1204,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 next_token_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
-                self.cuda_graph_runner_for_draft_extend,
+                (
+                    None
+                    if numerical_probe_requested
+                    else self.cuda_graph_runner_for_draft_extend
+                ),
                 return_hidden_states_before_norm=False,
             )
 
@@ -1184,6 +1222,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
+        if numerical_probe_requested:
+            can_run_decode_cuda_graph = False
 
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
@@ -1203,7 +1243,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        with (
+            canary_ctx,
+            self.eagle_numerical_probe.forward_scope(
+                forward_batch,
+                phase="decode",
+                logical_rows=numerical_probe_rows,
+                using_cuda_graph=can_run_decode_cuda_graph,
+                input_ids=forward_batch.input_ids,
+                target_hidden_states=forward_batch.spec_info.hidden_states,
+                positions=forward_batch.positions,
+            ),
+        ):
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch
@@ -1266,6 +1317,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
+        self.eagle_numerical_probe.record_proposal(
+            phase="decode",
+            logical_rows=ret_topk_index.shape[0],
+            topk_index=ret_topk_index,
+            topk_probability=ret_topk_p,
+        )
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -1369,6 +1426,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         shadow_probe = getattr(self._draft_worker, "dsa_topk_shadow_probe", None)
         if shadow_probe is not None and shadow_probe.matches_schedule_batch(batch):
             return True
+        numerical_probe = getattr(
+            self._draft_worker, "eagle_numerical_probe", None
+        )
+        if (
+            numerical_probe is not None
+            and numerical_probe.needs_eager_for_schedule_batch(batch)
+        ):
+            return True
         if getattr(self._draft_worker, "refresh_dsa_topk_each_step", False):
             return True
         if not self._draft_worker.seed_dsa_topk_from_draft_extend:
@@ -1392,9 +1457,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def note_request_finished(
         self, *, rid: str, natural_stop: bool, normal_completion: bool
     ) -> None:
+        if self._draft_worker is None:
+            return
         shadow_probe = getattr(self._draft_worker, "dsa_topk_shadow_probe", None)
         if shadow_probe is not None:
             shadow_probe.finish(rid=rid, natural_stop=normal_completion)
+        numerical_probe = getattr(
+            self._draft_worker, "eagle_numerical_probe", None
+        )
+        if numerical_probe is not None:
+            numerical_probe.finish(
+                rid=rid,
+                natural_stop=natural_stop,
+                normal_completion=normal_completion,
+            )
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
