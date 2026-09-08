@@ -92,7 +92,10 @@ def test_fasth3_pipeline_config_gates_and_rejections() -> None:
 
 
 def test_fasth3_lora_bundle_is_rejected_loudly() -> None:
-    model = SimpleNamespace(arch=SimpleNamespace(adaln_affine_input_dim=None))
+    model = SimpleNamespace(
+        arch=SimpleNamespace(adaln_affine_input_dim=None),
+        _adaln_precomputed=False,
+    )
     plain = {
         "blocks.0.attn.qkv_proj.lora_A": torch.zeros(3, 64, 8),
         "blocks.0.attn.qkv_proj.lora_B": torch.zeros(3, 8, 64),
