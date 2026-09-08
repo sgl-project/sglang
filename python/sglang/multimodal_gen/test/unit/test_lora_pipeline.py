@@ -3,13 +3,16 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
     _use_owned_base_snapshot,
     wrap_with_lora_layer,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
@@ -92,6 +95,30 @@ def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
     )
     assert meta_layer is not None
     assert meta_layer._base_is_view
+
+
+def test_quantized_base_uses_dynamic_lora_in_auto_mode():
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        return_value=1,
+    ):
+        base_layer = ReplicatedLinear(
+            2,
+            2,
+            bias=False,
+            quant_config=Fp8Config(is_checkpoint_fp8_serialized=True),
+        )
+    layer = BaseLayerWithLoRA(base_layer)
+    pipeline = _make_pipeline(layer)
+
+    assert not pipeline._should_merge_lora_for_layers(
+        "transformer", {"linear": layer}, "auto"
+    )
+    with pytest.raises(ValueError, match="use merge mode 'dynamic'"):
+        pipeline._should_merge_lora_for_layers(
+            "transformer", {"linear": layer}, "merge"
+        )
 
 
 def test_dynamic_lora_reactivates_cached_layers_without_weight_update_context():

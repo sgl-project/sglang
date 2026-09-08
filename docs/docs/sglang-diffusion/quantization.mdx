@@ -373,7 +373,7 @@ For a pipeline whose primary DiT is named `transformer`, the shorter
 
 MiniMax-H3 supports this path while preserving its required FP32 patch,
 timestep, and output projections. See the
-[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-feature-contracts-and-advanced-recipes)
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#8-feature-contracts-and-advanced-recipes)
 for its distributed serving recipe.
 
 ### MXFP4 Online Quantization
@@ -432,7 +432,7 @@ projections take that path.
 <Warning>
 `kitchen_int8` is approximate and is not a consistency ground-truth mode.
 The BF16 path is unchanged when `comfy-kitchen` is not installed. See the
-[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-feature-contracts-and-advanced-recipes)
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#8-feature-contracts-and-advanced-recipes)
 for the 24 GB offload recipe, including why `vae` must stay out of
 `--layerwise-offload-components`.
 </Warning>
