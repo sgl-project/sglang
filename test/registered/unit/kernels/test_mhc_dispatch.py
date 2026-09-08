@@ -174,7 +174,11 @@ class TestMHCDispatch(CustomTestCase):
 
         failing.mhc_post = fail_post
         modules["aiter.ops.mhc"] = failing
-        layer_input, h_res, h_post, _ = self._pre(x, fn, scale, base)
+        with (
+            patch.object(mhc, "_use_aiter_mhc", return_value=False),
+            patch.object(mhc, "_use_tilelang_mhc_pre", return_value=False),
+        ):
+            layer_input, h_res, h_post, _ = self._pre(x, fn, scale, base)
         with (
             patch.dict(sys.modules, modules),
             patch.object(mhc, "_use_aiter_mhc", return_value=True),
