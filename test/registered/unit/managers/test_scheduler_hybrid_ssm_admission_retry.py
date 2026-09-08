@@ -85,6 +85,7 @@ def _scheduler(*, is_hybrid_ssm: bool) -> Scheduler:
     s.new_token_ratio_tracker = SimpleNamespace(current=1.0)
     s.max_prefill_tokens = 4096
     s.is_mixed_chunk = False
+    s.processed_tokens_counter = 0
     s.priority_scheduling_preemption_threshold = 0
     s.max_prefill_bs = 1
     s.max_running_requests = 4
