@@ -333,6 +333,10 @@ CPU storage without automatically pinning or cloning it. Checkpoint mmap remains
 file-backed when no dtype conversion or weight mutation materializes a new copy;
 resident mmap pages still consume RAM. This is a host-memory/transfer tradeoff,
 not a guarantee of lower host-memory peaks or faster end-to-end generation.
+In particular, retaining pageable CPU weights can make H2D slower than reloading
+the pinned buffers produced by ordinary asynchronous component offload. Skipping
+D2H alone does not establish an end-to-end speedup; benchmark repeated requests
+with the actual host storage and workload.
 
 The whole component must still fit on GPU. Unlike layerwise offload with all layers
 retained across denoising steps, snapshot offload does not require a layer-structure
