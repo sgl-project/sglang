@@ -271,6 +271,8 @@ class _SelectorDraftSampler:
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
         self.q_out[:bs].copy_(q_rows)
+
+
 class _DominoDraftSampler:
     """Capture-safe TP=1 Domino rollout over a fixed-size draft block."""
 
@@ -372,7 +374,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._is_domino = draft_config.is_domino
         self.domino_candidate_pool_size = int(
-            server_args.speculative_domino_candidate_pool_size
+            get_spec().speculative_domino_candidate_pool_size
         )
         if self._is_domino:
             if self.domino_candidate_pool_size < 0:

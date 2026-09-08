@@ -2105,6 +2105,7 @@ class ServerArgs:
     speculative_domino_candidate_pool_size: A[
         int,
         "Domino only. Size of the approximate block-shared base-logit candidate pool. Set to 0 to score the full vocabulary.",
+        NS("spec"),
     ] = 2048
     speculative_dspark_block_size: A[
         Optional[int],

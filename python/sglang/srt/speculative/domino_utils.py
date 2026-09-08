@@ -18,6 +18,7 @@ def _domino_gru_cell(
         prefix_gru.bias_hh_l0 if prefix_gru.bias else None,
     )
 
+
 _DOMINO_CANDIDATE_POOL_SIZE = 2048
 
 
