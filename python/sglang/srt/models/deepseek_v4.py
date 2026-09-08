@@ -1697,14 +1697,14 @@ class MQALayer(MqaAttentionBase):
 
         if self.compress_ratio in (1, 2):
             # todo
-            pass
-            # attn_backend.forward_low_ratio_sources(
-            #     layer=self,
-            #     x=x,
-            #     q_lora=q_lora,
-            #     positions=positions,
-            #     forward_batch=forward_batch,
-            # )
+            # pass
+            attn_backend.forward_low_ratio_sources(
+                layer=self,
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
         else:
             if self.indexer is not None:
                 self.indexer(
