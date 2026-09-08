@@ -1104,6 +1104,8 @@ def _deterministic_attention_backend(view: Any) -> dict:
             else:
                 # fallback to flashinfer on Blackwell for non-DeepSeek models
                 backend = "flashinfer"
+        elif view.device == "xpu":
+            backend = "triton"
         else:
             # Hopper (SM90) and older architectures
             backend = "fa3"

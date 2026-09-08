@@ -44,9 +44,11 @@ from sglang.srt.arg_groups.moe_hook import (
     validate_deepep_v2_speculative_draft,
 )
 from sglang.srt.arg_groups.overrides import (
+    _deterministic_attention_backend,
     cutedsl_moe_max_num_tokens,
     max_speculative_num_draft_tokens,
     resolution_result,
+    run_post_process_pass,
 )
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
@@ -1514,6 +1516,62 @@ class TestHiCacheArgs(unittest.TestCase):
         )
 
         handle_cache_compatibility(args)
+
+    def test_xpu_rejects_every_host_pool_opt_in(self):
+        # sgl_kernel.kvcacheio is not built for XPU, so each of these would
+        # otherwise fail on a bare NameError once a transfer is attempted.
+        for overrides in (
+            {"enable_hierarchical_cache": True},
+            {
+                "disaggregation_mode": "decode",
+                "disaggregation_decode_enable_offload_kvcache": True,
+                "hicache_storage_backend": "file",
+            },
+            {
+                "disaggregation_mode": "decode",
+                "disaggregation_decode_retraction_backup": "host_pool",
+            },
+        ):
+            with self.subTest(**overrides):
+                args = self._make_args(device="xpu", **overrides)
+                with self.assertRaisesRegex(ValueError, "host KV pool"):
+                    handle_cache_compatibility(args)
+
+    def test_non_xpu_devices_keep_host_pool(self):
+        for device in ("cuda", "cpu"):
+            with self.subTest(device=device):
+                args = self._make_args(device=device, enable_hierarchical_cache=True)
+                handle_cache_compatibility(args)
+
+
+class TestDeterministicAttentionBackendFallback(CustomTestCase):
+    """Deterministic inference picked fa3 on any host the SM probes said no to,
+    and fa3 asserts SM 8x/9x in its own factory.
+    """
+
+    def _resolved_backend(self, **overrides) -> str:
+        args = ServerArgs(
+            model_path="dummy", enable_deterministic_inference=True, **overrides
+        )
+        run_post_process_pass(args, _deterministic_attention_backend)
+        return resolution_result(args, "attention_backend")
+
+    @override_platform(is_cuda=True)
+    def test_xpu_stays_off_the_sm_path_even_on_a_cuda_host(self):
+        self.assertEqual(self._resolved_backend(device="xpu"), "triton")
+
+    @override_platform(is_cuda=False, is_hip=False, is_musa=False)
+    def test_other_devices_keep_their_existing_fallback(self):
+        self.assertEqual(self._resolved_backend(device="cpu"), "fa3")
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=False)
+    def test_cuda_host_keeps_its_fa3_default(self):
+        self.assertEqual(self._resolved_backend(device="cuda"), "fa3")
+
+    def test_explicit_backend_is_left_alone(self):
+        self.assertEqual(
+            self._resolved_backend(device="xpu", attention_backend="triton"), "triton"
+        )
 
 
 class TestNgramExternalSamArgs(CustomTestCase):

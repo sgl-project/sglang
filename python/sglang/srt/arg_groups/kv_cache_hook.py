@@ -165,6 +165,19 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disable-priority-preemption when priority scheduling is enabled."
         )
 
+    if cfg.device == "xpu" and (
+        cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+        or cfg.disaggregation_decode_retraction_backup == "host_pool"
+    ):
+        raise ValueError(
+            "A host KV pool is not supported on XPU: its transfer kernels live "
+            "in sgl_kernel.kvcacheio, which is not built for this platform. Drop "
+            "--enable-hierarchical-cache, "
+            "--disaggregation-decode-enable-offload-kvcache and "
+            "--disaggregation-decode-retraction-backup=host_pool."
+        )
+
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
             "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
