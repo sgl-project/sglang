@@ -125,7 +125,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
+    CUDA_IPC_FEATURE_COPY_EVENT_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+    RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
     CudaIpcTensorTransportProxy,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -493,6 +495,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
                 self.precomputed_embeddings.reconstruct_on_target_device(target_device)
             )
         for extra_key in self.model_specific_data:
+            if extra_key == RETAINED_CUDA_IPC_FEATURE_PROXY_KEY:
+                continue
             if isinstance(
                 self.model_specific_data[extra_key], CudaIpcTensorTransportProxy
             ):
@@ -532,7 +536,11 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
     def release_transport_proxies(self, consumer_count: int = 1) -> None:
         """Best-effort release of proxies left by an abandoned request."""
-        values = [self.feature, self.precomputed_embeddings]
+        retained_proxy = self.model_specific_data.pop(
+            RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+        )
+        self.model_specific_data.pop(CUDA_IPC_FEATURE_COPY_EVENT_KEY, None)
+        values = [self.feature, self.precomputed_embeddings, retained_proxy]
         values.extend(self.model_specific_data.values())
         for value in values:
             if not isinstance(value, CudaIpcTensorTransportProxy):
@@ -681,10 +689,9 @@ class MultimodalInputs:
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
             try:
-                # A request can be rejected before a deferred GPU feature is
-                # reconstructed. Acknowledge that transport lease before the
-                # proxy is dropped so the tokenizer pool can reuse its slice.
-                item.acknowledge_deferred_cuda_ipc_feature()
+                # Release both deferred features that were never used and
+                # borrowed features retained for possible re-prefill.
+                item.release_transport_proxies()
             except Exception:
                 logger.warning(
                     "Failed to release an unused multimodal feature transport",

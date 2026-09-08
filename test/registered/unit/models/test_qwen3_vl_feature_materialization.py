@@ -1,15 +1,22 @@
 """Regression tests for Qwen3-VL multimodal feature materialization."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 from sglang.srt.multimodal.transport.cuda_ipc import (
+    BORROW_CUDA_IPC_FEATURE_KEY,
+    CUDA_IPC_FEATURE_COPY_EVENT_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
@@ -113,7 +120,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
             item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY]
         )
 
-    def test_retract_reprefill_retains_request_owned_visual_input(self):
+    def test_retract_reprefill_waits_for_preserved_visual_input(self):
         visual = Mock()
         visual.device = torch.device("cuda:0")
         visual.dtype = torch.bfloat16
@@ -122,16 +129,19 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
 
         proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
         proxy.total_consumer_count = 1
-        owned_feature = torch.ones(2, 3)
-        proxy.reconstruct_on_target_device = Mock(return_value=owned_feature)
-        # This marker exercised the old one-shot path, which released the pool
-        # slice and cleared item.feature after the first ViT call.
-        proxy.borrow_on_target_device = Mock(return_value=owned_feature)
+        borrowed_feature = torch.ones(2, 3)
+        packed_ready = Mock()
+        host_ready = Mock()
+        current_stream = Mock()
+        copy_stream = Mock()
+        proxy.reconstruct_on_target_device = Mock()
+        proxy.borrow_on_target_device = Mock(return_value=borrowed_feature)
         proxy.release_borrowed_on_current_stream = Mock()
+        proxy.release_without_reconstruction = Mock()
         item = MultimodalDataItem(
             modality=Modality.IMAGE,
             feature=proxy,
-            model_specific_data={"_sglang_borrow_cuda_ipc_feature_once": True},
+            model_specific_data={BORROW_CUDA_IPC_FEATURE_KEY: True},
         )
         item.image_grid_thw = torch.tensor([[1, 1, 2]])
 
@@ -144,15 +154,44 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 "sglang.srt.models.qwen3_vl.materialize_multimodal_features",
                 side_effect=lambda features, **_kwargs: torch.cat(features),
             ),
+            patch(
+                "sglang.srt.models.qwen3_vl.torch.cuda.current_stream",
+                return_value=current_stream,
+            ),
+            patch(
+                "sglang.srt.models.qwen3_vl.torch.cuda.Event",
+                side_effect=(packed_ready, host_ready),
+            ),
+            patch(
+                "sglang.srt.models.qwen3_vl.torch.cuda.Stream",
+                return_value=copy_stream,
+            ),
+            patch(
+                "sglang.srt.models.qwen3_vl.torch.cuda.stream",
+                return_value=nullcontext(),
+            ),
         ):
             first = model.get_image_feature([item])
             second = model.get_image_feature([item])
 
-        self.assertIs(item.feature, owned_feature)
+        self.assertIsNot(item.feature, borrowed_feature)
+        self.assertTrue(torch.equal(item.feature, borrowed_feature))
         self.assertTrue(torch.equal(first, second))
-        proxy.reconstruct_on_target_device.assert_called_once_with(0)
-        proxy.borrow_on_target_device.assert_not_called()
+        proxy.reconstruct_on_target_device.assert_not_called()
+        proxy.borrow_on_target_device.assert_called_once_with(0)
+        proxy.release_borrowed_on_current_stream.assert_called_once_with()
+        proxy.release_without_reconstruction.assert_not_called()
+        packed_ready.record.assert_called_once_with(current_stream)
+        copy_stream.wait_event.assert_called_once_with(packed_ready)
+        host_ready.record.assert_called_once_with(copy_stream)
+        current_stream.wait_event.assert_called_once_with(host_ready)
         self.assertEqual(visual.call_count, 2)
+
+        MultimodalInputs(mm_items=[item]).release_features()
+
+        proxy.release_without_reconstruction.assert_not_called()
+        self.assertIsNone(item.feature)
+        self.assertNotIn(CUDA_IPC_FEATURE_COPY_EVENT_KEY, item.model_specific_data)
 
     def test_image_features_are_packed_on_the_visual_device(self):
         visual = _RecordingVisual()
