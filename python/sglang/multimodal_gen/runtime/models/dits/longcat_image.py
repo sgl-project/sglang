@@ -35,10 +35,14 @@ from diffusers.models.normalization import (
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_layernorm_modulate,
     can_use_linear_gelu,
     fused_gelu_active,
+    fused_layernorm_modulate,
     fused_linear_gelu_tanh,
+    is_plain_layer_norm,
     mark_fused_gelu_site,
+    modulate_scale_shift,
     residual_gate_add,
     tensors_equal,
 )
@@ -62,6 +66,75 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 _LONGCAT_QKNORM_ROPE = BitExactFusionGate("LongCat fused QKNorm+RoPE")
+_LONGCAT_LN_MOD = BitExactFusionGate("LongCat fused LN+modulate", per_signature=True)
+
+
+def _longcat_norm_modulate(
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    # LayerNorm's reduction depends on the live aten dispatch. Verify each
+    # shape/stride before using the bit-exact fused kernel, outside capture.
+    if (
+        not _LONGCAT_LN_MOD.disabled
+        and is_plain_layer_norm(norm, x.shape[-1])
+        and can_use_fused_layernorm_modulate(x, scale, shift)
+    ):
+        sig = (
+            x.shape,
+            x.stride(),
+            scale.shape,
+            scale.stride(),
+            shift.shape,
+            shift.stride(),
+            norm.eps,
+            x.dtype,
+            x.device,
+        )
+        verified = _LONGCAT_LN_MOD.is_verified(sig)
+        if verified or not (
+            torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
+        ):
+            try:
+                out = fused_layernorm_modulate(x, scale, shift, norm.eps)
+            except Exception as exc:
+                _LONGCAT_LN_MOD.on_exception(exc, logger=logger)
+            else:
+                if verified:
+                    return out
+                reference = modulate_scale_shift(norm(x), scale, shift)
+                return _LONGCAT_LN_MOD.accept_or_fallback(
+                    out, reference, sig=sig, logger=logger
+                )
+    return modulate_scale_shift(norm(x), scale, shift)
+
+
+class _LongCatAdaLayerNormZero(AdaLayerNormZero):
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.LongTensor] = None,
+        hidden_dtype: Optional[torch.dtype] = None,
+        emb: Optional[torch.Tensor] = None,
+    ):
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(
+            6, dim=1
+        )
+        x = _longcat_norm_modulate(self.norm, x, scale_msa, shift_msa)
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+class _LongCatAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
+    def forward(self, x: torch.Tensor, emb: Optional[torch.Tensor] = None):
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+        return _longcat_norm_modulate(self.norm, x, scale_msa, shift_msa), gate_msa
 
 
 def _longcat_qknorm_rope_reference(
@@ -268,9 +341,9 @@ class _LongCatJointAttention(nn.Module):
         super().__init__()
         tp_size = get_tp_world_size()
         self.num_local_heads = num_attention_heads // tp_size
-        assert num_attention_heads % tp_size == 0, (
-            f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
-        )
+        assert (
+            num_attention_heads % tp_size == 0
+        ), f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
         self.head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -429,9 +502,9 @@ class _LongCatSingleAttention(nn.Module):
         super().__init__()
         tp_size = get_tp_world_size()
         self.num_local_heads = num_attention_heads // tp_size
-        assert num_attention_heads % tp_size == 0, (
-            f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
-        )
+        assert (
+            num_attention_heads % tp_size == 0
+        ), f"num_attention_heads ({num_attention_heads}) must be divisible by tp_size ({tp_size})"
         self.head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -500,7 +573,7 @@ class _SingleTransformerBlock(nn.Module):
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
-        self.norm = AdaLayerNormZeroSingle(dim)
+        self.norm = _LongCatAdaLayerNormZeroSingle(dim)
         # proj_mlp: ColumnParallelLinear with gather_output=False keeps output
         # head-sharded, consistent with attn_output from _LongCatSingleAttention.
         self.proj_mlp = ColumnParallelLinear(
@@ -619,8 +692,8 @@ class _TransformerBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.norm1 = AdaLayerNormZero(dim)
-        self.norm1_context = AdaLayerNormZero(dim)
+        self.norm1 = _LongCatAdaLayerNormZero(dim)
+        self.norm1_context = _LongCatAdaLayerNormZero(dim)
         self.attn = _LongCatJointAttention(
             dim=dim,
             num_attention_heads=num_attention_heads,
@@ -666,9 +739,8 @@ class _TransformerBlock(nn.Module):
             hidden_states, attn_output, gate_msa.unsqueeze(1)
         )
 
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = (
-            norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        norm_hidden_states = _longcat_norm_modulate(
+            self.norm2, hidden_states, scale_mlp, shift_mlp
         )
         ff_output = self.ff(norm_hidden_states)
         hidden_states = residual_gate_add(
@@ -679,10 +751,8 @@ class _TransformerBlock(nn.Module):
             encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1)
         )
 
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (
-            norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
-            + c_shift_mlp[:, None]
+        norm_encoder_hidden_states = _longcat_norm_modulate(
+            self.norm2_context, encoder_hidden_states, c_scale_mlp, c_shift_mlp
         )
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         encoder_hidden_states = residual_gate_add(
