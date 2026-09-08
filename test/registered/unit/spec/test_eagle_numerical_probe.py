@@ -62,7 +62,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
 
         probe.record_proposal(
             phase="decode",
-            logical_rows=2,
+            logical_rows=1,
             topk_index=torch.tensor([[3], [4], [5]]),
             topk_probability=torch.tensor([[0.7], [0.8], [0.9]]),
         )
@@ -98,8 +98,10 @@ class TestEagleNumericalProbe(unittest.TestCase):
         )
         self.assertEqual(
             stages["proposed_token"]["tensors"]["topk_index"]["values"],
-            [3, 4],
+            [3],
         )
+        self.assertEqual(stages["draft_extend_input"]["logical_rows"], 2)
+        self.assertEqual(stages["proposed_token"]["logical_rows"], 1)
         self.assertEqual(
             stages["draft_extend_input"]["row_domain"],
             "dense_request_major_prefix",
