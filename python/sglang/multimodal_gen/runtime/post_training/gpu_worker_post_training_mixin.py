@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING
+
+import torch
+import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_rank,
@@ -19,13 +23,17 @@ from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     get_updatable_modules,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.utils import MultiprocessingSerializer, init_custom_process_group
+from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+        DestroyWeightsUpdateGroupReqInput,
+        InitWeightsUpdateGroupReqInput,
         UpdateWeightFromTensorCheckerReqInput,
         UpdateWeightFromTensorReqInput,
+        UpdateWeightsFromDistributedReqInput,
     )
 
 
@@ -35,6 +43,93 @@ def _normalize_gpu_uuid(uuid: str) -> str:
 
 
 class GPUWorkerPostTrainingMixin:
+    def init_weights_update_group(
+        self, req: InitWeightsUpdateGroupReqInput
+    ) -> tuple[bool, str]:
+        world = get_world_group()
+        if req.group_name in self._model_update_group:
+            return False, f"Group {req.group_name} already exists"
+        if req.rank_offset + world.world_size > req.world_size:
+            return False, "Engine ranks exceed the update group size"
+        options = dist.ProcessGroupNCCL.Options() if req.backend == "nccl" else None
+        try:
+            self._model_update_group[req.group_name] = init_custom_process_group(
+                backend=req.backend,
+                init_method=NetworkAddress(
+                    req.master_address, req.master_port
+                ).to_tcp(),
+                world_size=req.world_size,
+                rank=req.rank_offset + world.rank_in_group,
+                group_name=req.group_name,
+                timeout=(
+                    timedelta(seconds=self.server_args.dist_timeout)
+                    if self.server_args.dist_timeout is not None
+                    else None
+                ),
+                pg_options=options,
+            )
+            if options is not None:
+                # Custom groups span independent worlds and cannot split the default communicator.
+                options.split_from = None
+        except Exception as exc:
+            return False, str(exc)
+        return True, "Initialized weight update group"
+
+    def destroy_weights_update_group(
+        self, req: DestroyWeightsUpdateGroupReqInput
+    ) -> tuple[bool, str]:
+        group = self._model_update_group.pop(req.group_name, None)
+        try:
+            if group is not None:
+                dist.destroy_process_group(group)
+        except Exception as exc:
+            return False, str(exc)
+        return True, "Destroyed weight update group"
+
+    def update_weights_from_distributed(
+        self, req: UpdateWeightsFromDistributedReqInput
+    ) -> tuple[bool, str]:
+        if req.group_name not in self._model_update_group:
+            return False, f"Unknown weight update group {req.group_name}"
+        try:
+            weights = [
+                (
+                    name,
+                    torch.empty(
+                        shape,
+                        dtype=torch.__dict__[dtype],
+                        device=torch.cuda.current_device(),
+                    ),
+                )
+                for name, dtype, shape in zip(
+                    req.names, req.dtypes, req.shapes, strict=True
+                )
+            ]
+            handles = [
+                dist.broadcast(
+                    weight,
+                    src=0,
+                    group=self._model_update_group[req.group_name],
+                    async_op=True,
+                )
+                for _, weight in weights
+            ]
+            for handle in handles:
+                handle.wait()
+            return WeightsUpdater(self.pipeline).update_weights_from_tensor(
+                named_tensors={req.target_modules[0]: weights},
+                load_format=None,
+                target_modules=req.target_modules,
+                weight_update_mode=req.weight_update_mode,
+                lora_alpha=req.lora_alpha,
+                lora_rank=req.lora_rank,
+            )
+        except Exception as exc:
+            return (
+                False,
+                f"Weight update failed; discard the partially updated model: {exc}",
+            )
+
     def update_weights_from_disk(
         self,
         model_path: str,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import msgspec
 from pydantic import BaseModel
 
 
@@ -115,3 +116,68 @@ class RolloutResponse(BaseModel):
 
     inference_time_s: Optional[float] = None
     peak_memory_mb: Optional[float] = None
+
+
+class InitWeightsUpdateGroupReqInput(msgspec.Struct, frozen=True):
+    master_address: str
+    master_port: int
+    rank_offset: int
+    world_size: int
+    group_name: str
+    backend: str = "nccl"
+
+    def __post_init__(self):
+        if not self.master_address or not 0 < self.master_port < 65536:
+            raise ValueError("A valid master address and port are required")
+        if not self.group_name or not 0 < self.rank_offset < self.world_size:
+            raise ValueError("A nonempty group name and valid rank offset are required")
+
+
+class DestroyWeightsUpdateGroupReqInput(msgspec.Struct, frozen=True):
+    group_name: str
+
+    def __post_init__(self):
+        if not self.group_name:
+            raise ValueError("group_name must be nonempty")
+
+
+class UpdateWeightsFromDistributedReqInput(msgspec.Struct, frozen=True):
+    names: list[str]
+    dtypes: list[str]
+    shapes: list[list[int]]
+    group_name: str
+    target_modules: list[str]
+    weight_update_mode: str | None = None
+    lora_alpha: int | None = None
+    lora_rank: int | None = None
+
+    def __post_init__(self):
+        import torch
+
+        if (
+            not self.names
+            or len(self.names) != len(self.dtypes)
+            or len(self.names) != len(self.shapes)
+        ):
+            raise ValueError(
+                "names, dtypes and shapes must have the same nonzero length"
+            )
+        if not all(self.names) or len(set(self.names)) != len(self.names):
+            raise ValueError("Tensor names must be nonempty and unique")
+        if any(
+            not isinstance(torch.__dict__.get(dtype), torch.dtype)
+            for dtype in self.dtypes
+        ):
+            raise ValueError("Unsupported tensor dtype")
+        if any(size < 0 for shape in self.shapes for size in shape):
+            raise ValueError("Tensor dimensions must be nonnegative")
+        if (
+            not self.group_name
+            or len(self.target_modules) != 1
+            or not self.target_modules[0]
+        ):
+            raise ValueError("A group name and exactly one target module are required")
+        if self.weight_update_mode not in (None, "lora_merge"):
+            raise ValueError("Unsupported weight update mode")
+        if self.lora_rank is not None and self.lora_rank <= 0:
+            raise ValueError("lora_rank must be positive")
