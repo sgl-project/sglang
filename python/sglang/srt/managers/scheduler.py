@@ -193,6 +193,7 @@ from sglang.srt.managers.overlap_utils import (
     RelayPayload,
     decide_needs_confidence_relay,
     decide_needs_cpu_seq_lens,
+    pre_upload_forward_inputs,
     resolve_forward_inputs,
 )
 from sglang.srt.managers.prefill_delayer import (
@@ -3944,12 +3945,9 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
-            )
-
+        # The HiCache load burst is handed over later, in run_batch
+        # (_handover_hicache_load), so that every round-head H2D copy is
+        # enqueued on the schedule stream before the burst starts.
         new_batch.prepare_for_extend()
 
         if self.tp_worker.model_runner.prefill_aware_swa:
@@ -4176,6 +4174,35 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _handover_hicache_load(self, batch: ScheduleBatch) -> None:
+        """Pre-upload the round-head forward inputs, then start the HiCache
+        load burst queued for this prefill batch.
+
+        This runs in run_batch rather than at batch formation because the
+        batch is only final here: mix_with_running and the DP mlp-sync gather
+        (which assigns global_num_tokens) happen in between. start_loading
+        records its start_event on the schedule stream and makes the load
+        stream wait on it, so the copies issued by pre_upload_forward_inputs
+        are ordered ahead of the burst. Issued the other way round, the
+        forward's first H2D copy can queue behind the entire burst on the copy
+        engine and stall the whole round.
+
+        Only new prefill batches own queued loads. The consumer-index check
+        keeps the hand-over idempotent for batches that re-enter run_batch
+        (pd-multiplexing runs a split prefill batch once per slice).
+        """
+        if not (
+            self.enable_hierarchical_cache or self.enable_unified_cache_external_linker
+        ):
+            return
+        if not batch.forward_mode.is_extend_without_speculative():
+            return
+        if batch.hicache_consumer_index != -1:
+            return
+        pre_upload_forward_inputs(batch)
+        # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+        batch.hicache_consumer_index = self.tree_cache.ready_to_load_host_cache()
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -4202,6 +4229,8 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
+
+        self._handover_hicache_load(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

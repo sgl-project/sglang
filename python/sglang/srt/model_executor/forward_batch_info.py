@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.managers.overlap_utils import StagedDeviceTensor
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -78,6 +79,21 @@ if TYPE_CHECKING:
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
 # ForwardBatch.apply_deprecated_skip_attn_backend_init.
 _skip_attn_backend_init_warned = False
+
+
+def _take_staged(
+    staged: Optional[StagedDeviceTensor], source: Any
+) -> Optional[torch.Tensor]:
+    """Consume a scheduler pre-uploaded device tensor built from ``source``.
+
+    Returns None when nothing was staged, when the staging was already taken
+    by an earlier init_new on the same batch, or when ``source`` is no longer
+    the host object it was uploaded from; the caller then uploads afresh.
+    """
+    if staged is None:
+        return None
+    return staged.take(source)
+
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -735,16 +751,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = batch.global_num_tokens
         self.global_num_tokens_cpu = global_num_tokens
+        # Prefer the copies the scheduler uploaded ahead of the HiCache load
+        # burst; they were built from the unscaled lists, so only a batch
+        # without spec scaling can use them (the staging itself skips spec
+        # batches, and take() guards against a re-gathered list).
+        staged_gpu = staged_logprob_gpu = None
+        if self.spec_info is None:
+            staged_gpu = _take_staged(
+                batch.head_staged_global_num_tokens, global_num_tokens
+            )
+            staged_logprob_gpu = _take_staged(
+                batch.head_staged_global_num_tokens_for_logprob,
+                global_num_tokens_for_logprob,
+            )
         pin_memory = is_pin_memory_available(device)
-        self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
+        if staged_gpu is not None:
+            self.global_num_tokens_gpu = staged_gpu
+        else:
+            self.global_num_tokens_gpu = torch.tensor(
+                global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
+            ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-        self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob,
-            dtype=torch.int64,
-            pin_memory=pin_memory,
-        ).to(device, non_blocking=True)
+        if staged_logprob_gpu is not None:
+            self.global_num_tokens_for_logprob_gpu = staged_logprob_gpu
+        else:
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_for_logprob,
+                dtype=torch.int64,
+                pin_memory=pin_memory,
+            ).to(device, non_blocking=True)
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
 
     @classmethod
@@ -925,14 +960,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
+                # The scheduler may already have uploaded these lists ahead of
+                # the HiCache load burst (head_staged_*); take() returns None
+                # once consumed or if the list was re-assigned since (e.g. a
+                # draft-extend re-running init_new on the same batch).
                 assert isinstance(extend_prefix_lens, list)
                 pin_memory = is_pin_memory_available(device)
-                ret.extend_seq_lens = torch.tensor(
-                    extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
-                ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                staged_seq_lens = _take_staged(
+                    batch.head_staged_extend_seq_lens, extend_seq_lens
+                )
+                staged_prefix_lens = _take_staged(
+                    batch.head_staged_extend_prefix_lens, extend_prefix_lens
+                )
+                if staged_seq_lens is not None:
+                    ret.extend_seq_lens = staged_seq_lens
+                else:
+                    ret.extend_seq_lens = torch.tensor(
+                        extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
+                    ).to(device, non_blocking=True)
+                if staged_prefix_lens is not None:
+                    ret.extend_prefix_lens = staged_prefix_lens
+                else:
+                    ret.extend_prefix_lens = torch.tensor(
+                        extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
+                    ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens
             else:

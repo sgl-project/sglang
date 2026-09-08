@@ -147,6 +147,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.overlap_utils import StagedDeviceTensor
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -2251,6 +2252,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # CPU twin of mix_running_indices; lets the overlap tail resolve gather
     # pinned mirrors without a device sync.
     mix_running_indices_cpu: Optional[torch.Tensor] = None
+    # Round-head metadata pre-uploaded on the schedule stream before the
+    # HiCache load burst hand-over (overlap_utils.pre_upload_forward_inputs).
+    # ForwardBatch.init_new takes each one at most once, and only while the
+    # host list it was built from is still the batch's current value.
+    head_staged_extend_seq_lens: Optional[StagedDeviceTensor] = None
+    head_staged_extend_prefix_lens: Optional[StagedDeviceTensor] = None
+    head_staged_global_num_tokens: Optional[StagedDeviceTensor] = None
+    head_staged_global_num_tokens_for_logprob: Optional[StagedDeviceTensor] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -3551,6 +3560,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
         else:
             self.input_ids = None
+        # Round-head staging belongs to one formation; a merged batch must not
+        # consume either side's tensors.
+        self.head_staged_extend_seq_lens = None
+        self.head_staged_extend_prefix_lens = None
+        self.head_staged_global_num_tokens = None
+        self.head_staged_global_num_tokens_for_logprob = None
         # Optional under no-verify-sync; drop the mirror if either side absent.
         if self.seq_lens_cpu is None or other.seq_lens_cpu is None:
             self.seq_lens_cpu = None
