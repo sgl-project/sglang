@@ -1308,11 +1308,20 @@ class IndexerKPool(MultiPlatformOp):
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
         def _compress_write() -> None:
+            # Draft extend plans before TP padding, whereas target verify
+            # plans complete request groups after padding. The plan owns the
+            # write domain in both cases; graph capture also uses a full bucket.
+            num_plan_tokens = plan.req.shape[0] * num_draft_tokens
+            assert num_plan_tokens <= key.shape[0], (
+                "DSA KPool write plan has more token rows than its input: "
+                f"planned={num_plan_tokens}, physical={key.shape[0]}"
+            )
+            score = self._compute_gate_score_if_missing(x, gate_score_maybe)
             kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
-                key=key,
-                score=self._compute_gate_score_if_missing(x, gate_score_maybe),
+                key=key[:num_plan_tokens],
+                score=score[:num_plan_tokens],
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 ape=self.index_kpool_compress_ape,
@@ -1320,7 +1329,7 @@ class IndexerKPool(MultiPlatformOp):
                 write_start=plan.write_start,
                 tail_logical_start=plan.tail_logical_start,
                 write_loc=plan.write_loc,
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=forward_batch.out_cache_loc[:num_plan_tokens],
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
                 effective_n_per_batch=plan.effective_n_per_batch,
