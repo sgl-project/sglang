@@ -2053,9 +2053,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
     ) -> None:
         super().__init__()
         out_dim = heads * head_dim
-        assert (
-            out_dim == in_dim
-        ), f"in_dim ({in_dim}) must equal heads*head_dim ({out_dim})"
+        assert out_dim == in_dim, (
+            f"in_dim ({in_dim}) must equal heads*head_dim ({out_dim})"
+        )
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.heads = heads
