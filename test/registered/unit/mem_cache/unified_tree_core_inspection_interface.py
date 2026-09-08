@@ -206,6 +206,11 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
     # ==== Targeted white-box operations ====
 
     @abstractmethod
+    def advance_insert_walk_once(self) -> None:
+        """Advance one suspended insert walk step without flushing its actions."""
+        ...
+
+    @abstractmethod
     def evict_component(
         self,
         node_id: NodeId,

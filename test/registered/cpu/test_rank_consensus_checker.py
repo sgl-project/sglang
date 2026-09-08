@@ -25,7 +25,7 @@ from sglang.srt.utils.rank_consensus_checker import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
-register_cpu_ci(est_time=193, suite="base-b-test-cpu")
+register_cpu_ci(est_time=193, suite="stage-a-test-cpu-intel")
 
 
 def run_distributed_test(
@@ -226,9 +226,9 @@ class TestAssertSame(RankConsensusCheckerTestCase):
 
         err = err_box.get()
         shutdown()
-        assert isinstance(
-            err, RuntimeError
-        ), f"Expected RuntimeError from stray-thread assert_same, got {err!r}"
+        assert isinstance(err, RuntimeError), (
+            f"Expected RuntimeError from stray-thread assert_same, got {err!r}"
+        )
 
     def test_assert_same_rejects_non_scheduler_thread(self):
         """Check that assert_same() must be called in the scheduler thread.  Otherwise report error."""

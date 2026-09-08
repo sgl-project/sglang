@@ -146,7 +146,7 @@ class StagingBuffer:
         self.data_ptr = self.buffer.data_ptr()
 
         logger.info(
-            f"StagingBuffer allocated: {size_bytes / (1024*1024):.1f} MB "
+            f"StagingBuffer allocated: {size_bytes / (1024 * 1024):.1f} MB "
             f"on {device}, method={alloc_method}, ptr=0x{self.data_ptr:x}"
         )
 
@@ -207,7 +207,7 @@ class StagingAllocator:
 
         logger.info(
             f"StagingAllocator (ring+overcommit): "
-            f"{total_size_bytes / (1024*1024):.1f} MB "
+            f"{total_size_bytes / (1024 * 1024):.1f} MB "
             f"on {device}, ptr=0x{self.base_ptr:x}"
         )
 
