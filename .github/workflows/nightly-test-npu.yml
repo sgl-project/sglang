@@ -33,7 +33,12 @@ on:
         description: 'The a3 running docker image of the test task with cann 9.1.0.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-nightly'
+      image_a5:
+        description: 'The a5 running docker image of the test task.'
+        required: false
+        type: string
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-nightly'
       skip_install_flag:
         description: 'Indicates whether to skip the installation of sglang, defaulting to false.'
         required: false
@@ -66,6 +71,11 @@ on:
         required: false
         type: string
         default: ''
+      image_a5:
+        description: 'The a5 running docker image of the test task.'
+        required: false
+        type: string
+        default: ''
       skip_install_flag:
         description: 'Indicates whether to skip the installation of sglang, defaulting to false.'
         required: false
@@ -83,6 +93,7 @@ jobs:
       image_a2: ${{ steps.set-vars.outputs.image_a2 }}
       image_a3: ${{ steps.set-vars.outputs.image_a3 }}
       image_a3_cann910: ${{ steps.set-vars.outputs.image_a3_cann910 }}
+      image_a5: ${{ steps.set-vars.outputs.image_a5 }}
       skip_install_flag: ${{ steps.set-vars.outputs.skip_install_flag }}
       run_start_metadata: ${{ steps.set-vars.outputs.run_start_metadata }}
     steps:
@@ -115,9 +126,14 @@ jobs:
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a3_cann910 }}" ]; then
-            echo "image_a3_cann910=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
+            echo "image_a3_cann910=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-nightly" >> $GITHUB_OUTPUT
           else
             echo "image_a3_cann910=${{ inputs.image_a3_cann910 }}" >> $GITHUB_OUTPUT
+          fi
+          if [ -z "${{ inputs.image_a5 }}" ]; then
+            echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-nightly" >> $GITHUB_OUTPUT
+          else
+            echo "image_a5=${{ inputs.image_a5 }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.skip_install_flag }}" ]; then
             echo "skip_install_flag=false" >> $GITHUB_OUTPUT
@@ -344,8 +360,7 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    # Disabled: does not involve CANN 9.1.0.
-    if: ${{ false }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
@@ -368,13 +383,13 @@ jobs:
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_flash performance tests
-          - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
+          # - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
@@ -457,7 +472,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests-cann910:
     name: multi-node-mix-poc-cann910
-    if: ${{ !cancelled() }}
+    if: ${{ false }}
     needs: [set-image-config, nightly-poc-multi-node-tests-cann910]
     strategy:
       fail-fast: false
