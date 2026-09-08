@@ -403,7 +403,7 @@ class ServerArgsAutoTuner:
         if (
             not self.could_override_server_args()
             or current_platform.is_cpu()
-            or not current_platform.is_cuda()
+            or (not current_platform.is_cuda() and not current_platform.is_xpu())
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.layerwise_offload_components is not None

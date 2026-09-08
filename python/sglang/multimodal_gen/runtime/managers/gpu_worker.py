@@ -106,6 +106,24 @@ from sglang.srt.utils.network import NetworkAddress
 logger = init_logger(__name__)
 
 
+def _device_has_allocator_cache() -> bool:
+    return (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_xpu()
+    )
+
+
+def _device_module():
+    return torch.get_device_module(current_platform.device_type)
+
+
+def _device_initialized() -> bool:
+    if not _device_has_allocator_cache():
+        return False
+    return _device_module().is_initialized()
+
+
 @dataclass
 class _ExpandedOutputParts:
     tensor_outputs: list[torch.Tensor] = field(default_factory=list)
@@ -273,8 +291,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         released = self._realtime_sessions.release(session_id)
         if released:
-            if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+            if _device_initialized():
+                _device_module().empty_cache()
         return OutputBatch(output={"released": released, "session_id": session_id})
 
     def _configure_persistent_torch_compile_cache(self) -> None:
@@ -930,9 +948,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         if (
             os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-            and torch.cuda.is_initialized()
+            and _device_initialized()
         ):
-            torch.cuda.synchronize()
+            _device_module().synchronize()
         start_time = time.perf_counter()
         output_batch.output = [
             self._materialize_frame_output(output, output_batch, req)
@@ -941,9 +959,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.metrics is not None:
             if (
                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-                and torch.cuda.is_initialized()
+                and _device_initialized()
             ):
-                torch.cuda.synchronize()
+                _device_module().synchronize()
             output_batch.metrics.record_stage(
                 "GPUWorker.frame_materialize_for_return",
                 time.perf_counter() - start_time,
@@ -1535,11 +1553,7 @@ OOM detected. Possible solutions:
 
 
 def _oom_exceptions():
-    # torch.OutOfMemoryError exists only in some PyTorch builds
-    types = [torch.cuda.OutOfMemoryError]
-    if hasattr(torch, "OutOfMemoryError"):
-        types.append(torch.OutOfMemoryError)
-    return tuple(types)
+    return (torch.OutOfMemoryError,)
 
 
 def run_scheduler_process(
@@ -1603,8 +1617,8 @@ def run_scheduler_process(
         if "scheduler" in locals():
             del scheduler
         gc.collect()
-        if torch.cuda.is_initialized():
-            torch.cuda.empty_cache()
+        if _device_initialized():
+            _device_module().empty_cache()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
         logger.info(f"Worker {rank}: Shutdown complete.")

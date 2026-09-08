@@ -138,7 +138,11 @@ def _should_use_channels_last_3d(
     if component_type not in (
         "vae",
         "video_vae",
-    ) or not (current_platform.is_cuda() or current_platform.is_rocm()):
+    ) or not (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_xpu()
+    ):
         return False
 
     override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)

@@ -66,6 +66,12 @@ def is_hip() -> bool:
     return current_platform.is_hip()
 
 
+def is_xpu() -> bool:
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    return current_platform.is_xpu()
+
+
 def has_triton() -> bool:
     """True when the live device runs the Triton implementations."""
     return platform_key() in _CUDA_LIKE
