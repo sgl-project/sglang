@@ -6,7 +6,7 @@
 //! ([`ServerArgs`] and its parts, constructed by keyword from Python; their
 //! `#[pyclass]`es and constructors live in `message::config`), [`Server`]
 //! (boot, `recv_requests`/`wait_request`, `push_*`, MM handoff, shutdown),
-//! [`RequestBatch`] and [`MmEncodeResult`]. Everything behind that boundary —
+//! [`RequestBatch`] and [`MmEncodedResult`]. Everything behind that boundary —
 //! receiving requests, encoding multimodal inputs, tokenizing, detokenizing,
 //! SSE streaming, and so on — is implemented purely in Rust and never touches
 //! a `PyObject`.
@@ -29,10 +29,10 @@ use crate::utils::startup::{listen_addr, value_error};
 use crate::utils::{logging, runtime};
 
 /// One drained MM result (see [`Server::take_mm_result`]), consumed by
-/// `RustMmProcessor.build_output` to build the scheduler's
+/// `RustMmProcessor.wrap_encoded` to build the scheduler's
 /// `MultimodalProcessorOutput`.
 #[pyclass(frozen, get_all)]
-struct MmEncodeResult {
+struct MmEncodedResult {
     // General fields.
     /// All items' `pixel_values` concatenated as flat `f32` with logical shape
     /// `[sum(t*h*w), feature_dim]`; present on the inline (single-rank) path.
@@ -199,14 +199,9 @@ impl Server {
     /// in Rust and parked for [`Server::take_mm_result`]; anything the pipeline
     /// cannot serve is rejected back to the client — there is no Python fallback.
     fn start_mm_workers(&self, spec: MmSpec, workers: usize) -> PyResult<()> {
-        let ctx = multi_modality::worker::Context::new(
-            spec,
-            self.rt.tokenizer.clone(),
-            self.rt.mm_sidecar.clone(),
-        )
-        .map_err(|e| value_error("mm spec", e))?;
-        self.rt.spawn_mm_pool(workers, std::sync::Arc::new(ctx));
-        Ok(())
+        self.rt
+            .start_mm_workers(spec, workers)
+            .map_err(|e| value_error("mm spec", e))
     }
 
     /// Pop the MM result for `rid` — parked strictly before the request reached
@@ -217,22 +212,22 @@ impl Server {
     /// Runs on the scheduler loop between decode steps, so any per-byte work
     /// here — memcpy or hashing, tens of MB per image-heavy request — would
     /// stall every running request's ITL. Hence the worker-precomputed `hashes`.
-    fn take_mm_result(&self, py: Python<'_>, rid: &str) -> Option<MmEncodeResult> {
+    fn take_mm_result(&self, py: Python<'_>, rid: &str) -> Option<MmEncodedResult> {
         use numpy::IntoPyArray;
 
-        let res = self.rt.mm_sidecar.take(rid)?;
+        let res = self.rt.mm_results.take(rid)?;
         let (features, shm_names) = match res.features {
-            multi_modality::sidecar::FeatureStore::Inline(v) => {
+            multi_modality::result_store::FeatureStore::Inline(v) => {
                 (Some(v.into_pyarray(py).unbind()), None)
             }
             // The segments — and the duty to unlink — move to Python here;
             // `materialize()` unlinks after the post-broadcast clone on each rank.
-            multi_modality::sidecar::FeatureStore::Shm(segments) => (
+            multi_modality::result_store::FeatureStore::Shm(segments) => (
                 None,
                 Some(segments.into_iter().map(|s| s.into_name()).collect()),
             ),
         };
-        Some(MmEncodeResult {
+        Some(MmEncodedResult {
             features,
             shm_names,
             grids: res.grids.iter().map(|g| (g[0], g[1], g[2])).collect(),
@@ -276,6 +271,6 @@ fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MmSpec>()?;
     m.add_class::<Server>()?;
     m.add_class::<RequestBatch>()?;
-    m.add_class::<MmEncodeResult>()?;
+    m.add_class::<MmEncodedResult>()?;
     Ok(())
 }
