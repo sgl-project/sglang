@@ -48,7 +48,7 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_serving,
 )
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import extend_mem_profile, flatten_nested_list, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
@@ -430,14 +430,14 @@ def embed_mm_inputs(
         items = [
             item for item in item_flatten_list if item.is_modality(modality=modality)
         ]
+        # "image", "video", etc
+        modality_id = modality.name.lower()
         embedder = (
             None
             if data_embedding_func_mapping is None
             else data_embedding_func_mapping.get(modality, None)
         )
         if embedder is None:
-            # "image", "video", etc
-            modality_id = modality.name.lower()
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
@@ -459,16 +459,17 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
 
-            embedding, mask, input_ids = get_embedding_and_mask(
-                data_embedding_func=embedder,
-                embedding_items=items,
-                placeholder_tensor=placeholder_tensor,
-                input_ids=input_ids,
-                items_size=items_size,
-                prefix_length=extend_prefix_lens,
-                extend_length=extend_seq_lens,
-                items_offset_list=items_offsets,
-            )
+            with extend_mem_profile.phase(f"mm-embed:{modality_id}"):
+                embedding, mask, input_ids = get_embedding_and_mask(
+                    data_embedding_func=embedder,
+                    embedding_items=items,
+                    placeholder_tensor=placeholder_tensor,
+                    input_ids=input_ids,
+                    items_size=items_size,
+                    prefix_length=extend_prefix_lens,
+                    extend_length=extend_seq_lens,
+                    items_offset_list=items_offsets,
+                )
 
             if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (
