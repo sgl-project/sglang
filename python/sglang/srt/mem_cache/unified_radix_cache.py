@@ -3033,10 +3033,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if consumer_index < 0 or self.cache_controller is None:
             return True
 
-        finish_event = self.cache_controller.layer_done_counter.events[
-            consumer_index
-        ].finish_event
-        if not finish_event.query():
+        event = self.cache_controller.layer_done_counter.events[consumer_index]
+        # With async load enqueue the slot's finish_event is still the previous
+        # rotation's until the loader thread has submitted this burst.
+        if not getattr(event, "is_enqueue_done", lambda: True)():
+            return False
+        if not event.finish_event.query():
             return False
 
         self.loading_check()

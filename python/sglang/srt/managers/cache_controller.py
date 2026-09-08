@@ -36,11 +36,16 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.l2_transfer import (
+    L2Transfer,
+    L2TransferEngine,
+    make_timing_event_pair,
+)
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -50,18 +55,93 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+# How long a consumer may wait for a layer's device event to be recorded before
+# the wait is reported. Only reachable with async load enqueue on; a burst that
+# takes this long has gone wrong somewhere the loader thread could not report.
+_ASYNC_RECORD_WAIT_WARN_S = 30.0
+
+
 class LayerLoadingEvent:
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, async_enqueue: bool = False):
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()  # start event on controller stream
+        # Async load enqueue only. The per-layer events are recorded by the
+        # loader thread, which runs *behind* the consumer instead of ahead of
+        # it, and waiting on a device event that has not been recorded yet is a
+        # no-op -- the consumer would sail past a copy that has not even been
+        # submitted. These flags are the CPU-side half of the handshake. They
+        # are None (and every method below a no-op) with the gate off, where the
+        # record always happens before the wait because both run on one thread.
+        self._recorded = (
+            [threading.Event() for _ in range(num_layers)] if async_enqueue else None
+        )
+        # Set once the burst holding this slot has been fully enqueued.
+        # update_producer needs it because finish_event alone cannot distinguish
+        # a slot whose burst is still sitting in the loader queue (its
+        # finish_event is the *previous* rotation's, long since ready) from a
+        # free one.
+        self._enqueue_done = threading.Event() if async_enqueue else None
+        if self._enqueue_done is not None:
+            self._enqueue_done.set()
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
+        # Read once: disable_async_handshake may drop the list concurrently.
+        recorded = self._recorded
+        if recorded is not None:
+            recorded[layer_index].set()
 
     def wait(self, layer_index: int):
+        recorded = self._recorded
+        if recorded is not None:
+            while not recorded[layer_index].wait(_ASYNC_RECORD_WAIT_WARN_S):
+                logger.error(
+                    "HiCache async load enqueue: layer %d has not been submitted "
+                    "after %.0fs; the forward is still blocked waiting for it.",
+                    layer_index,
+                    _ASYNC_RECORD_WAIT_WARN_S,
+                )
         device_module.current_stream().wait_event(self.load_events[layer_index])
+
+    def rearm(self):
+        """Scheduler thread, right before the slot is handed to a new burst."""
+        if self._recorded is None:
+            return
+        for recorded in self._recorded:
+            recorded.clear()
+        self._enqueue_done.clear()
+
+    def is_enqueue_done(self) -> bool:
+        enqueue_done = self._enqueue_done
+        return enqueue_done is None or enqueue_done.is_set()
+
+    def wait_enqueue_done(self):
+        enqueue_done = self._enqueue_done
+        if enqueue_done is not None:
+            enqueue_done.wait()
+
+    def mark_enqueue_done(self):
+        enqueue_done = self._enqueue_done
+        if enqueue_done is not None:
+            enqueue_done.set()
+
+    def disable_async_handshake(self):
+        """Drop back to the synchronous contract (record always precedes wait).
+
+        Callers that stop the loader thread must call this: nothing on the
+        synchronous path hands _enqueue_done back, so leaving it armed would
+        park the next rotation of this slot forever. Any current waiter is
+        released before the flags go away.
+        """
+        if self._recorded is None:
+            return
+        for recorded in self._recorded:
+            recorded.set()
+        self._enqueue_done.set()
+        self._recorded = None
+        self._enqueue_done = None
 
     @property
     def finish_event(self):
@@ -69,20 +149,34 @@ class LayerLoadingEvent:
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, async_enqueue: bool = False):
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
-        self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
+        self.events = [
+            LayerLoadingEvent(num_layers, async_enqueue=async_enqueue)
+            for _ in range(self.num_counters)
+        ]
         self.producer_index = -1
         self.consumer_index = -1
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[self.producer_index].finish_event.query(), (
+        producer_event = self.events[self.producer_index]
+        # No-op with async load enqueue off. With it on, this is the rotation's
+        # backpressure: block until the burst that last held this slot has been
+        # enqueued, so the assert below inspects that burst's finish_event and
+        # not a stale one.
+        producer_event.wait_enqueue_done()
+        assert producer_event.finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
+        producer_event.rearm()
         return self.producer_index
+
+    def disable_async_handshake(self):
+        for event in self.events:
+            event.disable_async_handshake()
 
     def set_consumer(self, index: int):
         self.consumer_index = index
@@ -344,7 +438,12 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        # Read once here: the loader thread and the per-layer event handshake
+        # are wired at construction and never switched at runtime.
+        self.async_load_enqueue = envs.SGLANG_HICACHE_ASYNC_LOAD_ENQUEUE.get()
+        self.layer_done_counter = LayerDoneCounter(
+            self.layer_num, async_enqueue=self.async_load_enqueue
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -364,6 +463,18 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+
+        self._init_load_enqueue_thread(self.async_load_enqueue)
+        # Positive activation signature: without this line there is no way to
+        # tell from the logs whether SGLANG_HICACHE_ASYNC_LOAD_ENQUEUE reached
+        # the scheduler process (an unset env silently runs the inline path).
+        # The concrete class is named because subclasses inherit this path, and
+        # stop_load_enqueue_thread logs the matching downgrade line.
+        logger.info(
+            "HiCache async load enqueue: %s (%s)",
+            "enabled" if self.async_load_enqueue else "disabled",
+            type(self).__name__,
+        )
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -432,6 +543,179 @@ class HiCacheController:
     ) -> None:
         for group in groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
+
+    def _init_load_enqueue_thread(self, enabled: bool) -> None:
+        """Wire the async load-enqueue worker (SGLANG_HICACHE_ASYNC_LOAD_ENQUEUE).
+
+        Nothing is created when the gate is off, so start_loading takes the
+        original inline path and no thread exists to reason about.
+        """
+        # Guards the ack append against reset()'s clear(); see _append_load_ack.
+        self._ack_load_lock = threading.Lock()
+        self.load_enqueue_stop_event = threading.Event()
+        self.load_enqueue_queue: Optional[Queue] = None
+        self.load_enqueue_thread: Optional[threading.Thread] = None
+        # Latched last loader-thread failure, for diagnostics; see _abort_load_burst.
+        self.load_enqueue_error: Optional[BaseException] = None
+        # A fresh thread starts on device 0, not on this rank's device, so
+        # capture the scheduler thread's device index here and re-apply it on
+        # the worker.
+        self.load_enqueue_device_index = None
+        if not enabled:
+            return
+
+        try:
+            self.load_enqueue_device_index = device_module.current_device()
+        except Exception:
+            logger.warning(
+                "Could not read the current device index for the HiCache load "
+                "enqueue thread; it will inherit the process default.",
+                exc_info=True,
+            )
+        self.load_enqueue_queue = Queue()
+        self.load_enqueue_thread = threading.Thread(
+            target=self._load_enqueue_thread_func,
+            name="hicache-load-enqueue",
+            daemon=True,
+        )
+        self.load_enqueue_thread.start()
+
+    def _load_enqueue_thread_func(self):
+        """Drain load bursts, submitting each layer-wise onto the H2D stream.
+
+        Deliberately a single consumer: the H2D stream ordering, the 3-slot
+        producer rotation and the ack queue the scheduler pops in order are all
+        FIFO, so a second worker would reorder all three.
+        """
+        if self.load_enqueue_device_index is not None:
+            try:
+                device_module.set_device(self.load_enqueue_device_index)
+            except Exception:
+                logger.warning(
+                    "Could not bind the HiCache load enqueue thread to device %s.",
+                    self.load_enqueue_device_index,
+                    exc_info=True,
+                )
+
+        while (
+            not self.load_enqueue_stop_event.is_set()
+        ) or not self.load_enqueue_queue.empty():
+            try:
+                job = self.load_enqueue_queue.get(block=True, timeout=1)
+            except Empty:
+                continue
+            try:
+                if job is not None:
+                    op, producer_event, fence_event = job
+                    self._enqueue_load_burst(
+                        op,
+                        producer_event,
+                        start_event_recorded=True,
+                        fence_event=fence_event,
+                    )
+            except Exception as e:
+                self._abort_load_burst(job[0], job[1], e)
+            finally:
+                if job is not None:
+                    # After the abort path, so a slot is never handed back out
+                    # while its release is still being recorded.
+                    job[1].mark_enqueue_done()
+                self.load_enqueue_queue.task_done()
+
+    def _abort_load_burst(
+        self,
+        op: CacheOperation,
+        producer_event: LayerLoadingEvent,
+        exc: BaseException,
+    ) -> None:
+        """Release everything a failed burst would otherwise leave waiting.
+
+        A forward that has already issued wait_until() for this producer is
+        parked on a per-layer event that will never be recorded, and there is
+        no way to interrupt it from here -- releasing it is the only outcome
+        that cannot deadlock. So every layer is marked complete and the ack is
+        published with a recorded finish event; withholding the ack instead
+        would strand this burst's node locks and, because loading_check pops in
+        order, every later burst's too. The events are recorded on the H2D
+        stream so the layers that did get submitted keep their real ordering.
+
+        The KV those layers point at is stale, hence the error log with the
+        node ids and the latched load_enqueue_error. The exception is not
+        re-raised: killing the loader thread would deadlock the next burst, and
+        a traceback raised here reaches nobody -- the scheduler thread is
+        elsewhere.
+        """
+        node_ids = getattr(op, "node_ids", None)
+        self.load_enqueue_error = exc
+        logger.error(
+            "HiCache async load enqueue failed for node_ids=%s; releasing %d layer "
+            "events and publishing the ack so no forward stays blocked. The KV for "
+            "these nodes is NOT valid.",
+            node_ids,
+            self.layer_num,
+            exc_info=exc,
+        )
+        try:
+            ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
+            stream = self.l2_transfer_engine.host_to_device_stream
+            with device_module.stream(stream):
+                for i in range(self.layer_num):
+                    producer_event.complete(i)
+                ack_start_event.record()
+                ack_finish_event.record()
+            self._append_load_ack(
+                HiCacheAck(
+                    start_event=ack_start_event,
+                    finish_event=ack_finish_event,
+                    node_ids=node_ids or [],
+                    num_tokens=0,
+                    timing_enabled=timing_enabled,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "HiCache async load abort path failed for node_ids=%s; a forward "
+                "waiting on this producer may now hang.",
+                node_ids,
+            )
+
+    def _drain_load_enqueue(self) -> None:
+        """Block until the loader thread holds no queued or in-flight burst."""
+        if self.load_enqueue_queue is not None:
+            # task_done() runs in the worker's finally, including on failure, so
+            # this cannot hang on a burst the loader already gave up on.
+            self.load_enqueue_queue.join()
+
+    def stop_load_enqueue_thread(self) -> None:
+        """Stop the load-enqueue worker and fall back to the inline path."""
+        if self.load_enqueue_thread is None:
+            return
+
+        # The __init__ line already claimed "enabled"; without this the process
+        # would run inline for the rest of its life behind a log that says
+        # otherwise.
+        logger.info(
+            "HiCache async load enqueue: downgraded to inline (%s)",
+            type(self).__name__,
+        )
+        self.load_enqueue_stop_event.set()
+        # Wake the worker if it is blocked on the queue's 1s get().
+        try:
+            self.load_enqueue_queue.put_nowait(None)
+        except Exception:
+            pass
+
+        self.load_enqueue_thread.join(timeout=10)
+        if self.load_enqueue_thread.is_alive():
+            logger.error("Failed to stop the HiCache load enqueue thread cleanly.")
+            return
+        self.load_enqueue_thread = None
+        # Falls start_loading back to the inline path rather than queueing onto
+        # a thread that is gone; the handshake has to go with it, since only the
+        # loader thread ever hands _enqueue_done back.
+        self.load_enqueue_queue = None
+        self.async_load_enqueue = False
+        self.layer_done_counter.disable_async_handshake()
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -742,10 +1026,16 @@ class HiCacheController:
     def reset(self):
         self.storage_stop_event.set()
 
+        # Let the loader thread finish what it already holds first: an append
+        # that lands after the clear below would resurrect an ack for nodes
+        # this reset has dropped.
+        self._drain_load_enqueue()
+
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
-        self.ack_load_queue.clear()
+        with self._ack_load_lock:
+            self.ack_load_queue.clear()
         if self.enable_storage:
             self.prefetch_thread.join()
             self.prefetch_io_aux_thread.join()
@@ -912,23 +1202,85 @@ class HiCacheController:
         return self._l2_transfers(host_indices, device_indices, pool_transfers)
 
     def start_loading(self) -> int:
+        # Only the producer slot has to be settled before this returns: the
+        # batch is created with it as hicache_consumer_index. Everything else
+        # -- the index move and the per-layer enqueue -- is scheduler-thread CPU
+        # that the async gate hands to the loader thread.
         if len(self.load_queue) == 0:
             return -1
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
-        producer_event.start_event.record()
 
-        if self.load_fence_stream is not None:
+        load_enqueue_queue = self.load_enqueue_queue
+        if load_enqueue_queue is None:
+            self._enqueue_load_burst(op, producer_event, start_event_recorded=False)
+        else:
+            # start_event orders the loads behind this point of the *compute*
+            # stream, and Event.record() takes the calling thread's current
+            # stream -- so it can only be recorded here, before the hand-over.
+            producer_event.start_event.record()
+            # Same for the fence: the point of the forward stream it captures
+            # has to be the one at hand-over, not wherever that stream is by
+            # the time the loader thread gets to the burst.
+            fence_event = None
+            if self.load_fence_stream is not None:
+                fence_event = device_module.Event()
+                fence_event.record(self.load_fence_stream)
+            load_enqueue_queue.put((op, producer_event, fence_event))
+        return producer_id
+
+    def _enqueue_load_burst(
+        self,
+        op: CacheOperation,
+        producer_event: LayerLoadingEvent,
+        start_event_recorded: bool,
+        fence_event=None,
+    ) -> None:
+        """Submit one load burst layer by layer onto the H2D stream.
+
+        This is the CPU cost the async gate exists to move: with io_backend
+        'direct' every layer builds a batched-copy descriptor, so the loop runs
+        for hundreds of milliseconds without touching the GPU. Runs inline on
+        the scheduler thread with the gate off, on the loader thread with it on.
+
+        ``start_event_recorded`` False means this body records
+        producer_event.start_event itself, after the index move, exactly as the
+        inline path always did. True means the caller recorded it before the
+        hand-over, and any read of an allocator-produced device tensor -- the
+        index move included -- must happen under the H2D stream after waiting
+        on it: that record point is the only ordering this body has against
+        the compute stream that wrote those values, and off the scheduler
+        thread there is no implicit one.
+        """
+        h2d_stream = self.l2_transfer_engine.host_to_device_stream
+        if start_event_recorded:
+            # Loader thread: op.device_indices' *values* are written by
+            # allocator kernels on the compute stream, and the current stream
+            # here is not that one. The D2H copy inside move_indices ('direct'
+            # backends) must therefore be ordered behind the hand-over point,
+            # or it reads unsettled memory and the copies built from it target
+            # wild device addresses.
+            with device_module.stream(h2d_stream):
+                producer_event.start_event.wait(h2d_stream)
+                host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        else:
+            host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+            # Recorded after the index move: for the 'direct' backends
+            # move_indices ends in a blocking D2H copy, so the point of the
+            # current stream this captures depends on the order.
+            producer_event.start_event.record()
+
+        if fence_event is not None:
+            # Recorded on load_fence_stream by start_loading at hand-over time.
+            fence_event.wait(h2d_stream)
+        elif self.load_fence_stream is not None:
             # in overlap scheduling, reclaimed pages might still be written by the forward thread
             # therefore a fence is needed for loading thread to prevent memory corruption
             # todo: it's possible to use a finer-grained fence
-            self.l2_transfer_engine.host_to_device_stream.wait_stream(
-                self.load_fence_stream
-            )
+            h2d_stream.wait_stream(self.load_fence_stream)
 
         completion = self.l2_transfer_engine.submit_host_to_device(
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
@@ -937,7 +1289,7 @@ class HiCacheController:
             layer_num=self.layer_num,
         )
 
-        self.ack_load_queue.append(
+        self._append_load_ack(
             HiCacheAck(
                 start_event=completion.start_event,
                 finish_event=completion.finish_event,
@@ -948,7 +1300,16 @@ class HiCacheController:
                 num_bytes=self._transfer_num_bytes(op),
             )
         )
-        return producer_id
+
+    def _append_load_ack(self, ack: HiCacheAck) -> None:
+        # The scheduler still scans and pops ack_load_queue unlocked, which
+        # stays correct: list append/pop are atomic under the GIL and the ack
+        # is fully built before the append, so it becomes visible only
+        # complete. The lock is what keeps a loader-thread append from landing
+        # *after* reset()'s clear() and resurrecting an ack whose nodes the
+        # scheduler already dropped.
+        with self._ack_load_lock:
+            self.ack_load_queue.append(ack)
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
