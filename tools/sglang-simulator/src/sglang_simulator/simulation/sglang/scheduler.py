@@ -95,10 +95,17 @@ def _session_io_structs():
 
 
 def _session_id_of(req) -> str | None:
-    """Session a generate request belongs to, or None when it is unsessioned."""
+    """Session a generate request belongs to, or None when it is unsessioned.
+
+    Radix-native sessions carry the top-level `session_id`; the older
+    session-controller path carries `session_params.id` (scheduler.py routes on
+    both). A request never sets both -- `GenerateReqInput` rejects that.
+    """
     _, _, tokenized_generate = _session_io_structs()
     if not isinstance(req, tokenized_generate):
         return None
+    if req.session_id is not None:
+        return req.session_id
     if req.session_params is None:
         return None
     return req.session_params.id
@@ -235,6 +242,15 @@ class ReqDispatcher:
         recv_reqs = []
 
         recv_reqs.extend(self.immediate_release_requests)
+        # A request admitted after the simulation started arrives now, whatever
+        # timestamp it carries. Multi-turn replay reuses one row's metadata for
+        # every round, so later turns would otherwise report the preceding turns'
+        # execution as their own queueing delay.
+        live_arrivals = (
+            {id(req) for req in self.immediate_release_requests}
+            if self.offline_recv_all_requests
+            else set()
+        )
         self.immediate_release_requests.clear()
 
         if self.mode == SimulationMode.OFFLINE and self.offline_recv_all_requests:
@@ -279,6 +295,7 @@ class ReqDispatcher:
                     simulation_args = {}
                 req_stats = request_stats_manager.get_req_stats(req.rid)
                 req_stats.rid = req.rid
+                req_stats.session_id = _session_id_of(req)
                 req_stats.input_length = len(req.input_ids)
                 req_stats.output_length = req.sampling_params.max_new_tokens
 
@@ -289,9 +306,12 @@ class ReqDispatcher:
                     req_stats.last_event_time = req_stats.created_time
                     req_stats.queue_start = now
                 elif self.mode == SimulationMode.OFFLINE:
-                    req_stats.created_time = self.simulation_created_time_s(
-                        simulation_args
-                    )
+                    if id(req) in live_arrivals:
+                        req_stats.created_time = StateManager.get_global_clock()
+                    else:
+                        req_stats.created_time = self.simulation_created_time_s(
+                            simulation_args
+                        )
                     req_stats.last_event_time = req_stats.created_time
                     # Align with the real queue start timestamp if queue_start is not None. For debugging only.
                     queue_start = simulation_args.get("queue_start")

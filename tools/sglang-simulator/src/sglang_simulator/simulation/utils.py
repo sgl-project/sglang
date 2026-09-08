@@ -104,6 +104,50 @@ def calc_iteration_metrics(
     return metrics
 
 
+def calc_session_metrics(requests: list[RequestStats]) -> dict:
+    """Aggregate reuse per session and by turn index.
+
+    Turn index is the arrival order within a session. Session reuse only shows up
+    across turns, so a per-request mean hides it: turn 1 is always cold.
+    """
+    by_session: dict[str, list[RequestStats]] = {}
+    for req in requests:
+        if req.session_id is None or not req.is_complete():
+            continue
+        by_session.setdefault(req.session_id, []).append(req)
+
+    if not by_session:
+        return {"num_sessions": 0}
+
+    session_hit_ratios = []
+    by_turn: dict[int, list[float]] = {}
+    for session_requests in by_session.values():
+        session_requests.sort(key=lambda req: req.created_time)
+        session_input = sum(req.input_length for req in session_requests)
+        session_hit = sum(req.final_device_hit_len for req in session_requests)
+        session_hit_ratios.append(
+            0.0 if session_input == 0 else session_hit / session_input
+        )
+        for turn_index, req in enumerate(session_requests):
+            ratio = (
+                0.0
+                if req.input_length == 0
+                else req.final_device_hit_len / req.input_length
+            )
+            by_turn.setdefault(turn_index, []).append(ratio)
+
+    turns_per_session = [len(reqs) for reqs in by_session.values()]
+    return {
+        "num_sessions": len(by_session),
+        "mean_turns_per_session": float(np.mean(turns_per_session)),
+        "mean_session_device_hit_ratio": float(np.mean(session_hit_ratios)),
+        "device_hit_ratio_by_turn": {
+            str(turn_index): float(np.mean(ratios))
+            for turn_index, ratios in sorted(by_turn.items())
+        },
+    }
+
+
 def calc_metrics(requests: list[RequestStats]) -> dict:
     ttfts = []
     tpots = []
@@ -236,4 +280,5 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         "max_output_tokens_per_s": max_output_tokens_per_s,
         "max_concurrent_requests": max_concurrent_requests,
         "time_cost": -1,  # Updated by external benchmark caller
+        **calc_session_metrics(requests),
     }
