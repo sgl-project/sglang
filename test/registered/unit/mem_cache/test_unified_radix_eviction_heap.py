@@ -310,7 +310,12 @@ def replay_pair(
 ):
     ops = gen_ops(seed, 320, page_size, session)
     reset_time_counter()
-    new = Replay(make_cache(policy=policy, enable_session=session, page_size=page_size))
+    # Pin the lazy side explicitly: the env var is read at UnifiedTreeCore
+    # construction, so an exported kill switch would otherwise flip both sides.
+    with envs.SGLANG_UNIFIED_RADIX_LAZY_EVICTION_HEAP.override(True):
+        new = Replay(
+            make_cache(policy=policy, enable_session=session, page_size=page_size)
+        )
     new.run(ops)
     reset_time_counter()
     if kill_switch:
@@ -478,7 +483,7 @@ class TestEvictionOrderParity(CustomTestCase):
     def test_parity_all_policies(self):
         for policy in POLICIES:
             for session in (False, True):
-                for seed in range(3):
+                for seed in range(12):
                     label = f"policy={policy} session={session} seed={seed}"
                     with self.subTest(label):
                         new, ref = replay_pair(policy, seed, session)
@@ -607,6 +612,20 @@ class TestHeapOnRealCache(CustomTestCase):
         cache.sanity_check()
         cache.evict(EvictParams(num_tokens=6))
         self.assertEqual(_match_len(cache, [1, 2, 3]) + _match_len(cache, [7, 8, 9]), 0)
+        cache.sanity_check()
+
+    def test_eviction_walk_keeps_heap_compact(self):
+        """Regression: a walk must not leave one stale entry per evicted leaf."""
+        cache = make_cache(policy="mru")
+        seqs = [[1000 + i * 3 + j for j in range(3)] for i in range(30)]
+        for s in seqs:
+            _insert(cache, s)
+        for _ in range(3):
+            for s in seqs:
+                _match_len(cache, s)
+        cache.evict(EvictParams(num_tokens=45))
+        heap = cache.tree_core.full_device_heap
+        self.assertLessEqual(len(heap._heap), 2 * len(heap._live) + 64)
         cache.sanity_check()
 
     def test_many_matches_keep_heap_compact(self):

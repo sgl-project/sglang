@@ -575,7 +575,7 @@ def bench_evict_step(
     step_tokens=64,
 ):
     """Decode-shaped eviction: pool full, then evict *step_tokens* and re-insert
-    one sequence of the same length per step so the tree stays full.
+    one distinct sequence of the same length per step so the tree stays full.
 
     Isolates the per-call eviction overhead (heap maintenance over the
     evictable-leaf set) instead of the prefill-shaped batch evictions of
@@ -592,10 +592,14 @@ def bench_evict_step(
 
     num_steps = min(1000, max(inserted // 5, 100))
     warmup = min(20, num_steps // 10)
-    # Fresh sequences (unique tails) so each step re-inserts new leaves.
-    fresh = env.seqs[inserted:] + env.seqs[:inserted]
+    # Slicing gen_random_sequences would repeat: every sequence shares the same
+    # chunk_len//4 root, so seq[:step_tokens] collapses to a handful of distinct
+    # payloads. Synthesize instead: a shared head keeps prefix reuse realistic,
+    # the per-step tail forces the new leaf the eviction walk has to manage.
+    head_len = max(1, min(step_tokens // 2, len(env.seqs[0])))
+    head = list(env.seqs[0][:head_len])
     items = [
-        (step_tokens, fresh[i % len(fresh)][:step_tokens])
+        (step_tokens, head + [1_000_000 + i] * (step_tokens - head_len))
         for i in range(num_steps + warmup)
     ]
 

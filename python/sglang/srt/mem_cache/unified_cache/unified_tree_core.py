@@ -449,9 +449,8 @@ class _LazyLeafHeap:
 
     def forget(self, node) -> None:
         """Membership-removal hook."""
-        live = self._live
-        if live.pop(node, None) is not None and len(self._heap) > 2 * len(live) + 64:
-            self._compact()
+        if self._live.pop(node, None) is not None:
+            self._maybe_compact()
 
     def _upsert(self, node) -> None:
         key = self._key(node)
@@ -459,10 +458,8 @@ class _LazyLeafHeap:
         if live.get(node) == key:
             return
         live[node] = key
-        heap = self._heap
-        heapq.heappush(heap, (key, node))
-        if len(heap) > 2 * len(live) + 64:
-            self._compact()
+        heapq.heappush(self._heap, (key, node))
+        self._maybe_compact()
 
     def begin_walk(self) -> None:
         assert self._pending is None, "eviction walk already in progress"
@@ -498,6 +495,16 @@ class _LazyLeafHeap:
             self.refresh(node)
         for node in pending:
             self.refresh(node)
+        # A yielded victim that the caller destroyed drops its live entry
+        # without passing a bound check; a walk leaves one stale entry per evicted leaf.
+        self._maybe_compact()
+
+    def _compact_threshold(self) -> int:
+        return 2 * len(self._live) + 64
+
+    def _maybe_compact(self) -> None:
+        if len(self._heap) > self._compact_threshold():
+            self._compact()
 
     def _compact(self) -> None:
         # Filter ``_live`` in place: the tree core keeps direct references to
@@ -533,7 +540,7 @@ class _LazyLeafHeap:
             report(
                 f"[{name}] live entry missing from heap: {[n.id for n in no_entry[:5]]}"
             )
-        if len(self._heap) > 2 * len(live) + 64:
+        if len(self._heap) > self._compact_threshold():
             report(
                 f"[{name}] heap not compacted: {len(self._heap)} entries for {len(live)} live"
             )
