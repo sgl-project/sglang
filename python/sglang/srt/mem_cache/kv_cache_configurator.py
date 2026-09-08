@@ -1246,7 +1246,7 @@ class KVCacheConfigurator:
         elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
-                req_to_token_pool=req_to_token_pool,
+                max_running_requests=req_to_token_pool.req_to_token.shape[0],
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
@@ -1542,7 +1542,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_dsa_kv_pool(
-        self, *, max_total_num_tokens: int, req_to_token_pool: ReqToTokenPool
+        self, *, max_total_num_tokens: int, max_running_requests: int
     ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
@@ -1597,8 +1597,7 @@ class KVCacheConfigurator:
                 self.model_config.hf_config
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
-            # Match the target hybrid pool's full request-table capacity.
-            max_running_requests=req_to_token_pool.req_to_token.shape[0],
+            max_running_requests=max_running_requests,
             **pool_kwargs,
         )
         return token_to_kv_pool
