@@ -149,11 +149,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "--dsv4-attn-backend trtllm does not support enable_hisparse."
         )
         assert not (
-            cfg.attn_cp_size > 1
-            or cfg.dcp_size > 1
-            or cfg.enable_prefill_cp
-            or cfg.enable_prefill_context_parallel
-            or cfg.enable_dsa_prefill_context_parallel
+            cfg.attn_cp_size > 1 or cfg.dcp_size > 1 or cfg.enable_prefill_cp
         ), (
             "--dsv4-attn-backend trtllm does not support context parallelism "
             "(prefill CP, attention CP, or decode CP)."
