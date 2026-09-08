@@ -58,15 +58,15 @@ class TestStreamingEventsLocal:
         first_item_event = output_item_added_events[0]
         assert first_item_event.item is not None
         assert first_item_event.output_index is not None
-        assert (
-            first_item_event.output_index == 0
-        ), "First output item must have output_index: 0 (zero-based indexing)"
+        assert first_item_event.output_index == 0, (
+            "First output item must have output_index: 0 (zero-based indexing)"
+        )
 
         # Verify subsequent items increment correctly
         for i, event in enumerate(output_item_added_events):
-            assert (
-                event.output_index == i
-            ), f"Output item {i} should have output_index: {i}"
+            assert event.output_index == i, (
+                f"Output item {i} should have output_index: {i}"
+            )
 
         # Verify output_item.done event exists
         output_item_done_events = [
@@ -101,9 +101,9 @@ class TestStreamingEventsLocal:
         output_item_added_events = [
             event for event in events if event.type == "response.output_item.added"
         ]
-        assert len(output_item_added_events) == len(
-            output_array
-        ), "Number of output_item.added events should match output array length"
+        assert len(output_item_added_events) == len(output_array), (
+            "Number of output_item.added events should match output array length"
+        )
 
 
 # =============================================================================
@@ -147,15 +147,15 @@ class TestStreamingEventsHarmony:
         first_item_event = output_item_added_events[0]
         assert first_item_event.item is not None
         assert first_item_event.output_index is not None
-        assert (
-            first_item_event.output_index == 0
-        ), "First output item must have output_index: 0 (zero-based indexing)"
+        assert first_item_event.output_index == 0, (
+            "First output item must have output_index: 0 (zero-based indexing)"
+        )
 
         # Verify subsequent items increment correctly
         for i, event in enumerate(output_item_added_events):
-            assert (
-                event.output_index == i
-            ), f"Output item {i} should have output_index: {i}"
+            assert event.output_index == i, (
+                f"Output item {i} should have output_index: {i}"
+            )
 
         # Verify output_item.done event exists
         output_item_done_events = [
@@ -190,9 +190,9 @@ class TestStreamingEventsHarmony:
         output_item_added_events = [
             event for event in events if event.type == "response.output_item.added"
         ]
-        assert len(output_item_added_events) == len(
-            output_array
-        ), "Number of output_item.added events should match output array length"
+        assert len(output_item_added_events) == len(output_array), (
+            "Number of output_item.added events should match output array length"
+        )
 
     def test_reasoning_content(self, setup_backend):
         """Test that reasoning content has correct zero-based output_index.
@@ -228,16 +228,16 @@ class TestStreamingEventsHarmony:
         # If reasoning is present, verify it has output_index: 0
         if reasoning_items:
             reasoning_item = reasoning_items[0]
-            assert (
-                reasoning_item.output_index == 0
-            ), "Reasoning item should have output_index: 0"
+            assert reasoning_item.output_index == 0, (
+                "Reasoning item should have output_index: 0"
+            )
 
         # If message is present after reasoning, verify it has output_index: 1
         if reasoning_items and message_items:
             message_item = message_items[0]
-            assert (
-                message_item.output_index == 1
-            ), "Message item after reasoning should have output_index: 1"
+            assert message_item.output_index == 1, (
+                "Message item after reasoning should have output_index: 1"
+            )
 
         # Find response.completed event
         completed_events = [

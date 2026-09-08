@@ -20,9 +20,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -35,7 +33,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -47,11 +44,13 @@ from sglang.srt.lora.deepseek_mla_correction import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
     is_mla_dcp_lse_base_on_e,
-    should_defer_dsa_cp_kv_gather,
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
@@ -141,6 +140,17 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
+def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
+    """Dequantize an absorbed MLA weight, skipping the pass when it is a no-op."""
+    if (
+        w.dtype == torch.bfloat16
+        and isinstance(w_scale, (int, float))
+        and w_scale == 1.0
+    ):
+        return w
+    return w.to(torch.bfloat16) * w_scale
+
+
 def rocm_absorb_q_bmm(
     attn: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
@@ -186,7 +196,7 @@ def rocm_absorb_q_bmm(
         else:
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
-                attn.w_kc.to(torch.bfloat16) * attn.w_scale,
+                _absorb_weight_bf16(attn.w_kc, attn.w_scale),
             )
     return q_nope_out
 
@@ -240,10 +250,26 @@ def rocm_absorb_v_bmm(
                 transpose_bm_in=True,
                 dtype=torch.bfloat16,
             )
+        elif not is_in_tc_piecewise_cuda_graph():
+            # Same (batch, heads, dim) layout as the quantized paths above, so the
+            # post-GEMM flatten is a view. Skipped under piecewise: torch dynamo
+            # rejects out= with a non-contiguous output tensor.
+            _bmm_buf = torch.empty(
+                attn_output.shape[0],
+                attn.num_local_heads,
+                attn.w_vc.shape[2],
+                device=attn_output.device,
+                dtype=torch.bfloat16,
+            )
+            torch.bmm(
+                attn_output.to(torch.bfloat16).transpose(0, 1),
+                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                out=_bmm_buf.transpose(0, 1),
+            )
         else:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
-                attn.w_vc.to(torch.bfloat16) * attn.w_scale,
+                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
             )
 
     if _bmm_buf is not None:
@@ -317,6 +343,13 @@ def _fused_rope_cat_and_cache(
     kv_cache_dtype = (
         fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
     )
+    # Gluon MLA decode (bh16bn128) requires bf16 Q; vLLM #50563.
+    q_out_dtype = (
+        q_nope_out.dtype
+        if attn.kv_cache_dtype == "fp8_e4m3"
+        and attn.current_attention_backend == "aiter"
+        else kv_cache_dtype
+    )
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
@@ -329,12 +362,11 @@ def _fused_rope_cat_and_cache(
         attn.rotary_emb.sin_cache,
         attn.attn_mqa.k_scale,
         attn.rotary_emb.is_neox_style,
-        q_out_dtype=kv_cache_dtype,
+        q_out_dtype=q_out_dtype,
     )
 
 
 class DeepseekMLARocmForwardMixin:
-
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -581,32 +613,6 @@ class DeepseekMLARocmForwardMixin:
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
-        mla_prefill_cp = mla_use_prefill_cp(forward_batch)
-        defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
-            dsa_prefill_cp=dsa_prefill_cp,
-            fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
-        )
-        if dsa_prefill_cp and not defer_kv_gather_until_after_rope:
-            from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
-
-            k_nope, k_pe = materialize_full_kv_cp(
-                self,
-                forward_batch,
-                latent_cache,
-                k_nope,
-                k_pe,
-            )
-        elif mla_prefill_cp and not is_cp_v2_active(forward_batch):
-            # CP-v1 gathers the latent here; CP-v2 gathers it in the attention
-            # backend via the strategy (materialize_full_mla_kv).
-            k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache,
-                forward_batch,
-                k_nope,
-                k_pe,
-            )
-
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
             if is_dcp_mla_decode_phase(forward_batch):
@@ -671,17 +677,16 @@ class DeepseekMLARocmForwardMixin:
                     forward_batch.out_cache_loc,
                 )
                 save_kv_cache = False
-                # On decode, pass q_cat directly to attn_mqa with q_rope=None so
-                # dsa_backend.forward_decode reuses q_cat as a zero-copy view
-                # (`q.contiguous().view(...)` fast-path) instead of running the
-                # redundant `concat_mla_absorb_q_general(q_nope_fused, q_pe_fused)`
-                # that would otherwise rebuild a tensor byte-identical to q_cat.
-                # On ROCm tilelang decode, this eliminates the
-                # `CatArrayBatchedCopy<OpaqueType<1u>, ...>` kernel that used to
-                # fire once per layer per decode step (~2.6 us / layer saved).
-                # Prefill keeps the split form because dsa_backend.forward_extend
-                # asserts `q_rope is not None`.
-                if forward_batch.forward_mode.is_decode_or_idle():
+                # Pass q_cat straight to attn_mqa with q_rope=None so the backend
+                # reuses it as a zero-copy view instead of rebuilding a tensor
+                # byte-identical to it -- one `CatArrayBatchedCopy` per layer per
+                # step. Target-verify is the same absorbed shape as decode, just
+                # more rows; real prefill keeps the split form because the Triton
+                # sparse-MLA kernel reads q_nope/q_rope separately.
+                if (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                ):
                     if llama_4_scaling is not None:
                         # llama_4_scaling applies only to the q_nope portion;
                         # mutate in place via the slice view of q_cat.
@@ -906,6 +911,8 @@ class DeepseekMLARocmForwardMixin:
         rotary_emb.cos_cache, so skipping the standalone rope there ends in
         AttributeError on None. Kimi-K3 has such layers.
         """
+        # NoPE models (rotary_emb=None, e.g. Kimi-K3) have no rope for the
+        # fused kernel to apply; keep both prepare and core on the plain path.
         return (
             _use_aiter_gfx95
             and self.current_attention_backend == "aiter"

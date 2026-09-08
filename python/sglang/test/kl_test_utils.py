@@ -285,9 +285,9 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
         output_logprobs.append(_extract_output_logprobs(result))
 
     if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
-        assert len(new_input_ids) > 0.5 * len(
-            input_ids
-        ), f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
+        assert len(new_input_ids) > 0.5 * len(input_ids), (
+            f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
+        )
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
@@ -367,9 +367,9 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         # Page-aligned SWA retention decides which prompts hit at all, so the default
         # only screens out a vacuous run. A caller whose checkpoint interval makes
         # every prompt hit raises this to pin that down.
-        assert len(new_input_ids) > min_cache_hit_ratio * len(
-            second_turn_input_ids
-        ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
+        assert len(new_input_ids) > min_cache_hit_ratio * len(second_turn_input_ids), (
+            f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
+        )
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)

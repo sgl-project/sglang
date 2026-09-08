@@ -929,6 +929,7 @@
               "docs/advanced_features/overview",
               "docs/advanced_features/server_arguments",
               "docs/advanced_features/session_radix_cache",
+              "docs/advanced_features/radix_eviction_policy",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
@@ -958,6 +959,7 @@
                 ]
               },
               "docs/advanced_features/fuzzy_kv_reuse",
+              "docs/advanced_features/sglang_simulator",
               "docs/advanced_features/vlm_query",
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
@@ -1214,6 +1216,12 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "IFM",
+                    "pages": [
+                      "cookbook/autoregressive/IFM/K2-Horizon"
+                    ]
+                  },
+                  {
                     "group": "Kimi (Moonshot AI)",
                     "pages": [
                       "cookbook/autoregressive/Moonshotai/Kimi-K3",
@@ -1401,6 +1409,7 @@
                   {
                     "group": "OpenBMB",
                     "pages": [
+                      "cookbook/autoregressive/OpenBMB/MiniCPM5-2B",
                       "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_6"
                     ]
                   },
