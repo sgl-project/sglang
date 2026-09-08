@@ -425,11 +425,12 @@ jobs:
   
   nightly-poc-multi-node-tests-cann910:
     name: multi-node-poc-cann910
-    # Upstream 9.0.0 multi-node jobs are currently disabled (skipped), so use
-    # !cancelled() to let this job still run; keeps serial execution with the
+    # Run after the cann910 single-node suites finish. Upstream 9.0.0
+    # multi-node jobs are currently disabled (skipped), so use !cancelled()
+    # to let this job still run; keeps serial execution with the
     # mix-tests-cann910 job below to avoid A3 multi-node resource contention.
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-poc-multi-node-tests, nightly-poc-multi-node-mix-tests]
+    needs: [set-image-config, nightly-perf-16-npu-a3-cann910, nightly-acc-16-npu-a3-cann910, nightly-poc-multi-node-tests, nightly-poc-multi-node-mix-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
