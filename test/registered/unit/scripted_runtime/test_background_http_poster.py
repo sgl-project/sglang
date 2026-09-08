@@ -16,6 +16,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class _FakeResponse:
     def __init__(self) -> None:
+        self.status = 200
         self.read_called = False
 
     async def read(self) -> bytes:

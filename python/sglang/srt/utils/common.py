@@ -418,6 +418,19 @@ def empty_device_cache(device_module: Optional[Any] = None) -> bool:
     return True
 
 
+def device_memory_reserved(device_module: Optional[Any] = None) -> int:
+    """Bytes reserved by the active device allocator, or 0 where unsupported."""
+
+    if device_module is None:
+        device_module = torch.get_device_module()
+
+    memory_reserved = getattr(device_module, "memory_reserved", None)
+    if memory_reserved is None:
+        return 0
+
+    return memory_reserved()
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):

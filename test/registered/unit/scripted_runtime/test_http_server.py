@@ -7,7 +7,10 @@ import uuid
 import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
+from sglang.test.scripted_runtime.http_server import (
+    ScriptedHttpServer,
+    _canary_launch_kwargs,
+)
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,
     RunScript,
@@ -139,6 +142,22 @@ class TestExecuteScriptDirtyGuard(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 server.execute_script(_sample_script)
             pair.assert_no_sent_message(self)
+
+
+class TestCanaryLaunchKwargs(CustomTestCase):
+    """The canary's kernels are CUDA-only, so a device that cannot build them
+    must be launched with it off rather than crashing in alloc_memory_pool.
+    """
+
+    def test_cuda_gets_the_canary_enabled(self):
+        kwargs = _canary_launch_kwargs("cuda")
+        self.assertEqual(kwargs["kv_canary"], "raise")
+        self.assertEqual(kwargs["kv_canary_real_data"], "partial")
+
+    def test_other_devices_pass_nothing_and_take_the_defaults(self):
+        for device in ("xpu", "cpu", "npu", "hip", "mps"):
+            with self.subTest(device=device):
+                self.assertEqual(_canary_launch_kwargs(device), {})
 
 
 if __name__ == "__main__":

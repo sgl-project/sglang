@@ -1,6 +1,7 @@
 import unittest
 from typing import Optional
 
+from sglang.srt.utils import is_flashinfer_available, is_xpu
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -755,6 +756,7 @@ class TestSpecialCaseNoChunking(ScriptedTestCase):
 DETERMINISTIC_ALIGN_SIZE = 4096
 
 
+@unittest.skipUnless(is_flashinfer_available(), "flashinfer ships NVIDIA-only kernels")
 class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DETERMINISTIC_ALIGN_SIZE,
@@ -791,6 +793,9 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
         assert saw_chunking, "test must observe the req mid-chunk at least once"
 
 
+@unittest.skipIf(
+    is_xpu(), "a host KV pool needs sgl_kernel.kvcacheio, which has no XPU build"
+)
 class TestSpecialCaseHiCache(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,

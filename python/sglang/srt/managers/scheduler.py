@@ -340,7 +340,11 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import (
+    device_memory_reserved,
+    empty_device_cache,
+    is_npu,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -5416,14 +5420,19 @@ class Scheduler(
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
-            before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
-            torch.cuda.empty_cache()
-            after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
-            logger.info(
-                f"[continue_generation] torch.cuda.empty_cache() called: "
-                f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
-                f"(freed {before_mb - after_mb:.1f} MB)"
-            )
+            before_mb = device_memory_reserved(self.device_module) / (1024 * 1024)
+            if not empty_device_cache(self.device_module):
+                logger.info(
+                    f"[continue_generation] {self.device} exposes no allocator "
+                    f"empty_cache hook; nothing to reclaim"
+                )
+            else:
+                after_mb = device_memory_reserved(self.device_module) / (1024 * 1024)
+                logger.info(
+                    f"[continue_generation] {self.device}: empty_cache() called: "
+                    f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
+                    f"(freed {before_mb - after_mb:.1f} MB)"
+                )
         # Enqueue any rebootstrap requests that were staged during a
         # retract-mode pause. Deferring until resume keeps the preallocation
         # queue empty during the pause window (so an intervening weight update
