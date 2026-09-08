@@ -113,7 +113,7 @@ class KernelTemplate {
   // Synchronize all threads within the cluster (which processes one q token)
   static __forceinline__ __device__ void sync_all_threads_in_cluster() {
     if constexpr (CLUSTER_SIZE == 1) {
-      __syncthreads();
+      cutlass::arch::NamedBarrier(NUM_THREADS, NamedBarriers::batch_loop_sync).arrive_and_wait_unaligned();
     } else {
       ku::barrier_cluster_arrive_relaxed();
       ku::barrier_cluster_wait_acquire();
@@ -184,7 +184,7 @@ class KernelTemplate {
       }
 
       cutlass::arch::fence_view_async_shared();
-      NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
+      NamedBarrier(256, NamedBarriers::epilogue_r2s_ready).arrive_and_wait_unaligned();
 
       if (threadIdx.x == 0) {
         SM90_TMA_STORE_5D::copy(
@@ -204,7 +204,7 @@ class KernelTemplate {
       }
       cutlass::arch::fence_view_async_shared();
 
-      NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
+      NamedBarrier(256, NamedBarriers::epilogue_r2s_ready).arrive_and_wait_unaligned();
 
       if (elect_one_sync()) {
         CUTLASS_PRAGMA_UNROLL

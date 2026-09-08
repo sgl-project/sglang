@@ -169,14 +169,16 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams& par
         gemm<true, -1>(tiled_mma_QK, thr_mma_QK.partition_fragment_A(sQ), thr_mma_QK.partition_fragment_B(sK), rP);
         bar_phase_k ^= 1 << buf_idx;
         // Preserve the consumer schedule: overlap the free-barrier with QK.
-        if (block_idx != args.start_block_idx) NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_free);
+        // Warpgroups reach their barriers from different control-flow paths.
+        if (block_idx != args.start_block_idx)
+          NamedBarrier(256, NamedBarriers::sScale_and_sS_free).arrive_and_wait_unaligned();
         cute::warpgroup_wait<0>();
         scale_softmax(
             rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], idx_in_warpgroup);
         save_rPb_to_sP(rS, sS, idx_in_warpgroup);
         fence_view_async_shared();
         gemm<false, -1>(tiled_mma_PV, rS, thr_mma_PV.partition_fragment_B(sV), rO);
-        NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_ready);
+        NamedBarrier(256, NamedBarriers::sScale_and_sS_ready).arrive_unaligned();
         cute::warpgroup_wait<0>();
         plan.bar_k_avail[buf_idx].arrive();
       }
@@ -213,7 +215,7 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams& par
           plan.sOScale[get_AorC_row_idx(i, idx_in_warpgroup)] = o_scales[i];
         }
       }
-      NamedBarrier::arrive_and_wait(256, NamedBarriers::oBuf_free_and_sL_ready);
+      NamedBarrier(256, NamedBarriers::oBuf_free_and_sL_ready).arrive_and_wait_unaligned();
       if (args.is_no_split) {
         bf16* o_ptr = params.out + batch_idx * params.stride_o_b + s_q_idx * params.stride_o_s_q;
         Tensor gO = make_tensor(
@@ -284,7 +286,7 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams& par
         const int buf_idx = (block_idx - args.start_block_idx) % NUM_K_BUFS;
         Tensor sV =
             make_tensor(make_smem_ptr(plan.u.k[buf_idx].data() + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
-        NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_ready);
+        NamedBarrier(256, NamedBarriers::sScale_and_sS_ready).arrive_and_wait_unaligned();
         float cur_scales[2];
         *(float2*)cur_scales = *(float2*)(sScale + (idx_in_warpgroup / 4) * 2);
         CUTE_UNROLL
@@ -297,9 +299,10 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams& par
         gemm<false, -1>(tiled_mma_PV, thr_mma_PV.partition_fragment_A(sS), thr_mma_PV.partition_fragment_B(sV), rO);
         cute::warpgroup_wait<0>();
         plan.bar_k_avail[buf_idx].arrive();
-        if (block_idx != args.end_block_idx - 1) NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_free);
+        if (block_idx != args.end_block_idx - 1)
+          NamedBarrier(256, NamedBarriers::sScale_and_sS_free).arrive_unaligned();
       }
-      NamedBarrier::arrive_and_wait(256, NamedBarriers::oBuf_free_and_sL_ready);
+      NamedBarrier(256, NamedBarriers::oBuf_free_and_sL_ready).arrive_and_wait_unaligned();
       float o_scales[2];
       CUTE_UNROLL
       for (int i = 0; i < 2; ++i)
