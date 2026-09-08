@@ -39,6 +39,8 @@ def _qkv_tensor(tensor: torch.Tensor, like: torch.Tensor | None = None) -> bool:
         and tensor.numel() > 0
         and tensor.stride(-1) == 1
         and tensor.stride(-2) == _HEAD_DIM
+        # The paired-head V copy uses 16-byte loads at every token boundary.
+        and tensor.stride(1) * tensor.element_size() % 16 == 0
         and tensor.data_ptr() % _ALIGN == 0
         and (
             like is None

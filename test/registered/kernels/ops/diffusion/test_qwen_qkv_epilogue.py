@@ -278,6 +278,32 @@ def test_qwen_attention_preserves_normalized_segments(mode):
 
 
 @pytest.mark.parametrize("misaligned_image", [True, False])
+def test_qwen_qkv_epilogue_rejects_misaligned_token_stride(misaligned_image):
+    tensor = torch.empty(1, 2, 2, 128, device="cuda", dtype=torch.bfloat16)
+    row = torch.empty(128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.empty(2, 128, device="cuda", dtype=torch.float32)
+    pitched = torch.empty_strided(
+        (1, 2, 2, 128), (520, 260, 128, 1), device="cuda", dtype=torch.bfloat16
+    )
+    assert pitched.data_ptr() % 32 == 0
+    assert pitched.stride(1) * pitched.element_size() % 16 == 8
+    img = pitched if misaligned_image else tensor
+    txt = tensor if misaligned_image else pitched
+    assert (
+        try_fused_qwen_qkv_epilogue(
+            *([img] * 3),
+            *([txt] * 3),
+            *([row] * 4),
+            cache,
+            cache,
+            1e-6,
+            1e-6,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("misaligned_image", [True, False])
 def test_qwen_qkv_epilogue_rejects_misaligned_cache(misaligned_image):
     tensor = torch.empty(1, 1, 1, 128, device="cuda", dtype=torch.bfloat16)
     row = torch.empty(128, device="cuda", dtype=torch.bfloat16)
