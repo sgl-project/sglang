@@ -82,7 +82,7 @@ It is a thinking model: the chat template turns chain-of-thought on by default a
 - Thinking is on by default (`enable_thinking` defaults to true in the chat template, and the `ling3` reasoning parser follows that default). Turn it off per request with `"chat_template_kwargs": {"enable_thinking": false}` (§3.3).
 - Native context is 128K, and the generated recipes default to the 256K YaRN variant (`--context-length 262144` plus the `rope_scaling` override and `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`), matching the model card. For the native 128K window, drop all three from the command.
 - Audio content parts are rejected before preprocessing; send images as `image_url` and clips as `video_url` content parts (§3).
-- An FP8 variant (`inclusionAI/Ling-3.0-flash-VL-FP8`) has its own quantization lane in the matrix. The BF16 checkpoint can also be quantized online with `--quantization fp8`; measured accuracy and speed for both paths are in the benchmark cards below.
+- The FP8 variant (`inclusionAI/Ling-3.0-flash-VL-FP8`) uses 128×128 block quantization, so plain TP must keep `768 ÷ tp` divisible by 128 (TP 1, 2, 3, or 6 — TP=4 fails to load). The FP8 recipes therefore pair TP with expert parallelism (`--tp 4 --ep 4`, `--tp 8 --ep 8`), which keeps experts whole per rank and is verified on 4×GB300; TP=2 without EP also works. The BF16 checkpoint can also be quantized online with `--quantization fp8`; measured accuracy and speed for both paths are in the benchmark cards below.
 
 ## 3. Advanced Usage
 
