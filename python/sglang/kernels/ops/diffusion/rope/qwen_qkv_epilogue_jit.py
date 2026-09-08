@@ -85,7 +85,7 @@ def try_fused_qwen_qkv_epilogue(
         and _qkv_tensor(txt_v, txt_q)
         and img_q.shape[2] == txt_q.shape[2]
         and torch.version.cuda is not None
-        and torch.cuda.get_device_capability(img_q.device)[0] >= 10
+        and torch.cuda.get_device_capability(img_q.device)[0] >= 9
     ):
         return None
 

@@ -37,7 +37,8 @@ struct Params {
   const void* txt_k_weight;
   const void* img_cache;
   const void* txt_cache;
-  int64_t input_token_stride_bytes;
+  int64_t img_token_stride_bytes;
+  int64_t txt_token_stride_bytes;
   int64_t output_token_stride_bytes;
   int64_t head_stride_bytes;
   uint32_t img_tokens;
@@ -81,8 +82,9 @@ __global__ void qwen_qkv_epilogue_kernel(const Params __grid_constant__ params) 
       output_base = params.joint_v;
     }
 
+    const auto input_token_stride_bytes = is_text ? params.txt_token_stride_bytes : params.img_token_stride_bytes;
     const void* input =
-        pointer::offset(input_base, source_token * params.input_token_stride_bytes, head * params.head_stride_bytes);
+        pointer::offset(input_base, source_token * input_token_stride_bytes, head * params.head_stride_bytes);
     void* output =
         pointer::offset(output_base, joint_token * params.output_token_stride_bytes, head * params.head_stride_bytes);
 
@@ -204,7 +206,6 @@ struct QwenQKVEpilogueKernel {
     RuntimeCheck(
         txt_q.stride(0) == txt_k.stride(0) && txt_q.stride(0) == txt_v.stride(0),
         "text QKV inputs must use the same token stride");
-    RuntimeCheck(img_q.stride(0) == txt_q.stride(0), "image/text QKV token strides must match");
     RuntimeCheck(
         img_q.stride(1) == kHeadDim && img_k.stride(1) == kHeadDim && img_v.stride(1) == kHeadDim,
         "image QKV heads must be contiguous");
@@ -224,7 +225,6 @@ struct QwenQKVEpilogueKernel {
     if (total_works == 0) return;
 
     const int64_t head_stride_bytes = kHeadDim * sizeof(bf16_t);
-    const int64_t input_token_stride_bytes = img_q.stride(0) * sizeof(bf16_t);
     const int64_t output_token_stride_bytes = num_heads * head_stride_bytes;
     const auto params = Params{
         .joint_q = joint_q.data_ptr(),
@@ -242,7 +242,8 @@ struct QwenQKVEpilogueKernel {
         .txt_k_weight = txt_k_weight.data_ptr(),
         .img_cache = img_cache.data_ptr(),
         .txt_cache = txt_cache.data_ptr(),
-        .input_token_stride_bytes = input_token_stride_bytes,
+        .img_token_stride_bytes = img_q.stride(0) * sizeof(bf16_t),
+        .txt_token_stride_bytes = txt_q.stride(0) * sizeof(bf16_t),
         .output_token_stride_bytes = output_token_stride_bytes,
         .head_stride_bytes = head_stride_bytes,
         .img_tokens = img_tokens,

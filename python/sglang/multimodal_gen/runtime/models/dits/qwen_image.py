@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -750,10 +751,18 @@ class QwenImageCrossAttention(nn.Module):
         self.prefix = prefix
         self.defer_output_bias = _defer_modelopt_output_bias(quant_config)
         quant_name = _modelopt_quant_name(quant_config)
+        capability = current_platform.get_device_capability()
         self.use_fused_qkv_epilogue = quant_name in {
             "modelopt_fp4",
             "modelopt_fp8",
-        }
+        } or (
+            quant_config is None
+            and current_platform.is_cuda()
+            and capability is not None
+            and capability.major == 9
+            and os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
+            not in {"0", "false", "off", "no"}
+        )
         self.use_fused_qkv = (
             isinstance(quant_config, NunchakuConfig) or quant_name == "modelopt_fp8"
         )
@@ -1004,6 +1013,10 @@ class QwenImageCrossAttention(nn.Module):
             and txt_cache is not None
             and not sp_text_sharded
             and sp_txt_pad == 0
+            # Masked attention packs the image and text segments separately.
+            # Its prefix tensors must go through the ordinary normalization.
+            and attn_mask is None
+            and encoder_hidden_states_mask is None
         ):
             joint_qkv = try_fused_qwen_qkv_epilogue(
                 img_query,

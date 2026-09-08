@@ -12,10 +12,11 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
-    reason="Qwen-Image QKV epilogue requires SM100+",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Qwen-Image QKV epilogue requires SM90+",
 )
 
 
@@ -24,11 +25,9 @@ def _seed_cuda():
     torch.cuda.manual_seed(0)
 
 
-def test_qwen_qkv_epilogue_is_bit_exact():
-    heads = 4
+@pytest.mark.parametrize("img_tokens,txt_tokens,heads", [(17, 7, 4), (8192, 53, 24)])
+def test_qwen_qkv_epilogue_is_bit_exact(img_tokens, txt_tokens, heads):
     head_dim = 128
-    img_tokens = 17
-    txt_tokens = 7
     img_qkv = [
         torch.randn(
             1,
@@ -55,6 +54,9 @@ def test_qwen_qkv_epilogue_is_bit_exact():
         RMSNorm(head_dim, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
         for _ in range(4)
     ]
+    with torch.no_grad():
+        for norm in norms:
+            norm.weight.copy_(torch.randn_like(norm.weight))
 
     def cache(tokens):
         angles = torch.randn(tokens, head_dim // 2, device="cuda")
@@ -120,23 +122,30 @@ def test_qwen_qkv_epilogue_is_bit_exact():
     ]
     assert all(not tensor.is_contiguous() for tensor in (*img_views, *txt_views))
 
-    packed_actual = try_fused_qwen_qkv_epilogue(
-        *img_views,
-        *txt_views,
-        norms[0].weight,
-        norms[1].weight,
-        norms[2].weight,
-        norms[3].weight,
-        img_cache,
-        txt_cache,
-        1e-6,
-        1e-6,
-    )
-    assert packed_actual is not None
-    assert all(
-        torch.equal(result, reference)
-        for result, reference in zip(packed_actual, expected)
-    )
+    # Unquantized image projections and packed text projections can use
+    # different token strides; each family also works when both are packed.
+    for img_inputs, txt_inputs in (
+        (img_views, txt_views),
+        (img_qkv, txt_views),
+        (img_views, txt_qkv),
+    ):
+        packed_actual = try_fused_qwen_qkv_epilogue(
+            *img_inputs,
+            *txt_inputs,
+            norms[0].weight,
+            norms[1].weight,
+            norms[2].weight,
+            norms[3].weight,
+            img_cache,
+            txt_cache,
+            1e-6,
+            1e-6,
+        )
+        assert packed_actual is not None
+        assert all(
+            torch.equal(result, reference)
+            for result, reference in zip(packed_actual, expected)
+        )
 
 
 def test_qwen_qkv_epilogue_rejects_compile():
