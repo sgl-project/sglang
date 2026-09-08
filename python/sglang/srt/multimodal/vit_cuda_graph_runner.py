@@ -64,9 +64,9 @@ class ViTCudaGraphRunner:
         # captured before the workspace grew.
         self.sin_cos_ws: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._retired_sin_cos_ws: List[Tuple[torch.Tensor, torch.Tensor]] = []
-        self._sin_cos_ws_by_graph: Dict[Hashable, Tuple[torch.Tensor, torch.Tensor]] = (
-            {}
-        )
+        self._sin_cos_ws_by_graph: Dict[
+            Hashable, Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self.max_context_len = getattr(vit, "max_context_len", None)
 
         # Qwen2.5-VL specific viarable.

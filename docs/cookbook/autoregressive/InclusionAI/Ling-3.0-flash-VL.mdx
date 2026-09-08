@@ -1,0 +1,310 @@
+---
+title: Ling-3.0-flash-VL
+description: "Deploy Ling-3.0-flash-VL with SGLang — a ~125B hybrid KDA + MLA MoE vision-language model (5.1B active) with image and video input, thinking mode, and 128K context on Blackwell and Hopper GPUs."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install --prerelease=allow sglang
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+docker pull lmsysorg/sglang:dev
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware to generate the launch command. The checkpoint ships in BF16 with an FP8 variant, and each GPU family carries one **Balanced** recipe sized so the ~250 GB of BF16 weights fit with KV-cache headroom: `--tp 4` on 288 GB-class (GB300, B300) and 141 GB-class (B200, H200) GPUs, and `--tp 8` on H100.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/inclusionAI/ling-3.0-flash-vl.jsx";
+import { benchmarks } from "/src/snippets/configs/inclusionAI/ling-3.0-flash-vl-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits the recipes on this page; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+Ling-3.0-flash-VL is the vision-language member of the BailingMoeV3 family. Its language backbone is the [Ling-3.0-flash](/cookbook/autoregressive/InclusionAI/Ling-3.0-flash) hybrid-attention Mixture-of-Experts (MoE) model: 42 layers that interleave Kimi Delta Attention (KDA) linear-attention layers with gated Multi-head Latent Attention (MLA) full-attention layers, on top of a fine-grained MoE feed-forward network with 512 routed experts (8 active per token) plus a shared expert. A 27-layer vision encoder (0.4B parameters, 16-pixel patches with 2×2 spatial merging and paired frames for video) feeds image and video tokens into that backbone through a small MLP projector. In total the checkpoint holds **~125B parameters with ~5.1B active per token**, so per-token inference cost stays close to a small model.
+
+It is a thinking model: the chat template turns chain-of-thought on by default and exposes an `enable_thinking` switch. It supports structured tool calling. Inputs are text, images, and video; audio is not supported. Native context length is 128K tokens. Unlike Ling-3.0-flash, the VL checkpoint ships no built-in MTP draft layer, so there is no speculative-decoding recipe.
+
+**Available Models:**
+
+- **BF16**: [inclusionAI/Ling-3.0-flash-VL](https://huggingface.co/inclusionAI/Ling-3.0-flash-VL) — ~125B total / ~5.1B active
+
+**License:** MIT
+
+**Recommended generation:** `temperature=1.0`, `top_p=0.95`, `top_k=20` (from the checkpoint's `generation_config.json`; SGLang applies these defaults, so the samples below do not set them).
+
+**Resources:** [HuggingFace](https://huggingface.co/inclusionAI/Ling-3.0-flash-VL).
+
+## 2. Configuration Tips
+
+- `--trust-remote-code` is required. The checkpoint declares its config and multimodal processor through `auto_map`, and SGLang's native implementation loads the image/video preprocessing and the chat template from those files. Serving from the Hub repo or from a local snapshot needs no extra environment setup.
+- BF16 weights take ~250 GB. The recipes use `--tp 4` on 288 GB-class (GB300, B300) and 141 GB-class (B200, H200) GPUs and `--tp 8` on H100, with the default memory pool. The 4×GB300 and 4×H200 cells are validated end to end; the rest are sized by the same rule and carry the unverified badge. Adjust TP in the **Attention Parallelism** card of the [Playground](#playground).
+- HiCache is supported: `--enable-hierarchical-cache` attaches the hierarchical cache to the hybrid SSM state (verified with CPU offload; L3 storage backends such as Mooncake are untested). On shared hosts, set an explicit `--hicache-size <GB>` — the default ratio can request more host RAM than is free.
+- Vision token budget: the encoder emits one token per 32×32-pixel block after merging, so a 1280×720 image costs about 880 tokens and the processor's `max_pixels` of 4,194,304 caps a single image at roughly 4,100 tokens. Video frames are paired before patching; the sample clip in §3.2 costs 4,224 tokens. Size `--chunked-prefill-size` and `--max-running-requests` with these counts in mind for image-heavy traffic.
+- Parsers: the generated recipes include `--reasoning-parser auto --tool-call-parser auto` by default. Both resolve to `ling3` from the chat template (the server logs `Auto-detected --reasoning-parser as ling3 from chat template` and the same for the tool-call parser), so no model-specific parser name is needed; the explicit form `--reasoning-parser ling3 --tool-call-parser ling3` is equivalent. With the parsers on, reasoning is returned in `message.reasoning_content` and structured tool calls in `message.tool_calls`; without them, `message.content` carries the reasoning followed by `</think>` and the answer (the opening `<think>` tag sits in the prompt and is not echoed).
+- Thinking is on by default (`enable_thinking` defaults to true in the chat template, and the `ling3` reasoning parser follows that default). Turn it off per request with `"chat_template_kwargs": {"enable_thinking": false}` (§3.3).
+- Native context is 128K, and the generated recipes default to the 256K YaRN variant (`--context-length 262144` plus the `rope_scaling` override and `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`), matching the model card. For the native 128K window, drop all three from the command.
+- Audio content parts are rejected before preprocessing; send images as `image_url` and clips as `video_url` content parts (§3).
+- The FP8 variant (`inclusionAI/Ling-3.0-flash-VL-FP8`) uses 128×128 block quantization, so plain TP must keep `768 ÷ tp` divisible by 128 (TP 1, 2, 3, or 6 — TP=4 fails to load). The FP8 recipes therefore pair TP with expert parallelism (`--tp 4 --ep 4`, `--tp 8 --ep 8`), which keeps experts whole per rank and is verified on 4×GB300; TP=2 without EP also works. The BF16 checkpoint can also be quantized online with `--quantization fp8`; measured accuracy and speed for both paths are in the benchmark cards below.
+
+## 3. Advanced Usage
+
+The examples below were run against a server launched with the recipe above plus `--reasoning-parser auto --tool-call-parser auto`, which resolves both parsers to `ling3` (§2). Reasoning therefore arrives in `message.reasoning_content` and the answer in `message.content`.
+
+### 3.1 Image Understanding
+
+Send images as OpenAI-style `image_url` content parts:
+
+<Accordion title="Image Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="inclusionAI/Ling-3.0-flash-VL",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}},
+            {"type": "text", "text": "Describe this image in one sentence."},
+        ],
+    }],
+    max_tokens=2048,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: The user wants a one-sentence description of this image. Let me look at the image carefully.
+
+The image shows a man wearing a yellow shirt (with some kind of text on it, probably "Sudsy" or similar) standing behind a yellow taxi SUV, ironing clothes on a portable ironing board set up at the rear of the vehicle. On the left side, another yellow taxi (sedan) is passing by on the street. The background is an urban streetscape with buildings lined up.
+
+I need to write this in one sentence. For example: "A man wearing a yellow shirt irons clothes on a portable ironing board attached to the back of a yellow taxi on a city street, while another taxi passes by."
+
+Let me make it concise yet descriptive. One sentence.
+
+"On a city street, a man in a yellow sweatshirt irons clothes on a portable ironing board mounted on the back of a yellow taxi SUV, while another yellow taxi drives past."
+
+This works. I'll return only the answer.
+Content: A man in a yellow shirt irons clothes on a portable ironing board set up at the back of a yellow taxi on a city street, while another yellow cab drives past.
+```
+
+</Accordion>
+
+### 3.2 Video Understanding
+
+Clips go in as `video_url` content parts. The processor samples and pairs frames itself; no client-side frame extraction is needed:
+
+<Accordion title="Video Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY", timeout=900)
+resp = client.chat.completions.create(
+    model="inclusionAI/Ling-3.0-flash-VL",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "video_url", "video_url": {"url": "https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4"}},
+            {"type": "text", "text": "What is happening in this video? Answer in two sentences."},
+        ],
+    }],
+    max_tokens=2048,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: The user wants me to describe what is happening in this video in two sentences.
+
+Looking at the video, I can see:
+- A man on stage (appears to be Steve Jobs) presenting something
+- He's wearing a black shirt and jeans
+- There's a large screen behind him showing a close-up of a hand reaching toward a pocket on blue jeans
+- Text appears on screen asking "Anyone know what this pocket is for?"
+- He pulls out a small white device (iPod Nano) from his pocket
+- The text says "I've always wondered that" and "well now we know" and "is the new iPod Nano"
+- He holds up the white iPod Nano device
+
+This is clearly Steve Jobs presenting the new iPod Nano at an Apple event. The small white device is the iPod Nano.
+
+I need to summarize this in exactly two sentences.
+Content: A presenter on stage pulls a small white device from his pocket while a large screen behind him displays a close-up image of a hand reaching toward a jeans pocket. He holds the device up to reveal it is the new iPod Nano, answering the on-screen text that questioned what the small pocket was designed for.
+```
+
+</Accordion>
+
+### 3.3 Thinking Mode
+
+Thinking is on by default. Disable it for a single request through the chat template's `enable_thinking` kwarg; the model then answers directly and `reasoning_content` stays empty:
+
+<Accordion title="Thinking-off Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="inclusionAI/Ling-3.0-flash-VL",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}},
+            {"type": "text", "text": "Describe this image in one sentence."},
+        ],
+    }],
+    max_tokens=512,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: None
+Content: A man in a yellow sweatshirt irons a blue shirt on a folding board attached to the back of a parked yellow taxi SUV, while another yellow cab drives past on a city street.
+```
+
+</Accordion>
+
+### 3.4 Tool Calling
+
+With the tool-call parser on, structured calls are parsed into `message.tool_calls` and `finish_reason` is `tool_calls`. Send the tool result back as a `tool` message to get the final answer; on this thinking model the follow-up turn may put text in `reasoning_content` as well as `content`, so print both:
+
+<Accordion title="Tool-calling Example (Python)">
+
+```python Example
+import json
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "City name"}},
+            "required": ["city"],
+        },
+    },
+}]
+messages = [{"role": "user", "content": "What's the weather like in Paris today?"}]
+
+resp = client.chat.completions.create(
+    model="inclusionAI/Ling-3.0-flash-VL",
+    messages=messages,
+    tools=tools,
+    tool_choice="auto",
+    max_tokens=2048,
+)
+msg = resp.choices[0].message
+print("finish_reason:", resp.choices[0].finish_reason)
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+for call in msg.tool_calls:
+    print("Tool call:", call.function.name, call.function.arguments)
+
+messages.append({
+    "role": "assistant",
+    "content": msg.content or "",
+    "tool_calls": [{"id": c.id, "type": "function",
+                    "function": {"name": c.function.name, "arguments": c.function.arguments}}
+                   for c in msg.tool_calls],
+})
+messages.append({
+    "role": "tool",
+    "tool_call_id": msg.tool_calls[0].id,
+    "content": json.dumps({"city": "Paris", "temperature_c": 18, "condition": "light rain"}),
+})
+resp = client.chat.completions.create(
+    model="inclusionAI/Ling-3.0-flash-VL",
+    messages=messages,
+    tools=tools,
+    max_tokens=2048,
+)
+msg = resp.choices[0].message
+print("finish_reason:", resp.choices[0].finish_reason)
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+finish_reason: tool_calls
+Reasoning: The user wants to know the current weather in Paris. I'll call the get_weather function with the city "Paris".
+Content: Let me check the weather in Paris for you right away!
+Tool call: get_weather {"city": "Paris"}
+finish_reason: stop
+Reasoning: None
+Content: Here's the current weather in Paris:
+
+- 🌡️ **Temperature:** 18°C
+- 🌧️ **Condition:** Light rain
+
+It looks like a mild day with some light rain. You might want to bring an umbrella if you're heading out! ☂️
+```
+
+</Accordion>
+
+For more API examples, see the [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision) and the [Tool Parser guide](../../../docs/advanced_features/tool_parser).

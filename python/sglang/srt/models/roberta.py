@@ -36,7 +36,6 @@ class RobertaClassificationHead(nn.Module):
 
 
 class RobertaEmbedding(nn.Module):
-
     def __init__(self, config: RobertaConfig):
         super().__init__()
         self.size = config.hidden_size
@@ -170,7 +169,6 @@ class XLMRobertaBaseModel(nn.Module):
             if self.pooler is None and "pooler" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
-
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
@@ -305,9 +303,9 @@ class XLMRobertaForSequenceClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> torch.Tensor:
-        assert (
-            get_embedding
-        ), "XLMRobertaForSequenceClassification is only used for rerank"
+        assert get_embedding, (
+            "XLMRobertaForSequenceClassification is only used for rerank"
+        )
 
         hidden_states = self.roberta(
             input_ids, positions, forward_batch, input_embeds, get_embedding

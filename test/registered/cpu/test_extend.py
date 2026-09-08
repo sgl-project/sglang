@@ -7,7 +7,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="stage-a-test-cpu-intel")
 
 torch.manual_seed(1234)
 
@@ -71,7 +71,6 @@ class TestExtendAttention(CustomTestCase):
 
         start_q, start_kv = 0, 0
         for seq_idx in range(seq_lens.shape[0]):
-
             extend_seq_len_q = extend_seq_lens[seq_idx]
             prefill_seq_len_q = extend_prefix_lens[seq_idx]
 

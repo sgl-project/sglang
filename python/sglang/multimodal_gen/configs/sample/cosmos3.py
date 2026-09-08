@@ -501,8 +501,7 @@ class Cosmos3SamplingParams(SamplingParams):
             raise ValueError("num_conditional_frames must be non-negative")
         if self.num_conditional_frames >= self.num_video_frames_per_chunk:
             raise ValueError(
-                "num_conditional_frames must be smaller than "
-                "num_video_frames_per_chunk"
+                "num_conditional_frames must be smaller than num_video_frames_per_chunk"
             )
         if self.num_first_chunk_conditional_frames < 0:
             raise ValueError("num_first_chunk_conditional_frames must be non-negative")
