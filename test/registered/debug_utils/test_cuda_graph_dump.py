@@ -90,6 +90,7 @@ class TestCudaGraphDumpConfig:
             cuda_graph_filter="x",
             cuda_graph_budget_mb=7,
             cuda_graph_strict=True,
+            cuda_graph_taps="t1",
         )
         config = CudaGraphDumpConfig.from_dumper_config(dumper_config)
         assert (config.enable, config.filter, config.budget_mb, config.strict) == (
@@ -98,10 +99,13 @@ class TestCudaGraphDumpConfig:
             7,
             True,
         )
+        assert config.armed_taps == {"t1"}
 
     def test_from_dumper_config_tolerates_missing_fields(self):
         config = CudaGraphDumpConfig.from_dumper_config(SimpleNamespace())
         assert not config.enable
+        # A DumperConfig predating the taps field must still arm every channel.
+        assert config.armed_taps == {"t1", "t3"}
 
 
 class TestBufferKey:
@@ -347,6 +351,68 @@ class TestEagerTags:
         # pure-eager baseline frame, and "t1|t3 plus eager equals eager-only"
         # is unverifiable.
         assert _state().eager_tags() == {"tap": "eager"}
+
+
+class TestArmedTaps:
+    def test_unset_arms_everything(self):
+        # A debugging tool that under-covers by default is the failure this
+        # package exists to close, so "unset" must not mean "only the cheap one".
+        assert CudaGraphDumpConfig().armed_taps == {"t1", "t3"}
+        assert CudaGraphDumpConfig(taps="").armed_taps == {"t1", "t3"}
+        assert CudaGraphDumpConfig(taps=" ALL ").armed_taps == {"t1", "t3"}
+
+    def test_narrowing_to_one_channel(self):
+        config = CudaGraphDumpConfig(taps="t1")
+        assert config.arms("t1") and not config.arms("t3")
+
+    def test_whitespace_case_and_unknown_names(self):
+        config = CudaGraphDumpConfig(taps=" T3 , t1 , t9 ")
+        assert config.armed_taps == {"t1", "t3"}
+
+    def test_none_arms_nothing(self):
+        assert CudaGraphDumpConfig(taps="none").armed_taps == frozenset()
+
+    def test_arms_is_false_whenever_the_feature_is_off(self):
+        # `build_compilation_config` asks the state, not the config: a disabled
+        # run must not register the split op no matter what TAPS says.
+        assert _state(enable=False, taps="t1,t3").arms("t3") is False
+        assert _state(enable=True, taps="t1,t3").arms("t3") is True
+
+
+class TestDisarmedTapsSwallow:
+    def test_disarmed_t1_swallows_instead_of_falling_through(self, monkeypatch):
+        state = _state(taps="t3")
+        with _pretend_stream_is_capturing(monkeypatch), state.capture_scope():
+            # True, not False: falling through here would hand a capture-time
+            # dummy to the eager writer and publish garbage.
+            assert state.tap("a", torch.zeros(4)) is True
+        assert state.registry.num_buffers == 0
+        assert state.summary()["disarmed_taps"] == 1
+
+    def test_disarmed_t3_swallows_instead_of_falling_through(self, monkeypatch):
+        state = _state(taps="t1")
+        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+        # Falling through under `fullgraph=True` would not lose a frame, it
+        # would raise: `dumper.dump` opens a file, which dynamo cannot trace.
+        assert state.tap("a", torch.zeros(4)) is True
+        assert state.summary()["compiled_tap_hits"] == 0
+        assert state.summary()["disarmed_taps"] == 1
+
+    def test_disarming_one_channel_does_not_renumber_the_other(self, monkeypatch):
+        state = _state(taps="t3")
+        with _pretend_stream_is_capturing(monkeypatch), state.capture_scope():
+            state.tap("a", torch.zeros(4))
+            state.tap("a", torch.zeros(4))
+        # The counter is bumped before the channel decision, so an eager frame
+        # for the third occurrence is still numbered 2.
+        assert state._next_key("a").occurrence == 2
+
+    def test_armed_t1_still_records(self, monkeypatch):
+        state = _state(taps="t1")
+        with _pretend_stream_is_capturing(monkeypatch), state.capture_scope():
+            assert state.tap("a", torch.zeros(4)) is True
+        assert state.registry.num_buffers == 1
+        assert state.summary()["disarmed_taps"] == 0
 
 
 class TestOccurrenceCounter:

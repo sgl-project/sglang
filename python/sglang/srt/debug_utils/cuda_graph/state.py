@@ -31,13 +31,17 @@ from typing import Any, Hashable, Iterator, Optional
 
 import torch
 
-from sglang.srt.debug_utils.cuda_graph.config import CudaGraphDumpConfig
+from sglang.srt.debug_utils.cuda_graph.config import (
+    TAP_COMPILED,
+    TAP_HOOK,
+    CudaGraphDumpConfig,
+)
 from sglang.srt.debug_utils.cuda_graph.registry import BufferKey, BufferRegistry
 
 logger = logging.getLogger(__name__)
 
-_TAP_IN_GRAPH = "t1"
-_TAP_COMPILED = "t3"
+_TAP_IN_GRAPH = TAP_HOOK
+_TAP_COMPILED = TAP_COMPILED
 _TAP_EAGER = "eager"
 
 
@@ -117,6 +121,7 @@ class _CudaGraphDumpState:
         self._channel_of: dict[BufferKey, str] = {}
         self._tap_hits = 0
         self._compiled_tap_hits = 0
+        self._disarmed_taps = 0
         self._collect_calls = 0
         self._reported = False
 
@@ -150,6 +155,17 @@ class _CudaGraphDumpState:
     def registry(self) -> Optional[BufferRegistry]:
         return self._registry
 
+    def arms(self, tap: str) -> bool:
+        """Whether `tap` is armed.  False whenever the feature is off at all.
+
+        Read by `tc_piecewise`'s `build_compilation_config` to decide whether to
+        register the T3 split op.  That decision is the only one that cannot be
+        revisited later: `mutates_args` makes each injected op a fusion barrier
+        and `add_split_op` makes it a piece boundary, both at *compile* time,
+        where no runtime filter can reach them.
+        """
+        return self.enabled and self._config.arms(tap)
+
     def configure(self) -> None:
         """Idempotent; safe to call from every seam entry point."""
         self._ensure_configured()
@@ -169,7 +185,9 @@ class _CudaGraphDumpState:
         2. **dynamo is tracing** (`tc_piecewise`) -> emit the opaque custom op,
            which becomes a piece boundary and does the `copy_` from inside the
            piece's graph.  A `dumper.dump(...)` here would be a hard trace
-           error under `fullgraph=True`.
+           error under `fullgraph=True`.  With `t3` disarmed the frame is
+           *swallowed*, not passed through, for exactly that reason: falling
+           through would trade a missing frame for a crashed run.
         3. **a capture session is open and the stream is capturing**
            (`full`, and the captured segments of `breakable`) -> `copy_` into
            the graph-resident buffer, which is recorded.
@@ -187,10 +205,19 @@ class _CudaGraphDumpState:
         if not self._config.enable or not isinstance(value, torch.Tensor):
             return False
 
+        # Bumped for every frame, before any channel decision and regardless of
+        # which taps are armed, so disarming one channel cannot renumber the
+        # other's occurrences.
         key = self._next_key(name)
         if torch.compiler.is_compiling():
+            if not self._config.arms(TAP_COMPILED):
+                self._disarmed_taps += 1
+                return True
             return self._emit_compiled_tap(key, value)
         if self._capture_depth and _stream_is_capturing():
+            if not self._config.arms(TAP_HOOK):
+                self._disarmed_taps += 1
+                return True
             self._record(key, value, _TAP_IN_GRAPH)
             return True
         return bool(self._setup_depth or self._capture_depth)
@@ -335,12 +362,14 @@ class _CudaGraphDumpState:
     def summary(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
+            "armed_taps": sorted(self._config.armed_taps),
             "buffers": 0 if self._registry is None else self._registry.num_buffers,
             "used_mb": (
                 0.0 if self._registry is None else self._registry.used_bytes / (1 << 20)
             ),
             "tap_hits": self._tap_hits,
             "compiled_tap_hits": self._compiled_tap_hits,
+            "disarmed_taps": self._disarmed_taps,
             "collect_calls": self._collect_calls,
         }
 
@@ -351,23 +380,36 @@ class _CudaGraphDumpState:
         run at all -- almost always a filter that matches no name.  That is
         exactly the silent hole this package exists to close, so it is reported
         rather than ignored, and raised in strict mode.
+
+        A run that dropped frames because a channel was disarmed is *not* an
+        error -- the user asked for that -- but it is still reported, because
+        "narrowed on purpose" and "broken" produce the same short dump
+        directory and only the summary can tell them apart.
         """
         if not self.enabled or self._reported:
             return
         self._reported = True
         summary = self.summary()
-        if self._tap_hits == 0:
+        if self._tap_hits == 0 and self._compiled_tap_hits == 0:
             message = (
                 "cuda-graph dumping was enabled but no tap fired; no module "
                 "inside a captured region was dumped. Check "
-                "DUMPER_CUDA_GRAPH_FILTER against the dump names, and that the "
-                "non-intrusive dumper is attached."
+                "DUMPER_CUDA_GRAPH_FILTER against the dump names, "
+                "DUMPER_CUDA_GRAPH_TAPS against the graph backend in use, and "
+                "that the non-intrusive dumper is attached."
             )
             if self._config.strict:
                 raise RuntimeError(message)
             logger.warning(message)
         else:
             logger.info("cuda-graph dump summary: %s", summary)
+        if self._disarmed_taps:
+            logger.warning(
+                "cuda-graph dumping dropped %d frame(s) because a tap was "
+                "disarmed (armed: %s); those modules are absent from the dump.",
+                self._disarmed_taps,
+                ",".join(sorted(self._config.armed_taps)) or "none",
+            )
 
     def _report_at_exit(self) -> None:
         """`report()` for the `atexit` path: never escapes into shutdown noise."""

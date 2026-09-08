@@ -178,6 +178,13 @@ class DumperConfig(_BaseConfig):
     cuda_graph_budget_mb: int = 4096
     # Raise instead of warning when the budget is exhausted or no tap fired.
     cuda_graph_strict: bool = False
+    # Which taps to arm: comma-separated subset of t1 (forward hook, used by
+    # `full` and `breakable`) and t3 (the `tc_piecewise` custom op); `all` or
+    # empty arms both. Worth narrowing to `t1` unless you need `tc_piecewise`:
+    # t3 costs inductor a fusion barrier and a piece boundary per injection
+    # point, and that cost is paid at compile time, where no runtime filter can
+    # reach it.
+    cuda_graph_taps: Optional[str] = None
 
     @classmethod
     def _env_prefix(cls) -> str:

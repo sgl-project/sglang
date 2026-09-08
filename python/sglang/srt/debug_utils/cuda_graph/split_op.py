@@ -13,13 +13,13 @@
 # ==============================================================================
 """The T3 tap: one dynamo-opaque custom op, for `tc_piecewise`.
 
-Under `tc_piecewise` the model is `torch.compile`-d with `fullgraph=True`.
-Dynamo inlines `Module.__call__`, so a forward hook's `buffer.copy_` is traced
-away and never becomes a kernel -- and routing to `dumper.dump(...)` instead
-would be a hard trace error.  A custom op is the one construct that survives
-tracing intact: it stays an FX node, `add_split_op` turns it into a piece
-boundary, and its body runs inside the piece's graph where the `copy_` is
-recorded exactly as in the T1 case.
+Under `tc_piecewise` the model is `torch.compile`-d with `fullgraph=True`, and
+the forward hook cannot reach the eager writer from there: `dumper.dump(...)`
+opens a file, which dynamo refuses to trace, and under `fullgraph=True` a graph
+break is a hard error rather than a fallback.  A custom op is the one construct
+that survives tracing intact: it stays an FX node, `add_split_op` turns it into
+a piece boundary, and its body runs inside the piece's graph where the `copy_`
+is recorded exactly as in the T1 case.
 
 Two declarations carry weight:
 
@@ -30,9 +30,18 @@ Two declarations carry weight:
 * `eager=True` is required: `register_custom_op`'s own NOTE says lazy
   registration does not work with `torch.compile`.
 
+Keeping the Python bookkeeping (name interning, registry lookups, occurrence
+counting) on the near side of the op boundary is the other half of the reason.
+A bare `buffer.copy_(x)` in a hook body does in fact survive dynamo -- measured
+on CPU under both the `eager` and `inductor` backends, the buffer refreshes on
+every call -- but `_record`'s dict mutations and logging would be traced too,
+and whether the resulting copy lands inside a *captured piece* is a property of
+the piecewise splitter, not of dynamo.  The op boundary makes that placement
+explicit instead of incidental.
+
 This module is imported lazily (from `state._emit_compiled_tap` and from the
 `build_compilation_config` patch) so that `import sglang` does not register a
-torch custom op as a side effect.
+torch custom op as a side effect, and only when the T3 tap is armed.
 """
 
 from __future__ import annotations
