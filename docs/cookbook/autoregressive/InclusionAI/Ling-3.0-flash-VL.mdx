@@ -22,7 +22,18 @@ pip install uv
 uv pip install --prerelease=allow sglang
 ```
 
-Then run the **Python** output of the command panel below in that environment. Ling-3.0-flash-VL support requires sgl-project/sglang#38526 (or newer) — until it merges, use the Docker path below or install sglang from that PR's branch.
+Then run the **Python** output of the command panel below in that environment. Ling-3.0-flash-VL support requires sgl-project/sglang#38526 (or newer); until it merges, install from the support branch:
+
+```bash Command
+git clone https://github.com/JustinTong0323/sglang.git --branch ling3flash-vl-code --depth 1
+cd sglang
+pip install --upgrade pip
+pip install uv
+uv pip install -e "python[all]"
+uv pip install torchcodec==0.16.0  # optional, preferred video-decode backend
+```
+
+Video input needs `decord` or `torchcodec` in the environment; audio is not supported. Downloading the checkpoint requires `HF_TOKEN`.
 
 </Tab>
 
