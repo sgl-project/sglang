@@ -54,6 +54,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    component_offload_host_store,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
@@ -194,17 +197,20 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
                 m for m in module.layerwise_offload_managers if m.enabled
             ]
 
-        if offload_managers:
+        host_store = component_offload_host_store(module)
+        if offload_managers or host_store is not None:
             entries = list(weights_iter)
             if any(shard_id is not None for _, _, shard_id in entries):
                 raise NotImplementedError(
                     "Fused-parameter weight updates are not supported for "
-                    "layerwise-offloaded modules."
+                    "offloaded modules."
                 )
             weight_dict = {n: w for n, w, _ in entries}
             offloaded_names: set[str] = set()
             for manager in offload_managers:
                 offloaded_names.update(manager.update_cpu_weights(weight_dict))
+            if host_store is not None:
+                offloaded_names.update(host_store.update_host_weights(weight_dict))
             remaining = (
                 (n, w) for n, w in weight_dict.items() if n not in offloaded_names
             )

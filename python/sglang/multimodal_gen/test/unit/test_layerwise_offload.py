@@ -199,6 +199,7 @@ class _TestServerArgs(SimpleNamespace):
     )
     _parse_component_value_map = staticmethod(ServerArgs._parse_component_value_map)
     layerwise_tuning_for = ServerArgs.layerwise_tuning_for
+    node_local_gpu_worker_count = ServerArgs.node_local_gpu_worker_count
 
 
 def _server_args(**kwargs):
@@ -224,6 +225,8 @@ def _server_args(**kwargs):
         layerwise_resident_layers={},
         layerwise_residency_policy={},
         pin_cpu_memory=False,
+        num_gpus=1,
+        nnodes=1,
         # the pin budget ranks candidates by bytes x steps, and reads the step
         # count off the pipeline's sampling defaults
         pipeline_class_name=None,

@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
     wrap_with_lora_layer,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    component_offload_host_store,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
@@ -295,11 +298,20 @@ class LoRAPipeline(ComposedPipelineBase):
             torch.get_device_module().empty_cache()
 
         offload_disabled_modules = []
+        component_stores = []
         for module_name in module_names:
             module = self.modules.get(module_name)
-            if module is not None and is_layerwise_offloaded_module(module):
+            if module is None:
+                continue
+            if is_layerwise_offloaded_module(module):
                 module.disable_offload()
                 offload_disabled_modules.append(module)
+            else:
+                store = component_offload_host_store(module)
+                if store is not None:
+                    # bind the host store so in-place updates write it directly
+                    store.begin_host_update()
+                    component_stores.append(store)
 
         try:
             yield offload_disabled_modules
@@ -307,6 +319,8 @@ class LoRAPipeline(ComposedPipelineBase):
             # Re-enable layerwise offload: sync weights to CPU and restore hooks
             for module in offload_disabled_modules:
                 module.enable_offload()
+            for store in component_stores:
+                store.end_host_update()
 
     def _needs_lora_weight_update_context(
         self,
@@ -320,7 +334,10 @@ class LoRAPipeline(ComposedPipelineBase):
             if any(layer.merged for layer in lora_layers_dict.values()):
                 return True
             module = self.modules.get(module_name)
-            if module is not None and is_layerwise_offloaded_module(module):
+            if module is not None and (
+                is_layerwise_offloaded_module(module)
+                or component_offload_host_store(module) is not None
+            ):
                 return True
         return False
 
