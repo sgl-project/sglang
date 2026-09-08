@@ -22,7 +22,10 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    moe_deferred_finalize_serves,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -187,6 +190,11 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     experts_can_defer_finalize: bool = False
     handoff_has_consumer: bool = False
 
+    # Whether the NEXT layer's prepare_attn exists to absorb a plain all-reduce.
+    # Unlike handoff_has_consumer this excludes the last layer: a model's final
+    # norm can close out a handoff, but it performs no all-reduce.
+    successor_absorbs_all_reduce: bool = False
+
     def prepare_attn(
         self,
         hidden_states,
@@ -215,6 +223,25 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
                 hidden_states, residual, gamma
             )
             return self._finish_prepare_attn(hidden_states, residual, forward_batch)
+
+        if (
+            residual is not None
+            and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+            and hidden_states._sglang_needs_allreduce_fusion
+            and self.can_absorb_post_moe_all_reduce(
+                forward_batch, int(hidden_states.shape[0])
+            )
+        ):
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            assert self.fusion_service is not None
+            hidden_states, residual = self.fusion_service.all_reduce_residual_rms_norm(
+                hidden_states,
+                residual,
+                fused_norm_gamma(self.input_layernorm),
+            )
+            return self._finish_prepare_attn(hidden_states, residual, forward_batch)
+
         return super().prepare_attn(
             hidden_states,
             residual,
@@ -278,6 +305,22 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             and parallel.moe_ep_size == 1
         )
 
+    def can_absorb_post_moe_all_reduce(
+        self, forward_batch: ForwardBatch, m: int
+    ) -> bool:
+        """Whether prepare_attn can fuse a plain post-MoE all-reduce here.
+
+        The finalize pattern minus the finalize: reached above the deferred
+        finalize bound, where the MoE returns a tensor but its all-reduce is
+        still this layer's to perform.
+        """
+        return (
+            self.successor_absorbs_all_reduce
+            and self._common_eligible(forward_batch, m)
+            and fused_norm_gamma(self.input_layernorm) is not None
+            and not get_exec().comm.enable_quant_communications
+        )
+
     def should_defer_moe_finalize(
         self, forward_batch: ForwardBatch, m: int | None = None
     ) -> bool:
@@ -291,6 +334,10 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             return False
         if m is None:
             m = int(forward_batch.input_ids.shape[0])
+        # Must agree with the MoE's own deferred_finalize bound, or the layer
+        # would skip its all-reduce expecting a handoff that never arrives.
+        if not moe_deferred_finalize_serves(m):
+            return False
         return self.should_use_finalize(forward_batch, m)
 
     def _common_eligible(self, forward_batch: ForwardBatch, m: int) -> bool:
@@ -309,7 +356,12 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        if self.should_defer_moe_finalize(forward_batch):
+        m = int(forward_batch.input_ids.shape[0])
+        if self.should_defer_moe_finalize(forward_batch, m):
+            return True
+        # Above the finalize bound the next layer's input norm can still absorb
+        # the plain post-MoE all-reduce, so keep skipping it here.
+        if self.can_absorb_post_moe_all_reduce(forward_batch, m):
             return True
         return super().should_fuse_mlp_allreduce_with_next_layer(forward_batch)
 
@@ -359,6 +411,9 @@ def install_cutedsl_fusion(
         communicator.fusion_service = service
         communicator.experts_can_defer_finalize = bool(can_defer_finalize(layer))
         communicator.handoff_has_consumer = has_consumer
+        communicator.successor_absorbs_all_reduce = successor is not None and (
+            isinstance(successor.layer_communicator, CuteDSLFusionLayerCommunicator)
+        )
     logger.info(
         "Installed one %s FlashInfer MNNVL CuTe DSL fusion handle for %d of %d layers "
         "(%d can defer the MoE finalize)",

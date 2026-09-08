@@ -98,6 +98,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    moe_deferred_finalize_serves,
     should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -1003,6 +1004,7 @@ class DeepseekV2MoE(nn.Module):
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
+            and moe_deferred_finalize_serves(hidden_states.shape[0])
         )
         if deferred_finalize:
             final_hidden_states = self.experts.forward_deferred_finalize(

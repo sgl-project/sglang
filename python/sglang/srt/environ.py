@@ -1131,6 +1131,12 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
+    # Deferring trades the GEMM2 in-epilogue reduction for an HBM round trip of
+    # the [M*top_k, hidden] permuted output, so it only pays at small M. 0
+    # disables the bound. Measured crossover on GLM-5.2 H=6144/top_k=8 TP8 B300
+    # with the cute-dsl backend, where the finalize folds into the collective:
+    # -8.4% TPOT at M=16, neutral at 192, +9.3% at 512.
+    SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,

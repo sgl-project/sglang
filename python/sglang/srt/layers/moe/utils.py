@@ -5,6 +5,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from functools import lru_cache
 from typing import NamedTuple
 
 import torch
@@ -674,6 +675,21 @@ def should_skip_mlp_all_reduce() -> bool:
     """
     f = get_forward()
     return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
+
+
+@lru_cache(maxsize=1)
+def moe_deferred_finalize_max_tokens() -> int:
+    """Largest M at which deferring the MoE finalize is still profitable.
+
+    Above it the [M*top_k, hidden] HBM round trip the deferral forces costs
+    more than the finalize kernel it saves. 0 means no bound.
+    """
+    return int(envs.SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS.get())
+
+
+def moe_deferred_finalize_serves(num_tokens: int) -> bool:
+    limit = moe_deferred_finalize_max_tokens()
+    return limit <= 0 or int(num_tokens) <= limit
 
 
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
