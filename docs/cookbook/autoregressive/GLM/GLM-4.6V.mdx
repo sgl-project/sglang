@@ -67,7 +67,7 @@ import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deploymen
 <GLM46VDeployment />
 
 ### 3.2 Configuration Tips
-- **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
+- **TTFT Optimization** : Pass `--mm-feature-transport cuda_ipc` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
 - **TP=8 Configuration**: When using Tensor Parallelism (TP) of 8, the vision attention's 12 heads cannot be evenly divided. You can resolve this by adding `--mm-enable-dp-encoder` (which the generator above handles automatically).
 - **Fast Model Loading**: For large models (like the 106B version), you can speed up model loading by using `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
 - **Hardware Notes:**
@@ -76,12 +76,10 @@ import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deploymen
   - **H200 / B200:** Runs out of the box, supporting full context length plus concurrent image + video processing.
 - **Additional Multimodal Parameters:**
   - `--mm-attention-backend fa3`: Specify multimodal attention backend (Flash Attention 3).
-  - `--keep-mm-feature-on-device`: Retain multimodal feature tensors on GPU after processing to avoid D2H memory copies.
-  - `SGLANG_USE_CUDA_IPC_TRANSPORT=1`: Use CUDA IPC shared memory for multimodal data transport to significantly improve E2E latency.
+  - `--mm-feature-transport cuda_ipc`: Keep multimodal feature tensors on a bounded CUDA IPC pool to avoid D2H copies and improve E2E latency (replaces deprecated `--keep-mm-feature-on-device` / `SGLANG_USE_CUDA_IPC_TRANSPORT`).
 
 **Example with full multimodal optimizations:**
 ```bash Command
-SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
 SGLANG_VLM_CACHE_SIZE_MB=0 \
 python -m sglang.launch_server \
   --model-path zai-org/GLM-4.6V \
@@ -97,6 +95,7 @@ python -m sglang.launch_server \
   --attention-backend fa3 \
   --mm-attention-backend fa3 \
   --mm-enable-dp-encoder \
+  --mm-feature-transport cuda_ipc \
   --enable-metrics
 ```
 

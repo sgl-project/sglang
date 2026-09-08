@@ -45,7 +45,7 @@ import { Qwen3VLDeployment } from "/src/snippets/autoregressive/qwen3-vl-deploym
 ### 3.2 Configuration Tips
 
 * **Multimodal attention backend** : Usually, `--mm-attention-backend` is default to `fa3` on H100/H200/A100 for better performance, but it is default to `triton_attn` on B200 for compatibility.
-* **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
+* **TTFT Optimization** : Pass `--mm-feature-transport cuda_ipc` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
 * **Memory Management** : Set lower `--context-length` to conserve memory. A value of `128000` is sufficient for most scenarios, down from the default 262K.
 * **Expert Parallelism** : SGLang supports Expert Parallelism (EP) via `--ep`, allowing experts in MoE models to be deployed on separate GPUs for better throughput. One thing to note is that, for quantized models, you need to set `--ep` to a value that satisfies the requirement: `(moe_intermediate_size / moe_tp_size) % weight_block_size_n == 0, where moe_tp_size is equal to tp_size divided by ep_size.` Note that EP may perform worse in low concurrency scenarios due to additional communication overhead. Check out [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism) for more details.
 * **Kernel Tuning** : For MoE Triton kernel tuning on your specific hardware, refer to [fused_moe_triton](https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton).
@@ -56,11 +56,10 @@ import { Qwen3VLDeployment } from "/src/snippets/autoregressive/qwen3-vl-deploym
 - **H200 / B200:** Runs out of the box, supporting full context length plus concurrent image + video processing.
 
 **Additional multimodal server parameters:**
-- `--keep-mm-feature-on-device`: Retain multimodal feature tensors on GPU after processing to avoid device-to-host memory copies, improving performance for high-frequency inference.
+- `--mm-feature-transport cuda_ipc`: Keep multimodal feature tensors on a bounded CUDA IPC pool to avoid device-to-host memory copies, improving performance for high-frequency inference.
 
 **Example with full multimodal optimizations:**
 ```bash Command
-SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
 SGLANG_VLM_CACHE_SIZE_MB=0 \
 python -m sglang.launch_server \
   --model-path Qwen/Qwen3-VL-235B-A22B-Instruct \
@@ -75,6 +74,7 @@ python -m sglang.launch_server \
   --chunked-prefill-size 8192 \
   --attention-backend fa3 \
   --mm-attention-backend fa3 \
+  --mm-feature-transport cuda_ipc \
   --enable-metrics
 ```
 
@@ -600,16 +600,17 @@ Max ITL (ms):                            31.92
 
 **Optimized Results (with CUDA IPC Transport):**
 
-For further TTFT optimization, enable CUDA IPC Transport for multimodal features by setting `SGLANG_USE_CUDA_IPC_TRANSPORT=1`. This significantly reduces TTFT by using CUDA IPC for transferring multimodal features.
+For further TTFT optimization, enable CUDA IPC transport for multimodal features with `--mm-feature-transport cuda_ipc`. This significantly reduces TTFT by using CUDA IPC for transferring multimodal features.
 
 - Model Deployment Command:
 
 ```shell Command
-SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
+python -m sglang.launch_server \
   --model Qwen/Qwen3-VL-235B-A22B-Instruct \
   --tp 8 \
   --host 0.0.0.0 \
-  --port 30000
+  --port 30000 \
+  --mm-feature-transport cuda_ipc
 ```
 
 - Benchmark Command:
@@ -631,7 +632,7 @@ python3 -m sglang.bench_serving \
 
 - **Test Results:**
 
-  With `SGLANG_USE_CUDA_IPC_TRANSPORT=1`, TTFT improves significantly:
+  With `--mm-feature-transport cuda_ipc`, TTFT improves significantly:
 
 ```text Output
 ============ Serving Benchmark Result ============

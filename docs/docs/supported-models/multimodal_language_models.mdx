@@ -404,10 +404,12 @@ sglang serve \
 
 ### Performance Optimization
 
-For multimodal models, you can use the `--keep-mm-feature-on-device` flag to optimize for latency at the cost of increased GPU memory usage:
+For multimodal models, prefer `--mm-feature-transport cuda_ipc` to optimize for latency at the cost of increased GPU memory usage:
 
-- **Default behavior**: Multimodal feature tensors are moved to CPU after processing to save GPU memory
-- **With `--keep-mm-feature-on-device`**: Feature tensors remain on GPU, reducing device-to-host copy overhead and improving latency, but consuming more GPU memory
+- **Default / auto behavior**: Multimodal feature tensors typically use CPU transport to save GPU memory
+- **With `--mm-feature-transport cuda_ipc`**: Feature tensors stay on a bounded CUDA IPC pool, reducing device-to-host copy overhead and improving latency, but reserving GPU memory for the pool
+
+(`--keep-mm-feature-on-device` and `SGLANG_USE_CUDA_IPC_TRANSPORT` remain deprecated aliases for the same cuda_ipc policy.)
 
 Use this flag when you have sufficient GPU memory and want to minimize latency for multimodal inference.
 
