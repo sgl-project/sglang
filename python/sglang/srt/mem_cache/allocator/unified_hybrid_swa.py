@@ -331,10 +331,13 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """Widened virtual WRITE loc -> kernel-facing id. DCP is rejected for this
         composite at argument validation, so it coincides with the read translate."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(loc, out=out)
+        return self.full_attn_allocator.translate_write_loc_for_kernel(
+            loc, out=out, out_width=out_width
+        )
 
     @property
     def swa_kernel_page_multiplier(self) -> int:
@@ -472,29 +475,13 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.full_attn_allocator.clear_inverse_history()
             self.swa_attn_allocator.clear_inverse_history()
 
-    def free_swa(
-        self, free_index: torch.Tensor, *, start_pos: Optional[int] = None
-    ) -> None:
+    def free_swa(self, free_index: torch.Tensor) -> None:
         """SWA tombstone path: release swa-physical, keep the virtual id and
         full-physical live; `swa.v2p_page[v_page] = -1` IS the tombstone."""
         if free_index is None or free_index.numel() == 0:
             return
         v = free_index.detach().to(torch.int64)
         ps = self.page_size
-        # `start_pos` promises a contiguous ascending range starting at that prefix
-        # position, so page reps come from stride arithmetic, not `torch.unique`.
-        if start_pos is not None and ps > 1:
-            reps = self.swa_attn_allocator._page_reps(v, start_pos)
-            # Keep only pages still bound on swa; freeing a tombstoned one would
-            # corrupt the hole list. `> 0` strict: -1 tombstoned, 0 padding sink.
-            rep_pages = reps // ps
-            swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[rep_pages]
-            live_reps = reps[swa_v2p_pages > 0]
-            if live_reps.numel() == 0:
-                return
-            self.swa_attn_allocator.free(live_reps, _pages=live_reps // ps)
-            self.swa_attn_allocator.clear_inverse_history()
-            return
         v_pages = v // ps
         # `> 0` strict: -1 = tombstoned, page 0 = padding sink (never freeable).
         swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
@@ -507,6 +494,28 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.free(live, _pages=live)
         else:
             self.swa_attn_allocator.free(live)
+        self.swa_attn_allocator.clear_inverse_history()
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        """free_swa() for a kv-row segment: `start_pos` promises a contiguous
+        ascending range, so page reps come from stride arithmetic, not `torch.unique`."""
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            self.free_swa(free_index)
+            return
+        ps = self.page_size
+        reps = self.swa_attn_allocator._page_reps(
+            free_index.detach().to(torch.int64), start_pos
+        )
+        # Keep only pages still bound on swa; freeing a tombstoned one would
+        # corrupt the hole list. `> 0` strict: -1 tombstoned, 0 padding sink.
+        rep_pages = reps // ps
+        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[rep_pages]
+        live_reps = reps[swa_v2p_pages > 0]
+        if live_reps.numel() == 0:
+            return
+        self.swa_attn_allocator.free(live_reps, _pages=live_reps // ps)
         self.swa_attn_allocator.clear_inverse_history()
 
     def free_full(self, free_index: torch.Tensor) -> None:
@@ -878,6 +887,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         at once, so re-check the JOINT gate instead of the per-side shortfall."""
         from sglang.srt.mem_cache.common import evict_from_tree_cache
 
+        # Arbitrary retry bound; a round that frees nothing ends the loop anyway.
         for _ in range(4):
             before = self.available_size()
             if before >= num_tokens:

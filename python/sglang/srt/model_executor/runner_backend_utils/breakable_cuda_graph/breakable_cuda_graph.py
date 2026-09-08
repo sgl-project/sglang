@@ -154,16 +154,18 @@ def _uninstall_wait_stream_hook():
 
 
 def _weak_ref_if_tensor(x):
-    """Return a weak-ref tensor view (shared storage, no refcount) for tensors;
-    recurse into tuples/lists; pass-through for non-tensors. Weak-ref'ing
-    captured args lets the shared mempool reclaim per-layer intermediates
-    between segments — storage stays alive for each segment CUDAGraph's
-    lifetime via its pool use_count.
+    """Return a weak-ref view for nonempty accelerator tensors; recurse into
+    tuples/lists and keep CPU, empty, and non-tensor values unchanged.
+    Weak-ref'ing captured args lets the shared mempool reclaim per-layer
+    intermediates between segments — storage stays alive for each segment
+    CUDAGraph's lifetime via its pool use_count.
 
     weak_ref_tensors is imported lazily because it hard-raises on
     platforms without a CUDA/HIP/NPU backend; we only reach this code during
     an active Breakable capture, which runs only on those backends."""
     if torch.is_tensor(x):
+        if x.numel() == 0 or x.device.type == "cpu":
+            return x
         from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
         return weak_ref_tensors(x)

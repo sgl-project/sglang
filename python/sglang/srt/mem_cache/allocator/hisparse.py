@@ -358,6 +358,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)
 
+    def free_swa_segment(self, free_indices: torch.Tensor, *, start_pos: int):
+        self.logical_attn_allocator.free_swa_segment(free_indices, start_pos=start_pos)
+
     def free_full(self, free_indices: torch.Tensor):
         if free_indices.numel() == 0:
             return
@@ -472,7 +475,8 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
-        return (last_locs - 3) // self.compress_ratio
+        # Last complete C4 block of a prefix of last_loc + 1 tokens; -1 stays -1.
+        return (last_locs - (self.compress_ratio - 1)) // self.compress_ratio
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self.hisparse_kvcache._translate_loc_to_hisparse_device(

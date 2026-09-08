@@ -3,7 +3,7 @@ gate, publish wiring, and the per-arch golden diffs for migrated families."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import dataclasses
 import json
@@ -94,6 +94,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "kv_cache_dtype",
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
+                    "dsa_topk_backend",
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",

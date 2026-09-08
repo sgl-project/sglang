@@ -43,6 +43,7 @@ from sglang.kernels.ops.memory.virtual_slot import (
     alloc_bind_inplace,
     bind_inplace,
     free_unbind_inplace,
+    write_loc_to_kernel_ids,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -361,8 +362,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         # Per-call move cap on NON-urgent `_flush`: bounds work per `on_idle()` so
         # a large backlog doesn't block ZMQ IPC. Urgent retries are uncapped.
-        self._lazy_max_moves_per_call = int(
-            os.environ.get("SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL", "4096")
+        self._lazy_max_moves_per_call = (
+            envs.SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL.get()
         )
 
         # Epoch-keyed memos for the capacity views: pure between mutations, but
@@ -990,39 +991,47 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         clamp to kernel-facing id 0, the page-0 sink. int64 out; a consumer whose
         kernel ABI wants int32 narrows where it fills that buffer.
         """
-        ps = self.pool_page_size
-        stride = ps * self.kernel_page_multiplier
         with record_function("MultiEndedAlloc.translate_kv_loc_for_kernel"):
-            pages = virt_tokens if ps == 1 else virt_tokens // ps
-            offsets = None if ps == 1 else virt_tokens % ps
-            if out is None:
-                phys = self.virtual_to_physical[pages]
-                ids = phys * stride if offsets is None else phys * stride + offsets
-                return ids.clamp_(min=0)
+            return self._translate_loc_fused(virt_tokens, dcp_size=1, out=out)
+
+    def _translate_loc_fused(
+        self,
+        loc: torch.Tensor,
+        *,
+        dcp_size: int,
+        dcp_rank: int = 0,
+        out: Optional[torch.Tensor] = None,
+        out_width: Optional[int] = None,
+    ) -> torch.Tensor:
+        """One launch for the read and write conversions alike; see
+        `write_loc_to_kernel_ids`."""
+        if out is not None:
             assert out.dtype == torch.int64, (
                 f"translate_kv_loc_for_kernel: out= dtype must be int64 (matches v2p), "
                 f"got {out.dtype}"
             )
-            assert out.shape == virt_tokens.shape, (
-                f"translate_kv_loc_for_kernel: out= shape {tuple(out.shape)} must "
-                f"match virt_tokens shape {tuple(virt_tokens.shape)}"
-            )
-            if pages.dtype != torch.int64:
-                pages = pages.to(torch.int64)
-            if pages is virt_tokens:
-                out.copy_(torch.take(self.virtual_to_physical, pages))
-            else:
-                torch.take(self.virtual_to_physical, pages, out=out)
-            out.mul_(stride)
-            if offsets is not None:
-                out.add_(offsets)
-            return out.clamp_(min=0)
+            if out_width is None:
+                assert out.shape == loc.shape, (
+                    f"translate_kv_loc_for_kernel: out= shape {tuple(out.shape)} must "
+                    f"match virt_tokens shape {tuple(loc.shape)}"
+                )
+        return write_loc_to_kernel_ids(
+            loc=loc,
+            v2p=self.virtual_to_physical,
+            page_size=self.pool_page_size,
+            stride=self.pool_page_size * self.kernel_page_multiplier,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            out=out,
+            out_width=out_width,
+        )
 
     def translate_write_loc_for_kernel(
         self,
         widened_loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """Widened virtual WRITE loc (`out_cache_loc`) -> kernel-facing id.
 
@@ -1032,16 +1041,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         parallel = get_parallel()
         dcp_size = parallel.attn_dcp_size if self.shards_under_dcp else 1
-        if dcp_size == 1:
-            return self.translate_kv_loc_for_kernel(widened_loc, out=out)
         with record_function("MultiEndedAlloc.translate_write_loc_for_kernel"):
-            owned = (widened_loc % dcp_size) == parallel.attn_dcp_rank
-            dense = self.translate_kv_loc_for_kernel(widened_loc // dcp_size)
-            dense = torch.where(owned, dense, torch.zeros_like(dense))
-            if out is not None:
-                out.copy_(dense)
-                return out
-            return dense
+            return self._translate_loc_fused(
+                widened_loc,
+                dcp_size=dcp_size,
+                dcp_rank=parallel.attn_dcp_rank,
+                out=out,
+                out_width=out_width,
+            )
 
     # -- alloc --
 

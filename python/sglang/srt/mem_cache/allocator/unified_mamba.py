@@ -260,9 +260,12 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """Widened virtual WRITE loc -> DENSE id; see the sub-allocator's copy."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(loc, out=out)
+        return self.full_attn_allocator.translate_write_loc_for_kernel(
+            loc, out=out, out_width=out_width
+        )
 
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
@@ -305,11 +308,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.free(free_index)
             self.full_attn_allocator.clear_inverse_history()
             self.mamba_allocator.clear_inverse_history()
-
-    def clear(self) -> None:
-        self.full_attn_allocator.clear()
-        self.mamba_allocator.clear()
-        self.free_group = None
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
         """Fixed-shape counterpart of `free()`; see `MultiEndedAllocator._page_reps`.

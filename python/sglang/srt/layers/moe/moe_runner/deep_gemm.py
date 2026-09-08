@@ -1650,6 +1650,7 @@ def _situ_mul_quant_contig_kernel(
 def _apply_swiglu_limit(
     gateup_output: torch.Tensor, swiglu_limit: float
 ) -> torch.Tensor:
+    """Clamp the contiguous runner's owned GEMM workspace in place."""
     assert swiglu_limit == 10
 
     num_tokens, hidden_size_x2 = gateup_output.shape
@@ -1659,12 +1660,12 @@ def _apply_swiglu_limit(
     assert gate.shape == (num_tokens, hidden_size_x2 // 2)
     assert up.shape == (num_tokens, hidden_size_x2 // 2)
 
-    up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
-    gate = torch.clamp(gate, max=swiglu_limit)
-
-    out = torch.cat([gate, up], dim=-1)
-    assert out.shape == (num_tokens, hidden_size_x2)
-    return out
+    # Both halves are views of a fresh GEMM output. Avoid separate clamped
+    # copies and their concatenation: large compact prefills need that
+    # headroom for the activation and down-projection workspaces.
+    up.clamp_(min=-swiglu_limit, max=swiglu_limit)
+    gate.clamp_(max=swiglu_limit)
+    return gateup_output
 
 
 @register_pre_permute("deepep_v2", "deep_gemm")

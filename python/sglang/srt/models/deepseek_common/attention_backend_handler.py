@@ -1,6 +1,6 @@
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -22,7 +22,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 
-MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
+MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla", "aiter"]
 
 # ROCm runs dedicated MHA/MLA implementations (forward_mha_rocm.py /
 # forward_mla_rocm.py) so the shared CUDA paths carry no AMD branches. Backend
@@ -32,6 +32,7 @@ MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 _ROCM_FORWARD_METHODS = {
     AttnForwardMethod.MHA: AttnForwardMethod.MHA_ROCM,
     AttnForwardMethod.MHA_ONE_SHOT: AttnForwardMethod.MHA_ONE_SHOT_ROCM,
+    AttnForwardMethod.MHA_CHUNKED_KV: AttnForwardMethod.MHA_CHUNKED_KV_ROCM,
     AttnForwardMethod.MLA: AttnForwardMethod.MLA_ROCM,
 }
 
@@ -111,16 +112,15 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
-    # MLA prefill CP forces absorbed MLA regardless of prefix length: the
-    # CP path gathers latent KV via rebuild_cp_kv_cache and feeds the
-    # backend's absorbed-MLA kernel.
-    if mla_use_prefill_cp(forward_batch):
+    # Strategy CP gathers latent KV in the backend's absorbed MLA path;
+    # normal MHA would write rank-local KV against full cache locations.
+    if is_cp_v2_active(forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    disable_ragged = (
-        backend_name in ["flashinfer", "flashmla"]
-    ) and attn.flashinfer_mla_disable_ragged
+    disable_ragged = (backend_name in ["flashinfer", "flashmla"]) and (
+        attn.flashinfer_mla_disable_ragged or attn.qk_rope_head_dim == 0
+    )
 
     if (
         not disable_ragged
@@ -198,6 +198,8 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        if not _support_mha_one_shot(attn, forward_batch, "aiter"):
+            return AttnForwardMethod.MHA_CHUNKED_KV
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA
@@ -230,7 +232,6 @@ def _can_use_triton_dense_fp8_prefill(attn, forward_batch) -> bool:
         and attn.v_head_dim == 128
         and attn.kv_lora_rank == 512
         and not get_parallel().dcp_enabled
-        and not mla_use_prefill_cp(forward_batch)
         and forward_batch.forward_mode.is_extend_without_speculative()
         and prefix_lens is not None
         and any(prefix_lens)
