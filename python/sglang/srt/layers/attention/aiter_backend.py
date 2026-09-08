@@ -154,6 +154,18 @@ class ForwardMetadata:
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
+# AITER's gfx950 FP8 FMHA ASM kernels only cover these GQA ratios. Other
+# ratios (e.g. Qwen3.8-27B 24Q/4KV = 6) must not take the pertensor shortcut.
+_AITER_FP8_ASM_GQA_RATIOS = frozenset({1, 2, 4, 8, 16})
+
+
+def _aiter_fp8_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
+    """Whether AITER's FP8 FMHA ASM kernel supports this GQA ratio."""
+    if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+        return False
+    return (num_q_heads // num_kv_heads) in _AITER_FP8_ASM_GQA_RATIOS
+
+
 def _asm_context_prefill_gather_indices(
     kv_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -2871,6 +2883,9 @@ class AiterAttnBackend(AttentionBackend):
                 and layer.qk_head_dim == 256
                 and layer.v_head_dim == 256
                 and self.kv_cache_dtype == fp8_dtype
+                and _aiter_fp8_asm_supports_gqa(
+                    layer.tp_q_head_num, layer.tp_k_head_num
+                )
                 and not self.kv_cache_is_vectorized_5d
                 and self.forward_metadata.max_kv_len is not None
             ):
@@ -2936,6 +2951,9 @@ class AiterAttnBackend(AttentionBackend):
                 and layer.qk_head_dim == 256
                 and layer.v_head_dim == 256
                 and self.kv_cache_dtype == fp8_dtype
+                and _aiter_fp8_asm_supports_gqa(
+                    layer.tp_q_head_num, layer.tp_k_head_num
+                )
             ):
                 q_c = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 k_c = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
