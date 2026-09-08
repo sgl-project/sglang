@@ -224,7 +224,7 @@ def _benchmark(m, n, k, tp_size, provider):
     tflops = flops / (ms * 1e-3) / 1e12
 
     # Print shape-specific results with TFLOPS
-    print(f"Time: {ms*1000:.2f} us, TFLOPS: {tflops:.2f}")
+    print(f"Time: {ms * 1000:.2f} us, TFLOPS: {tflops:.2f}")
     return ms, max_ms, min_ms
 
 

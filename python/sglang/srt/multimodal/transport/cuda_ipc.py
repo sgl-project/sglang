@@ -150,6 +150,17 @@ class MmItemMemoryPool:
             use_pool_handle_cache=use_pool_handle_cache,
         )
 
+    def cancel_proxy(self, proxy: "CudaIpcTensorTransportProxy") -> None:
+        """Return a published slice when its request was never dispatched."""
+        ipc_extra = proxy.proxy_state["ipc_extra"]
+        if tuple(ipc_extra["pool_handle"]) != tuple(self._pool_ipc_handle):
+            raise RuntimeError("CUDA IPC proxy does not belong to this pool")
+        self._pool.cancel_lease(
+            ready_byte_offset=proxy.ready_byte_offset,
+            ack_byte_offset=proxy.ack_byte_offset,
+            generation=proxy.generation,
+        )
+
     def _warn_pool_full_once(self, nbytes: int):
         if self._pool_full_warned:
             return
@@ -309,6 +320,10 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
                 base_address, device_id, consumer_count, consumer_rank
             )
         self._retain_storage_until_stream_completes(storage, device_id)
+
+    def release_without_reconstruction(self, consumer_count: int = 1) -> None:
+        """Release a pool slice when its request abandons this proxy."""
+        self.acknowledge_consumption(consumer_count)
 
     def reconstruct_on_target_device(
         self,

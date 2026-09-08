@@ -46,17 +46,9 @@ fn build_ctx(url: String) -> Arc<AppContext> {
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
     });
-    // Use the real loaded tokenizers (not the empty-registry test default) so
-    // the cache-aware policy can tokenize at ingress.
-    let policies = Arc::new(
-        build_registry(
-            &cfg,
-            Arc::new(HashTree::new()),
-            Arc::clone(&tokenizers),
-            BlockSizeOracle::new(),
-        )
-        .unwrap(),
-    );
+    // Use the configured tokenizer so the chat path can emit input_ids.
+    let policies =
+        Arc::new(build_registry(&cfg, Arc::new(HashTree::new()), BlockSizeOracle::new()).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }

@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -54,7 +54,6 @@ def _get_float4_e2m1fn_x2_dtype():
 
 
 class _NPULinearMethodBase(LinearMethodBase):
-
     def __init__(
         self,
         quant_config: Optional["QuantizationConfig"] = None,
@@ -63,7 +62,6 @@ class _NPULinearMethodBase(LinearMethodBase):
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
-
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
@@ -121,7 +119,6 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
 
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
-
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
@@ -307,8 +304,60 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         return output.reshape(output_shape)
 
 
-class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
+def npu_w8a8_mxfp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Block-FP8 linear on Atlas A5, used as the ``w8a8_block_fp8_linear``
+    backend on NPU (see ``fp8_utils._dispatch_auto_backend``).
 
+    The loading path requantizes block-FP8 weights into the A5 MXFP8 layout;
+    activations are quantized per call. ``block_size`` is retained for the shared
+    block-FP8 backend interface and ``input_scale`` is unused because activation
+    scales are always dynamic here.
+    """
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"npu_w8a8_mxfp8_linear expects float8_e4m3fn weights, got {weight.dtype}"
+        )
+
+    original_dtype = input.dtype
+    if original_dtype not in (torch.float16, torch.bfloat16):
+        input = input.to(torch.bfloat16)
+        original_dtype = torch.bfloat16
+
+    orig_shape = input.shape
+    input_2d = input.view(-1, orig_shape[-1]).contiguous()
+
+    x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        input_2d, dst_type=torch.float8_e4m3fn
+    )
+    e8m0_dtype = _get_float8_e8m0fnu_dtype()
+    quant_bias = (
+        bias.to(torch.float32)
+        if bias is not None and bias.dtype != torch.float32
+        else bias
+    )
+    output_2d = torch.ops.npu.npu_quant_matmul(
+        x_fp8,
+        weight,
+        scale=weight_scale,
+        scale_dtype=e8m0_dtype,
+        pertoken_scale=x_scale,
+        pertoken_scale_dtype=e8m0_dtype,
+        bias=quant_bias,
+        output_dtype=original_dtype,
+        group_sizes=(1, 1, MXFP8_BLOCK_SIZE),
+    )
+
+    return output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
+
+
+class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = layer.weight_scale.data.flatten()

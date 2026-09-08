@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     NamedTuple,
     Optional,
     Protocol,
@@ -72,6 +73,7 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
+    swa_branching_seqlen: Optional[int] = None
 
     # General
     chunked: bool = False
@@ -87,6 +89,7 @@ class InsertResult:
     total_len: int = 0
     last_device_node: Any = None
     mamba_exist: bool = False
+    swa_branch_inserted: bool = False
     inserted_host_node: Any = None
     host_insert_dropped: bool = False
     adopted_ranges: Optional[dict[ComponentType, list[tuple[int, int]]]] = None
@@ -200,6 +203,9 @@ class MatchResult(NamedTuple):
                             loaded back to device. Pure-KV cache semantics;
         swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
                             window) and will be load-back into the SWA device pool.
+        swa_branching_seqlen: The SWA radix cache branching point, which is the longest
+                              page-aligned position that could've been cache hit if there
+                              exists an SWA window.
         mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
                             into the Mamba device pool. Typically 0 or 1.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
@@ -215,6 +221,7 @@ class MatchResult(NamedTuple):
     best_match_node: Any
     host_hit_length: int = 0
     swa_host_hit_length: int = 0
+    swa_branching_seqlen: Optional[int] = None
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
@@ -239,9 +246,53 @@ def zero_match_result(
         best_match_node=root,
         host_hit_length=0,
         swa_host_hit_length=0,
+        swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
     )
+
+
+def _dfs_weight_order(
+    root_node: Any,
+    node_handles: Sequence[Any],
+    resolve_node_handle: Callable[[Any], Any],
+) -> list[int]:
+    last_node_to_indices: dict[Any, list[int]] = {}
+    for index, node_handle in enumerate(node_handles):
+        node = resolve_node_handle(node_handle)
+        last_node_to_indices.setdefault(node, []).append(index)
+
+    node_to_weight: dict[Any, int] = {
+        node: len(indices) for node, indices in last_node_to_indices.items()
+    }
+
+    stack: list[tuple[Any, bool]] = [(root_node, False)]
+    while stack:
+        node, visited = stack.pop()
+        if visited:
+            weight = node_to_weight.get(node, 0)
+            for child in node.children.values():
+                weight += node_to_weight.get(child, 0)
+            node_to_weight[node] = weight
+            continue
+        stack.append((node, True))
+        for child in reversed(list(node.children.values())):
+            stack.append((child, False))
+
+    order: list[int] = []
+
+    stack = [(root_node, False)]
+    while stack:
+        node, visited = stack.pop()
+        if visited:
+            order.extend(last_node_to_indices.get(node, ()))
+            continue
+        children = list(node.children.values())
+        children.sort(key=lambda child: -node_to_weight.get(child, 0))
+        stack.append((node, True))
+        for child in reversed(children):
+            stack.append((child, False))
+    return order
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
@@ -289,6 +340,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:
+        """Return request indices in depth-first, subtree-weight order."""
+        return _dfs_weight_order(self.root_node, node_handles, self.resolve_node_handle)
+
     def resolve_node_handle(self, node_handle: Any) -> Any:
         """Map a node handle to its node -- e.g. UnifiedRadixCache looks up the
         node object from its NodeId. Temporary API for the Unified Radix Cache
@@ -327,6 +382,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
         pass
+
+    def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
+        """Give back ascending, disjoint, half-open row-position ranges
+        of the ``kv`` record's row; one call keeps a shared page freed once.
+        """
+        from sglang.srt.mem_cache.common import free_kv_row_segments
+
+        row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
+        free_kv_row_segments(
+            self.token_to_kv_pool_allocator,
+            [(row[start:end], start) for start, end in ranges],
+            swa_evicted_seqlen=kv.swa_evicted_seqlen,
+        )
 
     @abstractmethod
     def evict(self, params: EvictParams) -> EvictResult:
@@ -384,6 +452,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Preparing KV cache loading from host to device.
         """
         raise NotImplementedError()
+
+    def finish_storage_prefetch_admission(
+        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+    ) -> None:
+        """Resolve storage-hit accounting once a request is admitted.
+
+        Non-storage caches have no lifecycle state to resolve.
+        """
+
+    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
+        """Forget storage-hit lifecycle state without emitting a result."""
+
+    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
+        """Pop L3-loaded tokens and their absolute prefix start, if known."""
+        return self.pop_prefetch_loaded_tokens(req_id), None
 
     def ready_to_load_host_cache(self) -> Any:
         """

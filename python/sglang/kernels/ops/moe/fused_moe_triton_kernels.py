@@ -866,9 +866,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
-            assert (
-                per_channel_quant
-            ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
+            assert per_channel_quant, (
+                "int8 quantization only supports channel-wise quantization except for block-wise quantization"
+            )
             A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
@@ -902,23 +902,23 @@ def invoke_fused_moe_kernel(
     if fuse_sum_all_reduce:
         assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
     if fuse_add_to_output:
-        assert (
-            not fuse_sum_all_reduce
-        ), "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
-        assert (
-            add_output_mask is not None
-        ), "add_output_mask required when fuse_add_to_output=True"
+        assert not fuse_sum_all_reduce, (
+            "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
+        )
+        assert add_output_mask is not None, (
+            "add_output_mask required when fuse_add_to_output=True"
+        )
     # ===== TO BE REFACTORED ====
     if mask_output:
-        assert (
-            not fuse_add_to_output
-        ), "mask_output and fuse_add_to_output are mutually exclusive"
-        assert (
-            not fuse_sum_all_reduce
-        ), "mask_output and fuse_sum_all_reduce are mutually exclusive"
-        assert (
-            add_output_mask is not None
-        ), "add_output_mask required when mask_output=True"
+        assert not fuse_add_to_output, (
+            "mask_output and fuse_add_to_output are mutually exclusive"
+        )
+        assert not fuse_sum_all_reduce, (
+            "mask_output and fuse_sum_all_reduce are mutually exclusive"
+        )
+        assert add_output_mask is not None, (
+            "add_output_mask required when mask_output=True"
+        )
     # ===== END TO BE REFACTORED ====
 
     if (
@@ -926,9 +926,9 @@ def invoke_fused_moe_kernel(
         and block_shape is not None
         and block_shape[1] > 0
     ):
-        assert (
-            not fuse_sum_all_reduce
-        ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
+        assert not fuse_sum_all_reduce, (
+            "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
+        )
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
@@ -1559,9 +1559,9 @@ def fused_append_shared_experts_with_weights(
       ``apply_sigmoid`` (the sigmoid is intrinsic), so the two are mutually
       exclusive.
     """
-    assert not (
-        fuse_gate and apply_sigmoid
-    ), "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
+    assert not (fuse_gate and apply_sigmoid), (
+        "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
+    )
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1569,9 +1569,9 @@ def fused_append_shared_experts_with_weights(
         return topk_ids, topk_weights
 
     if fuse_gate:
-        assert (
-            hidden_states is not None and gate_weight is not None
-        ), "fuse_gate=True requires hidden_states and gate_weight"
+        assert hidden_states is not None and gate_weight is not None, (
+            "fuse_gate=True requires hidden_states and gate_weight"
+        )
         hidden_arg = hidden_states.contiguous()
         wgate_arg = gate_weight.reshape(-1).contiguous()
         hidden_dim = hidden_arg.shape[1]
