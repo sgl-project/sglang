@@ -189,7 +189,7 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
             patch(
                 srt_args_module,
                 side_effect=lambda **kwargs: SimpleNamespace(page_size=None, **kwargs),
-            ),
+            ) as srt_args_cls,
             patch(
                 "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.get_local_torch_device",
                 return_value=torch.device("cpu"),
@@ -239,33 +239,40 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
                 ),
             )
 
+        requested_kwargs, untrusted_kwargs = [
+            call.kwargs for call in srt_args_cls.call_args_list
+        ]
+        worker_srt_args = worker_cls.call_args_list[0].kwargs["server_args"]
+        self.assertIs(runner.server_args, worker_srt_args)
+        self.assertIs(
+            untrusted_runner.server_args,
+            worker_cls.call_args_list[1].kwargs["server_args"],
+        )
         self.assertIs(runner.worker, fake_worker)
-        self.assertEqual(runner.server_args.model_path, "resolved:/custom/text_encoder")
         self.assertEqual(
-            runner.server_args.tokenizer_path, "resolved:/custom/tokenizer"
+            requested_kwargs["model_path"], "resolved:/custom/text_encoder"
         )
         self.assertEqual(
-            untrusted_runner.server_args.model_path, "/unused/model/text_encoder"
+            requested_kwargs["tokenizer_path"], "resolved:/custom/tokenizer"
         )
-        self.assertEqual(
-            untrusted_runner.server_args.tokenizer_path, "/unused/model/tokenizer"
-        )
-        self.assertIsNone(runner.server_args.page_size)
+        self.assertEqual(untrusted_kwargs["model_path"], "/unused/model/text_encoder")
+        self.assertEqual(untrusted_kwargs["tokenizer_path"], "/unused/model/tokenizer")
+        self.assertIsNone(worker_srt_args.page_size)
         self.assertEqual(runner.page_size, resolved_page_size)
         self.assertEqual(
             [call.kwargs["page_size"] for call in cache_init_params_cls.call_args_list],
             [resolved_page_size, resolved_page_size],
         )
-        self.assertEqual(runner.server_args.tp_size, 2)
-        self.assertEqual(runner.server_args.dp_size, 2)
-        self.assertTrue(runner.server_args.enable_dp_attention)
-        self.assertTrue(runner.server_args.enable_dp_lm_head)
-        self.assertEqual(runner.server_args.attn_cp_size, 1)
-        self.assertEqual(runner.server_args.ep_size, 1)
-        self.assertEqual(runner.server_args.moe_dp_size, 2)
-        self.assertEqual(runner.server_args.moe_dense_tp_size, 1)
-        self.assertEqual(runner.server_args.moe_a2a_backend, "none")
-        self.assertEqual(runner.server_args.max_running_requests, 4)
+        self.assertEqual(requested_kwargs["tp_size"], 2)
+        self.assertEqual(requested_kwargs["dp_size"], 2)
+        self.assertTrue(requested_kwargs["enable_dp_attention"])
+        self.assertTrue(requested_kwargs["enable_dp_lm_head"])
+        self.assertEqual(requested_kwargs["attn_cp_size"], 1)
+        self.assertEqual(requested_kwargs["ep_size"], 1)
+        self.assertEqual(requested_kwargs["moe_dp_size"], 2)
+        self.assertEqual(requested_kwargs["moe_dense_tp_size"], 1)
+        self.assertEqual(requested_kwargs["moe_a2a_backend"], "none")
+        self.assertEqual(requested_kwargs["max_running_requests"], 4)
         parallel_state = worker_cls.call_args_list[0].kwargs["ps"]
         self.assertEqual(parallel_state.tp_rank, 1)
         self.assertEqual(parallel_state.tp_size, 2)
@@ -281,9 +288,9 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
         self.assertEqual(parallel_state.moe_ep_size, 1)
         self.assertEqual(parallel_state.moe_dp_rank, 1)
         self.assertEqual(parallel_state.moe_dp_size, 2)
-        self.assertIs(runner.server_args.trust_remote_code, True)
-        self.assertIs(untrusted_runner.server_args.trust_remote_code, False)
-        self.assertEqual(untrusted_runner.server_args.revision, "pinned-rev")
+        self.assertIs(requested_kwargs["trust_remote_code"], True)
+        self.assertIs(untrusted_kwargs["trust_remote_code"], False)
+        self.assertEqual(untrusted_kwargs["revision"], "pinned-rev")
 
     def test_text_runner_scopes_singleton_attention_group_and_restores(self):
         import sglang.multimodal_gen.runtime.distributed.parallel_state as mm_parallel_state

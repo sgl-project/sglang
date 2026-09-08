@@ -46,6 +46,10 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Krea/Krea-2",
     },
     {
+      name: "LLaDA-Image",
+      modelIds: ["inclusionAI/LLaDA-Image"],
+    },
+    {
       name: "LongCat-Image",
       modelIds: [
         "meituan-longcat/LongCat-Image",

@@ -528,12 +528,17 @@ def test_lora_ipc_layer_guard_rejects_adaln_in_cache_mode():
 def _updater_for(model, model_path: str):
     from types import SimpleNamespace
 
+    from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
     from sglang.multimodal_gen.runtime.post_training.weights_updater import (
         WeightsUpdater,
     )
 
     model.register_parameter("probe", torch.nn.Parameter(torch.zeros(2)))
-    pipeline = SimpleNamespace(modules={"transformer": model}, model_path=model_path)
+    pipeline = SimpleNamespace(
+        modules={"transformer": model},
+        model_path=model_path,
+        server_args=SimpleNamespace(pipeline_config=PipelineConfig()),
+    )
     return WeightsUpdater(pipeline), pipeline
 
 
