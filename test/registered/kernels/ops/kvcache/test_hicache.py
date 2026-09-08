@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -97,9 +97,9 @@ def _run_transfer_roundtrip_mha(layout: str, element_dim: int) -> None:
         device_pool=device_pool,
         layout=layout,
     )
-    assert (
-        host_pool.can_use_jit
-    ), f"Expected JIT HiCache kernel for MHA dim={element_dim}"
+    assert host_pool.can_use_jit, (
+        f"Expected JIT HiCache kernel for MHA dim={element_dim}"
+    )
 
     for layer_id in range(NUM_LAYERS):
         _copy_tensor_with_offset(device_pool.k_buffer[layer_id], layer_id)
@@ -191,9 +191,9 @@ def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
         device_pool=device_pool,
         layout=layout,
     )
-    assert (
-        host_pool.can_use_jit
-    ), f"Expected JIT HiCache kernel for MLA dim={element_dim}"
+    assert host_pool.can_use_jit, (
+        f"Expected JIT HiCache kernel for MLA dim={element_dim}"
+    )
 
     for layer_id in range(NUM_LAYERS):
         _copy_tensor_with_offset(device_pool.kv_buffer[layer_id], layer_id)

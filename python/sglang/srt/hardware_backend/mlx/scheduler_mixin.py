@@ -213,6 +213,7 @@ class SchedulerMlxOverlapMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # 1. If pending_curr is a pure decode AND no new prefill is waiting,

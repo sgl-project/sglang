@@ -15,7 +15,7 @@ except ModuleNotFoundError:
         pass
 
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _load_mmmu_eval_utils():
@@ -123,12 +123,7 @@ class TestMMMUEvalUtils(CustomTestCase):
         self,
     ):
         response = (
-            "The options are:\n"
-            "(A) red\n"
-            "(B) blue\n"
-            "(C) green\n"
-            "(D) yellow\n"
-            "Answer: B"
+            "The options are:\n(A) red\n(B) blue\n(C) green\n(D) yellow\nAnswer: B"
         )
 
         pred_ans = self.eval_utils.parse_multi_choice_response(

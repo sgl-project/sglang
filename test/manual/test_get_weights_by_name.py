@@ -30,7 +30,6 @@ def _process_return(ret):
 
 
 class TestGetWeightsByName(CustomTestCase):
-
     def init_hf_model(self, model_name, tie_word_embeddings):
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype="bfloat16", tie_word_embeddings=tie_word_embeddings

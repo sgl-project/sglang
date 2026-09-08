@@ -132,9 +132,9 @@ def compare_weights(
     for (expect_dq, expect_tol), (actual_dq, actual_tol) in zip(
         expect.iter_chunks(), actual.iter_chunks(), strict=True
     ):
-        assert (
-            expect_dq.shape == actual_dq.shape
-        ), f"{expect_dq.shape=} {actual_dq.shape=}"
+        assert expect_dq.shape == actual_dq.shape, (
+            f"{expect_dq.shape=} {actual_dq.shape=}"
+        )
         numel += expect_dq.numel()
         abs_diff = (actual_dq.float() - expect_dq.float()).abs()
         if torch.all(abs_diff == 0):

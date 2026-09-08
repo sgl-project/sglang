@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -34,8 +35,12 @@ from sglang.srt.model_loader.loader import (
     ModelOptModelLoader,
     get_model_loader,
 )
-from sglang.srt.model_loader.weight_utils import get_quant_config
+from sglang.srt.model_loader.weight_utils import (
+    _modelopt_quant_section,
+    get_quant_config,
+)
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+from sglang.srt.models.muse_glimmer import MuseGlimmerForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -48,7 +53,7 @@ CALIBRATION_BATCH_SIZE = 36
 CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestModelOptModelLoader(CustomTestCase):
@@ -548,6 +553,21 @@ class TestParseQuantHfConfig(CustomTestCase):
                 self.assertIn("lm_head", quant_config.ignored_layers)
                 self.assertEqual(quant_config.kv_cache_quant_algo, "FP8")
 
+        nested_result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quantization": {
+                        "quant_algo": "MXFP8",
+                        "group_size": 32,
+                        "exclude_modules": ["lm_head"],
+                    }
+                }
+            }
+        )
+        self.assertEqual(nested_result["quant_method"], "mxfp8")
+        self.assertEqual(nested_result["scale_fmt"], "ue8m0")
+        self.assertIn("lm_head", nested_result["modules_to_not_convert"])
+
     def test_modelopt_mxfp8_override(self):
         """Generic ModelOpt selection must not route MXFP8 to scalar FP8."""
         self.assertEqual(
@@ -657,7 +677,7 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
                     quantization="modelopt_fp4",
                     is_draft_model=True,
                     is_draft_quantization_explicit=is_explicit,
-                    hf_config=SimpleNamespace(
+                    hf_config=PretrainedConfig(
                         quantization_config={
                             "quant_algo": "NVFP4",
                             "group_size": 16,
@@ -757,7 +777,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                 with self.subTest(inline_config=inline_config):
                     model_config = SimpleNamespace(
                         quantization="modelopt_mixed",
-                        hf_config=SimpleNamespace(
+                        hf_config=PretrainedConfig(
                             quantization_config=inline_config,
                         ),
                         model_path=model_path,
@@ -787,7 +807,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         }
         model_config = SimpleNamespace(
             quantization="modelopt_mixed",
-            hf_config=SimpleNamespace(
+            hf_config=PretrainedConfig(
                 quantization_config={
                     "quant_method": "modelopt_mixed",
                     "quant_algo": "MIXED_PRECISION",
@@ -870,6 +890,69 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             ["language_model.lm_head", "lm_head"],
         )
 
+    def test_muse_glimmer_mixed_precision_resolves_runtime_names(self):
+        """The vendor keys quant metadata under ``model.language_model.*``;
+        it must resolve for the ``model.*`` modules the runtime builds.
+        """
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.language_model.layers.0.mlp.gate_proj": {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    },
+                    "model.language_model.layers.0.mlp.up_proj": {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    },
+                    "model.language_model.layers.0.self_attn.q_proj": {
+                        "quant_algo": "FP8"
+                    },
+                    "model.language_model.layers.0.self_attn.k_proj": {
+                        "quant_algo": "FP8"
+                    },
+                    "model.language_model.layers.0.self_attn.v_proj": {
+                        "quant_algo": "FP8"
+                    },
+                    "model.language_model.layers.0.self_attn.gate_proj": {
+                        "quant_algo": "FP8"
+                    },
+                    "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+                    "model.vision_tower.layers.0.attn.q_proj": {"quant_algo": "FP8"},
+                },
+                "packed_modules_mapping": (
+                    MuseGlimmerForConditionalGeneration.packed_modules_mapping
+                ),
+            }
+        )
+        quant_config.apply_weight_name_mapper(
+            MuseGlimmerForConditionalGeneration.hf_to_sglang_mapper
+        )
+
+        self.assertEqual(
+            quant_config._resolve_quant_algo("model.layers.0.mlp.gate_up_proj"),
+            "W4A16_NVFP4",
+        )
+        # Attention stays unfused whenever a quant_config is present, so q/k/v
+        # resolve per shard; only the MLP goes through packed_modules_mapping.
+        self.assertEqual(
+            quant_config._resolve_quant_algo("model.layers.0.self_attn.q_proj"),
+            "FP8",
+        )
+        self.assertEqual(
+            quant_config._resolve_quant_algo(
+                "model.layers.0.self_attn.output_gate_proj"
+            ),
+            "FP8",
+        )
+        self.assertEqual(quant_config._resolve_quant_algo("lm_head"), "W4A16_NVFP4")
+        # The vision tower hangs off the entry class, not off ``model``.
+        self.assertEqual(
+            quant_config._resolve_quant_algo("vision_tower.layers.0.attn.q_proj"),
+            "FP8",
+        )
+
     def test_nemotron_mixed_precision_with_nvfp4_layers_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = MagicMock()
@@ -923,6 +1006,50 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         )
 
         self.assertEqual(result["quant_method"], "modelopt_mixed")
+
+    def test_flat_hf_quant_config_without_quantization_key(self):
+        """Diffusion/unified ModelOpt exports use a flat hf_quant_config.json.
+
+        Regression for Cosmos3-style checkpoints that put quant_algo at the top
+        level (no nested ``quantization`` key).
+        """
+        model_config = ModelConfig.__new__(ModelConfig)
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "FP8",
+                "quant_type": "FP8_FP8",
+                "ignore": ["lm_head", "visual*"],
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_fp8")
+        self.assertEqual(result["quant_algo"], "FP8")
+
+    def test_hf_quant_config_missing_quant_algo_returns_none(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        self.assertIsNone(
+            model_config._parse_modelopt_quant_config(
+                {"quant_method": "modelopt", "producer": {"name": "modelopt"}}
+            )
+        )
+
+    def test_modelopt_quant_section_supports_nested_and_flat(self):
+        nested = {"quantization": {"quant_algo": "FP8", "exclude_modules": ["lm_head"]}}
+        self.assertEqual(
+            _modelopt_quant_section(nested)["quant_algo"],
+            "FP8",
+        )
+
+        flat = {
+            "quant_method": "modelopt",
+            "quant_algo": "FP8",
+            "ignore": ["lm_head"],
+            "producer": {"name": "modelopt"},
+        }
+        self.assertIs(_modelopt_quant_section(flat), flat)
+        self.assertEqual(_modelopt_quant_section(flat)["quant_algo"], "FP8")
 
     def test_mixed_precision_override_does_not_hijack_w4afp8(self):
         self.assertIsNone(

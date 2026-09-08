@@ -51,9 +51,9 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        assert (
-            extra_embeddings is None
-        ), "Extra embeddings for lora a is not supported yet in chunked backend"
+        assert extra_embeddings is None, (
+            "Extra embeddings for lora a is not supported yet in chunked backend"
+        )
         output_tensor = sgemm_lora_a_embedding_fwd(
             inputs=input_ids,
             weights=weights,
@@ -248,9 +248,9 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         num_segments = len(weight_indices_tensor)
 
         if use_cuda_graph:
-            assert (
-                self.cuda_graph_batch_info is not None
-            ), "CUDA Graph batch info is not initialized."
+            assert self.cuda_graph_batch_info is not None, (
+                "CUDA Graph batch info is not initialized."
+            )
             batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = num_segments

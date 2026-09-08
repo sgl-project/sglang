@@ -46,7 +46,6 @@ OTHER_ARGS = [
 
 
 class TestNPUGLM5_Top64_Pruned_GSM8K(TestNpuAccuracyTestCaseBase):
-
     model = GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS

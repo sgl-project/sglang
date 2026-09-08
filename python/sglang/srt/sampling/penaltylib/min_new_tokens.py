@@ -60,9 +60,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                 fill_value=float("-inf"),
                 device=self.orchestrator.device,
             ),
-        )[
-            :, : self.orchestrator.vocab_size
-        ]
+        )[:, : self.orchestrator.vocab_size]
 
         self.len_output_tokens = torch.zeros(
             size=(len(self.orchestrator.reqs()), 1),

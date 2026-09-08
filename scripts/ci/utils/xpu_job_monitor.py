@@ -323,7 +323,7 @@ def fetch_all_jobs_snapshot(
 
     for i, run in enumerate(unique_runs):
         if (i + 1) % 20 == 0:
-            print(f"Processing run {i+1}/{total_runs}...", file=sys.stderr)
+            print(f"Processing run {i + 1}/{total_runs}...", file=sys.stderr)
 
         workflow_name = run.get("_workflow", "-")
         try:

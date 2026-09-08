@@ -134,8 +134,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.hot_token_id = None
 
         with (
-            empty_context()
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+            empty_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            draft_model_build_scope(),
+        ):
             # Both base classes own initialization, so initialize TpModelWorker
             # explicitly after EagleDraftWorkerBase above.
             TpModelWorker.__init__(
@@ -720,9 +723,9 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
 
         # Frozen MTP does not wire the adaptive controller yet.
-        assert (
-            not get_spec().speculative_adaptive
-        ), "Frozen-KV MTP does not support adaptive speculative decoding yet."
+        assert not get_spec().speculative_adaptive, (
+            "Frozen-KV MTP does not support adaptive speculative decoding yet."
+        )
         self.adaptive_controller = None
 
         # Some dummy tensors (parity with EAGLEWorkerV2 init).

@@ -183,7 +183,6 @@ def merge_multimodal_embeddings(
 
 
 class MlpProjector(nn.Module):
-
     def __init__(
         self,
         projector_type,
@@ -458,9 +457,9 @@ class Attention(nn.Module):
 
         self.use_rel_pos = use_rel_pos
         if self.use_rel_pos:
-            assert (
-                input_size is not None
-            ), "Input size must be provided if using relative positional encoding."
+            assert input_size is not None, (
+                "Input size must be provided if using relative positional encoding."
+            )
             # initialize relative positional embeddings
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
@@ -958,7 +957,6 @@ class NoTPAttention(torch.nn.Module):
         xqkv = xqkv.view(bsz, seqlen, 3, self.num_heads, self.head_dim)
 
         if self.use_flash_attention:
-
             xq, xk, xv = torch.split(xqkv, 1, dim=2)
             xq = xq.squeeze(2)
             xk = xk.squeeze(2)
@@ -1602,7 +1600,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         if pixel_values is not None:
             if not isinstance(pixel_values, (torch.Tensor, list)):
                 raise ValueError(
-                    "Incorrect type of pixel values. " f"Got type: {type(pixel_values)}"
+                    f"Incorrect type of pixel values. Got type: {type(pixel_values)}"
                 )
 
             if not isinstance(images_spatial_crop, (torch.Tensor, list)):
@@ -1613,7 +1611,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
             if not isinstance(images_crop, (torch.Tensor, list)):
                 raise ValueError(
-                    "Incorrect type of image crop. " f"Got type: {type(images_crop)}"
+                    f"Incorrect type of image crop. Got type: {type(images_crop)}"
                 )
 
             return [pixel_values, images_crop, images_spatial_crop]

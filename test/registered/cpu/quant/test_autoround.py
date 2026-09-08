@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cpu_ci(est_time=183, suite="base-b-tp-test-cpu")
+register_cpu_ci(est_time=183, suite="stage-a-tp-test-cpu-intel")
 
 
 class TestAutoRoundCPUConfig(CustomTestCase):

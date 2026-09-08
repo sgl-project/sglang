@@ -69,9 +69,7 @@ def _sparse_mla_fwd_kernel(
     )  # [H, D_V]
     q_tail = tl.load(
         q_rope_ptr + s_i * H * D_TAIL + h[:, None] * D_TAIL + dt[None, :]
-    ).to(
-        q_nope_ptr.dtype.element_ty
-    )  # [H, D_TAIL]
+    ).to(q_nope_ptr.dtype.element_ty)  # [H, D_TAIL]
 
     m_i = tl.full([H], -float("inf"), tl.float32)
     l_i = tl.zeros([H], tl.float32)
@@ -89,9 +87,7 @@ def _sparse_mla_fwd_kernel(
         )  # [BLOCK_N, D_V] -- reused as V
         kv_tail = tl.load(
             kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
-        ).to(
-            q_nope_ptr.dtype.element_ty
-        )  # [BLOCK_N, D_TAIL]
+        ).to(q_nope_ptr.dtype.element_ty)  # [BLOCK_N, D_TAIL]
 
         qk = tl.dot(q_main, tl.trans(kv_main)).to(tl.float32)
         qk += tl.dot(q_tail, tl.trans(kv_tail)).to(tl.float32)

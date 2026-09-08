@@ -234,7 +234,6 @@ NORM2FN = {
 
 
 class InternVisionEncoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

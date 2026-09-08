@@ -90,7 +90,7 @@ jobs:
           # full machine, no partitioning. 4 files: 3 TP + autoround.
           - runner: xeon-gnr
             role: gnr
-            suite: "base-b-tp-test-cpu"
+            suite: "stage-a-tp-test-cpu-intel"
             name: gnr
 
           # Three SPR boxes each run ONE full-machine container taking one
@@ -102,19 +102,19 @@ jobs:
           # per box keeps each server within the box's memory budget.
           - runner: xeon-spr
             role: spr
-            suite: "base-b-test-cpu,base-c-test-cpu"
+            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
             name: spr1
             part_id: 0
             part_size: 3
           - runner: xeon-spr
             role: spr
-            suite: "base-b-test-cpu,base-c-test-cpu"
+            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
             name: spr2
             part_id: 1
             part_size: 3
           - runner: xeon-spr
             role: spr
-            suite: "base-b-test-cpu,base-c-test-cpu"
+            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
             name: spr3
             part_id: 2
             part_size: 3

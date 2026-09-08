@@ -113,12 +113,12 @@ def build_trtllm_mha_page_table(
     ``full_to_swa`` is provided, which then also requires ``swa_page_table``.
     """
     has_swa = full_to_swa is not None
-    assert has_swa == (
-        swa_page_table is not None
-    ), "full_to_swa and swa_page_table must be provided together"
-    assert (
-        _MHA_KV_INDEX_BLOCK_TOKENS % page_size == 0
-    ), f"page_size={page_size} must divide _MHA_KV_INDEX_BLOCK_TOKENS={_MHA_KV_INDEX_BLOCK_TOKENS}"
+    assert has_swa == (swa_page_table is not None), (
+        "full_to_swa and swa_page_table must be provided together"
+    )
+    assert _MHA_KV_INDEX_BLOCK_TOKENS % page_size == 0, (
+        f"page_size={page_size} must divide _MHA_KV_INDEX_BLOCK_TOKENS={_MHA_KV_INDEX_BLOCK_TOKENS}"
+    )
     bs, num_pages = page_table.shape
     full_to_swa_numel = full_to_swa.numel() if has_swa else 0
     create_trtllm_mha_kv_indices_triton[

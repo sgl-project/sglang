@@ -721,7 +721,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract mean_tpot from output")
             logger.error(
-                f"Simplified output snippet around TPOT: {simplified_output[simplified_output.find('TPOT')-20:simplified_output.find('TPOT')+50] if 'TPOT' in simplified_output else 'TPOT not found'}"
+                f"Simplified output snippet around TPOT: {simplified_output[simplified_output.find('TPOT') - 20 : simplified_output.find('TPOT') + 50] if 'TPOT' in simplified_output else 'TPOT not found'}"
             )
 
         tps_matches = re.findall(
@@ -751,7 +751,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract total_tps from output")
             logger.warning(
-                f"Simplified output snippet around Output Token Throughput: {simplified_output[simplified_output.find('Output')-20:simplified_output.find('Output')+100] if 'Output' in simplified_output else 'Output not found'}"
+                f"Simplified output snippet around Output Token Throughput: {simplified_output[simplified_output.find('Output') - 20 : simplified_output.find('Output') + 100] if 'Output' in simplified_output else 'Output not found'}"
             )
 
         ttft_match = re.search(r"TTFT\s+total\s+([\d.]+)\s+ms", simplified_output)
@@ -761,7 +761,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract mean_ttft from output")
             logger.warning(
-                f"Simplified output snippet around TTFT: {simplified_output[simplified_output.find('TTFT')-20:simplified_output.find('TTFT')+50] if 'TTFT' in simplified_output else 'TTFT not found'}"
+                f"Simplified output snippet around TTFT: {simplified_output[simplified_output.find('TTFT') - 20 : simplified_output.find('TTFT') + 50] if 'TTFT' in simplified_output else 'TTFT not found'}"
             )
 
         e2el_match = re.search(r"E2EL\s+total\s+([\d.]+)\s+ms", simplified_output)
@@ -771,7 +771,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract mean_e2e_latency from output")
             logger.warning(
-                f"Simplified output snippet around E2EL: {simplified_output[simplified_output.find('E2EL')-20:simplified_output.find('E2EL')+50] if 'E2EL' in simplified_output else 'E2EL not found'}"
+                f"Simplified output snippet around E2EL: {simplified_output[simplified_output.find('E2EL') - 20 : simplified_output.find('E2EL') + 50] if 'E2EL' in simplified_output else 'E2EL not found'}"
             )
 
         concurrency_match = re.search(
@@ -783,7 +783,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract concurrency from output")
             logger.warning(
-                f"Simplified output snippet around Concurrency: {simplified_output[simplified_output.find('Concurrency')-20:simplified_output.find('Concurrency')+50] if 'Concurrency' in simplified_output else 'Concurrency not found'}"
+                f"Simplified output snippet around Concurrency: {simplified_output[simplified_output.find('Concurrency') - 20 : simplified_output.find('Concurrency') + 50] if 'Concurrency' in simplified_output else 'Concurrency not found'}"
             )
 
         max_concurrency_match = re.search(
@@ -795,7 +795,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract max_concurrency from output")
             logger.warning(
-                f"Simplified output snippet around Max Concurrency: {simplified_output[simplified_output.find('Max Concurrency')-20:simplified_output.find('Max Concurrency')+50] if 'Max Concurrency' in simplified_output else 'Max Concurrency not found'}"
+                f"Simplified output snippet around Max Concurrency: {simplified_output[simplified_output.find('Max Concurrency') - 20 : simplified_output.find('Max Concurrency') + 50] if 'Max Concurrency' in simplified_output else 'Max Concurrency not found'}"
             )
 
         req_throughput_match = re.search(
@@ -810,7 +810,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract request_throughput from output")
             logger.warning(
-                f"Simplified output snippet around Request Throughput: {simplified_output[simplified_output.find('Request')-20:simplified_output.find('Request')+50] if 'Request' in simplified_output else 'Request not found'}"
+                f"Simplified output snippet around Request Throughput: {simplified_output[simplified_output.find('Request') - 20 : simplified_output.find('Request') + 50] if 'Request' in simplified_output else 'Request not found'}"
             )
 
         total_requests_match = re.search(
@@ -822,7 +822,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract total_requests from output")
             logger.warning(
-                f"Simplified output snippet around Total Requests: {simplified_output[simplified_output.find('Total Requests')-20:simplified_output.find('Total Requests')+50] if 'Total Requests' in simplified_output else 'Total Requests not found'}"
+                f"Simplified output snippet around Total Requests: {simplified_output[simplified_output.find('Total Requests') - 20 : simplified_output.find('Total Requests') + 50] if 'Total Requests' in simplified_output else 'Total Requests not found'}"
             )
 
         failed_requests_match = re.search(
@@ -834,7 +834,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract failed_requests from output")
             logger.warning(
-                f"Simplified output snippet around Failed Requests: {simplified_output[simplified_output.find('Failed Requests')-20:simplified_output.find('Failed Requests')+50] if 'Failed Requests' in simplified_output else 'Failed Requests not found'}"
+                f"Simplified output snippet around Failed Requests: {simplified_output[simplified_output.find('Failed Requests') - 20 : simplified_output.find('Failed Requests') + 50] if 'Failed Requests' in simplified_output else 'Failed Requests not found'}"
             )
 
         logger.info(f"All extracted metrics: {metrics}")
@@ -1365,7 +1365,9 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.role = (
             "router"
             if "router" in cls.hostname
-            else "prefill" if "prefill" in cls.hostname else "decode"
+            else "prefill"
+            if "prefill" in cls.hostname
+            else "decode"
         )
         logger.info(f"Init {cls.host} {cls.role=}!")
 

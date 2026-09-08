@@ -196,8 +196,7 @@ def run_evalscope(
         process.wait()
 
         logger.info(
-            f"run_evalscope finished: pid={process.pid} "
-            f"returncode={process.returncode}"
+            f"run_evalscope finished: pid={process.pid} returncode={process.returncode}"
         )
 
         kill_process_group(process)
@@ -641,7 +640,9 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.role = (
             "router"
             if "router" in cls.hostname
-            else "prefill" if "prefill" in cls.hostname else "decode"
+            else "prefill"
+            if "prefill" in cls.hostname
+            else "decode"
         )
         logger.info(f"Init {cls.host} {cls.role=}!")
 

@@ -35,7 +35,6 @@ logger = init_logger(__name__)
 
 
 class RangeDict(dict):
-
     def __getitem__(self, item: int) -> str:
         for key in self.keys():
             if isinstance(key, tuple):
@@ -81,7 +80,6 @@ class SlidingTileAttentionMetadata(AttentionMetadata):
 
 
 class SlidingTileAttentionMetadataBuilder(AttentionMetadataBuilder):
-
     def __init__(self):
         pass
 
@@ -105,7 +103,6 @@ class SlidingTileAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class SlidingTileAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,

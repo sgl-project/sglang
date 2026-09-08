@@ -11,7 +11,7 @@ from contextlib import ExitStack
 from sglang.srt.environ import _DEPRECATED_ENVS, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestEnvField(unittest.TestCase):

@@ -23,7 +23,7 @@ which is below the >=3.5.0 the aiter gluon DSA kernels need, so it logs
 what loses the accuracy. Re-add a 7.0 job once its image ships Triton >=3.5.0,
 or once the legacy DSA fallback is fixed on gfx950.
 
-The eval matches the CUDA GLM-5.2-FP8 nightly (`test/registered/8-gpu-models/
+The eval matches the CUDA GLM-5.2-FP8 nightly (`test/registered/e2e/models_large/
 test_glm52_fp8.py`): same dataset and same 0.92 baseline, so a red run here
 means AMD diverged from CUDA rather than the harness diverging.
 

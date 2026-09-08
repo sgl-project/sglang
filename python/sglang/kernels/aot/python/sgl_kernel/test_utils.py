@@ -94,9 +94,9 @@ def _compute_imbalanced_split(
 
 
 def assert_all_close_or_tiny_diff(a: torch.Tensor, b: torch.Tensor):
-    assert (a.shape == b.shape) and (
-        a.dtype == b.dtype
-    ), f"{a.shape=} {b.shape=} {a.dtype=} {b.dtype=}"
+    assert (a.shape == b.shape) and (a.dtype == b.dtype), (
+        f"{a.shape=} {b.shape=} {a.dtype=} {b.dtype=}"
+    )
     numel = a.numel()
 
     if a.dtype == torch.float8_e4m3fn:

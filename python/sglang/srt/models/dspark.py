@@ -84,7 +84,6 @@ def run_markov_block(
 
 
 class VanillaMarkov(nn.Module):
-
     markov_head_type = "vanilla"
 
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
@@ -219,7 +218,6 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
 
 
 class GatedMarkovHead(VanillaMarkov):
-
     markov_head_type = "gated"
 
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
@@ -260,7 +258,6 @@ class GatedMarkovHead(VanillaMarkov):
 
 
 class RNNHead(VanillaMarkov):
-
     markov_head_type = "rnn"
 
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
@@ -413,7 +410,6 @@ def build_nemotron_35_markov_head(config, quant_config, prefix: str) -> nn.Modul
 
 
 class DSparkConfidenceHead(nn.Module):
-
     def __init__(
         self,
         *,
@@ -483,6 +479,7 @@ _DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
 
 
 class DSparkDraftMixin:
+    supports_pre_gather_target_hidden_projection = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
@@ -737,8 +734,13 @@ class DSparkDraftMixin:
         cache_loc: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        target_hidden_is_projected: bool = False,
     ) -> None:
-        ctx_hidden = self.project_target_hidden(target_hidden)
+        ctx_hidden = (
+            target_hidden
+            if target_hidden_is_projected
+            else self.project_target_hidden(target_hidden)
+        )
 
         bundle = self._fused_kv_write_bundle(pool)
         if bundle is not None:
@@ -852,7 +854,6 @@ class DSparkDraftMixin:
 
 
 class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
-
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None
         self.confidence_head = None

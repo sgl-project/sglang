@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 
 
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
-
     def __init__(self):
         if not get_platform().is_blackwell:
             raise ValueError(
@@ -337,9 +336,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 FlashInferCutlassMoeQuantInfo,
             )
 
-            assert (
-                not self.moe_runner_config.apply_router_weight_on_input
-            ), "apply_router_weight_on_input is not supported for Flashinfer"
+            assert not self.moe_runner_config.apply_router_weight_on_input, (
+                "apply_router_weight_on_input is not supported for Flashinfer"
+            )
 
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",

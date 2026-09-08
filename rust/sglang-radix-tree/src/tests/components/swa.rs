@@ -851,11 +851,11 @@ fn insert_overlap_straddling_the_boundary_splits_and_recovers_the_tail() {
             node_id,
             source_value,
         },
-        CacheAction::FreeDeviceKV(duplicates),
+        CacheAction::FreeDeviceKVFullOnly(duplicates),
     ] = result.cache_actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKV, got {:?}",
+            "expected FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
@@ -898,10 +898,10 @@ fn insert_overlap_straddling_with_a_locked_full_defers_the_tail() {
             kept_full,
             incoming_full,
         },
-        CacheAction::FreeDeviceKV(duplicates),
+        CacheAction::FreeDeviceKVFullOnly(duplicates),
     ] = result.cache_actions.as_slice()
     else {
-        panic!("expected RecoverSwaWithLockedFull then FreeDeviceKV");
+        panic!("expected RecoverSwaWithLockedFull then FreeDeviceKVFullOnly");
     };
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[12i64, 13])));
@@ -920,8 +920,8 @@ fn insert_overlap_entirely_outside_the_window_is_all_duplicate() {
         /* prev_prefix_len = */ 0,
         /* swa_evicted_seqlen = */ 3,
     ));
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
-        panic!("expected one FreeDeviceKV action");
+    let [CacheAction::FreeDeviceKVFullOnly(freed)] = result.cache_actions.as_slice() else {
+        panic!("expected one FreeDeviceKVFullOnly action");
     };
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
 }
@@ -972,7 +972,7 @@ fn insert_overlap_boundary_at_the_node_start_recovers_the_whole_node() {
             .equal(&Tensor::from_slice(&[23i64, 24]))
     );
     let [
-        CacheAction::FreeDeviceKV(duplicates),
+        CacheAction::FreeDeviceKVFullOnly(duplicates),
         CacheAction::FreeDeviceKVFullOnly(old_full),
         CacheAction::SwaRebuild {
             node_id,
@@ -981,7 +981,7 @@ fn insert_overlap_boundary_at_the_node_start_recovers_the_whole_node() {
     ] = result.cache_actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKV, FreeDeviceKVFullOnly, SwaRebuild, got {:?}",
+            "expected FreeDeviceKVFullOnly, FreeDeviceKVFullOnly, SwaRebuild, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
@@ -1027,17 +1027,17 @@ fn insert_overlap_straddling_a_second_level_node_recovers_the_tail() {
             .equal(&Tensor::from_slice(&[24i64]))
     );
     let [
-        CacheAction::FreeDeviceKV(duplicates_head),
+        CacheAction::FreeDeviceKVFullOnly(duplicates_head),
         CacheAction::FreeDeviceKVFullOnly(old_tail),
         CacheAction::SwaRebuild {
             node_id,
             source_value,
         },
-        CacheAction::FreeDeviceKV(duplicates_tail),
+        CacheAction::FreeDeviceKVFullOnly(duplicates_tail),
     ] = result.cache_actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKV, FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKV, got {:?}",
+            "expected FreeDeviceKVFullOnly, FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
@@ -1080,17 +1080,17 @@ fn insert_overlap_straddling_a_second_level_locked_node_defers_the_tail() {
             .equal(&Tensor::from_slice(&[14i64]))
     );
     let [
-        CacheAction::FreeDeviceKV(duplicates_head),
+        CacheAction::FreeDeviceKVFullOnly(duplicates_head),
         CacheAction::RecoverSwaWithLockedFull {
             node_id,
             kept_full,
             incoming_full,
         },
-        CacheAction::FreeDeviceKV(duplicates_tail),
+        CacheAction::FreeDeviceKVFullOnly(duplicates_tail),
     ] = result.cache_actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKV, RecoverSwaWithLockedFull, FreeDeviceKV, got {:?}",
+            "expected FreeDeviceKVFullOnly, RecoverSwaWithLockedFull, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
@@ -1321,7 +1321,7 @@ fn reinsert_boundary_at_the_node_start_rebuilds_the_whole_node() {
     ));
     assert_eq!(tc.arena.node(b).key, vec![4, 5]);
     let [
-        CacheAction::FreeDeviceKV(duplicates),
+        CacheAction::FreeDeviceKVFullOnly(duplicates),
         CacheAction::SwaRebuild {
             node_id,
             source_value,
@@ -1329,7 +1329,7 @@ fn reinsert_boundary_at_the_node_start_rebuilds_the_whole_node() {
     ] = result.cache_actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKV then SwaRebuild, got {:?}",
+            "expected FreeDeviceKVFullOnly then SwaRebuild, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
@@ -3137,11 +3137,11 @@ fn insert_overlap_straddling_with_a_partial_prev_prefix_recovers_the_tail() {
             node_id,
             source_value,
         },
-        CacheAction::FreeDeviceKV(duplicates),
+        CacheAction::FreeDeviceKVFullOnly(duplicates),
     ] = result.cache_actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKV, got {:?}",
+            "expected FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };

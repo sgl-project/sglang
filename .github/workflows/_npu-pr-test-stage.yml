@@ -186,26 +186,39 @@ jobs:
             }
 
       - name: Install dependencies
-        # Only PR jobs install dependencies
-        if: ${{ inputs.is_nightly_pipeline_job != true }}
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
           RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
+        shell: bash
         run: |
-          # speed up by using infra cache services
+          set -euo pipefail
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.npu_device_type }}
-          # copy required file from our daily cache
-          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          # copy gsm8k dataset
-          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+          if [[ "${{ inputs.is_nightly_pipeline_job }}" != "true" ]]; then
+            bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.npu_device_type }}
+
+          else
+            sglang_pkg_path=/sgl-workspace/sglang/python
+            ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
+            mkdir -p ${ascend_test_util_path}
+            mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
+            cp -r $(pwd)/python/sglang/test/ascend ${ascend_test_util_path}
+
+            pip install sentence_transformers zss "wandb>=0.16.0" tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
+            pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 "sacrebleu>=1.5.0" pytablewriter "peft>=0.2.0" "accelerate>=0.29.1"
+            pip install jsonlines "evaluate>=0.4.0" numexpr dotenv
+
+            hf download MMMU/MMMU --repo-type dataset
+          fi
 
           # install sglang_router
           apt-get install -y libssl-dev

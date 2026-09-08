@@ -29,7 +29,6 @@ os.environ["ASCEND_USE_FIA"] = "true"
 
 
 class TestAscendTp1Bf16(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()

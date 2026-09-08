@@ -362,9 +362,9 @@ class TestSeedSlot:
         new_stored = read_slot_fields(canary_buf=self.buf_pair[0], slot_idx=new_slot)
         assert new_stored[0] == new_token
         assert new_stored[1] == new_position
-        assert new_stored[2] == to_signed_int64(
-            expected_running
-        ), f"new slot prev_hash {new_stored[2]} != expected {to_signed_int64(expected_running)}"
+        assert new_stored[2] == to_signed_int64(expected_running), (
+            f"new slot prev_hash {new_stored[2]} != expected {to_signed_int64(expected_running)}"
+        )
 
 
 class TestChain:
@@ -446,9 +446,9 @@ class TestChain:
             stored_prev_signed, stored_real_kv_hash = read_slot_fields(
                 canary_buf=cuda_buf, slot_idx=slot_idx
             )[2:]
-            assert stored_prev_signed == to_signed_int64(
-                running
-            ), f"slot {slot_idx}: stored prev_hash != recomputed chain step"
+            assert stored_prev_signed == to_signed_int64(running), (
+                f"slot {slot_idx}: stored prev_hash != recomputed chain step"
+            )
             running = splitmix64_mix3(running, token, position)
 
 
@@ -711,9 +711,9 @@ class TestSlotHandling:
         for slot in range(cuda_buf.shape[0]):
             if slot in (5, 7):
                 continue
-            assert torch.equal(
-                after[slot], cuda_buf_before_slot_view[slot]
-            ), f"slot {slot} should not have been written"
+            assert torch.equal(after[slot], cuda_buf_before_slot_view[slot]), (
+                f"slot {slot} should not have been written"
+            )
 
     def test_shrink_active_reqs_does_not_write_stale_slots(self) -> None:
         """Run write with bs=3 plan after a bs=8 run on same buffer: stale slots from bs=8 stay intact."""
@@ -749,9 +749,9 @@ class TestSlotHandling:
 
         after = cuda_buf.view(torch.int64)
         for slot in big_slots:
-            assert torch.equal(
-                after[slot], untouched_snapshot[slot]
-            ), f"slot {slot} from earlier bs=8 run was overwritten by bs=3 run"
+            assert torch.equal(after[slot], untouched_snapshot[slot]), (
+                f"slot {slot} from earlier bs=8 run was overwritten by bs=3 run"
+            )
 
 
 class TestRealKvHash:
@@ -927,9 +927,9 @@ class TestRealKvHash:
         _, _, _, stored_real_kv_hash = read_slot_fields(
             canary_buf=self.buf_pair[0], slot_idx=0
         )
-        assert stored_real_kv_hash == to_signed_int64(
-            expected_hash
-        ), f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(expected_hash):#x}"
+        assert stored_real_kv_hash == to_signed_int64(expected_hash), (
+            f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(expected_hash):#x}"
+        )
 
     def test_paged_real_kv_hash_consistent_across_slots(self) -> None:
         """page=16: writing two slots inside same page yields independent real_kv_hash per slot."""
@@ -1008,9 +1008,9 @@ class TestRealKvHash:
         fields_b = _run_with(sources_b)
         assert fields_a[3] != 0
         assert fields_b[3] != 0
-        assert (
-            fields_a[3] != fields_b[3]
-        ), "reversing source order must change real_kv_hash (fold is ordered)"
+        assert fields_a[3] != fields_b[3], (
+            "reversing source order must change real_kv_hash (fold is ordered)"
+        )
 
 
 class TestRunCounter:
@@ -1201,9 +1201,9 @@ class TestPseudoMode:
         )
         assert int(cuda_log.write_index[0].item()) >= 1
         bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-        assert (
-            bits & consts.FailReason.WRITE_TOKEN_MISMATCH
-        ), f"expected WRITE_TOKEN_MISMATCH bit, got {bits:#b}"
+        assert bits & consts.FailReason.WRITE_TOKEN_MISMATCH, (
+            f"expected WRITE_TOKEN_MISMATCH bit, got {bits:#b}"
+        )
 
     def test_pseudo_mode_off_skips_token_check(self) -> None:
         """enable_write_verify_inputs=False makes the caller pass no expected-input tensors."""

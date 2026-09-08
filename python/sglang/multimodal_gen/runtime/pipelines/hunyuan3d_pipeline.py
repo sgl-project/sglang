@@ -35,9 +35,11 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader 
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
+)
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
     set_default_torch_dtype,
 )
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.hunyuan3d_paint import (
     Hunyuan3DPaintUNet,
 )

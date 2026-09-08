@@ -73,7 +73,6 @@ def _reshape_kv_for_fia_nz(
 
 @dataclass
 class ForwardMetadata:
-
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
 
@@ -301,7 +300,6 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
-
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -1276,9 +1274,12 @@ class AscendAttnBackend(AttentionBackend):
                 if self.use_fia:
                     if self._can_use_tnd(layer):
                         num_token_padding = q.shape[0]
-                        if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                        if (
+                            num_token_padding
+                            > forward_batch.global_num_token_non_padded_cpu
+                        ):
                             q, k, v = [
-                                data[: forward_batch.num_token_non_padded_cpu]
+                                data[: forward_batch.global_num_token_non_padded_cpu]
                                 for data in [q, k, v]
                             ]
                         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -1320,7 +1321,10 @@ class AscendAttnBackend(AttentionBackend):
                         attn_out = attn_out.view(
                             -1, layer.tp_q_head_num * layer.v_head_dim
                         )
-                        if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                        if (
+                            num_token_padding
+                            != forward_batch.global_num_token_non_padded_cpu
+                        ):
                             attn_out = torch.cat(
                                 [
                                     attn_out,
@@ -1413,9 +1417,12 @@ class AscendAttnBackend(AttentionBackend):
                     """FIA supports multi-bs in the current version of CANN"""
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     num_token_padding = q.shape[0]
-                    if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                    if (
+                        num_token_padding
+                        > forward_batch.global_num_token_non_padded_cpu
+                    ):
                         q, k, v = [
-                            data[: forward_batch.num_token_non_padded_cpu]
+                            data[: forward_batch.global_num_token_non_padded_cpu]
                             for data in [q, k, v]
                         ]
                     attn_output, _ = torch_npu.npu_fused_infer_attention_score(
@@ -1441,7 +1448,10 @@ class AscendAttnBackend(AttentionBackend):
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
 
-                    if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                    if (
+                        num_token_padding
+                        != forward_batch.global_num_token_non_padded_cpu
+                    ):
                         attn_output = torch.cat(
                             [
                                 attn_output,
@@ -1701,7 +1711,8 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 num_token_padding = q.shape[0]
                 q, k, v = [
-                    data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+                    data[: forward_batch.global_num_token_non_padded_cpu]
+                    for data in [q, k, v]
                 ]
                 q_nope, q_rope = q.split(
                     [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
@@ -1791,7 +1802,7 @@ class AscendAttnBackend(AttentionBackend):
                 attn_output = attn_output.reshape(
                     [-1, layer.tp_q_head_num, layer.v_head_dim]
                 )
-                if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                if num_token_padding != forward_batch.global_num_token_non_padded_cpu:
                     attn_output = torch.cat(
                         [
                             attn_output,
@@ -1864,7 +1875,8 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 num_token_padding = q.shape[0]
                 q, k, v = [
-                    data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+                    data[: forward_batch.global_num_token_non_padded_cpu]
+                    for data in [q, k, v]
                 ]
 
                 q_nope, q_rope = q.split(
@@ -1893,7 +1905,7 @@ class AscendAttnBackend(AttentionBackend):
                 attn_output = attn_output.reshape(
                     -1, layer.tp_q_head_num, layer.v_head_dim
                 )
-                if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                if num_token_padding != forward_batch.global_num_token_non_padded_cpu:
                     attn_output = torch.cat(
                         [
                             attn_output,
@@ -2013,7 +2025,7 @@ class AscendAttnBackend(AttentionBackend):
 
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
-                query = query[: forward_batch.num_token_non_padded_cpu]
+                query = query[: forward_batch.global_num_token_non_padded_cpu]
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
@@ -2023,15 +2035,22 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             if forward_batch.forward_mode.is_draft_extend_v2():
-                actual_seq_lengths = (
-                    np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
-                )
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                if not self.graph_mode:
+                    extend_seq_lens_cpu = extend_seq_lens_cpu[
+                        : forward_batch._original_batch_size
+                    ]
+                actual_seq_lengths = np.array(extend_seq_lens_cpu).cumsum().tolist()
             else:
                 actual_seq_lengths = np.arange(
                     self.speculative_num_draft_tokens,
                     self.speculative_num_draft_tokens + query.shape[0],
                     self.speculative_num_draft_tokens,
                 )
+
+            if not self.graph_mode:
+                actual_bs = len(actual_seq_lengths)
+                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
 
             is_swa_layer = layer.sliding_window_size != -1
             if (
@@ -2092,14 +2111,15 @@ class AscendAttnBackend(AttentionBackend):
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
-                and forward_batch.num_token_non_padded_cpu is not None
-                and forward_batch.num_token_non_padded_cpu != num_token_padding
+                and forward_batch.global_num_token_non_padded_cpu is not None
+                and forward_batch.global_num_token_non_padded_cpu != num_token_padding
             ):
                 attn_output = torch.cat(
                     [
                         attn_output,
                         attn_output.new_zeros(
-                            num_token_padding - forward_batch.num_token_non_padded_cpu,
+                            num_token_padding
+                            - forward_batch.global_num_token_non_padded_cpu,
                             *attn_output.shape[1:],
                         ),
                     ],
@@ -2127,8 +2147,8 @@ class AscendAttnBackend(AttentionBackend):
             q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
             if not self.graph_mode:
                 num_token_padding = q.shape[0]
-                q_nope = q_nope[: forward_batch.num_token_non_padded_cpu]
-                q_rope = q_rope[: forward_batch.num_token_non_padded_cpu]
+                q_nope = q_nope[: forward_batch.global_num_token_non_padded_cpu]
+                q_rope = q_rope[: forward_batch.global_num_token_non_padded_cpu]
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
@@ -2230,7 +2250,7 @@ class AscendAttnBackend(AttentionBackend):
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
-                and forward_batch.num_token_non_padded_cpu != num_token_padding
+                and forward_batch.global_num_token_non_padded_cpu != num_token_padding
             ):
                 attn_output = torch.cat(
                     [

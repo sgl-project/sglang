@@ -16,17 +16,19 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestOnIdleStallPublish(CustomTestCase):
     def _stalled_scheduler(self) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
+        s.scheduler_stage_metrics = None
         s.maybe_send_health_check_signal = MagicMock()
         s.is_fully_idle = MagicMock(return_value=False)  # stalled, not idle
         s.publish_load_snapshot = MagicMock(return_value=None)
         s.load_publisher = MagicMock()
         s.load_inquirer = MagicMock()
+        s.metrics_reporter = MagicMock()
         s._last_stall_publish_ts = float("-inf")
         return s
 

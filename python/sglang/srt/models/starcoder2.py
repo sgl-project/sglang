@@ -52,7 +52,6 @@ from sglang.srt.utils import add_prefix, make_layers
 
 
 class Starcoder2Attention(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -134,7 +133,6 @@ class Starcoder2Attention(nn.Module):
 
 
 class Starcoder2MLP(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -169,7 +167,6 @@ class Starcoder2MLP(nn.Module):
 
 
 class Starcoder2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -219,7 +216,6 @@ class Starcoder2DecoderLayer(nn.Module):
 
 
 class Starcoder2Model(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -276,7 +272,6 @@ class Starcoder2Model(nn.Module):
 
 
 class Starcoder2ForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,

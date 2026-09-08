@@ -51,9 +51,14 @@ mod tests {
             id: "qwen3".into(),
             tokenizer_path: "x".into(),
             policy: PolicyKind::RoundRobin,
+            decode_policy: Default::default(),
+            bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            affinity: None,
+            fused: None,
+            eligibility: None,
         };
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));
         let res = app

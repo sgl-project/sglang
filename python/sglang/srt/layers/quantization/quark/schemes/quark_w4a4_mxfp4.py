@@ -227,7 +227,6 @@ OCP_MX_BLOCK_SIZE = 32
 
 
 class QuarkW4A4MXFP4(QuarkLinearScheme):
-
     # PackedvLLMParameter / ModelWeightParameter (online and NVFP4->MXFP4
     # paths) only implement the v2 loader API.
     requires_weight_loader_v2 = True
@@ -595,7 +594,6 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
                 # Materialize FP8 parameters on first load on device (there may be several shards for a single layer parameter, e.g. q_proj, k_proj, v_proj).
 
                 if is_weight_or_weight_scale and not layer._fp8_weight_materialized:
-
                     # Sanity check.
                     assert layer.weight.device.type == "meta"
 
@@ -702,7 +700,9 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
                 2,
                 3,
                 5,
-            ], "For tuple input, only (x, x_s), (x, x_s, y), or (x, y, S1, S2, out_dtype) formats are accepted"
+            ], (
+                "For tuple input, only (x, x_s), (x, x_s, y), or (x, y, S1, S2, out_dtype) formats are accepted"
+            )
             if len(x) == 2:
                 x, x_s = x
             elif len(x) == 3:

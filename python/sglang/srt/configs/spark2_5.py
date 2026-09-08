@@ -59,5 +59,9 @@ class Spark2_5Config(PretrainedConfig):
                     "partial_rotary_factor": 1.0,
                 },
             }
-
+        self.hybrid_layer_pattern = [
+            1 if layer_type == "sliding_attention" else 0
+            for layer_type in self.layer_types
+        ]
+        self.is_hybrid_swa = any(self.hybrid_layer_pattern)
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)

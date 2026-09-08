@@ -2053,6 +2053,13 @@ class AbortReq(BaseReq, kw_only=True):
             self.rid = ""
 
 
+class EncoderDispatchErrorReq(BaseReq, kw_only=True):
+    """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
+
+    error_msg: str
+    error_code: int
+
+
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
 

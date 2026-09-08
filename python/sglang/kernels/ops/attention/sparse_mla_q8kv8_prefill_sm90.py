@@ -303,7 +303,7 @@ def sparse_mla_q8kv8_prefill_fwd(
         )
     if indices.ndim != 3:
         raise ValueError(
-            "indices must have shape (s_q, h_kv, topk), " f"got {tuple(indices.shape)}"
+            f"indices must have shape (s_q, h_kv, topk), got {tuple(indices.shape)}"
         )
 
     s_q, h_q, d_qk = q.shape
@@ -362,8 +362,7 @@ def sparse_mla_q8kv8_prefill_fwd(
 
     if indices.shape[:2] != (s_q, h_kv):
         raise ValueError(
-            "indices must have shape "
-            f"({s_q}, {h_kv}, topk), got {tuple(indices.shape)}"
+            f"indices must have shape ({s_q}, {h_kv}, topk), got {tuple(indices.shape)}"
         )
 
     if indices.dtype != torch.int32:
@@ -385,14 +384,13 @@ def sparse_mla_q8kv8_prefill_fwd(
             raise ValueError("topk_length must be a CUDA tensor")
         if topk_length.device != device:
             raise ValueError(
-                "topk_length must be on q's device "
-                f"{device}, got {topk_length.device}"
+                f"topk_length must be on q's device {device}, got {topk_length.device}"
             )
         if not topk_length.is_contiguous():
             raise ValueError("topk_length must be contiguous")
         if torch.any(topk_length < 0).item() or torch.any(topk_length > topk).item():
             raise ValueError(
-                "topk_length values must satisfy " f"0 <= topk_length <= topk ({topk})"
+                f"topk_length values must satisfy 0 <= topk_length <= topk ({topk})"
             )
 
     if d_v != 512:

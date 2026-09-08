@@ -28,8 +28,9 @@ class _CompilableModule(nn.Module):
 
 class _RegionalModel(_CompilableModule):
     _compile_conditions = [
-        lambda name, _module: name.startswith("transformer_blocks.")
-        and name.count(".") == 1
+        lambda name, _module: (
+            name.startswith("transformer_blocks.") and name.count(".") == 1
+        )
     ]
 
     def __init__(self):

@@ -8,7 +8,6 @@
 
 from collections import Counter, defaultdict
 from collections.abc import Callable, Generator
-from itertools import chain
 from types import MethodType
 from typing import Any
 
@@ -40,9 +39,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
 )
 from sglang.multimodal_gen.runtime.loader import rank_local_checkpoint
 from sglang.multimodal_gen.runtime.loader.utils import (
+    finalize_loaded_model,
     get_param_names_mapping,
     hf_to_custom_state_dict,
-    set_default_torch_dtype,
+    initialize_model,
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
@@ -50,10 +50,10 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    process_model_weights_after_loading,
+)
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
-from sglang.srt.utils import is_npu
-
-_is_npu = is_npu()
 
 logger = init_logger(__name__)
 
@@ -293,8 +293,9 @@ def maybe_load_fsdp_model(
         mp_policy=mp_policy,
     )
 
-    with set_default_torch_dtype(default_torch_dtype), torch.device("meta"):
-        model = model_cls(**init_params)
+    model = initialize_model(
+        model_cls, init_params, default_torch_dtype, torch.device("meta")
+    )
 
     # Check if we should use FSDP
     use_fsdp = fsdp_inference
@@ -447,26 +448,10 @@ def maybe_load_fsdp_model(
         # move to device to perform postprocessing
         _move_to_device_preserving_meta(model, weight_postprocess_device)
 
-    for _, module in model.named_modules():
-        quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None and hasattr(
-            quant_method, "process_weights_after_loading"
-        ):
-            if _is_npu and not isinstance(quant_method, UnquantizedLinearMethod):
-                # Activate the NZ format for storing weights,
-                # which is a specific optimization for Ascend NPU
-                torch.npu.config.allow_internal_format = True
-            quant_method.process_weights_after_loading(module)
-            if _is_npu:
-                torch.npu.empty_cache()
+    process_model_weights_after_loading(model)
     model.post_load_weights()
 
-    for n, p in chain(model.named_parameters(), model.named_buffers()):
-        if p.is_meta:
-            raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
-        # Avoid unintended computation graph accumulation during inference
-        if isinstance(p, torch.nn.Parameter):
-            p.requires_grad = False
+    finalize_loaded_model(model)
 
     # 4. deferred cpu offload
     if defer_cpu_placement:

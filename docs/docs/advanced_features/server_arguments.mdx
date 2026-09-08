@@ -521,6 +521,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--retraction-policy`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The decode retraction policy to use when the KV cache is full. 'length' preserves the existing behavior and retracts short-output, long-input requests first. 'priority' retracts lower-priority requests first, using the same priority direction as priority scheduling.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`length`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>length</code>, <code>priority</code></td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--page-size`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The number of tokens in a page.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1`</td>
@@ -1123,6 +1129,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--default-chat-template-kwargs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A JSON object used as defaults for <code>chat_template_kwargs</code> by Chat Completions, Responses, Anthropic-compatible requests, and chat tokenization. Direct Ollama and embedding paths do not consume these defaults. For ordinary template keys, explicit per-request values take precedence. Keys are specific to the selected model's chat template; <code>reasoning_effort</code> is normalized separately.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON / Dict</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--completion-template`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The builtin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
@@ -1142,15 +1154,15 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--reasoning-parser`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Specify the parser for reasoning models. Supported parsers: [deepseek-r1, deepseek-v3, glm45, gpt-oss, kimi, qwen3, qwen3-thinking, step3].</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Specify the parser for reasoning models. Use `auto` to detect the parser from the model's chat template.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>deepseek-r1</code>, <code>deepseek-v3</code>, <code>glm45</code>, <code>gpt-oss</code>, <code>kimi</code>, <code>qwen3</code>, <code>qwen3-thinking</code>, <code>step3</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>apertus2509</code>, <code>deepseek-r1</code>, <code>deepseek-v3</code>, <code>deepseek-v4</code>, <code>dots</code>, <code>glm45</code>, <code>ling3</code>, <code>hunyuan</code>, <code>gpt-oss</code>, <code>k2_horizon</code>, <code>kimi</code>, <code>kimi_k2</code>, <code>kimi_k3</code>, <code>mimo</code>, <code>muse</code>, <code>poolside_v1</code>, <code>qwen3</code>, <code>qwen3-thinking</code>, <code>minimax</code>, <code>minimax-append-think</code>, <code>minimax-m3</code>, <code>step3</code>, <code>step3p5</code>, <code>mistral</code>, <code>nemotron_3</code>, <code>interns1</code>, <code>gemma4</code>, <code>inkling</code>, <code>cohere_command4</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tool-call-parser`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Specify the parser for handling tool-call interactions. Supported parsers: [deepseekv3, deepseekv31, glm, glm45, glm47, gpt-oss, kimi_k2, llama3, mistral, pythonic, qwen, qwen25, qwen3_coder, step3].</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Specify the parser for handling tool-call interactions. Use `auto` to detect the parser from the model's chat template.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>deepseekv3</code>, <code>deepseekv31</code>, <code>glm</code>, <code>glm45</code>, <code>glm47</code>, <code>gpt-oss</code>, <code>kimi_k2</code>, <code>llama3</code>, <code>mistral</code>, <code>pythonic</code>, <code>qwen</code>, <code>qwen25</code>, <code>qwen3_coder</code>, <code>step3</code>, <code>gigachat3</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>apertus2509</code>, <code>cohere_command4</code>, <code>deepseekv3</code>, <code>deepseekv31</code>, <code>deepseekv32</code>, <code>deepseekv4</code>, <code>dots</code>, <code>glm</code>, <code>glm45</code>, <code>glm47</code>, <code>gpt-oss</code>, <code>k2_horizon</code>, <code>kimi_k2</code>, <code>kimi_k3</code>, <code>lfm2</code>, <code>ling3</code>, <code>llama3</code>, <code>mimo</code>, <code>minicpm5</code>, <code>mistral</code>, <code>muse</code>, <code>poolside_v1</code>, <code>pythonic</code>, <code>qwen</code>, <code>qwen25</code>, <code>qwen3_coder</code>, <code>spark25</code>, <code>step3</code>, <code>step3p5</code>, <code>minimax-m2</code>, <code>minimax-m3</code>, <code>trinity</code>, <code>interns1</code>, <code>hermes</code>, <code>hunyuan</code>, <code>gigachat3</code>, <code>gemma4</code>, <code>inkling</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tool-server`</td>
@@ -2758,6 +2770,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--return-hidden-states-mode`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set the maximum hidden-state return mode supported by the server. `last` allows requests with return_hidden_states=False or `last`; `full` also allows return_hidden_states=True.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>last</code>, <code>full</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-return-routed-experts`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable returning routed experts of each layer with responses.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
@@ -3098,6 +3116,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--language-only`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For VLM, load weights for the language model only.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--language-model-only`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip the multimodal encoder entirely: its weights are never loaded and the tower is never built, freeing that GPU memory for KV cache. Multimodal requests are rejected. Unlike --language-only this is a standalone mode, not part of encoder/decoder disaggregation.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>

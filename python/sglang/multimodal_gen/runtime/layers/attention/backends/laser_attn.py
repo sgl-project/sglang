@@ -32,7 +32,6 @@ _BF16_LASER_SCALE = 256.0
 
 
 class LaserAttentionBackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -49,7 +48,6 @@ class LaserAttentionBackend(AttentionBackend):
 
 
 class LaserAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,

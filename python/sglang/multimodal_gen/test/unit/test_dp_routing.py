@@ -6,7 +6,10 @@ and a realtime session always lands on the same replica it started on.
 
 import itertools
 
-from sglang.multimodal_gen.runtime.entrypoints.utils import SetLoraReq, ShutdownReq
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    SetLoraReq,
+    ShutdownReq,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import (

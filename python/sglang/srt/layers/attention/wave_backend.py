@@ -42,7 +42,6 @@ class ForwardMetadata:
 
 
 class WaveAttnBackend(AttentionBackend):
-
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
@@ -131,9 +130,9 @@ class WaveAttnBackend(AttentionBackend):
         num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
         num_group = num_token // num_seq
 
-        assert (
-            num_group * num_seq == num_token
-        ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+        assert num_group * num_seq == num_token, (
+            f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+        )
 
         if self.static_kv_splits or self.device_core_count <= 0:
             num_kv_splits.fill_(self.max_kv_splits)

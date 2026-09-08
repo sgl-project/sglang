@@ -182,8 +182,7 @@ def flatten_rc_config(config: dict) -> dict:
     activation = text.get("hidden_activation", "silu")
     if activation != "silu":
         raise ValueError(
-            f"RC config has hidden_activation={activation!r}; this port "
-            "hardcodes silu"
+            f"RC config has hidden_activation={activation!r}; this port hardcodes silu"
         )
 
     head_dim = int(text.get("head_dim", 128))

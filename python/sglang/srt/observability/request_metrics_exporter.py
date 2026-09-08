@@ -83,7 +83,10 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
         out_skip_names: Optional[set[str]],
     ):
         super().__init__(server_args, obj_skip_names, out_skip_names)
-        self.export_dir = getattr(server_args, "export_metrics_to_file_dir")
+        # Given at construction, not read from the process: the exporter is
+        # handed the directory it writes to, and a test builds several with
+        # different ones.
+        self.export_dir = server_args.export_metrics_to_file_dir
         os.makedirs(self.export_dir, exist_ok=True)
 
         # File handler state management

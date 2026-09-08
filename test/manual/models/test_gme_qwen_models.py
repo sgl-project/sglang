@@ -64,16 +64,16 @@ class TestQmeQwenModels(CustomTestCase):
             hf_text_embeddings.embed_logits[0], srt_text_embeddings.embed_logits[0]
         )
         print("texts similarity diff", abs(similarity - 1))
-        assert torch.all(
-            abs(similarity - 1) < prefill_tolerance
-        ), "embeddings are not all close"
+        assert torch.all(abs(similarity - 1) < prefill_tolerance), (
+            "embeddings are not all close"
+        )
         similarity = get_similarities(
             hf_image_embeddings.embed_logits[0], srt_image_embeddings.embed_logits[0]
         )
         print("images similarity diff", abs(similarity - 1))
-        assert torch.all(
-            abs(similarity - 1) < prefill_tolerance
-        ), "embeddings are not all close"
+        assert torch.all(abs(similarity - 1) < prefill_tolerance), (
+            "embeddings are not all close"
+        )
 
     def test_accuracy(self):
         for model, prefill_tolerance in MODELS:

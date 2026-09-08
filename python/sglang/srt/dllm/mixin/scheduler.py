@@ -75,9 +75,9 @@ class SchedulerDllmMixin:
             result.copy_done.synchronize()
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
-        assert (
-            not fdfo_mode or result.accept_length_per_req_cpu is not None
-        ), "FDFO dLLM result is missing accept lengths."
+        assert not fdfo_mode or result.accept_length_per_req_cpu is not None, (
+            "FDFO dLLM result is missing accept lengths."
+        )
 
         # FDFO also commits unresolved blocks so their KV can be reused.
         if fdfo_mode or result.next_token_ids:
@@ -317,9 +317,8 @@ class SchedulerDllmMixin:
 
             # Try preemption if batch is full
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req
                 ):
                     break
 

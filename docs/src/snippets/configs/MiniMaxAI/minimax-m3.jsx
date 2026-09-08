@@ -61,21 +61,21 @@ export const config = {
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
     accuracy: {
       gsm8k_pct:
-`pip install git+https://github.com/sgl-project/sgl-eval
+`pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
   --temperature 1.0 --top-p 0.95 \\
   --thinking`,
       gpqa_pct:
-`pip install git+https://github.com/sgl-project/sgl-eval
+`pip install sgl-eval
 sgl-eval run gpqa \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
   --temperature 1.0 --top-p 0.95 \\
   --thinking --n-repeats 4 --max-tokens 40960`,
       mmmu_pro_pct:
-`pip install git+https://github.com/sgl-project/sgl-eval
+`pip install sgl-eval
 sgl-eval run mmmu_pro \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\

@@ -173,9 +173,9 @@ def _find_unique_def(
         if isinstance(node, definition) and node.name == name
     ]
     assert matches, f"{name} not found in {where}"
-    assert (
-        len(matches) == 1
-    ), f"{len(matches)} defs named {name} in {where}; pass from_class to disambiguate"
+    assert len(matches) == 1, (
+        f"{len(matches)} defs named {name} in {where}; pass from_class to disambiguate"
+    )
     return matches[0]
 
 
@@ -287,9 +287,9 @@ def _lowered_call_text(text: str, node: ast.Call) -> str:
     """
     receiver = node.args[0]
     receiver_src = _node_slice(text, receiver)
-    assert (
-        "\n" not in receiver_src and "#" not in receiver_src
-    ), f"receiver {receiver_src!r} must be single-line and comment-free"
+    assert "\n" not in receiver_src and "#" not in receiver_src, (
+        f"receiver {receiver_src!r} must be single-line and comment-free"
+    )
     opener = _slice_span(
         text,
         node.func.end_lineno,
@@ -722,9 +722,9 @@ class Repro:
                     )
                 existing = [alias_text(a.name, a.asname) for a in node.names]
                 added = alias_text(name, asname)
-                assert (
-                    added not in existing
-                ), f"{name!r} already imported from {module!r} in {rel}"
+                assert added not in existing, (
+                    f"{name!r} already imported from {module!r} in {rel}"
+                )
                 rebuilt = f"from {module} import " + ", ".join(existing + [added]) + nl
                 lines[node.lineno - 1 : node.end_lineno] = [rebuilt]
                 _write_source(path, "".join(lines))
@@ -825,9 +825,9 @@ class Repro:
                 for node in tree.body
                 if isinstance(node, (ast.Import, ast.ImportFrom))
             ]
-            assert (
-                imports
-            ), f"no imports to anchor a new `if TYPE_CHECKING:` block in {rel}"
+            assert imports, (
+                f"no imports to anchor a new `if TYPE_CHECKING:` block in {rel}"
+            )
             insert_at = imports[-1].end_lineno
             lines[insert_at:insert_at] = [
                 nl,
@@ -864,9 +864,9 @@ class Repro:
                     replaced = lines[node.lineno - 1].replace(
                         f"from {spelled} import", f"from {new_module} import", 1
                     )
-                    assert (
-                        replaced != lines[node.lineno - 1]
-                    ), f"import spelling {spelled!r} not found on its line in {rel}"
+                    assert replaced != lines[node.lineno - 1], (
+                        f"import spelling {spelled!r} not found on its line in {rel}"
+                    )
                     lines[node.lineno - 1] = replaced
                     changed = True
             assert changed, f"nested import of {name} from {old_module} not in {rel}"
@@ -974,9 +974,9 @@ class Repro:
         ``self: Target`` annotation is dropped (redundant inside the class). The body is moved
         verbatim; the formatter normalises the surrounding blank lines.
         """
-        assert (
-            before is None or after is None
-        ), "move_symbol: before and after are mutually exclusive"
+        assert before is None or after is None, (
+            "move_symbol: before and after are mutually exclusive"
+        )
 
         def op(root: Path) -> None:
             src_path = root / src
@@ -1255,15 +1255,17 @@ class Repro:
                 targets = (
                     node.targets
                     if isinstance(node, ast.Assign)
-                    else [node.target] if isinstance(node, ast.AnnAssign) else []
+                    else [node.target]
+                    if isinstance(node, ast.AnnAssign)
+                    else []
                 )
                 names = {t.id for t in targets if isinstance(t, ast.Name)}
                 hit = names & dropped
                 if not hit:
                     continue
-                assert len(names) == len(
-                    targets
-                ), f"drop_assigns {sorted(hit)}: non-name targets in {src}"
+                assert len(names) == len(targets), (
+                    f"drop_assigns {sorted(hit)}: non-name targets in {src}"
+                )
                 value_src = ast.unparse(node.value) if node.value is not None else None
                 for dropped_name in hit:
                     removed_assigns[dropped_name] = value_src
@@ -1289,15 +1291,17 @@ class Repro:
                 else:
                     assign_spans.append((node.lineno, node.end_lineno))
                 found_assigns |= hit
-            assert (
-                found_assigns == dropped
-            ), f"{dropped - found_assigns} not assigned in {src}"
+            assert found_assigns == dropped, (
+                f"{dropped - found_assigns} not assigned in {src}"
+            )
             rederivable: dict[str, str | None] = {}
             for node in tree.body:
                 targets = (
                     node.targets
                     if isinstance(node, ast.Assign)
-                    else [node.target] if isinstance(node, ast.AnnAssign) else []
+                    else [node.target]
+                    if isinstance(node, ast.AnnAssign)
+                    else []
                 )
                 names = [t.id for t in targets if isinstance(t, ast.Name)]
                 if not names or set(names) & dropped:
@@ -1383,9 +1387,9 @@ class Repro:
             src_text = _read_source(src_path)
             assert src_text.count(body) == 1, f"block not found uniquely in {src}"
             at = src_text.find(body)
-            assert (
-                at == 0 or src_text[at - 1] == "\n"
-            ), f"block matches mid-line in {src}; it must start at a line boundary"
+            assert at == 0 or src_text[at - 1] == "\n", (
+                f"block matches mid-line in {src}; it must start at a line boundary"
+            )
             _write_source(src_path, src_text.replace(body, call, 1))
 
             dst_path = root / dst

@@ -26,7 +26,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _temp_path() -> str:
@@ -192,8 +192,10 @@ class TestZmqRoundTrip(CustomTestCase):
 
             loads = _read_until(
                 lambda: reader.read_all(),
-                lambda snaps: len(snaps) == dp_size
-                and all(snap.timestamp == 3.0 for snap in snaps),
+                lambda snaps: (
+                    len(snaps) == dp_size
+                    and all(snap.timestamp == 3.0 for snap in snaps)
+                ),
             )
             self.assertEqual(len(loads), dp_size)
             for load in loads:
@@ -373,8 +375,9 @@ class TestZmqReaderOwner(CustomTestCase):
         override = get_context().override_server_args(**fields)
         override.install()
         self.addCleanup(override.restore)
-        with mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"), mock.patch.object(
-            rc._CONTEXT, "_publish_role", "dp_controller"
+        with (
+            mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"),
+            mock.patch.object(rc._CONTEXT, "_publish_role", "dp_controller"),
         ):
             self.assertTrue(zmq_reader_owner("DataParallelController"))
 
@@ -442,8 +445,10 @@ class TestEndToEndZmqSimulation(CustomTestCase):
 
             loads = _read_until(
                 lambda: reader.read_all(),
-                lambda snaps: len(snaps) == dp_size
-                and all(snap.timestamp == 1.0 for snap in snaps),
+                lambda snaps: (
+                    len(snaps) == dp_size
+                    and all(snap.timestamp == 1.0 for snap in snaps)
+                ),
             )
             self.assertEqual(len(loads), dp_size)
             self.assertEqual(loads[0].num_running_reqs, 10)
@@ -464,8 +469,10 @@ class TestEndToEndZmqSimulation(CustomTestCase):
 
             loads = _read_until(
                 lambda: reader.read_all(),
-                lambda snaps: len(snaps) == dp_size
-                and all(snap.timestamp == 2.0 for snap in snaps),
+                lambda snaps: (
+                    len(snaps) == dp_size
+                    and all(snap.timestamp == 2.0 for snap in snaps)
+                ),
             )
             self.assertEqual(loads[0].num_running_reqs, 20)
             self.assertEqual(loads[1].num_running_reqs, 21)

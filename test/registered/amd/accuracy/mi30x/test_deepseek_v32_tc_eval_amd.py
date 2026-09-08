@@ -99,8 +99,7 @@ class TestDeepseekV32TC(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32 TC MI325)\n"
-                f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32 TC MI325)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], GSM8K_ACCURACY_THRESHOLD)
 
@@ -113,8 +112,7 @@ class TestDeepseekV32TC(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32 TC MI325)\n"
-                f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32 TC MI325)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 10)
 

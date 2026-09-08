@@ -195,7 +195,7 @@ def serve(args, extra_argv):
         else:
             registered = registry.get(backend_name)
             logger.info(
-                "Dispatch override enabled: --model-type=%s " "(skip auto detection)",
+                "Dispatch override enabled: --model-type=%s (skip auto detection)",
                 backend_name,
             )
 

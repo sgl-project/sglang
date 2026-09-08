@@ -33,8 +33,8 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
             "minicpm_flashattn": ("fa4" if get_platform().is_blackwell else "fa3"),
             "minicpm_flashinfer": "flashinfer",
         }
-        # Literal keys keep the written-field set statically derivable; a loop
-        # variable hides it from the census in test_chain_read_ratchet.py.
+        # Keep the three backend decisions explicit so each resolved field is
+        # easy to review independently.
         dense_attention = dense_backends.get(cfg.attention_backend)
         if dense_attention is not None:
             overrides["attention_backend"] = dense_attention

@@ -502,7 +502,7 @@ async def process_sample(
                         }
                     )
                 print(
-                    f"[INPUT ]   [{i+1}] type={ttype!r:12s}  expected: {expected[:120]}",
+                    f"[INPUT ]   [{i + 1}] type={ttype!r:12s}  expected: {expected[:120]}",
                     flush=True,
                 )
             # Print OCR output (truncate long outputs)

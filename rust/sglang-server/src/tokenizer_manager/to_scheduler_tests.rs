@@ -84,12 +84,12 @@ fn make_intake_inner(
     (intake, detok_rx, consumer, tm_tx, mm_rx)
 }
 
-/// An [`Mm`] over `tx` with a fresh sidecar.
-fn test_mm(tx: flume::Sender<MmRequest>, enabled: bool) -> Mm {
-    Mm {
+/// An [`MmDispatch`] over `tx` with a fresh result store.
+fn test_mm(tx: flume::Sender<MmRequest>, enabled: bool) -> MmDispatch {
+    MmDispatch {
         enabled,
         tx,
-        sidecar: Default::default(),
+        results: Default::default(),
     }
 }
 
@@ -636,6 +636,27 @@ fn negative_and_logprob_token_ids_rejected() {
     }
 }
 
+#[test]
+fn multimodal_sentinel_is_validated_after_expansion() {
+    let mut req = generate_req(24, SamplingParams::default());
+    let RequestKind::Generate(g) = &mut req.kind else {
+        unreachable!()
+    };
+    g.input_ids = Some(vec![1, -103, 2]);
+    g.mm = Some(Box::new(crate::message::request::MmData {
+        audio_data: Some(rmpv::Value::from("data:audio/wav;base64,xxxx")),
+        ..Default::default()
+    }));
+
+    assert!(validate(&mut req, &test_limits()).is_ok());
+    let RequestKind::Generate(g) = &mut req.kind else {
+        unreachable!()
+    };
+    assert!(validate_input_ids(g, test_limits().vocab_size).is_err());
+    g.input_ids = Some(vec![1, 103, 2]);
+    assert!(validate_input_ids(g, test_limits().vocab_size).is_ok());
+}
+
 /// A valid request is registered and handed onward — never deregistered.
 #[test]
 fn admitted_request_keeps_registration() {
@@ -760,7 +781,7 @@ fn mm_generate_req(rid: &str) -> Request {
 
 /// An abort while the request is parked for MM cancels it: the pending
 /// entry is removed, the worker's late result is dropped, and its parked
-/// sidecar entry is purged — no scheduler work runs for a dead client.
+/// result-store entry is purged — no scheduler work runs for a dead client.
 #[test]
 fn abort_cancels_parked_mm_request() {
     let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
@@ -768,10 +789,10 @@ fn abort_cancels_parked_mm_request() {
     mm_rx.try_recv().expect("parked to mm pool");
 
     // The worker parks its result, as it always does before MmEncoded.
-    intake.mm.sidecar.park(
+    intake.mm.results.park(
         "mm-gone".into(),
-        crate::multi_modality::sidecar::MmSidecarEntry {
-            features: crate::multi_modality::sidecar::FeatureStore::Inline(vec![]),
+        crate::multi_modality::result_store::MmEncodedEntry {
+            features: crate::multi_modality::result_store::FeatureStore::Inline(vec![]),
             grids: vec![],
             hashes: vec![],
             offsets: vec![],
@@ -782,13 +803,13 @@ fn abort_cancels_parked_mm_request() {
     intake.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
     assert_eq!(consumer.drain(16).headers.len(), 1, "only the AbortReq");
 
-    // The late result must be dropped, not queued, and the sidecar purged.
+    // The late result must be dropped, not queued, and the parked result purged.
     intake.on_mm_encoded("mm-gone".to_string().into(), vec![5, 6]);
     assert!(
         consumer.drain(16).headers.is_empty(),
         "cancelled, not queued"
     );
-    assert!(intake.mm.sidecar.take("mm-gone").is_none(), "entry purged");
+    assert!(intake.mm.results.take("mm-gone").is_none(), "entry purged");
 }
 
 /// A multimodal request parks in `Encoding` (submitted to the mm worker
@@ -840,7 +861,7 @@ fn mm_failure_rejects_parked_request() {
     assert!(consumer.drain(16).headers.is_empty(), "nothing queued");
 }
 
-/// On a non-multimodal model (`Mm::enabled == false`), image_data is silently
+/// On a non-multimodal model (`MmDispatch::enabled == false`), image_data is silently
 /// ignored and the request tokenizes as plain text — the Python
 /// TokenizerManager behavior when `mm_processor is None`.
 #[test]

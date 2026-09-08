@@ -42,7 +42,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=29, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
@@ -424,9 +424,9 @@ def bench_api(
     (excluded from latency measurement).
     """
     items = setup_fn()
-    assert (
-        len(items) >= num_ops + warmup
-    ), f"need {num_ops + warmup} items, got {len(items)}"
+    assert len(items) >= num_ops + warmup, (
+        f"need {num_ops + warmup} items, got {len(items)}"
+    )
 
     for i in range(warmup):
         op_fn(items[i])

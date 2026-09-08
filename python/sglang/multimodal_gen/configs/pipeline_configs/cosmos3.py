@@ -90,11 +90,6 @@ def _distilled_sampler_config(model_path: str) -> dict | None:
     return sampler
 
 
-def is_distilled_checkpoint(model_path: str) -> bool:
-    """Whether the checkpoint is a few-step distilled variant."""
-    return _distilled_sampler_config(model_path) is not None
-
-
 def get_distilled_sigmas(model_path: str) -> list[float] | None:
     """The explicit fixed-step sigma schedule for a distilled checkpoint."""
     sampler = _distilled_sampler_config(model_path)
@@ -170,7 +165,7 @@ class Cosmos3Config(PipelineConfig):
             if self.distilled_sigmas is not None:
                 self.scheduler_class_override = None
 
-    def adjust_num_frames(self, num_frames: int) -> int:
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
         """Round ``num_frames`` so ``(n - 1) % 4 == 0`` for the VAE.
 
         Skips rounding when ``num_frames == 1`` (T2I path) so the single

@@ -76,9 +76,9 @@ def check_lora_server_args(server_args: Any):
                             pinned=False,
                         )
                 elif isinstance(lora_path, dict):
-                    assert (
-                        "lora_name" in lora_path and "lora_path" in lora_path
-                    ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                    assert "lora_name" in lora_path and "lora_path" in lora_path, (
+                        f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                    )
                     lora_ref = LoRARef(
                         lora_id=LoRARef.deterministic_id(
                             lora_path["lora_name"], lora_path["lora_path"]
@@ -129,14 +129,14 @@ def check_lora_server_args(server_args: Any):
                 lora_target_modules=set(cfg.lora_target_modules),
             )
             if "all" in cfg.lora_target_modules:
-                assert (
-                    len(cfg.lora_target_modules) == 1
-                ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                assert len(cfg.lora_target_modules) == 1, (
+                    "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                )
 
         # Ensure sufficient information is provided for LoRA initialization.
-        assert cfg.lora_paths or (
-            cfg.max_lora_rank and cfg.lora_target_modules
-        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        assert cfg.lora_paths or (cfg.max_lora_rank and cfg.lora_target_modules), (
+            "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        )
 
         # Validate max_loaded_loras
         if cfg.max_loaded_loras is not None:
@@ -158,9 +158,9 @@ def check_lora_server_args(server_args: Any):
         if cfg.lora_use_virtual_experts:
             logger.info("Virtual expert computation enabled.")
 
-        assert (
-            cfg.lora_drain_wait_threshold >= 0.0
-        ), "--lora-drain-wait-threshold must be non-negative."
+        assert cfg.lora_drain_wait_threshold >= 0.0, (
+            "--lora-drain-wait-threshold must be non-negative."
+        )
 
 
 def check_lora_speculative_compatibility(server_args: Any):

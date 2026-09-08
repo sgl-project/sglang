@@ -36,7 +36,6 @@ def _srt_clip_param_name(name: str) -> str:
 
 
 class CLIPTextTransformer(nn.Module):
-
     def __init__(
         self,
         config: CLIPTextConfig,
@@ -145,7 +144,6 @@ class CLIPTextTransformer(nn.Module):
 
 
 class CLIPTextModel(TextEncoder):
-
     def __init__(
         self,
         config: CLIPTextConfig,
@@ -254,7 +252,6 @@ class CLIPTextModelWithProjection(CLIPTextModel):
 
 
 class CLIPVisionTransformer(nn.Module):
-
     def __init__(
         self,
         config: CLIPVisionConfig,

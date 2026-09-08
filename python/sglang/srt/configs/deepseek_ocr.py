@@ -193,7 +193,6 @@ class ImageTransform(object):
             elif not x.is_floating_point():
                 x = x.to(torch.float32)
             if self.normalize:
-
                 import torchvision.transforms as T
 
                 x = T.Normalize(self.mean, self.std)(x)
@@ -620,9 +619,9 @@ class DeepseekOCRProcessor(ProcessorMixin):
             tokenized_str = tokenized_str + [self.eos_id]
             images_seq_mask = images_seq_mask + [False]
 
-        assert len(tokenized_str) == len(
-            images_seq_mask
-        ), f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        assert len(tokenized_str) == len(images_seq_mask), (
+            f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        )
 
         masked_tokenized_str = []
         for token_index in tokenized_str:

@@ -1871,9 +1871,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
     ) -> None:
         super().__init__()
         out_dim = heads * head_dim
-        assert (
-            out_dim == in_dim
-        ), f"in_dim ({in_dim}) must equal heads*head_dim ({out_dim})"
+        assert out_dim == in_dim, (
+            f"in_dim ({in_dim}) must equal heads*head_dim ({out_dim})"
+        )
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.heads = heads
@@ -2219,9 +2219,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if beta.ndim == 3 and beta.shape != (B, heads, T):
             return f"requires beta shape {(B, heads, T)}, got {tuple(beta.shape)}"
         if beta.ndim == 4 and beta.shape != (B, heads, T, S):
-            return (
-                f"requires beta shape {(B, heads, T, S)}, " f"got {tuple(beta.shape)}"
-            )
+            return f"requires beta shape {(B, heads, T, S)}, got {tuple(beta.shape)}"
         if decay.shape != (B, heads, T):
             return f"requires decay shape {(B, heads, T)}, got {tuple(decay.shape)}"
         if head_dim > 128:
@@ -2252,8 +2250,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if precheck_reason is not None:
             if self.gdn_backend == "triton":
                 raise RuntimeError(
-                    "SANA-WM Triton camera GDN backend unavailable: "
-                    f"{precheck_reason}"
+                    f"SANA-WM Triton camera GDN backend unavailable: {precheck_reason}"
                 )
             return None
 

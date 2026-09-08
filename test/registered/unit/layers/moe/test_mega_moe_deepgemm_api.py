@@ -15,7 +15,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.moe import mega_moe
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):
@@ -106,8 +106,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         deep_gemm = ModuleType("deep_gemm")
         deep_gemm.transform_sf_into_required_layout = MagicMock(
-            side_effect=lambda _sf, mn, k, recipe, num_groups, disable_ue8m0_cast: torch.zeros(
-                (num_groups, mn, max(1, k // 32)), dtype=torch.int32
+            side_effect=lambda _sf, mn, k, recipe, num_groups, disable_ue8m0_cast: (
+                torch.zeros((num_groups, mn, max(1, k // 32)), dtype=torch.int32)
             )
         )
         deep_gemm.transform_weights_for_mega_moe = MagicMock(

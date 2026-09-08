@@ -71,26 +71,26 @@ export const config = {
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
   --num-threads 128`,
       gpqa_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 # GPQA's HF dataset (Idavidrein/gpqa) is gated — accept its terms with your HF account first.
 sgl-eval run gpqa \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
   --num-threads 128`,
       mmlu_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run mmlu \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
   --num-threads 128`,
       aime25_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\

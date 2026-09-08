@@ -887,9 +887,9 @@ class VisionTransformer(nn.Module):
         if global_pool is not None:
             assert global_pool in ("", "avg", "token", "map")
             if global_pool == "map" and self.attn_pool is None:
-                assert (
-                    False
-                ), "Cannot currently add attention pooling in reset_classifier()."
+                assert False, (
+                    "Cannot currently add attention pooling in reset_classifier()."
+                )
             elif global_pool != "map " and self.attn_pool is not None:
                 self.attn_pool = None  # remove attention pooling
             self.global_pool = global_pool
@@ -987,7 +987,6 @@ def model_name_to_cls(cls_name):
         cls = CLIPVisionTower
 
     elif "VQ" in cls_name:
-
         cls = VQ_models[cls_name]
     elif "vision_head" in cls_name:
         cls = vision_head
@@ -1056,9 +1055,9 @@ def create_siglip_vit(
     ckpt_path: str = "",
     **kwargs,
 ):
-    assert (
-        model_name in SigLIP_MODEL_CONFIG.keys()
-    ), f"model name should be in {SigLIP_MODEL_CONFIG.keys()}"
+    assert model_name in SigLIP_MODEL_CONFIG.keys(), (
+        f"model name should be in {SigLIP_MODEL_CONFIG.keys()}"
+    )
 
     vision_cfg = SigLIPVisionCfg(**SigLIP_MODEL_CONFIG[model_name])
 
@@ -1918,7 +1917,6 @@ class MultiModalityPreTrainedModel(PreTrainedModel):
 # Copied and adapted from:
 # https://github.com/deepseek-ai/Janus/tree/main/janus/models/modeling_vlm.py
 class MultiModalityCausalLM(MultiModalityPreTrainedModel):
-
     def __init__(
         self,
         config: MultiModalityConfig,

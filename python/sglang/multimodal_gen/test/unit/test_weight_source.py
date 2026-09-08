@@ -143,6 +143,44 @@ def test_safetensors_weight_set_rejects_unindexed_variants(tmp_path):
         resolve_safetensors_weight_set(str(tmp_path))
 
 
+def test_safetensors_weight_set_prefers_canonical_precision_family(tmp_path):
+    canonical = tmp_path / "model.safetensors"
+    canonical.write_bytes(b"canonical")
+    (tmp_path / "model.fp16.safetensors").write_bytes(b"fp16")
+
+    resolved = resolve_safetensors_weight_set(str(tmp_path))
+
+    assert resolved.selected_files == (canonical.name,)
+
+
+def test_explicit_precision_variant_overrides_canonical_fallback(tmp_path):
+    (tmp_path / "model.safetensors").write_bytes(b"canonical")
+    variant = tmp_path / "model.fp16.safetensors"
+    variant.write_bytes(b"fp16")
+
+    resolved = resolve_safetensors_weight_set(str(tmp_path), weight_name=variant.name)
+
+    assert resolved.selected_files == (variant.name,)
+
+
+def test_safetensors_weight_set_prefers_canonical_precision_index(tmp_path):
+    canonical = tmp_path / "model.safetensors"
+    variant = tmp_path / "model.fp16.safetensors"
+    canonical.write_bytes(b"canonical")
+    variant.write_bytes(b"fp16")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"weight":"model.safetensors"}}'
+    )
+    (tmp_path / "model.fp16.safetensors.index.json").write_text(
+        '{"weight_map":{"weight":"model.fp16.safetensors"}}'
+    )
+
+    resolved = resolve_safetensors_weight_set(str(tmp_path))
+
+    assert resolved.index_file == "model.safetensors.index.json"
+    assert resolved.selected_files == (canonical.name,)
+
+
 def test_safetensors_index_rejects_non_weight_shard(tmp_path):
     (tmp_path / "config.json").write_text("{}")
     (tmp_path / "model.safetensors.index.json").write_text(

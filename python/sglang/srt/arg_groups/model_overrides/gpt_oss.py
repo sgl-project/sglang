@@ -67,7 +67,6 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
         # use bf16 for mxfp4 triton kernels
         overrides["dtype"] = "bfloat16"
     if cfg.moe_runner_backend == "auto":
-
         if get_platform().is_sm100 and is_mxfp4_quant_format:
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
             logger.warning(

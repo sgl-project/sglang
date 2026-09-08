@@ -442,9 +442,10 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
 
     bf16_capture = _Capture()
     q8_capture = _Capture()
-    with _patched_sparse_kernels(
-        bf16_capture, q8_capture
-    ), _patched_compressed_sparse_cache_paths(compress_ratio):
+    with (
+        _patched_sparse_kernels(bf16_capture, q8_capture),
+        _patched_compressed_sparse_cache_paths(compress_ratio),
+    ):
         bf16_out = backend._forward_prefill_sparse(
             q=q,
             layer_id=0,

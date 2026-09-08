@@ -61,12 +61,12 @@ export const config = {
   --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
       aime26_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime26 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 64000 \\
@@ -74,7 +74,7 @@ sgl-eval run aime26 \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
       aime25_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 64000 \\

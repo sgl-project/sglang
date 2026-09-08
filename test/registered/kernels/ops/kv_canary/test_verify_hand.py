@@ -380,9 +380,9 @@ class TestChain:
                 buf_pair=buf_pair, plan_pair=plan_pair, assert_equal=False
             )
 
-            assert (
-                _n_violations(cuda_log) == 0
-            ), f"unexpected violation at iteration token={token} position={position} slot={slot_idx}"
+            assert _n_violations(cuda_log) == 0, (
+                f"unexpected violation at iteration token={token} position={position} slot={slot_idx}"
+            )
 
     def test_prev_slot_padding_skips_chain_check_arbitrary_stored_hash(self) -> None:
         """prev_slot_idx == TOKEN_TO_KV_SLOT_PADDING → chain check is skipped, regardless of stored chain hash."""
@@ -692,9 +692,9 @@ class TestViolationField:
                 f"(bit_to_trigger={bit_to_trigger} injection_position={injection_position})"
             )
         else:
-            assert (
-                _n_violations(cuda_log) > ring_capacity
-            ), "write_index did not advance beyond ring_capacity after overflow"
+            assert _n_violations(cuda_log) > ring_capacity, (
+                "write_index did not advance beyond ring_capacity after overflow"
+            )
 
     def test_position_mismatch_sets_position_bit_only(self) -> None:
         """Plan.position != stored.position with chain hash correct → only POSITION bit set."""
@@ -706,12 +706,12 @@ class TestViolationField:
         cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
         assert _n_violations(cuda_log) == 1
         bits = _fail_bits(cuda_log)
-        assert (
-            bits & consts.FailReason.VERIFY_POSITION_MISMATCH
-        ), f"expected POSITION bit, got {bits:#b}"
-        assert (
-            bits & consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
-        ) == 0, f"chain hash bit unexpectedly set: {bits:#b}"
+        assert bits & consts.FailReason.VERIFY_POSITION_MISMATCH, (
+            f"expected POSITION bit, got {bits:#b}"
+        )
+        assert (bits & consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH) == 0, (
+            f"chain hash bit unexpectedly set: {bits:#b}"
+        )
 
 
 class TestRealKvHash:
@@ -990,9 +990,9 @@ class TestRealKvHash:
 
         assert _n_violations(cuda_log) >= 1
         bits = _fail_bits(cuda_log)
-        assert (
-            bits & consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
-        ), f"expected REAL_KV_HASH bit, got {bits:#b}"
+        assert bits & consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH, (
+            f"expected REAL_KV_HASH bit, got {bits:#b}"
+        )
 
     def test_real_kv_off_does_not_deref_real_kv_sources(self) -> None:
         buf_pair = _buf_pair(num_slots=8)
@@ -1738,9 +1738,9 @@ class TestViolationRing:
         plan_slot_set = set(slot_indices)
         for row in range(n_violations):
             kind = int(cuda_log.ring[row, consts.VIOLATION_FIELD_KERNEL_KIND].item())
-            assert kind == int(
-                launch_tag
-            ), f"row {row} kind {kind} != {int(launch_tag)}"
+            assert kind == int(launch_tag), (
+                f"row {row} kind {kind} != {int(launch_tag)}"
+            )
             slot = int(cuda_log.ring[row, 1].item())
             assert slot in plan_slot_set, f"row {row} slot {slot} not in plan"
 

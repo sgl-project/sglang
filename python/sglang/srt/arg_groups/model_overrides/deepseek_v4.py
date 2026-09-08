@@ -24,7 +24,6 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     writes, the max_running_requests fill and the validations stay in the
     hook at its legacy slot."""
     cfg = resolving_view(server_args)
-    from sglang.srt.server_args import ServerArgs
 
     model_arch = hf_config.architectures[0]
     overrides: Dict[str, Any] = {"attention_backend": "dsv4"}
@@ -44,7 +43,7 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."
     )
 
-    if cfg.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+    if cfg.swa_full_tokens_ratio is None:
         overrides["swa_full_tokens_ratio"] = 0.1
         logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
 
@@ -70,7 +69,5 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             )
         ):
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
-            logger.info(
-                "Use flashinfer_mxfp4 as MoE runner backend for " f"{model_arch}."
-            )
+            logger.info(f"Use flashinfer_mxfp4 as MoE runner backend for {model_arch}.")
     return overrides

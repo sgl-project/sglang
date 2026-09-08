@@ -52,8 +52,9 @@ cvt.rs.f16x2.f32 $0, $2, $1, $3;
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
 @triton.heuristics(
     {
-        "HAS_STATE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"]
-        is not None
+        "HAS_STATE_BATCH_INDICES": lambda args: (
+            args["state_batch_indices_ptr"] is not None
+        )
     }
 )
 @triton.heuristics(
@@ -61,24 +62,23 @@ cvt.rs.f16x2.f32 $0, $2, $1, $3;
 )
 @triton.heuristics(
     {
-        "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"]
-        is not None
+        "CACHE_INTERMEDIATE_STATES": lambda args: (
+            args["intermediate_states_buffer"] is not None
+        )
     }
 )
 @triton.heuristics(
     {
-        "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: args[
-            "retrieve_parent_token_ptr"
-        ]
-        is not None
+        "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: (
+            args["retrieve_parent_token_ptr"] is not None
+        )
     }
 )
 @triton.heuristics(
     {
-        "HAS_INTERMEDIATE_STATE_INDICES": lambda args: args[
-            "intermediate_state_indices_ptr"
-        ]
-        is not None
+        "HAS_INTERMEDIATE_STATE_INDICES": lambda args: (
+            args["intermediate_state_indices_ptr"] is not None
+        )
     }
 )
 @triton.jit(do_not_specialize=["T"])

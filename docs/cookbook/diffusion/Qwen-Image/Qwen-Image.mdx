@@ -95,7 +95,7 @@ also tested on this profile and did not improve steady-state latency.
 
 ### 3.3 Configuration Tips
 
-Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
+See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
@@ -248,6 +248,15 @@ sglang serve --model-path Qwen/Qwen-Image
 - `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference.
 - `--vae-cpu-offload`: Use CPU offload for VAE.
 - `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
+
+#### 4.2.3 Known LoRA examples
+
+Use `--lora-path` at startup or the [LoRA management API](/docs/sglang-diffusion/api/openai_api#lora-management) to load an adapter. Known Qwen-Image examples include:
+
+- [`lightx2v/Qwen-Image-Lightning`](https://huggingface.co/lightx2v/Qwen-Image-Lightning)
+- [`flymy-ai/qwen-image-realism-lora`](https://huggingface.co/flymy-ai/qwen-image-realism-lora)
+- [`prithivMLmods/Qwen-Image-HeadshotX`](https://huggingface.co/prithivMLmods/Qwen-Image-HeadshotX)
+- [`starsfriday/Qwen-Image-EVA-LoRA`](https://huggingface.co/starsfriday/Qwen-Image-EVA-LoRA)
 
 ## 5. Benchmark
 

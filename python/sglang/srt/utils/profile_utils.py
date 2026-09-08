@@ -109,9 +109,9 @@ class ProfileManager:
         self.detailed_annotations = detailed_annotations
         # not supported yet
         assert start_step is None
-        assert (
-            profile_by_stage
-        ), "only support profile_by_stage=true now"  # `false` can be easily supported
+        assert profile_by_stage, (
+            "only support profile_by_stage=true now"
+        )  # `false` can be easily supported
         assert not merge_profiles
 
         if output_dir is None:

@@ -39,9 +39,7 @@ class BenchArgs:
     presence_penalty: float = 0.0
     json: bool = False
     return_logprob: bool = False
-    prompt: str = (
-        "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
-    )
+    prompt: str = "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
     image: bool = False
     many_images: bool = False
     stop: Optional[list] = None
@@ -144,7 +142,7 @@ def send_one_prompt(
         else:
             if args.different_prompts:
                 prompt = [
-                    f"Test case {i+1}: " + args.prompt for i in range(args.batch_size)
+                    f"Test case {i + 1}: " + args.prompt for i in range(args.batch_size)
                 ]
             else:
                 prompt = [args.prompt] * args.batch_size

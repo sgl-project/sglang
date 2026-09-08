@@ -359,6 +359,54 @@ class MyModelPipeline(LoRAPipeline, ComposedPipelineBase):
 EntryClass = [MyModelPipeline]
 ```
 
+#### Reuse component loaders
+
+Most components should keep the default loader for their role (transformer,
+text encoder, VAE, scheduler, or tokenizer). For an auxiliary module that accepts
+`model_cls(**config)` and loads an unchanged state dict, select
+`PlainStateDictComponentLoader` instead of adding a model-specific loader class:
+
+```python
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    PlainStateDictComponentLoader,
+)
+
+
+class MyModelPipeline(ComposedPipelineBase):
+    _required_config_modules = ["transformer", "queryformer", "text_projection"]
+    component_loaders = {
+        "queryformer": PlainStateDictComponentLoader,
+        "text_projection": PlainStateDictComponentLoader,
+    }
+
+    # Wire the stages as in the examples above.
+```
+
+The mapping uses exact pipeline component names, including aliases declared in
+`_extra_config_module_map`. It is local to this pipeline; omitted components keep
+their existing dispatch. An explicitly selected loader fails on errors instead
+of falling back to a different implementation.
+
+Register each module through `EntryClass` in its model file, or
+`ModelRegistry.register_model` for an out-of-tree package. The shared loader:
+
+- Resolves the registered class from `config.json`'s `_class_name`, falling back
+  to the architecture in `model_index.json`, and passes non-metadata config
+  fields to its constructor.
+- Loads a single safetensors file or an indexed sharded checkpoint using the
+  shared checkpoint selector, with strict key and shape checks.
+- Honors exact overrides such as `--component-weights-paths.queryformer PATH`
+  and `--component-precisions.queryformer bf16`. Precision defaults to the
+  pipeline's `dit_precision`.
+- Leaves eval mode and final CPU/GPU placement to the shared loading lifecycle.
+  It does not implement TP/FSDP weight sharding, quantization, or direct GPU
+  loading. Explicit quantization and direct-GPU-loading overrides are rejected.
+
+Keep a specialized loader when the component needs a config-object constructor,
+weight remapping or fusion, sharding, or a non-standard checkpoint format. Such
+a loader can also be selected through `component_loaders`; registering a model
+alone does not opt it into the plain state-dict protocol.
+
 ### 4. Last-Resort Before-Denoising Stage
 
 A `BeforeDenoisingStage` is not a catch-all replacement for the native stages.
@@ -456,8 +504,9 @@ implementation.
    baseline.
 5. If the model supports LoRA, CFG parallelism, or disaggregation, test each
    feature explicitly.
-6. Add or update docs, examples, or the compatibility matrix when users need a
-   new launch command.
+6. Add or update the cookbook, examples, and
+   [Supported Models](./compatibility_matrix) catalog when users need a new
+   launch command.
 
 Common failure points:
 

@@ -284,7 +284,6 @@ REFERENCE_STATS = {
 
 
 class TestMoELoraRegression(unittest.TestCase):
-
     def test_sglang_moe_parity_strict(self):
 
         with SRTRunner(
@@ -299,7 +298,6 @@ class TestMoELoraRegression(unittest.TestCase):
             attention_backend="flashinfer",
             mem_fraction_static=0.80,
         ) as srt_runner:
-
             srt_outputs = srt_runner.forward(
                 MOE_LORA_TEST_PROMPTS,
                 max_new_tokens=10,

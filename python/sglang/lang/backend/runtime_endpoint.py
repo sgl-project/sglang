@@ -133,18 +133,14 @@ class RuntimeEndpoint(BaseBackend):
 
         dtype_regex = None
         if sampling_params.dtype in ["int", int]:
-
             dtype_regex = REGEX_INT
             sampling_params.stop.extend([" ", "\n"])
         elif sampling_params.dtype in ["float", float]:
-
             dtype_regex = REGEX_FLOAT
             sampling_params.stop.extend([" ", "\n"])
         elif sampling_params.dtype in ["str", str]:
-
             dtype_regex = REGEX_STR
         elif sampling_params.dtype in ["bool", bool]:
-
             dtype_regex = REGEX_BOOL
         else:
             raise RuntimeError(f"Invalid dtype: {sampling_params.dtype}")

@@ -109,6 +109,18 @@ class _BoundedCaptureCache:
             or self.evict_on_miss
         )
 
+    def _evict_lru(self) -> None:
+        evicted_signature, evicted = self.entries.popitem(last=False)
+        self._release(evicted)
+        self.evictions += 1
+        logger.debug(
+            "Evicted VLA %s CUDA graph for signature %s (entries=%d/%d)",
+            self.name,
+            evicted_signature,
+            len(self.entries),
+            self.max_entries,
+        )
+
     def prepare_admission(self, signature: Any) -> None:
         if (
             signature in self.entries
@@ -116,16 +128,7 @@ class _BoundedCaptureCache:
             or not self.evict_on_miss
         ):
             return
-        evicted_signature, evicted = self.entries.popitem(last=False)
-        self._release(evicted)
-        self.evictions += 1
-        logger.info(
-            "Evicted VLA %s CUDA graph for signature %s (entries=%d/%d)",
-            self.name,
-            evicted_signature,
-            len(self.entries),
-            self.max_entries,
-        )
+        self._evict_lru()
 
     def put(self, signature: Any, entry: Any) -> bool:
         if self.max_entries == 0 or not self.can_admit(signature):
@@ -138,16 +141,7 @@ class _BoundedCaptureCache:
         self.captures += 1
 
         if len(self.entries) > self.max_entries:
-            evicted_signature, evicted = self.entries.popitem(last=False)
-            self._release(evicted)
-            self.evictions += 1
-            logger.info(
-                "Evicted VLA %s CUDA graph for signature %s (entries=%d/%d)",
-                self.name,
-                evicted_signature,
-                len(self.entries),
-                self.max_entries,
-            )
+            self._evict_lru()
         return True
 
     def discard(self, signature: Any) -> None:

@@ -26,7 +26,7 @@ def _jit_usp_relayout_module(dtype: torch.dtype) -> Module:
         cuda_wrappers=[
             (
                 "usp_merge_heads",
-                "usp_relayout::" f"UspMergeHeadsKernel<{args}>::run",
+                f"usp_relayout::UspMergeHeadsKernel<{args}>::run",
             ),
         ],
     )

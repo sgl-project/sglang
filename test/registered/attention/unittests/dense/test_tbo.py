@@ -21,8 +21,8 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

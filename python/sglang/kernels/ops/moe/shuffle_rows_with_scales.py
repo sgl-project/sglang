@@ -95,12 +95,12 @@ def shuffle_rows_with_scales(
     assert q.dim() == 2 and scale.dim() == 2, "q and scale must be 2D"
     assert q.is_contiguous() and scale.is_contiguous(), "q and scale must be contiguous"
     assert q.element_size() == 1, f"q must be a 1-byte dtype, got {q.dtype}"
-    assert (
-        q.shape[0] == scale.shape[0]
-    ), f"row count mismatch: q {q.shape[0]} vs scale {scale.shape[0]}"
-    assert (
-        dst2src_map.numel() >= num_dst_rows
-    ), f"map holds {dst2src_map.numel()} rows, need {num_dst_rows}"
+    assert q.shape[0] == scale.shape[0], (
+        f"row count mismatch: q {q.shape[0]} vs scale {scale.shape[0]}"
+    )
+    assert dst2src_map.numel() >= num_dst_rows, (
+        f"map holds {dst2src_map.numel()} rows, need {num_dst_rows}"
+    )
     # The kernel reads the map as whatever dtype it carries and casts to int64,
     # so a float map would truncate into a plausible-looking row id instead of
     # failing.

@@ -290,7 +290,7 @@ def _run_e2e_scenario(
     print(f"Comparator debug output: {debug_file}")
 
     assert result.returncode == 0, (
-        f"Comparator failed (rc={result.returncode}). " f"Debug output: {debug_file}"
+        f"Comparator failed (rc={result.returncode}). Debug output: {debug_file}"
     )
 
 

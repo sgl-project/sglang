@@ -24,9 +24,9 @@ from sglang.srt.multimodal.internvl_utils import IMAGENET_MEAN, IMAGENET_STD
 
 def float_triplet(seq: Any):
     a, b, c = tuple(seq)
-    assert (
-        isinstance(a, float) and isinstance(b, float) and isinstance(c, float)
-    ), "expected three floats"
+    assert isinstance(a, float) and isinstance(b, float) and isinstance(c, float), (
+        "expected three floats"
+    )
     return a, b, c
 
 

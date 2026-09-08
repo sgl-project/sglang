@@ -105,6 +105,10 @@ def _next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
+def _triton_key() -> str:
+    return "triton-stub"
+
+
 class _Config:
     """Minimal stand-in for ``triton.Config`` used in ``@triton.autotune``."""
 
@@ -438,6 +442,10 @@ def install_platform_stubs() -> None:
         jit_mod.KernelInterface = _KernelInterface
         runtime.jit = jit_mod
 
+        cache_mod = _make_mock("triton.runtime.cache")
+        cache_mod.triton_key = _triton_key
+        runtime.cache = cache_mod
+
         # Torch 2.13 imports these as classes while initializing Inductor, even on
         # MPS where no Triton kernel is compiled. Define them explicitly so the
         # catch-all meta-path finder does not materialize class names as modules.
@@ -465,7 +473,7 @@ def install_platform_stubs() -> None:
             pass
 
         compiler_impl.ASTSource = _ASTSource
-        compiler_impl.triton_key = lambda: "triton-stub"
+        compiler_impl.triton_key = _triton_key
         compiler_root.compiler = compiler_impl
         triton.compiler = compiler_root
 

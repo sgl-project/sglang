@@ -4,7 +4,6 @@ import requests
 
 
 class EBNFConstrainedMixin:
-
     ebnf_grammar = 'root ::= "test"'  # Default grammar
 
     def _run_decode_ebnf(

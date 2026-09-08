@@ -24,9 +24,9 @@ class AscendLoRABackend(BaseLoRABackend):
     def run_lora_a_embedding(
         self, input_ids, weights, vocab_size, extra_embeddings=None, *args, **kwargs
     ):
-        assert (
-            extra_embeddings is None
-        ), "Ascend LoRA embedding backend does not support extra embeddings (added tokens)."
+        assert extra_embeddings is None, (
+            "Ascend LoRA embedding backend does not support extra embeddings (added tokens)."
+        )
 
         total_seq_len = input_ids.shape[0]
         if weights.numel() == 0:
@@ -268,9 +268,9 @@ class AscendLoRABackend(BaseLoRABackend):
         bs = forward_batch.batch_size
 
         if use_cuda_graph:
-            assert (
-                self.npu_graph_batch_info is not None
-            ), "NPU Graph batch info is not initialized."
+            assert self.npu_graph_batch_info is not None, (
+                "NPU Graph batch info is not initialized."
+            )
             batch_info = self.npu_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = forward_batch.batch_size

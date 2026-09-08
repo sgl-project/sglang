@@ -624,9 +624,9 @@ class StreamExecutor:
             self.meta_info[name] = meta_info
             self.variable_event[name].set()
         else:
-            assert (
-                self.num_api_spec_tokens is None
-            ), "stream is not supported with api speculative execution"
+            assert self.num_api_spec_tokens is None, (
+                "stream is not supported with api speculative execution"
+            )
             generator = self.backend.generate_stream(
                 self, sampling_params=sampling_params
             )

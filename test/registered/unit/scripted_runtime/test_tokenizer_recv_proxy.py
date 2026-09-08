@@ -11,25 +11,22 @@ from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import unittest
 
 
 @dataclass
 class _ControlMsg:
-
     tag: str = "flush"
 
 
 @dataclass
 class _StartReq:
-
     rid: str
 
 
 class _FakeUnderlyingSocket:
-
     def __init__(self) -> None:
         self._ready: deque = deque()
         self._scheduled: list[list] = []
@@ -62,7 +59,6 @@ def _is_start_req(rid: str):
 
 
 class TestScriptedTokenizerRecvProxyRecv(CustomTestCase):
-
     def test_recv_pyobj_drains_then_pops_fifo(self):
         underlying = _FakeUnderlyingSocket()
         proxy = ScriptedTokenizerRecvProxy(underlying=underlying)
@@ -88,7 +84,6 @@ class TestScriptedTokenizerRecvProxyRecv(CustomTestCase):
 
 
 class TestScriptedTokenizerRecvProxyWaitUntilArrived(CustomTestCase):
-
     def _proxy_with_stale_control(self):
         underlying = _FakeUnderlyingSocket()
         proxy = ScriptedTokenizerRecvProxy(underlying=underlying)

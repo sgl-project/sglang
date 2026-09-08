@@ -23,9 +23,9 @@ class HostTensorAllocator:
         self.dims = None
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
-        assert (
-            device == "cpu"
-        ), f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
+        assert device == "cpu", (
+            f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
+        )
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
@@ -46,9 +46,9 @@ class ShmHostTensorAllocator(HostTensorAllocator):
         return self.mms[0] if self.mms else None
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
-        assert (
-            device == "cpu"
-        ), f"ShmHostTensorAllocator only supports CPU allocations; got device={device!r}"
+        assert device == "cpu", (
+            f"ShmHostTensorAllocator only supports CPU allocations; got device={device!r}"
+        )
         self.dtype = dtype
         self.dims = dims
         from sglang.srt.mem_cache.storage.mmap import alloc_shm
@@ -189,8 +189,7 @@ def _cuda_host_unregister_ranges(
         if rc != 0:
             failed_ranges.append((ptr, size))
             logger.warning(
-                "cudaHostUnregister failed during %s (rc=%d, %s) "
-                "for ptr=%#x size=%d",
+                "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
                 operation,
                 rc,
                 cudart.cudaGetErrorString(rc),

@@ -100,9 +100,9 @@ class TestRegressionBasic(ScriptedTestCase):
             f"observed max={observed_max} (pre-fix bug would bump to 2 "
             f"at the last-chunk admit boundary)"
         )
-        assert (
-            cleared_inflight
-        ), "inflight_middle_chunks should be 0 once the chunk loop clears"
+        assert cleared_inflight, (
+            "inflight_middle_chunks should be 0 once the chunk loop clears"
+        )
 
         yield from run_until_finished(r)
         assert r.finished
@@ -247,15 +247,15 @@ class TestRegressionBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
 
-        assert (
-            r.req.kv.req_pool_idx is None
-        ), f"96d4749094: abort must release row; got row_idx={r.req.kv.req_pool_idx!r}"
-        assert (
-            r.kv_pages == 0
-        ), f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
-        assert (
-            r.lock_refs == 0
-        ), f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
+        assert r.req.kv.req_pool_idx is None, (
+            f"96d4749094: abort must release row; got row_idx={r.req.kv.req_pool_idx!r}"
+        )
+        assert r.kv_pages == 0, (
+            f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
+        )
+        assert r.lock_refs == 0, (
+            f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
+        )
         assert not r.is_chunking
         assert r.req.inflight_middle_chunks == 0
         assert sum(t.get_all_node_lock_refs().values()) == baseline_refs
