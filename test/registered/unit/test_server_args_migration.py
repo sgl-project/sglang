@@ -7,6 +7,8 @@ translates field annotations into argparse arguments.
 import argparse
 import unittest
 
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.runtime_context import get_model, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import configure_media_url_security
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -16,7 +18,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestServerArgsAnnotatedCli(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.parser = argparse.ArgumentParser()
@@ -95,8 +96,10 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                     "32",
                 ]
             )
+            # The normalization is a declaration.
             self.assertEqual(
-                sa.allowed_media_domains, ["127.0.0.1", "media.example.com"]
+                resolution_result(sa, "allowed_media_domains"),
+                ["127.0.0.1", "media.example.com"],
             )
             self.assertEqual(sa.media_url_max_file_size_mb, 32)
         finally:
@@ -130,9 +133,13 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         serial = self._parse([])
         overlap = self._parse(["--startup-weight-load-mode", "overlap"])
         self.assertEqual(serial.startup_weight_load_mode, "serial")
-        self.assertFalse(serial.is_startup_weight_load_overlap)
         self.assertEqual(overlap.startup_weight_load_mode, "overlap")
-        self.assertTrue(overlap.is_startup_weight_load_overlap)
+        # The predicate over that leaf is a bag leaf now, computed at publish.
+        for record, expected in ((serial, False), (overlap, True)):
+            reset_context()
+            self.addCleanup(reset_context)
+            publish(record, role="test")
+            self.assertIs(get_model().is_startup_weight_load_overlap, expected)
 
         with self.assertRaises(SystemExit):
             self.parser.parse_args(

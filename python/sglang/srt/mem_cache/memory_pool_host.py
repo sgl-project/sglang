@@ -2,11 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.hicache_storage import PoolName
+from typing import Optional
 
 import torch
 
@@ -189,10 +185,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        page_aligned_only: bool = False,
     ):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
+        # A page row of the FP4 indexer buffers is a grouped slot layout rather
+        # than a flat token array, so the token-granular copy used for fused
+        # DSv4 C4 rows does not apply and only whole pages may move.
+        self.page_aligned_only = page_aligned_only
         self.num_host_pages = num_host_pages
         self.slot_page_size = slot_page_size
         self.dtype = torch.uint8
@@ -240,6 +241,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=self.layer_num * self.item_bytes,
             )
         elif self.layout == "page_first_direct":
             self.kv_buffer = alloc_func(
@@ -248,6 +250,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=self.layer_num * self.item_bytes,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -306,6 +309,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
+
+    def _unaligned_transfer_error(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> ValueError:
+        return ValueError(
+            f"{self.pool_name} expects page-aligned indices: got "
+            f"{host_indices.numel()} host and {device_indices.numel()} device "
+            f"indices for page size {self.slot_page_size}."
+        )
 
     def _has_transfer_indices(
         self, host_indices: torch.Tensor | None, device_indices: torch.Tensor | None
@@ -377,6 +389,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             # Token-granular DSV4 C4 copy needs this helper because a token is
             # not one contiguous byte range in the paged row:
             # [value0..value63][scale0..scale63].
+            if self.page_aligned_only:
+                raise self._unaligned_transfer_error(host_indices, device_indices)
             transfer_cache_dsv4_mla(
                 src_ptrs=self.device_ptrs,
                 dst_ptrs=self.data_ptrs,
@@ -455,6 +469,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         ):
             # Same DSV4 C4 layout issue as backup: this is token-granular
             # preload, so it cannot use the normal HiCache page-row copy.
+            if self.page_aligned_only:
+                raise self._unaligned_transfer_error(host_indices, device_indices)
             transfer_cache_dsv4_mla(
                 src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
                 dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],
@@ -643,6 +659,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=(self.layer_num * self.state_page_bytes),
             )
         elif self.layout == "page_first_direct":
             self.kv_buffer = alloc_func(
@@ -651,6 +668,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=(self.layer_num * self.state_page_bytes),
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -955,131 +973,3 @@ class DeepSeekV4StateHostPool(HostKVCache):
             self.kv_buffer.data_ptr() % page_size_bytes == 0
             and page_bytes % page_size_bytes == 0
         )
-
-
-@dataclass
-class PoolEntry:
-    name: PoolName
-    host_pool: Any
-    device_pool: Any
-    layer_mapper: Callable[[int], Optional[int]]
-    is_primary_index_anchor: bool = False
-    # Optional eviction callbacks for auto-alloc in HybridCacheController.
-    # host_evict_fn(n): evict n slots from the host pool (used by write()).
-    # device_evict_fn(n): evict n slots from the device pool (used by load()).
-    host_evict_fn: Optional[Callable] = None
-    device_evict_fn: Optional[Callable] = None
-    # Optional alloc/free overrides for the device side, used by
-    # _resolve_pool_transfers_allocation. Set when entry.device_pool is the
-    # raw KV/state pool (layout) rather than an allocator (e.g. SWA/Mamba,
-    # where alloc lives on a separate allocator object).
-    # When None, fall back to entry.device_pool.alloc/free.
-    device_alloc_fn: Optional[Callable] = None
-    device_free_fn: Optional[Callable] = None
-
-
-class HostPoolGroup:
-    def __init__(self, entries: list[PoolEntry]):
-        if not entries:
-            raise ValueError("HostPoolGroup requires at least one pool entry.")
-        self.entries = entries
-        self.entry_map = {entry.name: entry for entry in entries}
-        self.anchor_entry = next(
-            (entry for entry in entries if entry.is_primary_index_anchor),
-            entries[0],
-        )
-
-        self.layout = self.anchor_entry.host_pool.layout
-        self.page_size = self.anchor_entry.host_pool.page_size
-        self.device = self.anchor_entry.host_pool.device
-        self.size = self.anchor_entry.host_pool.size
-        self.logical_size = self.anchor_entry.host_pool.logical_size
-        child_write_back_jit = [
-            getattr(entry.host_pool, "can_use_write_back_jit", False)
-            for entry in entries
-        ]
-        self.can_use_write_back_jit = all(child_write_back_jit)
-        self.supports_per_pool_backup_indices = any(child_write_back_jit)
-
-    def add_entry(self, entry: PoolEntry) -> None:
-        if entry.name in self.entry_map:
-            raise ValueError(f"Host pool {entry.name} is already registered.")
-        self.entries.append(entry)
-        self.entry_map[entry.name] = entry
-        self.can_use_write_back_jit = (
-            self.can_use_write_back_jit and entry.host_pool.can_use_write_back_jit
-        )
-        self.supports_per_pool_backup_indices = (
-            self.supports_per_pool_backup_indices
-            or entry.host_pool.can_use_write_back_jit
-        )
-
-    @property
-    def kv_buffer(self):
-        return self.anchor_entry.host_pool.kv_buffer
-
-    @property
-    def size_per_token(self):
-        return self.anchor_entry.host_pool.size_per_token
-
-    @property
-    def allocator(self):
-        return self.anchor_entry.host_pool.allocator
-
-    @property
-    def dtype(self):
-        return self.anchor_entry.host_pool.dtype
-
-    @property
-    def start_layer(self):
-        return self.anchor_entry.host_pool.start_layer
-
-    @property
-    def end_layer(self):
-        return self.anchor_entry.host_pool.end_layer
-
-    def get_ksize_per_token(self):
-        return self.anchor_entry.host_pool.get_ksize_per_token()
-
-    def get_size_per_token(self):
-        return self.anchor_entry.host_pool.get_size_per_token()
-
-    def get_pool(self, name: PoolName):
-        return self.entry_map[name].host_pool
-
-    def get_page_buffer_meta(self, indices):
-        return self.anchor_entry.host_pool.get_page_buffer_meta(indices)
-
-    def get_split_heads_page_buffer_meta(self, indices, split_factor: int):
-        return self.anchor_entry.host_pool.get_split_heads_page_buffer_meta(
-            indices, split_factor
-        )
-
-    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        return self.anchor_entry.host_pool.is_stride_page_aligned(page_size_bytes)
-
-    def clear(self) -> None:
-        for entry in self.entries:
-            entry.host_pool.clear()
-
-    def destroy(self) -> None:
-        for entry in self.entries:
-            entry.host_pool.destroy()
-
-    def available_size(self):
-        return self.anchor_entry.host_pool.available_size()
-
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        return self.anchor_entry.host_pool.alloc(need_size)
-
-    def free(self, indices: torch.Tensor) -> int:
-        return self.anchor_entry.host_pool.free(indices)
-
-    def get_data_page(self, index, flat: bool = True):
-        return self.anchor_entry.host_pool.get_data_page(index, flat)
-
-    def get_dummy_flat_data_page(self):
-        return self.anchor_entry.host_pool.get_dummy_flat_data_page()
-
-    def set_from_flat_data_page(self, index: int, data_page) -> None:
-        return self.anchor_entry.host_pool.set_from_flat_data_page(index, data_page)
