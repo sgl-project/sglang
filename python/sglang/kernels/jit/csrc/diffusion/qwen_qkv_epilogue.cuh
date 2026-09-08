@@ -135,8 +135,10 @@ __global__ void qwen_qkv_epilogue_kernel(const Params __grid_constant__ params) 
       const float y = elems[i + 1];
       const float cos = i == 0 ? cos_pair.x : cos_pair.y;
       const float sin = i == 0 ? sin_pair.x : sin_pair.y;
-      elems[i] = x * cos - y * sin;
-      elems[i + 1] = y * cos + x * sin;
+      // Preserve the original QKNorm/RoPE contraction: round the sin product
+      // before adding it to the fused cos product, including for vector loads.
+      elems[i] = __fmaf_rn(x, cos, -__fmul_rn(y, sin));
+      elems[i + 1] = __fmaf_rn(y, cos, __fmul_rn(x, sin));
     }
 
 #pragma unroll
