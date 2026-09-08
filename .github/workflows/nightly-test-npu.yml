@@ -408,7 +408,9 @@ jobs:
   nightly-poc-multi-node-tests-cann910:
     name: multi-node-poc-cann910
     if: ${{ !cancelled() }}
-    needs: [set-image-config]
+    # Multi-node jobs run strictly one at a time to avoid contending for the
+    # same A3 multi-node resources: 9.0.0 multi -> 9.0.0 mix -> cann910 multi -> cann910 mix.
+    needs: [set-image-config, nightly-poc-multi-node-tests, nightly-poc-multi-node-mix-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
