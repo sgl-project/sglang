@@ -62,6 +62,7 @@ from __future__ import annotations
 import bisect
 import json
 import logging
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -147,6 +148,10 @@ def _parse_bs_candidates(cfg: dict) -> tuple[list[int], dict[int, list[int]]]:
     for key, entry in cfg.items():
         if not key.isdigit():
             continue
+        if int(key) < 1:
+            raise ValueError(
+                f"throughput-aware batch-size key must be positive, got {key!r}"
+            )
         if not isinstance(entry, dict):
             raise ValueError(
                 f"throughput-aware config key '{key}' must map to a JSON object, "
@@ -156,14 +161,16 @@ def _parse_bs_candidates(cfg: dict) -> tuple[list[int], dict[int, list[int]]]:
         if (
             not isinstance(steps, list)
             or not steps
-            or not all(isinstance(s, int) and s > 0 for s in steps)
+            or not all(
+                isinstance(s, int) and not isinstance(s, bool) and s > 0 for s in steps
+            )
         ):
             raise ValueError(
                 f"throughput-aware config key '{key}': "
                 f"candidate_steps must be a non-empty list of positive ints, "
                 f"got {steps!r}"
             )
-        bs_candidates[int(key)] = sorted(steps)
+        bs_candidates[int(key)] = sorted(set(steps))
 
     if not bs_candidates:
         raise ValueError(
@@ -174,7 +181,44 @@ def _parse_bs_candidates(cfg: dict) -> tuple[list[int], dict[int, list[int]]]:
     return sorted(bs_candidates), bs_candidates
 
 
-def resolve_throughput_aware_candidate_steps(cfg_path: Optional[str] = None) -> list[int]:
+def _config_int(cfg: dict, name: str, default: int, *, minimum: int) -> int:
+    value = cfg.get(name, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    return value
+
+
+def _config_optional_positive_int(cfg: dict, name: str) -> Optional[int]:
+    value = cfg.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{name} must be a positive integer or null, got {value!r}")
+    return value
+
+
+def _config_profile_batch_sizes(cfg: dict) -> Optional[list[int]]:
+    value = cfg.get("profile_run_batch_sizes")
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(
+            isinstance(item, int) and not isinstance(item, bool) and item > 0
+            for item in value
+        )
+    ):
+        raise ValueError(
+            "profile_run_batch_sizes must be a non-empty list of positive "
+            f"integers or null, got {value!r}"
+        )
+    return sorted(set(value))
+
+
+def resolve_throughput_aware_candidate_steps(
+    cfg_path: Optional[str] = None,
+) -> list[int]:
     """Return the union of all candidate steps across all BS slots.
 
     Used by ``server_args.max_speculative_num_draft_tokens`` to pre-size
@@ -207,20 +251,37 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
         )
         self._all_candidate_steps: list[int] = all_candidate_steps
 
-        window_size: int = int(cfg.get("window_size", 20))
-        self._update_interval: int = int(cfg.get("update_interval", 5))
+        window_size = _config_int(cfg, "window_size", 20, minimum=1)
+        self._update_interval = _config_int(cfg, "update_interval", 5, minimum=1)
         self._tracker = PositionAcceptanceTracker(
             max_steps=max(all_candidate_steps),
             window_size=window_size,
         )
         self._cost_table = BatchSizeCostTable()
 
-        self._profile_batch_sizes: Optional[list[int]] = cfg.get("profile_run_batch_sizes")
-        self._max_profile_bs: Optional[int] = cfg.get("max_profile_run_batch_size")
-        self._profile_n_warmup: int = int(cfg.get("profile_run_n_warmup", 5))
-        self._profile_n_measure: int = int(cfg.get("profile_run_n_measure", 10))
-        self._profile_run_seq_len: Optional[int] = cfg.get("profile_run_seq_len")
-        self._switch_hysteresis: float = float(cfg.get("switch_hysteresis", 0.1))
+        self._profile_batch_sizes = _config_profile_batch_sizes(cfg)
+        self._max_profile_bs = _config_optional_positive_int(
+            cfg, "max_profile_run_batch_size"
+        )
+        self._profile_n_warmup = _config_int(cfg, "profile_run_n_warmup", 5, minimum=0)
+        self._profile_n_measure = _config_int(
+            cfg, "profile_run_n_measure", 10, minimum=1
+        )
+        self._profile_run_seq_len = _config_optional_positive_int(
+            cfg, "profile_run_seq_len"
+        )
+        switch_hysteresis = cfg.get("switch_hysteresis", 0.1)
+        if (
+            not isinstance(switch_hysteresis, (int, float))
+            or isinstance(switch_hysteresis, bool)
+            or not math.isfinite(switch_hysteresis)
+            or switch_hysteresis < 0
+        ):
+            raise ValueError(
+                "switch_hysteresis must be a finite non-negative number, "
+                f"got {switch_hysteresis!r}"
+            )
+        self._switch_hysteresis = float(switch_hysteresis)
 
         first_candidates = self._bs_candidates[self._bs_list[0]]
         self._current_steps: int = worker.speculative_num_steps
@@ -265,7 +326,8 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
         if self._cuda_graph_bs is None:
             return None
         return [
-            bs for bs in self._cuda_graph_bs
+            bs
+            for bs in self._cuda_graph_bs
             if step in self._bs_candidates[self._find_closest_bs_key(bs)]
         ]
 
@@ -274,22 +336,26 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
 
     def _resolve_profile_seq_len(self) -> int:
         """Prefill context length for profiling (config or auto, clamped to context_length)."""
-        server_args = getattr(self.worker, "server_args", None)
-        ctx = int(getattr(server_args, "context_length", None) or 4096)
+        ctx = int(self.worker.model_config.context_len)
         max_step = max(self._all_candidate_steps) if self._all_candidate_steps else 1
         decode_growth = (self._profile_n_warmup + self._profile_n_measure) * (
             max_step + 1
         )
         headroom = decode_growth + 16
+        if ctx <= headroom:
+            raise ValueError(
+                "throughput-aware profiling needs context_length greater than "
+                f"warmup/measurement headroom, got {ctx} <= {headroom}"
+            )
         default_len = min(2048, max(256, ctx - headroom))
         seq_len = self._profile_run_seq_len or default_len
         return int(max(1, min(seq_len, ctx - headroom)))
 
-    def run_profiling(self, tree_cache) -> None:
+    def run_profiling(self, tree_cache, *, max_running_requests: int) -> None:
         """Fill cost table via SpecProfilingSession for each (steps, batch_size)."""
         from sglang.srt.speculative.spec_profiling_session import SpecProfilingSession
 
-        steps_to_profile_bs = self._build_profile_grid()
+        steps_to_profile_bs = self._build_profile_grid(max_running_requests)
         if not any(steps_to_profile_bs.values()):
             log_info_on_rank0(
                 logger,
@@ -346,7 +412,7 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
             f"[ThroughputAware] Cost table ready: {self._cost_table.summary()}",
         )
 
-    def _build_profile_grid(self) -> dict[int, list[int]]:
+    def _build_profile_grid(self, max_running_requests: int) -> dict[int, list[int]]:
         """Map num_steps -> batch sizes to profile."""
         if self._cuda_graph_bs is None:
             return {}
@@ -357,10 +423,15 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
         )
         if self._max_profile_bs is not None:
             pool = [b for b in pool if b <= self._max_profile_bs]
+        pool = [b for b in pool if b <= max_running_requests]
         return {
             steps: profiled
             for steps in self._all_candidate_steps
-            if (profiled := sorted(set(pool) & set(self.cuda_graph_bs_for_step(steps) or [])))
+            if (
+                profiled := sorted(
+                    set(pool) & set(self.cuda_graph_bs_for_step(steps) or [])
+                )
+            )
         }
 
     def activate_step_by_batch(self, batch_size: int) -> None:
@@ -455,6 +526,8 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
             )
             logger.debug(
                 "[ThroughputAware] detail: pos_rates=%s  scores=%s",
-                format_position_rates(self._tracker, max(candidates) if candidates else 0),
+                format_position_rates(
+                    self._tracker, max(candidates) if candidates else 0
+                ),
                 format_score_rows(rows, best_steps),
             )
