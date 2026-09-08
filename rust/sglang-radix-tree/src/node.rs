@@ -901,7 +901,7 @@ const CACHE_NAMESPACE_DOMAIN: &[u8] = b"sglang-cache-namespace-v1";
 /// This mirrors python/sglang/srt/mem_cache/utils.py::namespace_seed. The
 /// default namespace stays unseeded; named namespaces seed only the first page
 /// in the chain, and descendants continue from their parent's last page hash.
-fn storage_namespace_seed(namespace: KeyNamespaceRef<'_>) -> Option<HashDigest> {
+pub(crate) fn storage_namespace_seed(namespace: KeyNamespaceRef<'_>) -> Option<HashDigest> {
     if namespace.extra_key.is_none() && namespace.cache_salt.is_none() {
         return None;
     }
@@ -940,7 +940,7 @@ pub(crate) fn hash_page<K: ChildKeyType>(
 }
 
 /// Lowercase-hex encoding of a digest.
-fn digest_to_hex(digest: &HashDigest) -> String {
+pub(crate) fn digest_to_hex(digest: &HashDigest) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(DIGEST_LEN * 2);
     for byte in digest {

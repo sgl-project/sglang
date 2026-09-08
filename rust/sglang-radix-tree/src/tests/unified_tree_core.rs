@@ -2401,9 +2401,18 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
         .best_match_node_id;
     let leaf_idx = tc.arena.resolve(leaf);
     assert_eq!(tc.salted_event_hashes[&leaf].len(), 2);
+    let storage_prior = crate::node::storage_namespace_seed(crate::node::KeyNamespaceRef::new(
+        None,
+        Some("tenant-a"),
+    ))
+    .map(|digest| crate::node::digest_to_hex(&digest));
     assert_eq!(
         tc.arena.node(leaf_idx).hash_value,
-        Some(crate::node::get_hash_str::<Vec<i64>>(&key, None, 2))
+        Some(crate::node::get_hash_str::<Vec<i64>>(
+            &key,
+            storage_prior.as_deref(),
+            2
+        ))
     );
 
     let mut tracker = HashMap::from([(FULL, 0)]);
