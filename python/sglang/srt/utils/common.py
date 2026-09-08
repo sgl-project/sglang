@@ -781,28 +781,10 @@ def get_cpu_memory_capacity():
     n_numa_node: int = len(get_cpu_ids_by_node())
     if n_numa_node == 0:
         # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
-        return float(get_available_cpu_memory() // (1 << 20))
-    try:
-        numa_mem_list = list()
-        file_prefix = "/sys/devices/system/node/"
-        for numa_id in range(n_numa_node):
-            file_meminfo = f"node{numa_id}/meminfo"
-            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # MemTotal info is at the 1st line
-                line = f.readline()
-                # Expected format: "Node 0 MemTotal:       100000000 kB"
-                parts = line.split()
-                if len(parts) >= 4 and parts[2] == "MemTotal:":
-                    numa_mem_list.append(int(parts[3]))
-                else:
-                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
-        # Retrieved value in KB, need MB
-        numa_mem = float(min(numa_mem_list) // 1024)
-        return numa_mem
-    except (FileNotFoundError, ValueError, IndexError):
-        numa_mem = get_available_cpu_memory() / n_numa_node
-        # Retrieved value in Byte, need MB
-        return float(numa_mem // (1 << 20))
+        n_numa_node = 1
+    per_numa_mem = get_available_cpu_memory() / n_numa_node
+    # Retrieved value in Byte, need MB
+    return float(per_numa_mem // (1 << 20))
 
 
 def get_xpu_memory_capacity():
