@@ -13,12 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 
-from sglang.kernels.ops.diffusion import (
-    BitExactFusionGate,
-    fused_bias_glu,
-    fused_bias_silu,
-    tensors_equal,
-)
+from sglang.kernels.ops import diffusion as diffusion_ops
+from sglang.kernels.ops.diffusion import BitExactFusionGate, tensors_equal
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -1088,10 +1084,10 @@ class GLUMBConvTemp(nn.Module):
                         conv.dilation,
                         conv.groups,
                     )
-                    hidden = fused_bias_silu(raw, conv.bias)
+                    hidden = diffusion_ops.fused_bias_silu(raw, conv.bias)
                     # Native depthwise conv accumulates bias before rounding;
                     # preserve it and fuse only its following SiLU/multiply.
-                    out = fused_bias_glu(self.depth_conv(hidden), None)
+                    out = diffusion_ops.fused_bias_glu(self.depth_conv(hidden), None)
                 except Exception as exc:
                     _SANA_WM_CONV_POST.on_exception(exc, logger=logger)
                 else:

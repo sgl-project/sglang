@@ -107,7 +107,7 @@ class TestSanaWMConvPost(CustomTestCase):
         module = wm.GLUMBConvTemp(32, 96).cuda().bfloat16()
         x = torch.randn(3, 32, 17, 23, device="cuda", dtype=torch.bfloat16)
         expected = self.reference(module, x)
-        with patch.object(wm, "fused_bias_silu") as fused:
+        with patch.object(wm.diffusion_ops, "fused_bias_silu") as fused:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 actual = module._spatial_glu(x)
@@ -115,12 +115,12 @@ class TestSanaWMConvPost(CustomTestCase):
             fused.assert_not_called()
         self.assertTrue(torch.equal(actual, expected))
         with patch.object(
-            wm, "fused_bias_glu", return_value=torch.zeros_like(expected)
+            wm.diffusion_ops, "fused_bias_glu", return_value=torch.zeros_like(expected)
         ):
             actual = module._spatial_glu(x)
         self.assertTrue(torch.equal(actual, expected))
         self.assertTrue(wm._SANA_WM_CONV_POST.disabled)
-        with patch.object(wm, "fused_bias_silu") as fused:
+        with patch.object(wm.diffusion_ops, "fused_bias_silu") as fused:
             actual = module._spatial_glu(x)
             fused.assert_not_called()
         self.assertTrue(torch.equal(actual, expected))
@@ -130,7 +130,7 @@ class TestSanaWMConvPost(CustomTestCase):
         x = torch.randn(
             2, 32, 7, 11, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
-        with patch.object(wm, "fused_bias_silu") as fused:
+        with patch.object(wm.diffusion_ops, "fused_bias_silu") as fused:
             actual = module._spatial_glu(x)
             actual.float().sum().backward()
             fused.assert_not_called()
