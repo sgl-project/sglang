@@ -8,7 +8,7 @@ worker logic is identical regardless of CC (CC only changes whether the
 scheduler routes the readback through the worker). To exercise the worker on an
 ordinary GPU, run inside the sglang container:
 
-    python -m pytest test/registered/core/test_async_d2h_copy_worker.py -v
+    python -m pytest test/registered/kernel/managers/test_async_d2h_copy_worker.py -v
 """
 
 import os
@@ -22,7 +22,7 @@ from sglang.srt.utils.common import is_confidential_compute
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "AsyncD2HCopyWorker requires CUDA")
