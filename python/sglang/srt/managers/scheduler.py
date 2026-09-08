@@ -4671,7 +4671,7 @@ class Scheduler(
         # (queues parked under KV pressure / disagg transfer) has no
         # process_batch_result to publish the growing gauge, and gating here
         # froze /get_loads, DP balancing, and the LoadStat for the stall. This
-        # path spins without sleeping, so a wall-clock floor bounds the
+        # path is polled repeatedly, so a wall-clock floor bounds the
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
         fully_idle = self.is_fully_idle()
@@ -4684,6 +4684,10 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
+            if self.enable_hicache_storage:
+                # Storage workers need the GIL between I/O calls. Yield while
+                # there is no GPU batch so polling cannot starve their acks.
+                time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
 
