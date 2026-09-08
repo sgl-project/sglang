@@ -200,9 +200,9 @@ jobs:
     secrets: inherit
 
   # Phase A (temporary): dedicated calibration job — runs ONLY
-  # test_npu_dp_attention.py via the dedicated suite
-  # `nightly-calibrate-dp-attn-4-npu-a3` on a PR-triggered nightly to validate
-  # the run_full_gsm8k_in_pr opt-out and collect the full-1319 GSM8K mu.
+  # test_npu_dp_attention.py and test_npu_sampling_backend.py via the dedicated
+  # suite `nightly-calibrate-dp-attn-4-npu-a3` on a PR-triggered nightly to
+  # validate the run_full_gsm8k_in_pr opt-out and collect the full-1319 GSM8K mu.
   # The other jobs are temporarily disabled (`if: false`). Remove this job and
   # restore the others after calibration.
   calibrate-dp-attn-4-npu-a3:
