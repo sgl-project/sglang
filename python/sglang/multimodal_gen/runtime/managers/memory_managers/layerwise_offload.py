@@ -1161,6 +1161,10 @@ class LayerwiseOffloadManager:
             self._coordinated_prefetch_active
             and self.copy_stream is not None
             and layer_idx in self._consolidated_cpu_weights
+            and all(
+                buffer.is_pinned()
+                for buffer in self._consolidated_cpu_weights[layer_idx].values()
+            )
             and not self._mapped_cpu_weights.get(layer_idx)
         )
 

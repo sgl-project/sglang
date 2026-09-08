@@ -156,6 +156,10 @@ def _get_active_prefetch_traffic_coordinator(
     # Coordinators are installed during model initialization, before inference
     # threads start. Avoid creating and locking a coordinator for the default,
     # feature-disabled path that executes on every Ulysses collective.
+    if not _COORDINATORS or (
+        isinstance(device, torch.device) and device.type != "cuda"
+    ):
+        return None
     coordinator = _COORDINATORS.get(_device_index(device))
     return coordinator if coordinator is not None and coordinator.active else None
 
