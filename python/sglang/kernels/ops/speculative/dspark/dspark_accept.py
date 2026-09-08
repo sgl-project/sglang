@@ -8,15 +8,22 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
-from sglang.kernels.ops.speculative.reject_sampling import (
-    chain_speculative_sampling_triton,
-)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_dflash_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
 )
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.sample import chain_speculative_sampling_triton
+else:
+    from sglang.kernels.ops.speculative.reject_sampling import (
+        chain_speculative_sampling_triton,
+    )
 
 
 class AcceptSampling:
@@ -117,7 +124,12 @@ def _accept_sampling_core(
         draft_token_num=verify_num_draft_tokens,
         device=device,
     )
-    uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
+    # The NPU implementation uses the candidate width as its row stride.  The
+    # last value is intentionally unused because candidate slot 0 is the root.
+    uniform_width = candidates.shape[1] if _is_npu else gamma
+    uniform_samples = torch.rand(
+        (bs, uniform_width), dtype=torch.float32, device=device
+    )
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
     chain_speculative_sampling_triton(
         predicts=predicts,
