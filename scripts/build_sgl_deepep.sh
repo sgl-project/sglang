@@ -14,7 +14,7 @@ usage() {
 Usage: build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> <packaging-overlay> [architecture]
 
   python-version:     3.10, 3.11, 3.12, or 3.13
-  cuda-version:       12.9 or 13.0
+  cuda-version:       12.9, 13.0 or 13.4
   deepep-source:      checkout of the selected DeepEP implementation branch
   packaging-overlay: path to the shared DeepEP sgl_deep_ep directory
   architecture:       x86_64 or aarch64 (defaults to the current machine)
@@ -50,6 +50,9 @@ case "${CUDA_VERSION}" in
         ;;
     13.0)
         CUDA_TAG=cu130
+        ;;
+    13.4)
+        CUDA_TAG=cu134
         ;;
     *)
         echo "Unsupported CUDA version: ${CUDA_VERSION}" >&2
@@ -95,6 +98,13 @@ IMAGE_TAG="sgl-deep-ep-builder:cuda${CUDA_VERSION}-${PYTHON_TAG}-${ARCHITECTURE}
 DIST_DIR="${DEEPEP_SOURCE}/dist"
 PYPI_DIST_DIR="${DEEPEP_SOURCE}/dist-pypi"
 
+# CUDA 13.4 has no stable torch; pass the nightly pinned in docker/Dockerfile.
+if [[ "${CUDA_TAG}" == cu134 && -z "${TORCH_VERSION:-}" ]]; then
+    echo "CUDA 13.4 requires TORCH_VERSION (see TORCH_NIGHTLY_VERSION in docker/Dockerfile)" >&2
+    exit 2
+fi
+TORCH_VERSION="${TORCH_VERSION:-2.13.0}"
+
 mkdir -p "${DIST_DIR}" "${PYPI_DIST_DIR}"
 
 echo "----------------------------------------"
@@ -102,6 +112,7 @@ echo "Python:            ${PYTHON_VERSION} (${PYTHON_TAG})"
 echo "CUDA:              ${CUDA_VERSION} (${CUDA_TAG})"
 echo "Architecture:      ${ARCHITECTURE}"
 echo "Base image:        ${BASE_IMAGE}:cuda${CUDA_VERSION}"
+echo "torch:             ${TORCH_VERSION}"
 echo "DeepEP source:     ${DEEPEP_SOURCE}"
 echo "Packaging overlay: ${PACKAGING_OVERLAY}"
 echo "Builder image:     ${IMAGE_TAG}"
@@ -114,7 +125,7 @@ docker build \
     --build-arg CUDA_TAG="${CUDA_TAG}" \
     --build-arg PYTHON_TAG="${PYTHON_TAG}" \
     --build-arg ARCHITECTURE="${ARCHITECTURE}" \
-    --build-arg TORCH_VERSION="${TORCH_VERSION:-2.13.0}" \
+    --build-arg TORCH_VERSION="${TORCH_VERSION}" \
     --tag "${IMAGE_TAG}" \
     --network=host \
     "${REPOSITORY_ROOT}/docker"

@@ -1,9 +1,10 @@
 name: Release Docker Images Nightly (CUDA 13.4 Rubin)
 #
 # Builds and publishes nightly CUDA 13.4 / Rubin (sm_107) images from
-# docker/Dockerfile.cu134, aarch64 only:
+# docker/Dockerfile with CUDA_VERSION=13.4.x, aarch64 only:
 #   - lmsysorg/sglang:nightly-cu134-{date}-{sha}
 #   - lmsysorg/sglang:nightly-cu134
+# The +cu134 sgl-* wheels come from the release-whl-* workflows (target: cu134).
 #
 
 on:
@@ -17,13 +18,17 @@ on:
         description: "Dockerfile stage to build and publish."
         required: false
         default: "runtime"
+      cuda_version:
+        description: "CUDA_VERSION build-arg. Needs a published nvidia/cuda:<version>-cudnn-devel-ubuntu24.04 tag."
+        required: false
+        default: "13.4.0"
       build_only:
         description: "Build and validate without logging in or pushing."
         required: false
         type: boolean
         default: false
   schedule:
-    # Offset from the other nightly docker builds; this one runs long.
+    # Offset from the other nightly docker builds.
     - cron: "0 10 * * *"
 
 concurrency:
@@ -33,11 +38,8 @@ concurrency:
 jobs:
   build-arm64:
     if: github.repository == 'sgl-project/sglang'
-    # Use kernel builder node since we need to build wheels from source.
-    runs-on: arm-kernel-build-node
+    runs-on: arm-docker-build-node
     environment: ${{ (github.event_name == 'schedule' || !inputs.build_only) && 'prod' || null }}
-    # Cold builds recompile three CUDA wheels from source.
-    timeout-minutes: 360
 
     steps:
       - name: Delete huge unnecessary tools folder
@@ -67,6 +69,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # SGLANG_RUST_BUILD_MODE=auto: see the ARG comment in docker/Dockerfile.
       - name: Build image
         run: |
           set -euo pipefail
@@ -75,10 +78,12 @@ jobs:
             --progress=plain \
             --platform linux/arm64 \
             --target "${{ inputs.docker_target || 'runtime' }}" \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION="${{ inputs.cuda_version || '13.4.0' }}" \
             --build-arg BRANCH_TYPE=local \
             --build-arg BUILD_TYPE=all \
-            --build-arg BUILD_JOBS="$(nproc)" \
-            -f docker/Dockerfile.cu134 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg SGLANG_RUST_BUILD_MODE=auto \
             -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" \
             -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag_rolling }}" \
             .

@@ -3,12 +3,12 @@
 #
 # Usage: build_sgl_deep_gemm.sh <PYTHON_VERSION> <CUDA_VERSION> <DEEPGEMM_SRC> [ARCH]
 #   PYTHON_VERSION: e.g. 3.10
-#   CUDA_VERSION:   e.g. 12.9 or 13.0
+#   CUDA_VERSION:   12.9, 13.0 or 13.4
 #   DEEPGEMM_SRC:   path to a checkout of sgl-project/DeepGEMM
 #   ARCH:           x86_64 (default) or aarch64
 #
 # Writes:
-#   <DEEPGEMM_SRC>/dist/      — wheel(s) tagged +cu129 / +cu130 and manylinux
+#   <DEEPGEMM_SRC>/dist/      — wheel(s) tagged +cu129 / +cu130 / +cu134 and manylinux
 #   <DEEPGEMM_SRC>/dist-pypi/ — cu130 only: same wheel(s) with +cu130 stripped
 #                              (PyPI rejects local-version segments)
 set -ex
@@ -24,6 +24,7 @@ DEEPGEMM_SRC="$(cd "$3" && pwd)"
 ARCH="${4:-$(uname -i)}"
 
 case "${CUDA_VERSION}" in
+  13.4) CU_TAG=cu134 ;;
   13.0) CU_TAG=cu130 ;;
   12.9) CU_TAG=cu129 ;;
   *)
@@ -47,10 +48,18 @@ RENAME_SCRIPT="${SCRIPT_DIR}/rename_sgl_deep_gemm_whl.sh"
 
 DEPS_TAG="sgl-deep-gemm-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"
 
+# CUDA 13.4 has no stable torch; pass the nightly pinned in docker/Dockerfile.
+if [ "${CU_TAG}" = "cu134" ] && [ -z "${TORCH_VER:-}" ]; then
+  echo "CUDA 13.4 requires TORCH_VER (see TORCH_NIGHTLY_VERSION in docker/Dockerfile)" >&2
+  exit 1
+fi
+TORCH_VER="${TORCH_VER:-2.13.0}"
+
 echo "----------------------------------------"
 echo "PYTHON_VERSION: ${PYTHON_VERSION}"
 echo "CUDA_VERSION:   ${CUDA_VERSION}"
 echo "CU_TAG:         ${CU_TAG}"
+echo "TORCH_VER:      ${TORCH_VER}"
 echo "ARCH:           ${ARCH}"
 echo "BASE_IMG:       ${BASE_IMG}"
 echo "DEEPGEMM_SRC:   ${DEEPGEMM_SRC}"
@@ -64,6 +73,7 @@ docker build \
   --build-arg ARCH="${ARCH}" \
   --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
   --build-arg PYTHON_TAG="${PY_TAG}" \
+  --build-arg TORCH_VER="${TORCH_VER}" \
   -t "${DEPS_TAG}" \
   --network=host
 

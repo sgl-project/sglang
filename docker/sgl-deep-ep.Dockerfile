@@ -66,9 +66,13 @@ RUN --mount=type=cache,id=sgl-deep-ep-pip-${CUDA_TAG}-${PYTHON_TAG}-${ARCHITECTU
     set -eux; \
     "${PYTHON_BIN}" -m pip uninstall -y deep-ep sgl-deep-ep || true; \
     "${PYTHON_BIN}" -m pip install --upgrade pip; \
+    case "${CUDA_TAG}" in \
+        cu134) TORCH_CHANNEL=nightly/cu134 ;; \
+        *) TORCH_CHANNEL="${CUDA_TAG}" ;; \
+    esac; \
     "${PYTHON_BIN}" -m pip install --force-reinstall \
         "torch==${TORCH_VERSION}" \
-        --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"; \
+        --index-url "https://download.pytorch.org/whl/${TORCH_CHANNEL}"; \
     if [ "${CUDA_TAG}" = cu130 ]; then \
         "${PYTHON_BIN}" -m pip install --force-reinstall --no-deps \
             "nvidia-nccl-cu13==${NCCL_VERSION}"; \

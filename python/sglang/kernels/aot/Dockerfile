@@ -18,6 +18,8 @@ ARG CCACHE_VERSION=4.12.1
 ARG GITHUB_ARTIFACTORY=github.com
 ARG PYTORCH_INDEX_BASE=https://download.pytorch.org/whl
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
+# CUDA 13.4 only; must match TORCH_NIGHTLY_VERSION in docker/Dockerfile.
+ARG TORCH_NIGHTLY_VERSION=
 # Optional mirror for the manylinux base image's yum repos (AlmaLinux 8).
 # Pass scheme + host (and optional path prefix), e.g.
 #   --build-arg YUM_MIRROR=https://mirrors.aliyun.com
@@ -97,6 +99,7 @@ RUN set -eux; \
 RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
+      13.4) TORCH_VER="${TORCH_NIGHTLY_VERSION:?TORCH_NIGHTLY_VERSION build-arg is required for CUDA 13.4}"; CU_TAG=nightly/cu134 ;; \
       13.0) TORCH_VER=2.13.0; CU_TAG=cu130 ;; \
       12.9) TORCH_VER=2.13.0; CU_TAG=cu129 ;; \
       *)    TORCH_VER=2.13.0; CU_TAG=cu126 ;; \

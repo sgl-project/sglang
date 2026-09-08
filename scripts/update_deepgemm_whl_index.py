@@ -8,7 +8,7 @@ import hashlib
 import pathlib
 import re
 
-SUPPORTED_CUDA_VERSIONS = ["129", "130"]
+SUPPORTED_CUDA_VERSIONS = ["129", "130", "134"]
 
 
 def update_wheel_index(cuda_version, wheel_dir):

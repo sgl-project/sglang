@@ -26,6 +26,7 @@ RUN set -eux; \
 RUN --mount=type=cache,id=sgl-deep-gemm-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
+      13.4) CU_TAG=nightly/cu134 ;; \
       13.0) CU_TAG=cu130 ;; \
       12.9) CU_TAG=cu129 ;; \
       *)    CU_TAG=cu130 ;; \
