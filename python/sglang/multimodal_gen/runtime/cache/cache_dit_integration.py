@@ -22,18 +22,36 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 import cache_dit
-from cache_dit import (
-    BlockAdapter,
-    BlockAdapterRegister,
-    DBCacheConfig,
-    DMDCalibratorConfig,
-    ForwardPattern,
-    ParallelismBackend,
-    ParallelismConfig,
-    ParamsModifier,
-    TaylorSeerCalibratorConfig,
-    steps_mask,
-)
+
+try:
+    from cache_dit import (
+        BlockAdapter,
+        BlockAdapterRegister,
+        DBCacheConfig,
+        DMDCalibratorConfig,
+        ForwardPattern,
+        ParallelismBackend,
+        ParallelismConfig,
+        ParamsModifier,
+        TaylorSeerCalibratorConfig,
+        steps_mask,
+    )
+except ImportError:
+    # cache-dit < 1.5.0 exports BlockAdapterRegister only via submodules;
+    # DMDCalibratorConfig does not exist at all before 1.5.0
+    from cache_dit import (
+        BlockAdapter,
+        DBCacheConfig,
+        ForwardPattern,
+        ParamsModifier,
+        TaylorSeerCalibratorConfig,
+        steps_mask,
+    )
+    from cache_dit.caching.block_adapters import BlockAdapterRegister
+    from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
+
+    # DMD calibrator requires cache-dit >= 1.5.0; guarded at enable time
+    DMDCalibratorConfig = None
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
@@ -447,6 +465,30 @@ def _assert_calibrator_exclusive(config: CacheDitConfig, label: str = "transform
         )
 
 
+def _assert_dmd_supported(config: CacheDitConfig, label: str = "transformer"):
+    """Reject DMD requests when the installed cache-dit predates DMD support.
+
+    DMDCalibratorConfig only exists since cache-dit 1.5.0; environments
+    pinning older cache-dit (e.g. the CI base jobs with 1.3.0) import this
+    module via the fallback import path where it is None.
+
+    Args:
+        config: The CacheDitConfig to validate.
+        label: Human-readable label for the error message.
+
+    Raises:
+        ValueError: If ``enable_dmd`` is True but cache-dit < 1.5.0 is installed.
+    """
+    if config.enable_dmd and DMDCalibratorConfig is None:
+        raise ValueError(
+            f"DMD calibrator requires cache-dit >= 1.5.0, but cache-dit "
+            f"{getattr(cache_dit, '__version__', 'unknown')} is installed on "
+            f"{label}. Please upgrade cache-dit (e.g. pip install "
+            f"'cache-dit>=1.5.1') or disable DMD (SGLANG_CACHE_DIT_DMD / "
+            f"enable_dmd knob)."
+        )
+
+
 def enable_cache_on_transformer(
     transformer: torch.nn.Module,
     config: CacheDitConfig,
@@ -473,6 +515,7 @@ def enable_cache_on_transformer(
         return transformer
 
     _assert_calibrator_exclusive(config, label=model_name)
+    _assert_dmd_supported(config, label=model_name)
 
     if config.num_inference_steps is None:
         raise ValueError(
@@ -632,6 +675,8 @@ def enable_cache_on_dual_transformer(
 
     _assert_calibrator_exclusive(primary_config, label="primary")
     _assert_calibrator_exclusive(secondary_config, label="secondary")
+    _assert_dmd_supported(primary_config, label="primary")
+    _assert_dmd_supported(secondary_config, label="secondary")
 
     if primary_config.num_inference_steps is None:
         raise ValueError(
