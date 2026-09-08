@@ -839,7 +839,7 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     Prepare the server arguments from the command line arguments.
 
     Args:
-        args: The command line arguments. Typically, it should be `sys.argv[1:]`
+        argv: The command line arguments. Typically, it should be `sys.argv[1:]`
             to ensure compatibility with `parse_args` when no arguments are passed.
 
     Returns:
