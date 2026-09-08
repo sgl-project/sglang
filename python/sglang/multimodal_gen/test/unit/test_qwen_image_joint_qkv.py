@@ -14,18 +14,23 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     apply_unquantized_linear,
 )
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel import (
+    sgl_kernel_convrot_available,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageCrossAttention,
     _joint_qkv_head_views,
     _project_qkv_into_joint_buffers,
     _use_joint_qkv_buffers,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
-
 DIM = 32
+# ConvRot rotates 256-wide input groups.
+CONVROT_DIM = 256
 NUM_HEADS = 2
 HEAD_DIM = 8
 INNER_DIM = NUM_HEADS * HEAD_DIM
@@ -41,20 +46,38 @@ FUSED_INPLACE_QKNORM = (
 _TP_GROUP = SimpleNamespace(world_size=1, rank_in_group=0)
 
 
-def _linear(*, bias: bool = True) -> ColumnParallelLinear:
+requires_convrot_kernel = unittest.skipUnless(
+    sgl_kernel_convrot_available(),
+    "needs a GPU in sgl-kernel's convrot table and a build with the convrot ops",
+)
+
+
+def _linear(
+    *,
+    bias: bool = True,
+    dim: int = DIM,
+    dtype: torch.dtype = torch.bfloat16,
+    quant_config: KitchenInt8Config | None = None,
+    prefix: str = "",
+) -> ColumnParallelLinear:
     linear = ColumnParallelLinear(
-        DIM,
+        dim,
         INNER_DIM,
         bias=bias,
         gather_output=False,
-        params_dtype=torch.bfloat16,
+        params_dtype=dtype,
+        quant_config=quant_config,
+        prefix=prefix,
         tp_group=_TP_GROUP,
     )
     with torch.no_grad():
         linear.weight.normal_()
         if bias:
             linear.bias.normal_()
-    return linear.cuda()
+    linear = linear.cuda()
+    if quant_config is not None:
+        linear.quant_method.process_weights_after_loading(linear)
+    return linear
 
 
 def _passthrough(x: torch.Tensor) -> tuple[torch.Tensor, None]:
@@ -78,23 +101,39 @@ class _RecordingAttention:
         return q + k + v
 
 
-def _attention(*, bias: bool = True) -> QwenImageCrossAttention:
+def _attention(
+    *,
+    bias: bool = True,
+    dtype: torch.dtype = torch.bfloat16,
+    quant_config: KitchenInt8Config | None = None,
+) -> QwenImageCrossAttention:
+    dim = DIM if quant_config is None else CONVROT_DIM
     attn = object.__new__(QwenImageCrossAttention)
     nn.Module.__init__(attn)
     attn.head_dim = HEAD_DIM
     attn.local_num_heads = NUM_HEADS
-    attn.added_kv_proj_dim = DIM
+    attn.added_kv_proj_dim = dim
     attn.qk_norm = True
     attn.use_fused_qkv = False
     attn.use_fused_qkv_epilogue = False
     attn.use_fused_added_qkv = False
     attn._unquantized_added_qkv_is_packed = False
-    attn.separate_unquantized_qkv_proj = True
-    attn.separate_convrot_qkv_proj = False
+    attn.separate_unquantized_qkv_proj = quant_config is None
+    attn.separate_convrot_qkv_proj = quant_config is not None
     for name in ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj"):
-        setattr(attn, name, _linear(bias=bias))
+        setattr(
+            attn,
+            name,
+            _linear(
+                bias=bias,
+                dim=dim,
+                dtype=dtype,
+                quant_config=quant_config,
+                prefix=f"transformer_blocks.0.attn.{name}",
+            ),
+        )
     for name in ("norm_q", "norm_k", "norm_added_q", "norm_added_k"):
-        norm = RMSNorm(HEAD_DIM, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+        norm = RMSNorm(HEAD_DIM, eps=1e-6).to(device="cuda", dtype=dtype)
         with torch.no_grad():
             norm.weight.normal_()
         setattr(attn, name, norm)
@@ -104,14 +143,25 @@ def _attention(*, bias: bool = True) -> QwenImageCrossAttention:
     return attn
 
 
-def _streams() -> tuple[torch.Tensor, torch.Tensor]:
-    hidden = torch.randn(1, SEQ_IMG, DIM, device="cuda", dtype=torch.bfloat16)
-    encoder = torch.randn(1, SEQ_TXT, DIM, device="cuda", dtype=torch.bfloat16)
+def _streams(
+    *, dim: int = DIM, dtype: torch.dtype = torch.bfloat16
+) -> tuple[torch.Tensor, torch.Tensor]:
+    hidden = torch.randn(1, SEQ_IMG, dim, device="cuda", dtype=dtype)
+    encoder = torch.randn(1, SEQ_TXT, dim, device="cuda", dtype=dtype)
     return hidden, encoder
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestQwenImageJointQkvBuffers(CustomTestCase):
+def _joint_flag(attn: QwenImageCrossAttention) -> str:
+    return (
+        "separate_convrot_qkv_proj"
+        if attn.separate_convrot_qkv_proj
+        else "separate_unquantized_qkv_proj"
+    )
+
+
+class _JointQkvCase(CustomTestCase):
+    """Forward helpers shared by the unquantized and the ConvRot test classes."""
+
     def setUp(self) -> None:
         torch.manual_seed(20260902)
         # The runtime forwards under no_grad; the out= GEMMs of the joint path
@@ -120,8 +170,14 @@ class TestQwenImageJointQkvBuffers(CustomTestCase):
         torch.set_grad_enabled(False)
         self.addCleanup(torch.set_grad_enabled, grad_was_enabled)
 
-    def _forward(self, attn: QwenImageCrossAttention, **kwargs):
-        hidden, encoder = _streams()
+    def _forward(
+        self,
+        attn: QwenImageCrossAttention,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
+    ):
+        hidden, encoder = _streams(dim=attn.added_kv_proj_dim, dtype=dtype)
         with patch(SP_WORLD_SIZE, return_value=1):
             return attn.forward(
                 hidden_states=hidden,
@@ -131,14 +187,20 @@ class TestQwenImageJointQkvBuffers(CustomTestCase):
             )
 
     def _assert_joint_path_matches_join_seqs_path(
-        self, attn: QwenImageCrossAttention
+        self, attn: QwenImageCrossAttention, *, dtype: torch.dtype = torch.bfloat16
     ) -> None:
+        flag = _joint_flag(attn)
         outputs = []
         for joint in (True, False):
             torch.manual_seed(20260902)
-            attn.separate_unquantized_qkv_proj = joint
+            setattr(attn, flag, joint)
             attn.attn.calls.clear()
-            outputs.append((self._forward(attn), attn.attn.calls[0]))
+            with patch(
+                PROJECT_INTO_JOINT_BUFFERS, wraps=_project_qkv_into_joint_buffers
+            ) as project:
+                out = self._forward(attn, dtype=dtype)
+            self.assertEqual(project.call_count, 1 if joint else 0)
+            outputs.append((out, attn.attn.calls[0]))
         (joint_out, joint_call), (ref_out, ref_call) = outputs
 
         self.assertIsNone(joint_call[3]["q_prefix"])
@@ -150,6 +212,21 @@ class TestQwenImageJointQkvBuffers(CustomTestCase):
         self.assertTrue(torch.equal(joint_out[0], ref_out[0]))
         self.assertTrue(torch.equal(joint_out[1], ref_out[1]))
 
+    def _assert_forward_bypasses_joint_buffers(
+        self, attn: QwenImageCrossAttention, *, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The out= kernels reject these operand dtypes, so the joint path must
+        # not be entered; the flag-off forward is the same code the fallback runs.
+        with patch(
+            PROJECT_INTO_JOINT_BUFFERS, wraps=_project_qkv_into_joint_buffers
+        ) as project:
+            out = self._forward(attn, dtype=dtype)
+        project.assert_not_called()
+        return out
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestQwenImageJointQkvBuffers(_JointQkvCase):
     def test_forward_is_bitwise_identical_to_join_seqs_path(self):
         self._assert_joint_path_matches_join_seqs_path(_attention())
 
@@ -158,6 +235,20 @@ class TestQwenImageJointQkvBuffers(CustomTestCase):
         buffer views in place; their values must still reach the joint buffers."""
         with patch(FUSED_INPLACE_QKNORM, return_value=False):
             self._assert_joint_path_matches_join_seqs_path(_attention())
+
+    def test_fp16_parameters_and_streams_take_the_joint_path(self):
+        """--dit-precision fp16 keeps every operand FP16, which the out= GEMMs
+        accept like BF16."""
+        self._assert_joint_path_matches_join_seqs_path(
+            _attention(dtype=torch.float16), dtype=torch.float16
+        )
+
+    def test_fp32_streams_under_bf16_autocast_bypass_joint_buffers(self):
+        """FP32 streams under BF16 autocast must take the join_seqs path; the
+        out= GEMMs of the joint path do not autocast."""
+        attn = _attention()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            self._assert_forward_bypasses_joint_buffers(attn, dtype=torch.float32)
 
     def test_masked_forward_bypasses_joint_buffers(self):
         """A masked sequence hands text Q/K/V to attention as a prefix, so the
@@ -253,6 +344,77 @@ class TestQwenImageJointQkvBuffers(CustomTestCase):
         lora_wrapped = _attention()
         lora_wrapped.to_q = BaseLayerWithLoRA(lora_wrapped.to_q)
         self.assertFalse(eligible(attention=lora_wrapped))
+
+    def test_eligibility_requires_one_dtype_across_streams_weights_and_autocast(
+        self,
+    ):
+        """The out= GEMMs neither promote nor autocast, so they may only stand
+        in for F.linear when every operand already has the dtype F.linear
+        would compute in."""
+        attn = _attention()
+        hidden, encoder = _streams()
+
+        def eligible(h=hidden, e=encoder, *, attention=attn):
+            with patch(SP_WORLD_SIZE, return_value=1):
+                return _use_joint_qkv_buffers(
+                    attn=attention,
+                    hidden_states=h,
+                    encoder_hidden_states=e,
+                    masked=False,
+                )
+
+        self.assertFalse(eligible(h=hidden.float(), e=encoder.float()))
+        self.assertFalse(eligible(e=encoder.float()))
+        fp32_bias = _attention()
+        fp32_bias.to_k.bias.data = fp32_bias.to_k.bias.data.float()
+        self.assertFalse(eligible(attention=fp32_bias))
+        with torch.autocast("cuda", dtype=torch.float16):
+            self.assertFalse(eligible())
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            self.assertTrue(eligible())
+            self.assertFalse(eligible(h=hidden.float(), e=encoder.float()))
+        self.assertTrue(eligible())
+        fp16 = _attention(dtype=torch.float16)
+        h16, e16 = _streams(dtype=torch.float16)
+        self.assertTrue(eligible(h=h16, e=e16, attention=fp16))
+
+
+@requires_convrot_kernel
+class TestQwenImageJointQkvBuffersConvRot(_JointQkvCase):
+    """The same forward with the six projections on kitchen_int8's sgl-kernel
+    backend, which writes the joint buffers through its out= op."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.config = KitchenInt8Config(backend="sgl_kernel")
+
+    def test_forward_is_bitwise_identical_to_join_seqs_path(self):
+        attn = _attention(quant_config=self.config)
+        self.assertEqual(attn.to_q.weight.dtype, torch.int8)
+        self._assert_joint_path_matches_join_seqs_path(attn)
+
+    def test_fp16_streams_bypass_joint_buffers_and_return_fp16(self):
+        """FP16 streams must skip the joint buffers (the out= kernel stores BF16
+        only) and the forward must still return FP16."""
+        attn = _attention(dtype=torch.float16, quant_config=self.config)
+        self.assertEqual(attn.to_q.bias.dtype, torch.bfloat16)
+        out = self._assert_forward_bypasses_joint_buffers(attn, dtype=torch.float16)
+        self.assertEqual(out[0].dtype, torch.float16)
+        self.assertEqual(out[1].dtype, torch.float16)
+
+    def test_eligibility_requires_bf16_streams(self):
+        attn = _attention(quant_config=self.config)
+        hidden, encoder = _streams(dim=CONVROT_DIM)
+
+        def eligible(h, e):
+            with patch(SP_WORLD_SIZE, return_value=1):
+                return _use_joint_qkv_buffers(
+                    attn=attn, hidden_states=h, encoder_hidden_states=e, masked=False
+                )
+
+        self.assertTrue(eligible(hidden, encoder))
+        self.assertFalse(eligible(hidden.half(), encoder.half()))
+        self.assertFalse(eligible(hidden, encoder.half()))
 
 
 if __name__ == "__main__":

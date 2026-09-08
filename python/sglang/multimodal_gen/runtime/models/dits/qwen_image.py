@@ -82,7 +82,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     is_nunchaku_available,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_customkernel import (
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel import (
     apply_convrot_int8_gelu_input,
     apply_convrot_int8_shared_input,
     apply_convrot_int8_shared_input_out,
@@ -740,6 +740,39 @@ def _joint_qkv_layers(
     )
 
 
+def _joint_qkv_operands_match(
+    *,
+    attn: "QwenImageCrossAttention",
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+) -> bool:
+    dtype = hidden_states.dtype
+    if encoder_hidden_states.dtype != dtype:
+        return False
+    layers = _joint_qkv_layers(attn)
+    # A LoRA wrapper forwards .weight to its base layer and adds its delta in
+    # forward, so the bare addmm below would silently drop it.
+    if not all(isinstance(layer, ColumnParallelLinear) for layer in layers):
+        return False
+    if attn.separate_convrot_qkv_proj:
+        # convrot_int8_linear_prequant_out stores BF16 only; FP16 streams take
+        # the allocating helper, which casts at the op boundary.
+        return dtype == torch.bfloat16
+    # The out= GEMMs below take no part in autocast and do no promotion, so
+    # every operand must already be in the dtype F.linear would compute in.
+    device_type = hidden_states.device.type
+    if (
+        torch.is_autocast_enabled(device_type)
+        and torch.get_autocast_dtype(device_type) != dtype
+    ):
+        return False
+    return all(
+        layer.weight.dtype == dtype
+        and (layer.bias is None or layer.bias.dtype == dtype)
+        for layer in layers
+    )
+
+
 def _use_joint_qkv_buffers(
     *,
     attn: "QwenImageCrossAttention",
@@ -758,10 +791,10 @@ def _use_joint_qkv_buffers(
         and hidden_states.is_contiguous()
         and encoder_hidden_states.is_contiguous()
         and get_sp_world_size() <= 1
-        # A LoRA wrapper forwards .weight to its base layer and adds its delta
-        # in forward, so the bare addmm below would silently drop it.
-        and all(
-            isinstance(layer, ColumnParallelLinear) for layer in _joint_qkv_layers(attn)
+        and _joint_qkv_operands_match(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
         )
     )
 
