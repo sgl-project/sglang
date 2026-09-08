@@ -339,6 +339,7 @@ def _fused_moe_lora_expand(
     split_k: int,
     mul_routed_weight: bool = False,
     offset: int = 0,
+    output_slice_stride: int = 0,
 ) -> None:
 
     b_ptr = _get_ptr(lora_b_stacked, device)
@@ -403,8 +404,13 @@ def _fused_moe_lora_expand(
         IS_PRIMARY=False,
         **expand_config,
     )
+    # Marlin pads the expert intermediate, so the [gate | up] slices of the base output
+    # sit at the padded stride while each LoRA slice is only N wide
+    if output_slice_stride == 0:
+        output_slice_stride = N
     for i in range(num_slices):
-        output[:, :, i * N + offset : (i + 1) * N + offset] += b_intermediate_cache1[i]
+        start = i * output_slice_stride + offset
+        output[:, :, start : start + N] += b_intermediate_cache1[i]
 
 
 @torch.inference_mode()
@@ -442,6 +448,7 @@ def _fused_moe_lora(
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
+    output_slice_stride: int = 0,
 ) -> None:
     assert len(lora_a_stacked) == len(lora_b_stacked) > 0
     assert (
@@ -562,6 +569,7 @@ def _fused_moe_lora(
         expand_split_k,
         mul_routed_weight,
         offset,
+        output_slice_stride,
     )
 
 
@@ -595,6 +603,7 @@ def _fused_moe_lora_fake(
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
+    output_slice_stride: int = 0,
 ) -> None:
     return
 
@@ -661,6 +670,7 @@ def _fused_moe_lora_expand_fake(
     split_k: int,
     mul_routed_weight: bool = False,
     offset: int = 0,
+    output_slice_stride: int = 0,
 ) -> None:
     return
 
