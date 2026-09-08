@@ -110,6 +110,7 @@ may be either a normal style adapter or a timestep-distilled Turbo adapter.
 | DiT | Official Diffusers component layout | `--component-paths.transformer MiniMaxAI/MiniMax-H3/transformer` (`fl2va`) or `.../transformer_ref` (`ref2va`) | Loads the official component through the native SGLang graph; no Diffusers runtime fallback. |
 | DiT | [AdaLN-pruned Diffusers component](https://huggingface.co/multimodalart/MiniMax-H3-Pruned) | `--component-paths.transformer multimodalart/MiniMax-H3-Pruned/transformer` or `.../transformer_ref` | Approximate curve-AdaLN architecture; its config and basis metadata are loaded natively. |
 | DiT | [Full or AdaLN-pruned](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models), or [LoRA-merged/remixed](https://huggingface.co/FX-FeiHou/MiniMax-H3-Remix) BF16 safetensors | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Weight-only override for a native full/pruned H3 layout. Match the FL2VA/Ref2VA partition; pruned, merged, or dtype-converted exports are approximate, and any author-specific sampler remains a separate requirement. |
+| DiT | FL/Ref hybrid fine-tunes, including [Singularity v1.3](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity) (full or pruned INT8) | Replace `--model-variant` with `hybrid`; add `--component-weights-paths.transformer OWNER/REPO/FILE.safetensors` | Explicit merged-weight deployment serving `t2va`, `fl2va`, and `ref2va` on one native pipeline. Quantization and pruning are detected from the file; INT8 requires `comfy-kitchen`. See [Singularity](#singularity-hybrid-weights). |
 | DiT | Comfy FP8 or self-describing MXFP8 safetensors | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Per-layer metadata selects static/dynamic FP8 or MXFP8 automatically. |
 | DiT | ConvRot INT8, W4A8, W4A4, or mixed W4A4+INT8 safetensors ([INT8](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models), [W4A8](https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI), [W4A4](https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot)) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Auto-detected; requires `comfy-kitchen`. TP must preserve each file's ConvRot group boundaries. |
 | DiT | [NVFP4, optionally mixed with INT8 or FP8](https://huggingface.co/Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Auto-detected; NVFP4 execution requires NVIDIA compute capability 10.0+. |
@@ -143,6 +144,39 @@ compact-encoder, and LoRA routes are outside that baseline and the audited
 `quality="high"` contract. Packed and per-layer mixed formats reject FSDP unless
 their row says otherwise; see
 [Quantization](/docs/sglang-diffusion/quantization) for backend-wide constraints.
+
+### Singularity hybrid weights
+
+[Singularity](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity) is an
+FL/Ref fusion fine-tune, not a complete pipeline repository. Keep the official
+model ID for the encoders and VAEs, and select one exact transformer file:
+
+```bash 2×B300 hybrid checkpoint
+pip install comfy-kitchen
+
+WEIGHTS=WarmBloodAban/Minimax-h3_Singularity/Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors
+sglang serve --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant hybrid \
+  --component-weights-paths.transformer "$WEIGHTS" \
+  --num-gpus 2 --ulysses-degree 2 --performance-mode speed \
+  --port 30000
+```
+
+For the full INT8 checkpoint, replace the filename with
+`Minimax-h3_Singularity_ref2va_v1.3_int8.safetensors`. SGLang downloads the
+selected file automatically. Do not add an online quantization override.
+`hybrid` requires an explicit weight override; it does not convert the official
+Ref2VA weights into a multimode model. Request `task` and `conditions` retain
+their [usual meanings](#4-generate-video-and-audio), including `conditions: []`
+for `t2va` and keyframes for `fl2va`.
+
+Start with `quality: "lossless"` and the standard 50-point schedule. Here
+`lossless` disables additional request-time approximations; it does not undo
+INT8 quantization, pruning, or fine-tuning. The author's recommended Ref2V
+Turbo LoRA is a separate optional adapter, not an automatically inferred
+4-step schedule. Reference fidelity can differ from the official model; see
+the [author's guidance](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity/discussions/1)
+before applying the [LoRA sampling contract](#5-lora-recipes).
 
 LoRA tensors alone do not make an execution-coupled release portable. Sparse-
 attention/SLA adapters and causal-streaming adapters such as RAVEN also require
