@@ -2051,9 +2051,14 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
-        recv_reqs = self.request_receiver.recv_requests(
-            local_reqs=self._poll_timeout_aborts()
-        )
+        local_reqs = []
+        if (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            local_reqs = self._poll_timeout_aborts()
+        recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
         if recv_reqs:
             self.metrics_reporter.record_scheduler_active()
         self.process_input_requests(recv_reqs)
@@ -3247,13 +3252,6 @@ class Scheduler(
         same iteration, or the extend-vs-decode decision splits and the
         collectives hang.
         """
-        if not (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
-        ):
-            return []
-
         aborts: List[AbortReq] = []
 
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
