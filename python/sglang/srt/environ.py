@@ -1157,6 +1157,11 @@ class Envs:
     # FP8 quantization; unlike DeepSeek-V4's QAT MXFP4 experts the model was
     # never trained for this precision. Validate accuracy before relying on it.
     SGLANG_FP8_MOE_EXPERTS_REQUANT_MXFP4 = EnvBool(False)
+    # FlashInfer cutedsl MegaMoE: the fused launch costs grow with the session's
+    # token capacity (measured 0.23 ms at capacity 8192 vs 0.11 ms at 256 for a
+    # 4-token batch), so decode batches up to this size run in a second, small
+    # session; larger batches use the full-capacity one. 0 disables the split.
+    SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK = EnvInt(256)
 
     # ===================================================================
     # Top-k kernels

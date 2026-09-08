@@ -16,6 +16,23 @@ logger = logging.getLogger(__name__)
 
 def handle_mega_moe(server_args: ServerArgs) -> None:
     handle_moe_runner_backend_alias(server_args)
+    check_megamoe_backend(server_args)
+
+
+def check_megamoe_backend(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.megamoe_backend == "deepgemm":
+        return
+    if cfg.moe_a2a_backend != "megamoe":
+        raise ValueError(
+            f"--megamoe-backend {cfg.megamoe_backend} requires "
+            "--moe-a2a-backend megamoe."
+        )
+    if cfg.enable_w4a4_mxfp4_megamoe:
+        raise ValueError(
+            "--enable-w4a4-mxfp4-megamoe selects a DeepGEMM MMA type; it cannot "
+            f"be combined with --megamoe-backend {cfg.megamoe_backend}."
+        )
 
 
 def handle_moe_runner_backend_alias(server_args: ServerArgs) -> None:

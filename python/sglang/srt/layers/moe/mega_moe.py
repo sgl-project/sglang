@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.mega_moe_flashinfer import run_flashinfer_mega_routed
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -286,6 +287,18 @@ def run_mega_routed_experts(
         f"{num_max_tokens_per_rank}; raise the env var or shrink "
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
+
+    mega_flashinfer = getattr(experts, "mega_flashinfer", None)
+    if mega_flashinfer is not None:
+        return run_flashinfer_mega_routed(
+            mega_flashinfer,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            top_k=top_k,
+            num_tokens=num_tokens,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
     mma_type = _mega_moe_mma_type(experts)
     if _device_sm != 90:

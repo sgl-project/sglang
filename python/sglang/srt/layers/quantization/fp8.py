@@ -81,6 +81,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
 )
@@ -1727,6 +1728,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         build_mega_moe_experts_weights,
                     )
 
+                    if get_exec().moe.megamoe_backend != "deepgemm":
+                        raise ValueError(
+                            "--megamoe-backend flashinfer_cutedsl needs NVFP4 "
+                            "ModelOpt experts; this checkpoint has MXFP4 experts."
+                        )
                     build_mega_moe_experts_weights(layer)
                     return
 

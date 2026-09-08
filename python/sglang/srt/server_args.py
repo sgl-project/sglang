@@ -2415,6 +2415,14 @@ class ServerArgs:
         "--moe-a2a-backend megamoe.",
         NS("exec.moe"),
     ] = False
+    megamoe_backend: A[
+        Literal["deepgemm", "flashinfer_cutedsl"],
+        "Fused MegaMoE kernel used by --moe-a2a-backend megamoe. `deepgemm` is "
+        "DeepGEMM's fp8_fp4_mega_moe family; `flashinfer_cutedsl` is FlashInfer's "
+        "sm100_nvfp4_nvfp4_bf16_cutedsl mega kernel (NVFP4 ModelOpt checkpoints "
+        "only, needs the nvshmem4py package).",
+        NS("exec.moe"),
+    ] = "deepgemm"
     deepep_v2_mode: A[
         Literal["direct", "hybrid"],
         "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "

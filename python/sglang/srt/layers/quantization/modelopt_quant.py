@@ -63,7 +63,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
@@ -2541,6 +2541,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer._mega_moe_nvfp4 = True
         layer._mega_moe_weights_built = True
 
+    def _build_flashinfer_mega_moe(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.mega_moe_flashinfer import (
+            build_flashinfer_mega_moe_layer,
+        )
+
+        assert layer.moe_runner_config.is_gated, "MegaMoE NVFP4 needs a gated MLP"
+        layer.mega_flashinfer = build_flashinfer_mega_moe_layer(
+            layer,
+            num_experts=layer.num_experts,
+            hidden_size=layer.hidden_size,
+            intermediate_size=layer.intermediate_size_per_partition,
+            top_k=layer.top_k,
+            activation_clamp=layer.moe_runner_config.swiglu_limit,
+        )
+        layer._mega_moe_weights_built = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
@@ -2556,7 +2572,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer._w13_deinterleaved = True
 
         if get_moe_a2a_backend().is_megamoe():
-            self._build_mega_moe_weights(layer)
+            if get_exec().moe.megamoe_backend == "flashinfer_cutedsl":
+                self._build_flashinfer_mega_moe(layer)
+            else:
+                self._build_mega_moe_weights(layer)
             return
 
         # GEMM1 scale processing is deferred until the input scale is known;
