@@ -1612,6 +1612,9 @@ class AscendAttnBackend(AttentionBackend):
                     o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
                     # add forward_batch.encoder_lens and is_cross_attention arguments for cross attention scene
+                    cross_attn_custom_mask = getattr(
+                        forward_batch, "cross_attention_custom_mask", None
+                    )
                     attn_output = self.native_attn.run_sdpa_forward_extend(
                         q_,
                         o_,
@@ -1635,6 +1638,7 @@ class AscendAttnBackend(AttentionBackend):
                         ),
                         logit_cap=layer.logit_cap,
                         logit_capping_method=layer.logit_capping_method,
+                        cross_attention_custom_mask=cross_attn_custom_mask,
                     )
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
