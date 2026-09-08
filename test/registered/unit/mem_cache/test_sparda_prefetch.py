@@ -188,9 +188,7 @@ class TestSparDAPrefetcher(CustomTestCase):
                 lease=CallbackPageLease(lambda: releases.append(True)),
             )
 
-        prefetcher = SparDAKVPrefetcher(
-            engine, CallbackPrefetchResolver(resolve)
-        )
+        prefetcher = SparDAKVPrefetcher(engine, CallbackPrefetchResolver(resolve))
         ticket = prefetcher.prefetch_forecast("request-a", 0, 1, [4])
 
         self.assertEqual(ticket.state, PrefetchTicketState.CANCELLED)

@@ -101,9 +101,7 @@ class PrefetchTicket:
                 return True
             # A failed cancellation keeps the lease and ticket reachable so
             # cleanup can retry the event synchronization.
-            return (
-                self.state is PrefetchTicketState.CANCELLED and self.lease is None
-            )
+            return self.state is PrefetchTicketState.CANCELLED and self.lease is None
 
 
 class PrefetchResolver(Protocol):
@@ -259,10 +257,13 @@ class SparDAKVPrefetcher:
     def begin_request(self, request_id: str) -> int:
         """Start a new request generation and invalidate older tickets."""
         with self._lock:
-            generation = max(
-                self._latest_generation.get(request_id, -1),
-                self._retired_generations.get(request_id, -1),
-            ) + 1
+            generation = (
+                max(
+                    self._latest_generation.get(request_id, -1),
+                    self._retired_generations.get(request_id, -1),
+                )
+                + 1
+            )
             self._retired_generations.pop(request_id, None)
             self.invalidate_generation(request_id, generation)
         return generation
