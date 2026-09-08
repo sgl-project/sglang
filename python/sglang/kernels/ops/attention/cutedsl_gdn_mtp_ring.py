@@ -918,6 +918,7 @@ def gdn_wide_vec_kernel(
     disable_output: cutlass.Constexpr[bool],
     recovery_steps: cutlass.Constexpr[int],
     per_request_accepted_steps: cutlass.Constexpr[bool],
+    phase_b_unroll: cutlass.Constexpr[int],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
     replayssm_rawv: cute.Tensor,
@@ -1680,7 +1681,7 @@ def gdn_wide_vec_kernel(
                 _loop_limit = T_decode_const  # constexpr int — propagates as constexpr
             for i_t_offset in cutlass.range(
                 _loop_limit,
-                unroll=1,
+                unroll=phase_b_unroll,
                 unroll_full=(T_decode_const <= 1) and not per_request_accepted_steps,
             ):
                 if cutlass.const_expr(per_request_fused):
@@ -2615,6 +2616,7 @@ def _run_wide_vec(
     disable_output: cutlass.Constexpr[bool],
     recovery_steps: cutlass.Constexpr[int],
     per_request_accepted_steps: cutlass.Constexpr[bool],
+    phase_b_unroll: cutlass.Constexpr[int],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
     replayssm_rawv: cute.Tensor,
@@ -2668,6 +2670,7 @@ def _run_wide_vec(
         disable_output,
         recovery_steps,
         per_request_accepted_steps,
+        phase_b_unroll,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
         replayssm_rawv,
@@ -2957,6 +2960,15 @@ def _get_bf16_mtp_config(
 # picking is done by `_select_wide_vec_tile_v` below.
 _WIDE_VEC_WORK_UNITS_THRESHOLD = 128
 
+# The ReplaySSM verify path uses a short Phase-B loop while also writing its
+# raw ring. Two-way unrolling exposes useful ILP in the measured T=3..8 range
+# without the register-pressure regressions measured at larger factors. Keep
+# shapes outside that range and non-replay modes on the generic schedule.
+_WIDE_VEC_PHASE_B_DEFAULT_UNROLL = 1
+_WIDE_VEC_PHASE_B_REPLAY_UNROLL = 2
+_WIDE_VEC_PHASE_B_REPLAY_MIN_SEQ_LEN = 3
+_WIDE_VEC_PHASE_B_REPLAY_MAX_SEQ_LEN = 8
+
 
 def _select_wide_vec_tile_v(B: int, HV: int) -> Optional[int]:
     """Pick a wide_vec tile_v by `work_units = B * HV`, or return None to
@@ -2984,6 +2996,25 @@ def _select_wide_vec_tile_v(B: int, HV: int) -> Optional[int]:
     if work_units >= _WIDE_VEC_WORK_UNITS_THRESHOLD:
         return 32
     return None
+
+
+def _select_wide_vec_phase_b_unroll(
+    seq_len: int,
+    cache_ring: bool,
+) -> int:
+    """Select the compile-time Phase-B schedule for the wide-vector kernel.
+
+    Use the tuned schedule only for the measured ReplaySSM ring-write domain;
+    retain the generic one-way schedule as an explicit fallback.
+    """
+    if (
+        cache_ring
+        and _WIDE_VEC_PHASE_B_REPLAY_MIN_SEQ_LEN
+        <= seq_len
+        <= _WIDE_VEC_PHASE_B_REPLAY_MAX_SEQ_LEN
+    ):
+        return _WIDE_VEC_PHASE_B_REPLAY_UNROLL
+    return _WIDE_VEC_PHASE_B_DEFAULT_UNROLL
 
 
 # ==============================================================================
@@ -3049,9 +3080,9 @@ def gated_delta_rule_mtp_wide_vec(
     assert K_val == 128 and V_val == 128
     assert initial_state_source.dtype == torch.bfloat16
     assert tile_v in (32, 64, 128), f"tile_v must be 32/64/128, got {tile_v}"
-    assert (
-        V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0
-    ), f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
+    assert V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0, (
+        f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
+    )
 
     if cache_ring:
         assert replayssm_rawv is not None and replayssm_rawk is not None
@@ -3163,13 +3194,13 @@ def gated_delta_rule_mtp_wide_vec(
     )
 
     # Validate recovery_steps for fused recovery+decode mode.
-    assert (
-        0 <= recovery_steps <= T_val
-    ), f"recovery_steps must be in [0, T={T_val}], got {recovery_steps}"
+    assert 0 <= recovery_steps <= T_val, (
+        f"recovery_steps must be in [0, T={T_val}], got {recovery_steps}"
+    )
     if recovery_steps > 0:
-        assert (
-            not cache_intermediate_states
-        ), "recovery_steps > 0 is incompatible with intermediate state caching"
+        assert not cache_intermediate_states, (
+            "recovery_steps > 0 is incompatible with intermediate state caching"
+        )
         assert not disable_state_update, (
             "recovery_steps > 0 requires state writeback "
             "(disable_state_update=False); the boundary writeback at i_t=K-1 "
@@ -3189,12 +3220,12 @@ def gated_delta_rule_mtp_wide_vec(
     # accepted_steps[i] is the per-request phase boundary.
     per_request_accepted_steps = accepted_steps is not None
     if per_request_accepted_steps:
-        assert accepted_steps.shape == (
-            B_val,
-        ), f"accepted_steps must have shape [B={B_val}], got {accepted_steps.shape}"
-        assert (
-            accepted_steps.dtype == torch.int32
-        ), f"accepted_steps must be int32, got {accepted_steps.dtype}"
+        assert accepted_steps.shape == (B_val,), (
+            f"accepted_steps must have shape [B={B_val}], got {accepted_steps.shape}"
+        )
+        assert accepted_steps.dtype == torch.int32, (
+            f"accepted_steps must be int32, got {accepted_steps.dtype}"
+        )
         assert accepted_steps.device == q.device
 
     # FLA-style per-token pool scatter (vLLM API compat). When the public
@@ -3205,15 +3236,15 @@ def gated_delta_rule_mtp_wide_vec(
     # this entry point hit the same fail-fast errors.
     per_token_pool_scatter = ssm_state_indices is not None
     if per_token_pool_scatter:
-        assert (
-            intermediate_states_buffer is None
-        ), "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
-        assert (
-            not disable_state_update
-        ), "ssm_state_indices requires state writes; disable_state_update must be False"
-        assert (
-            recovery_steps == 0
-        ), "ssm_state_indices + recovery_steps>0 not yet supported (MVP exclusion)"
+        assert intermediate_states_buffer is None, (
+            "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
+        )
+        assert not disable_state_update, (
+            "ssm_state_indices requires state writes; disable_state_update must be False"
+        )
+        assert recovery_steps == 0, (
+            "ssm_state_indices + recovery_steps>0 not yet supported (MVP exclusion)"
+        )
         assert T_val >= 2, (
             f"ssm_state_indices requires T >= 2 (got T={T_val}); "
             f"for T=1 use output_state_indices"
@@ -3222,10 +3253,15 @@ def gated_delta_rule_mtp_wide_vec(
             f"ssm_state_indices must have shape [B={B_val}, T={T_val}], "
             f"got {tuple(ssm_state_indices.shape)}"
         )
-        assert (
-            ssm_state_indices.dtype == torch.int32
-        ), f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
+        assert ssm_state_indices.dtype == torch.int32, (
+            f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
+        )
         assert ssm_state_indices.device == q.device
+
+    phase_b_unroll = _select_wide_vec_phase_b_unroll(
+        seq_len=T_val,
+        cache_ring=cache_ring,
+    )
 
     # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
     # agnostic); padded/strided pool keeps real pool_size/stride in the key.
@@ -3257,6 +3293,7 @@ def gated_delta_rule_mtp_wide_vec(
         disable_output,
         recovery_steps,
         per_request_accepted_steps,
+        phase_b_unroll,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
         cache_ring,
@@ -3355,6 +3392,7 @@ def gated_delta_rule_mtp_wide_vec(
                 disable_output,
                 recovery_steps,
                 per_request_accepted_steps,
+                phase_b_unroll,
                 per_token_pool_scatter,
                 per_token_pool_scatter_flat,
                 rawv_,
@@ -3479,9 +3517,9 @@ def gated_delta_rule_t1_wide_vec(
     assert K_val == 128 and V_val == 128
     assert initial_state_source.dtype == torch.bfloat16
     assert tile_v in (32, 64, 128), f"tile_v must be 32/64/128, got {tile_v}"
-    assert (
-        V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0
-    ), f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
+    assert V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0, (
+        f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
+    )
 
     if scale is None:
         scale = 1.0 / math.sqrt(K_val)
@@ -3789,9 +3827,9 @@ def gated_delta_rule_mtp(
             f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
             f"batch size B={B}; the buffer is batch-scoped, not pool-scoped"
         )
-        assert (
-            cache_steps >= T
-        ), f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
+        assert cache_steps >= T, (
+            f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
+        )
         assert intermediate_states_buffer.dtype == torch.bfloat16
         intermediate_states = intermediate_states_buffer.reshape(
             B * cache_steps * HV, V, K
@@ -3822,28 +3860,28 @@ def gated_delta_rule_mtp(
     # results/2026-06-03/FLA_SCATTER_MODE_PLAN.md.
     per_token_pool_scatter = ssm_state_indices is not None
     if per_token_pool_scatter:
-        assert (
-            intermediate_states_buffer is None
-        ), "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
-        assert (
-            not disable_state_update
-        ), "ssm_state_indices requires state writes; disable_state_update must be False"
-        assert (
-            recovery_steps == 0
-        ), "ssm_state_indices + recovery_steps>0 not yet supported (MVP exclusion)"
-        assert (
-            T >= 2
-        ), f"ssm_state_indices requires T >= 2 (got T={T}); for T=1 use output_state_indices"
+        assert intermediate_states_buffer is None, (
+            "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
+        )
+        assert not disable_state_update, (
+            "ssm_state_indices requires state writes; disable_state_update must be False"
+        )
+        assert recovery_steps == 0, (
+            "ssm_state_indices + recovery_steps>0 not yet supported (MVP exclusion)"
+        )
+        assert T >= 2, (
+            f"ssm_state_indices requires T >= 2 (got T={T}); for T=1 use output_state_indices"
+        )
         assert ssm_state_indices.shape == (B, T), (
             f"ssm_state_indices must have shape [B={B}, T={T}], "
             f"got {tuple(ssm_state_indices.shape)}"
         )
-        assert (
-            ssm_state_indices.dtype == torch.int32
-        ), f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
-        assert (
-            ssm_state_indices.device == q.device
-        ), f"ssm_state_indices device {ssm_state_indices.device} != q device {q.device}"
+        assert ssm_state_indices.dtype == torch.int32, (
+            f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
+        )
+        assert ssm_state_indices.device == q.device, (
+            f"ssm_state_indices device {ssm_state_indices.device} != q device {q.device}"
+        )
 
     # Dispatch to the wide_vec kernel when work_units (B*HV) amortizes its
     # lower per-CTA parallelism. ``_select_wide_vec_tile_v`` picks tile_v
@@ -3922,12 +3960,12 @@ def gated_delta_rule_mtp(
     # Per-request K opt-in (see gated_delta_rule_mtp_wide_vec for full rationale).
     per_request_accepted_steps = accepted_steps is not None
     if per_request_accepted_steps:
-        assert accepted_steps.shape == (
-            B,
-        ), f"accepted_steps must have shape [B={B}], got {accepted_steps.shape}"
-        assert (
-            accepted_steps.dtype == torch.int32
-        ), f"accepted_steps must be int32, got {accepted_steps.dtype}"
+        assert accepted_steps.shape == (B,), (
+            f"accepted_steps must have shape [B={B}], got {accepted_steps.shape}"
+        )
+        assert accepted_steps.dtype == torch.int32, (
+            f"accepted_steps must be int32, got {accepted_steps.dtype}"
+        )
         assert accepted_steps.device == q.device
 
     # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size

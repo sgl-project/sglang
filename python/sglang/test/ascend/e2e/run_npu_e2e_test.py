@@ -537,11 +537,15 @@ def monitor_pod_logs(
 def generate_metrics_json(metrics_data_file, test_case, status):
     """Generate per-case metrics JSON.
 
-    With Plan A, the test runner writes each case's log into its own
-    subdirectory ``{metrics_data_file}/{tc_name}/test_output.log``. This
+    In batch mode the test runner writes each case's log into its own
+    subdirectory ``{metrics_data_file}/{tc_name}/test_output.log``; this
     function reads that per-case log and writes ``metrics.json`` next to it.
     For backward compatibility with single-case runs that still write to
     ``{metrics_data_file}/test_output.log``, fall back to the flat layout.
+
+    The result feeds the persistence-directory output (e.g.
+    /root/.cache/tests/output/...). It is NOT consumed by CI artifacts
+    (the former /tmp/metrics.json + 'Upload metrics' path was removed).
     """
     tc_name = test_case.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     per_case_log = os.path.join(metrics_data_file, tc_name, "test_output.log")
@@ -605,13 +609,6 @@ def generate_metrics_json(metrics_data_file, test_case, status):
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
     logger.info(f"Metrics JSON written to {output_path}")
-
-    # /tmp/metrics.json is consumed by the workflow's upload-artifact step; in a
-    # batch run each case overwrites it, so the final content reflects the last
-    # case. The per-case metrics.json files above are the source of truth.
-    with open("/tmp/metrics.json", "w") as f:
-        json.dump(output, f, indent=2)
-    logger.info("Metrics JSON written to /tmp/metrics.json")
 
 
 def run_npu_e2e_test_case(

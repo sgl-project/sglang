@@ -87,8 +87,7 @@ permissions:
 
 jobs:
   rerun-test-cuda:
-    # Temporarily reject reruns targeting the broken GB300 runner.
-    if: inputs.mode == 'cuda' && inputs.runs_on != '4-gpu-gb300'
+    if: inputs.mode == 'cuda'
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 120
     permissions:
@@ -128,6 +127,10 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
+        env:
+          # Public-read-only PAT: the checkout above leaves no job token for the
+          # install script's github.com clones. Unset -> anonymous.
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_CI_CLONE }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
@@ -200,8 +203,7 @@ jobs:
         if: failure()
 
   rerun-test-multimodal-gen:
-    # Temporarily reject reruns targeting the broken GB300 runner.
-    if: inputs.mode == 'multimodal_gen' && inputs.runs_on != '4-gpu-gb300'
+    if: inputs.mode == 'multimodal_gen'
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 120
     permissions:
@@ -236,6 +238,8 @@ jobs:
 
       - name: Install dependencies (diffusion)
         timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_CI_CLONE }}
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
