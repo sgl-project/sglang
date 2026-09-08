@@ -936,6 +936,9 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
+    # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
+    SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
