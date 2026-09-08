@@ -8,7 +8,7 @@ RUN apt-get update && \
     apt-get full-upgrade -y && \
     DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
     ca-certificates \
-    ffmpeg=7:8.0.1-3ubuntu2 \
+    ffmpeg \
     git \
     curl \
     wget \
