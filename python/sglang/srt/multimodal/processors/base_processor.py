@@ -43,6 +43,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_mm,
     get_serving,
 )
@@ -723,7 +724,7 @@ class BaseMultimodalProcessor(ABC):
         preprocessing worker there is one more competitor for that device rather
         than added parallelism.
         """
-        if _is_cpu or self.server_args.rl_on_policy_target is not None:
+        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return False
         if self.disable_fast_image_processor:
             return False
@@ -759,7 +760,7 @@ class BaseMultimodalProcessor(ABC):
         tokenizer process each carry their own ``base_gpu_id``.
         """
         server_args = self.server_args
-        if _is_cpu or server_args.rl_on_policy_target is not None:
+        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return "cpu"
         if _is_xpu:
             return "xpu"
@@ -965,11 +966,14 @@ class BaseMultimodalProcessor(ABC):
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
+                # PIL decodes lazily; do it here in the io worker so the decode
+                # doesn't run later on the event-loop thread.
                 if discard_alpha_channel:
                     if cls.smart_rgb_conversion:
                         return smart_to_rgb(img)
                     if img.mode != "RGB":
                         return img.convert("RGB")
+                img.load()
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)

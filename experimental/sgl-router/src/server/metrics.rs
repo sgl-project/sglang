@@ -23,7 +23,6 @@
 //! | `sgl_router_worker_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
-//! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
 //! | `sgl_router_worker_health` | Gauge | `worker_url` |
@@ -34,6 +33,11 @@
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
 //! | `sgl_router_policy_selection_failures_total` | Counter | `policy`, `reason` |
+//! | `sgl_router_cache_admission_evaluated_total` | Counter | — |
+//! | `sgl_router_cache_admission_rejected_total` | Counter | — |
+//! | `sgl_router_cache_pressure_guard_compared_total` | Counter | — |
+//! | `sgl_router_cache_pressure_guard_override_total` | Counter | — |
+//! | `sgl_router_cache_monitor_decisions_total` | Counter | `source` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
@@ -49,16 +53,6 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-
-/// Histogram bucket upper bounds for `sgl_router_overlap_blocks`. Blocks are
-/// 32–64 tokens each, and the `MAX_CHAT_BODY_BYTES` cap bounds context length —
-/// putting the practical ceiling for a maximum-length context in the low tens
-/// of thousands of blocks. The ladder spans 0 → ~8k blocks at the resolution
-/// worth charting; the `+Inf` bucket catches the longer-context tail beyond
-/// 8000.
-const OVERLAP_BLOCKS_BUCKETS: &[f64] = &[
-    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0, 2000.0, 4000.0, 8000.0,
-];
 
 /// Histogram bucket upper bounds (seconds) for
 /// `sgl_router_request_duration_seconds`. Standard latency ladder spanning
@@ -239,13 +233,17 @@ pub struct MetricsRegistry {
     // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
-    overlap_blocks: Mutex<HashMap<String, Histogram>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     policy_decisions_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
     policy_selection_failures_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
+    cache_admission_evaluated_total: AtomicU64,
+    cache_admission_rejected_total: AtomicU64,
+    cache_pressure_guard_compared_total: AtomicU64,
+    cache_pressure_guard_override_total: AtomicU64,
+    cache_monitor_decisions_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
@@ -304,10 +302,8 @@ struct PolicyDecisionKey {
 
 #[derive(Debug)]
 struct Histogram {
-    /// Bucket upper bounds this histogram observes against (e.g.
-    /// [`OVERLAP_BLOCKS_BUCKETS`] or [`REQUEST_DURATION_BUCKETS`]). Held
-    /// per-instance so a single `Histogram` type backs metrics with
-    /// different bucket ladders.
+    /// Bucket upper bounds this histogram observes against. Held per-instance
+    /// so a single `Histogram` type backs metrics with different bucket ladders.
     bounds: &'static [f64],
     /// One counter per boundary in `bounds`, plus one for `+Inf`. Buckets
     /// are cumulative on render but stored as non-cumulative counts here.
@@ -392,15 +388,6 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Observe an overlap-blocks count for `sgl_router_overlap_blocks`.
-    pub fn observe_overlap_blocks(&self, model_id: &str, blocks: u64) {
-        let mut guard = self.overlap_blocks.lock();
-        let hist = guard
-            .entry(model_id.to_owned())
-            .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
-        hist.observe(blocks as f64);
     }
 
     /// Observe end-to-end request latency (seconds) for
@@ -536,6 +523,38 @@ impl MetricsRegistry {
         let mut guard = self.policy_selection_failures_total.lock();
         let counter = guard
             .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cache-Aware candidates evaluated by hard admission.
+    pub fn record_cache_admission_evaluations(&self, count: u64) {
+        self.cache_admission_evaluated_total
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Cache-Aware candidates rejected by hard admission.
+    pub fn record_cache_admission_rejections(&self, count: u64) {
+        self.cache_admission_rejected_total
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Pressure-guard pairs compared and overridden with complete monitor data.
+    pub fn record_cache_pressure_guard(&self, compared: u64, overrides: u64) {
+        self.cache_pressure_guard_compared_total
+            .fetch_add(compared, Ordering::Relaxed);
+        self.cache_pressure_guard_override_total
+            .fetch_add(overrides, Ordering::Relaxed);
+    }
+
+    /// Load source used for a Cache-Aware decision. Benchmarks reject
+    /// `router_local` results to verify that monitor data affected selection.
+    pub fn record_cache_monitor_decision(&self, source: &'static str) {
+        let mut guard = self.cache_monitor_decisions_total.lock();
+        let counter = guard
+            .entry(source)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -690,21 +709,6 @@ impl MetricsRegistry {
                 key.status_code,
                 value,
             ));
-        }
-        drop(guard);
-
-        // overlap_blocks histogram
-        out.push_str(
-            "# HELP sgl_router_overlap_blocks Overlap-block count observed at cache-aware-zmq policy selection.\n",
-        );
-        out.push_str("# TYPE sgl_router_overlap_blocks histogram\n");
-        let guard = self.overlap_blocks.lock();
-        let mut models: Vec<&String> = guard.keys().collect();
-        models.sort();
-        for model_id in models {
-            let hist = guard.get(model_id).unwrap();
-            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
-            render_histogram(&mut out, "sgl_router_overlap_blocks", &label_body, hist);
         }
         drop(guard);
 
@@ -888,6 +892,58 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        out.push_str(
+            "# HELP sgl_router_cache_admission_evaluated_total Cache-Aware candidates evaluated by hard admission.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_admission_evaluated_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_admission_evaluated_total {}\n",
+            self.cache_admission_evaluated_total.load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_admission_rejected_total Cache-Aware candidates rejected by hard admission.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_admission_rejected_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_admission_rejected_total {}\n",
+            self.cache_admission_rejected_total.load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_pressure_guard_compared_total Complete fresh Cache-Aware candidate pairs evaluated by the pressure guard.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_pressure_guard_compared_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_pressure_guard_compared_total {}\n",
+            self.cache_pressure_guard_compared_total
+                .load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_pressure_guard_override_total Pressure-guard comparisons whose outcome differs from cache/work ordering without the guard.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_pressure_guard_override_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_pressure_guard_override_total {}\n",
+            self.cache_pressure_guard_override_total
+                .load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_monitor_decisions_total Cache-Aware candidate resolutions by actual load source.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_monitor_decisions_total counter\n");
+        let guard = self.cache_monitor_decisions_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(source, value)| (source, value.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|entry| *entry.0);
+        for (source, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_cache_monitor_decisions_total{{source=\"{}\"}} {}\n",
+                source, value,
+            ));
+        }
+        drop(guard);
+
         // ingress_tokenize_errors_total
         out.push_str(
             "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
@@ -964,7 +1020,6 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_request_duration_seconds histogram"));
         assert!(out.contains("# TYPE sgl_router_ttft_seconds histogram"));
         assert!(out.contains("# TYPE sgl_router_responses_total counter"));
-        assert!(out.contains("# TYPE sgl_router_overlap_blocks histogram"));
         assert!(out.contains("# TYPE sgl_router_active_load gauge"));
         assert!(out.contains("# TYPE sgl_router_workers gauge"));
         assert!(out.contains("# TYPE sgl_router_worker_health gauge"));
@@ -1201,28 +1256,6 @@ mod tests {
     }
 
     #[test]
-    fn observe_overlap_blocks_writes_buckets_and_count() {
-        let reg = MetricsRegistry::new();
-        reg.observe_overlap_blocks("tiny", 3);
-        reg.observe_overlap_blocks("tiny", 9);
-        reg.observe_overlap_blocks("tiny", 50);
-        let out = reg.render();
-        // 3 observations -> count=3, sum=62
-        assert!(out.contains(r#"sgl_router_overlap_blocks_count{model_id="tiny"} 3"#));
-        assert!(out.contains(r#"sgl_router_overlap_blocks_sum{model_id="tiny"} 62"#));
-        // The le=64 bucket is cumulative: 3 is <=4, 9 is <=16, 50 is <=64.
-        assert!(
-            out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="tiny",le="64"} 3"#),
-            "bucket le=64 should be 3 (cumulative); got:\n{out}",
-        );
-        // The le=4 bucket should include only the 3.
-        assert!(
-            out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="tiny",le="4"} 1"#),
-            "bucket le=4 should be 1; got:\n{out}",
-        );
-    }
-
-    #[test]
     fn set_active_load_gauge_overwrites() {
         let reg = MetricsRegistry::new();
         reg.set_active_load("http://w:30000", ActiveLoadKind::PrefillTokens, 100);
@@ -1321,6 +1354,24 @@ mod tests {
     }
 
     #[test]
+    fn cache_monitor_and_guard_counters_are_exposed() {
+        let reg = MetricsRegistry::new();
+        reg.record_cache_monitor_decision("estimated_prefill_queue_ms");
+        reg.record_cache_admission_evaluations(3);
+        reg.record_cache_admission_rejections(2);
+        reg.record_cache_pressure_guard(3, 1);
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_cache_monitor_decisions_total{source="estimated_prefill_queue_ms"} 1"#
+        ));
+        assert!(out.contains("sgl_router_cache_admission_evaluated_total 3"));
+        assert!(out.contains("sgl_router_cache_admission_rejected_total 2"));
+        assert!(out.contains("sgl_router_cache_pressure_guard_compared_total 3"));
+        assert!(out.contains("sgl_router_cache_pressure_guard_override_total 1"));
+    }
+
+    #[test]
     fn ingress_tokenize_error_counter_increments_per_model() {
         let reg = MetricsRegistry::new();
         reg.record_ingress_tokenize_error("tiny");
@@ -1368,16 +1419,5 @@ mod tests {
             out.contains(r#"model_id="back\\slash""#),
             "render did not escape backslash; got:\n{out}",
         );
-    }
-
-    #[test]
-    fn histogram_plus_inf_bucket_catches_overflow() {
-        let reg = MetricsRegistry::new();
-        // 8001 is just above the last finite bucket (8000); it should land
-        // in +Inf only.
-        reg.observe_overlap_blocks("m", 8001);
-        let out = reg.render();
-        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="8000"} 0"#));
-        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="+Inf"} 1"#));
     }
 }
