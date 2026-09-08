@@ -14,10 +14,10 @@ flight.
 
 from __future__ import annotations
 
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum, auto
-import threading
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, TransferCompletion
