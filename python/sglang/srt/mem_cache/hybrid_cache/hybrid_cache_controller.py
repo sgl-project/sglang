@@ -684,6 +684,7 @@ class HybridCacheController(BaseHiCacheController):
             if self.should_backup(transfer)
         ]
 
+        sidecar_unwritten_by_pool = {}
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
@@ -691,25 +692,36 @@ class HybridCacheController(BaseHiCacheController):
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
+            for transfer in backup_transfers:
+                success_list = results.get(transfer.name)
+                if success_list is None:
+                    success_list = results.get(transfer.name.value)
+                expected = len(transfer.keys or [])
+                if expected == 0 and transfer.host_indices is not None:
+                    expected = int(transfer.host_indices.numel())
+                if not isinstance(success_list, (list, tuple)):
+                    failed_in_pool = expected
+                else:
+                    failed_in_pool = sum(
+                        1 for success in success_list[:expected] if not success
+                    ) + max(0, expected - len(success_list))
+                if failed_in_pool:
+                    sidecar_unwritten_by_pool[transfer.name] = failed_in_pool
+            if sidecar_unwritten_by_pool:
+                operation.failed = True
+                if operation.failure_kind is None:
+                    operation.failure_kind = "sidecar_backend_false"
+                operation.sidecar_unwritten_by_pool = sidecar_unwritten_by_pool
+                logger.warning(
+                    "Sidecar pool write failed for operation %s: %s",
+                    operation.id,
+                    sidecar_unwritten_by_pool,
+                )
+
         if not self.backup_skip:
             super()._page_backup(operation)
         else:
-            sidecar_ok = bool(backup_transfers)
-            if sidecar_ok:
-                for transfer in backup_transfers:
-                    result = results.get(transfer.name)
-                    if result is None:
-                        result = results.get(transfer.name.value)
-                    expected = len(transfer.keys or [])
-                    if expected == 0 and transfer.host_indices is not None:
-                        expected = int(transfer.host_indices.numel())
-                    if (
-                        not isinstance(result, (list, tuple))
-                        or len(result) != expected
-                        or not all(bool(ok) for ok in result)
-                    ):
-                        sidecar_ok = False
-                        break
+            sidecar_ok = bool(backup_transfers) and not sidecar_unwritten_by_pool
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
@@ -748,7 +760,23 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                try:
+                    self._page_backup(operation)
+                except Exception:
+                    operation.failed = True
+                    operation.failure_kind = "exception"
+                    operation.unwritten_pages = (
+                        0
+                        if self.backup_skip
+                        else max(
+                            0,
+                            len(operation.hash_value)
+                            - operation.completed_tokens // self.page_size,
+                        )
+                    )
+                    logger.exception(
+                        "Backup operation %s raised an exception.", operation.id
+                    )
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
