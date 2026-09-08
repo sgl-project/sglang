@@ -553,10 +553,6 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
-        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
-        self.require_attn_tp_allgather = (
-            not get_parallel().enable_dsa_prefill_context_parallel
-        )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -817,9 +813,7 @@ class SchedulerPPMixin:
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
-                all_gather_group=(
-                    self.attn_tp_group if self.require_attn_tp_allgather else None
-                ),
+                all_gather_group=(self.attn_tp_group),
                 async_send=async_send,
             )
         )
@@ -864,9 +858,7 @@ class SchedulerPPMixin:
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
+                    all_gather_group=(self.attn_tp_group),
                 )
             )
         return pp_proxy_tensors
@@ -876,9 +868,7 @@ class SchedulerPPMixin:
     ) -> Dict[str, torch.Tensor]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(
-                self.attn_tp_group if self.require_attn_tp_allgather else None
-            ),
+            all_gather_group=(self.attn_tp_group),
         )
 
     def _pp_make_skip_output_result(

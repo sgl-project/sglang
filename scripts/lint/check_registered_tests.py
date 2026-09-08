@@ -26,6 +26,7 @@ import glob
 import importlib.util
 import os
 import re
+import subprocess
 import sys
 
 # Suite names of the form `{stage}-test-{runner_config}` are exactly what the
@@ -37,6 +38,8 @@ _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 # form. Anything else needs stage=/runner_config=, or its effective_suite matches
 # no suite any workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
+
+_TEST_KINDS = {"unit", "kernel", "e2e", "accuracy", "perf", "stress"}
 
 
 def _defines_testcase(tree: ast.AST) -> bool:
@@ -70,6 +73,99 @@ def _main_runs_tests(tree: ast.Module) -> bool:
     return False
 
 
+def _git_lines(*args: str) -> list[str] | None:
+    result = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def _changed_registered_files() -> set[str]:
+    """Return added, copied, or renamed registered-test destinations."""
+
+    lines = _git_lines("diff", "--cached", "--name-status", "--diff-filter=ACR")
+    if not lines:
+        base_ref = os.environ.get("GITHUB_BASE_REF", "main")
+        for candidate in (f"origin/{base_ref}", base_ref):
+            if _git_lines("rev-parse", "--verify", candidate) is None:
+                continue
+            merge_base = _git_lines("merge-base", candidate, "HEAD")
+            if not merge_base:
+                continue
+            lines = _git_lines(
+                "diff",
+                "--name-status",
+                "--diff-filter=ACR",
+                merge_base[0],
+                "HEAD",
+            )
+            break
+
+    selected = set()
+    for line in lines or []:
+        fields = line.split("\t")
+        destination = fields[-1]
+        if destination.startswith("test/registered/") and destination.endswith(".py"):
+            selected.add(destination)
+    return selected
+
+
+def _contains_call(tree: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == name)
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+        )
+        for node in ast.walk(tree)
+    )
+
+
+def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
+    """Validate the kind/subsystem contract for a newly admitted path."""
+
+    parts = path.split("/")
+    relative_parts = parts[2:] if parts[:2] == ["test", "registered"] else []
+    if len(relative_parts) < 3 or relative_parts[0] not in _TEST_KINDS:
+        return [
+            f"{path}: registered tests must live under "
+            "test/registered/<kind>/<subsystem>/; kind must be one of "
+            + ", ".join(sorted(_TEST_KINDS))
+        ]
+
+    kind = relative_parts[0]
+    errors = []
+    if kind == "unit":
+        non_cpu = [r for r in registries if r.backend.name != "CPU"]
+        if non_cpu:
+            errors.append(f"{path}: unit tests may register only CPU suites")
+        if any(r.est_time > 60 for r in registries):
+            errors.append(f"{path}: unit test est_time must be <= 60 seconds")
+        if _contains_call(tree, "popen_launch_server"):
+            errors.append(f"{path}: unit tests may not launch a server")
+    elif kind == "kernel":
+        if any("-kernel-" not in (r.effective_suite or "") for r in registries):
+            errors.append(f"{path}: kernel tests must use a *-kernel-* suite")
+    elif kind in {"accuracy", "perf"}:
+        invalid = [
+            r
+            for r in registries
+            if not (r.effective_suite or "").startswith(("nightly-", "weekly-"))
+        ]
+        if invalid:
+            errors.append(f"{path}: {kind} tests must use nightly/weekly suites")
+    elif kind == "stress":
+        invalid = [
+            r
+            for r in registries
+            if (r.effective_suite or "") != "stress"
+            and not (r.effective_suite or "").startswith("weekly-")
+        ]
+        if invalid:
+            errors.append(f"{path}: stress tests must use stress/weekly suites")
+    return errors
+
+
 def main() -> int:
     # Import ci_register directly to avoid pulling in all of sglang
     spec = importlib.util.spec_from_file_location(
@@ -93,6 +189,8 @@ def main() -> int:
     legacy_shape = []  # (file, suite, stage, runner_config) -- has a -test- split
     non_dispatchable = []  # (file, suite) -- legacy CUDA suite no workflow invokes
     dead_tests = []  # (file) -- TestCase classes that `python3 file.py` never runs
+    taxonomy_violations = []
+    changed_files = _changed_registered_files()
     for f in files:
         try:
             registries, _has_main_entry = ci_register.ut_parse_one_file(f)
@@ -106,6 +204,8 @@ def main() -> int:
         # `python3 file.py`); the ERROR text below explains the fix.
         with open(f, "r", encoding="utf-8") as fh:
             tree = ast.parse(fh.read(), filename=f)
+        if f in changed_files:
+            taxonomy_violations.extend(taxonomy_errors(f, registries, tree))
         if _defines_testcase(tree) and not _main_runs_tests(tree):
             dead_tests.append(f)
         for r in registries:
@@ -170,6 +270,12 @@ def main() -> int:
         )
         for f in dead_tests:
             print(f"  {f}")
+        print()
+        exit_code = 1
+    if taxonomy_violations:
+        print("ERROR: Registered-test taxonomy violations:")
+        for error in taxonomy_violations:
+            print(f"  {error}")
         print()
         exit_code = 1
 

@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     MMInputsProcessError,
@@ -37,7 +38,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -78,6 +79,9 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    # Emits AbortReqs for SGLANG_REQ_WAITING_TIMEOUT / _RUNNING_TIMEOUT;
+    # runs on the rank that owns the waiting queue.
+    poll_timeout_aborts: Callable[[], List[AbortReq]]
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -102,7 +106,17 @@ class SchedulerRequestReceiver:
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
+        # Decided once and broadcast, so every rank sharing this waiting queue
+        # drops the same requests in the same iteration.
+        local_reqs = []
+        if (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            local_reqs = self.poll_timeout_aborts()
+
+        recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
 
         if self.ps.pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
@@ -162,10 +176,18 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         return recv_reqs
 
-    def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
+    def _broadcast_reqs_across_ranks(
+        self, recv_reqs: Optional[List], local_reqs: Optional[List] = None
+    ) -> List:
+        """local_reqs ride the work channel, which is scoped to the ranks
+        sharing one waiting queue; the control channel fans out from global
+        rank 0 and would overwrite every DP group's aborts but the first.
+        """
+        local_reqs = local_reqs or []
         if get_parallel().enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
+                work_reqs.extend(local_reqs)
             else:
                 work_reqs = None
                 control_reqs = None
@@ -179,7 +201,7 @@ class SchedulerRequestReceiver:
             # all-ranks gloo sync.
             _local_ctrl = (
                 get_parallel().enable_dp_attention_local_control_broadcast
-                or is_ep_scale_joiner()
+                or get_exec().moe.is_ep_scale_joiner
             )
             if _local_ctrl:
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
@@ -191,13 +213,16 @@ class SchedulerRequestReceiver:
                     src=self.tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
-        elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
+        else:
+            if recv_reqs is not None:
+                recv_reqs = [*recv_reqs, *local_reqs]
+            if self.ps.tp_size != 1:
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
