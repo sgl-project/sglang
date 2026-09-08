@@ -17,6 +17,12 @@ from torch import nn
 
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
+from sglang.srt.layers.dp_attention import (
+    dp_gather_partial,
+    dp_scatter,
+    get_attention_dp_size,
+    get_global_dp_buffer_len,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
@@ -317,7 +323,7 @@ class EngramEmbedding(nn.Module):
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight[self.row_start : self.row_start + self.rows])
 
-    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+    def forward(self, indices: torch.Tensor, forward_batch=None) -> torch.Tensor:
         local = indices - self.row_start
         owned = (local >= 0) & (local < self.rows)
         local = local.masked_fill(~owned, 0)
@@ -325,7 +331,25 @@ class EngramEmbedding(nn.Module):
         values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
         values = values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         if self.tp_size > 1:
-            values = tensor_model_parallel_all_reduce(values)
+            if forward_batch is not None and get_attention_dp_size() > 1:
+                # DP attention: token counts (hence all_reduce shapes) differ
+                # across TP ranks -- a plain tensor_model_parallel_all_reduce on
+                # the local tensor mismatches in HCCL (an idle rank contributes
+                # a 0-row tensor and deadlocks busy ranks). Reduce through the
+                # uniform global DP buffer instead: write our partial rows at
+                # our dp offset, all_reduce the whole buffer (identical shape
+                # on every rank), then slice our segment back out.
+                global_buf = torch.zeros(
+                    (get_global_dp_buffer_len(), values.shape[-1]),
+                    dtype=values.dtype,
+                    device=values.device,
+                )
+                dp_gather_partial(global_buf, values, forward_batch)
+                out = torch.zeros_like(values)
+                dp_scatter(out, global_buf, forward_batch)
+                values = out
+            else:
+                values = tensor_model_parallel_all_reduce(values)
         return values
 
 
@@ -382,9 +406,11 @@ class Engram(nn.Module):
         self.q_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
 
-    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, hash_ids: torch.Tensor, forward_batch=None
+    ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
-        kv, _ = self.wkv(self.embed(hash_ids).flatten(-2))
+        kv, _ = self.wkv(self.embed(hash_ids, forward_batch).flatten(-2))
         return engram_gate(
             x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
         )

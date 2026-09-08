@@ -3266,7 +3266,9 @@ class DeepseekV4Model(nn.Module):
             if engram is not None:
                 before_engram = hidden_states
                 hidden_states = engram(
-                    hidden_states, hash_ids[:, engram.layer_hash_index]
+                    hidden_states,
+                    hash_ids[:, engram.layer_hash_index],
+                    forward_batch,
                 )
                 if (
                     self.config.model_type == "deepseek_v4.1"
