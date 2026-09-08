@@ -463,6 +463,81 @@ _NON_GPU_WORKFLOW_HINTS = (
 )
 
 
+def percentile(values: list[float], p: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[int(round((len(ordered) - 1) * p))]
+
+
+def queue_timeline(
+    jobs: list[dict],
+    window_start: datetime,
+    window_end: datetime,
+    bucket_minutes: int = 60,
+) -> list[dict]:
+    """Per-bucket queue backlog and wait p90, for the Lark timeline card.
+
+    `backlog` is the same sweep-line counter calculate_concurrency_metrics
+    reduces to a single peak, kept per bucket instead: the highest number of
+    jobs simultaneously waiting for a runner at any instant inside the bucket.
+    `p90_wait_min` covers the jobs a runner picked up during the bucket, so a
+    bucket can show a deep backlog and no p90 at all when nothing got picked up.
+    """
+    # Buckets start on the hour so the chart's x-axis labels mean what they
+    # say; the first one is clipped by window_start and so covers less time.
+    bucket = timedelta(minutes=bucket_minutes)
+    origin = window_start.replace(minute=0, second=0, microsecond=0)
+    starts = []
+    t = origin
+    while t < window_end:
+        starts.append(t)
+        t += bucket
+    if not starts:
+        return []
+    peaks = [0] * len(starts)
+
+    def bucket_index(when: datetime) -> int:
+        offset = (when - origin).total_seconds() // (bucket_minutes * 60)
+        return max(0, min(len(starts) - 1, int(offset)))
+
+    events = []
+    for job in jobs:
+        created_at, queue_end = job.get("created_at"), job.get("queue_end")
+        if not created_at or not queue_end or created_at >= queue_end:
+            continue
+        if queue_end < window_start or created_at > window_end:
+            continue
+        events.append((max(created_at, window_start), 1))
+        events.append((min(queue_end, window_end), -1))
+    # Level between two events applies to every bucket the gap spans, so a
+    # backlog that persists without any event still shows in later buckets.
+    events.sort(key=lambda e: (e[0], e[1] == 1))
+    current, prev_time = 0, window_start
+    for event_time, delta in events + [(window_end, 0)]:
+        if current > 0 and event_time > prev_time:
+            for i in range(bucket_index(prev_time), bucket_index(event_time) + 1):
+                peaks[i] = max(peaks[i], current)
+        current += delta
+        prev_time = event_time
+
+    waits: list[list[float]] = [[] for _ in starts]
+    for job in jobs:
+        start = job.get("start")
+        if start is None or start < window_start or start > window_end:
+            continue
+        waits[bucket_index(start)].append(job["queue_time"])
+    return [
+        {
+            "start": starts[i].strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "backlog": peaks[i],
+            "started": len(waits[i]),
+            "p90_wait_min": (percentile(waits[i], 0.9) or 0.0) / 60,
+        }
+        for i in range(len(starts))
+    ]
+
+
 def _likely_no_gpu_jobs(workflow_name: str) -> bool:
     """Heuristic: skip per-run job-fetch for workflows that don't dispatch
     to self-hosted GPU runners. The GH API rate limit is the bottleneck on
@@ -781,6 +856,7 @@ def calculate_utilization(
                 "saturation_pct": conc["saturation_pct"],
                 "peak_queue": conc["peak_queue"],
                 "status_counts": status_counts,
+                "queue_timeline": queue_timeline(jobs, window_start, window_end),
             }
         )
 
@@ -957,6 +1033,11 @@ def main():
         "--filter", type=str, help="Filter runner labels (e.g., '5090', 'h200')"
     )
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
+    parser.add_argument(
+        "--queue-series-out",
+        type=str,
+        help="Write the per-label hourly queue series as JSON (for the Lark card)",
+    )
     args = parser.parse_args()
 
     results, fetch_failure_pct, longest_waits, coverage_hours = calculate_utilization(
@@ -969,6 +1050,17 @@ def main():
         longest_waits=longest_waits,
         coverage_hours=coverage_hours,
     )
+
+    if args.queue_series_out:
+        # Every bucket carries its own start, so the window needs no separate
+        # field -- and cannot drift from the one calculate_utilization used.
+        series = {
+            "bucket_minutes": 60,
+            "labels": {r["label"]: r["queue_timeline"] for r in results},
+        }
+        with open(args.queue_series_out, "w") as f:
+            json.dump(series, f)
+        print(f"Queue series written to {args.queue_series_out}")
 
     if args.output:
         with open(args.output, "w") as f:

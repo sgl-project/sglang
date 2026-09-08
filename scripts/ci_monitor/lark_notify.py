@@ -190,6 +190,18 @@ def button(text: str, url: str) -> dict:
     }
 
 
+def chart(spec: dict, aspect_ratio: str = "16:9") -> dict:
+    # Native chart component: the spec is VChart JSON rendered by the Lark
+    # client, so no image upload (and no Lark app credentials) is involved.
+    # Needs Lark client 7.1+.
+    return {
+        "tag": "chart",
+        "aspect_ratio": aspect_ratio,
+        "color_theme": "brand",
+        "chart_spec": spec,
+    }
+
+
 HR = {"tag": "hr"}
 
 
@@ -239,6 +251,13 @@ def fmt_local(dt: Optional[datetime]) -> str:
     if dt is None:
         return "-"
     return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %I:%M %p %Z")
+
+
+def fmt_local_hour(dt: Optional[datetime]) -> str:
+    """Timeline bucket label: the local hour alone, e.g. "9am"."""
+    if dt is None:
+        return "-"
+    return dt.astimezone(LOCAL_TZ).strftime("%I%p").lstrip("0").lower()
 
 
 def plural(n: int, word: str) -> str:
@@ -681,6 +700,120 @@ def cmd_queue_digest(args: argparse.Namespace, gh: GitHub) -> None:
 
 
 # --------------------------------------------------------------------------
+# queue-timeline
+# --------------------------------------------------------------------------
+
+
+def merge_timeline(series: dict) -> list:
+    """Fold the per-label series into one CUDA-wide series, bucket by bucket.
+
+    Backlog sums across pools (a job waits in exactly one pool) while the wait
+    is a max of the per-pool p90s: averaging them would let idle pools mask the
+    one pool that is actually stuck, which is the number worth alerting on.
+    """
+    buckets: dict = {}
+    for label, rows in series.get("labels", {}).items():
+        if not CUDA_LABEL_RE.match(label):
+            continue
+        for row in rows:
+            b = buckets.setdefault(
+                row["start"], {"backlog": 0, "started": 0, "p90": 0.0}
+            )
+            b["backlog"] += row["backlog"]
+            b["started"] += row["started"]
+            b["p90"] = max(b["p90"], row["p90_wait_min"])
+    return [dict(start=k, **v) for k, v in sorted(buckets.items())]
+
+
+def timeline_chart_spec(rows: list) -> dict:
+    hours = [fmt_local_hour(parse_time(r["start"])) for r in rows]
+    return {
+        "type": "common",
+        "data": [
+            {
+                "id": "backlog",
+                "values": [
+                    {"hour": h, "value": r["backlog"]} for h, r in zip(hours, rows)
+                ],
+            },
+            {
+                "id": "wait",
+                "values": [
+                    {"hour": h, "value": round(r["p90"], 1)}
+                    for h, r in zip(hours, rows)
+                ],
+            },
+        ],
+        "series": [
+            {
+                "type": "bar",
+                "id": "backlog",
+                "dataIndex": 0,
+                "xField": "hour",
+                "yField": "value",
+                "name": "Jobs waiting (peak)",
+            },
+            {
+                "type": "line",
+                "id": "wait",
+                "dataIndex": 1,
+                "xField": "hour",
+                "yField": "value",
+                "name": "p90 wait (min)",
+            },
+        ],
+        "axes": [
+            {"orient": "left", "seriesIndex": [0], "title": {"visible": False}},
+            {"orient": "right", "seriesId": ["wait"], "grid": {"visible": False}},
+            {"orient": "bottom", "type": "band", "label": {"visible": True}},
+        ],
+        "legends": {"visible": True, "orient": "bottom"},
+    }
+
+
+def render_queue_timeline(rows: list, report_url: str) -> dict:
+    peak = max(rows, key=lambda r: r["backlog"])
+    slowest = max(rows, key=lambda r: r["p90"])
+    span = f"{fmt_local(parse_time(rows[0]['start']))} to {fmt_local(parse_time(rows[-1]['start']))}"
+    elements = [
+        md(f"{grey('Window')}  {span}  {grey('(bucket: 1h)')}"),
+        kv_columns(
+            [
+                ("Jobs started", str(sum(r["started"] for r in rows))),
+                ("Peak backlog", f"{peak['backlog']} jobs"),
+                ("Peak hour", fmt_local_hour(parse_time(peak["start"]))),
+                ("Worst p90 wait", fmt_duration(slowest["p90"] * 60)),
+            ]
+        ),
+        chart(timeline_chart_spec(rows)),
+    ]
+    return build_card(
+        "CUDA queue over the day",
+        "blue",
+        elements,
+        [("View utilization report", report_url)],
+    )
+
+
+def cmd_queue_timeline(args: argparse.Namespace, gh: GitHub) -> None:
+    with open(args.series_file) as f:
+        series = json.load(f)
+    rows = merge_timeline(series)
+    if not rows:
+        print("no CUDA buckets in the series; skipping")
+        return
+    # The card is built from THIS run's scan, so link to it rather than to the
+    # last successful one, which would be yesterday's report.
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    report_url = (
+        f"https://github.com/{gh.repo}/actions/runs/{run_id}"
+        if run_id
+        else gh.latest_run_url(UTILIZATION_WORKFLOW)
+    )
+    post_card(render_queue_timeline(rows, report_url), args.webhook, args.dry_run)
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -726,6 +859,13 @@ def main() -> int:
     p.add_argument("--workflows", default=",".join(CUDA_WORKFLOW_FILES))
     p.add_argument("--workers", type=int, default=8)
 
+    p = sub.add_parser("queue-timeline", help="daily queue backlog / wait chart")
+    p.add_argument(
+        "--series-file",
+        required=True,
+        help="JSON written by runner_utilization_report.py --queue-series-out",
+    )
+
     args = parser.parse_args()
     if not args.token:
         print("GITHUB_TOKEN (or --token) is required", file=sys.stderr)
@@ -741,6 +881,7 @@ def main() -> int:
         "ci-status": cmd_ci_status,
         "runner-health": cmd_runner_health,
         "queue-digest": cmd_queue_digest,
+        "queue-timeline": cmd_queue_timeline,
     }[args.command](args, gh)
     return 0
 
