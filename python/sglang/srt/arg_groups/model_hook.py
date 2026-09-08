@@ -80,6 +80,30 @@ def _rocm_fp8_wo_a_supported() -> bool:
         return False
 
 
+def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -> None:
+    flag = envs.SGLANG_OPT_FP8_WO_A_GEMM
+    if not _rocm_fp8_wo_a_supported():
+        flag.set(False)
+        return
+    if flag.is_set():
+        return
+
+    from sglang.srt.model_loader.weight_utils import probe_safetensors_weight_dtype
+
+    revision = (
+        getattr(model_config.hf_config, "_commit_hash", None) or model_config.revision
+    )
+    dtype = probe_safetensors_weight_dtype(
+        model_config.model_path,
+        ".wo_a.weight",
+        revision=revision,
+        cache_dir=download_dir,
+    )
+    if dtype is not None and dtype != "F8_E4M3":
+        flag.set(False)
+        logger.info("Disabled ROCm fp8 wo_a GEMM for checkpoint dtype %s", dtype)
+
+
 def handle_model_specific_adjustments(server_args: Any):
 
     cfg = resolving_view(server_args)
@@ -401,11 +425,7 @@ def handle_model_specific_adjustments(server_args: Any):
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
         elif get_platform().is_hip:
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-            # The fp8 wo_a GEMM is DeepGEMM-based on CUDA. ROCm has an aiter
-            # e8m0 block-scale equivalent, but only on gfx950 -- everywhere else
-            # keeps the bf16 absorb GEMM.
-            if not _rocm_fp8_wo_a_supported():
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            _configure_rocm_fp8_wo_a_gemm(model_config, cfg.download_dir)
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
             envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
