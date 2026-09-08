@@ -16,11 +16,22 @@ register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 INT32 = dict(dtype=torch.int32)
 
 
-def _extend_forward_batch():
+def _extend_forward_batch(*, req_pool_indices=(0,), extend_seq_lens=None):
     """Not decode, and without the CPU length copies, so the extend dispatchers
     take the torch path (the oracle these tests exercise)."""
+    req = torch.tensor(req_pool_indices, dtype=torch.int64)
+    lens = torch.tensor(
+        extend_seq_lens if extend_seq_lens is not None else [1] * len(req),
+        dtype=torch.int32,
+    )
     return SimpleNamespace(
-        forward_mode=SimpleNamespace(is_decode=lambda: False, is_extend=lambda: True),
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: False,
+            is_extend=lambda: True,
+            is_target_verify=lambda: False,
+        ),
+        req_pool_indices=req,
+        extend_seq_lens=lens,
         seq_lens_cpu=None,
         extend_seq_lens_cpu=None,
     )
@@ -229,32 +240,26 @@ class TestLowRatioPoolMapping(CustomTestCase):
         pool.compression_ratios = ratios
         pool.kv_source_layers = sources
         pool._stage_start, pool._stage_end = 0, len(ratios)
-        pool.low_ratio_sources = {
-            r: [l for l in sources if ratios[l] == r] for r in (1, 2)
+        pool.sources_by_ratio = pool._collect_sources_by_ratio()
+        pool.kv_pools = {
+            r: SimpleNamespace(name=f"c{r}") for r in pool.sources_by_ratio
         }
-        pool.c1_kv_pool = (
-            SimpleNamespace(name="c1") if pool.low_ratio_sources[1] else None
-        )
-        pool.c2_kv_pool = (
-            SimpleNamespace(name="c2") if pool.low_ratio_sources[2] else None
-        )
-        pool.c4_kv_pool = pool.c128_kv_pool = None
         pool._init_compressed_layer_mapping()
         return pool
 
     def test_layers_read_the_nearest_source_of_their_ratio(self):
         # Mirrors the released layout in miniature: two ratio-2 sources, one ratio-1.
         pool = self._pool([0, 0, 2, 2, 2, 2, 1, 1, 1], sources=[2, 4, 6])
-        self.assertEqual(pool.latent_source_layer(3), 2)
-        self.assertEqual(pool.latent_source_layer(4), 4)
-        self.assertEqual(pool.latent_source_layer(5), 4)
-        self.assertEqual(pool.latent_source_layer(8), 6)
+        self.assertEqual(pool.source_layer_of(3), 2)
+        self.assertEqual(pool.source_layer_of(4), 4)
+        self.assertEqual(pool.source_layer_of(5), 4)
+        self.assertEqual(pool.source_layer_of(8), 6)
         # compress_layer_id is the source's index inside its ratio's pool.
         self.assertEqual(pool.layer_mapping[3].compress_layer_id, 0)
         self.assertEqual(pool.layer_mapping[5].compress_layer_id, 1)
-        self.assertIs(pool.layer_mapping[5].compress_kv_pool, pool.c2_kv_pool)
+        self.assertIs(pool.layer_mapping[5].compress_kv_pool, pool.kv_pools[2])
         self.assertEqual(pool.layer_mapping[7].compress_layer_id, 0)
-        self.assertIs(pool.layer_mapping[7].compress_kv_pool, pool.c1_kv_pool)
+        self.assertIs(pool.layer_mapping[7].compress_kv_pool, pool.kv_pools[1])
         self.assertIsNone(pool.layer_mapping[0].compress_kv_pool)
 
     def test_layer_before_any_source_is_rejected(self):
@@ -357,7 +362,17 @@ class TestLowRatioTorchIndexer(CustomTestCase):
             freqs_cis=torch.ones(1024, 2, dtype=torch.complex64),
         )
         x = torch.zeros(T, dim, dtype=torch.bfloat16)
-        backend._low_ratio_index_topk(layer, x, x, req, pos, _extend_forward_batch())
+        reqs, counts = torch.unique_consecutive(req, return_counts=True)
+        backend._low_ratio_index_topk(
+            layer,
+            x,
+            x,
+            req,
+            pos,
+            _extend_forward_batch(
+                req_pool_indices=reqs.tolist(), extend_seq_lens=counts.tolist()
+            ),
+        )
         return page_indices, raw_indices, topk_lengths, req_to_token
 
     def test_valid_prefix_matches_metadata_lengths(self):
@@ -391,12 +406,22 @@ class TestLowRatioTorchCompressor(CustomTestCase):
             _low_ratio_compression_metadata,
         )
         from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
+        from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 
         dim = 64
+        state = CompressStatePool(
+            size=4 * 2,
+            ring_size=2,
+            overlap=False,
+            head_dim=dim,
+            dtype=torch.float32,
+            device="cpu",
+            enable_memory_saver=False,
+            ratio=2,
+        )
         writes = []
         pool = SimpleNamespace(
-            c2_pair_kv_state={0: torch.zeros(4, dim)},
-            c2_pair_score_state={0: torch.zeros(4, dim)},
+            get_attention_compress_states=lambda layer_id: state,
             source_index_k={},
             set_extra_key_buffer_fused=lambda layer_id, loc, cache_k: writes.append(
                 (loc.clone(), cache_k.clone())
@@ -416,36 +441,50 @@ class TestLowRatioTorchCompressor(CustomTestCase):
 
         def chunk(positions):
             pos = torch.tensor(positions, dtype=torch.int64)
-            req = torch.zeros_like(pos)
             raw_out_loc = (base_loc + pos).to(torch.int32)
             out_loc, _ = _low_ratio_compression_metadata(
                 2, (pos + 1).to(torch.int32), raw_out_loc
             )
-            core = SimpleNamespace(c1_out_loc=None, c2_out_loc=out_loc)
+            core = SimpleNamespace(
+                raw_out_loc=raw_out_loc, c1_out_loc=None, c2_out_loc=out_loc
+            )
             backend = _backend_with(core, pool, req_to_token=None)
             backend._low_ratio_compress(
-                layer, x_all[pos], req, pos, _extend_forward_batch()
+                layer,
+                x_all[pos],
+                torch.zeros_like(pos),
+                pos,
+                _extend_forward_batch(
+                    req_pool_indices=[0], extend_seq_lens=[len(positions)]
+                ),
             )
 
+        def pending(position):
+            # Request 0 parks position p at ring slot p % 2.
+            return state.kv_score_buffer[position % state.ring_size].kv
+
         # Chunk 1 ends on an even position: pairs (0,1) and (2,3) complete, 4 waits.
+        # Every row writes -- an even one lands on the reserved dummy slot 0.
         chunk([0, 1, 2, 3, 4])
         self.assertEqual(len(writes), 1)
         slots, latent = writes[0]
-        self.assertEqual(slots.tolist(), [(base_loc + 1) // 2, (base_loc + 3) // 2])
+        self.assertEqual(
+            slots.tolist(), [0, (base_loc + 1) // 2, 0, (base_loc + 3) // 2, 0]
+        )
         expected = torch.stack(
             [x_all[0:2].float().mean(0), x_all[2:4].float().mean(0)]
         ).to(torch.bfloat16)
-        torch.testing.assert_close(latent, fake_quant_fp4(expected))
-        torch.testing.assert_close(pool.c2_pair_kv_state[0][0], x_all[4].float())
+        torch.testing.assert_close(latent[1::2], fake_quant_fp4(expected))
+        torch.testing.assert_close(pending(4), x_all[4].float())
 
-        # Chunk 2 starts on the odd partner: (4,5) pairs through the state, 6 waits.
+        # Chunk 2 starts on the odd partner: (4,5) pairs through the ring, 6 waits.
         chunk([5, 6])
         self.assertEqual(len(writes), 2)
         slots, latent = writes[1]
-        self.assertEqual(slots.tolist(), [(base_loc + 5) // 2])
+        self.assertEqual(slots.tolist(), [(base_loc + 5) // 2, 0])
         expected = x_all[4:6].float().mean(0, keepdim=True).to(torch.bfloat16)
-        torch.testing.assert_close(latent, fake_quant_fp4(expected))
-        torch.testing.assert_close(pool.c2_pair_kv_state[0][0], x_all[6].float())
+        torch.testing.assert_close(latent[:1], fake_quant_fp4(expected))
+        torch.testing.assert_close(pending(6), x_all[6].float())
 
     def test_ratio_one_writes_every_token(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -473,14 +512,16 @@ class TestLowRatioTorchCompressor(CustomTestCase):
         out_loc, _ = _low_ratio_compression_metadata(
             1, (pos + 1).to(torch.int32), raw_out_loc
         )
-        core = SimpleNamespace(c1_out_loc=out_loc, c2_out_loc=None)
+        core = SimpleNamespace(
+            raw_out_loc=raw_out_loc, c1_out_loc=out_loc, c2_out_loc=None
+        )
         backend = _backend_with(core, pool, req_to_token=None)
         backend._low_ratio_compress(
             layer,
             torch.randn(3, dim, dtype=torch.bfloat16),
-            torch.zeros(3, dtype=torch.int64),
+            torch.zeros_like(pos),
             pos,
-            _extend_forward_batch(),
+            _extend_forward_batch(req_pool_indices=[0], extend_seq_lens=[3]),
         )
         self.assertEqual(writes[0].tolist(), [259, 260, 261])
 

@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c4_state_indices,
     get_dsv4_c128_state_indices,
+    get_dsv4_request_state_indices,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -582,6 +583,32 @@ class TestDSV4C128StateIndices(unittest.TestCase):
             get_dsv4_c128_state_indices(7, 129, online=False, ring_size=256),
             np.array([15], dtype=np.int32),
         )
+
+
+class TestDSV4RequestStateIndices(unittest.TestCase):
+    def test_pair_ring_ships_one_request_item_for_an_odd_prefix(self):
+        pool = SimpleNamespace(kv_pools={1: object(), 2: object()})
+        np.testing.assert_array_equal(
+            get_dsv4_request_state_indices(pool, 7, 257),
+            np.array([7], dtype=np.int32),
+        )
+
+    def test_pair_ring_ships_nothing_for_an_even_prefix(self):
+        pool = SimpleNamespace(kv_pools={1: object(), 2: object()})
+        np.testing.assert_array_equal(
+            get_dsv4_request_state_indices(pool, 7, 256),
+            np.empty((0,), dtype=np.int32),
+        )
+
+    def test_c128_ring_keeps_the_page_addressing(self):
+        pool = SimpleNamespace(
+            kv_pools={4: object(), 128: object()}, get_ring_size=lambda ratio: 256
+        )
+        with envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(False):
+            np.testing.assert_array_equal(
+                get_dsv4_request_state_indices(pool, 7, 129),
+                get_dsv4_c128_state_indices(7, 129, online=False, ring_size=256),
+            )
 
 
 def _buf_infos(*ptrs):

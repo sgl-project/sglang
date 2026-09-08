@@ -115,8 +115,13 @@ class DSV4ReqToTokenTablesMixin:
     def _dsv4_free(self, req) -> None:
         # Trigger C128 KV free/state clear via the allocator's unified path. May be None
         # between __init__ and register_dsv4_allocator — defensive None check.
-        if self._dsv4_allocator is not None:
-            self._dsv4_allocator.free(req=req, req_to_token_pool=self)
+        # V4.1 uses the plain SWATokenToKVPoolAllocator (no c128 sub-allocator),
+        # whose free() signature doesn't accept req/req_to_token_pool — skip it.
+        if self._dsv4_allocator is None:
+            return
+        if getattr(self._dsv4_allocator, "c128_attn_allocator", None) is None:
+            return
+        self._dsv4_allocator.free(req=req, req_to_token_pool=self)
 
 
 class DSV4NPUReqToTokenPool(DSV4ReqToTokenTablesMixin, ReqToTokenPool):

@@ -19,7 +19,7 @@ class TestCompressStateWritePad(CustomTestCase):
 
     def test_pad_is_zero_without_speculation(self):
         """A non-speculative ring is exactly one window wide: nothing rolls back."""
-        for compress_ratio in (4, 128):
+        for compress_ratio in (2, 4, 128):
             ring_size = get_compress_state_ring_size(compress_ratio, False)
             with self.subTest(cr=compress_ratio, ring=ring_size):
                 self.assertEqual(
@@ -33,6 +33,21 @@ class TestCompressStateWritePad(CustomTestCase):
             with self.subTest(cr=compress_ratio, ring=ring_size):
                 self.assertEqual(
                     get_compress_state_write_pad(compress_ratio, ring_size), expected
+                )
+
+    def test_ratio_two_ring_covers_the_draft_window(self):
+        """One pair without speculation; with it, the smallest power-of-two ring
+        wider than the draft window, so a regenerated position overwrites its
+        rejected draft before the position after it reads the slot before it."""
+        self.assertEqual(get_compress_state_ring_size(2, False), 2)
+        for num_draft_tokens in range(1, 17):
+            ring_size = get_compress_state_ring_size(2, True, num_draft_tokens)
+            with self.subTest(num_draft_tokens=num_draft_tokens):
+                self.assertEqual(ring_size & (ring_size - 1), 0)
+                self.assertGreaterEqual(ring_size, 2 + num_draft_tokens)
+                self.assertLess(ring_size // 2, 2 + num_draft_tokens)
+                self.assertGreaterEqual(
+                    get_compress_state_write_pad(2, ring_size), num_draft_tokens
                 )
 
     def test_pad_is_zero_for_rings_below_one_window(self):

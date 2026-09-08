@@ -131,12 +131,19 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 need_sort=need_sort,
             )
 
-        self.c128_attn_allocator = mk(kvcache.c128_size, kvcache.c128_kv_pool)
-        self.c128_page_refcount = torch.zeros(
-            self.c128_attn_allocator.num_pages + 1,
-            dtype=torch.int32,
-            device=device,
-        )
+        # V4.1 (ratios 1/2) has no c128 KV pool; only V4 (ratios 4/128) does.
+        # Guard the C128 sub-allocator so V4.1 doesn't NPE on the None alias.
+        c128_pool = kvcache.c128_kv_pool
+        if c128_pool is not None:
+            self.c128_attn_allocator = mk(kvcache.c128_size, c128_pool)
+            self.c128_page_refcount = torch.zeros(
+                self.c128_attn_allocator.num_pages + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            self.c128_attn_allocator = None
+            self.c128_page_refcount = None
 
         # Returned by the c-pool helpers when a step adds no compressed tokens.
         self._empty_loc = torch.empty((0,), dtype=torch.int64, device=device)
@@ -265,6 +272,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def _has_c128_sidecar_capacity(
         self, prefix_lens_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
     ) -> bool:
+        if self.c128_attn_allocator is None:
+            return True  # V4.1 has no c128 pool
         ratio = 128
         page_size = self.c128_attn_allocator.page_size
         prefix_groups = (prefix_lens_cpu // ratio + page_size - 1) // page_size
@@ -288,6 +297,14 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             "DSV4NPUTokenToKVPoolAllocator requires req_pool_indices "
             "(forwarded from batch.req_pool_indices)."
         )
+        if self.c128_attn_allocator is None:
+            # V4.1 (ratios 1/2): no c4/c128 KV pools; return full+swa only.
+            return DSV4OutCacheLoc(
+                out_full_loc=out_full_loc,
+                out_swa_loc=out_swa_loc,
+                out_c4_loc=self._empty_loc,
+                out_c128_loc=self._empty_loc,
+            )
         out_c4_loc = self._derive_c4_loc_from_full(out_full_loc)
         out_c128_loc = self._alloc_c_extend(
             self.c128_attn_allocator,
@@ -470,22 +487,28 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if kv_len <= 0 or req_pool_idx is None:
             return
 
+        if self.c128_attn_allocator is None:
+            return  # V4.1 has no c128 KV/state to free
+
         row = req_to_token_pool.req_to_c128_sidecar[int(req_pool_idx)]
         self.release_c128_pages(row[row > 0])
         row.zero_()
         self.get_kvcache().clear_c128_req_state(int(req_pool_idx))
 
     def available_size(self):
+        if self.c128_attn_allocator is None:
+            return super().available_size()
         return min(
             super().available_size(),
             self.c128_attn_allocator.available_size() * 128,
         )
 
     def resize(self, config) -> None:
-        self.c128_attn_allocator.size = int(config.c128_max_total_num_tokens)
-        self.c128_attn_allocator.num_pages = (
-            self.c128_attn_allocator.size // self.c128_attn_allocator.page_size
-        )
+        if self.c128_attn_allocator is not None:
+            self.c128_attn_allocator.size = int(config.c128_max_total_num_tokens)
+            self.c128_attn_allocator.num_pages = (
+                self.c128_attn_allocator.size // self.c128_attn_allocator.page_size
+            )
         super().resize(config)
 
     def clear(self):

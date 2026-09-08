@@ -1938,7 +1938,16 @@ class KVCacheConfigurator:
                 if self.is_hybrid_swa:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
-                    if is_dsv4_model:
+                    # V4.1 (ratios 1/2) has no c4/c128 KV pools, so it uses the
+                    # plain SWA allocator — same as GPU, and all V4-specific
+                    # hooks (maybe_write_dsv4_extend, etc.) no-op via the
+                    # is_dsv4 = hasattr(allocator, "c128_attn_allocator")
+                    # gate in mem_cache/allocation.py.
+                    has_c4_or_c128 = is_dsv4_model and (
+                        getattr(token_to_kv_pool, "c4_kv_pool", None) is not None
+                        or getattr(token_to_kv_pool, "c128_kv_pool", None) is not None
+                    )
+                    if has_c4_or_c128:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
                             DSV4NPUTokenToKVPoolAllocator,
                         )

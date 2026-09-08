@@ -144,6 +144,40 @@ class NgramEmbeddingManager:
                     if any(skip_token_table_update)
                     else None
                 )
+        elif batch.forward_mode.is_prebuilt():
+            # PD decode: a prebuilt batch skips EXTEND, so the row its first DECODE
+            # reads is written here — the n-1 tokens before the one prefill
+            # sampled, which is the token decode feeds as its first input.
+            n1 = self.n - 1
+            all_tokens = []
+            column_starts = []
+            request_lengths = []
+            for req in batch.reqs:
+                fill_ids = req.origin_input_ids + req.output_ids
+                end = len(fill_ids) - 1  # position of the sampled token
+                if end >= n1:
+                    tokens = fill_ids[end - n1 : end]
+                    column_starts.append(end - n1)
+                else:
+                    tokens = fill_ids[0:end]
+                    column_starts.append(0)
+                all_tokens.extend(tokens)
+                request_lengths.append(len(tokens))
+            if all_tokens:
+                dtype = self.table.dtype
+                device = self.table.device
+                update_token_table(
+                    ne_token_table=self.table,
+                    tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
+                    row_indices=batch.req_pool_indices,
+                    column_starts=torch.tensor(
+                        column_starts, dtype=torch.int32, device=device
+                    ),
+                    req_lens=torch.tensor(
+                        request_lengths, dtype=torch.int32, device=device
+                    ),
+                    ignore_tokens=None,
+                )
         return batch
 
 
