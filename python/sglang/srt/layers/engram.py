@@ -20,6 +20,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -319,16 +320,23 @@ class EngramEmbedding(nn.Module):
         assert num_embeddings % self.tp_size == 0, (num_embeddings, self.tp_size)
         self.rows = num_embeddings // self.tp_size
         self.row_start = get_tensor_model_parallel_rank() * self.rows
-        self.weight = nn.Parameter(
-            torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
-            requires_grad=False,
-        )
-        self.scale = nn.Parameter(
-            torch.empty(self.rows, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu),
-            requires_grad=False,
-        )
-        self.weight.weight_loader = self._load_rows
-        self.scale.weight_loader = self._load_rows
+        if not is_npu_arch35():
+            self.weight = nn.Parameter(
+                torch.empty(self.rows, dim, dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            self.weight.weight_loader = self._load_rows
+        else:
+            self.weight = nn.Parameter(
+                torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.scale = nn.Parameter(
+                torch.empty(self.rows, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu),
+                requires_grad=False,
+            )
+            self.weight.weight_loader = self._load_rows
+            self.scale.weight_loader = self._load_rows
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight[self.row_start : self.row_start + self.rows])
@@ -339,19 +347,21 @@ class EngramEmbedding(nn.Module):
         local = indices - self.row_start
         owned = (local >= 0) & (local < self.rows)
         local = local.masked_fill(~owned, 0)
-        w = self.weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
-        s_raw = self.scale.view(torch.uint8)[local].to(torch.float32)
-        s = torch.pow(2.0, s_raw - 127.0)
-        rows = w.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
-        values = (rows * s.unsqueeze(-1)).flatten(-2)
-        return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
+        if not is_npu_arch35():
+            return self.weight[local].to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
+        else:
+            w = self.weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
+            s_raw = self.scale.view(torch.uint8)[local].to(torch.float32)
+            s = torch.pow(2.0, s_raw - 127.0)
+            rows = w.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
+            values = (rows * s.unsqueeze(-1)).flatten(-2)
+            return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
 
     def forward(
         self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
         if (
             self.tp_size > 1
-            and forward_batch is not None
             and get_attention_dp_size() > 1
         ):
             # moe_dense_tp style: allgather the DP domain first so the

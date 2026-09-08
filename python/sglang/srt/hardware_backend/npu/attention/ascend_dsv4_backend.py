@@ -1915,6 +1915,8 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
+        # todo
+        return torch.zeros_like(q)
         if compress_ratio not in (0, 4, 128):
             raise ValueError(
                 f"V4 attention expects compress_ratio in (0, 4, 128); got {compress_ratio}"
