@@ -894,6 +894,34 @@ impl ChildKeyType for Vec<(i64, i64)> {
 pub(crate) const DIGEST_LEN: usize = 32;
 pub(crate) type HashDigest = [u8; DIGEST_LEN];
 
+const CACHE_NAMESPACE_DOMAIN: &[u8] = b"sglang-cache-namespace-v1";
+
+/// The storage hash-chain seed for a radix namespace.
+///
+/// This mirrors python/sglang/srt/mem_cache/utils.py::namespace_seed. The
+/// default namespace stays unseeded; named namespaces seed only the first page
+/// in the chain, and descendants continue from their parent's last page hash.
+fn storage_namespace_seed(namespace: KeyNamespaceRef<'_>) -> Option<HashDigest> {
+    if namespace.extra_key.is_none() && namespace.cache_salt.is_none() {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(CACHE_NAMESPACE_DOMAIN);
+    for part in [namespace.extra_key, namespace.cache_salt] {
+        match part {
+            None => hasher.update([0]),
+            Some(part) => {
+                let bytes = part.as_bytes();
+                hasher.update([1]);
+                hasher.update((bytes.len() as u64).to_le_bytes());
+                hasher.update(bytes);
+            }
+        }
+    }
+    Some(hasher.finalize().into())
+}
+
 /// SHA256(prior_digest || page atom words as little-endian u32 bytes).
 pub(crate) fn hash_page<K: ChildKeyType>(
     page: &[K::Atom],
@@ -1032,6 +1060,22 @@ pub struct NodeArena<K: ChildKeyType> {
 }
 
 impl<K: ChildKeyType> NodeArena<K> {
+    fn compute_node_hash_prior(&self, node_id: NodeIdx_, page_size: usize) -> Option<String> {
+        let node = self.node(node_id);
+        let parent_id = node.parent?;
+        let parent = self.node(parent_id);
+        if parent.key.atom_len() > 0 {
+            if let Some(parent_hash) = parent.get_last_hash_value() {
+                return Some(parent_hash.to_string());
+            }
+            return self
+                .compute_node_hash_values(parent_id, page_size)
+                .last()
+                .cloned();
+        }
+        storage_namespace_seed(node.namespace.as_ref()).map(|digest| digest_to_hex(&digest))
+    }
+
     /// Build an arena for the given component types and install a fresh root.
     pub fn new(component_types: Vec<ComponentType>, page_size: usize) -> Self {
         let mut arena = NodeArena {
@@ -1104,18 +1148,12 @@ impl<K: ChildKeyType> NodeArena<K> {
             .filter_map(|(idx, slot)| slot.as_ref().map(|_| NodeIdx_(idx)))
     }
 
-    /// Per-page hash values for a node's key, chained from its parent's last hash.
+    /// Per-page storage hash values for a node's key, chained from its parent's
+    /// last hash or, for namespace roots, from the namespace seed.
     pub fn compute_node_hash_values(&self, node_id: NodeIdx_, page_size: usize) -> Vec<String> {
         let node = self.node(node_id);
-        let parent_hash = node.parent.and_then(|parent_id| {
-            let parent = self.node(parent_id);
-            if parent.key.atom_len() > 0 {
-                parent.get_last_hash_value()
-            } else {
-                None
-            }
-        });
-        crate::node::get_hash_str::<K>(node.key.as_ref(), parent_hash, page_size)
+        let prior_hash = self.compute_node_hash_prior(node_id, page_size);
+        crate::node::get_hash_str::<K>(node.key.as_ref(), prior_hash.as_deref(), page_size)
     }
 
     /// The ancestor chain's hash values ending at `node_id`, in root-to-node

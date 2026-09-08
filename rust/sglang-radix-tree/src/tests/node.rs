@@ -937,6 +937,79 @@ fn get_hash_str_panics_on_a_zero_page_size() {
 }
 
 #[test]
+fn storage_namespace_seed_matches_python_contract() {
+    let seed = storage_namespace_seed(KeyNamespaceRef::new(Some("adapter-a"), Some("tenant-a")))
+        .expect("named namespace should be seeded");
+
+    assert_eq!(
+        digest_to_hex(&seed),
+        "8e1e7fc906efa115a3a2cd3b566bd6381bb106615abb1950ee0481105973f441"
+    );
+    assert!(storage_namespace_seed(KeyNamespaceRef::new(None, None)).is_none());
+}
+
+#[test]
+fn root_storage_hashes_are_seeded_by_full_namespace() -> Result<(), TreeCoreRuntimeError> {
+    let mut arena = NodeArena::new(vec![FULL], /* page_size = */ 4);
+    let root = arena.root();
+    let salted = arena.alloc_child_in_namespace(
+        root,
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
+        /* priority = */ 0,
+        KeyNamespaceRef::new(Some("adapter-a"), Some("tenant-a")),
+    )?;
+    let default = arena.alloc_child_in_namespace(
+        root,
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
+        /* priority = */ 0,
+        KeyNamespaceRef::new(None, None),
+    )?;
+
+    assert_eq!(
+        arena.compute_node_hash_values(salted, 4),
+        vec![
+            "77f4d7fcbf069f58240d5b204ce44ae6114e5c27e2d1d0a022645e627a0e938d".to_string(),
+            "86f7508d297d96511443009485292dfc604df82ba5da5130fc9b9506018e864a".to_string(),
+        ]
+    );
+    assert_eq!(
+        arena.compute_node_hash_values(default, 4),
+        get_hash_str::<Vec<i64>>(&[1, 2, 3, 4, 5, 6, 7, 8], None, 4)
+    );
+    assert_ne!(
+        arena.compute_node_hash_values(salted, 4),
+        arena.compute_node_hash_values(default, 4)
+    );
+    Ok(())
+}
+
+#[test]
+fn descendant_storage_hashes_compute_missing_parent_chain() -> Result<(), TreeCoreRuntimeError> {
+    let mut arena = NodeArena::new(vec![FULL], /* page_size = */ 4);
+    let root = arena.root();
+    let parent = arena.alloc_child_in_namespace(
+        root,
+        vec![1, 2, 3, 4],
+        /* priority = */ 0,
+        KeyNamespaceRef::new(Some("adapter-a"), Some("tenant-a")),
+    )?;
+    let parent_hashes = arena.compute_node_hash_values(parent, 4);
+
+    let child = arena.alloc_child_in_namespace(
+        parent,
+        vec![5, 6, 7, 8],
+        /* priority = */ 0,
+        KeyNamespaceRef::new(None, None),
+    )?;
+
+    assert_eq!(
+        arena.compute_node_hash_values(child, 4),
+        get_hash_str::<Vec<i64>>(&[5, 6, 7, 8], parent_hashes.last().map(String::as_str), 4)
+    );
+    Ok(())
+}
+
+#[test]
 fn split_redistributes_page_hashes() {
     let hashes = vec!["a".to_string(), "b".to_string(), "c".to_string()];
     let (head, tail) = split_node_hash_value(Some(hashes), 4, 2);
