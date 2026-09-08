@@ -625,10 +625,19 @@ class RadixCache(BasePrefixCache):
         ]
         heapq.heapify(eviction_heap)
 
+        now = time.monotonic()
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_kv_age(
+                    now - x.last_access_time,
+                    len(x.value),
+                    event="evict",
+                    tier="device",
+                    outcome="dropped",
+                )
             # Tree values are page-aligned copies of a kv row: page-exact segment.
             self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
@@ -708,8 +717,16 @@ class RadixCache(BasePrefixCache):
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = access_time
             prefix_len = child.key.match(key, page_size=self.page_size)
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_kv_age(
+                    access_time - child.last_access_time,
+                    prefix_len,
+                    event="hit",
+                    tier="host" if child.evicted else "device",
+                    outcome="hit",
+                )
+            child.last_access_time = access_time
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)

@@ -1291,8 +1291,21 @@ class HiRadixCache(RadixCache):
         self._update_leaf_status(node.parent)
         return num_evicted
 
+    def _observe_evicted_age(
+        self, node: TreeNode, num_tokens: int, tier: str, outcome: str
+    ) -> None:
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_kv_age(
+                time.monotonic() - node.last_access_time,
+                num_tokens,
+                event="evict",
+                tier=tier,
+                outcome=outcome,
+            )
+
     def _evict_backuped(self, node: TreeNode):
         device_indices = node.value
+        self._observe_evicted_age(node, len(device_indices), "device", "demoted")
         num_evicted = self._detach_backuped(node)
         self.cache_controller.evict_device(device_indices)
         return num_evicted
@@ -1301,6 +1314,7 @@ class HiRadixCache(RadixCache):
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
+        self._observe_evicted_age(node, len(node.value), "device", "dropped")
         self.kv_events.record_remove(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
@@ -1373,6 +1387,7 @@ class HiRadixCache(RadixCache):
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
+            self._observe_evicted_age(x, len(x.host_value), "host", "dropped")
             self.kv_events.record_remove(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
@@ -1862,8 +1877,16 @@ class HiRadixCache(RadixCache):
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = time.monotonic()
             prefix_len = child.key.match(key, page_size=self.page_size)
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_kv_age(
+                    time.monotonic() - child.last_access_time,
+                    prefix_len,
+                    event="hit",
+                    tier="host" if child.evicted else "device",
+                    outcome="hit",
+                )
+            child.last_access_time = time.monotonic()
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:

@@ -2085,6 +2085,31 @@ class ExpertDispatchCollector(_StatLoggerDIMixin):
         )
 
 
+KV_AGE_BUCKETS = (
+    1.0,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+    1200.0,
+    1800.0,
+    3600.0,
+    7200.0,
+)
+_KV_AGE_LABELS = tuple(str(int(b)) for b in KV_AGE_BUCKETS) + ("+Inf",)
+
+
+def kv_age_bucket(age_seconds: float) -> str:
+    """Upper-edge label of the KV_AGE_BUCKETS bucket that age_seconds falls in."""
+    for edge, label in zip(KV_AGE_BUCKETS, _KV_AGE_LABELS):
+        if age_seconds <= edge:
+            return label
+    return "+Inf"
+
+
 class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
@@ -2193,6 +2218,28 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.kv_age_seconds = Histogram(
+            name="sglang:kv_age_seconds",
+            documentation="Seconds since a radix node was last matched, observed "
+            "once per node when it is matched again (event=hit) or removed from "
+            "a tier (event=evict). tier is device or host. outcome is hit for "
+            "matches; for evictions, demoted means the device copy was freed "
+            "with the host copy kept, dropped means the data was destroyed. "
+            "Compare the hit and evict curves of one tier: overlap means pages "
+            "leave shortly before the traffic would have reused them.",
+            labelnames=list(labels.keys()) + ["event", "tier", "outcome"],
+            buckets=list(KV_AGE_BUCKETS),
+        )
+
+        self.kv_age_tokens = Counter(
+            name="sglang:kv_age_tokens_total",
+            documentation="Token-weighted companion of sglang:kv_age_seconds: "
+            "tokens matched or removed, by the age bucket the node fell in "
+            "(age_le is the bucket upper edge in seconds, or +Inf). Use it "
+            "when node counts would over-weight small leaves.",
+            labelnames=list(labels.keys()) + ["event", "tier", "outcome", "age_le"],
+        )
+
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
             documentation="GPU-stream span of a merged host-to-device load-back "
@@ -2286,6 +2333,25 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(
             num_tokens
         )
+
+    def observe_kv_age(
+        self,
+        age_seconds: float,
+        num_tokens: int,
+        event: str,
+        tier: str,
+        outcome: str,
+    ) -> None:
+        self.kv_age_seconds.labels(
+            **self.labels, event=event, tier=tier, outcome=outcome
+        ).observe(age_seconds)
+        self.kv_age_tokens.labels(
+            **self.labels,
+            event=event,
+            tier=tier,
+            outcome=outcome,
+            age_le=kv_age_bucket(age_seconds),
+        ).inc(num_tokens)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):
