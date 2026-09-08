@@ -45,6 +45,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
@@ -1304,7 +1305,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
-        pp_proxy_tensors=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill

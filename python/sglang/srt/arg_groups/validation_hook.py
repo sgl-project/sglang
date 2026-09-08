@@ -50,11 +50,24 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        if not envs.SGLANG_ENABLE_PP_SPEC.get():
-            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+        if get_platform().is_npu:
+            # NPU: allow PP + EAGLE speculative decoding
+            assert cfg.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
             )
-        else:
+            if cfg.speculative_algorithm is not None:
+                assert (
+                    cfg.speculative_algorithm.upper() == "EAGLE"
+                    and not cfg.enable_multi_layer_eagle
+                ), (
+                    "Pipeline parallelism currently only supports EAGLE "
+                    "(non-multi-layer) speculative decoding"
+                )
+                assert cfg.disaggregation_mode == "prefill", (
+                    "NPU PP + speculative decoding (MTP) is only supported "
+                    "on prefill nodes (disaggregation-mode=prefill)"
+                )
+        elif envs.SGLANG_ENABLE_PP_SPEC.get():
             assert cfg.disable_overlap_schedule, (
                 "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
             )
@@ -83,6 +96,11 @@ def check_server_args(server_args: Any):
             # DP attention partitions it per DP rank.
             assert not cfg.enable_dp_attention, (
                 "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+            )
+        else:
+            # Non-NPU: PP + speculative decoding is not supported
+            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
+                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
             )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
