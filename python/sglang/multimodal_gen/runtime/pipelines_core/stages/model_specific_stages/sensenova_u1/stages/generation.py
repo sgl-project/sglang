@@ -99,7 +99,16 @@ class SenseNovaU1GenerationStage(PipelineStage):
 
         images = _denorm_sensenova_output(images)
         samples = [sample.contiguous() for sample in images]
-        usage = {"think_text": think_text} if think_text is not None else None
+
+        extra = batch.extra.get(SENSENOVA_U1_REQUEST_EXTRA_KEY, {})
+        enhanced_prompt = extra.get("enhanced_prompt")
+        usage: dict[str, Any] | None = None
+        if think_text is not None:
+            usage = {"think_text": think_text}
+        if enhanced_prompt is not None:
+            usage = usage or {}
+            usage["enhanced_prompt"] = enhanced_prompt
+
         return OutputBatch(
             output=samples,
             metrics=batch.metrics,

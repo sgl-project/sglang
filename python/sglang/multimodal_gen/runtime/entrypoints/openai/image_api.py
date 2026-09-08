@@ -179,6 +179,10 @@ def _build_image_response_kwargs(
     For url: uses cloud_url or fallback_url.
     file_path is omitted when is_persistent=False to avoid exposing stale temp paths.
     """
+    revised_prompt = prompt
+    if result.usage:
+        revised_prompt = result.usage.get("enhanced_prompt", prompt)
+
     ret = None
     if resp_format == "b64_json":
         if not b64_list:
@@ -186,7 +190,7 @@ def _build_image_response_kwargs(
         data = [
             ImageResponseData(
                 b64_json=b64,
-                revised_prompt=prompt,
+                revised_prompt=revised_prompt,
                 file_path=os.path.abspath(path) if is_persistent else None,
                 resize=resize,
             )
@@ -211,7 +215,7 @@ def _build_image_response_kwargs(
             data.append(
                 ImageResponseData(
                     url=url,
-                    revised_prompt=prompt,
+                    revised_prompt=revised_prompt,
                     file_path=os.path.abspath(path) if is_persistent else None,
                     resize=resize,
                 )
