@@ -98,6 +98,7 @@ class Schedule:
                 "lof",
                 "priority",
                 "routing-key",
+                "hrrn",
             ],
         ),
     ] = "fcfs"

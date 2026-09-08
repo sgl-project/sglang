@@ -752,6 +752,10 @@ class Envs:
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
+    # Opt-in limit for the number of KV cache indices represented by one
+    # synchronous all-layer Mooncake batch. Set to a positive value to split
+    # larger transfers; 0 preserves the legacy single-batch behavior.
+    SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
@@ -1138,6 +1142,10 @@ class Envs:
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+    # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only
+    # by the model-specific dispatcher configuration; all other paths retain
+    # their existing behavior.
+    SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE = EnvStr("mxfp8")
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
@@ -1790,8 +1798,6 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN": _DeprecatedEnv(),
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     "SGLANG_OPT_USE_CUDA_SCONV": _DeprecatedEnv(),
-    # The direct dense BF16 GEMM source is vendored in-tree.
-    "SGLANG_FLASHINFER_PR4266_SOURCE": _DeprecatedEnv(),
     # DSV4 compressor V2 is always used.
     "SGLANG_OPT_USE_COMPRESSOR_V2": _DeprecatedEnv(),
     "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
