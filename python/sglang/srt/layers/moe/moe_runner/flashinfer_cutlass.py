@@ -346,9 +346,12 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
+    x = dispatch_output.hidden_states
+    if x.shape[0] == 0:
+        return StandardCombineInput(hidden_states=x)
+
     flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
 
-    x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
     # Under ``--moe-runner-backend flashinfer_mxfp4`` topk may be in bypassed
