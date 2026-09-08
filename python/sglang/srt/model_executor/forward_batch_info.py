@@ -550,6 +550,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _eagle_cuda_sync_debug_detail: Optional[str] = field(
         default=None, repr=False, compare=False
     )
+    _dsa_topk_shadow_callback: Optional[Callable[..., None]] = field(
+        default=None, repr=False, compare=False
+    )
+    _dsa_topk_shadow_step: Optional[int] = field(
+        default=None, repr=False, compare=False
+    )
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 

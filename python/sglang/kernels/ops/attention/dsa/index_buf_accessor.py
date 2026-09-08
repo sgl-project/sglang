@@ -274,6 +274,115 @@ class SetKAndS:
         )
 
 
+def logical_token_byte_offsets(
+    *,
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    page_size: int,
+    index_head_dim: int,
+    preshuffle_tile: int = 0,
+) -> torch.Tensor:
+    """Return raw-byte offsets for arbitrary logical index-K token slots.
+
+    The backing buffer is page-major rather than token-major.  Keeping this
+    mapping in one helper lets diagnostic snapshot/restore use the exact same
+    row-major or preshuffled layout as the production store kernel without a
+    host readback.  The final four bytes are the fp32 scale for each token.
+    """
+    if loc.ndim != 1:
+        raise ValueError(f"loc must be one-dimensional, got shape={tuple(loc.shape)}")
+    if buf.ndim != 2 or buf.dtype != torch.uint8:
+        raise ValueError(
+            "index-K buffer must be a two-dimensional uint8 tensor, "
+            f"got shape={tuple(buf.shape)} dtype={buf.dtype}"
+        )
+    if preshuffle_tile and (
+        page_size % preshuffle_tile != 0 or index_head_dim % preshuffle_tile != 0
+    ):
+        raise ValueError(
+            "preshuffle tile must divide page_size and index_head_dim, "
+            f"got tile={preshuffle_tile}, page_size={page_size}, "
+            f"index_head_dim={index_head_dim}"
+        )
+
+    loc = loc.to(dtype=torch.int64)
+    page = torch.div(loc, page_size, rounding_mode="floor")
+    token = torch.remainder(loc, page_size)
+    byte_in_token = torch.arange(
+        index_head_dim + 4, dtype=torch.int64, device=loc.device
+    )
+    key_byte = byte_in_token[:index_head_dim]
+    page_base = page[:, None] * buf.shape[1]
+    if preshuffle_tile:
+        token_tile = torch.div(token, preshuffle_tile, rounding_mode="floor")
+        token_in_tile = torch.remainder(token, preshuffle_tile)
+        col_tile = torch.div(key_byte, preshuffle_tile, rounding_mode="floor")
+        col_in_tile = torch.remainder(key_byte, preshuffle_tile)
+        key_offsets = (
+            page_base
+            + token_tile[:, None] * (preshuffle_tile * index_head_dim)
+            + col_tile[None, :] * (preshuffle_tile * preshuffle_tile)
+            + token_in_tile[:, None] * preshuffle_tile
+            + col_in_tile[None, :]
+        )
+    else:
+        key_offsets = page_base + token[:, None] * index_head_dim + key_byte
+
+    scale_offsets = (
+        page_base
+        + page_size * index_head_dim
+        + token[:, None] * 4
+        + byte_in_token[index_head_dim:][None, :]
+        - index_head_dim
+    )
+    return torch.cat((key_offsets, scale_offsets), dim=1)
+
+
+def snapshot_k_and_s_by_loc(
+    *,
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    page_size: int,
+    index_head_dim: int,
+    preshuffle_tile: int = 0,
+) -> torch.Tensor:
+    """Copy raw K+scale bytes for logical token locations on device."""
+    offsets = logical_token_byte_offsets(
+        buf=buf,
+        loc=loc,
+        page_size=page_size,
+        index_head_dim=index_head_dim,
+        preshuffle_tile=preshuffle_tile,
+    )
+    return buf.flatten()[offsets]
+
+
+def restore_k_and_s_by_loc(
+    *,
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    snapshot: torch.Tensor,
+    page_size: int,
+    index_head_dim: int,
+    preshuffle_tile: int = 0,
+) -> None:
+    """Restore a snapshot produced by :func:`snapshot_k_and_s_by_loc`."""
+    offsets = logical_token_byte_offsets(
+        buf=buf,
+        loc=loc,
+        page_size=page_size,
+        index_head_dim=index_head_dim,
+        preshuffle_tile=preshuffle_tile,
+    )
+    if snapshot.shape != offsets.shape or snapshot.dtype != buf.dtype:
+        raise ValueError(
+            "snapshot does not match logical index-K byte layout: "
+            f"snapshot={tuple(snapshot.shape)}/{snapshot.dtype}, "
+            f"expected={tuple(offsets.shape)}/{buf.dtype}"
+        )
+    buf.flatten()[offsets] = snapshot
+
+
 def _set_k_and_s_triton(
     buf: torch.Tensor,
     loc: torch.Tensor,

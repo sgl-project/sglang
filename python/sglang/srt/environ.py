@@ -1482,6 +1482,11 @@ class Envs:
     # Keep unset outside targeted fault localization because synchronization
     # changes execution timing and is not valid for performance evidence.
     SGLANG_EAGLE_CUDA_SYNC_DEBUG = EnvTuple(())
+    # Diagnostic-only exact request id for comparing the DSA TopK carried by
+    # MTP IndexShare with a same-input eager indexer result.  Empty disables
+    # the probe.  The matching request is forced off the draft CUDA graph and
+    # the probe seals itself when that request finishes.
+    SGLANG_DSA_TOPK_SHADOW_RID = EnvStr(None)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

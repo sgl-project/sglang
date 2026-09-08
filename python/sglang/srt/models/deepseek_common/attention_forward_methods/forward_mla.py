@@ -145,6 +145,28 @@ class DeepseekMLAForwardMixin:
         """
         return not self.skip_topk or (self.is_nextn and prev_topk_indices is None)
 
+    def _maybe_compare_carried_dsa_topk(
+        self: DeepseekV2AttentionMLA,
+        *,
+        hidden_states: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prev_topk_indices: Optional[torch.Tensor],
+    ) -> None:
+        """Run the explicitly armed eager-only shadow observer, if any."""
+        callback = getattr(forward_batch, "_dsa_topk_shadow_callback", None)
+        if callback is None or prev_topk_indices is None or not self.is_nextn:
+            return
+        callback(
+            indexer=self.indexer,
+            x=hidden_states,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+        )
+
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
@@ -364,6 +386,13 @@ class DeepseekMLAForwardMixin:
                         layer_id=self.layer_id,
                     )
                 else:
+                    self._maybe_compare_carried_dsa_topk(
+                        hidden_states=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        prev_topk_indices=prev_topk_indices,
+                    )
                     # skip_topk reuses prev layer's indices; mirror into this
                     # layer's slot so the captured buffer matches what's used.
                     topk_indices = maybe_capture_indexer_topk(
@@ -439,6 +468,13 @@ class DeepseekMLAForwardMixin:
                             layer_id=self.layer_id,
                         )
                     else:
+                        self._maybe_compare_carried_dsa_topk(
+                            hidden_states=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            prev_topk_indices=prev_topk_indices,
+                        )
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
                         )

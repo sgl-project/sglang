@@ -1,4 +1,5 @@
 import logging
+from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
@@ -54,6 +55,22 @@ def get_global_indexer_capturer() -> Optional[IndexerTopkCapturer]:
 def set_global_indexer_capturer(capturer: Optional[IndexerTopkCapturer]):
 
     get_resources().indexer_capturer = capturer
+
+
+@contextmanager
+def suspend_indexer_topk_capture():
+    """Temporarily suppress the ordinary capturer for an observer call.
+
+    The diagnostic shadow indexer must not masquerade as the TopK actually
+    consumed by attention.  This scope is process-local and is only entered
+    for the explicitly selected single-request eager diagnostic.
+    """
+    previous = get_global_indexer_capturer()
+    set_global_indexer_capturer(None)
+    try:
+        yield
+    finally:
+        set_global_indexer_capturer(previous)
 
 
 def maybe_capture_indexer_topk(

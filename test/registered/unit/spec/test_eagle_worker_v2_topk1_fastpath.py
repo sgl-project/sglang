@@ -221,9 +221,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             ("decode", True, False, True, False),
             ("null", False, False, True, True),
         ):
-            with self.subTest(
-                mode=mode, seed_gate=seed_gate, fused_gate=fused_gate
-            ):
+            with self.subTest(mode=mode, seed_gate=seed_gate, fused_gate=fused_gate):
                 override = get_context().override_server_args(disaggregation_mode=mode)
                 override.install()
                 with (
@@ -236,9 +234,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 self.assertTrue(worker.index_share_for_mtp_iteration)
                 self.assertEqual(worker.dsa_index_topk, 2048)
                 self.assertEqual(worker.seed_dsa_topk_from_draft_extend, expected_seed)
-                self.assertEqual(
-                    worker.dsa_seed_cuda_graph_compatible, expected_graph
-                )
+                self.assertEqual(worker.dsa_seed_cuda_graph_compatible, expected_graph)
 
     def test_dp_attention_eager_vote_uses_resolved_seed_contract(self):
         worker = object.__new__(EAGLEWorkerV2)
@@ -253,6 +249,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker._draft_worker = SimpleNamespace(
             seed_dsa_topk_from_draft_extend=False,
             dsa_seed_cuda_graph_compatible=True,
+            dsa_topk_shadow_probe=SimpleNamespace(
+                matches_schedule_batch=lambda batch: False
+            ),
         )
         self.assertFalse(
             worker.requires_dp_attention_eager_forward(
@@ -297,6 +296,32 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     ),
                     expected,
                 )
+
+    def test_dp_attention_eager_vote_for_exact_shadow_rid(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        probe = SimpleNamespace(matches_schedule_batch=lambda batch: True)
+        worker._draft_worker = SimpleNamespace(
+            dsa_topk_shadow_probe=probe,
+            seed_dsa_topk_from_draft_extend=True,
+            dsa_seed_cuda_graph_compatible=True,
+        )
+
+        self.assertTrue(
+            worker.requires_dp_attention_eager_forward(
+                SimpleNamespace(reqs=[SimpleNamespace(rid="probe-rid")])
+            )
+        )
+
+    def test_note_request_finished_delegates_to_shadow_probe(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        finish = MagicMock()
+        worker._draft_worker = SimpleNamespace(
+            dsa_topk_shadow_probe=SimpleNamespace(finish=finish)
+        )
+
+        worker.note_request_finished(rid="probe-rid", natural_stop=True)
+
+        finish.assert_called_once_with(rid="probe-rid", natural_stop=True)
 
     def test_missing_seed_cuda_graph_fallback(self):
         graph_result = (

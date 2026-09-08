@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.layers.attention.dsa.topk_shadow import DSATopKShadowProbe
 from sglang.srt.layers.attention.dsa.utils import (
     should_seed_dsa_topk_from_draft_extend,
     should_use_pd_dsa_seed_cuda_graph,
@@ -300,6 +301,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
         self._init_dsa_index_share_state()
+        self.dsa_topk_shadow_probe = DSATopKShadowProbe.from_runtime(
+            envs.SGLANG_DSA_TOPK_SHADOW_RID.get(),
+            seed_enabled=self.seed_dsa_topk_from_draft_extend,
+        )
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
@@ -875,6 +880,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     ),
                     canary_index_ctx,
                     self._model_forward_cuda_debug(forward_batch, f"step={i}"),
+                    self.dsa_topk_shadow_probe.forward_scope(
+                        forward_batch, step=i, using_cuda_graph=False
+                    ),
                 ):
                     logits_output = self.draft_runner.forward(
                         forward_batch
@@ -1353,6 +1361,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # is reduced with the last stage's actual seed availability.
         if self._draft_worker is None:
             return False
+        shadow_probe = getattr(self._draft_worker, "dsa_topk_shadow_probe", None)
+        if shadow_probe is not None and shadow_probe.matches_schedule_batch(batch):
+            return True
         if not self._draft_worker.seed_dsa_topk_from_draft_extend:
             return False
         if not self._draft_worker.dsa_seed_cuda_graph_compatible:
@@ -1370,6 +1381,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         else:
             has_seed = getattr(draft_input, "dsa_topk_indices", None) is not None
         return not has_seed
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        shadow_probe = getattr(self._draft_worker, "dsa_topk_shadow_probe", None)
+        if shadow_probe is not None:
+            shadow_probe.finish(rid=rid, natural_stop=natural_stop)
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
