@@ -232,14 +232,6 @@ class IndexerKPool(MultiPlatformOp):
         metadata,
     ):
         batch = key.shape[0]
-        seq_lens = metadata.get_seqlens_int32()
-        real_batch = seq_lens.shape[0]
-        assert real_batch <= batch, (
-            "DSA KPool metadata has more request rows than token rows: "
-            f"real={real_batch}, physical={batch}"
-        )
-        # MLP-sync padding participates in collectives but owns no request state.
-        batch = real_batch
         if batch == 0:
             return
 
@@ -249,13 +241,13 @@ class IndexerKPool(MultiPlatformOp):
 
         pool.kpool_decode_update_index_cache(
             layer_id=layer_id,
-            key=key[:batch],
-            slot_score=gate_score[:batch],
+            key=key,
+            slot_score=gate_score,
             ape=self.index_kpool_compress_ape,
             block_tables=metadata.get_page_table_64(),
             req_pool_indices=forward_batch.req_pool_indices[:batch],
             positions=positions[:batch],
-            seq_lens=seq_lens,
+            seq_lens=metadata.get_seqlens_int32()[:batch],
             out_cache_loc=forward_batch.out_cache_loc[:batch],
             round_scale=self.scale_fmt is not None,
         )
