@@ -226,7 +226,20 @@ class EngramHasher(nn.Module):
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         info = forward_batch.ngram_embedding_info
-        assert info is not None, "engram reads predecessors from the n-gram token table"
+        if info is None:
+            # DP attention idle ranks run a dummy forward: ForwardBatch.init_new
+            # returns early for IDLE batches before _init_ngram_embedding_info,
+            # and prepare_mlp_sync_batch may further convert the mode to
+            # EXTEND/TARGET_VERIFY with padded dummy tokens. Emit row id 0
+            # (valid in every layer's table) so the dummy tokens flow through;
+            # their outputs are sliced off in post_forward_mlp_sync_batch.
+            return self.primes.new_zeros(
+                (
+                    len(input_ids),
+                    self.primes.shape[0],
+                    self.primes.shape[1] * self.primes.shape[2],
+                )
+            )
         req = forward_batch.req_pool_indices.to(torch.int64)
         if not forward_batch.forward_mode.is_decode():
             req = torch.repeat_interleave(
