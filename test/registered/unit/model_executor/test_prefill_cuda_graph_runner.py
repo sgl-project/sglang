@@ -1,12 +1,15 @@
 """CPU coverage for chunked-prefix Full prefill CUDA-graph state."""
 
 import unittest
+from contextlib import contextmanager, nullcontext
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
+import sglang.srt.model_executor.runner.flashinfer_autotune as autotune_module
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
@@ -23,7 +26,22 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_context
+from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    BreakableCudaGraphBackend,
+)
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    FullCudaGraphBackend,
+)
+from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+    TcPiecewiseCudaGraphBackend,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -91,6 +109,131 @@ class _FakeBatchRegistry:
 
     def get_slot(self, name):
         return self.slots[name]
+
+
+class TestPrefillGraphAutotune(CustomTestCase):
+    def test_capture_uses_graph_path_tactics_and_honors_autotune_disable(self):
+        """BCG must record graph-path tactics; other backends and opt-outs stay untuned."""
+        backend_types = (
+            BreakableCudaGraphBackend,
+            FullCudaGraphBackend,
+            TcPiecewiseCudaGraphBackend,
+        )
+        for backend_type, policy in product(
+            backend_types, ("enabled", "disabled", "deterministic")
+        ):
+            with self.subTest(backend=backend_type.__name__, policy=policy):
+                enabled = (
+                    policy == "enabled" and backend_type is BreakableCudaGraphBackend
+                )
+                runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+                runner.model_runner = SimpleNamespace(
+                    device="cuda",
+                    gpu_id=0,
+                    model_config=SimpleNamespace(quantization=None),
+                    spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+                )
+                runner.capture_num_tokens = [4, 8]
+                runner._capture_chunked_prefix = False
+                runner.enable_cp_v2_bcg_capture = False
+                runner._is_full_backend = backend_type is FullCudaGraphBackend
+                runner.warmup = lambda: None
+                batch = SimpleNamespace(lora_ids=None, global_num_tokens_gpu=None)
+                runner.capture_prepare = lambda _size: (
+                    batch,
+                    SimpleNamespace(
+                        init_forward_metadata_out_graph=lambda *_a, **_kw: None
+                    ),
+                )
+                runner._init_forward_metadata_for_capture = lambda *_args: None
+                # Eager warmup populated a different output shape from the graph.
+                tactics = {(8, 16): 7}
+                captured = {}
+                tuning = False
+                tuning_sizes = []
+
+                @contextmanager
+                def autotune_context(_mr, *, run_lm_head):
+                    nonlocal tuning
+                    self.assertFalse(run_lm_head)
+                    tuning = True
+                    try:
+                        yield
+                    finally:
+                        tuning = False
+
+                def forward(forward_batch, size):
+                    self.assertIs(forward_batch, batch)
+                    output_width = 0 if is_in_breakable_cuda_graph() else 16
+                    if tuning:
+                        tuning_sizes.append(size)
+                        for bucket in runner.capture_num_tokens:
+                            if bucket <= size:
+                                tactics[bucket, output_width] = 11
+                    return tactics.get((size, output_width), -1)
+
+                def capture_one(key, forward_fn, **_kwargs):
+                    self.assertFalse(tuning)
+                    self.assertEqual(
+                        is_in_breakable_cuda_graph(),
+                        backend_type is BreakableCudaGraphBackend,
+                    )
+                    self.assertEqual(
+                        is_in_tc_piecewise_cuda_graph(),
+                        backend_type is TcPiecewiseCudaGraphBackend,
+                    )
+                    captured[key.size] = forward_fn()
+
+                runner._run_forward = forward
+                runner.backend = backend_type.__new__(backend_type)
+                runner.backend._pool = (0, 0)
+                runner.backend.capture_one = capture_one
+                stream = object()
+                with (
+                    get_context().override_server_args(
+                        moe_runner_backend="flashinfer_trtllm",
+                        disable_flashinfer_autotune=policy == "disabled",
+                        enable_deterministic_inference=policy == "deterministic",
+                    ),
+                    get_parallel().override(tp_rank=1),
+                    patch.object(runner_module, "freeze_gc", lambda *_a: nullcontext()),
+                    patch.object(
+                        runner_module,
+                        "get_or_create_global_graph_capture_stream",
+                        return_value=stream,
+                    ),
+                    patch.object(
+                        runner_module,
+                        "graph_capture",
+                        lambda **_kw: nullcontext(SimpleNamespace(stream=stream)),
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend.set_graph_pool_id"
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.set_graph_pool_id"
+                    ),
+                    patch.object(BreakableCudaGraphBackend, "begin_cuda_graph_capture"),
+                    patch.object(BreakableCudaGraphBackend, "end_cuda_graph_capture"),
+                    patch.object(
+                        runner_module, "get_available_gpu_memory", return_value=80
+                    ),
+                    patch.object(
+                        torch.cuda, "get_device_capability", return_value=(10, 0)
+                    ),
+                    patch.object(
+                        autotune_module, "flashinfer_autotune_context", autotune_context
+                    ),
+                ):
+                    runner.capture()
+
+                expected = {8: 7, 4: -1}
+                if backend_type is BreakableCudaGraphBackend:
+                    expected = {8: 11, 4: 11} if enabled else {8: -1, 4: -1}
+                self.assertEqual(captured, expected)
+                self.assertEqual(tuning_sizes, [8] if enabled else [])
+                self.assertFalse(is_in_breakable_cuda_graph())
+                self.assertFalse(is_in_tc_piecewise_cuda_graph())
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):

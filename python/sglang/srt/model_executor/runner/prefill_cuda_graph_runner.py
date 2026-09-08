@@ -90,6 +90,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     prefill_graph_tolerates_sum_len,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner import flashinfer_autotune
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -135,6 +136,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     is_cuda,
     is_npu,
+    log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_tp_gather,
@@ -1428,6 +1430,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.gpu_id,
             empty_cache=False,
         )
+        # Graph-mode MoE can defer finalize, producing a different tuning key
+        # from eager warmup. Tune that path before recording any graph.
+        if isinstance(self.backend, BreakableCudaGraphBackend) and (
+            flashinfer_autotune.should_run_flashinfer_autotune(self.model_runner)
+        ):
+            self.capture_one_shape(max(self.capture_num_tokens), autotune=True)
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_num_tokens)))
             if get_parallel().tp_rank == 0
@@ -1448,7 +1456,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self, size: int, *, prefix_num_chunks: int = 0, autotune: bool = False
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
@@ -1498,6 +1508,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
+
+        if autotune:
+            log_info_on_rank0(
+                logger,
+                f"FlashInfer autotune: prefill CUDA graph path at {num_tokens} tokens.",
+            )
+            flashinfer_autotune.run_flashinfer_autotune_forward(
+                self.model_runner, run_once, run_lm_head=False
+            )
+            return
 
         # Main's monolithic BCG runner never invokes
         # on_after_cuda_graph_warmup between warmup iterations — the BCG
