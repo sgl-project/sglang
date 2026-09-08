@@ -52,4 +52,8 @@ export const benchmarks = [
     notes: "4×H200, TP=4. Speed: bench_serving --flush-cache, temperature 0; tok/s/GPU = total (input + output) token throughput ÷ 4. HT columns are queue-dominated (KDA state cache caps concurrent requests at 314 on this cell) — judge HT by TPOT/throughput, not TTFT. Image workload (one 720p JPEG per request, +883 vision tokens, in/out=1024/1024): conc 1: TTFT 221.40 ms, TPOT 3.69 ms, 187 tok/s/GPU; conc 16: TTFT 1228.40 ms, TPOT 7.23 ms, 1378 tok/s/GPU; conc 64: TTFT 3932.72 ms, TPOT 13.02 ms, 2766 tok/s/GPU; conc 128: TTFT 6722.44 ms, TPOT 18.24 ms, 3737 tok/s/GPU. Accuracy: MMMU-Pro (sgl-eval, 1730 examples, single-shot, thinking on), stop rate 99.19%; also GSM8K 97.35% (stop rate 100%), eager, streaming, structured output, and auto parser resolution validated on this cell.",
   },
   { match: { hw: "h100", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "b200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "h100", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
 ];
