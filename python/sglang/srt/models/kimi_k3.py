@@ -38,6 +38,7 @@ from sglang.srt.layers import (
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -2911,6 +2912,15 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+        if (
+            self.dspark_layers_to_capture is not None
+            and self.start_layer - 1 in self.dspark_layers_to_capture
+        ):
+            aux_hidden_states.append(
+                self._dspark_capture_stream(
+                    self.start_layer - 1, hidden_states, residual, attn_res
+                )
+            )
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
@@ -2942,9 +2952,12 @@ class KimiK3LinearModel(nn.Module):
                     # full stream head (bit-identical to the fused fold).
                     hidden_states = residual + hidden_states
                 residual = attn_res.block_residual  # raw bank across ranks
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if aux_hidden_states:
+                tensors["dspark_aux_hidden_states"] = pack_aux_hidden_states(
+                    aux_hidden_states
+                )
+            return PPProxyTensors(tensors)
 
         if hidden_states.shape[0] != 0:
             if attn_res is not None:
@@ -2986,7 +2999,12 @@ class KimiK3LinearModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
 
         if self.dspark_layers_to_capture is not None:
-            return hidden_states, aux_hidden_states
+            # An empty feature stage still participates in the PP reduction.
+            return hidden_states, (
+                aux_hidden_states
+                if aux_hidden_states
+                else hidden_states.new_empty((hidden_states.shape[0], 0))
+            )
         return hidden_states
 
     def _dspark_capture_stream(
@@ -3053,18 +3071,28 @@ class KimiK3LinearForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if self.pp_group.world_size > 1:
-            # Capture layers living on non-last PP ranks would be silently
-            # skipped (the flag is only set on the last rank).
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
         self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        self.model.dspark_layers_to_capture = list(
+            layer_ids[self.get_dspark_context_feature_slice(layer_ids)]
+        )
+
+    def get_dspark_context_feature_slice(self, layer_ids: list[int]) -> slice:
+        from sglang.srt.speculative.dspark_components.dspark_pp import (
+            context_feature_slice,
+        )
+
+        if any(i < 0 or i >= self.config.num_hidden_layers for i in layer_ids):
+            raise ValueError("DSpark target layer id is outside the K3 model.")
+        return context_feature_slice(
+            layer_ids,
+            self.model.start_layer,
+            self.model.end_layer,
+            self.pp_group.is_last_rank,
+        )
 
     @torch.no_grad()
     def forward(
@@ -3514,6 +3542,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def get_dspark_context_feature_slice(self, layer_ids: list[int]) -> slice:
+        return self.language_model.get_dspark_context_feature_slice(layer_ids)
 
     def preprocess_mm_for_encoder(
         self,

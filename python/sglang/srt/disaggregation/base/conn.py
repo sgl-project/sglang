@@ -49,6 +49,9 @@ class KVArgs:
     kv_data_lens: List[int]
     kv_item_lens: List[int]
     kv_layer_ids: List[int]
+    # Local prefill metadata for head-sharded draft KV appended to an MLA pool.
+    num_draft_kv_entries: int = 0
+    draft_total_kv_head_num: int = 0
     kv_cache_dtype_str: str
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]

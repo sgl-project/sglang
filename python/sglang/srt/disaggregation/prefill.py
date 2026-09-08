@@ -257,6 +257,12 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.num_draft_kv_entries = num_draft_entries
+        if num_draft_entries and self.scheduler.spec_algorithm.is_dspark():
+            draft_config = (
+                self.scheduler.draft_worker.draft_worker.model_runner.model_config
+            )
+            kv_args.draft_total_kv_head_num = draft_config.get_total_num_kv_heads()
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=draft_kv_pool,

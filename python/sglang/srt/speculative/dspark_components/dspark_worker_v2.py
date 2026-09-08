@@ -1,6 +1,5 @@
 import logging
 from contextlib import nullcontext
-from dataclasses import replace
 from typing import Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -20,6 +19,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+    PPProxyTensors,
     compute_position,
 )
 from sglang.srt.runtime_context import (
@@ -64,6 +64,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
+from sglang.srt.speculative.dspark_components.dspark_pp import accumulate_context
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
@@ -150,6 +151,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             get_parallel().enable_dp_attention and not self._draft_is_moe
         )
         self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
+        self._is_pp_prefill = self._is_pd_prefill and ps.pp_size > 1
+        self._context_only_pp_rank = self._is_pp_prefill and ps.pp_rank < ps.pp_size - 1
+        if self._is_pp_prefill and not hasattr(
+            self.model_runner.model, "get_dspark_context_feature_slice"
+        ):
+            raise ValueError("DSpark PP prefill currently requires a Kimi-K3 target.")
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self._is_pd_prefill
@@ -169,7 +176,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                ps=replace(ps, pp_rank=0, pp_size=1),
+                ps=ps,
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
@@ -244,7 +251,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.query_token_num), device=self.device
         )
 
-        if getattr(self.draft_model, "uses_own_vocab_modules", False):
+        if self._is_pd_prefill:
+            # Context/KV injection never embeds or samples draft tokens. In PP
+            # the target embedding and LM head may not even live on this rank.
+            pass
+        elif getattr(self.draft_model, "uses_own_vocab_modules", False):
             if self.ps.tp_rank == 0:
                 logger.info(
                     "DSpark draft uses its checkpoint-local embedding and LM head."
@@ -371,6 +382,23 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+        if self._is_pp_prefill:
+            if not isinstance(self.draft_model.fc, torch.nn.Linear):
+                raise ValueError("DSpark PP requires a dense context projection.")
+            if self.draft_model.fc.bias is not None:
+                raise ValueError("DSpark PP requires a bias-free context projection.")
+            layer_ids = self.model_runner.spec_aux_config.dflash_target_layer_ids
+            if len(layer_ids) != self.draft_model.num_context_features:
+                raise ValueError(
+                    "DSpark target captures do not match draft FC features."
+                )
+            self._context_features = (
+                self.model_runner.model.get_dspark_context_feature_slice(layer_ids)
+            )
+        if self._context_only_pp_rank:
+            # Only the final stage writes and transfers draft KV.
+            self.draft_model.layers = torch.nn.ModuleList()
+            self.draft_model_runner.token_to_kv_pool = None
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -383,6 +411,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
+        if self._context_only_pp_rank:
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -398,12 +428,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
+    def _draft_model_runners(self) -> tuple:
+        return () if self._context_only_pp_rank else (self.draft_model_runner,)
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if self._context_only_pp_rank:
+            return
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
@@ -411,6 +446,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
+        if self._context_only_pp_rank:
+            return
         with self._draft_context():
             self._draft_worker.init_attention_backends()
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
@@ -431,6 +468,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        if self._context_only_pp_rank:
+            return
         capture_decode_cuda_graph = self._decode_graph_allowed
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
@@ -512,29 +551,46 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+        if (
+            self._is_pd_prefill
+            or batch.forward_mode.is_extend()
+            or batch.is_extend_in_batch
+        ):
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
-            if get_parallel().enable_dp_attention:
-                self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            if get_parallel().enable_dp_attention or self._is_pp_prefill:
+                batch_output = self.target_worker.forward_batch_generation(
+                    batch,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    pp_proxy_tensors=pp_proxy_tensors,
                 )
+                if self._context_only_pp_rank:
+                    batch_output.new_seq_lens = batch.seq_lens
+                    return batch_output
             return self._decode_idle_result(on_publish=on_publish)
 
         batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+        if self._is_pp_prefill:
+            self._accumulate_pp_context(batch, batch_output, pp_proxy_tensors)
+            if self._context_only_pp_rank:
+                batch_output.new_seq_lens = batch.seq_lens
+                return batch_output
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
-        target_hidden_is_projected = (
+        target_hidden_is_projected = self._is_pp_prefill or (
             self._target_hidden_projection_enabled
             and self.target_worker.model_runner.model.should_project_dspark_target_hidden(
                 forward_mode=batch.forward_mode,
@@ -606,6 +662,35 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
         )
         return batch_output
+
+    def _accumulate_pp_context(self, batch, batch_output, pp_proxy_tensors):
+        outgoing = batch_output.pp_hidden_states_proxy_tensors
+        hidden = (
+            outgoing.tensors.pop("dspark_aux_hidden_states", None)
+            if self._context_only_pp_rank
+            else batch_output.logits_output.hidden_states
+        )
+        accumulated = (
+            pp_proxy_tensors.tensors.get("dspark_ctx_acc")
+            if pp_proxy_tensors is not None
+            else None
+        )
+        accumulated = accumulate_context(
+            hidden,
+            accumulated,
+            self.draft_model.fc.weight,
+            self._context_features,
+            sum(batch.extend_lens),
+        )
+        if self._context_only_pp_rank:
+            if accumulated is not None:
+                outgoing["dspark_ctx_acc"] = accumulated
+        else:
+            if accumulated is None:
+                raise RuntimeError("DSpark PP prefill did not capture any context.")
+            batch_output.logits_output.hidden_states = self.draft_model.hidden_norm(
+                accumulated.to(self.draft_model.fc.weight.dtype)
+            )
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:

@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -164,6 +165,32 @@ class AscendKVManager(MooncakeKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
+        if self.is_hybrid_mla_backend and self.kv_args.draft_total_kv_head_num > 0:
+            return self._send_hybrid_draft_kvcache(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_ptrs,
+                dst_kv_indices,
+                dst_layer_ids,
+                dst_attn_tp_size,
+            )
+
+        # Hybrid MLA prefill stages expose PP-local entries, while a PP=1
+        # decode peer registers all model layers. Pair only this layout by
+        # global layer id; every other Ascend layout keeps the legacy path.
+        if self.is_hybrid_mla_backend and self.pp_size > 1:
+            return self._send_kvcache_generic(
+                mooncake_session_id=mooncake_session_id,
+                src_data_ptrs=self.kv_args.kv_data_ptrs,
+                dst_data_ptrs=dst_kv_ptrs,
+                item_lens=self.kv_args.kv_item_lens,
+                prefill_data_indices=prefill_kv_indices,
+                dst_data_indices=dst_kv_indices,
+                executor=executor,
+                src_layer_ids=self.kv_args.kv_layer_ids,
+                dst_layer_ids=dst_layer_ids,
+            )
+
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -262,6 +289,105 @@ class AscendKVManager(MooncakeKVManager):
             return process_layers(layers_params)
 
         return 0
+
+    def _send_hybrid_draft_kvcache(
+        self,
+        session_id,
+        src_indices,
+        dst_ptrs,
+        dst_indices,
+        dst_layer_ids,
+        dst_tp_size,
+    ):
+        # Existing bootstrap routing maps each decode rank to rank // ratio
+        # on prefill. This covers both split heads and replicated GQA heads
+        # when decode TP is an integer multiple of prefill TP (e.g. 16 -> 32).
+        if (
+            dst_tp_size is None
+            or dst_tp_size < self.attn_tp_size
+            or dst_tp_size % self.attn_tp_size
+        ):
+            raise ValueError(
+                "Ascend hybrid draft KV requires decode attention TP to be an "
+                "integer multiple of prefill attention TP."
+            )
+        heads = self.kv_args.draft_total_kv_head_num
+        if heads <= 0 or any(
+            max(heads, tp) % min(heads, tp) for tp in (self.attn_tp_size, dst_tp_size)
+        ):
+            raise ValueError("Unsupported Ascend draft KV head/TP partition.")
+        src_heads = max(1, heads // self.attn_tp_size)
+        dst_heads = max(1, heads // dst_tp_size)
+        src_rank = self.kv_args.engine_rank % self.attn_tp_size
+        dst_rank = self.decode_kv_args_table[session_id].dst_tp_rank % dst_tp_size
+        src_head_start = src_rank // max(1, self.attn_tp_size // heads) * src_heads
+        dst_head_start = dst_rank // max(1, dst_tp_size // heads) * dst_heads
+        head_offset = dst_head_start - src_head_start
+        if head_offset < 0 or head_offset + dst_heads > src_heads:
+            raise ValueError(
+                "Decode rank requested draft KV from the wrong prefill rank."
+            )
+
+        args = self.kv_args
+        if len(src_indices) != len(dst_indices):
+            raise ValueError("Prefill/decode draft KV page counts must match.")
+        num_target_entries = len(args.kv_data_ptrs) - args.num_draft_kv_entries
+        pairs = build_transfer_entry_pairs(
+            args.kv_layer_ids,
+            dst_layer_ids or [],
+            len(args.kv_data_ptrs),
+            len(dst_ptrs),
+            allow_positional_fallback=False,
+        )
+        src_blocks, dst_blocks = group_concurrent_contiguous(src_indices, dst_indices)
+        page_size = args.page_size
+        tokens = np.arange(page_size, dtype=np.int64)
+        transfer_blocks = []
+        for i, j in pairs:
+            src_ptr, dst_ptr = args.kv_data_ptrs[i], dst_ptrs[j]
+            src_item_len = args.kv_item_lens[i]
+            if i < num_target_entries or src_heads == dst_heads:
+                # Target MLA and replicated draft heads can copy whole pages.
+                for src, dst in zip(src_blocks, dst_blocks):
+                    transfer_blocks.append(
+                        (
+                            src_ptr + int(src[0]) * src_item_len,
+                            dst_ptr + int(dst[0]) * src_item_len,
+                            len(src) * src_item_len,
+                        )
+                    )
+                continue
+
+            if src_item_len % (page_size * src_heads):
+                raise ValueError("Draft KV page is not a token-major head partition.")
+            head_bytes = src_item_len // page_size // src_heads
+            dst_item_len = page_size * dst_heads * head_bytes
+            # NPU MHA pools are [page, token, head, dim]. A head slice is
+            # contiguous within each token, not across adjacent tokens.
+            src_addrs = (
+                (
+                    src_ptr
+                    + np.asarray(src_indices, dtype=np.int64)[:, None] * src_item_len
+                    + tokens * (src_heads * head_bytes)
+                    + head_offset * head_bytes
+                )
+                .reshape(-1)
+                .tolist()
+            )
+            dst_addrs = (
+                (
+                    dst_ptr
+                    + np.asarray(dst_indices, dtype=np.int64)[:, None] * dst_item_len
+                    + tokens * (dst_heads * head_bytes)
+                )
+                .reshape(-1)
+                .tolist()
+            )
+            transfer_blocks.extend(
+                (src, dst, dst_heads * head_bytes)
+                for src, dst in zip(src_addrs, dst_addrs)
+            )
+        return self._transfer_data(session_id, transfer_blocks)
 
     def _is_generic_kvcache_state_type(self, st) -> bool:
         # DSV4 per-pool components also use the page-indexed send path.

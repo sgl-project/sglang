@@ -547,9 +547,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if cfg.pp_size != 1:
-        raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
-        )
+        if cfg.disaggregation_mode != "prefill":
+            raise ValueError("DSpark PP is only supported on PD prefill workers.")
+        if cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
+            raise ValueError("DSpark PP prefill does not support CP or DCP.")
 
     if cfg.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):
