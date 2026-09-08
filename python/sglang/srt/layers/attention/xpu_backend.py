@@ -577,11 +577,6 @@ class XPUAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
-        # Piecewise XPU graph for prefill pre-allocates a fixed-address output
-        # buffer so graph replay writes to the same storage. radix_attention sets
-        # it only on the graph path; None on the eager path.
-        attn_output_buffer = forward_batch._attn_output
-
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -665,14 +660,17 @@ class XPUAttentionBackend(AttentionBackend):
                 return_softmax_lse=use_cascade_attn,
                 # `out` is injected via out_kwargs only on the graph path (buffer
                 # present, non-cascade); the eager path omits it for flash_attn
-                # builds that lack the kwarg.
+                # builds that lack the kwarg. Piecewise XPU graph for prefill
+                # pre-allocates this fixed-address output buffer so graph replay
+                # writes to the same storage; radix_attention sets it only on the
+                # graph path, None on the eager path.
                 **(
                     {
-                        "out": attn_output_buffer.view(
+                        "out": forward_batch._attn_output.view(
                             -1, layer.tp_q_head_num, layer.v_head_dim
                         )
                     }
-                    if not use_cascade_attn and attn_output_buffer is not None
+                    if not use_cascade_attn and forward_batch._attn_output is not None
                     else {}
                 ),
                 **kwargs,
