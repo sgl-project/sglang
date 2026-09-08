@@ -365,7 +365,7 @@ class TestGDNDecodeFusedProjectionConv1D(unittest.TestCase):
         torch.testing.assert_close(state_test, ref[4], rtol=0, atol=0)
 
     def test_padded_merged_projection_column_views_are_supported(self):
-        # _split_qkvzba hands down column views of the merged projection, whose
+        # split_output hands down column views of the merged projection, whose
         # N is padded for GEMM alignment, so stride(0) exceeds the slice width
         # and the ba view starts at a nonzero storage offset.  The fusion only
         # requires a unit stride on the feature dimension, not full contiguity.

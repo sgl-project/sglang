@@ -1,12 +1,16 @@
 """MI35x PR-CI accuracy gate for the Qwen3.5 GDN in_proj_qkvzba merge.
 
-Two parallel TP2 servers on the MXFP4-AttnFP8 checkpoint: in_proj_ba folded into
-in_proj_qkvz as one wider GEMM (GPUs 4,5, SGLANG_GDN_FUSE_QKVZBA=1) vs the two
-separate projections (GPUs 6,7, the default).
+Two parallel TP2 servers on the MXFP4-AttnFP8 checkpoint (8-GPU stage-c):
+in_proj_ba folded into in_proj_qkvz as one wider GEMM (GPUs 0-1,
+SGLANG_GDN_FUSE_QKVZBA=1) vs the two separate projections (GPUs 2-3, the
+default). The merged path must hold GSM8K accuracy against the baseline. The
+feature is default-off, so this is the only CI coverage that actually executes
+it.
 
 Only the V2 line quantizes in_proj_ba to FP8, so only there do all four shards
-resolve to one scheme. A mismatch falls back to separate projections, which would
-turn this into baseline vs baseline, so the fused arm's log is checked for it.
+resolve to one scheme. A mismatch falls back to separate projections, which
+would turn this into baseline vs baseline, so the fused arm's log is checked
+for it.
 """
 
 import ast
@@ -44,15 +48,15 @@ QWEN35_ATTNFP8_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 GSM8K_NUM_SHOTS = 5
-# Submit all at once; the mamba state pool caps concurrency server-side.
+# Submit everything at once; the mamba state pool caps concurrency server-side.
 GSM8K_PARALLEL = int(os.environ.get("GSM8K_PARALLEL", str(GSM8K_NUM_QUESTIONS)))
-# Reasoning model: leave room for the <think> block.
+# Reasoning model: the <think> block needs room before the answer line.
 GSM8K_MAX_NEW_TOKENS = int(os.environ.get("GSM8K_MAX_NEW_TOKENS", "8192"))
 ACCURACY_THRESHOLD = 0.92
-# GSM8K stderr at 1319 questions is ~0.006.
+# The merge must be accuracy-neutral; GSM8K stderr at 1319 questions is ~0.006.
 ACCURACY_DELTA_TOLERANCE = 0.02
 
-# create_qkvzba_proj logs this when the shards disagree.
+# gdn_in_proj_merge.build logs this when the shards disagree.
 MERGE_FALLBACK_MARKER = "in_proj_qkvz and in_proj_ba kept separate"
 
 GSM8K_DATA_URL = (
@@ -60,9 +64,13 @@ GSM8K_DATA_URL = (
     "master/grade_school_math/data/test.jsonl"
 )
 
+# TP=2 keeps in_proj_ba at 2*num_v_heads/tp = 64 columns. TP=4 narrows it to 32,
+# which aiter's gemm_a8w8_bpreshuffle has no kernel for once M reaches 256.
 TP_SIZE = int(os.environ.get("QWEN35_TP_SIZE", "2"))
-# First TP slice runs merged, second runs separate.
-DEVICE_POOL: List[str] = os.environ.get("QWEN35_DEVICE_POOL", "4,5,6,7").split(",")
+# Two arms run concurrently: first slice is merged, second is baseline.
+DEVICE_POOL: List[str] = os.environ.get("QWEN35_DEVICE_POOL", "0,1,2,3,4,5,6,7").split(
+    ","
+)
 
 COMMON_ARGS: List[str] = [
     "--attention-backend",
@@ -99,16 +107,6 @@ class InProjFusionVariant:
     hip_visible_devices: str
     port_offset: int
     env_vars: Dict[str, str] = field(default_factory=dict)
-
-
-@dataclass
-class ArmMetrics:
-    """One arm's GSM8K result, plus whether the merge engaged."""
-
-    accuracy: float
-    invalid: float
-    latency: float
-    merge_fell_back: bool
 
 
 def _base_url_with_port_offset(offset: int) -> str:
@@ -189,15 +187,16 @@ def run_gsm8k_benchmark(
     @sgl.function
     def few_shot_gsm8k(s, question):
         s += few_shot_examples + question
-        # Never stop on "Assistant:": the model opens its turn with it, which
-        # empties 32% of the answers. EOS ends generation.
+        # Stop only at the next few-shot boundary. Never "Assistant:": the model
+        # opens its turn with it, emptying 32% of answers. EOS ends generation.
         s += sgl.gen(
             "answer",
             max_tokens=GSM8K_MAX_NEW_TOKENS,
             stop=["\n\nQuestion"],
         )
 
-    # Both arms share this process, so pass the backend per call.
+    # Both arms share this process, so pass the backend per call instead of
+    # through the global set_default_backend().
     tic = time.perf_counter()
     states = few_shot_gsm8k.run_batch(
         [{"question": q} for q in questions],
@@ -221,10 +220,10 @@ class TestQwen35GdnInProjFusionMI35x(CustomTestCase):
     def setUpClass(cls):
         cls.model = QWEN35_ATTNFP8_MODEL_PATH
         cls.variants = get_in_proj_fusion_variants()
-        # Pre-fetch so the two eval threads don't race the cache write.
+        # Pre-fetch once so the two parallel eval threads don't race the cache write.
         cls.gsm8k_data_path = download_and_cache_file(GSM8K_DATA_URL)
 
-    def _run_variant(self, variant: InProjFusionVariant) -> ArmMetrics:
+    def _run_variant(self, variant: InProjFusionVariant) -> Dict[str, float]:
         env = os.environ.copy()
         env["HIP_VISIBLE_DEVICES"] = variant.hip_visible_devices
         env.update(COMMON_ENV)
@@ -234,8 +233,6 @@ class TestQwen35GdnInProjFusionMI35x(CustomTestCase):
         log_path = os.path.join(
             os.environ.get("TMPDIR", "/tmp"), f"qwen35-in-proj-{variant.variant}.log"
         )
-        # Grepped below for the fallback notice; stdout and stderr share one file
-        # so it is found wherever logging is pointed.
         log_file = open(log_path, "w")
         try:
             process = popen_launch_server(
@@ -253,7 +250,6 @@ class TestQwen35GdnInProjFusionMI35x(CustomTestCase):
                 )
             finally:
                 kill_process_tree(process.pid)
-                # Let the forwarding threads drain before closing the sink.
                 time.sleep(2)
         finally:
             log_file.close()
@@ -261,17 +257,17 @@ class TestQwen35GdnInProjFusionMI35x(CustomTestCase):
         with open(log_path, "r", errors="replace") as f:
             fell_back = MERGE_FALLBACK_MARKER in f.read()
 
-        metrics = ArmMetrics(
-            accuracy=accuracy,
-            invalid=invalid,
-            latency=latency,
-            merge_fell_back=fell_back,
-        )
+        metrics = {
+            "accuracy": accuracy,
+            "invalid": invalid,
+            "latency": latency,
+            "merge_fell_back": fell_back,
+        }
         print(f"[{variant.variant}] {metrics=}")
         return metrics
 
     def test_qwen35_gdn_in_proj_fusion_accuracy(self):
-        results: Dict[str, ArmMetrics] = {}
+        results: Dict[str, Dict[str, float]] = {}
         with ThreadPoolExecutor(max_workers=len(self.variants)) as executor:
             future_to_variant = {
                 executor.submit(self._run_variant, variant): variant
@@ -295,16 +291,16 @@ class TestQwen35GdnInProjFusionMI35x(CustomTestCase):
         )
         for variant in self.variants:
             metrics = results[variant.variant]
-            passed = metrics.accuracy >= ACCURACY_THRESHOLD
+            passed = metrics["accuracy"] >= ACCURACY_THRESHOLD
             summary += (
                 f"| {variant.variant} | {variant.hip_visible_devices} | "
-                f"{metrics.accuracy:.3f} | {metrics.invalid:.3f} | "
-                f"{metrics.latency:.2f} | {ACCURACY_THRESHOLD} | "
+                f"{metrics['accuracy']:.3f} | {metrics['invalid']:.3f} | "
+                f"{metrics['latency']:.2f} | {ACCURACY_THRESHOLD} | "
                 f"{'PASS' if passed else 'FAIL'} |\n"
             )
 
-        fused_accuracy = results[FUSED_VARIANT].accuracy
-        baseline_accuracy = results[BASELINE_VARIANT].accuracy
+        fused_accuracy = results[FUSED_VARIANT]["accuracy"]
+        baseline_accuracy = results[BASELINE_VARIANT]["accuracy"]
         delta = fused_accuracy - baseline_accuracy
         summary += (
             f"\nmerged - separate = {delta:+.4f} "
@@ -315,17 +311,16 @@ class TestQwen35GdnInProjFusionMI35x(CustomTestCase):
             write_github_step_summary(summary)
         print(summary)
 
-        # Otherwise both arms are the same code path and agree trivially.
         self.assertFalse(
-            results[FUSED_VARIANT].merge_fell_back,
+            results[FUSED_VARIANT]["merge_fell_back"],
             f"{self.model} left in_proj_qkvz and in_proj_ba separate, so the "
             "merged arm never ran; the accuracy comparison is meaningless",
         )
 
         below_threshold = [
-            (name, metrics.accuracy)
+            (name, metrics["accuracy"])
             for name, metrics in sorted(results.items())
-            if metrics.accuracy < ACCURACY_THRESHOLD
+            if metrics["accuracy"] < ACCURACY_THRESHOLD
         ]
         self.assertEqual(
             below_threshold,
@@ -337,8 +332,8 @@ class TestQwen35GdnInProjFusionMI35x(CustomTestCase):
         self.assertGreaterEqual(
             delta,
             -ACCURACY_DELTA_TOLERANCE,
-            f"merged in_proj regressed vs separate baseline: {fused_accuracy:.4f} "
-            f"vs {baseline_accuracy:.4f} (delta {delta:+.4f}, tolerance "
+            f"merged in_proj regressed vs separate baseline: {fused_accuracy:.4f} vs "
+            f"{baseline_accuracy:.4f} (delta {delta:+.4f}, tolerance "
             f"-{ACCURACY_DELTA_TOLERANCE})",
         )
 

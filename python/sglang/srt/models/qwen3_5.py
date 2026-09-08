@@ -83,6 +83,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models import qwen3_5_gdn_in_proj_merge as gdn_in_proj_merge
 from sglang.srt.models.qwen2_moe import (
     Qwen2MoeMLP,
     Qwen2MoeSparseMoeBlock,
@@ -99,7 +100,6 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
-    get_lora,
     get_parallel,
     get_stream,
 )
@@ -137,16 +137,9 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
-
-# in_proj_ba is tiny and shares in_proj_qkvz's input; merging saves a launch. AMD-only.
-_fuse_gdn_qkvzba = get_bool_env_var("SGLANG_GDN_FUSE_QKVZBA", "False") and _is_hip
-
-# Tile-granularity heuristic for the a8w8 GEMM; correctness only needs N % 16.
-_GEMM_N_ALIGN = 128
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
-
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
@@ -278,25 +271,6 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     )
 
 
-def _gdn_input_proj_stacked_mapping(model: nn.Module):
-    separate = [
-        ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-        ("in_proj_qkvz.", "in_proj_z.", 3),
-        ("in_proj_ba.", "in_proj_b.", 0),
-        ("in_proj_ba.", "in_proj_a.", 1),
-    ]
-    if not _fuse_gdn_qkvzba:
-        return separate
-    if any("in_proj_qkvzba." in name for name, _ in model.named_parameters()):
-        return [
-            ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvzba.", "in_proj_z.", 3),
-            ("in_proj_qkvzba.", "in_proj_b.", 4),
-            ("in_proj_qkvzba.", "in_proj_a.", 5),
-        ]
-    return separate
-
-
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     if not isinstance(hidden_states, tuple):
         return hidden_states
@@ -393,18 +367,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.ba_width = (2 * self.num_v_heads) // self.attn_tp_size
         self.in_proj_qkvz = None
         self.in_proj_ba = None
-        self.in_proj_qkvzba = None
-        if _fuse_gdn_qkvzba:
-            self.in_proj_qkvzba = self.create_qkvzba_proj(
-                hidden_size=self.hidden_size,
-                key_dim=self.key_dim,
-                value_dim=self.value_dim,
-                num_v_heads=self.num_v_heads,
-                quant_config=quant_config,
-                prefix=add_prefix("in_proj_qkvzba", prefix),
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
-            )
+        self.in_proj_qkvzba = self.create_qkvzba_proj(
+            hidden_size=self.hidden_size,
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
+            num_v_heads=self.num_v_heads,
+            quant_config=quant_config,
+            prefix=add_prefix(gdn_in_proj_merge.MERGED_PARAM, prefix),
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+        )
         if self.in_proj_qkvzba is None:
             self.in_proj_qkvz = self.create_qkvz_proj(
                 hidden_size=self.hidden_size,
@@ -680,44 +652,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
     ) -> Optional[MergedColumnParallelLinear]:
-        """Both input projections as one GEMM, or None to keep them separate."""
-        if not _fuse_gdn_qkvzba:
-            return None
-        lora = get_lora()
-        if bool(lora.lora_paths) or lora.enable_lora:
-            # supported_lora_modules names in_proj_qkvz, which the merge removes.
-            return None
-
-        output_sizes = [
-            key_dim,
+        return gdn_in_proj_merge.build(
+            hidden_size,
             key_dim,
             value_dim,
-            value_dim,
             num_v_heads,
-            num_v_heads,
-        ]
-        shards = tp_size if tp_size is not None else 1
-        pad = (-(sum(output_sizes) // shards)) % _GEMM_N_ALIGN * shards
-        if pad:
-            output_sizes.append(pad)
-        try:
-            merged = MergedColumnParallelLinear(
-                input_size=hidden_size,
-                output_sizes=output_sizes,
-                bias=False,
-                quant_config=quant_config,
-                prefix=prefix,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-            )
-        except (ValueError, NotImplementedError) as e:
-            logger.info_once(f"in_proj_qkvz and in_proj_ba kept separate: {e}")
-            return None
-        weight = getattr(merged, "weight", None)
-        if pad and weight is not None:
-            # Nothing loads these rows.
-            weight.data[-(pad // shards) :].zero_()
-        return merged
+            quant_config,
+            prefix,
+            tp_rank,
+            tp_size,
+        )
 
     @property
     def qkvz_proj(self) -> nn.Module:
@@ -725,14 +669,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.in_proj_qkvzba
             if self.in_proj_qkvzba is not None
             else self.in_proj_qkvz
-        )
-
-    def _split_qkvzba(self, projected: torch.Tensor):
-        """qkvz and ba views of the merged output, without the padding."""
-        ba_end = self.qkvz_width + self.ba_width
-        return (
-            projected[..., : self.qkvz_width],
-            projected[..., self.qkvz_width : ba_end],
         )
 
     def fix_query_key_value_ordering(
@@ -761,7 +697,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if self.in_proj_qkvzba is not None:
             hs = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvzba)
             projected_states, _ = self.in_proj_qkvzba(hs)
-            return self._split_qkvzba(projected_states)
+            return gdn_in_proj_merge.split_output(
+                projected_states, self.qkvz_width, self.ba_width
+            )
 
         # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
         # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
@@ -1599,18 +1537,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
-        **(
-            {
-                "in_proj_qkvzba": [
-                    "in_proj_qkv",
-                    "in_proj_z",
-                    "in_proj_b",
-                    "in_proj_a",
-                ]
-            }
-            if _is_hip
-            else {}
-        ),
+        **gdn_in_proj_merge.PACKED_MODULES_MAPPING,
     }
 
     supported_lora_modules = [
@@ -1940,7 +1867,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN
-            *_gdn_input_proj_stacked_mapping(self),
+            *gdn_in_proj_merge.stacked_params_mapping(self),
         ]
 
         loaded_params: Set[str] = set()
@@ -2026,7 +1953,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN
-            *_gdn_input_proj_stacked_mapping(self),
+            *gdn_in_proj_merge.stacked_params_mapping(self),
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -2289,7 +2216,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN fused projections
-            *_gdn_input_proj_stacked_mapping(self),
+            *gdn_in_proj_merge.stacked_params_mapping(self),
         ]
 
         loaded_params: Set[str] = set()
@@ -2456,7 +2383,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN fused projections
-            *_gdn_input_proj_stacked_mapping(self),
+            *gdn_in_proj_merge.stacked_params_mapping(self),
         ]
 
         num_experts = self.config.num_experts
