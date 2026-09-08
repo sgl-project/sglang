@@ -9,7 +9,7 @@ export const config = {
     { id: "bf16", label: "BF16" },
     { id: "fp8", label: "FP8" },
     { id: "int4", label: "INT4 (GPTQ)" },
-    { id: "fp4", label: "FP4 (NVFP4)" },
+    { id: "fp4", label: "FP4 (MXFP4)" },
   ],
   strategies: [{ id: "balanced", label: "Balanced" }],
   nodesOptions: [{ id: "single", label: "Single Node" }],
