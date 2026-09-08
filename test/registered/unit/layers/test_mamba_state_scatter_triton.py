@@ -2,10 +2,12 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
+    register_xpu_ci,
 )
 
 register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 # The dst layout-contract tests run on CPU (no kernel launch).
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -37,14 +39,13 @@ from sglang.srt.utils import get_device
 from sglang.srt.utils.common import get_device_module
 from sglang.test.test_utils import CustomTestCase
 
-# Backends the multi-type scatter is verified against; extend as others gain
-# Triton.
+# Backends the multi-type scatter is verified against; extend as others gain Triton.
 TRITON_DEVICES = ("cuda", "xpu")
 
 
 def _triton_device():
-    """The accelerator to launch on, or None. ``get_device()`` raises when the
-    host has none, and the layout-contract cases below run on the CPU suite."""
+    # get_device() raises when the host has no accelerator; the layout-contract
+    # cases below still run on the CPU suite.
     try:
         device = get_device()
     except RuntimeError:
@@ -392,19 +393,11 @@ class TestMambaStateScatterEnvelopeDst(unittest.TestCase):
     f"multi-type conv scatter needs one of {TRITON_DEVICES}",
 )
 class TestFusedConvWindowScatterMulti(CustomTestCase):
-    """The single-launch multi-type conv-window scatter, on whichever
-    accelerator is present.
-
-    Unlike its per-type sibling, this variant addresses every conv type through
-    a host-built device-pointer table, so it is the one scatter whose
-    correctness depends on how ``data_ptr()`` values are packed (issue #35047).
-    No case exercised this kernel before, on any backend.
-    """
+    """Multi-type conv scatter must place every conv type correctly; it reaches
+    them through a host-built device-pointer table (issue #35047)."""
 
     def _run(self, num_types, n2):
-        """Scatter ``num_types`` conv types plus an optional second index set
-        (the interval-crossing track set), and compare against advanced
-        indexing."""
+        # n2 sizes the optional second (interval-crossing track) index set.
         torch.manual_seed(11)
         dev = DEVICE
         layers, slots, batch, steps, dim, km1 = 2, 16, 5, 3, 8, 3

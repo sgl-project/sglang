@@ -21,18 +21,19 @@ from sglang.srt.mem_cache.mamba_slot_fused import (
 )
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import get_device_module
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
 # Backends these kernels are verified against; extend as others gain Triton.
 TRITON_DEVICES = ("cuda", "xpu")
 
 
 def _triton_device():
-    """The accelerator to launch on, or None. ``get_device()`` raises when the
-    host has none, and importing this module must not."""
+    # get_device() raises when the host has no accelerator; importing this
+    # module must not.
     try:
         device = get_device()
     except RuntimeError:

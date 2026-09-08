@@ -1,15 +1,13 @@
-"""Device-pointer tables must survive addresses with the top bit set.
+"""Device-pointer tables must survive addresses with the top bit set (#35047).
 
-Bug regression (issue #35047): these tables were built as ``int64``, so a base
-address ``>= 2**63`` raised ``ValueError: Overflow when unpacking long long`` on
-the host, before any launch. Backends whose addresses stay ``< 2**47`` cannot
-catch this, so the cases below spoof a high address onto CPU tensors and run
-anywhere.
+Backends whose addresses stay ``< 2**47`` cannot catch this, so the cases below
+spoof a high address onto CPU tensors and run anywhere.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
 
 import unittest
 
@@ -33,7 +31,7 @@ except Exception as e:  # triton is not installed on every CPU runner
 
 
 def _accelerator_or_none():
-    """The local accelerator, or None: ``get_device()`` raises on a CPU-only host."""
+    # get_device() raises on a CPU-only host.
     try:
         return get_device()
     except RuntimeError:
@@ -47,8 +45,7 @@ _HIGH_BASE = 0xFFFF85ABD4E00000
 
 
 class _SpoofedPtrTensor(torch.Tensor):
-    """A real tensor reporting a top-bit-set ``data_ptr()``; everything else
-    (shape, strides, dtype, device) stays real."""
+    # Only data_ptr() is faked; shape, strides, dtype and device stay real.
 
     _spoofed_ptr = None
 
@@ -65,7 +62,7 @@ def _spoof(t: torch.Tensor, offset: int) -> torch.Tensor:
 
 
 def _conv_pairs(elems):
-    """(dst, src) conv-window pairs as the multi-type scatter takes them."""
+    # (dst, src) order, as the multi-type scatter takes them.
     layers, slots, batch, steps, dim = 2, 8, 4, 3, 1
     return [
         (
@@ -77,7 +74,7 @@ def _conv_pairs(elems):
 
 
 def _conv_tensors(feats):
-    """Conv-state pool tensors as ``build_conv_slot_descriptor`` takes them."""
+    # [layers, slots, conv_len, feat], as build_conv_slot_descriptor takes them.
     return [torch.zeros((2, 16, 4, f), dtype=torch.bfloat16) for f in feats]
 
 
@@ -93,9 +90,8 @@ class TestMakePtrTable(CustomTestCase):
 
 @unittest.skipUnless(_IMPORT_ERROR is None, f"import failed: {_IMPORT_ERROR}")
 class TestPtrTableCallSites(CustomTestCase):
-    """Each call site builds its table twice, from a spoofed top-bit-set
-    address and from the real low CPU address: the address columns must survive
-    and the companion columns must be identical either way."""
+    """Built from a spoofed top-bit-set address, each call site's address columns
+    must survive and its companion columns must match a real-address build."""
 
     def test_conv_multi_meta_table(self):
         elems = (128, 64)

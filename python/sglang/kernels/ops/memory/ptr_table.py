@@ -14,9 +14,9 @@ def make_ptr_table(
     """Pack ``data_ptr()`` values -- flat, or 2-D with companion columns such as
     strides -- into an ``int64`` table a kernel bitcasts back to pointers.
 
-    Build unsigned, never ``dtype=torch.int64``: XPU USM addresses set the top
-    bit, which ``torch.tensor()`` rejects while unpacking through ``long long``.
-    ``view`` moves no bits, so kernels keep their signed element type. Values
-    must be in ``[0, 2**64)``.
+    Built unsigned because XPU USM addresses set the top bit, which
+    ``dtype=torch.int64`` rejects while unpacking through ``long long``;
+    ``view`` moves no bits, so kernels keep their signed element type.
+    Values must be in ``[0, 2**64)``.
     """
     return torch.tensor(rows, dtype=torch.uint64, device=device).view(torch.int64)
