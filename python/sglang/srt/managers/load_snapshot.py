@@ -89,7 +89,7 @@ def should_use_zmq() -> bool:
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
-_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
+_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens", "shape_aware"})
 
 
 def _tokenizer_load_snapshot_owner_caller() -> str:
@@ -211,6 +211,11 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
     num_waiting_uncached_tokens: int = 0
+    # Estimated compute still owed in each phase. These are kept separate so
+    # shape-aware DP routing does not let a prefill-heavy rank look equivalent
+    # to a decode-heavy rank with the same aggregate token count.
+    input_token_load: int = 0
+    output_token_load: int = 0
     num_used_tokens: int = 0
     num_total_tokens: int = 0
     # num_total_tokens minus tokens still awaiting a KV transfer (equal to it

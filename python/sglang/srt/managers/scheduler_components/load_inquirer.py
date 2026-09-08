@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import (
     DisaggregationMetrics,
     LoadSnapshot,
@@ -29,6 +30,15 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _estimated_output_tokens(req) -> int:
+    # Whole generation, decoded tokens included, not just what's left -- matches
+    # what the DP controller already charged the rank at dispatch.
+    return min(
+        max(0, req.sampling_params.max_new_tokens),
+        envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get(),
+    )
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -78,7 +88,7 @@ class SchedulerLoadInquirer:
             num_pending_tokens += req.seqlen - req.prefix_len - chunk_deduct
         return num_pending_tokens
 
-    def get_num_waiting_uncached_tokens(self) -> int:
+    def get_input_token_load(self) -> int:
         """Estimate input tokens waiting for prefill compute."""
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             return 0
@@ -105,10 +115,30 @@ class SchedulerLoadInquirer:
             num_tokens += max(0, cr.seqlen - cr.prefix_len)
         return num_tokens
 
+    def get_output_token_load(self) -> int:
+        """Estimate total decode tokens for admitted and queued requests.
+
+        Every request here has already been through
+        ``Scheduler.init_req_max_new_tokens``, so ``max_new_tokens`` is a
+        concrete int rather than the ``None`` the API layer may hand over.
+        """
+        num_tokens = 0
+        for req in self.get_running_batch().reqs:
+            num_tokens += _estimated_output_tokens(req)
+        for req in self.get_waiting_queue():
+            num_tokens += _estimated_output_tokens(req)
+        cr = self.get_chunked_req()
+        if cr is not None:
+            # The chunked req is held out of the running batch while it prefills
+            # (see ``chunked_req_to_exclude``), so it is not double counted.
+            num_tokens += _estimated_output_tokens(cr)
+        return num_tokens
+
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         stats = self.get_stats()
         num_running_reqs = len(self.get_running_batch().reqs)
+        input_token_load = self.get_input_token_load()
 
         lists = self.get_request_lists()
         waiting_queues = [self.get_waiting_queue()]
@@ -229,7 +259,9 @@ class SchedulerLoadInquirer:
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
-            num_waiting_uncached_tokens=self.get_num_waiting_uncached_tokens(),
+            num_waiting_uncached_tokens=input_token_load,
+            input_token_load=input_token_load,
+            output_token_load=self.get_output_token_load(),
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,

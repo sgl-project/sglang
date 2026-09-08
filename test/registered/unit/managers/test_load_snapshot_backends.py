@@ -381,7 +381,7 @@ class TestZmqReaderOwner(CustomTestCase):
         )
 
     def test_data_parallel_controller_owns_load_aware(self):
-        for method in ("total_tokens", "total_requests"):
+        for method in ("total_tokens", "total_requests", "shape_aware"):
             self.assertEqual(
                 self._owners(
                     attn_dp_size=4, tokenizer_worker_num=8, load_balance_method=method
@@ -425,7 +425,12 @@ class TestZmqReaderOwner(CustomTestCase):
         with envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(True):
             for attn_dp_size in (1, 4):
                 for tw in (1, 8):
-                    for method in ("round_robin", "total_tokens", "total_requests"):
+                    for method in (
+                        "round_robin",
+                        "total_tokens",
+                        "total_requests",
+                        "shape_aware",
+                    ):
                         for node_rank in (0, 1):
                             owners = self._owners(
                                 attn_dp_size=attn_dp_size,
