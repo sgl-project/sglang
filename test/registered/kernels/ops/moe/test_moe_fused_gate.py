@@ -343,6 +343,23 @@ def test_moe_fused_gate_softmax_matches_aot(
     )
 
 
+@pytest.mark.parametrize("M", [1, 8, 32])
+def test_moe_fused_gate_softmax_none_bias_matches_zero_bias(M: int) -> None:
+    torch.manual_seed(M)
+    scores = torch.randn(M, 256, dtype=torch.float32, device=DEVICE)
+    zero_bias = torch.zeros(256, dtype=torch.float32, device=DEVICE)
+
+    none_w, none_i = moe_fused_gate(
+        scores, None, topk=8, scoring_func="softmax", renormalize=True
+    )
+    zero_w, zero_i = moe_fused_gate(
+        scores, zero_bias, topk=8, scoring_func="softmax", renormalize=True
+    )
+
+    torch.testing.assert_close(none_w, zero_w, rtol=0, atol=0)
+    torch.testing.assert_close(none_i, zero_i, rtol=0, atol=0)
+
+
 _SIGMOID_AOT_CASES = get_ci_test_range(
     [
         (1, 128, 4, True, True, torch.float32),
