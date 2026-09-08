@@ -291,6 +291,7 @@ def _init_parallel_groups(
         attention_context_model_parallel_size=attn_cp_size,
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
+        shared_experts_tensor_parallel_size=get_parallel().shared_experts_tp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,
