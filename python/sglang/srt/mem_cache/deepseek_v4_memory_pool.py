@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Tuple
+from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -61,6 +61,12 @@ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
     window wide."""
     window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
     return ring_size - window_size + 2 if ring_size > window_size else 0
+
+
+def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
+    # A verify batch writes its draft tokens ahead of the committed position.
+    spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
+    return sliding_window + spec_extra
 
 
 class DeepSeekV4SingleKVPool(KVCache):
@@ -566,6 +572,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        # Resolve the unified-kv gate before any sizing so the two cannot drift.
+        self._unified_kv = is_unified_kv_triton()
+        c4_ring_size = self.get_ring_size(4)
+        if self._unified_kv:
+            # Unified C4 state is request-addressed: one ring per req slot,
+            # so the caller-supplied, SWA-scaled size does not apply here.
+            c4_state_pool_size = self.num_req_slots * c4_ring_size
+        # Non-unified (fp8) keeps the caller-supplied, SWA-addressed size.
         self.c4_state_pool_size = c4_state_pool_size
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:
@@ -621,20 +639,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        self._unified_kv = is_unified_kv_triton()
-
         if self._unified_kv:
             self.swa_kv_pool = None
             self.c4_kv_pool = None
             self.c128_kv_pool = None
-            spec_extra = (
-                (get_spec().speculative_num_draft_tokens - 1)
-                if get_spec().speculative_algorithm is not None
-                else 0
+            swa_ring_size = get_swa_ring_size(
+                self.sliding_window, get_spec().speculative_algorithm is not None
             )
             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
                 stage_ratios=stage_ratios,
@@ -646,12 +656,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
-                swa_ring_size=self.sliding_window + spec_extra,
+                swa_ring_size=swa_ring_size,
             )
 
             self.unified_swa_window = self.sliding_window
-            self.unified_swa_ring_size = self.sliding_window + spec_extra
+            self.unified_swa_ring_size = swa_ring_size
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
+            self.swa_req_ring_size = self.unified_swa_ring_size
         else:
             self.unified_kv_pool = None
             self.swa_kv_pool = self._make_kv_pool(
@@ -1052,6 +1063,32 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.online_c128_mtp_pending_seq_lens is not None
         return self.online_c128_mtp_pending_seq_lens
 
+    def clear_c4_req_states(self, req_pool_indices: Sequence[int]) -> None:
+        if not self._unified_kv or not req_pool_indices:
+            return
+
+        pools = [
+            pool
+            for pool in self.compress_state_pools + self.indexer_compress_state_pools
+            if pool is not None and pool.ratio == 4
+        ]
+        if not pools:
+            return
+
+        ring_size = self.get_ring_size(4)
+        device = pools[0].kv_score_buffer.kv_score.device
+        req_indices = torch.as_tensor(req_pool_indices, dtype=torch.long, device=device)
+        state_locs = (
+            req_indices[:, None] * ring_size
+            + torch.arange(ring_size, dtype=torch.long, device=device)
+        ).flatten()
+
+        for pool in pools:
+            state = pool.kv_score_buffer.kv_score
+            half = state.shape[-1] // 2
+            state[state_locs, :half] = 0
+            state[state_locs, half:] = float("-inf")
+
     def clear_c128_req_state(self, req_pool_idx: int) -> None:
         """Reset request-scoped C128 state for one req slot."""
         for pool in self.compress_state_pools:
@@ -1078,7 +1115,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         accept_lens: torch.Tensor,
         num_draft_tokens: int,
     ) -> None:
-        """Clear offline C128 ring slots written for rejected speculative tokens."""
+        """Clear offline C128 ring slots written for rejected speculative tokens.
+        C4 needs no counterpart: its draft states are overwritten in position order
+        before any read; a C128 compression boundary can read a stale draft slot."""
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 

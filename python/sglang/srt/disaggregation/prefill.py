@@ -81,7 +81,6 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import is_npu
@@ -200,12 +199,6 @@ class PrefillBootstrapQueue:
                 raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER with pp_size > 1 is only "
                     "supported by Mooncake."
-                )
-            if get_parallel().enable_prefill_context_parallel:
-                # CP rewrites index_slice per rank, breaking the chunk grid.
-                raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER does not support "
-                    "prefill context parallelism."
                 )
         self.kv_manager = self._init_kv_manager()
 
@@ -606,8 +599,7 @@ class SchedulerDisaggregationPrefillMixin:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -646,8 +638,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
