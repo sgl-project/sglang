@@ -116,9 +116,15 @@ def fused_kda_conv_gating_verify_kernel(
     is_qk_owner = (i_v == 0) & (i_hv % (HV // H) == 0)
 
     cs_idx = tl.load(conv_state_indices + i_n).to(tl.int64)
-    # Padded rows carry -1 slots; the reference conv kernel early-returns on
-    # them (their outputs are never consumed), so skip the whole program.
+    # Dummy requests own no state, but downstream layers consume their
+    # physical output rows. Initialize them before skipping the update.
     if cs_idx < 0:
+        for token_idx in range(T):
+            tl.store(
+                o + ((bos + token_idx) * HV + i_hv) * V + o_v,
+                0.0,
+                mask=mask_v,
+            )
         return
     cs_base = conv_state + cs_idx * stride_cs_line
 

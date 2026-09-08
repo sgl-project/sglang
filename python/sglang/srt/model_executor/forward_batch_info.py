@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import math
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -1331,10 +1332,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
-        # Local imports: module-level CP helper imports here are circular (#27014).
-        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-        from sglang.srt.layers.cp.utils import enable_cp_v2
-
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -1343,20 +1340,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
+        # Fixed-width hybrid verify kernels consume complete request groups.
+        # Align the globally agreed token counts before selecting MAX_LEN/SUM_LEN
+        # so active and synchronized idle ranks retain the same collective domain.
+        token_alignment = attn_tp_size
+        if (
+            self.spec_info is not None
+            and not self.spec_info.is_draft_input()
+            and self.spec_info.ragged_verify_layout is None
+            and self.spec_info.num_tokens_per_req > 0
+            and (self.forward_mode.is_target_verify() or self.forward_mode.is_idle())
+            and mambaish_config(model_runner.model_config) is not None
+        ):
+            token_alignment = math.lcm(
+                token_alignment, self.spec_info.num_tokens_per_req
+            )
+
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
-
-        # make sure that each rank has the same number of tokens to do collective communication.
-        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
-        # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
-        # prefill with NaN draft logits, see #23269).
-        # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
-        if not enable_cp_v2():
-            cp_align_size = get_cp_padding_align_size()
-            for i in range(sync_group_size):
-                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], token_alignment)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens

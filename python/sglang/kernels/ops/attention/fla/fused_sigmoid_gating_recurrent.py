@@ -134,6 +134,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # per-slot pitch spans ALL layers' state, not HV*K*V. int64: envelope
         # pitches overflow an int32 index product.
         idx = tl.load(h0_indices + i_n).to(tl.int64)
+        if DISABLE_STATE_UPDATE and CACHE_INTERMEDIATE_STATES:
+            if idx < 0:
+                # Padded verify rows have no state or tree metadata. Do not
+                # read their gates, parent links, or intermediate-state indices.
+                for token_idx in range(T):
+                    tl.store(p_o + token_idx * HV * V, 0.0, mask=mask_v)
+                return
         if idx >= 0:
             p_h0 = (
                 h0_source
