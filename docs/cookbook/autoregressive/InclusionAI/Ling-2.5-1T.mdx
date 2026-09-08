@@ -48,7 +48,7 @@ import { Ling251TDeployment } from '/src/snippets/autoregressive/ling-25-1t-depl
 - The `--trust-remote-code` flag is required for this model due to custom modeling code.
 - `--tp-size` can be set to a maximum of 8 for this model. If you have more GPUs available, increase `--pp-size` to scale across additional nodes.
 - Adding `--model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}'` enables faster model loading.
-- On H200/GB200/GB300 with 2-node deployment, `--mem-frac 0.95` is required to avoid OOM since the model occupies most of the GPU memory. For better throughput, consider 4-node deployment (ref [model card](https://huggingface.co/inclusionAI/Ling-2.5-1T#run-inference) for more details).
+- On H200/GB200/GB300 with 2-node deployment, `--mem-fraction-static 0.95` is required to avoid OOM since the model occupies most of the GPU memory. For better throughput, consider 4-node deployment (ref [model card](https://huggingface.co/inclusionAI/Ling-2.5-1T#run-inference) for more details).
 
 ## 4. Model Invocation
 
@@ -74,7 +74,7 @@ python3 -m sglang.launch_server \
 --dist-init-addr ${MASTER_IP}:${DIST_PORT} \
 --tool-call-parser qwen \
 --model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}' \
---mem-frac 0.95
+--mem-fraction-static 0.95
 
 
 # Node 1:
@@ -88,7 +88,7 @@ python3 -m sglang.launch_server \
 --dist-init-addr ${MASTER_IP}:${DIST_PORT} \
 --tool-call-parser qwen \
 --model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}' \
---mem-frac 0.95
+--mem-fraction-static 0.95
 ```
 
 Once the server is running, send requests to the master node:

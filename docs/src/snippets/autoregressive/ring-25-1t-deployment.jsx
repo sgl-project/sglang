@@ -124,7 +124,7 @@ export const Ring251TDeployment = () => {
         cmd += '--dist-init-addr ${MASTER_IP}:${DIST_PORT} \\\n';
         cmd += '--attention-backend triton \\\n';
         cmd += '--model-loader-extra-config \'{"enable_multithread_load": "true","num_threads": 64}\' \\\n';
-        cmd += '--mem-frac 0.95';
+        cmd += '--mem-fraction-static 0.95';
         extraFlags.forEach((flag) => {
           cmd += ` \\\n${flag}`;
         });

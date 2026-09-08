@@ -116,7 +116,7 @@ export const Ling251TDeployment = () => {
         cmd += ` \\\n  --tool-call-parser qwen`;
       }
       if (needMemFrac) {
-        cmd += ` \\\n  --mem-frac 0.95`;
+        cmd += ` \\\n  --mem-fraction-static 0.95`;
       }
       return cmd;
     };
