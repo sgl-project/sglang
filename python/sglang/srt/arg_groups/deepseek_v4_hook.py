@@ -145,14 +145,28 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
 
     if cfg.speculative_algorithm is not None:
-        assert cfg.speculative_algorithm in (
-            "EAGLE",
-            "DSPARK",
+        # Resolve before comparing. This handler runs from
+        # handle_model_specific_adjustments, well before handle_speculative_decoding
+        # case-folds the field and collapses the NEXTN alias, so the raw CLI string
+        # arrives here unnormalized: "NEXTN" and "eagle" would both fail the membership
+        # test even though both mean EAGLE. SpeculativeAlgorithm.from_string is the
+        # same resolution the speculative hook eventually applies.
+        # Lazy import to avoid a circular import at module scope.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        algorithm = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+        assert algorithm in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.DSPARK,
         ), (
             f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
         )
-        if cfg.speculative_algorithm == "EAGLE":
-            assert cfg.speculative_eagle_topk == 1, (
+        if algorithm is SpeculativeAlgorithm.EAGLE:
+            # None is the unset default; handle_speculative_decoding fills it with 1
+            # later (speculative_hook.py, `if cfg.speculative_eagle_topk is None`), so
+            # rejecting None here would reject a valid command line that simply omits
+            # --speculative-eagle-topk.
+            assert cfg.speculative_eagle_topk in (None, 1), (
                 f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
             )
 
