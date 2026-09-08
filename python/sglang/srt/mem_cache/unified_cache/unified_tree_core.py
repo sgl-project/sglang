@@ -1967,6 +1967,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node.children[child_key] = new_node
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(node)
+        self.kv_events.record_store(new_node, medium=StorageMedium.CPU)
         result.inserted_host_node = new_node.id
         return result
 
