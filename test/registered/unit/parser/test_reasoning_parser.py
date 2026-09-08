@@ -1219,6 +1219,22 @@ class TestGptOssDetector(CustomTestCase):
         self.assertIn("reasoning part", all_reasoning)
         self.assertIn("answer", all_normal)
 
+    def test_non_streaming_final_closed_by_end_token(self):
+        """Non-streaming output of a final block closed by <|end|> drops the marker.
+
+        The marker used to survive in normal_text, so a client rendered the answer
+        with a trailing <|end|>. Streaming the same text already dropped it.
+        """
+        text = (
+            "<|start|><|channel|>analysis<|message|>reasoning part<|end|>"
+            "<|start|><|channel|>final<|message|>answer<|end|>"
+        )
+
+        result = self.detector.detect_and_parse(text)
+
+        self.assertEqual(result.reasoning_text, "reasoning part")
+        self.assertEqual(result.normal_text, "answer")
+
 
 class TestMiniMaxAppendThinkDetector(CustomTestCase):
     """Test cases for MiniMaxAppendThinkDetector."""
