@@ -73,17 +73,27 @@ def prepare_moe_topk(
         log_info_on_rank0(logger, f"Prepared {num_prepared} Waterfill TopK modules.")
 
 
-def prebuild_deepep_v2_buffers(
-    *,
-    model,
-    disaggregation_mode: str,
-    chunked_prefill_size: int,
-    attn_tp_size: int,
-) -> None:
+def maybe_prebuild_deepep_v2_buffers(*, model, decode_cuda_graph_runner) -> None:
+    """Prebuild deepep_v2 buffers unless a captured decode graph already built them.
+
+    A captured decode graph already ran a dispatch that built the ElasticBuffer;
+    an EagerRunner means no capture happened, so prebuild is still needed.
+    """
+    from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+
+    decode_runner_captured = decode_cuda_graph_runner is not None and not isinstance(
+        decode_cuda_graph_runner, EagerRunner
+    )
+    if decode_runner_captured:
+        return
+    prebuild_deepep_v2_buffers(model=model)
+
+
+def prebuild_deepep_v2_buffers(*, model) -> None:
     """Build every deepep_v2 dispatcher's ElasticBuffer at deployment time.
 
-    No-op unless the a2a backend is deepep_v2. On a prefill node, first validate
-    the per-rank cap against the chunk slice (buffer preallocates per that cap).
+    No-op unless the a2a backend is deepep_v2. The per-rank cap is validated in
+    validate_deepep_v2_dispatch_token_budget at server-args time.
     """
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
@@ -92,15 +102,6 @@ def prebuild_deepep_v2_buffers(
     if not get_moe_a2a_backend().is_deepep_v2():
         return
 
-    min_tokens_per_rank = None
-    if (
-        disaggregation_mode == "prefill"
-        and chunked_prefill_size
-        and chunked_prefill_size > 0
-        and attn_tp_size > 0
-    ):
-        min_tokens_per_rank = chunked_prefill_size // attn_tp_size
-
     num_prebuilt = 0
     for module in model.modules():
         if not isinstance(module, FusedMoE):
@@ -108,19 +109,6 @@ def prebuild_deepep_v2_buffers(
         dispatcher = module.dispatcher
         if not isinstance(dispatcher, DeepEPv2Dispatcher):
             continue
-        if (
-            min_tokens_per_rank is not None
-            and dispatcher.num_max_dispatch_tokens_per_rank < min_tokens_per_rank
-        ):
-            raise ValueError(
-                "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-                f"{dispatcher.num_max_dispatch_tokens_per_rank} is too small for the "
-                "prefill DeepEP-V2 ElasticBuffer: it must be >= the per-rank chunk "
-                f"slice (chunked_prefill_size / attn_tp_size = {min_tokens_per_rank}). "
-                "DeepEP-V2 preallocates buffer space assuming all of a rank's tokens "
-                "may hit one expert, so raise the cap to at least "
-                f"{min_tokens_per_rank}."
-            )
         dispatcher.prebuild()
         num_prebuilt += 1
     if num_prebuilt:
