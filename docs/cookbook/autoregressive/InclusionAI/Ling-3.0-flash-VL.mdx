@@ -40,7 +40,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware to generate the launch command. The checkpoint ships in BF16 with an FP8 variant, and each GPU family carries one **Balanced** recipe sized so the ~250 GB of BF16 weights fit with KV-cache headroom: `--tp 4` on 288 GB-class (GB300, B300) and 141 GB-class (B200, H200) GPUs, and `--tp 8` on H100.
+Pick your hardware to generate the launch command. The checkpoint ships in BF16 with FP8, INT4, and FP4 variants, and each GPU family carries one **Balanced** recipe sized so the ~250 GB of BF16 weights fit with KV-cache headroom: `--tp 4` on 288 GB-class (GB300, B300) and 141 GB-class (B200, H200) GPUs, and `--tp 8` on H100.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/inclusionAI/ling-3.0-flash-vl.jsx";
@@ -83,6 +83,8 @@ It is a thinking model: the chat template turns chain-of-thought on by default a
 - Native context is 128K, and the generated recipes default to the 256K YaRN variant (`--context-length 262144` plus the `rope_scaling` override and `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`), matching the model card. For the native 128K window, drop all three from the command.
 - Audio content parts are rejected before preprocessing; send images as `image_url` and clips as `video_url` content parts (§3).
 - The FP8 variant (`inclusionAI/Ling-3.0-flash-VL-FP8`) uses 128×128 block quantization, so plain TP must keep `768 ÷ tp` divisible by 128 (TP 1, 2, 3, or 6 — TP=4 fails to load). The FP8 recipes therefore pair TP with expert parallelism (`--tp 4 --ep 4`, `--tp 8 --ep 8`), which keeps experts whole per rank and is verified on 4×GB300; TP=2 without EP also works. The BF16 checkpoint can also be quantized online with `--quantization fp8`; measured accuracy and speed for both paths are in the benchmark cards below.
+- The INT4 variant (`inclusionAI/Ling-3.0-flash-VL-int4`) is a GPTQ 4-bit export (compressed-tensors, group size 32). It runs on all listed hardware with the same TP sizing as BF16; its cells are pending verification.
+- The FP4 variant (`inclusionAI/Ling-3.0-flash-VL-fp4`) is an NVFP4 export (FP4 weights with FP8 e4m3 dynamic activations) and runs on Blackwell only (GB300, B300, B200, DGX Spark); verified hardware is TBD, so its cells carry the unverified badge.
 
 ## 3. Advanced Usage
 
