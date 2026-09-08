@@ -60,6 +60,14 @@ def _is_oom_error(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
+def _empty_device_cache() -> None:
+    """empty_cache() on the active device module; a no-op for backends whose
+    module (e.g. torch.cpu) exposes no cache to empty."""
+    empty_cache = getattr(torch.get_device_module(), "empty_cache", None)
+    if empty_cache is not None:
+        empty_cache()
+
+
 def _seed_for_output(seed, output_idx: int):
     if isinstance(seed, list):
         if output_idx < len(seed):
@@ -202,6 +210,7 @@ class HunyuanImage3AR(PipelineStage):
         model_path: str,
         vision_model,
         vision_aligner,
+        max_cond_encode_chunk: int | None = None,
     ):
         super().__init__()
         self.ar_model = ar_model
@@ -211,6 +220,10 @@ class HunyuanImage3AR(PipelineStage):
         self._model_path = model_path
         self._vision_model = vision_model
         self._vision_aligner = vision_aligner
+        # Initial cap for the cond-encode chunk, derived from the scheduler's
+        # --batching-max-size: an operator raising it declares the device can
+        # take grouped work; None (or 1) leaves the chunk unlimited.
+        self._max_cond_encode_chunk = max_cond_encode_chunk
         self._custom_tokenizer = HunyuanImage3TokenizerWrapper(tokenizer)
         self._gen_config_cache: dict | None = None
         self._cache_dit_adapter = None
@@ -314,14 +327,13 @@ class HunyuanImage3AR(PipelineStage):
         cos = cos.contiguous()
         sin = sin.contiguous()
 
-        # Broadcast from rank 0 for deterministic TP collectives
+        # hidden_states changes on every denoising step, so keep its TP
+        # synchronization in the per-step path. Request-static attention
+        # inputs are synchronized once before the loop.
         if model_parallel_is_initialized():
             tp_group = get_tp_group()
             if tp_group.world_size > 1:
                 hidden_states = tp_group.broadcast(hidden_states, src=0)
-                attention_mask = tp_group.broadcast(attention_mask, src=0)
-                cos = tp_group.broadcast(cos, src=0)
-                sin = tp_group.broadcast(sin, src=0)
 
         if self._cache_dit_adapter is not None:
             output = self._cache_dit_adapter(hidden_states, attention_mask, (cos, sin))
@@ -338,6 +350,24 @@ class HunyuanImage3AR(PipelineStage):
         actual_batch = attention_mask.shape[0]
         actual_seq_len = output.shape[0] // actual_batch
         return output.view(actual_batch, actual_seq_len, hidden_size)
+
+    def _broadcast_static_inputs(
+        self,
+        attention_mask: torch.Tensor,
+        custom_pos_emb: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Synchronize request-static attention inputs once across TP ranks."""
+        attention_mask = attention_mask.contiguous()
+        cos, sin = custom_pos_emb
+        cos = cos.contiguous()
+        sin = sin.contiguous()
+        if model_parallel_is_initialized():
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                attention_mask = tp_group.broadcast(attention_mask, src=0)
+                cos = tp_group.broadcast(cos, src=0)
+                sin = tp_group.broadcast(sin, src=0)
+        return attention_mask, (cos, sin)
 
     def _instantiate_vae_tokens_first_step(
         self,
@@ -384,6 +414,26 @@ class HunyuanImage3AR(PipelineStage):
             ts_scatter_index = timestep_index.long()
 
         num_positions = ts_scatter_index.shape[1]
+        if ts_scatter_index.shape[0] != bsz or timestep_emb.shape[1] != num_positions:
+            # Covers both the gen-timestep and cond-timestep callers; without
+            # this the expand below fails with a cryptic broadcast error.
+            logger.error(
+                "timestep scatter mismatch: bsz=%d seqlen=%d "
+                "timestep_index=%s dtype=%s timesteps=%s "
+                "timestep_emb=%s",
+                bsz,
+                seqlen,
+                tuple(timestep_index.shape),
+                timestep_index.dtype,
+                tuple(timesteps.shape),
+                tuple(timestep_emb.shape),
+            )
+            raise RuntimeError(
+                "timestep scatter mismatch: "
+                f"timestep_emb rows {timestep_emb.shape[1]} vs "
+                f"index positions {num_positions} "
+                f"(bsz {ts_scatter_index.shape[0]} vs {bsz})"
+            )
         timestep_emb = timestep_emb.expand(-1, num_positions, -1)
         hidden_states.scatter_(
             dim=1,
@@ -535,14 +585,22 @@ class HunyuanImage3AR(PipelineStage):
                 [[] for _ in per_request_joint_infos],
             )
 
-        try:
-            batched = self._encode_conditions_batched(flat_infos, device)
-        except (torch.OutOfMemoryError, RuntimeError) as e:
-            if isinstance(e, RuntimeError) and "out of memory" not in str(e).lower():
-                raise
-            logger.warning("Batched cond encoding OOM; falling back to sequential")
-            torch.get_device_module().empty_cache()
-            batched = None
+        # Batched cond encoding is opt-in via env var: the AR backbone is
+        # resident on the same device, so full-batch encoding is tight on
+        # memory and stays sequential unless explicitly enabled.
+        batched = None
+        if envs.SGLANG_HI3_COND_ENCODE_BATCHING:
+            try:
+                batched = self._encode_conditions_batched(flat_infos, device)
+            except (torch.OutOfMemoryError, RuntimeError) as e:
+                if isinstance(e, RuntimeError) and "out of memory" not in str(
+                    e
+                ).lower():
+                    raise
+                logger.warning(
+                    "Batched cond encoding OOM; falling back to sequential"
+                )
+                _empty_device_cache()
         if batched is None:
             batched = self._encode_conditions_sequential(flat_infos, device)
         vae_embeds, t_values, vit_embeds = batched
@@ -617,12 +675,15 @@ class HunyuanImage3AR(PipelineStage):
             vit_kwargs["attention_mask"] = vit_kwargs["attention_mask"].unsqueeze(0)
         return vit_kwargs
 
-    def _encode_adaptive(self, count, run_batch):
+    def _encode_adaptive(self, count, run_batch, max_chunk=None):
         """Encode ``count`` items via ``run_batch(indices) -> list`` in the
         largest batch that fits.
 
-        Starts with every item in one batched call; on OOM it empties the cache,
-        halves the batch, and retries the same items -- down to one at a time.
+        Starts with every item in one batched call (capped to ``max_chunk``
+        when given -- the cap never blocks work, it only splits it: the
+        remaining items are processed in further calls of the same size).
+        On OOM it empties the cache, halves the batch, and retries the same
+        items -- down to one at a time.
         Chunking is bit-safe here: VAE conv is independent per batch row and the
         ViT isolates each image via its attention_mask + spatial_shapes (packed
         internally), so each image's embedding does not depend on which other
@@ -634,7 +695,7 @@ class HunyuanImage3AR(PipelineStage):
             return []
         results: list = []
         start = 0
-        chunk = count
+        chunk = count if max_chunk is None else min(count, max_chunk)
         while start < count:
             size = min(chunk, count - start)
             try:
@@ -643,7 +704,7 @@ class HunyuanImage3AR(PipelineStage):
             except (torch.OutOfMemoryError, RuntimeError) as e:
                 if not _is_oom_error(e):
                     raise
-                torch.get_device_module().empty_cache()
+                _empty_device_cache()
                 if size <= 1:
                     raise
                 chunk = size // 2
@@ -701,7 +762,10 @@ class HunyuanImage3AR(PipelineStage):
                 )
                 return [(image_seq[k], t_chunk[k : k + 1]) for k in range(len(idxs))]
 
-            vae_results = self._encode_adaptive(len(flat_infos), _run_vae)
+            max_chunk = self._max_cond_encode_chunk
+            vae_results = self._encode_adaptive(
+                len(flat_infos), _run_vae, max_chunk=max_chunk
+            )
             vae_embeds = [r[0] for r in vae_results]
             t_values = [r[1] for r in vae_results]
 
@@ -731,7 +795,9 @@ class HunyuanImage3AR(PipelineStage):
                 image_embed = self._vision_aligner(image_embed)
                 return [image_embed[b] for b in range(len(idxs))]
 
-            vit_embeds = self._encode_adaptive(len(flat_infos), _run_vit)
+            vit_embeds = self._encode_adaptive(
+                len(flat_infos), _run_vit, max_chunk=max_chunk
+            )
         return vae_embeds, t_values, vit_embeds
 
     def _scatter_cond_vae_tokens_batched(
@@ -1167,6 +1233,9 @@ class HunyuanImage3AR(PipelineStage):
             device,
             do_cfg,
         )
+        attention_mask, (cos, sin) = self._broadcast_static_inputs(
+            attention_mask, (cos, sin)
+        )
 
         scheduler = self._scheduler
         scheduler.set_timesteps(num_inference_steps)
@@ -1245,10 +1314,39 @@ class HunyuanImage3AR(PipelineStage):
                     )
                     if cond_timestep_scatter_index is not None:
                         all_cond_t = torch.cat(per_request_t, dim=0).repeat(cfg_factor)
+                        cond_ts_index = cond_timestep_scatter_index
+                        # Legacy tokenizer shapes: 1-D [P] or [1, P] must be
+                        # expanded to one index row per sequence row (the
+                        # cfg-packed uncond rows keep the cond sections too).
+                        if cond_ts_index.ndim == 1:
+                            cond_ts_index = cond_ts_index.unsqueeze(0).expand(
+                                actual_batch_size, -1
+                            )
+                        elif cond_ts_index.shape[0] == 1 and actual_batch_size > 1:
+                            cond_ts_index = cond_ts_index.expand(actual_batch_size, -1)
+                        expected_t = cond_ts_index.shape[0] * cond_ts_index.shape[1]
+                        if all_cond_t.shape[0] != expected_t:
+                            logger.error(
+                                "cond timestep scatter mismatch: "
+                                "all_cond_t=%d n_req=%d cfg_factor=%d "
+                                "conds_per_req=%s scatter_index=%s "
+                                "cond_vae_slices=%s",
+                                all_cond_t.shape[0],
+                                n_req,
+                                cfg_factor,
+                                [len(j) for j in per_request_joint_infos],
+                                tuple(cond_timestep_scatter_index.shape),
+                                [len(s) for s in cond_vae_slices_rows],
+                            )
+                            raise RuntimeError(
+                                "cond timestep scatter mismatch: "
+                                f"{all_cond_t.shape[0]} t values for "
+                                f"{cond_ts_index.shape} scatter index"
+                            )
                         hidden_states = self._instantiate_timestep_tokens(
                             hidden_states,
                             all_cond_t.to(hidden_states.device),
-                            cond_timestep_scatter_index,
+                            cond_ts_index,
                         )
 
                 # CFG: run cond/uncond halves separately (halves peak attention memory).
