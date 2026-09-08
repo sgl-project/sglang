@@ -340,9 +340,10 @@ class EngramEmbedding(nn.Module):
         owned = (local >= 0) & (local < self.rows)
         local = local.masked_fill(~owned, 0)
         w = self.weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
-        s = self.scale.view(torch.uint8)[local].view(torch.float8_e8m0fnu)
+        s_raw = self.scale.view(torch.uint8)[local].to(torch.float32)
+        s = torch.pow(2.0, s_raw - 127.0)
         rows = w.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
-        values = (rows * s.float().unsqueeze(-1)).flatten(-2)
+        values = (rows * s.unsqueeze(-1)).flatten(-2)
         return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
 
     def forward(
