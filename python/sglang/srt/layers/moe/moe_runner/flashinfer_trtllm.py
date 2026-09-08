@@ -26,6 +26,8 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_moe_out_wrapper,
     trtllm_fp8_block_scale_routed_moe_out_wrapper,
+    trtllm_fp8_per_channel_scale_moe_wrapper,
+    trtllm_fp8_per_channel_scale_routed_moe_wrapper,
     trtllm_fp8_per_tensor_scale_moe_wrapper,
 )
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -323,6 +325,121 @@ def align_fp8_moe_weights_for_flashinfer_trtllm(
         output1_scales_gate_scalar, requires_grad=False
     )
     layer.output2_scales_scalar = Parameter(output2_scales_scalar, requires_grad=False)
+
+
+def align_fp8_per_channel_moe_weights_for_flashinfer_trtllm(
+    layer: Module,
+) -> None:
+    """Prepare per-channel FP8 weights and dequantization scales for FlashInfer."""
+    from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
+
+    is_gated = _is_gated(layer)
+    w13_weight = cast(torch.Tensor, layer.w13_weight)
+    w2_weight = cast(torch.Tensor, layer.w2_weight)
+    w13_scale = cast(torch.Tensor, layer.w13_weight_scale).squeeze(-1)
+    w2_scale = cast(torch.Tensor, layer.w2_weight_scale).squeeze(-1)
+
+    if (
+        w13_weight.dtype != torch.float8_e4m3fn
+        or w2_weight.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError(
+            "FlashInfer FP8 per-channel MoE weights must use torch.float8_e4m3fn"
+        )
+    if w13_scale.dtype != torch.float32 or w2_scale.dtype != torch.float32:
+        raise ValueError(
+            "FlashInfer FP8 per-channel MoE dequantization scales must be float32"
+        )
+
+    num_experts, gate_up_dim, hidden_size = w13_weight.shape
+    intermediate_size = w2_weight.shape[2]
+    expected_gate_up_dim = (2 if is_gated else 1) * intermediate_size
+    if gate_up_dim != expected_gate_up_dim:
+        raise ValueError(
+            f"w13 rows ({gate_up_dim}) do not match the expected "
+            f"{expected_gate_up_dim} for intermediate_size={intermediate_size}"
+        )
+    if w13_scale.shape != (num_experts, gate_up_dim):
+        raise ValueError(
+            f"w13 per-channel scales must have shape {(num_experts, gate_up_dim)}, "
+            f"got {tuple(w13_scale.shape)}"
+        )
+    if w2_scale.shape != (num_experts, hidden_size):
+        raise ValueError(
+            f"w2 per-channel scales must have shape {(num_experts, hidden_size)}, "
+            f"got {tuple(w2_scale.shape)}"
+        )
+
+    # Compressed-tensors loads the canonical SGLang W13 layout [W1, W3]
+    # ([gate, up]). TRT-LLM's gated epilogue consumes W31 ([up, gate]). Other
+    # FlashInfer quantization methods swap the checkpoint shard ids in the
+    # weight loader; this method is selected only for compressed-tensors, so
+    # swap both the weight rows and their channel scales here.
+    if is_gated:
+        w13_weight = (
+            w13_weight.reshape(num_experts, 2, intermediate_size, hidden_size)
+            .flip(1)
+            .reshape(num_experts, gate_up_dim, hidden_size)
+        )
+        w13_scale = (
+            w13_scale.reshape(num_experts, 2, intermediate_size)
+            .flip(1)
+            .reshape(num_experts, gate_up_dim)
+        )
+
+    min_alignment = 16 if is_gated else 128
+    padded_intermediate = round_up_to_multiple(intermediate_size, min_alignment)
+    if padded_intermediate != intermediate_size:
+        pad = padded_intermediate - intermediate_size
+        if is_gated:
+            w13_halves = w13_weight.reshape(
+                num_experts, 2, intermediate_size, hidden_size
+            )
+            scale_halves = w13_scale.reshape(num_experts, 2, intermediate_size)
+            w13_weight = torch.nn.functional.pad(w13_halves, (0, 0, 0, pad)).reshape(
+                num_experts, 2 * padded_intermediate, hidden_size
+            )
+            w13_scale = torch.nn.functional.pad(
+                scale_halves, (0, pad), value=1.0
+            ).reshape(num_experts, 2 * padded_intermediate)
+        else:
+            w13_weight = torch.nn.functional.pad(w13_weight, (0, 0, 0, pad))
+            w13_scale = torch.nn.functional.pad(w13_scale, (0, pad), value=1.0)
+        w2_weight = torch.nn.functional.pad(w2_weight, (0, pad))
+
+    if is_gated:
+        w13_weight = torch.stack(
+            [reorder_rows_for_gated_act_gemm(weight) for weight in w13_weight]
+        )
+        w13_scale = torch.stack(
+            [
+                reorder_rows_for_gated_act_gemm(scale.unsqueeze(-1)).squeeze(-1)
+                for scale in w13_scale
+            ]
+        )
+
+    epilogue_tile_m = 128
+
+    def shuffle_rows(tensors: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            [shuffle_matrix_a(tensor, epilogue_tile_m) for tensor in tensors]
+        )
+
+    w13_weight = shuffle_rows(w13_weight.view(torch.uint8)).view(torch.float8_e4m3fn)
+    w2_weight = shuffle_rows(w2_weight.view(torch.uint8)).view(torch.float8_e4m3fn)
+    w13_scale = shuffle_rows(w13_scale.unsqueeze(-1)).squeeze(-1).contiguous()
+    w2_scale = shuffle_rows(w2_scale.unsqueeze(-1)).squeeze(-1).contiguous()
+
+    copy_or_rebind_param(layer, "w13_weight", w13_weight)
+    copy_or_rebind_param(layer, "w2_weight", w2_weight)
+    copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
+    copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
+
+    unit_scale = torch.ones(num_experts, dtype=torch.float32, device=w13_weight.device)
+    copy_or_rebind_param(layer, "output1_scales_scalar", unit_scale)
+    copy_or_rebind_param(layer, "output1_scales_gate_scalar", unit_scale)
+    copy_or_rebind_param(layer, "output2_scales_scalar", unit_scale)
+    layer.intermediate_size_per_partition = padded_intermediate
 
 
 def _align_mxfp8_moe_weights(
@@ -716,6 +833,11 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     output2_scales_scalar: torch.Tensor | None = None
     use_routing_scales_on_input: bool = False
 
+    # Dynamic per-token activation / per-channel weight path
+    per_channel_quant: bool = False
+    w13_per_channel_weight_scale: torch.Tensor | None = None
+    w2_per_channel_weight_scale: torch.Tensor | None = None
+
     # Activation type (None = kernel default / Swiglu)
     activation_type: int | None = None
 
@@ -768,7 +890,81 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             "FlashInfer TRTLLM backend, and bypassed TopK"
         )
 
-    if quant_info.block_quant:
+    if quant_info.per_channel_quant:
+        assert quant_info.w13_per_channel_weight_scale is not None
+        assert quant_info.w2_per_channel_weight_scale is not None
+        assert quant_info.output1_scales_scalar is not None
+        assert quant_info.output1_scales_gate_scalar is not None
+        assert quant_info.output2_scales_scalar is not None
+
+        a_q, a_scale = scaled_fp8_quant(hidden_states, use_per_token_if_dynamic=True)
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            symm_output = torch.empty(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+
+        common_kwargs = dict(
+            routing_bias=correction_bias,
+            hidden_states=a_q,
+            hidden_states_scale=a_scale,
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_per_channel_weight_scale=quant_info.w13_per_channel_weight_scale,
+            output1_scale_scalar=quant_info.output1_scales_scalar,
+            output1_scale_gate_scalar=quant_info.output1_scales_gate_scalar,
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_per_channel_weight_scale=quant_info.w2_per_channel_weight_scale,
+            output2_scale_scalar=quant_info.output2_scales_scalar,
+            num_experts=quant_info.global_num_experts,
+            intermediate_size=quant_info.intermediate_size,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            routed_scaling_factor=(
+                runner_config.routed_scaling_factor
+                if runner_config.routed_scaling_factor is not None
+                else 1.0
+            ),
+            use_routing_scales_on_input=(
+                quant_info.use_routing_scales_on_input and not use_routed_topk
+            ),
+            routing_method_type=(
+                RoutingMethodType.TopK
+                if use_routed_topk
+                and routing_method_type == RoutingMethodType.DeepSeekV3
+                else routing_method_type
+            ),
+            tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+            activation_type=quant_info.activation_type,
+        )
+        if use_routed_topk:
+            assert runner_config.top_k is not None
+            packed_topk_ids = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
+            output = trtllm_fp8_per_channel_scale_routed_moe_wrapper(
+                topk_ids=packed_topk_ids,
+                top_k=runner_config.top_k,
+                n_group=None,
+                topk_group=None,
+                **common_kwargs,
+            )
+        else:
+            assert TopKOutputChecker.format_is_bypassed(topk_output)
+            if quant_info.use_routing_scales_on_input:
+                router_logits = router_logits.to(torch.bfloat16)
+            output = trtllm_fp8_per_channel_scale_moe_wrapper(
+                routing_logits=router_logits,
+                top_k=topk_config.top_k,
+                n_group=topk_config.num_expert_group,
+                topk_group=topk_config.topk_group,
+                norm_topk_prob=topk_config.renormalize,
+                **common_kwargs,
+            )
+        symm_output.copy_(output)
+        output = symm_output
+    elif quant_info.block_quant:
         assert quant_info.weight_block_k is not None
         assert quant_info.w13_weight_scale_inv is not None
         assert quant_info.w2_weight_scale_inv is not None
