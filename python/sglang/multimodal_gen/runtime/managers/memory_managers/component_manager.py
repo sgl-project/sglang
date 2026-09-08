@@ -10,6 +10,7 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
+    SNAPSHOT_OFFLOAD,
     ComponentResidencyError,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ComponentResidencyStrategy,
     LayerwiseOffloadStrategy,
     ResidentStrategy,
+    SnapshotOffloadStrategy,
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -96,11 +98,16 @@ def build_component_residency_strategy(
             f"Component {component_name!r} resolved to layerwise-offload, but its "
             "loaded module did not enable layerwise offload"
         )
-    if residency_mode == COMPONENT_OFFLOAD and is_fsdp_managed_module(module):
+    if residency_mode in (
+        COMPONENT_OFFLOAD,
+        SNAPSHOT_OFFLOAD,
+    ) and is_fsdp_managed_module(module):
         raise ComponentResidencyError(
-            f"Component {component_name!r} resolved to component-offload, but it "
+            f"Component {component_name!r} resolved to {residency_mode}, but it "
             "was loaded as an FSDP-managed module"
         )
+    if residency_mode == SNAPSHOT_OFFLOAD:
+        return SnapshotOffloadStrategy()
     if (
         not current_platform.is_mps()
         and not is_fsdp_managed_module(module)
@@ -231,7 +238,7 @@ class ComponentResidencyManager:
             for component_name, module in self.pipeline.modules.items()
             if isinstance(module, nn.Module)
             and self.server_args.explicit_residency_mode(component_name)
-            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
             and component_name not in declared_components
         )
         if unmanaged_components:
