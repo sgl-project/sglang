@@ -157,7 +157,14 @@ def compute_engram_hash_ids(
     """tokens [T, n]: column 0 is the token itself, column s its s-th predecessor;
     blocked [T, n] marks look-back that ran off the sequence start. Returns
     [T, n_engram_layers, (n - 1) * n_heads] row ids into each layer's table."""
-    compressed = torch.where(blocked, pad_id, token_map[tokens])
+    # token_table is allocated with torch.empty and lookback positions are
+    # clamped to 0, so blocked lanes can hold garbage int32 (or MM_PAD-shifted
+    # image placeholders / negated ignore markers) far outside the vocab. The
+    # where() below replaces those lanes with pad_id, but only after the
+    # indexing -- clamp first so the gather itself never goes out of bounds.
+    vocab = token_map.shape[0]
+    safe_tokens = tokens.clamp(0, vocab - 1)
+    compressed = torch.where(blocked, pad_id, token_map[safe_tokens])
     products = compressed.unsqueeze(1) * multipliers
     # XOR the multiplied ids one look-back at a time: after step i the running value
     # is the (i + 1)-gram hash, bucketed by that n-gram size's primes.
