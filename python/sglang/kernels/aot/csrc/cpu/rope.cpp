@@ -340,14 +340,7 @@ void apply_rotary_embedding_single_kernel_impl(
 at::Tensor apply_rotary_embedding_cpu(const at::Tensor& input, const at::Tensor& cos, const at::Tensor& sin) {
   const int64_t input_dim = input.dim();
 
-  TORCH_CHECK(
-      input_dim == 3 || input_dim == 4,
-      "expects input to be "
-      "[S, H, D] or [B, S, H, D], but got ",
-      input_dim,
-      "D tensor with shape ",
-      input.sizes());
-
+  TORCH_CHECK(input_dim == 3 || input_dim == 4, "expects input to be [S, H, D] or [B, S, H, D]")
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
 
   CHECK_DIM(2, cos);

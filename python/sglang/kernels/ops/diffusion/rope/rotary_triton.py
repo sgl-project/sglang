@@ -145,15 +145,9 @@ def apply_rotary_embedding_cpu(
         or sin.dtype not in supported_dtypes
         or cos.dtype != sin.dtype
     ):
-        from .torch_fallback import apply_rotary_embedding_native
-
-        return apply_rotary_embedding_native(
-            x,
-            cos,
-            sin,
-            interleaved,
+        return lazy_fallback("torch", "apply_rotary_embedding_native")(
+            x, cos, sin, interleaved
         )
-
     head_size = x.shape[-1]
     assert head_size % 2 == 0, "head_size must be divisible by 2"
 
