@@ -1672,8 +1672,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
-        with torch.inference_mode(), self.draft_tp_context(
-            self.draft_model_runner.tp_group
+        with (
+            torch.inference_mode(),
+            self.draft_tp_context(self.draft_model_runner.tp_group),
         ):
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 
@@ -2362,7 +2363,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 if enable_num_token_non_padded()
                 else None
             ),
-            num_token_non_padded_cpu=bs * block_size,
+            global_num_token_non_padded_cpu=bs * block_size,
         )
 
         if self.selector is not None:
@@ -2373,8 +2374,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     bs=bs, sampling_info=batch.sampling_info
                 )
 
-        with torch.inference_mode(), self.draft_tp_context(
-            self.draft_model_runner.tp_group
+        with (
+            torch.inference_mode(),
+            self.draft_tp_context(self.draft_model_runner.tp_group),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output

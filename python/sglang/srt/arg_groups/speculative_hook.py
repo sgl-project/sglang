@@ -192,6 +192,14 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding only supports CUDA and NPU devices."
         )
 
+    # DFLASH + dp attention is validated and tested on NPU only; keep the
+    # guard for other devices until their DP-attention path is verified.
+    if cfg.enable_dp_attention and not cfg.device == "npu":
+        raise ValueError(
+            "Currently DFLASH speculative decoding does not support dp "
+            "attention on non-NPU devices."
+        )
+
     if cfg.pp_size != 1:
         raise ValueError(
             "Currently DFLASH speculative decoding only supports pp_size == 1."

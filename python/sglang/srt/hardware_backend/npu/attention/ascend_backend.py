@@ -508,6 +508,12 @@ class AscendAttnBackend(AttentionBackend):
             ).int()
 
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        # Graph-mode replay rebinds actual_seq_kvlen via graph.update, which
+        # only works when it was captured as a Python list; a CPU tensor gets
+        # baked as a constant. Leaving seq_lens_cpu_int as None here (and in
+        # _init_cuda_graph_metadata) makes forward_mtp fall back to binding
+        # seq_lens_cpu_list instead.
+
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
@@ -660,11 +666,8 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
-        # NOTE: seq_lens_cpu_int is intentionally left None for
-        # target_verify/draft_extend_v2 so forward_mtp binds
-        # seq_lens_cpu_list (Python list) to the v2 operator's Host-side
-        # IntArray actual_seq_kvlen — only a list can be rebound by
-        # graph.update on replay; a CPU tensor gets baked as a constant.
+        # Deliberately no seq_lens_cpu_int here: see init_forward_metadata —
+        # forward_mtp must bind seq_lens_cpu_list so graph.update can rebind it.
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -743,10 +746,6 @@ class AscendAttnBackend(AttentionBackend):
         max_len = seq_lens_cpu[:bs].max().item()
         if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
             max_len += self.speculative_num_draft_tokens
-            # seq_lens must include speculative_num_draft_tokens BEFORE the
-            # SWA mask is computed below, or the mask masks out the draft
-            # token KV positions.
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
@@ -765,10 +764,9 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[bs:, :].fill_(0)
 
             # Update SWA mask: True = masked out (don't attend), False = attend.
-            # For DFlash verify seq_lens is prefix only (unlike Eagle, where
-            # speculative_num_draft_tokens was added above), so use
-            # seq_lens_cpu (= prefix + block_size) to keep the draft token KV
-            # positions inside the mask window.
+            # DFlash verify seq_lens stays prefix-only (unlike other spec
+            # algorithms), so use seq_lens_cpu (= prefix + block_size) to
+            # keep the draft token KV positions inside the mask window.
             if (
                 forward_mode.is_target_verify()
                 and _is_dflash_verify(spec_info)
@@ -795,11 +793,12 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
-            # seq_lens already had speculative_num_draft_tokens added before
-            # the SWA mask computation (non-DFlash). For DFlash, seq_lens_cpu
-            # (= prefix + block_size) is the true KV length: the draft model
-            # just wrote block_size tokens, and actual_seq_kvlen (fed to
-            # graph.update via seq_lens_cpu_list) must cover them.
+            seq_lens = seq_lens + self.speculative_num_draft_tokens
+            # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
+            # length: the draft model just wrote block_size tokens, and
+            # actual_seq_kvlen (fed to graph.update via seq_lens_cpu_list)
+            # must cover them. For other spec algorithms seq_lens above
+            # already includes speculative_num_draft_tokens (same as main).
             if _is_dflash_verify(spec_info) and seq_lens_cpu is not None:
                 kv_lens = seq_lens_cpu[:bs]
             else:

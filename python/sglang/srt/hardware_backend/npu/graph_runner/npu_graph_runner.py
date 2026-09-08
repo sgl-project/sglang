@@ -280,9 +280,12 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 self.buffers.num_token_non_padded.fill_(
                     compute_local_num_token_non_padded_cpu(
                         global_num_token_non_padded=(
-                            forward_batch.num_token_non_padded_cpu
+                            forward_batch.global_num_token_non_padded_cpu
                         ),
                         num_tokens_per_dp=bs * self.captured_req_width,
+                        sharded=self.model_runner.attn_tp_sequence_sharded(
+                            bs * self.captured_req_width
+                        ),
                     )
                 )
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
