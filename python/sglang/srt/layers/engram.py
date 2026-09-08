@@ -233,6 +233,16 @@ class EngramHasher(nn.Module):
                 req, forward_batch.extend_seq_lens.to(torch.int64)
             )
         positions = forward_batch.positions.to(torch.int64)
+        # TP/DP-attention padding aligns token-level tensors (positions,
+        # input_ids) to attn_tp_size while request-level req_pool_indices keeps
+        # the real batch size. Align req to the token count; padded rows hash
+        # from table row 0 and are discarded with the dummy tokens after the
+        # forward (post_forward_mlp_sync_batch slices them off).
+        num_tokens = positions.shape[0]
+        if req.shape[0] < num_tokens:
+            req = torch.cat([req, req.new_zeros(num_tokens - req.shape[0])])
+        elif req.shape[0] > num_tokens:
+            req = req[:num_tokens]
         shifts = torch.arange(self.max_ngram_size, device=positions.device)
         lookback = positions.unsqueeze(-1) - shifts
         tokens = info.token_table[req.unsqueeze(-1), lookback.clamp_min(0)].to(
