@@ -333,9 +333,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.num_pages = max_slots // self.pool_page_size
         # `min_page_index` = ceil(min_slot_index / pool_page_size), keeping the
         # reserved-sink invariant (min_page_index * entry_bytes_per_page >= entry_max).
-        assert virtual_num_pages is None or not is_id_owner, (
-            "only a non-owner allocator may use another pool's virtual-id space"
-        )
+        assert (
+            virtual_num_pages is None or not is_id_owner
+        ), "only a non-owner allocator may use another pool's virtual-id space"
         # An ID owner has one virtual page per physical page. A non-owner may
         # deliberately have a different physical capacity while indexing the
         # owner's virtual page space (the unified SWA allocator does this).
@@ -373,9 +373,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.high_peer: Optional[MultiEndedAllocator] = None
 
         # Inverse history of relocations (spec rollback), at PAGE granularity.
-        self._inverse_history: List[
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = []
+        self._inverse_history: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
+            []
+        )
 
         # --- Lazy compaction state (all unused when lazy_compaction=False) ---
         # `_free_phys_pages`: GPU free list of physical PAGE ids, sorted at `_flush`.
@@ -1237,9 +1237,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         v2p stays -1 and translation yields negative ids → CUDA OOB.
         """
         with record_function("MultiEndedAlloc.alloc_extend"):
-            assert self.is_id_owner, (
-                f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
-            )
+            assert (
+                self.is_id_owner
+            ), f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
             if num_new_pages is None:
                 num_new_pages = get_num_new_pages(
                     seq_lens=seq_lens_cpu,
@@ -1301,9 +1301,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         virtual page on THIS sub-allocator (else v2p stays -1 → CUDA OOB).
         """
         with record_function("MultiEndedAlloc.alloc_decode"):
-            assert self.is_id_owner, (
-                f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
-            )
+            assert (
+                self.is_id_owner
+            ), f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
             bs = len(seq_lens)
             # CPU-only count BEFORE the kernel, to snapshot the exact slice the
             # kernel will consume.
@@ -3425,31 +3425,77 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def current_swa_capacity(self) -> int:
         return self.swa_available_size() + self.swa_attn_allocator.allocated_count()
 
-    def allocation_shortfalls(
-        self, full_tokens: int | float, swa_tokens: int | float
-    ) -> tuple[int, int]:
-        """Return the shared-byte and SWA-slot shortfalls in token units.
+    def reclaim_plan(
+        self,
+        full_tokens: int | float,
+        swa_tokens: int | float,
+        *,
+        full_evictable_tokens: int = 0,
+        swa_evictable_tokens: int = 0,
+        empty_pool: bool = False,
+    ) -> Optional[Tuple[int, int]]:
+        """Return cumulative FULL/SWA eviction targets, or None if impossible.
 
-        SWA bytes are charged to the FULL budget so the shared gap is counted
-        once. SWA-only eviction backs the slot budget, not the byte budget.
+        The tree evicts FULL before SWA. Minimize required SWA reclaim with all
+        evictable FULL available, then trim excess FULL reclaim. FULL eviction's
+        actual SWA cascade is counted by the tree's shared eviction tracker.
         """
         if full_tokens < 0 or swa_tokens < 0:
-            raise ValueError("allocation sizes must be non-negative")
+            return None
 
         page_size = self.page_size
         full_pages = (math.ceil(full_tokens) + page_size - 1) // page_size
         swa_pages = (math.ceil(swa_tokens) + page_size - 1) // page_size
-        full_page_bytes = self.full_attn_allocator.entry_bytes_per_page
-        swa_page_bytes = self.swa_attn_allocator.entry_bytes_per_page
-        swa_full_pages = (
-            swa_pages * swa_page_bytes + full_page_bytes - 1
-        ) // full_page_bytes
+        if swa_pages > full_pages:
+            return None
 
-        joint_full_tokens = (full_pages + swa_full_pages) * page_size
-        aligned_swa_tokens = swa_pages * page_size
+        compacted = empty_pool or not self.lazy_compaction or self._compaction_allowed()
+
+        def fits(full_reclaim_pages: int, swa_reclaim_pages: int) -> bool:
+            return self._fits_page_demand(
+                full_pages,
+                swa_pages,
+                full_reclaim_pages=full_reclaim_pages,
+                swa_reclaim_pages=swa_reclaim_pages,
+                compacted=compacted,
+                empty_pool=empty_pool,
+            )
+
+        if empty_pool:
+            return (0, 0) if fits(0, 0) else None
+        if fits(0, 0):
+            return (0, 0)
+
+        max_full_pages = min(
+            self.full_attn_allocator.allocated_count() // page_size,
+            max(0, int(full_evictable_tokens)) // page_size,
+        )
+        max_swa_pages = min(
+            self.swa_attn_allocator.allocated_count() // page_size,
+            max(0, int(swa_evictable_tokens)) // page_size,
+        )
+        if not fits(max_full_pages, max_swa_pages):
+            return None
+
+        def first_fit(high: int, predicate: Callable[[int], bool]) -> int:
+            low = 0
+            while low < high:
+                mid = (low + high) // 2
+                if predicate(mid):
+                    high = mid
+                else:
+                    low = mid + 1
+            return low
+
+        swa_reclaim_pages = first_fit(
+            max_swa_pages, lambda value: fits(max_full_pages, value)
+        )
+        full_reclaim_pages = first_fit(
+            max_full_pages, lambda value: fits(value, swa_reclaim_pages)
+        )
         return (
-            max(0, joint_full_tokens - self.full_available_size()),
-            max(0, aligned_swa_tokens - self.swa_available_size()),
+            full_reclaim_pages * page_size,
+            swa_reclaim_pages * page_size,
         )
 
     def can_reserve(
@@ -3465,9 +3511,11 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """Check pending FULL/SWA demand against the shared byte envelope.
 
         Scheduler admission keeps the historical one-token strict slack at an
-        empty-pool boundary. For a live pool, shared bytes are backed only by
-        FULL eviction; SWA eviction backs its own slot shortfall.
+        empty-pool boundary. Live admission checks the state reachable after
+        reclaiming the currently evictable pages from both sides.
         """
+        if full_tokens < 0 or swa_tokens < 0:
+            return False
         if not self.supports_asymmetric_reservation:
             if (
                 full_tokens != swa_tokens
@@ -3477,42 +3525,20 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             ):
                 return False
             return full_tokens <= self.available_size()
-        if full_tokens < 0 or swa_tokens < 0:
-            return False
         if require_token_slack and (
             full_tokens >= self.size_full or swa_tokens >= self.size_swa
         ):
             return False
 
-        if empty_pool:
-            page_size = self.page_size
-            full_pages = (math.ceil(full_tokens) + page_size - 1) // page_size
-            swa_pages = (math.ceil(swa_tokens) + page_size - 1) // page_size
-            return self._fits_page_demand(
-                full_pages,
-                swa_pages,
-                compacted=True,
-                empty_pool=True,
+        return (
+            self.reclaim_plan(
+                full_tokens,
+                swa_tokens,
+                full_evictable_tokens=full_evictable_tokens,
+                swa_evictable_tokens=swa_evictable_tokens,
+                empty_pool=empty_pool,
             )
-
-        full_shortfall, swa_shortfall = self.allocation_shortfalls(
-            full_tokens, swa_tokens
-        )
-        page_size = self.page_size
-        if (
-            full_shortfall > max(0, int(full_evictable_tokens)) // page_size * page_size
-            or swa_shortfall
-            > max(0, int(swa_evictable_tokens)) // page_size * page_size
-        ):
-            return False
-
-        compacted = not self.lazy_compaction or self._compaction_allowed()
-        return self._fits_page_demand(
-            (math.ceil(full_tokens) + page_size - 1) // page_size,
-            (math.ceil(swa_tokens) + page_size - 1) // page_size,
-            full_reclaim_pages=full_shortfall // page_size,
-            swa_reclaim_pages=swa_shortfall // page_size,
-            compacted=compacted,
+            is not None
         )
 
     def _compaction_allowed(self) -> bool:
@@ -3737,9 +3763,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("UnifiedSWAAlloc.alloc"):
-            if need_size > self.available_size():
-                if not _relieve_for_alloc(self, need_size):
-                    return None
+            if not self.ensure_capacity(need_size, need_size):
+                return None
             # Snapshot the virtual PAGES full will consume, to bind them on swa too.
             num_pages = need_size // self.page_size
             fa = self.full_attn_allocator
@@ -3775,9 +3800,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 prefix_lens=prefix_lens_cpu,
             )
             need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
-                if not _relieve_for_alloc(self, need_tokens):
-                    return None
+            if not self.ensure_capacity(need_tokens, need_tokens):
+                return None
 
             # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
             # its view after the slice is consumed.
@@ -3816,6 +3840,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             assert len(seq_lens_cpu) == len(prefix_lens_cpu) == 1
             prefix_len = int(prefix_lens_cpu[0])
             seq_len = int(seq_lens_cpu[0])
+            assert seq_len - prefix_len == extend_num_tokens
             assert 0 <= swa_tail_len <= extend_num_tokens
             tail_start = seq_len - swa_tail_len
             assert prefix_len <= tail_start
@@ -3875,9 +3900,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
             )
             need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
-                if not _relieve_for_alloc(self, need_tokens):
-                    return None
+            if not self.ensure_capacity(need_tokens, need_tokens):
+                return None
 
             fa = self.full_attn_allocator
             new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
