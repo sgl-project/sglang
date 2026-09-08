@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""VDN-H3 sampling params: the 8-NFE t2va grid on the MiniMax-H3 request surface."""
+"""VDN-H3 sampling params: the 8-NFE grid on the MiniMax-H3 request surface."""
 
 from dataclasses import dataclass
 
@@ -22,11 +22,14 @@ class VDNH3SamplingParams(MiniMaxH3SamplingParams):
                 f"forwards); got num_inference_steps={self.num_inference_steps}. "
                 "Use MiniMaxAI/MiniMax-H3 for other schedules."
             )
-        if self.task is not None and self.task.strip().lower() != "t2va":
+        if self.task is not None and self.task.strip().lower() not in (
+            "t2va",
+            "fl2va",
+        ):
             raise ValueError(
-                "VDN-H3 is trained for t2va only; fl2va and ref2va were not "
-                f"trained (got task={self.task!r}). Use MiniMaxAI/MiniMax-H3 "
-                "for those tasks."
+                "VDN-H3 serves t2va and fl2va; ref2va was not trained (got "
+                f"task={self.task!r}). Use MiniMaxAI/MiniMax-H3 --model-variant "
+                "ref2va for that task."
             )
 
 

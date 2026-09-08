@@ -48,7 +48,7 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "OpenVDN/vdn-minimax-h3": {
         "overlay_repo_id": "kevin-mi/VDN-H3-overlay",
-        "overlay_revision": "2bf8c73689d54d49e176efcdaf00504b1a7e1ad8",
+        "overlay_revision": "0ad315a05b914c4003af4d26152d288c2506a609",
     },
 }
 

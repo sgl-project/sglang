@@ -68,12 +68,21 @@ def test_vdn_h3_sampling_defaults_and_rejections() -> None:
     assert params.num_inference_steps == 9  # 8 NFE
     with pytest.raises(ValueError, match="exactly nine sigma grid points"):
         VDNH3SamplingParams(prompt="p", num_inference_steps=8)
-    with pytest.raises(ValueError, match="t2va only"):
+    fl2va = VDNH3SamplingParams(
+        prompt="p",
+        task="fl2va",
+        conditions=[
+            {"type": "image", "uri": "x.png", "role": "keyframe", "frame_index": 0}
+        ],
+        target={"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 5.0},
+    )
+    assert fl2va.task == "fl2va"
+    with pytest.raises(ValueError, match="ref2va was not trained"):
         VDNH3SamplingParams(
             prompt="p",
-            task="fl2va",
-            conditions=[{"type": "image", "uri": "x.png", "role": "first_frame"}],
-            target={"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
+            task="ref2va",
+            conditions=[{"type": "image", "uri": "x.png", "role": "reference"}],
+            target={"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 5.0},
         )
 
 
@@ -214,6 +223,30 @@ def test_layout_from_packed_t2va() -> None:
     assert layout.used == 70 + 100 + 12 * 48
     assert layout.seq_len == int(packed["seq_len"]) and layout.seq_len % 64 == 0
     assert layout.global_ranges == [(0, 170)]
+
+
+def test_layout_from_packed_fl2va_keeps_keyframe_rows_global() -> None:
+    """Keyframe rows must land in the global ranges, not in the video span
+    the linear branch scans."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence,
+    )
+
+    packed = minimax_h3_packed_sequence(
+        text_len=70,
+        latent_t=12,
+        latent_h=12,
+        latent_w=16,
+        audio_t=50,
+        include_keyframe_cond=True,
+        keyframe_frame_indices=[0, -1],
+        frame_count=45,
+    )
+    layout = vdn_h3_layout_from_packed(packed, latent_t=12, latent_h=12, latent_w=16)
+    assert layout.text_len == 70
+    assert layout.video_start == 70 + 2 * 48 + 100
+    assert layout.used == layout.video_end == layout.video_start + 12 * 48
+    assert layout.global_ranges == [(0, layout.video_start)]
 
 
 # --------------------------------------------------------------------------

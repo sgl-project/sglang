@@ -757,7 +757,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     model=model,
                     packed=packed,
                     latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
-                    condition_rows=ctx.is_ref2va or ctx.include_cond,
                     server_args=server_args,
                     device=device,
                 )

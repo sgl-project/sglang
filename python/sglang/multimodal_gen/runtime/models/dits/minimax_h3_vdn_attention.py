@@ -573,7 +573,6 @@ def prepare_hybrid_attention_metadata(
     model,
     packed: Mapping[str, torch.Tensor],
     latent_shape: tuple[int, int, int],
-    condition_rows: bool,
     server_args,
     device: torch.device,
 ) -> Callable[[int], Any] | None:
@@ -592,12 +591,6 @@ def prepare_hybrid_attention_metadata(
             "(transformer/config.json with hybrid_attention); this checkpoint has "
             "no linear branch. Use --attention-backend fa for MiniMax-H3."
         )
-    if condition_rows:
-        raise NotImplementedError(
-            "VDN-H3 is trained for the t2va packed layout; condition rows "
-            "(fl2va keyframes, ref2va references) are not supported."
-        )
-
     from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
         _rope_cos_sin_cache,
     )
