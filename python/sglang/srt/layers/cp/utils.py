@@ -118,17 +118,8 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
     )
 
 
-def supports_generic_prefill_cp() -> bool:
-    """Return whether the strategy-based generic prefill CP path is available."""
-    from sglang.srt.utils import is_hip, is_musa, is_npu
-
-    return not (is_hip() or is_npu() or is_musa())
-
-
 def is_cp_active(forward_batch) -> bool:
     """Return whether the current forward batch is running through CP."""
-    if not supports_generic_prefill_cp():
-        return False
     forward_mode = getattr(forward_batch, "forward_mode", None)
     if forward_mode is None or not forward_mode.is_context_parallel_extend():
         return False
@@ -146,7 +137,7 @@ def is_cp_active(forward_batch) -> bool:
 
 def is_mla_cp_enabled() -> bool:
     """Return whether prefill CP is configured for an MLA attention backend."""
-    return supports_generic_prefill_cp() and is_cp_enabled() and uses_mla_backend()
+    return is_cp_enabled() and uses_mla_backend()
 
 
 def is_mla_cp_active(forward_batch) -> bool:
@@ -330,7 +321,6 @@ __all__ = [
     "InterleaveContextParallelMetadata",
     "ZigzagCPStrategy",
     "ZigzagContextParallelMetadata",
-    "supports_generic_prefill_cp",
     "get_cp_strategy",
     "is_cp_active",
     "is_mla_cp_enabled",

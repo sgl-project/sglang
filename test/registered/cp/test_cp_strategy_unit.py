@@ -26,7 +26,6 @@ from sglang.srt.layers.cp.utils import (
     cp_split_before_forward,
     is_cp_active,
     prepare_cp_forward,
-    supports_generic_prefill_cp,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -121,16 +120,6 @@ class TestCPStrategyUnit(CustomTestCase):
             ),
         ):
             self.assertFalse(is_dsa_enable_prefill_cp())
-
-    @patch("sglang.srt.utils.is_npu", return_value=False)
-    @patch("sglang.srt.utils.is_hip", return_value=True)
-    def test_hip_keeps_strategy_cp_disabled(self, _mock_is_hip, _mock_is_npu):
-        self.assertFalse(supports_generic_prefill_cp())
-
-    @patch("sglang.srt.utils.is_npu", return_value=True)
-    @patch("sglang.srt.utils.is_hip", return_value=False)
-    def test_npu_keeps_strategy_cp_disabled(self, _mock_is_hip, _mock_is_npu):
-        self.assertFalse(supports_generic_prefill_cp())
 
 
 class TestPrefillCPBCGReplay(CustomTestCase):
@@ -305,7 +294,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             attn_cp_metadata=metadata,
         )
 
-    def test_supports_generic_prefill_cp_and_is_cp_active(self):
+    def test_is_cp_active(self):
         active_batch = SimpleNamespace(
             input_ids=torch.arange(8),
             forward_mode=_ExtendMode(),
@@ -318,7 +307,6 @@ class TestCPZigzagStrategy(CustomTestCase):
         )
 
         with patch.dict("os.environ", {"SGLANG_ENABLE_CP_V2": "0"}):
-            self.assertTrue(supports_generic_prefill_cp())
             self.assertTrue(is_cp_active(active_batch))
             self.assertFalse(is_cp_active(inactive_batch))
 
