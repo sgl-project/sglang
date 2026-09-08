@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
@@ -16,7 +16,7 @@ register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
 # initialized, `_get_float8_e8m0fnu_dtype` not yet defined). Initializing the
 # package first mirrors how the engine loads quantization at model-config time.
 import sglang.srt.layers.quantization  # noqa: F401
-from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluLimit
+from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluMxfp8Quant
 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
     NPUW4A8MXFP4FusedMoEMethod,
 )
@@ -62,18 +62,29 @@ class TestFP4MethodGate(unittest.TestCase):
         self.assertIsInstance(method, NPUW4A8MXFP4FusedMoEMethod)
 
 
-class TestNPUSwigluLimit(unittest.TestCase):
-    def test_clamps_before_swiglu(self):
-        # DeepSeek-V4 clamps gate (first half) to <= limit but only the upper
-        # bound, while up (second half) is clamped symmetrically to [-limit, limit].
-        # A regression that swapped these would silently change expert activations.
-        gate_up = torch.tensor([[8.0, -9.0, 9.0, -9.0]])
-        with patch.object(
-            torch.ops.npu, "npu_swiglu", return_value=torch.empty(1, 2), create=True
-        ) as swiglu:
-            NPUSwigluLimit(7.0)._apply_activation(gate_up)
-        self.assertTrue(torch.equal(gate_up, torch.tensor([[7.0, -9.0, 7.0, -7.0]])))
-        self.assertIs(swiglu.call_args.args[0], gate_up)
+class TestNPUSwigluMxfp8Quant(unittest.TestCase):
+    def test_passes_quantized_activations_and_scale_to_gmm2(self):
+        activation = object.__new__(NPUSwigluMxfp8Quant)
+        activation._limit = 7.0
+        output = torch.empty(2, 4, dtype=torch.float8_e4m3fn)
+        scale = torch.empty(2, 1, 2, dtype=torch.float8_e8m0fnu)
+        activation._kernel = MagicMock(return_value=(output, scale))
+        group_list = torch.tensor([1, 1], dtype=torch.int64)
+
+        actual_output, actual_scale = activation._apply_activation(
+            torch.empty(2, 8), group_list, group_list_type=1
+        )
+
+        self.assertIs(actual_output, output)
+        self.assertIs(actual_scale, scale)
+        activation._kernel.assert_called_once_with(
+            ANY,
+            group_list=group_list,
+            group_list_type=1,
+            need_quant=True,
+            do_limit=True,
+            limit=7.0,
+        )
 
 
 class TestReshapeMxfp4ScaleForNpu(unittest.TestCase):

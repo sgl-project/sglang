@@ -13,7 +13,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSitu,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
-    NPUSwigluLimit,
+    NPUSwigluMxfp8Quant,
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
@@ -104,10 +104,7 @@ class AscendRunnerCore(MoeRunnerCore):
             and config.swiglu_limit is not None
             and config.swiglu_limit > 0
         ):
-            # DeepSeek-V4 clips gate/up before the regular SwiGLU operation.
-            # This is distinct from the post-SiLU clamp used by
-            # NPUSwigluStepAndMul.
-            self.activation = NPUSwigluLimit(config.swiglu_limit)
+            self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(
@@ -197,7 +194,7 @@ class AscendRunnerCore(MoeRunnerCore):
             # Grouped-row activations require dispatch metadata.
             if isinstance(
                 self.activation,
-                (NPUSwigluDeepEPKernel, NPUSitu),
+                (NPUSwigluDeepEPKernel, NPUSitu, NPUSwigluMxfp8Quant),
             ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,

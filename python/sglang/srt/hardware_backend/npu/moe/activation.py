@@ -201,17 +201,29 @@ class NPUSwigluStepAndMul(BaseActivation):
         return gate * up
 
 
-class NPUSwigluLimit(BaseActivation):
-    """DeepSeek-V4 SwiGLU with pre-activation gate/up clipping."""
+class NPUSwigluMxfp8Quant(BaseActivation):
+    """DeepSeek-V4 grouped SwiGLU with MXFP8 requantization for GMM2."""
 
     def __init__(self, limit: float):
-        self._limit = float(limit)
+        from sgl_kernel_npu.activation.swiglu_mxfp8_quant import swiglu_quant
 
-    def _apply_activation(self, hidden_states: torch.Tensor):
-        gate, up = hidden_states.chunk(2, dim=-1)
-        gate.clamp_(max=self._limit)
-        up.clamp_(min=-self._limit, max=self._limit)
-        return torch.ops.npu.npu_swiglu(hidden_states), None
+        self._limit = float(limit)
+        self._kernel = swiglu_quant
+
+    def _apply_activation(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ):
+        return self._kernel(
+            hidden_states,
+            group_list=group_list,
+            group_list_type=group_list_type,
+            need_quant=True,
+            do_limit=True,
+            limit=self._limit,
+        )
 
 
 # =============================================================================
