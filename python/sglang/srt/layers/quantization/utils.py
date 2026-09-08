@@ -219,29 +219,6 @@ def replace_parameter(
         mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
 
 
-def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
-    assert a.shape == b.shape
-    assert a.dtype == b.dtype == torch.float8_e4m3fn
-
-    a_u8 = a.view(torch.uint8)
-    b_u8 = b.view(torch.uint8)
-    diff_u8 = (a_u8.to(torch.int16) - b_u8.to(torch.int16)).abs()
-
-    numel = a.numel()
-
-    count_diff_sign = ((a_u8 >= 0) & (b_u8 < 0)).sum().item()
-    count_tiny_diff = (diff_u8 >= 1).sum().item()
-    count_large_diff = (diff_u8 >= 2).sum().item()
-
-    assert (
-        (count_diff_sign == 0)
-        and (count_tiny_diff / numel < 0.005)
-        and (count_large_diff == 0)
-    ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=}"
-
-
-# Match dynamic rules with module name (prefix) and override quantize
-# config if module (prefix) matches a rule
 def override_config(config: QuantizationConfig, prefix: str):
     weight_bits = get_dynamic_override(config, prefix, "bits", config.weight_bits)
     if isinstance(weight_bits, int):
@@ -615,7 +592,7 @@ def swizzle_blockscale(scale: torch.Tensor):
     assert cols % 4 == 0
     padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
     swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
-    swizzled_scale = swizzled_scale.contiguous().cuda()
+    swizzled_scale = swizzled_scale.contiguous().to(scale.device)
     return (
         swizzled_scale.reshape(M_padded, K_padded)
         if scale_ndim == 2
