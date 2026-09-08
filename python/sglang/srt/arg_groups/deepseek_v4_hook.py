@@ -168,24 +168,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"DeepSeekV4 only supports interleave CP strategy, got {cfg.cp_strategy}"
         )
 
-    if get_platform().is_hip or get_platform().is_npu or get_platform().is_musa:
-        # Protected platform implementations still consume the legacy runtime
-        # fields. Generic backends use enable_prefill_cp/cp_strategy directly.
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v4_cp",
-            enable_dsa_prefill_context_parallel=True,
-        )
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v4_cp",
-            enable_prefill_context_parallel=False,
-        )
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v4_cp",
-            dsa_prefill_cp_mode="round-robin-split",
-        )
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
