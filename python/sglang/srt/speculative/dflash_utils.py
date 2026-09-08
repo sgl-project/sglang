@@ -42,10 +42,11 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 
 if is_cuda() or is_musa():
     try:
-        from sgl_kernel import (
+        from sgl_kernel import tree_speculative_sampling_target_only
+
+        from sglang.srt.layers.sampling_renorm import (
             top_k_renorm_prob,
             top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
         )
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
