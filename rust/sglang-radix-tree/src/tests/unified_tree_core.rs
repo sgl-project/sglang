@@ -2132,11 +2132,11 @@ fn insert_threshold_crossing_emits_the_backup_kv_action() {
 }
 
 #[test]
-fn mark_write_through_pending_stamps_the_node_id_as_the_ack() {
+fn mark_write_through_pending_stamps_the_supplied_ack() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
-    tc.mark_write_through_pending(leaf);
+    tc.mark_write_through_pending(vec![leaf], /* ack_id = */ leaf);
     assert_eq!(
         tc.arena
             .node(tc.arena.resolve(leaf))
@@ -2146,11 +2146,59 @@ fn mark_write_through_pending_stamps_the_node_id_as_the_ack() {
 }
 
 #[test]
+fn mark_write_through_pending_stamps_one_ack_on_every_published_node() {
+    let mut tc = core();
+    tc.insert(&insert_params(&vec![1], &[10]));
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let parent = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+
+    let published = tc.mark_write_through_pending(vec![parent, leaf], /* ack_id = */ leaf);
+
+    assert_eq!(published, vec![parent, leaf]);
+    for node_id in [parent, leaf] {
+        assert_eq!(
+            tc.arena
+                .node(tc.arena.resolve(node_id))
+                .write_through_pending_id,
+            Some(leaf)
+        );
+    }
+    tc.finish_write_through(vec![parent, leaf], /* ack_id = */ leaf);
+    for node_id in [parent, leaf] {
+        assert_eq!(
+            tc.arena
+                .node(tc.arena.resolve(node_id))
+                .write_through_pending_id,
+            None
+        );
+    }
+}
+
+#[test]
+fn mark_write_through_pending_returns_the_published_nodes_ancestors_first() {
+    let mut tc = core();
+    tc.insert(&insert_params(&vec![1], &[10]));
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let parent = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+
+    // The caller merges per-component transfers, whose order is not tree order.
+    let published = tc.mark_write_through_pending(vec![leaf, parent], /* ack_id = */ leaf);
+
+    assert_eq!(published, vec![parent, leaf]);
+}
+
+#[test]
 fn finish_write_through_clears_only_the_matching_ack() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
-    tc.mark_write_through_pending(leaf);
+    tc.mark_write_through_pending(vec![leaf], /* ack_id = */ leaf);
     tc.finish_write_through(vec![leaf], /* ack_id = */ 999_999);
     assert_eq!(
         tc.arena
@@ -2202,7 +2250,7 @@ fn split_of_a_pending_node_transfers_the_ack_and_emits_the_replace_action() {
     let node = tc
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
-    tc.mark_write_through_pending(node);
+    tc.mark_write_through_pending(vec![node], /* ack_id = */ node);
     let (new_node, action) = tc.split_node_(tc.arena.resolve(node), /* split_len = */ 1);
     assert_eq!(tc.arena.node(new_node).write_through_pending_id, Some(node));
     assert_eq!(
@@ -2806,7 +2854,7 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4]))
         .best_match_node_id;
-    tc.mark_write_through_pending(leaf);
+    tc.mark_write_through_pending(vec![leaf], /* ack_id = */ leaf);
     let _ = tc.take_events();
     let result = tc.insert(&insert_params(&vec![1, 2, 5, 6], &[20, 21, 22, 23]));
     let new_node_id = result
@@ -3179,7 +3227,7 @@ fn insert_host_drop_preserves_split_actions_and_lengths() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
-    tc.mark_write_through_pending(leaf);
+    tc.mark_write_through_pending(vec![leaf], /* ack_id = */ leaf);
     let root = tc.arena.root();
     let result = tc.insert_host(
         tc.arena.node(root).id,

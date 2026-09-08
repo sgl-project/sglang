@@ -1009,7 +1009,7 @@ class CommonKVManager(BaseKVManager):
         returned unchanged.
         """
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
+        end_layer = self.kv_args.prefill_end_layer
         assert end_layer is not None, (
             "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
         )
