@@ -41,7 +41,11 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
+from sglang.srt.configs.model_config import (
+    REQUANTIZATION_METHODS,
+    ModelConfig,
+    is_qwen3_5_mtp_draft,
+)
 from sglang.srt.distributed import get_world_group
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -61,6 +65,7 @@ from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
     is_cpu,
+    is_hip,
     log_info_on_rank0,
     print_warning_once,
 )
@@ -272,6 +277,10 @@ def _quark_draft_online_quant_config(
         and model_config.is_draft_quantization_explicit
         and model_config.quantization == "quark_mxfp4"
         and hf_quant_config.get("quant_method") == "quark"
+        # ROCm + Qwen3.5 MTP draft only (validated combination); anything else is
+        # left exactly as before.
+        and is_hip()
+        and is_qwen3_5_mtp_draft(model_config.hf_config)
     ):
         return None
     excluded = hf_quant_config.get("exclude") or []
