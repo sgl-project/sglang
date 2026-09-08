@@ -91,7 +91,9 @@ class RustServer:
             local_dp_rank = (scheduler.ps.tp_rank % tp_size_per_node) // dp_group_width
         else:
             local_dp_rank = None
-        listen_port = get_serving().port + (local_dp_rank or 0)
+        listen_port = get_serving().port
+        if local_dp_rank is not None:
+            listen_port += local_dp_rank
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
         launch_cores, server_cores = _partition_cores(

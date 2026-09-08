@@ -1170,7 +1170,10 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
 
             # A node-local Rust listener owns the health endpoints when present.
-            if not (envs.SGLANG_RUST_SERVER.get() and _node_hosts_rust_server()):
+            rust_server_owns_base_port = (
+                envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
+            )
+            if not rust_server_owns_base_port:
                 launch_dummy_health_check_server(
                     get_serving().host,
                     get_serving().port,
@@ -1872,8 +1875,8 @@ def _calculate_rank_ranges(
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
 
 
-def _node_hosts_rust_server() -> bool:
-    """Whether this node contains a scheduler that embeds a Rust server."""
+def node_hosts_rust_server() -> bool:
+    """Whether this node contains a Rust listener rank, assuming Rust mode."""
     parallel = get_parallel()
     pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(
         parallel.nnodes,
@@ -1884,7 +1887,8 @@ def _node_hosts_rust_server() -> bool:
     if 0 not in pp_rank_range:
         return False
 
-    # Rust servers run on the first (CP, TP) rank of each attention DP group.
+    # Matches Scheduler._hosts_rust_server: attention CP and TP ranks are both
+    # zero exactly at multiples of their combined group width.
     dp_group_width = parallel.attn_tp_size * parallel.attn_cp_size
     return any(tp_rank % dp_group_width == 0 for tp_rank in tp_rank_range)
 
