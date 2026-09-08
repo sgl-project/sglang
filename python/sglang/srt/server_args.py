@@ -597,35 +597,11 @@ class ServerArgs:
             help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
-            "--enable-nsa-prefill-context-parallel",
-            dest="enable_dsa_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
             "--enable-gdn-replayssm-spec",
             dest="enable_linear_replayssm_spec",
             action=DeprecatedStoreTrueAction,
             new_flag="--enable-linear-replayssm-spec",
             help="[Deprecated] Use --enable-linear-replayssm-spec instead.",
-        )
-        parser.add_argument(
-            "--enable-prefill-context-parallel",
-            dest="enable_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
-            "--nsa-prefill-cp-mode",
-            dest="dsa_prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=argparse.SUPPRESS,
-            choices=["in-seq-split", "round-robin-split"],
-            help="[Deprecated] Use --cp-strategy instead.",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
@@ -797,8 +773,7 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 # NOTE: The process-wide ServerArgs is owned by the runtime context
 # (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
 # for the existing call-sites; they publish/read the same live object by
-# reference. Do not add new call-sites — the counts are ratcheted
-# (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
+# reference. Do not add new call-sites.
 # Imports are in-function so the two modules stay cycle-free at import time.
 @functools.lru_cache(maxsize=1)
 def _underscore_field_names() -> frozenset:

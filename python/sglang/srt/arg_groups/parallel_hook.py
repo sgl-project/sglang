@@ -28,18 +28,17 @@ logger = logging.getLogger(__name__)
 
 
 def handle_context_parallelism(server_args: Any):
+    validate_prefill_cp_platform(server_args)
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
         model_config = model_config_of(server_args)
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
-        platform = get_platform()
         if (
             cfg.enable_prefill_cp
             and model_arch == "DeepseekV32ForCausalLM"
             and cfg.cp_strategy == "zigzag"
-            and not (platform.is_hip or platform.is_npu or platform.is_musa)
         ):
             raise ValueError(
                 "DeepSeek V3.2 prefill CP does not support --cp-strategy "
@@ -66,16 +65,6 @@ def handle_context_parallelism(server_args: Any):
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
         raise ValueError(
             "--cp-strategy must be set when --enable-prefill-cp is enabled."
-        )
-
-    if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
-        raise ValueError(
-            "--enable-prefill-context-parallel and "
-            "--enable-nsa-prefill-context-parallel are mutually "
-            "exclusive. Use --enable-nsa-prefill-context-parallel for "
-            "DeepSeek V3.2 (NSA) models and "
-            "--enable-prefill-context-parallel for MLA-based models "
-            "(DeepSeek V3/R1, Kimi K2.5) or MHA/GQA-based models."
         )
 
     view = resolved_view(server_args)
@@ -560,98 +549,6 @@ def handle_eplb_and_dispatch(server_args: Any):
         assert resolved_view(server_args).ep_size > 1
 
 
-def handle_platform_cp_compatibility(server_args: Any):
-    cfg = resolving_view(server_args)
-    platform = get_platform()
-    is_protected_platform = platform.is_hip or platform.is_npu or platform.is_musa
-    if not is_protected_platform:
-        if (
-            cfg.enable_prefill_context_parallel
-            or cfg.enable_dsa_prefill_context_parallel
-        ):
-            raise ValueError(
-                "Legacy prefill context-parallel options are supported only "
-                "by protected HIP, Ascend NPU, or MUSA paths. Use "
-                "--enable-prefill-cp with --cp-strategy."
-            )
-        return
-
-    legacy_mode_to_strategy = {
-        "in-seq-split": "zigzag",
-        "round-robin-split": "interleave",
-    }
-
-    if cfg.enable_prefill_context_parallel or cfg.enable_dsa_prefill_context_parallel:
-        declare_resolution(
-            server_args,
-            "_handle_platform_cp_compatibility",
-            enable_prefill_cp=True,
-        )
-
-    if cfg.enable_prefill_context_parallel and cfg.cp_strategy is None:
-        declare_resolution(
-            server_args,
-            "_handle_platform_cp_compatibility",
-            cp_strategy=legacy_mode_to_strategy[cfg.prefill_cp_mode],
-        )
-    if cfg.enable_dsa_prefill_context_parallel and cfg.cp_strategy is None:
-        declare_resolution(
-            server_args,
-            "_handle_platform_cp_compatibility",
-            cp_strategy=legacy_mode_to_strategy[cfg.dsa_prefill_cp_mode],
-        )
-
-
-def handle_legacy_cp_runtime_compatibility(server_args: Any):
-    """Project canonical CP settings only for protected platform runtimes."""
-    platform = get_platform()
-    if not (platform.is_hip or platform.is_npu or platform.is_musa):
-        return
-    cfg = resolving_view(server_args)
-
-    if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
-        return
-
-    if not cfg.enable_prefill_cp or cfg.cp_strategy is None:
-        return
-
-    strategy_to_legacy_mode = {
-        "zigzag": "in-seq-split",
-        "interleave": "round-robin-split",
-    }
-    mode = strategy_to_legacy_mode[cfg.cp_strategy]
-    use_dsa_legacy_aliases = cfg.enable_dsa_prefill_context_parallel or getattr(
-        resolved_view(server_args), "attention_backend", None
-    ) in ("dsa", "dsv4")
-    if use_dsa_legacy_aliases:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_runtime_compatibility",
-            enable_dsa_prefill_context_parallel=True,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_runtime_compatibility",
-            enable_prefill_context_parallel=False,
-        )
-    else:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_runtime_compatibility",
-            enable_prefill_context_parallel=True,
-        )
-    declare_resolution(
-        server_args,
-        "_handle_legacy_cp_runtime_compatibility",
-        dsa_prefill_cp_mode=mode,
-    )
-    declare_resolution(
-        server_args,
-        "_handle_legacy_cp_runtime_compatibility",
-        prefill_cp_mode=mode,
-    )
-
-
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
     if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
@@ -683,3 +580,15 @@ def handle_expert_distribution_metrics(server_args: Any):
                 "_handle_expert_distribution_metrics",
                 expert_distribution_recorder_buffer_size=1000,
             )
+
+
+def validate_prefill_cp_platform(server_args: Any):
+    """Reject deprecated platform CP before resolving models or CP topology."""
+    cfg = resolving_view(server_args)
+    platform = get_platform()
+    if cfg.enable_prefill_cp and (
+        platform.is_hip or platform.is_npu or platform.is_musa
+    ):
+        raise ValueError(
+            "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+        )
