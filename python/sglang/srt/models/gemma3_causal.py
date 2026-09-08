@@ -255,15 +255,11 @@ class Gemma3Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # [s, h, head_dim]
-        q = q.unflatten(-1, (self.num_heads, self.head_dim)).unsqueeze(0)
+        q = q.unflatten(-1, (self.num_heads, self.head_dim))
         q = self.q_norm(q)
-        k = k.unflatten(-1, (self.num_kv_heads, self.head_dim)).unsqueeze(0)
+        k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
-
-        # RadixAttention expects token-major q/k tensors.
-        q = q.squeeze(0)
-        k = k.squeeze(0)
 
         attn_output = self.attn(q, k, v, forward_batch=forward_batch)
 
@@ -287,21 +283,16 @@ class Gemma3Attention(nn.Module):
 
         # [s, h, head_dim]
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        # -> [h, s, head_dim]
-        q = q.transpose(0, 1).unsqueeze(0)
         q = self.q_norm(q)
         k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-        # -> [h, s, head_dim]
-        k = k.transpose(0, 1).unsqueeze(0)
         k = self.k_norm(k)
 
-        # q, k = self.rotary_emb(positions, q, k)
         cos, sin = position_embeddings
+        # Gemma3RotaryEmbedding preserves the leading position-id dimensions,
+        # while SGLang represents the corresponding Q/K tensors token-major.
+        cos = cos.reshape(-1, cos.shape[-1])
+        sin = sin.reshape(-1, sin.shape[-1])
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        # [1, h, s, head_dim] -> [s, h, head_dim]
-        q = q.permute(0, 2, 1, 3).squeeze(0)
-        k = k.permute(0, 2, 1, 3).squeeze(0)
 
         attn_output = self.attn(q, k, v, forward_batch=forward_batch)
 
