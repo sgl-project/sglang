@@ -34,7 +34,7 @@ use sgl_kv_indexer::{
     PrefixIndex, PrefixIndexConfig, MAX_GRPC_DECODING_MESSAGE_SIZE,
 };
 use test_id::nanos;
-use test_kv::{action, apply_request, hbm};
+use test_kv::{action, action_with_parent, apply_request, hbm};
 use test_net::free_addr;
 
 async fn start_backend(
@@ -211,6 +211,27 @@ fn apply_report(
     )
 }
 
+fn apply_report_with_parent(
+    worker: &str,
+    addr: &str,
+    seq: u64,
+    tier: i32,
+    parent_block_hash: Option<i64>,
+    hashes: &[i64],
+) -> ApplyExternalKvBatchRequest {
+    apply_request(
+        worker,
+        addr,
+        seq,
+        vec![action_with_parent(
+            ExternalKvActionType::ActionReport,
+            tier,
+            parent_block_hash,
+            hashes,
+        )],
+    )
+}
+
 #[tokio::test]
 async fn multiple_workers_share_one_indexer_server() {
     let mut indexer = start().await;
@@ -225,7 +246,7 @@ async fn multiple_workers_share_one_indexer_server() {
             "10.0.0.1:9000",
             1,
             hbm(),
-            &[hash_0, shared_hash],
+            &[shared_hash, hash_0],
         ))
         .await
         .expect("apply worker-0");
@@ -235,7 +256,7 @@ async fn multiple_workers_share_one_indexer_server() {
             "10.0.0.2:9000",
             1,
             hbm(),
-            &[hash_1, shared_hash],
+            &[shared_hash, hash_1],
         ))
         .await
         .expect("apply worker-1");
@@ -309,6 +330,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
             hashes: vec![1],
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
+            parent_block_hash: None,
         }],
     };
     let err = c
@@ -316,6 +338,76 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
         .await
         .expect_err("unknown action type must be rejected");
     assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn rejected_batch_is_atomic_over_grpc() {
+    let mut c = start().await;
+    c.apply_external_kv_batch(apply_report("w", "old-address", 1, hbm(), &[1, 2]))
+        .await
+        .expect("seed chain");
+
+    let err = c
+        .apply_external_kv_batch(apply_request(
+            "w",
+            "new-address",
+            2,
+            vec![
+                action(ExternalKvActionType::ActionReport, hbm(), &[3]),
+                action_with_parent(ExternalKvActionType::ActionReport, hbm(), Some(9), &[2]),
+            ],
+        ))
+        .await
+        .expect_err("conflicting parent must reject the whole batch");
+    assert_eq!(err.code(), Code::InvalidArgument);
+
+    let old = c
+        .match_external_kv(MatchExternalKvRequest {
+            hashes: vec![1],
+            count_as_hit: false,
+        })
+        .await
+        .expect("query original state")
+        .into_inner();
+    assert_eq!(old.matches.len(), 1);
+    assert_eq!(old.matches[0].address, "old-address");
+
+    let leaked = c
+        .match_external_kv(MatchExternalKvRequest {
+            hashes: vec![3],
+            count_as_hit: false,
+        })
+        .await
+        .expect("query rejected action")
+        .into_inner();
+    assert!(leaked.matches.is_empty());
+}
+
+#[tokio::test]
+async fn cyclic_report_is_rejected_over_grpc() {
+    let mut c = start().await;
+    let err = c
+        .apply_external_kv_batch(apply_report_with_parent(
+            "w",
+            "address",
+            1,
+            hbm(),
+            Some(2),
+            &[1, 2],
+        ))
+        .await
+        .expect_err("cyclic report must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument);
+
+    let response = c
+        .match_external_kv(MatchExternalKvRequest {
+            hashes: vec![1, 2],
+            count_as_hit: false,
+        })
+        .await
+        .expect("query rejected report")
+        .into_inner();
+    assert!(response.matches.is_empty());
 }
 
 #[tokio::test]
@@ -358,12 +450,14 @@ async fn prefix_query_scans_more_than_one_apply_chunk_over_grpc() {
     let mut indexer = start().await;
     let hashes: Vec<i64> = (0..=APPLY_CHUNK_SIZE as i64).collect();
     for (seq, chunk) in hashes.chunks(APPLY_CHUNK_SIZE).enumerate() {
+        let parent_block_hash = (seq > 0).then_some(chunk[0] - 1);
         indexer
-            .apply_external_kv_batch(apply_report(
+            .apply_external_kv_batch(apply_report_with_parent(
                 "large-prefix-worker",
                 "10.0.0.1:9000",
                 seq as u64,
                 hbm(),
+                parent_block_hash,
                 chunk,
             ))
             .await
@@ -487,7 +581,7 @@ async fn start_recording_deadlines(
 /// the only thing letting the indexer shed a query whose caller gave up.
 #[tokio::test]
 async fn router_client_publishes_its_deadline_on_the_wire() {
-    let (index, seen) = start_recording_deadlines(Duration::from_millis(250)).await;
+    let (index, seen) = start_recording_deadlines(Duration::from_secs(2)).await;
 
     index
         .match_prefix(vec![1, 2, 3])

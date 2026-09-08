@@ -1373,6 +1373,16 @@ click [Server Arguments](../../../advanced_features/server_arguments).
 
 ## Speculative decoding
 
+Ascend NPU supports non-greedy target verification for the supported EAGLE-based speculative algorithms. Request-level
+`temperature`, `top_k`, and `top_p` are applied when constructing the target probability distribution. Request-level
+`top_k` controls token sampling and is separate from `--speculative-eagle-topk`, which controls the draft tree branching
+factor.
+
+The default target-only mode supports both linear and tree-shaped draft candidates. Classic rejection sampling is
+available for EAGLE3 and NEXTN with `--speculative-use-rejection-sampling` and requires
+`--speculative-eagle-topk 1`. Rejection sampling uses the draft proposal distribution and cannot be combined with
+non-default speculative acceptance thresholds or deterministic inference.
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "16.7%"}} />
@@ -1443,13 +1453,19 @@ click [Server Arguments](../../../advanced_features/server_arguments).
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-accept-threshold-single`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`1.0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Type: float</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Special for GPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-accept-threshold-acc`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`1.0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Type: float</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Special for GPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-use-rejection-sampling`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag<br/> (requires `--speculative-eagle-topk 1`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-token-map`</td>
