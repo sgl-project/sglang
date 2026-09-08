@@ -55,15 +55,10 @@ def test_unknown_op_or_backend_raises():
         (_HIP, False),
     ],
 )
-def test_qwen_qkv_registry_accepts_hopper(monkeypatch, platform, eligible):
-    monkeypatch.setattr(sel, "_platform", lambda: platform)
-    if eligible:
-        assert (
-            K.select_kernel("diffusion.qwen_qkv_epilogue").backend is KernelBackend.JIT
-        )
-    else:
-        with pytest.raises(ValueError, match="no backend usable"):
-            K.select_kernel("diffusion.qwen_qkv_epilogue")
+def test_qwen_qkv_registry_accepts_hopper(platform, eligible):
+    spec = K.select_kernel("diffusion.qwen_qkv_epilogue")
+    assert spec.backend is KernelBackend.JIT
+    assert K.capabilities_satisfied(spec.capabilities, platform) is eligible
 
 
 def test_multi_backend_requires_explicit_backend(monkeypatch):
