@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=180, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=180, stage="weekly", runner_config="1-gpu-large")
 
 
 def setup_class(cls, *, enable_lora):

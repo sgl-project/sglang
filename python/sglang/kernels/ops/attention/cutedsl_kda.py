@@ -1427,12 +1427,12 @@ def cutedsl_fused_sigmoid_gating_kda_update(
     N = initial_state_indices.shape[0]
 
     assert K == TILE_K, f"Current CuTe DSL KDA kernel requires K={TILE_K}, got {K}"
-    assert (
-        V % TILE_V_SMALL == 0
-    ), f"Current CuTe DSL KDA kernel requires V % {TILE_V_SMALL} == 0, got V={V}"
-    assert (
-        V % TILE_V == 0
-    ), f"Current CuTe DSL KDA kernel requires V % {TILE_V} == 0, got V={V}"
+    assert V % TILE_V_SMALL == 0, (
+        f"Current CuTe DSL KDA kernel requires V % {TILE_V_SMALL} == 0, got V={V}"
+    )
+    assert V % TILE_V == 0, (
+        f"Current CuTe DSL KDA kernel requires V % {TILE_V} == 0, got V={V}"
+    )
     assert (V // TILE_V_SMALL) % NUM_BLOCKS_PER_STATE_SMALL == 0, (
         "Small-batch KDA kernel requires num_v_tiles_small divisible by "
         f"{NUM_BLOCKS_PER_STATE_SMALL}, got V={V}"

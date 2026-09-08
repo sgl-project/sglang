@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerMultiplexMixin:
-
     def init_pdmux(self: Scheduler):
         # The current split prefill batch
         self.split_prefill_batch: Optional[ScheduleBatch] = None
