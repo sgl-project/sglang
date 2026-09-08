@@ -93,7 +93,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                 return_value=False,
             ),
             mock.patch(
-                "sglang.srt.layers.cp.utils.is_mla_prefill_cp_enabled",
+                "sglang.srt.layers.cp.utils.is_mla_cp_enabled",
                 return_value=False,
             ),
         )
