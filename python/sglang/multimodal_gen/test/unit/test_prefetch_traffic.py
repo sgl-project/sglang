@@ -3,7 +3,9 @@ import time
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers import prefetch_traffic
 from sglang.multimodal_gen.runtime.managers.memory_managers.prefetch_traffic import (
     PrefetchTrafficCoordinator,
     collective_prefetch_guard,
@@ -173,3 +175,42 @@ def test_collective_guard_records_current_stream_completion():
     assert generation == 1
     copy_stream.wait_event.assert_called_once_with(completion)
     coordinator.cancel_block(token)
+
+
+@pytest.mark.parametrize(
+    "device,registered",
+    [
+        ("cpu", False),
+        ("cpu", True),
+        ("cpu:0", True),
+        ("meta", True),
+        ("mps", True),
+        ("cuda", False),
+    ],
+)
+def test_collective_guard_disabled_or_non_cuda_never_touches_cuda(device, registered):
+    coordinator = PrefetchTrafficCoordinator()
+    coordinator.register()
+    with (
+        patch.dict(
+            prefetch_traffic._COORDINATORS,
+            {0: coordinator} if registered else {},
+            clear=True,
+        ),
+        patch(
+            "torch.cuda.current_device",
+            side_effect=AssertionError("CUDA device resolution"),
+        ),
+        patch(
+            "torch.cuda.is_current_stream_capturing",
+            side_effect=AssertionError("CUDA capture query"),
+        ),
+        patch(
+            "torch.cuda.current_stream", side_effect=AssertionError("CUDA stream query")
+        ),
+        patch("torch.cuda.Event", side_effect=AssertionError("CUDA event allocation")),
+        patch.object(coordinator, "begin_collective") as begin_collective,
+    ):
+        with collective_prefetch_guard(torch.device(device)):
+            pass
+    begin_collective.assert_not_called()
