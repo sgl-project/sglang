@@ -4,11 +4,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.arg_groups.overrides import _dllm_attention_backend
+from sglang.srt.arg_groups.overrides import _dllm_attention_backend, resolving_view
 from sglang.srt.dllm.algorithm import get_algorithm
 from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -165,9 +165,8 @@ class TestGemma4Renoise(unittest.TestCase):
         )
         server_args = SimpleNamespace(
             device="cuda",
-            get_model_config=lambda: SimpleNamespace(
-                hf_config=hf_config, quantization=None
-            ),
+            _model_config=SimpleNamespace(hf_config=hf_config, quantization=None),
+            model_path="diffusiongemma",
             pp_size=1,
             dcp_size=1,
             attn_cp_size=1,
@@ -175,9 +174,9 @@ class TestGemma4Renoise(unittest.TestCase):
             prefill_attention_backend="fa3",
             decode_attention_backend=None,
             disable_radix_cache=False,
-            cuda_graph_config=SimpleNamespace(
-                decode=SimpleNamespace(backend=Backend.FULL),
-                prefill=SimpleNamespace(backend=Backend.FULL),
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.FULL),
+                prefill=PhaseConfig(backend=Backend.FULL),
             ),
             chunked_prefill_size=128,
         )
@@ -187,12 +186,14 @@ class TestGemma4Renoise(unittest.TestCase):
         self.assertEqual(server_args.attention_backend, "flashinfer")
         self.assertEqual(server_args.prefill_attention_backend, "fa3")
         self.assertIsNone(server_args.decode_attention_backend)
-        self.assertTrue(server_args.disable_radix_cache)
-        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
-        self.assertEqual(
-            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
-        )
-        self.assertEqual(server_args.chunked_prefill_size, -1)
+        resolved = resolving_view(server_args)
+        self.assertTrue(resolved.disable_radix_cache)
+        self.assertEqual(resolved.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(resolved.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertEqual(resolved.chunked_prefill_size, -1)
+        self.assertFalse(server_args.disable_radix_cache)
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.FULL)
+        self.assertEqual(server_args.cuda_graph_config.prefill.backend, Backend.FULL)
 
         with self.assertRaisesRegex(ValueError, "GPU execution"):
             Gemma4Renoise.configure_server_args(SimpleNamespace(device="cpu"))

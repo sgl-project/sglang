@@ -163,6 +163,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder.can_run_list = []
         adder._mamba_gap_budget_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
+        adder._account_prefill_cache_admission = Mock()
 
         req = _Req(context_len=300, block_size=256, prefill=True)
         req.host_hit_length = req.storage_hit_length = 0
