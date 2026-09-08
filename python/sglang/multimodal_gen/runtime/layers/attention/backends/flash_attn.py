@@ -67,9 +67,9 @@ def flash_attn_varlen_func_fake_out(
     head_dim_v = v.shape[-1]
 
     if cu_seqlens_q is not None:
-        assert cu_seqlens_q.shape == (
-            batch_size + 1,
-        ), "cu_seqlens_q must have shape (batch_size + 1,)"
+        assert cu_seqlens_q.shape == (batch_size + 1,), (
+            "cu_seqlens_q must have shape (batch_size + 1,)"
+        )
         assert cu_seqlens_q.dtype == torch.int32, "cu_seqlens_q must be int32"
         assert cu_seqlens_q.stride(0) == 1, "cu_seqlens_q must be contiguous"
 
@@ -129,9 +129,9 @@ def flash_attn_varlen_func_fake_out_lse(
     head_dim_v = v.shape[-1]
 
     if cu_seqlens_q is not None:
-        assert cu_seqlens_q.shape == (
-            batch_size + 1,
-        ), "cu_seqlens_q must have shape (batch_size + 1,)"
+        assert cu_seqlens_q.shape == (batch_size + 1,), (
+            "cu_seqlens_q must have shape (batch_size + 1,)"
+        )
         assert cu_seqlens_q.dtype == torch.int32, "cu_seqlens_q must be int32"
         assert cu_seqlens_q.stride(0) == 1, "cu_seqlens_q must be contiguous"
 
@@ -329,7 +329,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class FlashAttentionBackend(AttentionBackend):
-
     @classmethod
     def supports_ring_rotation(cls) -> bool:
         return True

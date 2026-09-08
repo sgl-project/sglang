@@ -317,9 +317,9 @@ class BreakableCUDAGraphCapture:
         capture_error_mode: str = "global",
         barrier_fn: Callable[[], None] | None = None,
     ):
-        assert isinstance(
-            cuda_graph, BreakableCUDAGraph
-        ), "cuda_graph must be a BreakableCUDAGraph"
+        assert isinstance(cuda_graph, BreakableCUDAGraph), (
+            "cuda_graph must be a BreakableCUDAGraph"
+        )
         self.cuda_graph = cuda_graph
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream

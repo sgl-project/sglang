@@ -127,7 +127,7 @@ class TestAttentionDpRequestCapacity(CustomTestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "max_mamba_cache_size=15.*per-worker auxiliary-state cap=3.*" "at least 16",
+            "max_mamba_cache_size=15.*per-worker auxiliary-state cap=3.*at least 16",
         ):
             _initialize_stub(stub, hybrid=True)
 

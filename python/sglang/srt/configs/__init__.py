@@ -2,6 +2,13 @@ from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
+from sglang.srt.configs.cosmos3 import (
+    Cosmos3Config,
+    Cosmos3EdgeConfig,
+    Cosmos3EdgeProjectorConfig,
+    Cosmos3EdgeTextConfig,
+    Cosmos3EdgeVisionConfig,
+)
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
 from sglang.srt.configs.dots3 import Dots3Config
@@ -25,6 +32,7 @@ from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
+from sglang.srt.configs.k2_horizon import K2HorizonConfig, XllmConfig
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
@@ -73,12 +81,19 @@ __all__ = [
     "BailingHybridConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
+    "Cosmos3Config",
+    "Cosmos3EdgeConfig",
+    "Cosmos3EdgeTextConfig",
+    "Cosmos3EdgeVisionConfig",
+    "Cosmos3EdgeProjectorConfig",
     "DbrxConfig",
     "DeepseekVL2Config",
     "LongcatFlashConfig",
     "MultiModalityConfig",
     "KimiVLConfig",
     "MoonViTConfig",
+    "K2HorizonConfig",
+    "XllmConfig",
     "Step3VLConfig",
     "Step3TextConfig",
     "Step3VisionEncoderConfig",

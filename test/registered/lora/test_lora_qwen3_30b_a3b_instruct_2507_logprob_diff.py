@@ -67,7 +67,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
 
 
 class TestLoRAQwen3_30B_A3B_Instruct_2507_LogprobDiff(CustomTestCase):
-
     def test_lora_qwen3_30b_a3b_instruct_2507_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,

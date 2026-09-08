@@ -391,9 +391,10 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
                 free[0] += os.path.getsize(p)
             return original_remove(p)
 
-        with mock.patch.object(
-            b._evictor, "_fs_stats", side_effect=fake_fs_stats
-        ), mock.patch("os.remove", side_effect=tracked_remove):
+        with (
+            mock.patch.object(b._evictor, "_fs_stats", side_effect=fake_fs_stats),
+            mock.patch("os.remove", side_effect=tracked_remove),
+        ):
             self.assertTrue(b.set("newk", _t(60)))
         self.assertFalse(b.exists("victim"))
         self.assertTrue(b.exists("newk"))
@@ -516,9 +517,10 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
         b.set("k2", _t(50))
 
         # Now patch os.scandir and os.path.exists
-        with mock.patch("os.scandir") as mock_scandir, mock.patch(
-            "os.path.exists"
-        ) as mock_exists:
+        with (
+            mock.patch("os.scandir") as mock_scandir,
+            mock.patch("os.path.exists") as mock_exists,
+        ):
             mock_exists.return_value = True
 
             # batch_exists_v2 for k1 and k2 should hit the metadata cache and NOT call os.scandir or os.path.exists

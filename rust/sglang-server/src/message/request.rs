@@ -109,6 +109,18 @@ pub struct GenerateBody {
 }
 
 impl GenerateBody {
+    /// Merge operator-provided sampling defaults beneath request values,
+    /// matching Python TokenizerManager's preferred/request precedence.
+    pub fn apply_preferred_sampling(&mut self, preferred: &serde_json::Value) -> Result<(), Error> {
+        match &mut self.sampling_params {
+            Some(params) => params.apply_preferred(preferred),
+            None => SamplingParamsInput::from_preferred(preferred).map(|params| {
+                self.sampling_params = Some(params);
+            }),
+        }
+        .map_err(|e| Error::Validation(format!("invalid preferred_sampling_params: {e}")))
+    }
+
     /// Validate, normalize and fan the body into one [`GenerateRequest`] per
     /// prompt + `is_batch` (list form — a 1-element list is still a batch → JSON
     /// array response). The Rust counterpart of Python

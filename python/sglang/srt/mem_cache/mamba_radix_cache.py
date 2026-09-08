@@ -71,7 +71,6 @@ _MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
 
 class TreeNode:
-
     counter = 0
     last_access_time_counter_float = float64(1.0)
 
@@ -238,9 +237,9 @@ class LRUList:
         Move a (existing) node to most recently used position
         """
         assert node.id in self.cache, f"Resetting node {node.id=} not in lru list"
-        assert (
-            not self.mamba or node.mamba_value is not None
-        ), f"Resetting mamba tombstone node in mamba lru list: {node.id=}"
+        assert not self.mamba or node.mamba_value is not None, (
+            f"Resetting mamba tombstone node in mamba lru list: {node.id=}"
+        )
         if self.mamba:
             node.mamba_last_access_time = get_last_access_time()
         self._remove_node(node)
@@ -254,9 +253,9 @@ class LRUList:
         prev_node = self.head
         while node != root_node:
             if not self.mamba or node.mamba_value is not None:
-                assert (
-                    node.id in self.cache
-                ), f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
+                assert node.id in self.cache, (
+                    f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
+                )
                 self._remove_node(node)
                 self._add_node_after(prev_node, node)
                 prev_node = node
@@ -266,12 +265,12 @@ class LRUList:
         """
         Insert a (new) node as most recently used
         """
-        assert (
-            not self.mamba or node.mamba_value is not None
-        ), f"Inserting mamba tombstone node in mamba lru list: {node.id=}"
-        assert (
-            node.id not in self.cache
-        ), f"Inserting node {node.id=} already in lru list, existing node: {self.cache[node.id].id=}"
+        assert not self.mamba or node.mamba_value is not None, (
+            f"Inserting mamba tombstone node in mamba lru list: {node.id=}"
+        )
+        assert node.id not in self.cache, (
+            f"Inserting node {node.id=} already in lru list, existing node: {self.cache[node.id].id=}"
+        )
         if self.mamba:
             node.mamba_last_access_time = get_last_access_time()
         self.cache[node.id] = node
@@ -282,9 +281,9 @@ class LRUList:
         Remove node from lru list
         """
         assert node.id in self.cache, f"Removing node {node.id=} not in lru list"
-        assert (
-            not self.mamba or node.mamba_value is not None
-        ), f"Removing mamba tombstone node from mamba lru list: {node.id=}"
+        assert not self.mamba or node.mamba_value is not None, (
+            f"Removing mamba tombstone node from mamba lru list: {node.id=}"
+        )
         del self.cache[node.id]
         self._remove_node(node)
 
@@ -307,9 +306,9 @@ class LRUList:
         Get the previous (i.e. more recently used) node that is not locked
         """
         if check_id:
-            assert (
-                node.id in self.cache
-            ), f"Getting prev of node {node.id=} not in lru list"
+            assert node.id in self.cache, (
+                f"Getting prev of node {node.id=} not in lru list"
+            )
         x = getattr(node, self.prv)  # x = node.prev
         while getattr(x, self.lock_ref) > 0:
             x = getattr(x, self.prv)  # x = x.prev
@@ -323,9 +322,9 @@ class LRUList:
         Get the previous (i.e. more recently used) leaf node that is not locked
         """
         if check_id:
-            assert (
-                node.id in self.cache
-            ), f"Getting prev of node {node.id=} not in lru list"
+            assert node.id in self.cache, (
+                f"Getting prev of node {node.id=} not in lru list"
+            )
         x = getattr(node, self.prv)  # x = node.prev
         while getattr(x, self.lock_ref) > 0 or len(x.children) > 0:
             x = getattr(x, self.prv)  # x = x.prev
@@ -396,28 +395,28 @@ class LRUList:
             # lists have independent recency, so they use different stamps)
             nodes.sort(key=lambda n: getattr(n, self.time_attr))
             # the root node is not in the lru list
-            assert len(nodes) == (
-                total_lru + (0 if self.mamba else 1)
-            ), f"len(nodes): {len(nodes)}, total_lru: {total_lru}"
+            assert len(nodes) == (total_lru + (0 if self.mamba else 1)), (
+                f"len(nodes): {len(nodes)}, total_lru: {total_lru}"
+            )
 
             x_lru = self._get_lru()
             for x in nodes:
                 if x == tree_cache.root_node:
                     # root node is not in the lru list
                     continue
-                assert (
-                    x_lru is not None and x_lru.id in self.cache
-                ), f"Incorrect LRU list, x_lru is None or not in cache: {x_lru=}, {x.id=}"
+                assert x_lru is not None and x_lru.id in self.cache, (
+                    f"Incorrect LRU list, x_lru is None or not in cache: {x_lru=}, {x.id=}"
+                )
 
-                assert (
-                    x == x_lru
-                ), f"Incorrect LRU list, {self.mamba=}, x: {x.id=} != x_lru: {x_lru.id=}, {getattr(x, self.time_attr)=}, {getattr(x_lru, self.time_attr)=}"
-                assert (
-                    x_lru.full_lock_ref == 0
-                ), f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.id=}"
-                assert (
-                    x_lru.mamba_lock_ref == 0
-                ), f"x_lru should not be locked when idle, {x_lru.mamba_lock_ref=}, {x_lru.id=}"
+                assert x == x_lru, (
+                    f"Incorrect LRU list, {self.mamba=}, x: {x.id=} != x_lru: {x_lru.id=}, {getattr(x, self.time_attr)=}, {getattr(x_lru, self.time_attr)=}"
+                )
+                assert x_lru.full_lock_ref == 0, (
+                    f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.id=}"
+                )
+                assert x_lru.mamba_lock_ref == 0, (
+                    f"x_lru should not be locked when idle, {x_lru.mamba_lock_ref=}, {x_lru.id=}"
+                )
                 x_lru = getattr(x, self.prv)
 
             if self.mamba:
@@ -427,9 +426,9 @@ class LRUList:
                 evictable_size = tree_cache.full_evictable_size()
                 lru_list_evictable_size = self.sanity_check_evictable_size()
 
-            assert (
-                evictable_size == lru_list_evictable_size
-            ), f"{self.mamba=}, total nodes: {total_nodes}, total lru: {total_lru}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
+            assert evictable_size == lru_list_evictable_size, (
+                f"{self.mamba=}, total nodes: {total_nodes}, total lru: {total_lru}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
+            )
         except Exception as e:
             if get_parallel().tp_rank == 0:
                 msg = f"Mamba Radix tree sanity check failed, ping @yizhang2077: {e}"
@@ -464,9 +463,9 @@ class MambaRadixCache(BasePrefixCache):
         )
 
         if not self.enable_mamba_extra_buffer:
-            assert (
-                self.page_size == 1
-            ), f"Page size must be 1 for MambaRadixCache v1, got {self.page_size}"
+            assert self.page_size == 1, (
+                f"Page size must be 1 for MambaRadixCache v1, got {self.page_size}"
+            )
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -592,9 +591,9 @@ class MambaRadixCache(BasePrefixCache):
                 page_aligned_len = len(kv_indices)
                 page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
-            assert (
-                cache_len == page_aligned_len
-            ), f"It is required {cache_len=}, {page_aligned_len=}, {kv_len_to_handle=}, {len(req.origin_input_ids)=}, {len(req.output_ids)=} ping @yizhang2077 if you see this"
+            assert cache_len == page_aligned_len, (
+                f"It is required {cache_len=}, {page_aligned_len=}, {kv_len_to_handle=}, {len(req.origin_input_ids)=}, {len(req.output_ids)=} ping @yizhang2077 if you see this"
+            )
 
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
@@ -706,9 +705,9 @@ class MambaRadixCache(BasePrefixCache):
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
-        assert page_aligned_len == len(
-            kv_indices
-        ), f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {self.mamba_cache_chunk_size=}"
+        assert page_aligned_len == len(kv_indices), (
+            f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {self.mamba_cache_chunk_size=}"
+        )
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
@@ -778,12 +777,12 @@ class MambaRadixCache(BasePrefixCache):
         if not mamba_exist:
             assert torch.equal(new_last_node.mamba_value, mamba_value_donated)
 
-        assert (
-            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
+        )
+        assert new_prefix_len <= len(new_indices), (
+            f"{new_prefix_len=}, {len(new_indices)=}"
+        )
 
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
@@ -813,9 +812,9 @@ class MambaRadixCache(BasePrefixCache):
     def _evict_leaf_node(
         self, x: TreeNode, is_evict_mamba: bool
     ) -> Tuple[int, int, TreeNode, TreeNode]:
-        assert (
-            x.full_lock_ref == 0 and x.mamba_lock_ref == 0
-        ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
+        assert x.full_lock_ref == 0 and x.mamba_lock_ref == 0, (
+            f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
+        )
 
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
@@ -868,9 +867,9 @@ class MambaRadixCache(BasePrefixCache):
         # evict lru leaf nodes until mamba_num_tokens is reached
         while mamba_num_evicted < mamba_num and (self.mamba_lru_list.in_list(x)):
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
-            assert (
-                len(x.mamba_value) == 1
-            ), f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
+            assert len(x.mamba_value) == 1, (
+                f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
+            )
             assert x != self.root_node, f"root node is not evictable, {x.id=}"
             assert x.mamba_lock_ref == 0, f"node is in use by mamba kv indices, {x.id=}"
 
@@ -903,9 +902,9 @@ class MambaRadixCache(BasePrefixCache):
         x = self.full_lru_list.get_leaf_lru_no_lock()
 
         while full_num_evicted < full_num_tokens and self.full_lru_list.in_list(x):
-            assert (
-                x != self.root_node
-            ), f"root node should not exist in full lru list, {x.id=}"
+            assert x != self.root_node, (
+                f"root node should not exist in full lru list, {x.id=}"
+            )
             full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x, False)
             full_num_evicted += full_num_evicted_delta
 
@@ -936,9 +935,9 @@ class MambaRadixCache(BasePrefixCache):
 
         while node != self.root_node:
             # lock full from node to root
-            assert (
-                node.full_lock_ref >= 0
-            ), f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            assert node.full_lock_ref >= 0, (
+                f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            )
             if node.full_lock_ref == 0:
                 self.full_evictable_size_ -= len(node.value)
                 self.full_protected_size_ += len(node.value)
@@ -958,18 +957,18 @@ class MambaRadixCache(BasePrefixCache):
             return DecLockRefResult()
 
         if node.mamba_value is not None:
-            assert (
-                node.mamba_lock_ref > 0
-            ), f"dec_lock_ref on node with {node.mamba_lock_ref=}, {node.id=}"
+            assert node.mamba_lock_ref > 0, (
+                f"dec_lock_ref on node with {node.mamba_lock_ref=}, {node.id=}"
+            )
             if node.mamba_lock_ref == 1:
                 self.mamba_evictable_size_ += len(node.mamba_value)
                 self.mamba_protected_size_ -= len(node.mamba_value)
             node.mamba_lock_ref -= 1
 
         while node != self.root_node:
-            assert (
-                node.full_lock_ref > 0
-            ), f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            assert node.full_lock_ref > 0, (
+                f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            )
             if node.full_lock_ref == 1:
                 self.full_evictable_size_ += len(node.value)
                 self.full_protected_size_ -= len(node.value)
@@ -1326,9 +1325,9 @@ class MambaRadixCache(BasePrefixCache):
             # if locked, means node is in use, skip
             if node.parent.full_lock_ref > 0:
                 break
-            assert (
-                node.parent.mamba_lock_ref == 0
-            ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
+            assert node.parent.mamba_lock_ref == 0, (
+                f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
+            )
             # delete tombstone node evicts full tokens
             self.kv_events.record_remove(node.parent)
             self.token_to_kv_pool_allocator.free_segment(node.parent.value, start_pos=0)
@@ -1340,9 +1339,9 @@ class MambaRadixCache(BasePrefixCache):
         return node, full_num_evicted
 
     def _delete_leaf(self, node: TreeNode) -> None:
-        assert (
-            node.mamba_value is not None
-        ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
+        assert node.mamba_value is not None, (
+            f"Invariant violated: leaf node is a tombstone, {node.id=}"
+        )
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
@@ -1357,9 +1356,9 @@ class MambaRadixCache(BasePrefixCache):
         node.mamba_value = None
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
-        assert (
-            node.mamba_value is None
-        ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
+        assert node.mamba_value is None, (
+            f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
+        )
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
@@ -1406,9 +1405,9 @@ class MambaRadixCache(BasePrefixCache):
             for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
 
-                assert key == child.key.child_key(
-                    self.page_size
-                ), f"{key=}, {child.key.child_key(self.page_size)=}"
+                assert key == child.key.child_key(self.page_size), (
+                    f"{key=}, {child.key.child_key(self.page_size)=}"
+                )
 
     def _total_size_helper(self) -> Tuple[int, int]:
         total_size = 0

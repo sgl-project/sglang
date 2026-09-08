@@ -54,17 +54,16 @@ class TestFlashinferTrtllmFp8Fallback(CustomTestCase):
         trtllm_spy = MagicMock(return_value=torch.zeros((M, N), dtype=dtype))
         quant_spy = MagicMock(return_value=(MagicMock(), MagicMock()))
 
-        with patch.object(
-            fp8_utils,
-            "_get_flashinfer_groupwise_backend",
-            return_value="trtllm",
-            create=True,
-        ), patch.object(
-            fp8_utils, "gemm_fp8_nt_groupwise", trtllm_spy, create=True
-        ), patch.object(
-            fp8_utils, "triton_w8a8_block_fp8_linear", triton_spy
-        ), patch.object(
-            fp8_utils, "sglang_per_token_group_quant_fp8", quant_spy
+        with (
+            patch.object(
+                fp8_utils,
+                "_get_flashinfer_groupwise_backend",
+                return_value="trtllm",
+                create=True,
+            ),
+            patch.object(fp8_utils, "gemm_fp8_nt_groupwise", trtllm_spy, create=True),
+            patch.object(fp8_utils, "triton_w8a8_block_fp8_linear", triton_spy),
+            patch.object(fp8_utils, "sglang_per_token_group_quant_fp8", quant_spy),
         ):
             fp8_utils.flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
                 input_2d, weight, BLOCK_SIZE, weight_scale

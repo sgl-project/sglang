@@ -24,7 +24,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=465, stage="base-c", runner_config="4-gpu-b200")
 
-MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
+MTP_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
@@ -33,7 +34,7 @@ _DEEPEP_ENV = {
 }
 
 
-class TestDSV4FlashFP4B200(
+class TestDSV4FlashFP4B200MTP(
     SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
@@ -47,7 +48,7 @@ class TestDSV4FlashFP4B200(
 
     @classmethod
     def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
+        cls.model = try_cached_model(MTP_MODEL)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -77,17 +78,17 @@ class TestDSV4FlashFP4B200(
             kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashFP4B200Balanced(
+class TestDSV4FlashFP4B200DSpark(
     SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
 ):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+    """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
 
     gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 1.8
-    bs_1_speed_thres = 100
+    accept_length_thres = 4.0
+    bs_1_speed_thres = 300
 
     @classmethod
     def setUpClass(cls):
@@ -101,23 +102,10 @@ class TestDSV4FlashFP4B200Balanced(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
-                "4",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
                 "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
-                "--deepep-config",
-                DEEPEP_CONFIG,
+                "DSPARK",
+                "--disable-flashinfer-autotune",
             ],
-            env=_DEEPEP_ENV,
         )
 
     @classmethod
@@ -126,7 +114,7 @@ class TestDSV4FlashFP4B200Balanced(
             kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashFP4NonMTPB200(
+class TestDSV4FlashFP4NonSpecB200(
     BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):
     """Non-MTP recipe: TP=4, DP=4, DeepEP, no speculative decoding."""

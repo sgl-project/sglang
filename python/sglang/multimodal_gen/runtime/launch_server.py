@@ -662,7 +662,7 @@ def launch_disagg_role(server_args: ServerArgs):
     role_type = server_args.disagg_role
     if server_args.disagg_server_addr is None:
         raise ValueError(
-            "--disagg-server-addr is required for --disagg-role " f"{role_type.value}"
+            f"--disagg-server-addr is required for --disagg-role {role_type.value}"
         )
 
     # Derive endpoints

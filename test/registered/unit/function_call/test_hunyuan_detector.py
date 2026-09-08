@@ -351,9 +351,7 @@ class TestHunyuanDetectorStreaming(CustomTestCase):
     def test_complete_tool_call_single_chunk(self):
         detector = self._new_detector()
         text = (
-            "<tool_calls>"
-            "<tool_call>get_current_date<tool_sep></tool_call>"
-            "</tool_calls>"
+            "<tool_calls><tool_call>get_current_date<tool_sep></tool_call></tool_calls>"
         )
         result = detector.parse_streaming_increment(text, self.tools)
         collected = _collect_streamed_tool_calls(result.calls)

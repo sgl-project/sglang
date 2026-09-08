@@ -16,7 +16,6 @@ register_amd_ci(est_time=630, suite="stage-b-test-2-gpu-large-amd")
 
 
 class TestBenchOneBatch2GPU(CustomTestCase):
-
     def test_moe_tp2_bs1(self):
         output_throughput = run_bench_offline_throughput(
             DEFAULT_MOE_MODEL_NAME_FOR_TEST,

@@ -585,9 +585,9 @@ def test_humming_range_ignores_prerounded_hidden_tail():
         "w13 Humming residual changed with the never-written hidden tail; "
         "the _UE8M0_ONE fill leaked into the per-expert E8M0 range"
     )
-    assert torch.equal(
-        residuals[0][1], residuals[1][1]
-    ), "w2 Humming residual changed with the never-written hidden tail"
+    assert torch.equal(residuals[0][1], residuals[1][1]), (
+        "w2 Humming residual changed with the never-written hidden tail"
+    )
 
 
 @pytest.mark.skipif(

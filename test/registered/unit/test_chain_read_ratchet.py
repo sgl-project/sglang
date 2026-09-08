@@ -78,15 +78,39 @@ def _returned_field_names(function):
     returned literal, assignments (annotated or not) to a returned name, a
     literal-key subscript write on it, and `.update(field=...)` on it. A
     spelling this cannot see raises instead of skipping.
+
+    ``overrides[name]`` is also accepted when ``name`` comes from
+    ``for name in ("a", "b", ...)`` -- the keys stay statically enumerable.
     """
     names = set()
     returned = set()
+    # for x in ("a", "b"): ...  ->  {"x": {"a", "b"}}
+    loop_keys = {
+        node.target.id: {elt.value for elt in node.iter.elts}
+        for node in ast.walk(function)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and isinstance(node.iter, (ast.Tuple, ast.List))
+        and node.iter.elts
+        and all(
+            isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+            for elt in node.iter.elts
+        )
+    }
 
     def top_level_keys(mapping):
         for key in mapping.keys:
             if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
                 raise AssertionError(f"non-literal key in {function.name}")
             names.add(key.value)
+
+    def add_subscript_key(key):
+        if isinstance(key, ast.Constant):
+            names.add(key.value)
+        elif isinstance(key, ast.Name) and key.id in loop_keys:
+            names.update(loop_keys[key.id])
+        else:
+            raise AssertionError(f"non-literal key in {function.name}")
 
     for node in ast.walk(function):
         if isinstance(node, ast.Return) and node.value is not None:
@@ -114,9 +138,7 @@ def _returned_field_names(function):
                 if isinstance(target, ast.Subscript) and (
                     isinstance(target.value, ast.Name) and target.value.id in returned
                 ):
-                    if not isinstance(target.slice, ast.Constant):
-                        raise AssertionError(f"non-literal key in {function.name}")
-                    names.add(target.slice.value)
+                    add_subscript_key(target.slice)
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)

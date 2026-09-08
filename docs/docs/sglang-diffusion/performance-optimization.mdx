@@ -12,11 +12,28 @@ The docs use "output-preserving" instead of promising bit-exact "lossless" becau
 
 ## Start Here
 
-1. Pick a serving or generation mode from [Deployment and Performance Modes](./deployment_cookbook). `--performance-mode auto` is the default; use `speed` when the model fits in GPU memory and latency matters most, `memory` when GPU memory is the bottleneck, and `manual` when every performance flag should be explicit.
-2. Choose the right attention backend from [Attention Backends](./attention_backends).
-3. Use [Sequence Parallelism](./ring_sp_performance) only when the model and video shape benefit from sequence splitting.
-4. Use [Inference Batching](./dynamic_batching) for concurrent compatible requests during serving.
-5. Use [Profiling](./profiling) before changing several levers at once.
+1. Pick a serving or generation mode from [Deployment and Performance Modes](/docs/sglang-diffusion/deployment_cookbook). `--performance-mode auto` is the default; use `speed` when the model fits in GPU memory and latency matters most, `memory` when GPU memory is the bottleneck, and `manual` when every performance flag should be explicit.
+2. Choose the right attention backend from [Attention Backends](/docs/sglang-diffusion/attention_backends).
+3. Use [Sequence Parallelism](/docs/sglang-diffusion/ring_sp_performance) only when the model and video shape benefit from sequence splitting.
+4. Use [Inference Batching](/docs/sglang-diffusion/dynamic_batching) for concurrent compatible requests during serving.
+5. Use [Profiling](/docs/sglang-diffusion/profiling) before changing several levers at once.
+
+## Choose a request quality tier
+
+`--quality` is cumulative: a broader tier never drops an optimization from a
+stricter tier.
+
+| Tier | Optimization boundary |
+| --- | --- |
+| `lossless` (default) | The selected deployment's reference execution plus all unconditional bit-exact replacements |
+| `extra-high` | Everything in `lossless`, plus only request-gated DiT/VAE kernel fusions; the tier does not itself enable sparse, caching, or other approximate paths |
+| `high` | Everything in `extra-high`, plus model-owned high-only paths such as an audited Cache-DiT policy or lower-precision VAE decode |
+
+Use `extra-high` when you want to isolate fusion wins from approximate
+acceleration. A tier may be a no-op when the active model has no eligible path.
+Separately configured quantization, attention, or caching options still apply.
+See [Fused Kernels](/docs/sglang-diffusion/fused_kernels) for the current
+request-gated families and their numerical contracts.
 
 ## Output-Preserving / Lossless-Style Levers
 
@@ -39,42 +56,42 @@ These settings should preserve model behavior while changing residency, parallel
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}><code>--performance-mode</code></td>
       <td style={{padding: "9px 12px"}}>You want a safe preset for speed or memory without overriding explicit flags.</td>
-      <td style={{padding: "9px 12px"}}><a href="./deployment_cookbook">Deployment and Performance Modes</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/deployment_cookbook">Deployment and Performance Modes</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Breakable CUDA graph</td>
       <td style={{padding: "9px 12px"}}>A supported pipeline serves a fixed set of shapes and eager execution is launch-bound.</td>
-      <td style={{padding: "9px 12px"}}><a href="./api/cli">CLI reference</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/api/cli">CLI reference</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Offload, FSDP, CFG parallelism</td>
       <td style={{padding: "9px 12px"}}>GPU memory, multi-GPU residency, or CFG branch splitting is the main bottleneck.</td>
-      <td style={{padding: "9px 12px"}}><a href="./deployment_cookbook">Deployment and Performance Modes</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/deployment_cookbook">Deployment and Performance Modes</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Sequence parallelism</td>
       <td style={{padding: "9px 12px"}}>Long image/video sequences need sequence-level parallelism.</td>
-      <td style={{padding: "9px 12px"}}><a href="./ring_sp_performance">Sequence Parallelism</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/ring_sp_performance">Sequence Parallelism</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}><code>--encoder-parallel</code></td>
       <td style={{padding: "9px 12px"}}>Text/image encoding is a visible share of the request and the DiT replica sits idle during it.</td>
-      <td style={{padding: "9px 12px"}}><a href="./encoder_parallel">Encoder Parallelism</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/encoder_parallel">Encoder Parallelism</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Attention backend</td>
       <td style={{padding: "9px 12px"}}>Kernel choice dominates DiT latency or memory.</td>
-      <td style={{padding: "9px 12px"}}><a href="./attention_backends">Attention Backends</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/attention_backends">Attention Backends</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Fused kernels</td>
       <td style={{padding: "9px 12px"}}>You want to know which elementwise chains are already fused, or to opt into the request-gated set.</td>
-      <td style={{padding: "9px 12px"}}><a href="./fused_kernels">Fused Kernels</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/fused_kernels">Fused Kernels</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Dynamic batching</td>
       <td style={{padding: "9px 12px"}}>Serving many compatible requests concurrently.</td>
-      <td style={{padding: "9px 12px"}}><a href="./dynamic_batching">Inference Batching</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/dynamic_batching">Inference Batching</a></td>
     </tr>
   </tbody>
 </table>
@@ -100,22 +117,22 @@ These techniques can change the denoising path, numerical representation, or gen
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Cache-DiT</td>
       <td style={{padding: "9px 12px"}}>Skips selected DiT block or step computation based on cache decisions.</td>
-      <td style={{padding: "9px 12px"}}><a href="./cache_dit">Cache-DiT</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/cache_dit">Cache-DiT</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>TeaCache</td>
       <td style={{padding: "9px 12px"}}>Reuses residuals when consecutive denoising steps are similar enough.</td>
-      <td style={{padding: "9px 12px"}}><a href="./teacache">TeaCache</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/teacache">TeaCache</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Progressive resolution</td>
       <td style={{padding: "9px 12px"}}>Runs early denoising at lower latent resolution for supported pipelines.</td>
-      <td style={{padding: "9px 12px"}}><a href="./progressive_resolution">Progressive Resolution Generation</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/progressive_resolution">Progressive Resolution Generation</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Quantization</td>
       <td style={{padding: "9px 12px"}}>Uses lower-precision transformer weights or activations.</td>
-      <td style={{padding: "9px 12px"}}><a href="./quantization">Quantization</a></td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/quantization">Quantization</a></td>
     </tr>
   </tbody>
 </table>
@@ -124,20 +141,21 @@ These techniques can change the denoising path, numerical representation, or gen
 
 1. Establish a baseline with the target model, resolution, frame count, step count, and GPU type.
 2. Select `--performance-mode` and explicit residency or parallelism flags.
-3. Compare breakable CUDA graph against eager execution for supported fixed-shape pipelines. Pass every served resolution to `--warmup-resolutions` and confirm capture in the server log.
-4. Tune attention backend and batching for the deployment pattern.
-5. Profile if the bottleneck is unclear.
-6. Add caching, progressive resolution, or quantization only after comparing output quality against your acceptance target.
+3. Compare `quality=lossless` with `quality=extra-high` to isolate the request-gated fusion set.
+4. Compare breakable CUDA graph against eager execution for supported fixed-shape pipelines. Pass every served resolution to `--warmup-resolutions` and confirm capture in the server log. Models with request-gated DiT fusions cannot combine those fusions with a graph captured from the lossless branches.
+5. Tune attention backend and batching for the deployment pattern.
+6. Profile if the bottleneck is unclear.
+7. Add `quality=high`, caching, progressive resolution, or quantization only after comparing output quality against your acceptance target.
 
 ## Diagnostics
 
-[Profiling](./profiling) is not an optimization technique by itself. It belongs in the performance workflow because it tells you which stage, kernel, or denoising step is worth optimizing before you change multiple levers.
+[Profiling](/docs/sglang-diffusion/profiling) is not an optimization technique by itself. It belongs in the performance workflow because it tells you which stage, kernel, or denoising step is worth optimizing before you change multiple levers.
 
 ## References
 
-- [Deployment and Performance Modes](./deployment_cookbook)
-- [Attention Backends](./attention_backends)
-- [Fused Kernels](./fused_kernels)
-- [Sequence Parallelism](./ring_sp_performance)
-- [Caching Strategies](./caching-acceleration)
-- [Profiling](./profiling)
+- [Deployment and Performance Modes](/docs/sglang-diffusion/deployment_cookbook)
+- [Attention Backends](/docs/sglang-diffusion/attention_backends)
+- [Fused Kernels](/docs/sglang-diffusion/fused_kernels)
+- [Sequence Parallelism](/docs/sglang-diffusion/ring_sp_performance)
+- [Caching Strategies](/docs/sglang-diffusion/caching-acceleration)
+- [Profiling](/docs/sglang-diffusion/profiling)

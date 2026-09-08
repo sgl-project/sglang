@@ -2350,10 +2350,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             args._model_config = SimpleNamespace(attention_arch=AttentionArch.MHA)
             return args
 
-        with override_platform(is_sm100=True), patch.object(
-            qwen3_5_module,
-            "get_default_attn_backend",
-            lambda server_args, **_: server_args.default_backend_for_test,
+        with (
+            override_platform(is_sm100=True),
+            patch.object(
+                qwen3_5_module,
+                "get_default_attn_backend",
+                lambda server_args, **_: server_args.default_backend_for_test,
+            ),
         ):
             # radix on + no extra buffer + no spec -> page_size=1 path
             self.assertEqual(

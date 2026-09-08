@@ -575,9 +575,9 @@ def validate_image_file(
     assert os.path.exists(file_path), f"Image file does not exist: {file_path}"
 
     # 2. Extension check
-    assert file_path.endswith(
-        f".{expected_ext}"
-    ), f"Expected .{expected_ext} extension, got: {file_path}"
+    assert file_path.endswith(f".{expected_ext}"), (
+        f"Expected .{expected_ext} extension, got: {file_path}"
+    )
 
     # 3. File size > 0
     file_size = os.path.getsize(file_path)
@@ -585,9 +585,9 @@ def validate_image_file(
 
     # 4. Filename validation
     actual_filename = os.path.basename(file_path)
-    assert (
-        actual_filename == expected_filename
-    ), f"Filename mismatch: expected '{expected_filename}', got '{actual_filename}'"
+    assert actual_filename == expected_filename, (
+        f"Filename mismatch: expected '{expected_filename}', got '{actual_filename}'"
+    )
 
     # 5. Image format validation (magic bytes check based on expected format)
     with open(file_path, "rb") as f:
@@ -603,12 +603,12 @@ def validate_image_file(
     if expected_width is not None and expected_height is not None:
         with Image.open(file_path) as img:
             width, height = img.size
-            assert (
-                width == expected_width
-            ), f"Width mismatch: expected {expected_width}, got {width}"
-            assert (
-                height == expected_height
-            ), f"Height mismatch: expected {expected_height}, got {height}"
+            assert width == expected_width, (
+                f"Width mismatch: expected {expected_width}, got {width}"
+            )
+            assert height == expected_height, (
+                f"Height mismatch: expected {expected_height}, got {height}"
+            )
 
 
 def _get_video_dimensions_from_metadata(
@@ -707,9 +707,9 @@ def validate_video_file(
 
     # 4. Filename validation
     actual_filename = os.path.basename(file_path)
-    assert (
-        actual_filename == expected_filename
-    ), f"Filename mismatch: expected '{expected_filename}', got '{actual_filename}'"
+    assert actual_filename == expected_filename, (
+        f"Filename mismatch: expected '{expected_filename}', got '{actual_filename}'"
+    )
 
     # 5. Video format validation (reuse is_mp4)
     with open(file_path, "rb") as f:
@@ -719,12 +719,12 @@ def validate_video_file(
     # 6. Video dimension validation (using OpenCV)
     if expected_width is not None and expected_height is not None:
         actual_width, actual_height = get_video_dimensions(file_path)
-        assert (
-            actual_width == expected_width
-        ), f"Video width mismatch: expected {expected_width}, got {actual_width}"
-        assert (
-            actual_height == expected_height
-        ), f"Video height mismatch: expected {expected_height}, got {actual_height}"
+        assert actual_width == expected_width, (
+            f"Video width mismatch: expected {expected_width}, got {actual_width}"
+        )
+        assert actual_height == expected_height, (
+            f"Video height mismatch: expected {expected_height}, got {actual_height}"
+        )
 
 
 @dataclass(frozen=True)
@@ -776,9 +776,9 @@ def probe_audio_stream(file_path: str) -> AudioStreamInfo:
     )
     assert sample_rate > 0, f"Audio stream has invalid sample rate: {sample_rate}"
     assert channels > 0, f"Audio stream has invalid channel count: {channels}"
-    assert (
-        math.isfinite(duration) and duration > 0
-    ), f"Audio stream has invalid duration: {duration}"
+    assert math.isfinite(duration) and duration > 0, (
+        f"Audio stream has invalid duration: {duration}"
+    )
     return AudioStreamInfo(sample_rate, channels, duration)
 
 

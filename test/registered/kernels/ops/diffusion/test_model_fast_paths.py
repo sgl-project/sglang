@@ -82,6 +82,7 @@ from sglang.multimodal_gen.runtime.models.dits.flux import (
     _flux_norm_modulate,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
+    _can_use_nvfp4_swiglu_quant_fusion,
     _flux2_norm_modulate,
     _flux2_swiglu,
 )
@@ -121,6 +122,7 @@ from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
     VaeFastPathGate,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -341,6 +343,11 @@ class TestFlux2EagerFusions(CustomTestCase):
 
         self.assertFalse(flux2._FLUX2_SWIGLU.disabled)
         self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 2)
+
+    def test_nvfp4_swiglu_quant_fusion_is_sm103_only(self):
+        self.assertFalse(_can_use_nvfp4_swiglu_quant_fusion(DeviceCapability(10, 0)))
+        self.assertTrue(_can_use_nvfp4_swiglu_quant_fusion(DeviceCapability(10, 3)))
+        self.assertFalse(_can_use_nvfp4_swiglu_quant_fusion(DeviceCapability(12, 0)))
 
     def test_fp16_preserves_reference_path(self):
         x = torch.randn(1, 17, 512, device="cuda", dtype=torch.float16)

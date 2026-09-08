@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
@@ -374,10 +374,43 @@ class Compressor(BaseFusedOp):
         self.norm = RMSNorm(
             self.head_dim, eps=config.rms_norm_eps, weight_dtype=torch.float32
         )
+        if (
+            is_in_indexer
+            and _is_hip
+            and get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        ):
+            self._init_fp4_norm_weight()
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
 
         self.ape_converted = False
+
+    def _init_fp4_norm_weight(self) -> None:
+        """Mirror the FP32 norm weight in BF16 for the AITER FP4 K writer.
+
+        The FP8 path feeds the FP32 weight straight to its kernel; AITER wants
+        BF16, and converting at the call site costs one copy per C4 layer per
+        forward. A buffer keeps the conversion out of the forward and survives
+        module ``_apply``, and the loader below re-derives it so online weight
+        updates propagate -- they land as ``param.data.copy_``, which leaves the
+        parameter's identity and ``_version`` untouched and would silently
+        defeat any cache keyed on those. Same reach as ``load_ape_weight``:
+        ``update_weights_from_tensor(load_format="direct")`` calls
+        ``default_weight_loader`` itself and so skips both hooks.
+        """
+        self.norm.register_buffer(
+            "fp4_weight_bf16",
+            self.norm.weight.detach().to(torch.bfloat16).contiguous(),
+            persistent=False,
+        )
+        set_weight_attrs(self.norm.weight, {"weight_loader": self.load_norm_weight})
+
+    def load_norm_weight(
+        self, param: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> None:
+        assert param is self.norm.weight
+        param.data.copy_(loaded_weight)
+        self.norm.fp4_weight_bf16.copy_(param.data)
 
     def _apply_ape_hotfix(self):
         self.ape_converted = True

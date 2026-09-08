@@ -25,7 +25,6 @@ register_amd_ci(est_time=261, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestSRTEngine(CustomTestCase):
-
     def test_1_engine_runtime_consistency(self):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

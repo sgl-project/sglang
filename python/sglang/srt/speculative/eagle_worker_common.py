@@ -472,6 +472,7 @@ def run_eagle_verify(
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     grammar_barrier=None,
+    uno_target_max_top_k: Optional[int] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -589,6 +590,7 @@ def run_eagle_verify(
         batch,
         logits_output,
         grammar_mask,
+        uno_target_max_top_k=uno_target_max_top_k,
         watermark_state=target_worker.model_runner.watermark_state,
         watermark_full_mask=(
             target_worker.model_runner.attn_backend.verify_mask is None

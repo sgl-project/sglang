@@ -37,6 +37,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -77,6 +79,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
+    SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION: bool = True
+    SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS: int = 3
+    SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS: int = 3
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -260,6 +265,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Plan slots in the MiniMax-H3 --minimax-h3-adaln-online GPU slab
+    # (9.25 MiB per slot-timestep; 64 x width 4 = 2.31 GiB). A request needs
+    # up to num_inference_steps - 1 slots; the default covers the 50-step
+    # serving schedule, so this is an escape hatch, not a deployment knob.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": _lazy_int(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS", 64
+    ),
+    # Experimental: compute the online AdaLN rebuild projections once in fp32
+    # (TF32 off) before the bf16 store. Not bit-comparable to resident
+    # adaln_proj weights; keep off until an e2e trajectory gate clears it.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
+    ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
@@ -349,6 +367,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory is low or when this flag is disabled.
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
+    ),
+    # Run the first/last denoising steps of a ModelOpt FP8 (W8A8) Cosmos3 DiT
+    # as W8A16 when the checkpoint's diffusion_step_policy asks for it; the
+    # same FP8 weights are dequantized per call and fed to a 16-bit GEMM.
+    # Kill-switch: set 0 to run pure W8A8 regardless of the checkpoint.
+    "SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION", "true"
+    ),
+    # Manual overrides for experiments: setting either explicitly overrides
+    # that field of the checkpoint policy, or force-enables mixed precision
+    # on a checkpoint without one (the other field then takes the default
+    # below). When neither is set, the checkpoint fully owns the behavior.
+    "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS": _lazy_int(
+        "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS", 3
+    ),
+    "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS": _lazy_int(
+        "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS", 3
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

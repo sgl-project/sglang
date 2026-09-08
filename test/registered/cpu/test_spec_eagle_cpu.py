@@ -20,7 +20,7 @@ from sglang.test.server_fixtures.spec_eagle_fixture import EagleLlama2Base
 # Measured 780s all-green on a 40-core GNR socket (1 launch + 18 methods).
 register_cpu_ci(
     est_time=800,
-    suite="base-b-test-cpu",
+    suite="stage-a-test-cpu-intel",
     disabled="EagleLlama2Base needs gated meta-llama/Llama-2-7b-chat-hf",
 )
 

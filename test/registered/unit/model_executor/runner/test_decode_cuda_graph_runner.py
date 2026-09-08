@@ -60,13 +60,17 @@ class TestInitProfileBatchMode(CustomTestCase):
         env = {_BATCH_CAPTURE: "1"}
         if profiler_dir is not None:
             env["SGLANG_TORCH_PROFILER_DIR"] = profiler_dir
-        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
-            mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
-        ), mock.patch.object(mod, "profile") as mock_profile, mock.patch(
-            "torch.profiler.schedule"
-        ) as mock_schedule, mock.patch(
-            "torch.cuda.memory._record_memory_history"
-        ) as mock_record_history:
+        with (
+            mock.patch.dict(os.environ, env, clear=False),
+            mock.patch.object(
+                mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
+            ),
+            mock.patch.object(mod, "profile") as mock_profile,
+            mock.patch("torch.profiler.schedule") as mock_schedule,
+            mock.patch(
+                "torch.cuda.memory._record_memory_history"
+            ) as mock_record_history,
+        ):
             os.environ.pop(_CAPTURE_TRACE, None)  # original flag off
             if profiler_dir is None:
                 os.environ.pop("SGLANG_TORCH_PROFILER_DIR", None)
@@ -110,19 +114,16 @@ class TestInitProfileBatchMode(CustomTestCase):
         # No SGLANG_TORCH_PROFILER_DIR -> falls back to the envs default base dir.
         # Patch makedirs so the test never writes to the cwd.
         fake_self = _make_fake_self([1])
-        with mock.patch.dict(
-            os.environ, {_BATCH_CAPTURE: "1"}, clear=False
-        ), mock.patch.object(
-            mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
-        ), mock.patch.object(
-            mod, "profile"
-        ), mock.patch(
-            "torch.profiler.schedule"
-        ), mock.patch(
-            "torch.cuda.memory._record_memory_history"
-        ), mock.patch.object(
-            mod.os, "makedirs"
-        ) as mock_makedirs:
+        with (
+            mock.patch.dict(os.environ, {_BATCH_CAPTURE: "1"}, clear=False),
+            mock.patch.object(
+                mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+            ),
+            mock.patch.object(mod, "profile"),
+            mock.patch("torch.profiler.schedule"),
+            mock.patch("torch.cuda.memory._record_memory_history"),
+            mock.patch.object(mod.os, "makedirs") as mock_makedirs,
+        ):
             os.environ.pop("SGLANG_TORCH_PROFILER_DIR", None)
             os.environ.pop(_CAPTURE_TRACE, None)
             DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
@@ -143,12 +144,14 @@ class TestInitProfileOriginalMode(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             environ = dict(env)
             environ["SGLANG_TORCH_PROFILER_DIR"] = tmp
-            with mock.patch.dict(os.environ, environ, clear=False), mock.patch.object(
-                mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
-            ), mock.patch.object(mod, "profile") as mock_profile, mock.patch(
-                "torch.profiler.schedule"
-            ) as mock_schedule, mock.patch(
-                "torch.cuda.memory._record_memory_history"
+            with (
+                mock.patch.dict(os.environ, environ, clear=False),
+                mock.patch.object(
+                    mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+                ),
+                mock.patch.object(mod, "profile") as mock_profile,
+                mock.patch("torch.profiler.schedule") as mock_schedule,
+                mock.patch("torch.cuda.memory._record_memory_history"),
             ):
                 for k in (_CAPTURE_TRACE, _BATCH_CAPTURE):
                     if k not in environ:
@@ -176,18 +179,18 @@ class TestInitProfileOriginalMode(CustomTestCase):
 class TestOnTraceReadyNaming(CustomTestCase):
     def _build_on_trace_ready(self, *, capture_bs, rank, tmp):
         fake_self = _make_fake_self(capture_bs)
-        with mock.patch.dict(
-            os.environ,
-            {"SGLANG_TORCH_PROFILER_DIR": tmp, _BATCH_CAPTURE: "1"},
-            clear=False,
-        ), mock.patch.object(
-            mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
-        ), mock.patch.object(
-            mod, "profile"
-        ) as mock_profile, mock.patch(
-            "torch.profiler.schedule"
-        ), mock.patch(
-            "torch.cuda.memory._record_memory_history"
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"SGLANG_TORCH_PROFILER_DIR": tmp, _BATCH_CAPTURE: "1"},
+                clear=False,
+            ),
+            mock.patch.object(
+                mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
+            ),
+            mock.patch.object(mod, "profile") as mock_profile,
+            mock.patch("torch.profiler.schedule"),
+            mock.patch("torch.cuda.memory._record_memory_history"),
         ):
             os.environ.pop(_CAPTURE_TRACE, None)
             DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)

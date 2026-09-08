@@ -7,7 +7,7 @@ from starlette.datastructures import Headers
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=4, suite="base-b-test-cpu")
+register_cpu_ci(est_time=4, suite="stage-a-test-cpu-intel")
 
 
 def _obj():

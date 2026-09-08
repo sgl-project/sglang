@@ -688,6 +688,49 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
     ),
+    DiffusionTestCase(
+        "fasth3_t2va_vsa_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+            modality="video",
+            num_gpus=4,
+            extras=[
+                "--attention-backend",
+                "video_sparse_attn_h3",
+                "--attention-backend-config",
+                '{"VSA_sparsity": 0.9}',
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A curious raccoon peers through a vibrant field of yellow "
+                "sunflowers, its eyes wide with interest."
+            ),
+            output_size="1344x768",
+            seconds=5,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 5.0,
+                },
+                "num_inference_steps": 5,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
 ]
 
 TWO_GPU_CASES = [

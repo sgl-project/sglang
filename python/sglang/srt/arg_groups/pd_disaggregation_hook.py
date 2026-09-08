@@ -129,9 +129,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     elif cfg.disaggregation_mode == "prefill":
-        assert (
-            cfg.disaggregation_transfer_backend != "fake"
-        ), "Prefill server does not support 'fake' as the transfer backend"
+        assert cfg.disaggregation_transfer_backend != "fake", (
+            "Prefill server does not support 'fake' as the transfer backend"
+        )
 
         if envs.SGLANG_RUST_SERVER.get():
             _alias_bootstrap_port_to_api_port(server_args)

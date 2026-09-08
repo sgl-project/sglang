@@ -424,9 +424,9 @@ def bench_api(
     (excluded from latency measurement).
     """
     items = setup_fn()
-    assert (
-        len(items) >= num_ops + warmup
-    ), f"need {num_ops + warmup} items, got {len(items)}"
+    assert len(items) >= num_ops + warmup, (
+        f"need {num_ops + warmup} items, got {len(items)}"
+    )
 
     for i in range(warmup):
         op_fn(items[i])

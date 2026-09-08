@@ -161,12 +161,12 @@ def cutlass_fused_experts_fp8(
             w2_q.shape[1] // 32,
             w2_q.shape[2],
         )
-        assert (
-            w1_scale.shape == expected_w1_scale_shape
-        ), f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
-        assert (
-            w2_scale.shape == expected_w2_scale_shape
-        ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
+        assert w1_scale.shape == expected_w1_scale_shape, (
+            f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
+        )
+        assert w2_scale.shape == expected_w2_scale_shape, (
+            f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
+        )
 
         mxfp8_blockscale_align = 128
         total_tokens = m * topk

@@ -291,7 +291,6 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
 
 
 class TestVerifyLenAnchorContract(CustomTestCase):
-
     @_for_each_impl
     def test_explicit_zero_min_still_clamped_to_anchor(self, impl):
         survival = _survival_from_confidence(

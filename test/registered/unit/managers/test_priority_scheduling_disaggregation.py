@@ -451,18 +451,21 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.waiting_queue[0].priority = 1
         scheduler.waiting_queue[1].priority = 10
         scheduler.enable_priority_scheduling = True
-        scheduler.policy.calc_priority.side_effect = (
-            lambda waiting_queue, _: waiting_queue.sort(key=lambda req: -req.priority)
+        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
+            waiting_queue.sort(key=lambda req: -req.priority)
         )
 
         new_batch = MagicMock()
         # get_new_prebuilt_batch reads the published disagg config
         # (disaggregation_decode_enable_radix_cache).
-        with patch(
-            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
-            return_value=new_batch,
-        ) as init_new, get_context().override_server_args(
-            disaggregation_decode_enable_radix_cache=False
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ) as init_new,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
         ):
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch
@@ -490,11 +493,14 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
         new_batch.process_prebuilt.side_effect = lambda *_: call_order.append("process")
 
-        with patch(
-            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
-            return_value=new_batch,
-        ), get_context().override_server_args(
-            disaggregation_decode_enable_radix_cache=False
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ),
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
         ):
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch

@@ -48,7 +48,7 @@ OTHER_ARGS = [
     "--max-running-requests",
     32,
     "--chunked-prefill-size",
-    262144,
+    32768,
     "--context-length",
     75000,
     "--enable-multimodal",

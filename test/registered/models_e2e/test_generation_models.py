@@ -129,7 +129,6 @@ TORCH_DTYPES = [torch.float16]
 
 
 class TestGenerationModels(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)

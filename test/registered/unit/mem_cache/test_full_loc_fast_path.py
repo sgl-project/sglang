@@ -176,7 +176,10 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
         # A real sub-allocator (not a stand-in): the translation reads its v2p
         # table, and the pool reaches it through the allocator's own method.
         swa_allocator = object.__new__(MultiEndedAllocator)
+        # `page_size` is the WIDENED (DCP) surface, `pool_page_size` the physical
+        # rows per page; equal at dcp_size == 1, which is what this fixture is.
         swa_allocator.page_size = page_size
+        swa_allocator.pool_page_size = page_size
         swa_allocator.virtual_to_physical = v2p
         swa_allocator.kernel_page_multiplier = multiplier
         pool = object.__new__(UnifiedSWAKVPool)
@@ -350,6 +353,62 @@ class TestHybridLinearMLARouting(unittest.TestCase):
 
         self.assertEqual(len(pool.full_kv_pool.mla_get_calls), 1)
         self.assertIs(pool.full_kv_pool.mla_get_calls[0], loc)
+
+
+class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
+    """Which MLA write door is DCP-aware, and which refuses.
+
+    `set_mla_kv_buffer` resolves the owner rule inside its kernel, so it owns
+    the DCP write. `set_kv_buffer` (the combined latent+rope row) cannot: the
+    two backends that could reach it disagree on the loc space -- flashinfer's
+    `k_rope is None` branch passes a WIDENED loc, the Triton backend one it
+    already collapsed -- so there is no single correct translation. It used to
+    select `loc % dcp_size == dcp_rank` and then write WITHOUT dividing, i.e.
+    widened ids straight into a rank-local buffer. Refusing is the contract;
+    a re-added masked-but-undivided write is what this guards."""
+
+    def _bare_mla_pool(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        pool = object.__new__(MLATokenToKVPool)
+        pool.size = 64
+        pool.page_size = 1
+        pool.kernel_page_blocks = 1
+        pool.start_layer = 0
+        pool.dtype = torch.float16
+        pool.store_dtype = torch.float16
+        pool.dsa_kv_cache_store_fp8 = False
+        pool.kv_buffer = [torch.zeros((65, 1, 8), dtype=torch.float16)]
+        return pool
+
+    def test_set_kv_buffer_refuses_under_dcp(self):
+        from sglang.srt.runtime_context import get_parallel
+
+        pool = self._bare_mla_pool()
+        layer = types.SimpleNamespace(layer_id=0)
+        loc = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        cache_k = torch.ones((4, 1, 8), dtype=torch.float16)
+
+        with get_parallel().override(
+            dcp_enabled=True, attn_dcp_size=2, attn_dcp_rank=1
+        ):
+            with self.assertRaises(AssertionError) as cm:
+                pool.set_kv_buffer(layer, _loc_info(loc), cache_k, None)
+        self.assertIn("set_mla_kv_buffer", str(cm.exception))
+        # Nothing was written on the way to refusing.
+        self.assertTrue(bool((pool.kv_buffer[0] == 0).all()))
+
+    def test_set_kv_buffer_still_writes_without_dcp(self):
+        pool = self._bare_mla_pool()
+        layer = types.SimpleNamespace(layer_id=0)
+        loc = torch.tensor([3, 5], dtype=torch.int64)
+        cache_k = torch.ones((2, 1, 8), dtype=torch.float16)
+
+        pool.set_kv_buffer(layer, _loc_info(loc), cache_k, None)
+
+        self.assertTrue(bool((pool.kv_buffer[0][3] == 1).all()))
+        self.assertTrue(bool((pool.kv_buffer[0][5] == 1).all()))
+        self.assertTrue(bool((pool.kv_buffer[0][4] == 0).all()))
 
 
 if __name__ == "__main__":

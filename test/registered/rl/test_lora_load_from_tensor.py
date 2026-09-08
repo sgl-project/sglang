@@ -63,7 +63,7 @@ class TestLoRALoadFromTensor(CustomTestCase):
         # This should trigger LRU eviction when we exceed the limit
         TEST_LORA_COUNT = 10
         for i in range(TEST_LORA_COUNT):
-            print(f"[Test]Loading LoRA adapter {i+1}/10: self_cognition_Alice_{i}")
+            print(f"[Test]Loading LoRA adapter {i + 1}/10: self_cognition_Alice_{i}")
             result = test_engine.load_lora_adapter_from_tensors(
                 lora_name=f"self_cognition_Alice_{i}",
                 tensors=self.lora_tensors,
@@ -74,7 +74,7 @@ class TestLoRALoadFromTensor(CustomTestCase):
                 f"Failed to load LoRA adapter {i}: {result.error_message}",
             )
             print(
-                f"[Test]Successfully loaded LoRA {i+1}, current loaded adapters: {list(result.loaded_adapters.keys())}"
+                f"[Test]Successfully loaded LoRA {i + 1}, current loaded adapters: {list(result.loaded_adapters.keys())}"
             )
 
         EXPECTED_LORA_ADAPTERS = [

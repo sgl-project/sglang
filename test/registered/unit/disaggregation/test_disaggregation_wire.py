@@ -445,12 +445,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             # positions are passed through unremapped.
             ("other", False, False, False, unremapped),
         ):
-            with self.subTest(platform=platform), envs.SGLANG_DSA_FUSE_TOPK.override(
-                True
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip
+            with (
+                self.subTest(platform=platform),
+                envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
+                ),
+                patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip),
             ):
                 self.assertEqual(
                     should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True),

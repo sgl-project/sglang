@@ -353,7 +353,13 @@ class ModelConfig:
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
         )
-        self.is_lm_only = getattr(self.hf_config, "language_model_only", False)
+        # Text-only serving comes from either the checkpoint's own declaration
+        # or the --language-model-only flag; every capability flag below
+        # (is_multimodal, is_*_understandable_model) must see both sources,
+        # since /model_info advertises them and drives media warmup requests.
+        self.is_lm_only = language_model_only or getattr(
+            self.hf_config, "language_model_only", False
+        )
         self.model_is_mrope = (
             not self.is_lm_only
             and rope_scaling is not None
@@ -576,6 +582,7 @@ class ModelConfig:
         self.hf_eos_token_id = self._get_hf_eos_token_id()
         # Set by scheduler when reasoning_parser is enabled
         self.think_end_ids: Optional[List[int]] = None
+        self.request_selectable_think_end_id_sequences: Optional[List[List[int]]] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -587,7 +594,7 @@ class ModelConfig:
         # Checkpoints declare this one themselves (hf_transformers/processor.py),
         # so the flag may only turn it on: writing the default back would build a
         # vision tower with no weights to fill.
-        self.hf_config.language_model_only = language_model_only or self.is_lm_only
+        self.hf_config.language_model_only = self.is_lm_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
@@ -1352,8 +1359,23 @@ class ModelConfig:
         return quant_cfg
 
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
-        """Parse ModelOpt quantization config and return the appropriate quant_method."""
-        json_quant_configs = quant_config_dict["quantization"]
+        """Parse ModelOpt quantization config and return the appropriate quant_method.
+
+        Supports both nested LLM ``hf_quant_config.json``::
+
+            {"quantization": {"quant_algo": "FP8", ...}}
+
+        and flat formats (``config.json`` ``quantization_config``, or diffusion /
+        unified ModelOpt exports such as Cosmos3)::
+
+            {"quant_algo": "FP8", "quant_method": "modelopt", ...}
+        """
+        if "quantization" in quant_config_dict:
+            json_quant_configs = quant_config_dict["quantization"]
+        elif "quant_algo" in quant_config_dict:
+            json_quant_configs = quant_config_dict
+        else:
+            return None
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
@@ -1593,7 +1615,6 @@ class ModelConfig:
             # of an NVFP4/mixed checkpoint) must not be overridden back to the
             # source format
             if self.quantization not in REQUANTIZATION_METHODS:
-
                 # Detect which checkpoint is it
                 if not preserve_online_draft_quantization:
                     for _, method in QUANTIZATION_METHODS.items():
@@ -1886,6 +1907,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 multimodal_model_archs = [
     "CLIPModel",
     "Cohere2VisionForConditionalGeneration",
+    "Cosmos3EdgeForConditionalGeneration",
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -2242,12 +2264,14 @@ def get_hybrid_layer_ids(
     elif "InklingForConditionalGeneration" in model_architectures:
         local_layer_ids = hf_text_config.local_layer_ids
         local_layer_id_set = set(local_layer_ids)
-        assert len(local_layer_id_set) == len(
-            local_layer_ids
-        ), f"Inkling local_layer_ids must be unique: {local_layer_ids}"
+        assert len(local_layer_id_set) == len(local_layer_ids), (
+            f"Inkling local_layer_ids must be unique: {local_layer_ids}"
+        )
         assert all(
             0 <= layer_id < num_hidden_layers for layer_id in local_layer_id_set
-        ), f"Inkling local_layer_ids must be in [0, {num_hidden_layers}): {local_layer_ids}"
+        ), (
+            f"Inkling local_layer_ids must be in [0, {num_hidden_layers}): {local_layer_ids}"
+        )
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if i in local_layer_id_set
         ]

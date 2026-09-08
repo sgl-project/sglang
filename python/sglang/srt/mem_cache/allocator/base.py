@@ -93,7 +93,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def get_kvcache(self):
         return self._kvcache
 
+    def get_all_free_pages(self):
+        # Debug / invariant census; None when the pool has no page free list.
+        if self.free_pages is None:
+            return None
+        if self.release_pages is None or len(self.release_pages) == 0:
+            return self.free_pages
+        return torch.cat((self.free_pages, self.release_pages))
+
     def free_group_begin(self):
+        assert self.free_group is None, "free groups cannot be nested"
         self.free_group = []
 
     def free_group_end(self):
@@ -165,25 +174,49 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.free(free_index)
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a
-        page-aligned copy); subclasses may use ``start_pos`` to skip the
-        data-dependent dedup. Default: plain free()."""
+        """Free ``kv_row[start_pos : start_pos + n]`` of one request.
+
+        In page units the segment is ``[start_pos // ps, ceil(end / ps))``:
+        ``start_pos`` sits on a page boundary, the end may fall mid-page, and
+        the whole last page is released. Default: plain free()."""
+        assert start_pos % self.page_size == 0, (
+            f"segment start {start_pos} is not page-aligned"
+        )
         self.free(free_index)
 
     def free_segments(self, segments):
-        """Free disjoint ascending ``(free_index, start_pos)`` segments of one
-        request's kv row; a boundary page shared by consecutive segments is
-        emitted once (the later segment's head is trimmed)."""
+        """Free several ``(free_index, start_pos)`` segments of one request's
+        kv row.
+
+        Each segment covers the pages ``[start_pos // ps, ceil(end / ps))``.
+        Starts sit on page boundaries, ends may fall mid-page, and the page
+        ranges of consecutive segments do not overlap -- so in page units the
+        segments are aligned and disjoint, and every page is released once."""
+        for free_index, start_pos in self._page_disjoint(segments):
+            self.free_segment(free_index, start_pos=start_pos)
+
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """free_full() for a kv-row segment; same start-alignment contract as
+        free_segment(). Default: plain free_full()."""
+        assert start_pos % self.page_size == 0, (
+            f"segment start {start_pos} is not page-aligned"
+        )
+        self.free_full(free_index)
+
+    def free_full_segments(self, segments):
+        """free_segments() for the full side alone; see free_full()."""
+        for free_index, start_pos in self._page_disjoint(segments):
+            self.free_full_segment(free_index, start_pos=start_pos)
+
+    def _page_disjoint(self, segments):
         ps = self.page_size
         prev_end = None
         for free_index, start_pos in segments:
             n = free_index.numel()
             if n == 0:
                 continue
-            seg_end = start_pos + n
-            if prev_end is not None and start_pos // ps == (prev_end - 1) // ps:
-                boundary = (start_pos // ps + 1) * ps
-                free_index = free_index[boundary - start_pos :]
-                start_pos = boundary
-            prev_end = seg_end
-            self.free_segment(free_index, start_pos=start_pos)
+            assert prev_end is None or start_pos // ps > (prev_end - 1) // ps, (
+                f"segment at {start_pos} shares a page with the one ending at {prev_end}"
+            )
+            prev_end = start_pos + n
+            yield free_index, start_pos

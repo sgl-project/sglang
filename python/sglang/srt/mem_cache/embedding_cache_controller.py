@@ -583,7 +583,7 @@ class EmbeddingCacheController:
                         self._lru_touch(mm_hash)
                     else:
                         logger.debug(
-                            f"Req {req_id}: {mm_hash} is FILLING; " f"treating as miss."
+                            f"Req {req_id}: {mm_hash} is FILLING; treating as miss."
                         )
                     continue
 

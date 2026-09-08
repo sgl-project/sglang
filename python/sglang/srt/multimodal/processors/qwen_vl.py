@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
 from sglang.srt.models.interns2_mobius import (
     InternS2MobiusForConditionalGeneration,
 )
@@ -98,9 +99,7 @@ if _is_cpu and _is_cpu_amx_available:
 
         from sglang.srt.layers.amx_utils import fast_preprocess_cpu
 
-        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = (
-            fast_preprocess_cpu
-        )
+        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = fast_preprocess_cpu
     except Exception as e:
         logger.warning(
             f"Failed to hack Qwen2VLImageProcessorFast with AMX optimization: {e}"
@@ -178,9 +177,9 @@ def smart_nframes(
     Returns:
         int: the number of frames for video used for model inputs.
     """
-    assert not (
-        "fps" in ele and "nframes" in ele
-    ), "Only accept either `fps` or `nframes`"
+    assert not ("fps" in ele and "nframes" in ele), (
+        "Only accept either `fps` or `nframes`"
+    )
     if "nframes" in ele:
         nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
     else:
@@ -300,6 +299,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         InternS2PreviewForConditionalGeneration,
         InternS2MobiusForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
+        Cosmos3ForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -523,6 +523,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
             "interns2_mobius",
+            "cosmos3_omni",
         ):
             return None
 
@@ -658,6 +659,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "qwen3_5",
                 "qwen3_5_moe",
                 "intern_s2_preview",
+                "cosmos3_omni",
             ]
             and video_timestamps is not None
         ):
@@ -767,6 +769,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
             "interns2_mobius",
+            "cosmos3_omni",
         ):
             processor_kwargs.update(
                 video_metadata=video_metadata,

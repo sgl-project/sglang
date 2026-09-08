@@ -361,8 +361,7 @@ class UMBPStore(HiCacheStorage):
             ssd_backend = str(extra["ssd_backend"]).strip().lower()
             if ssd_backend not in ("file", "spdk", "spdk_proxy"):
                 raise ValueError(
-                    "extra_config['ssd_backend'] must be one of: "
-                    "file, spdk, spdk_proxy"
+                    "extra_config['ssd_backend'] must be one of: file, spdk, spdk_proxy"
                 )
             cfg.ssd.ssd_backend = ssd_backend
         if "spdk_nvme_pci_addr" in extra:

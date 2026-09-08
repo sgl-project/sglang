@@ -13,7 +13,6 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
-
     def __init__(
         self,
         cpu_group: ProcessGroup,

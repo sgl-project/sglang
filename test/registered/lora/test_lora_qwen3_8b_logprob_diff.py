@@ -103,7 +103,6 @@ def _build_qwen3_mock():
 
 
 class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
-
     def test_auto_detect_lora_target_modules(self):
         """Verify auto_detect_lora_target_modules returns the expected module
         set for a Qwen3-8B-like (dense) architecture.  Catches silent renames

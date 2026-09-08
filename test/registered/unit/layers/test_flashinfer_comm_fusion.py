@@ -484,9 +484,12 @@ class TestTagGroupsForFlashInferAllReduceOnly(CustomTestCase):
     def _tag(self, *, attn_tp, moe_ep, moe_tp):
         from sglang.srt.distributed import parallel_state as ps
 
-        with patch.object(ps, "_ENABLE_FLASHINFER_ALLREDUCE_ONLY", True), patch.object(
-            ps, "_ATTN_TP", attn_tp
-        ), patch.object(ps, "_MOE_EP", moe_ep), patch.object(ps, "_MOE_TP", moe_tp):
+        with (
+            patch.object(ps, "_ENABLE_FLASHINFER_ALLREDUCE_ONLY", True),
+            patch.object(ps, "_ATTN_TP", attn_tp),
+            patch.object(ps, "_MOE_EP", moe_ep),
+            patch.object(ps, "_MOE_TP", moe_tp),
+        ):
             ps._tag_groups_for_flashinfer_allreduce_only()
 
     def test_hybrid_ep_tp_tags_only_the_ep_group(self):

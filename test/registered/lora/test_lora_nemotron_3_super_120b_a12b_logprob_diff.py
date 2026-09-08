@@ -73,7 +73,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
 
 
 class TestLoRANemotron3Super120B_A12B_LogprobDiff(CustomTestCase):
-
     def test_lora_nemotron_3_super_120b_a12b_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,

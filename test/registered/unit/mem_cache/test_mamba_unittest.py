@@ -300,17 +300,17 @@ class TestMamba(unittest.TestCase):
         full_num_tokens = 1
         print(f"evicting {full_num_tokens} full token")
         result = tree.evict(EvictParams(num_tokens=full_num_tokens))
-        assert (
-            result.num_tokens_evicted >= full_num_tokens
-        ), f"evicted {result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
+        assert result.num_tokens_evicted >= full_num_tokens, (
+            f"evicted {result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
+        )
         tree.pretty_print()
 
         mamba_num = 1
         print(f"evicting {mamba_num} mamba")
         result = tree.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-        assert (
-            result.mamba_num_evicted >= mamba_num
-        ), f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        assert result.mamba_num_evicted >= mamba_num, (
+            f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        )
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
@@ -348,9 +348,9 @@ class TestMamba(unittest.TestCase):
         mamba_num = 1
         print(f"evicting {mamba_num} mamba")
         result = tree.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-        assert (
-            result.mamba_num_evicted >= mamba_num
-        ), f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        assert result.mamba_num_evicted >= mamba_num, (
+            f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        )
         tree.pretty_print()
 
         req8_token_ids = [1, 2, 3, 4, 5, 60, 70]

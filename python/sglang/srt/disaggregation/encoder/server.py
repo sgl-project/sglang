@@ -950,9 +950,10 @@ class MMEncoder:
         modality_str = modality.name.lower()
         preprocess_start = time.perf_counter()
         try:
-            preprocess_result, items_per_req = (
-                await self.preprocessor.process_batch_mm_items(requests, modality)
-            )
+            (
+                preprocess_result,
+                items_per_req,
+            ) = await self.preprocessor.process_batch_mm_items(requests, modality)
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
         except Exception as e:

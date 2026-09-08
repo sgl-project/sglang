@@ -191,8 +191,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
             )
         if not get_platform().is_sm100:
             raise ValueError(
-                f"--bf16-gemm-backend {backend.value} requires "
-                "SM100/SM103 (Blackwell)"
+                f"--bf16-gemm-backend {backend.value} requires SM100/SM103 (Blackwell)"
             )
 
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
@@ -1079,11 +1078,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             return StandardCombineInput(hidden_states=output)
         else:
             assert backend.is_triton()
-            assert (
-                moe_runner_config.activation == "silu"
-            ), f"activation = {moe_runner_config.activation} is not supported \
+            assert moe_runner_config.activation == "silu", (
+                f"activation = {moe_runner_config.activation} is not supported \
             for Triton PATH, please drop --moe-runner-backend triton to use \
             the sgl-kernel-xpu path, which supports more activations."
+            )
 
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)

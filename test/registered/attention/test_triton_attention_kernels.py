@@ -152,7 +152,6 @@ def decode_attention_fwd_torch(
 
 
 class TestTritonAttention(CustomTestCase):
-
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
         random.seed(seed)

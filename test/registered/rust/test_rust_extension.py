@@ -59,7 +59,8 @@ features = ["python"]
 [lib]
 name = "demo_extension"
 crate-type = ["cdylib"]
-""".strip() + "\n",
+""".strip()
+            + "\n",
             encoding="utf-8",
         )
         (crate / "lib.rs").write_text("fn input() {}\n", encoding="utf-8")

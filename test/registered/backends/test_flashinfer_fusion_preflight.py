@@ -62,9 +62,7 @@ def _run_rank(rank, world_size, port, scenario, result_q):
 
             free, _total = torch.cuda.mem_get_info(rank)
             target = max(free - (1 << 30), 0)
-            granularity_flag = (
-                cuda_driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
-            )
+            granularity_flag = cuda_driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
             err, gran = cuda_driver.cuMemGetAllocationGranularity(
                 prop,
                 granularity_flag,

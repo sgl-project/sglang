@@ -60,7 +60,6 @@ def _quant_blockwise(w: torch.Tensor, block: int = 128):
     "requires HPC-Ops (install from source: https://github.com/Tencent/hpc-ops) and an SM90 (Hopper) GPU",
 )
 class TestHpcOpsMoeBlockwise(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))

@@ -3,10 +3,10 @@
 
 Fuses every decoder ``WanRMS_norm -> SiLU`` chain into one Triton kernel on
 the channels_last_3d layout. Wrappers are installed once at VAE load and
-dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality == "high"``
-runs the fused kernel (not bitwise-identical to aten, hence gated), the
-``"lossless"`` default runs the original module path bit-for-bit. Install is
-all-or-nothing and fail-closed.
+dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality="extra-high"``
+and ``quality="high"`` run the fused kernel (not bitwise-identical to aten,
+hence gated), while the ``"lossless"`` default runs the original module path
+bit-for-bit. Install is all-or-nothing and fail-closed.
 """
 
 import torch

@@ -486,9 +486,9 @@ class DeepseekMHAForwardMixin:
         if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
             backend = backend.primary
         kv_indices = backend.forward_metadata.page_table_1_flattened
-        assert (
-            kv_indices is not None
-        ), "page_table_1_flattened should have been generated for FP8 MHA path"
+        assert kv_indices is not None, (
+            "page_table_1_flattened should have been generated for FP8 MHA path"
+        )
 
         if _use_aiter_gfx95:
             # ROCm (gfx950) stores the FP8 MLA KV in the raw
@@ -499,6 +499,10 @@ class DeepseekMHAForwardMixin:
             # Without this, a chunked-prefill split (extend_prefix_lens != 0) that
             # reads cached prefix KV crashes with "576 != 656".
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
+            # Read door: the pool never translates, so the production site does.
+            kv_indices = get_attn_backend().kv_index_translator.translate_dcp_read_ids(
+                kv_indices
+            )
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, torch.bfloat16
             )

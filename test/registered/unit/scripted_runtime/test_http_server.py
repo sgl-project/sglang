@@ -28,7 +28,6 @@ _NO_REPLY = object()
 
 
 class _PairSocketHarness:
-
     def __init__(self, *, reply: object = _NO_REPLY) -> None:
         self._ctx = zmq.Context()
         self.server_socket = self._ctx.socket(zmq.PAIR)
@@ -62,7 +61,6 @@ class _PairSocketHarness:
 
 
 class _FakeProcess:
-
     def __init__(self, *, alive: bool) -> None:
         self._alive = alive
 
@@ -79,7 +77,6 @@ def _make_server(socket: zmq.Socket, process: _FakeProcess) -> ScriptedHttpServe
 
 
 class TestExecuteScriptReplyMatching(CustomTestCase):
-
     def test_returns_on_script_succeeded(self):
         with _PairSocketHarness(reply=ScriptSucceeded()) as pair:
             server = _make_server(pair.server_socket, _FakeProcess(alive=True))
@@ -116,7 +113,6 @@ class TestExecuteScriptReplyMatching(CustomTestCase):
 
 
 class TestExecuteScriptNoReply(CustomTestCase):
-
     def test_timeout_when_process_still_alive(self):
         with _PairSocketHarness() as pair:
             server = _make_server(pair.server_socket, _FakeProcess(alive=True))
@@ -135,7 +131,6 @@ class TestExecuteScriptNoReply(CustomTestCase):
 
 
 class TestExecuteScriptDirtyGuard(CustomTestCase):
-
     def test_refuses_to_run_when_already_dirty(self):
         with _PairSocketHarness() as pair:
             server = _make_server(pair.server_socket, _FakeProcess(alive=True))

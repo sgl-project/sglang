@@ -149,9 +149,9 @@ def _compare(
     # Invalid positions in SM120 output must be -inf
     positions = torch.arange(max_seq_len, device=sm120.device)
     invalid = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
-    assert torch.all(
-        torch.isinf(sm120[invalid]) & (sm120[invalid] < 0)
-    ), "SM120 output must fill invalid positions with -inf"
+    assert torch.all(torch.isinf(sm120[invalid]) & (sm120[invalid] < 0)), (
+        "SM120 output must fill invalid positions with -inf"
+    )
 
 
 class TestSM120PagedMqaLogitsTorch(CustomTestCase):

@@ -382,9 +382,9 @@ def compute_cu_seqlens_from_grid_numpy(grid_thw: torch.Tensor) -> torch.Tensor:
     Returns:
         cu_seqlens: 1D int32 tensor on CPU, shape [N + 1]
     """
-    assert (
-        grid_thw.device.type == "cpu"
-    ), "compute_cu_seqlens_from_grid_numpy expects a CPU tensor"
+    assert grid_thw.device.type == "cpu", (
+        "compute_cu_seqlens_from_grid_numpy expects a CPU tensor"
+    )
     arr = grid_thw.numpy()
 
     cu_seqlens = np.repeat(arr[:, 1] * arr[:, 2], arr[:, 0]).cumsum(

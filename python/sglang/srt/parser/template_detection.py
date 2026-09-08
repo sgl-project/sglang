@@ -146,6 +146,15 @@ def _has_toggle_default_assignment(
 
 REASONING_MODE_RULES = (
     DetectionRule(
+        name="k2_v3_reasoning_effort",
+        value=ReasoningToggleConfig(special_case="always"),
+        predicate=lambda ctx: (
+            ctx.has_text("<ifm|think>")
+            and ctx.has_text("<ifm|think_fast>")
+            and ctx.has_text("reasoning_effort")
+        ),
+    ),
+    DetectionRule(
         name="gpt_oss_channel_markers",
         value=ReasoningToggleConfig(special_case="always"),
         predicate=lambda ctx: ctx.has_text("<|channel|>"),
@@ -153,27 +162,32 @@ REASONING_MODE_RULES = (
     DetectionRule(
         name="force_reasoning_pattern",
         value=ReasoningToggleConfig(special_case="always"),
-        predicate=lambda ctx: ctx.has_pattern(r"<\|im_start\|>assistant\\n<think>\\n")
-        and not ctx.has_text("enable_thinking")
-        and not ctx.has_text("thinking"),
+        predicate=lambda ctx: (
+            ctx.has_pattern(r"<\|im_start\|>assistant\\n<think>\\n")
+            and not ctx.has_text("enable_thinking")
+            and not ctx.has_text("thinking")
+        ),
     ),
     DetectionRule(
         name="mistral_reasoning_effort",
         value=ReasoningToggleConfig(special_case="mistral"),
-        predicate=lambda ctx: ctx.has_text("reasoning_effort")
-        and ctx.has_text("[THINK]"),
+        predicate=lambda ctx: (
+            ctx.has_text("reasoning_effort") and ctx.has_text("[THINK]")
+        ),
     ),
     DetectionRule(
         name="explicit_enable_thinking_default_false",
         value=ReasoningToggleConfig(
             toggle_param="enable_thinking", default_enabled=False
         ),
-        predicate=lambda ctx: ctx.has_pattern(
-            r"{%\s*if\s+not\s+enable_thinking\s+is\s+defined\s*%}.*?"
-            r"{%\s*set\s+enable_thinking\s*=\s*(?:false|False)\s*%}",
-            re.DOTALL,
-        )
-        or _has_toggle_default_assignment(ctx, "enable_thinking", False),
+        predicate=lambda ctx: (
+            ctx.has_pattern(
+                r"{%\s*if\s+not\s+enable_thinking\s+is\s+defined\s*%}.*?"
+                r"{%\s*set\s+enable_thinking\s*=\s*(?:false|False)\s*%}",
+                re.DOTALL,
+            )
+            or _has_toggle_default_assignment(ctx, "enable_thinking", False)
+        ),
     ),
     DetectionRule(
         name="nemotron_3_super_low_effort",
@@ -182,58 +196,65 @@ REASONING_MODE_RULES = (
             default_enabled=True,
             effort_kwarg="low_effort",
         ),
-        predicate=lambda ctx: ctx.has_text("low_effort")
-        and ctx.has_text("truncate_history_thinking"),
+        predicate=lambda ctx: (
+            ctx.has_text("low_effort") and ctx.has_text("truncate_history_thinking")
+        ),
     ),
     DetectionRule(
         name="enable_thinking_default_true",
         value=ReasoningToggleConfig(
             toggle_param="enable_thinking", default_enabled=True
         ),
-        predicate=lambda ctx: ctx.has_pattern(
-            r"{%\s*if\s+not\s+enable_thinking\s+is\s+defined\s*%}.*?"
-            r"{%\s*set\s+enable_thinking\s*=\s*(?:true|True)\s*%}",
-            re.DOTALL,
-        )
-        or ctx.has_pattern(
-            r"set\s+enable_thinking\s*=\s*enable_thinking\s+if\s+enable_thinking\s+is\s+defined\s+else\s+(?:true|True)"
-        )
-        or ctx.has_pattern(
-            r"enable_thinking\s+is\s+defined\s+and\s+(?:enable_thinking\s+is\s+false|not\s+enable_thinking)"
-        )
-        or ctx.has_pattern(
-            r"enable_thinking\s+is\s+not\s+defined\s+or\s+enable_thinking"
-        )
-        or ctx.has_pattern(r"namespace\([^)]*enable_thinking\s*=\s*true")
-        or _has_toggle_default_assignment(ctx, "enable_thinking", True),
+        predicate=lambda ctx: (
+            ctx.has_pattern(
+                r"{%\s*if\s+not\s+enable_thinking\s+is\s+defined\s*%}.*?"
+                r"{%\s*set\s+enable_thinking\s*=\s*(?:true|True)\s*%}",
+                re.DOTALL,
+            )
+            or ctx.has_pattern(
+                r"set\s+enable_thinking\s*=\s*enable_thinking\s+if\s+enable_thinking\s+is\s+defined\s+else\s+(?:true|True)"
+            )
+            or ctx.has_pattern(
+                r"enable_thinking\s+is\s+defined\s+and\s+(?:enable_thinking\s+is\s+false|not\s+enable_thinking)"
+            )
+            or ctx.has_pattern(
+                r"enable_thinking\s+is\s+not\s+defined\s+or\s+enable_thinking"
+            )
+            or ctx.has_pattern(r"namespace\([^)]*enable_thinking\s*=\s*true")
+            or _has_toggle_default_assignment(ctx, "enable_thinking", True)
+        ),
     ),
     DetectionRule(
         name="explicit_thinking_default_false",
         value=ReasoningToggleConfig(toggle_param="thinking", default_enabled=False),
-        predicate=lambda ctx: ctx.has_pattern(
-            r"{%\s*if\s+not\s+thinking\s+is\s+defined\s*%}.*?"
-            r"{%\s*set\s+thinking\s*=\s*(?:false|False)\s*%}",
-            re.DOTALL,
-        )
-        or _has_toggle_default_assignment(ctx, "thinking", False),
+        predicate=lambda ctx: (
+            ctx.has_pattern(
+                r"{%\s*if\s+not\s+thinking\s+is\s+defined\s*%}.*?"
+                r"{%\s*set\s+thinking\s*=\s*(?:false|False)\s*%}",
+                re.DOTALL,
+            )
+            or _has_toggle_default_assignment(ctx, "thinking", False)
+        ),
     ),
     DetectionRule(
         name="thinking_default_true",
         value=ReasoningToggleConfig(toggle_param="thinking", default_enabled=True),
-        predicate=lambda ctx: ctx.has_pattern(
-            r"{%\s*if\s+not\s+thinking\s+is\s+defined\s*%}.*?"
-            r"{%\s*set\s+thinking\s*=\s*(?:true|True)\s*%}",
-            re.DOTALL,
-        )
-        or ctx.has_pattern(
-            r"set\s+thinking\s*=\s*thinking\s+if\s+thinking\s+is\s+defined\s+else\s+(?:true|True)"
-        )
-        or ctx.has_pattern(
-            r"thinking\s+is\s+defined\s+and\s+(?:thinking\s+is\s+false|not\s+thinking)"
-        )
-        or ctx.has_pattern(r"thinking\s+is\s+not\s+defined\s+or\s+thinking")
-        or ctx.has_pattern(r"namespace\([^)]*thinking\s*=\s*true")
-        or _has_toggle_default_assignment(ctx, "thinking", True),
+        predicate=lambda ctx: (
+            ctx.has_pattern(
+                r"{%\s*if\s+not\s+thinking\s+is\s+defined\s*%}.*?"
+                r"{%\s*set\s+thinking\s*=\s*(?:true|True)\s*%}",
+                re.DOTALL,
+            )
+            or ctx.has_pattern(
+                r"set\s+thinking\s*=\s*thinking\s+if\s+thinking\s+is\s+defined\s+else\s+(?:true|True)"
+            )
+            or ctx.has_pattern(
+                r"thinking\s+is\s+defined\s+and\s+(?:thinking\s+is\s+false|not\s+thinking)"
+            )
+            or ctx.has_pattern(r"thinking\s+is\s+not\s+defined\s+or\s+thinking")
+            or ctx.has_pattern(r"namespace\([^)]*thinking\s*=\s*true")
+            or _has_toggle_default_assignment(ctx, "thinking", True)
+        ),
     ),
 )
 
@@ -274,6 +295,14 @@ def _is_gpt_oss(ctx):
 
 def _is_kimi_k2(ctx):
     return ctx.has_vocab("<|tool_calls_section_begin|>")
+
+
+def _is_k2_v3(ctx):
+    return (
+        ctx.has_text("<ifm|think>")
+        and ctx.has_text("<ifm|tool_calls>")
+        and ctx.has_text("<ifm|tool_call>")
+    )
 
 
 def _is_nemotron_3(ctx):
@@ -431,6 +460,7 @@ def _is_deepseek_r1_think_tags(ctx):
 # ---------------------------------------------------------------------------
 
 REASONING_PARSER_RULES = (
+    DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="kimi", value="kimi", predicate=_is_kimi),
@@ -465,6 +495,7 @@ REASONING_PARSER_RULES = (
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PARSER_RULES = (
+    DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),

@@ -79,7 +79,7 @@ jobs:
         KUBECONFIG: /root/.cache/.cache/kb.yaml
         KUBECTL: /root/.cache/.cache/kubectl
         NAMESPACE: sgl-project
-        KUBE_JOB_NAME: ascend-sglang-test-${{ github.run_id }}
+        KUBE_JOB_NAME: ascend-${{ github.run_id }}
         SGLANG_IS_IN_CI: true
         ASCEND_E2E_TEST_CONFIG_PATH: python/sglang/test/ascend/e2e
         SGLANG_USE_MODELSCOPE: true

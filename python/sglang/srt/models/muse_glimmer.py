@@ -522,7 +522,6 @@ class MuseGlimmerVisionPatchEmbedder(nn.Module):
 
 
 class MuseGlimmerVisionRotaryEmbedding(nn.Module):
-
     def __init__(self, head_dim: int, theta: float):
         super().__init__()
         spatial_dim = head_dim // 2
@@ -611,7 +610,6 @@ class MuseGlimmerVisionEncoderLayer(nn.Module):
 
 
 class MuseGlimmerVisionModel(nn.Module):
-
     def __init__(
         self,
         config,

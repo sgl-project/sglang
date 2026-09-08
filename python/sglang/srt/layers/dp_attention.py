@@ -83,7 +83,6 @@ _is_cpu = is_cpu()
 
 
 class DpPaddingMode(IntEnum):
-
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
     MAX_LEN = auto()
     # Padding tokens to sum length and then gather tokens using `all_reduce`
@@ -512,9 +511,9 @@ def _dp_gather_via_all_reduce(
     if local_tokens.shape[0] > 0 and (
         is_partial or get_attn_tensor_model_parallel_rank() == 0
     ):
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between global_tokens and local_tokens not allowed"
+        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
+            "aliasing between global_tokens and local_tokens not allowed"
+        )
 
         memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
 
@@ -865,9 +864,9 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between local_tokens and global_tokens not allowed"
+        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
+            "aliasing between local_tokens and global_tokens not allowed"
+        )
 
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 

@@ -714,8 +714,7 @@ class TestResolutionDeclarations(CustomTestCase):
                 current = getattr(server_args, name, None)
                 if current != raw_input[name]:
                     moved.append(
-                        f"{shape} -> {name}: raw={raw_input[name]!r} "
-                        f"field={current!r}"
+                        f"{shape} -> {name}: raw={raw_input[name]!r} field={current!r}"
                     )
         self.assertEqual(
             moved,

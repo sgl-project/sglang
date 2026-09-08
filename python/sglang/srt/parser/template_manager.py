@@ -38,7 +38,10 @@ from sglang.srt.parser.conversation import (
     get_conv_template_by_model_path,
     register_conv_template,
 )
-from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
+from sglang.srt.parser.jinja_template_utils import (
+    detect_jinja_template_content_format,
+    jinja_template_may_reorder_tool_results,
+)
 from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
@@ -68,6 +71,7 @@ class TemplateManager:
         self._reasoning_config: Optional[ReasoningToggleConfig] = None
         self._suggested_reasoning_parser: Optional[str] = None
         self._suggested_tool_call_parser: Optional[str] = None
+        self._jinja_template_may_reorder_tool_results: bool = False
 
     @property
     def chat_template_name(self) -> Optional[str]:
@@ -109,8 +113,15 @@ class TemplateManager:
         """Get the auto-detected tool-call parser name, or None."""
         return self._suggested_tool_call_parser
 
+    @property
+    def jinja_template_may_reorder_tool_results(self) -> bool:
+        return self._jinja_template_may_reorder_tool_results
+
     def _run_template_detection(self, template, tokenizer) -> None:
         """Run reasoning pattern and parser detection on a template."""
+        self._jinja_template_may_reorder_tool_results = (
+            jinja_template_may_reorder_tool_results(template)
+        )
         self._force_reasoning, self._reasoning_config = detect_reasoning_pattern(
             template
         )
@@ -279,9 +290,9 @@ class TemplateManager:
 
     def _load_json_chat_template(self, template_path: str) -> None:
         """Load a JSON chat template file."""
-        assert template_path.endswith(
-            ".json"
-        ), "unrecognized format of chat template file"
+        assert template_path.endswith(".json"), (
+            "unrecognized format of chat template file"
+        )
 
         with open(template_path, "r") as filep:
             template = json.load(filep)
@@ -308,9 +319,9 @@ class TemplateManager:
 
     def _load_json_completion_template(self, template_path: str) -> None:
         """Load a JSON completion template file."""
-        assert template_path.endswith(
-            ".json"
-        ), "unrecognized format of completion template file"
+        assert template_path.endswith(".json"), (
+            "unrecognized format of completion template file"
+        )
 
         with open(template_path, "r") as filep:
             template = json.load(filep)

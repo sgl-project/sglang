@@ -93,9 +93,9 @@ def _mp_set_executable(executable: str, debug_str: str):
     try:
         yield
     finally:
-        assert (
-            os.fsdecode(multiprocessing.spawn.get_executable()) == executable
-        ), f"{multiprocessing.spawn.get_executable()=}"
+        assert os.fsdecode(multiprocessing.spawn.get_executable()) == executable, (
+            f"{multiprocessing.spawn.get_executable()=}"
+        )
         multiprocessing.spawn.set_executable(old_executable)
         logger.debug(f"mp.set_executable revert to {old_executable}")
 

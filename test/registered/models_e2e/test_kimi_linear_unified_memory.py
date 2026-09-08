@@ -70,5 +70,33 @@ class TestKimiLinearUnifiedMemoryFlashMLA(TestKimiLinearUnifiedMemory):
     ]
 
 
+class TestKimiLinearUnifiedMemoryDCP(
+    GSM8KMixin, PrefixCacheBranchingMixin, DefaultServerBase
+):
+    """Unified memory + decode context parallelism.
+
+    `test_prefix_cache_branching` is the sharp one here: a radix hit replays
+    widened virtual locs whose pages may have moved under compaction, and each
+    rank must recover the same physical page from them while keeping a
+    different row inside it.
+    """
+
+    model = KIMI_LINEAR_MODEL
+    cache_chunk_size = 64
+    gsm8k_score_threshold = 0.88
+    other_args = [
+        "--trust-remote-code",
+        "--tp-size",
+        "2",
+        "--dcp-size",
+        "2",
+        "--attention-backend",
+        "flashinfer",
+        "--chunked-prefill-size",
+        "2048",
+        "--enable-unified-memory",
+    ]
+
+
 if __name__ == "__main__":
     unittest.main()

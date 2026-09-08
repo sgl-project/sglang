@@ -18,7 +18,6 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestSLRUAccuracy(unittest.TestCase):
-
     def setUp(self):
         """Setup minimal memory pools for testing"""
         torch.set_default_device(None)

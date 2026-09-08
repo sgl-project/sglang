@@ -7,6 +7,7 @@ import torch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -178,17 +179,8 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
         second_step = torch.arange(16, dtype=torch.float32).view(8, 2)[4:]
 
         def result(hidden_states):
-            return SimpleNamespace(
-                copy_done=None,
-                auxiliary_host_output=None,
-                routed_experts_output=None,
-                indexer_topk_output=None,
+            return GenerationBatchResult(
                 logits_output=SimpleNamespace(hidden_states=hidden_states),
-                next_token_ids=None,
-                can_run_cuda_graph=False,
-                num_correct_drafts=0,
-                num_block_accept_tokens=0,
-                num_cap_tokens=0,
                 speculative_num_draft_tokens=4,
             )
 

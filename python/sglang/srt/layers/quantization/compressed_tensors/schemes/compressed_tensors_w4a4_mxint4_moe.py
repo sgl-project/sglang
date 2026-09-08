@@ -66,12 +66,12 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
             and config.num_bits == 4
         ), "MxInt4 only supports group strategy with group size 32"
         assert config.symmetric, "Only symmetric quantization is supported for MoE"
-        assert (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-        ), "MxInt4 only supports flashinfer_trtllm backend"
-        assert (
-            not config.actorder
-        ), "Actorder is not supported by flashinfer_trtllm backend"
+        assert get_moe_runner_backend().is_flashinfer_trtllm(), (
+            "MxInt4 only supports flashinfer_trtllm backend"
+        )
+        assert not config.actorder, (
+            "Actorder is not supported by flashinfer_trtllm backend"
+        )
         self.moe_ep_rank = get_parallel().moe_ep_rank
 
         if self.quant_config.quant_format != CompressionFormat.pack_quantized.value:
@@ -95,9 +95,9 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        assert (
-            params_dtype == torch.bfloat16
-        ), f"Params dtype should be torch.bfloat16, but got: {params_dtype}"
+        assert params_dtype == torch.bfloat16, (
+            f"Params dtype should be torch.bfloat16, but got: {params_dtype}"
+        )
 
         extra_weight_attrs.update({"quant_method": self.strategy})
         w13_weight = torch.nn.Parameter(
@@ -301,9 +301,9 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.is_gated
-        ), "Only gated MoEs are supported for flashinfer mxint4"
+        assert self.moe_runner_config.is_gated, (
+            "Only gated MoEs are supported for flashinfer mxint4"
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

@@ -42,7 +42,6 @@ class TestLoRAOverlapLoading(CustomTestCase):
 
 
 class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
-
     mock_lora_manager: MagicMock
     mock_stream: MagicMock
     mock_stream_context: MagicMock
@@ -96,8 +95,8 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
             self._create_mock_event(query_return=False),
         ]
         self.mock_device_module.Event.side_effect = events
-        self.mock_lora_manager.validate_lora_batch.side_effect = (
-            lambda lora_ids: len(lora_ids) <= 1
+        self.mock_lora_manager.validate_lora_batch.side_effect = lambda lora_ids: (
+            len(lora_ids) <= 1
         )
 
         self.assertTrue(
@@ -124,8 +123,8 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
             self._create_mock_event(query_return=False),
         ]
         self.mock_device_module.Event.side_effect = events
-        self.mock_lora_manager.validate_lora_batch.side_effect = (
-            lambda lora_ids: len(lora_ids) <= 2
+        self.mock_lora_manager.validate_lora_batch.side_effect = lambda lora_ids: (
+            len(lora_ids) <= 2
         )
 
         self.assertTrue(loader._try_start_overlap_load("lora_A", running_loras=set()))
