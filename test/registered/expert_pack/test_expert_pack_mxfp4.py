@@ -1,5 +1,10 @@
 """CUDA unit tests for the MXFP4 expert-pack kernels."""
 
+import os
+import signal
+import subprocess
+import sys
+import tempfile
 import unittest
 
 import torch
@@ -11,7 +16,12 @@ from sglang.kernels.ops.moe.expert_pack_mxfp4 import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
+
+
+_ISOLATED_WORKER_ENV = "SGLANG_EXPERT_PACK_MXFP4_TEST_WORKER"
+_ISOLATED_ATTEMPTS = 2
+_ISOLATED_TIMEOUT_SECONDS = 240
 
 
 _FP4_VALUES = (
@@ -356,5 +366,43 @@ class TestExpertPackMxfp4(unittest.TestCase):
             )
 
 
+def _run_isolated_tests() -> int:
+    """Bound JIT extension loading and avoid locks shared with prior CI jobs."""
+
+    command = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
+    for attempt in range(1, _ISOLATED_ATTEMPTS + 1):
+        with tempfile.TemporaryDirectory(
+            prefix="sglang_expert_pack_mxfp4_test_"
+        ) as extension_dir:
+            env = os.environ.copy()
+            env[_ISOLATED_WORKER_ENV] = "1"
+            env["TORCH_EXTENSIONS_DIR"] = extension_dir
+            process = subprocess.Popen(command, env=env, start_new_session=True)
+            try:
+                return_code = process.wait(timeout=_ISOLATED_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                print(
+                    f"MXFP4 test worker timed out after "
+                    f"{_ISOLATED_TIMEOUT_SECONDS}s (attempt {attempt}/"
+                    f"{_ISOLATED_ATTEMPTS}); terminating its process group.",
+                    flush=True,
+                )
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                if attempt < _ISOLATED_ATTEMPTS:
+                    print(
+                        "Retrying with a fresh Torch extension build directory.",
+                        flush=True,
+                    )
+                continue
+
+            # Retry only hangs. Preserve genuine test and compilation failures.
+            return return_code
+
+    return 1
+
+
 if __name__ == "__main__":
-    unittest.main()
+    if os.getenv(_ISOLATED_WORKER_ENV) == "1":
+        unittest.main()
+    raise SystemExit(_run_isolated_tests())
