@@ -395,7 +395,7 @@ def _check_fi_a2a_single_node(cp_group: "GroupCoordinator", cp_size: int) -> Non
         raise RuntimeError(
             "--dcp-comm-backend fi_a2a without MNNVL fabric memory needs every "
             f"DCP rank on one node, but got {sorted(set(hosts))}. Use "
-            "--dcp-comm-backend a2a or ag_rs for multi-node DCP off GB200 NVL72."
+            "--dcp-comm-backend a2a or ag_rs for multi-node DCP."
         )
 
 

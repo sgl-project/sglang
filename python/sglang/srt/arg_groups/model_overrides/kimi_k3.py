@@ -111,7 +111,10 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["dcp_replicate_q_proj"] = True
 
         device_name = get_device_name()
-        dcp_comm_backend = "fi_a2a" if is_mnnvl_fabric_device() else "a2a"
+        fi_a2a_usable = get_platform().is_sm100 and (
+            is_mnnvl_fabric_device() or cfg.nnodes == 1
+        )
+        dcp_comm_backend = "fi_a2a" if fi_a2a_usable else "a2a"
         logger.info(
             "Kimi-K3 DCP selects communication backend on "
             f"{device_name!r}: {cfg.dcp_comm_backend!r} -> "
