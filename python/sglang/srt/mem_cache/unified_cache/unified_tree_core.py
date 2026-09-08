@@ -165,10 +165,11 @@ class UnifiedTreeNode:
         return self.hash_value[-1]
 
     def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
-        if node is None or node.hash_value is None:
-            return []
-
-        return node.get_prefix_hash_values(node.parent) + node.hash_value
+        chunks = []
+        while node is not None and node.hash_value is not None:
+            chunks.append(node.hash_value)
+            node = node.parent
+        return [value for chunk in reversed(chunks) for value in chunk]
 
 
 class UnifiedLRUList:

@@ -1,7 +1,9 @@
 """A warmup probe that does not fit is retried smaller instead of abandoned."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.warmup_request_builder import lighten_warmup_req
@@ -16,6 +18,7 @@ def _server_args(temporal_compression_ratio: int = 4) -> SimpleNamespace:
     return SimpleNamespace(
         pipeline_class_name=None,
         pipeline_config=SimpleNamespace(
+            adjust_num_frames=lambda num_frames, **kwargs: num_frames,
             vae_config=SimpleNamespace(arch_config=arch_config),
             vae_scale_factor=8,
         ),
@@ -62,17 +65,8 @@ class TestLightenWarmupReq:
         assert lighten_warmup_req(_server_args(), _req(16, 16, 1)) is None
 
     def test_frames_follow_the_model_frame_contract(self):
-        # LongLive2-style contract: latent frames come in causal blocks of 8,
-        # so with a temporal ratio of 4 only 29, 61, 93, ... frames are valid.
         server_args = _server_args()
-
-        def adjust_num_frames(num_frames: int) -> int:
-            latent = (num_frames - 1) // 4 + 1
-            if latent % 8 == 0:
-                return num_frames
-            return (max(8, latent // 8 * 8) - 1) * 4 + 1
-
-        server_args.pipeline_config.adjust_num_frames = adjust_num_frames
+        server_args.pipeline_config = LongLive2T2VConfig()
 
         lighter = lighten_warmup_req(server_args, _req(960, 928, 61))
         assert lighter.num_frames == 29
@@ -82,6 +76,30 @@ class TestLightenWarmupReq:
         floor = lighten_warmup_req(server_args, lighter)
         assert floor.num_frames == 29
         assert floor.width * floor.height <= 960 * 928 // 2
+
+    def test_internal_frame_search_is_quiet_but_user_adjustment_warns(self):
+        server_args = _server_args()
+        config = server_args.pipeline_config = LongLive2T2VConfig()
+        with (
+            patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.wan.logger.warning"
+            ) as wan_warning,
+            patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.longlive2.logger.warning"
+            ) as causal_warning,
+            patch.object(
+                config, "adjust_num_frames", wraps=config.adjust_num_frames
+            ) as adjust,
+        ):
+            lighter = lighten_warmup_req(server_args, _req(1280, 704, 29))
+            assert lighter.num_frames == 29
+            assert adjust.call_count == 1
+            wan_warning.assert_not_called()
+            causal_warning.assert_not_called()
+
+            assert config.adjust_num_frames(2) == 29
+            wan_warning.assert_called_once()
+            causal_warning.assert_called_once()
 
 
 def _record(width: int, height: int, num_frames: int, *, peak_gib: float):
@@ -165,6 +183,25 @@ class TestFitAutoResidencyProbe:
         )
         assert (steps, estimate) == (0, None)
         assert fitted.num_frames == 81
+
+    def test_longlive_probe_stops_at_the_measured_workload_floor(self):
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            fit_auto_residency_probe,
+        )
+
+        server_args = _server_args()
+        server_args.pipeline_config = LongLive2T2VConfig()
+        fitted, _, steps = fit_auto_residency_probe(
+            _req(1280, 704, 61),
+            records=[_record(832, 480, 29, peak_gib=30.0)],
+            free_bytes=8 << 30,
+            total_bytes=80 << 30,
+            server_args=server_args,
+        )
+        assert steps > 0
+        assert fitted.num_frames == 29
+        assert fitted.width > 16 and fitted.height > 16
+        assert fitted.width * fitted.height <= 832 * 480
 
 
 class TestOutOfMemoryClassification:
