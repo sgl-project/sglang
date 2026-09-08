@@ -115,25 +115,15 @@ def test_comfy_embedding_checkpoint_lookup(tmp_path, backend, tensorwise, tp_siz
     prefix = "model.language_model.embed_tokens"
     assert config.quantizes_embedding(prefix)
     for rank in range(tp_size):
-        with (
-            mock.patch(
-                "sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding.get_group_rank",
-                return_value=rank,
-            ),
-            mock.patch(
-                "sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding.get_group_size",
-                return_value=tp_size,
-            ),
-        ):
-            embedding = VocabParallelEmbedding(
-                7,
-                256,
-                params_dtype=torch.bfloat16,
-                padding_size=8,
-                quant_config=config,
-                prefix=prefix,
-                tp_group=object(),
-            )
+        embedding = VocabParallelEmbedding(
+            7,
+            256,
+            params_dtype=torch.bfloat16,
+            padding_size=8,
+            quant_config=config,
+            prefix=prefix,
+            tp_group=SimpleNamespace(world_size=tp_size, rank_in_group=rank),
+        )
         embedding.weight_loader(embedding.weight, weights)
         embedding.weight_loader(embedding.weight_scale, scale)
         start = embedding.shard_indices.org_vocab_start_index
@@ -184,6 +174,33 @@ def test_comfy_nvfp4_dynamic_matmul():
     )[:33]
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert torch.isfinite(actual).all()
+    zero = method.apply(layer, torch.zeros_like(x))
+    assert torch.isfinite(zero).all()
+    assert torch.count_nonzero(zero) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_comfy_scalar_embedding_matches_kitchen_kernel():
+    pytest.importorskip("comfy_kitchen")
+    method = ComfyInt8EmbeddingMethod(tensorwise=True)
+    layer = nn.Module()
+    method.create_weights(layer, 256, [128], 256, 128, torch.bfloat16)
+    layer.to("cuda")
+    layer.weight.data.copy_(
+        torch.arange(128 * 256, device="cuda")
+        .reshape(128, 256)
+        .remainder(251)
+        .sub(125)
+        .to(torch.int8)
+    )
+    layer.weight_scale.data.fill_(0.0137)
+    indices = torch.tensor([0, 63, 127, 0], device="cuda")
+    expected = torch.ops.comfy_kitchen.dequantize_int8_embedding(
+        layer.weight, layer.weight_scale, indices, 0, 2
+    )
+    torch.testing.assert_close(
+        method.embedding(layer, indices), expected, rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("missing", [False, True])
