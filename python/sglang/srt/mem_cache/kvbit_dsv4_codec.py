@@ -81,11 +81,13 @@ def validate_dsv4_int4_attention(
     validate_dsv4_int4_geometry(nope_dim, rope_dim)
     if (
         attn_tp_size <= 0
+        or num_attention_heads <= 0
         or num_attention_heads % attn_tp_size != 0
-        or num_attention_heads // attn_tp_size != 64
+        or num_attention_heads // attn_tp_size > 64
+        or (attn_tp_size == 1 and num_attention_heads != 64)
     ):
         raise ValueError(
-            "DSV4 INT4 requires exactly 64 local query heads; "
+            "DSV4 INT4 requires 64 local query heads after model TP padding; "
             f"num_attention_heads={num_attention_heads}, attn_tp_size={attn_tp_size}."
         )
     if head_dim_v != 512 or kv_heads != 1:

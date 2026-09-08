@@ -207,7 +207,7 @@ class Model:
                 "enables the target-only DeepSeek V4 368-byte signed INT4 cache "
                 "with group size 32, E4M3-nearest scales, BF16 RoPE, and no rotation. "
                 "It requires CUDA SM90, the INT4 AOT extension, and 64 local query "
-                "heads, and resolves its backing dtype as auto."
+                "heads after model TP padding, and resolves its backing dtype as auto."
             ),
             choices=[
                 "auto",

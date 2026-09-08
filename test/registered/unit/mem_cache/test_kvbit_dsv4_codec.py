@@ -132,6 +132,19 @@ class TestDSV4INT4Codec(unittest.TestCase):
 
 
 class TestDSV4INT4AttentionContract(unittest.TestCase):
+    def test_tp_local_heads_padded_by_model_are_supported(self):
+        for heads, tp in ((64, 8), (64, 4), (128, 8), (128, 2), (512, 8)):
+            with self.subTest(heads=heads, tp=tp):
+                validate_dsv4_int4_attention(
+                    num_attention_heads=heads,
+                    attn_tp_size=tp,
+                    nope_dim=448,
+                    rope_dim=64,
+                    head_dim_v=512,
+                    kv_heads=1,
+                    sparse_width=512,
+                )
+
     def test_supported_geometry_and_rejections(self):
         args = dict(
             num_attention_heads=512,
@@ -151,6 +164,9 @@ class TestDSV4INT4AttentionContract(unittest.TestCase):
             ({"attn_tp_size": 0}, "64 local query heads"),
             ({"attn_tp_size": 3}, "64 local query heads"),
             ({"num_attention_heads": 513}, "64 local query heads"),
+            ({"num_attention_heads": 0}, "64 local query heads"),
+            ({"num_attention_heads": 32, "attn_tp_size": 1}, "64 local query heads"),
+            ({"num_attention_heads": 128, "attn_tp_size": 1}, "64 local query heads"),
             ({"nope_dim": 512}, "448-nope/64-rope"),
             ({"rope_dim": 32}, "448-nope/64-rope"),
             ({"head_dim_v": 256}, "MQA"),
