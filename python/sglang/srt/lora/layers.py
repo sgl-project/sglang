@@ -995,9 +995,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.intermediate_size_per_partition = (
             base_layer.intermediate_size_per_partition
         )
-        # Stock MoE LoRA buffers are split gate/up except for GPT-OSS-style weights.
+        # K3 sets gemm1_alpha (SiTU beta) but loads w1/w3 contiguously (gate_up_interleaved=False)
         self._uses_interleaved_gate_up = (
             base_layer.moe_runner_config.gemm1_alpha is not None
+            and base_layer.moe_runner_config.gate_up_interleaved
         )
 
         # Initialize triton_lora moe runner for batches with lora enabled
