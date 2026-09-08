@@ -54,6 +54,11 @@ from sglang.srt.utils import (
     load_video,
 )
 from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
+from sglang.srt.utils.pre_sampled_video import (
+    PreSampledVideo,
+    is_pre_sampled_video,
+    load_pre_sampled_video,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -310,7 +315,7 @@ class EncoderPreprocessor:
 
         media_metadata = {}
         content_hash = None
-        if isinstance(data, dict):
+        if isinstance(data, dict) and not is_pre_sampled_video(data):
             if "url" not in data:
                 return data
             media_metadata = {key: value for key, value in data.items() if key != "url"}
@@ -349,6 +354,12 @@ class EncoderPreprocessor:
                     }
                 return img
             elif modality == Modality.VIDEO:
+                if is_pre_sampled_video(data):
+                    try:
+                        self._validate_pre_sampled_video_model()
+                        return load_pre_sampled_video(data)
+                    except ValueError as e:
+                        raise BadRequestError(str(e)) from e
                 vid = load_video(data, frame_count_limit)
                 if (
                     media_metadata
@@ -514,6 +525,18 @@ class EncoderPreprocessor:
         }
         return [frames], video_processor_kwargs
 
+    def _validate_pre_sampled_video_model(self):
+        if "glm" not in self.model_type and self.model_type not in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        ):
+            raise ValueError(
+                "Pre-sampled video is supported only for Qwen3-VL, Qwen3.5, "
+                f"and GLM video models; got {self.model_type}"
+            )
+
     async def _flatten_and_load_videos(self, mm_items):
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
@@ -563,8 +586,25 @@ class EncoderPreprocessor:
                     for config in video_configs
                 ]
 
+            pre_sampled = any(
+                isinstance(video, PreSampledVideo) for video in video_items
+            )
             framed = any(isinstance(video, list) for video in video_items)
-            if framed:
+            if pre_sampled:
+                # Supplied frames already have a temporal sampling plan. Keep
+                # each video intact, including mixed encoded/pre-sampled batches.
+                processed = await asyncio.gather(
+                    *[
+                        asyncio.get_running_loop().run_in_executor(
+                            self.io_executor,
+                            glm_sample_and_decode_sync,
+                            video,
+                            video_configs[index],
+                        )
+                        for index, video in enumerate(video_items)
+                    ]
+                )
+            elif framed:
                 processed = await asyncio.gather(
                     *[
                         asyncio.get_running_loop().run_in_executor(

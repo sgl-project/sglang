@@ -69,6 +69,7 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
+from sglang.srt.utils.pre_sampled_video import PreSampledVideo
 from sglang.srt.utils.weight_versions import WeightVersionSpans
 
 # Handle serialization of Image for pydantic
@@ -157,7 +158,7 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
 # Individual data item types for each modality
 ImageDataInputItem = Union[str, bytes, Dict[str, Any], ImageData, Image]
 AudioDataInputItem = Union[str, bytes, Dict[str, Any]]
-VideoDataInputItem = Union[str, bytes, Dict[str, Any], VideoData]
+VideoDataInputItem = Union[str, bytes, Dict[str, Any], VideoData, PreSampledVideo]
 # Union type for any multimodal data item
 MultimodalDataInputItem = Union[
     ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
@@ -195,7 +196,8 @@ class GenerateReqInput:
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
     image_data: Optional[MultimodalDataInputFormat] = None
-    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    # A video path, URL, base64 video, or PreSampledVideo (wire format:
+    # {"format": "pre_sampled_video", "frames": [...], ...}).
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
@@ -1108,7 +1110,8 @@ class EmbeddingReqInput:
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
     image_data: Optional[MultimodalDataInputFormat] = None
-    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    # A video path, URL, base64 video, or PreSampledVideo (wire format:
+    # {"format": "pre_sampled_video", "frames": [...], ...}).
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None

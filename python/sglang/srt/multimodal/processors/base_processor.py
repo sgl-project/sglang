@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     logger,
     smart_to_rgb,
 )
+from sglang.srt.utils.pre_sampled_video import is_pre_sampled_video
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -210,6 +211,8 @@ def _tokenizer_of(processor):
 
 
 class BaseMultimodalProcessor(ABC):
+    supports_pre_sampled_video = False
+
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
@@ -1222,6 +1225,12 @@ class BaseMultimodalProcessor(ABC):
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
     ) -> BaseMultiModalProcessorOutput:
+        if not self.supports_pre_sampled_video and any(
+            is_pre_sampled_video(video) for video in (video_data or [])
+        ):
+            raise ValueError(
+                f"{type(self).__name__} does not support pre-sampled video input"
+            )
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
 
         input_ids = prompt if isinstance(prompt, list) else None
