@@ -74,6 +74,8 @@ class KVArgs:
     page_size: int
     # for system dp
     system_dp_rank: int
+    # Local Rust /route registry port; None on scheduler ranks without a listener.
+    rust_http_port: Optional[int]
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
@@ -90,7 +92,9 @@ class KVArgs:
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
-    total_kv_layers: int
+    hidden_kv_layers: int
+    # Only used of npu, for decode total kv layers
+    draft_kv_layers: int
 
 
 class KVPoll:
