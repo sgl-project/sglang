@@ -24,6 +24,7 @@ from common_utils import (
 )
 from ray.experimental.tqdm_ray import tqdm
 
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import clear_b_tma_desc_cache
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     get_config_dtype_str,
@@ -36,11 +37,19 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config impor
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.server_args import (
     ServerArgs,
+    get_global_server_args,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import (
+    get_device,
+    get_device_module,
+    is_hip,
+    is_xpu,
+)
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
+device_module = get_device_module()
 
 
 @dataclasses.dataclass
@@ -72,11 +81,12 @@ class KernelWrapper:
             expert_ids=moe_input.expert_ids,
             num_tokens_post_padded=moe_input.num_tokens_post_padded,
         )
-        torch.cuda.synchronize()
+        device_module.synchronize()
 
-        # Capture 10 invocations with CUDA graph
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        # Capture inner_iter invocations into one replayable graph.
+        graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
+        graph = graph_cls()
+        with device_module.graph(graph):
             for k in range(self.inner_iter):
                 moe_input = self.moe_inputs[k]
                 self.func(
@@ -86,19 +96,19 @@ class KernelWrapper:
                     expert_ids=moe_input.expert_ids,
                     num_tokens_post_padded=moe_input.num_tokens_post_padded,
                 )
-        torch.cuda.synchronize()
+        device_module.synchronize()
 
         # Warmup
         for _ in range(5):
             graph.replay()
-        torch.cuda.synchronize()
+        device_module.synchronize()
         return graph
 
     def forward_cost(self, try_cnt=2):
         time_cost = float("inf")
         for _ in range(try_cnt):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+            start_event = device_module.Event(enable_timing=True)
+            end_event = device_module.Event(enable_timing=True)
             start_event.record()
             if self.use_cuda_graph:
                 self.graph.replay()
@@ -113,14 +123,20 @@ class KernelWrapper:
                         num_tokens_post_padded=moe_input.num_tokens_post_padded,
                     )
             end_event.record()
-            torch.cuda.synchronize()
+            device_module.synchronize()
             time_cost = min(time_cost, start_event.elapsed_time(end_event))
         return time_cost
 
 
 def load_topk_ids(topk_ids_dir, i: int):
-    num_layers = 61
-    dense_layers = 3
+    server_args = get_global_server_args()
+    model_config = get_model_config(
+        server_args.model_path,
+        tp_size=server_args.tp_size,
+        ep_size=server_args.ep_size,
+    )
+    num_layers = model_config["num_layers"]
+    dense_layers = model_config["dense_layers"]
     moe_layers = num_layers - dense_layers
     return torch.load(
         f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
@@ -150,6 +166,8 @@ def benchmark_config(
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
     if ncu_enable:
         num_iters = 1
+    # Weights here are per-call, so a cached descriptor only pins a dead w1/w2.
+    clear_b_tma_desc_cache()
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     hidden_states = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16 or use_int8_w8a8:
@@ -470,7 +488,7 @@ def benchmark_config(
         if build_down:
             ts1.append(kernel1.forward_cost())  # down no-tma
             ts_tma1.append(kernel1_tma.forward_cost())  # down tma
-    torch.cuda.synchronize()
+    device_module.synchronize()
 
     avg = sum(ts0) / (num_iters) * 1000 if ts0 else float("inf")
     avg1 = sum(ts1) / (num_iters) * 1000 if ts1 else float("inf")
@@ -536,12 +554,12 @@ class BestConfigTrace:
 
 class BenchmarkWorker:
     def __init__(self, seed: int, server_args: ServerArgs) -> None:
-        torch.set_default_device("cuda")
-        torch.cuda.manual_seed_all(0)
+        torch.set_default_device(get_device())
+        device_module.manual_seed_all(0)
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
-        self.device_id = 0  # int(ray.get_gpu_ids()[0])
+        self.device_id = 0 if not ray.is_initialized() else int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
@@ -562,9 +580,13 @@ class BenchmarkWorker:
         ep_size: int = 1,
         enable_up_tma: bool = False,
     ) -> Tuple[Dict[str, int], float]:
-        torch.cuda.manual_seed_all(0)
+        device_module.manual_seed_all(0)
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
-        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+        with (
+            device_module.device(self.device_id)
+            if _is_xpu or _is_hip
+            else nullcontext()
+        ):
             if enable_up_tma:
                 # Two-step: first measure down to determine c_sorted,
                 # then measure up with the correct c_sorted.
@@ -654,7 +676,11 @@ class BenchmarkWorker:
             trace0 = BestConfigTrace("kernel0", down_moe=False, enable_up_tma=False)
             trace1 = BestConfigTrace("kernel1", down_moe=True)
 
-            with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            with (
+                device_module.device(self.device_id)
+                if _is_xpu or _is_hip
+                else nullcontext()
+            ):
                 for config in tqdm(search_space):
                     try:
                         kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma = benchmark_config(
@@ -693,7 +719,11 @@ class BenchmarkWorker:
             trace1 = BestConfigTrace("kernel1", down_moe=True)
 
             # === Round 1: Down-only ===
-            with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            with (
+                device_module.device(self.device_id)
+                if _is_xpu or _is_hip
+                else nullcontext()
+            ):
                 for config in tqdm(search_space, desc="Round 1 (down)"):
                     try:
                         _, _, kt1_no_tma, kt1_tma = benchmark_config(
@@ -732,7 +762,11 @@ class BenchmarkWorker:
             )
 
             # === Round 2: Up with c_sorted from round 1 ===
-            with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            with (
+                device_module.device(self.device_id)
+                if _is_xpu or _is_hip
+                else nullcontext()
+            ):
                 for config in tqdm(search_space, desc="Round 2 (up)"):
                     try:
                         kt0_no_tma, kt0_tma, _, _ = benchmark_config(
@@ -804,8 +838,12 @@ class BenchmarkWorker:
             print(f"config {i}: {file}")
 
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
-        torch.cuda.manual_seed_all(0)
-        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+        device_module.manual_seed_all(0)
+        with (
+            device_module.device(self.device_id)
+            if _is_xpu or _is_hip
+            else nullcontext()
+        ):
             for bs in num_tokens:
                 kernel_times = []
                 cfgs = []
