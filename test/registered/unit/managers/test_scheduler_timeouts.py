@@ -1,11 +1,8 @@
 """Boundary tests for the scheduler's waiting / running request timeouts.
 
-Timeouts are collected by _poll_timeout_aborts() on the request-pulling rank
-and applied on every TP rank through the broadcast abort path
-(abort_request), so the poll itself is pure bookkeeping over timestamps --
-no model, no GPU, no draft worker -- and is driven here directly. The e2e
-side (503 reaching the client, all TP ranks dropping the request in the same
-iteration, server stays up) is covered by scheduler/test_scheduler_control.py.
+The poll is pure bookkeeping over timestamps -- no model, no GPU, no draft
+worker -- so it is driven here directly instead of through a server. The 503
+reaching the client is covered by scheduler/test_scheduler_control.py.
 """
 
 import time
@@ -106,8 +103,7 @@ class TestWaitingTimeout(CustomTestCase):
 
         self.assertEqual([a.rid for a in aborts], ["stale"])
         self.assertEqual(aborts[0].finished_reason["type"], "abort")
-        # The poll only emits AbortReqs; removal happens on every rank at
-        # once through the broadcast abort path, never locally here.
+        # The poll emits only; removal happens on every rank via the broadcast.
         self.assertEqual([r.rid for r in s.waiting_queue], ["stale", "fresh"])
 
     def test_unset_entry_time_is_never_emitted(self):

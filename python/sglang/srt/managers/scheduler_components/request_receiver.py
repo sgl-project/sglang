@@ -78,9 +78,8 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
-    # Emits AbortReqs for SGLANG_REQ_WAITING_TIMEOUT / _RUNNING_TIMEOUT on the
-    # rank that owns the waiting queue; broadcast as local reqs, see
-    # _broadcast_reqs_across_ranks().
+    # Emits AbortReqs for SGLANG_REQ_WAITING_TIMEOUT / _RUNNING_TIMEOUT;
+    # runs on the rank that owns the waiting queue.
     poll_timeout_aborts: Optional[Callable[[], List[Any]]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -106,9 +105,8 @@ class SchedulerRequestReceiver:
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        # Timeout aborts are decided once, on the rank that owns the waiting
-        # queue, and then broadcast as local reqs so that every rank sharing
-        # that queue drops the same requests in the same iteration.
+        # Decided once and broadcast, so every rank sharing this waiting queue
+        # drops the same requests in the same iteration.
         local_reqs = []
         if (
             self.poll_timeout_aborts is not None
@@ -181,14 +179,9 @@ class SchedulerRequestReceiver:
     def _broadcast_reqs_across_ranks(
         self, recv_reqs: Optional[List], local_reqs: Optional[List] = None
     ) -> List:
-        """Broadcast the pulled requests plus any locally generated ones.
-
-        local_reqs (timeout aborts) are produced by the queue-owning rank
-        itself instead of arriving from the tokenizer, so they ride the work
-        channel, which is scoped to exactly the ranks that share that waiting
-        queue. The control channel would be wrong: it fans out from global
-        rank 0, so under DP attention every DP group but the first would have
-        its aborts overwritten and never drop the timed-out requests.
+        """local_reqs ride the work channel, which is scoped to the ranks
+        sharing one waiting queue; the control channel fans out from global
+        rank 0 and would overwrite every DP group's aborts but the first.
         """
         local_reqs = local_reqs or []
         if get_parallel().enable_dp_attention:

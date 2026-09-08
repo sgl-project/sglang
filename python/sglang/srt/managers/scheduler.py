@@ -3236,12 +3236,9 @@ class Scheduler(
         return req_to_abort.rid == recv_req.rid
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
-        """Collect timeout aborts on the request-pulling rank only.
-
-        Runs before the TP broadcast in recv_requests(), so the emitted
-        AbortReqs reach every rank and abort_request() drops the same
-        requests in the same iteration; a rank-local scan would instead
-        desynchronize the extend-vs-decode decision and hang the collectives.
+        """Emit aborts only; every rank must drop the same requests in the
+        same iteration, or the extend-vs-decode decision splits and the
+        collectives hang.
         """
         aborts: List[AbortReq] = []
 
@@ -3491,8 +3488,6 @@ class Scheduler(
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
-        # Timeout aborts belong in _poll_timeout_aborts(), not here: a
-        # rank-local wall-clock scan splits the queue across TP ranks.
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -5174,8 +5169,8 @@ class Scheduler(
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req.rid)
             self.beam_coordinator.retire_group(req)
-            # Preserve the initiator's finish reason (e.g. the 503 emitted by
-            # timeout aborts) so the tokenizer returns it to the client.
+            # Without the initiator's reason the tokenizer falls back to a
+            # generic abort message.
             self.ipc_channels.send_to_tokenizer.send_output(
                 _make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
