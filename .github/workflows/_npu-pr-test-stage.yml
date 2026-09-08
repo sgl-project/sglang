@@ -255,6 +255,11 @@ jobs:
             install_pkg "${pkg}"
           done
 
+          # Install sgl-eval (CLI used by run_eval.py's `sgl-eval run ...`) if missing.
+          # Nightly jobs skip reinstalling sglang (install_sglang_deps: false) and rely
+          # on the preinstalled image, so ensure sgl-eval is available at runtime.
+          command -v sgl-eval >/dev/null 2>&1 || install_pkg "sgl-eval==0.1.0"
+
           cd test
           # Append `--nightly` and `--continue-on-error` when the job belongs to the nightly pipeline.
           # --nightly: Collect test cases registered for nightly runs.

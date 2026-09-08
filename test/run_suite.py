@@ -165,6 +165,7 @@ NIGHTLY_SUITES = {
         "nightly-1-npu-a3",
         "nightly-2-npu-a3",
         "nightly-4-npu-a3",
+        "nightly-calibrate-dp-attn-4-npu-a3",
         "nightly-8-npu-a3",
         "nightly-16-npu-a3",
         "nightly-acc-2-npu-a3",

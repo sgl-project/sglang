@@ -44,7 +44,7 @@ class TestAscendSamplingBackend(CustomTestCase):
     def test_mmlu(self):
         if _is_pr_pipeline:
             run_npu_pr_smoke(self.base_url)
-            return
+            # return
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
