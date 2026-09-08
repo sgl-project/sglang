@@ -54,6 +54,8 @@ def test_flexkv_radix_prefetch_request_page_aligns_and_launches():
 
     req = MagicMock()
     req.rid = "r1"
+    req.extra_key = None
+    req.cache_salt = None
     req.full_untruncated_fill_ids = [1, 2, 3, 4, 5]
     req._compute_max_prefix_len = MagicMock(return_value=4)
     req.init_next_round_input = MagicMock()
