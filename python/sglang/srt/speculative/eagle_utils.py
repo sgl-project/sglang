@@ -883,6 +883,10 @@ def eagle_sample(
             from sglang.kernels.ops.speculative.reject_sampling import (
                 chain_speculative_sampling_triton,
             )
+            from sglang.srt.layers.sampling_renorm import (
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+            )
 
         # if/else, not a ternary: the CUDA-only name still has to resolve in the
         # branch not taken, and HIP only reaches here with rejection sampling on.
@@ -903,7 +907,10 @@ def eagle_sample(
                 top_p_renorm_probs_triton as top_p_renorm_prob,
             )
         elif not _is_npu:
-            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+            from sglang.srt.layers.sampling_renorm import (
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+            )
 
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
