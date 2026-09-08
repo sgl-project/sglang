@@ -1858,7 +1858,7 @@
             "expected_avg_denoise_ms": 2029.88,
             "expected_median_denoise_ms": 2020.71,
             "load_peak_vram_mb": 6440.0,
-            "runtime_peak_vram_mb": 21524.0,
+            "runtime_peak_vram_mb": 22120.0,
             "warmup_peak_vram_mb": 46020.0,
             "load_peak_allocated_mb": 6175.0,
             "runtime_peak_allocated_mb": 15472.0,
@@ -2899,9 +2899,9 @@
             "expected_avg_denoise_ms": 336.29,
             "expected_median_denoise_ms": 337.51,
             "load_peak_vram_mb": 92.0,
-            "runtime_peak_vram_mb": 66634.0,
+            "runtime_peak_vram_mb": 66732.0,
             "load_peak_allocated_mb": 80.0,
-            "runtime_peak_allocated_mb": 58436.0,
+            "runtime_peak_allocated_mb": 66495.0,
             "estimated_full_test_time_s": 600.0
         },
         "lingbot_world_realtime_plastic_beach": {
@@ -3182,9 +3182,9 @@
             "expected_avg_denoise_ms": 50.95,
             "expected_median_denoise_ms": 52.38,
             "load_peak_vram_mb": 13120.0,
-            "runtime_peak_vram_mb": 17604.0,
+            "runtime_peak_vram_mb": 23042.0,
             "load_peak_allocated_mb": 12852.0,
-            "runtime_peak_allocated_mb": 15130.0,
+            "runtime_peak_allocated_mb": 21338.0,
             "estimated_full_test_time_s": 40.5
         },
         "flux1_modelopt_fp8_t2i": {
@@ -3238,7 +3238,7 @@
             "expected_avg_denoise_ms": 120.9,
             "expected_median_denoise_ms": 124.47,
             "load_peak_vram_mb": 16742.0,
-            "runtime_peak_vram_mb": 36348.0,
+            "runtime_peak_vram_mb": 37582.0,
             "load_peak_allocated_mb": 16063.0,
             "runtime_peak_allocated_mb": 30436.0,
             "estimated_full_test_time_s": 64.3
