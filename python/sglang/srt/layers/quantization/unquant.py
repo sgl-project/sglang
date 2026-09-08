@@ -195,6 +195,18 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
         _enable_bf16_splitk_gemm = True
         _precompile_splitk_tactics()
 
+    if (
+        envs.SGLANG_SM120_ONLINE_MXFP8.get()
+        and _is_cuda
+        and torch.cuda.get_device_capability() == (12, 0)
+    ):
+        from sglang.kernels.ops.gemm import sm120_online_fp8 as _online_mod
+
+        _online_mod.online_fp8_enabled = True
+        logger.info(
+            "[mratsim's sm120-turbo r22] SM120 online FP8 enabled (HyperConnection mix pair born meta and ingested rowwise fp8, lm_head replaced at end of load)"
+        )
+
     _BF16_GEMM_BACKEND = backend
 
 
