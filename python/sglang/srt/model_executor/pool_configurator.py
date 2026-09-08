@@ -54,7 +54,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
-    is_950_npu,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
@@ -244,15 +243,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
                 if _is_npu and is_deepseek_dsa(kvc.model_config.hf_config):
+                    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
                     from sglang.srt.mem_cache.kv_cache_configurator import (
                         calculate_mla_kv_cache_dim,
                     )
 
                     draft_dtype = kvc.spec_aux_config.eagle_draft_kv_cache_dtype
                     model_config = kvc.model_config
-                    use_c8 = draft_dtype == torch.float8_e4m3fn and is_950_npu(
-                        kvc.gpu_id
-                    )
+                    use_c8 = draft_dtype == torch.float8_e4m3fn and is_npu_arch35()
                     draft_main_bytes = (
                         calculate_mla_kv_cache_dim(
                             model_config=model_config, kv_cache_dtype=draft_dtype
@@ -325,11 +323,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
         if _is_npu and kvc.use_mla_backend and is_deepseek_dsa(model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
             )
 
-            use_c8 = kv_cache_dtype == torch.float8_e4m3fn and is_950_npu(kvc.gpu_id)
+            use_c8 = kv_cache_dtype == torch.float8_e4m3fn and is_npu_arch35()
             main_bytes = (
                 calculate_mla_kv_cache_dim(
                     model_config=model_config, kv_cache_dtype=kv_cache_dtype
@@ -464,13 +463,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 _should_elide_dsa_index_k,
             )
 
             dtype = kvc.kv_cache_dtype if kv_cache_dtype is None else kv_cache_dtype
-            is_950 = is_950_npu(kvc.gpu_id)
-            use_c8 = dtype == torch.float8_e4m3fn and is_950
+            is_arch35 = is_npu_arch35()
+            use_c8 = dtype == torch.float8_e4m3fn and is_arch35
             architectures = (
                 getattr(kvc.model_config.hf_config, "architectures", ()) or ()
             )
@@ -478,7 +478,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             is_glm_compact_rollout = (
                 not allocate_all_layers
                 and primary_arch == "GlmMoeDsaForCausalLM"
-                and is_950
+                and is_arch35
                 and _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
             )
             num_indexer_layers = (

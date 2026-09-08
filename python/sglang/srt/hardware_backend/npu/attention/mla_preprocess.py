@@ -5,13 +5,12 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35, npu_format_cast
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.common import is_950_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -104,11 +103,11 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.q_b_proj_weight_scale = (
             q_b_scale.view(1, -1).to(torch.float) if q_b_scale is not None else None
         )
-        self.is_950 = is_950_npu(torch.npu.current_device())
+        self.is_npu_arch35 = is_npu_arch35()
 
     def uses_mlaprolog(self) -> bool:
         pool = get_token_to_kv_pool()
-        if self.is_950 and pool.index_head_dim is not None:
+        if self.is_npu_arch35 and pool.index_head_dim is not None:
             return True
         quant_method = self.qkv_a_proj.quant_method
         if (
@@ -557,7 +556,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             "query_norm_flag": True,
             "weight_quant_mode": self.weight_quant_mode,
         }
-        if self.is_950 and pool.index_head_dim is not None:
+        if self.is_npu_arch35 and pool.index_head_dim is not None:
             mla_prolog_input_args.update(
                 kv_cache_quant_mode=3 if packed else 0,
                 query_quant_mode=0,
@@ -580,7 +579,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             )
         import torch_npu
 
-        if self.is_950 or hasattr(torch_npu, "npu_mla_prolog_v3"):
+        if self.is_npu_arch35 or hasattr(torch_npu, "npu_mla_prolog_v3"):
             prolog = torch_npu.npu_mla_prolog_v3
         else:
             prolog = torch.ops.custom.npu_mla_prolog_v3

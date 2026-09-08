@@ -95,7 +95,6 @@ from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_available_gpu_memory,
     get_device_memory_capacity,
-    is_950_npu,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
@@ -1506,14 +1505,15 @@ class KVCacheConfigurator:
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (
             NPUMLATokenToKVPool,
         )
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         architectures = getattr(self.model_config.hf_config, "architectures", ()) or ()
         primary_arch = architectures[0] if architectures else None
-        is_950 = is_950_npu(self.gpu_id)
+        is_arch35 = is_npu_arch35()
         is_glm_compact_rollout = (
             is_dsa_model
             and primary_arch == "GlmMoeDsaForCausalLM"
-            and is_950
+            and is_arch35
             and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
         )
         indexer_layer_ids = None
@@ -1524,7 +1524,7 @@ class KVCacheConfigurator:
                 self.layer_info.end_layer,
             )
         use_dsa_fp8_kv_cache_storage = (
-            self.kv_cache_dtype == torch.float8_e4m3fn and is_950
+            self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
         if is_dsa_model:
             logger.info(

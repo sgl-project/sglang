@@ -857,14 +857,6 @@ def get_device_name(device_id: int = 0) -> str:
         return torch.npu.get_device_name(device_id)
 
 
-def is_950_npu(device_id: int = 0) -> bool:
-    # torch_npu can register after this module is imported. Do not cache absence.
-    npu = vars(torch).get("npu")
-    if npu is None or not npu.is_available():
-        return False
-    return (get_device_name(device_id) or "").startswith("Ascend950")
-
-
 @lru_cache(maxsize=1)
 def is_mnnvl_fabric_device() -> bool:
     """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on

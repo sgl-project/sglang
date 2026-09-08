@@ -10,13 +10,13 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.utils.common import is_950_npu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -371,8 +371,8 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
-    if not hasattr(m, "_npu_is_950"):
-        m._npu_is_950 = is_950_npu(torch.npu.current_device())
+    if not hasattr(m, "_npu_is_arch35"):
+        m._npu_is_arch35 = is_npu_arch35()
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -544,7 +544,7 @@ def forward_dsa_core_npu(
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
     attn_output = attn_output.contiguous()
 
-    if m._npu_is_950:
+    if m._npu_is_arch35:
         attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
             attn_output,
             m.w_vc,
