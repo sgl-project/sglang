@@ -189,6 +189,8 @@ def alloc_paged_token_slots_extend(
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
     if is_dsv4:
+        c128_num_pages = allocator.c128_num_pages_needed(prefix_lens_cpu, seq_lens_cpu)
+        allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
         # Per-call per-req table for the C128 KV last_loc lookup.
         if batch is not None:
@@ -489,6 +491,10 @@ def alloc_paged_token_slots_decode(
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
     if is_dsv4:
+        c128_num_pages = allocator.c128_num_pages_needed(
+            (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu
+        )
+        allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
         # Per-call per-req C128 table for the last_loc lookup.
         if batch is not None:
