@@ -59,6 +59,22 @@ class TestSamplingMaskCapture(CustomTestCase):
         self.sampler.tp_sync_group = None
         self.sampler.cp_sync_group = None
 
+    def test_default_sampling_does_not_construct_capture_helpers(self):
+        """Requests without masks must bypass capture-only allocations."""
+        probs = torch.tensor([[0.6, 0.4]])
+        info = SimpleNamespace(sampling_mask_batch_indices=None, sampling_seed=None)
+        with patch.object(
+            sampler_module, "partial", side_effect=AssertionError("capture helper")
+        ):
+            sampled, capture = self.sampler._sample_from_probs(
+                probs=probs,
+                sampling_info=info,
+                positions=torch.tensor([0]),
+                simple_sampling_case=True,
+            )
+        self.assertIn(sampled.item(), (0, 1))
+        self.assertIsNone(capture)
+
     def _sample(
         self, probs, backend, *, top_k=2, top_p=0.45, min_p=0.0, requested_rows=None
     ):

@@ -329,9 +329,10 @@ class Sampler(nn.Module):
         capture_rows = sampling_info.sampling_mask_batch_indices
         return_sampling_mask = capture_rows is not None
         sampling_mask_capture = None
-        select_capture_rows = partial(
-            _select_sampling_mask_rows, batch_indices=capture_rows
-        )
+        if return_sampling_mask:
+            select_capture_rows = partial(
+                _select_sampling_mask_rows, batch_indices=capture_rows
+            )
 
         if simple_sampling_case:
             batch_next_token_ids = sampling_from_probs_torch(
