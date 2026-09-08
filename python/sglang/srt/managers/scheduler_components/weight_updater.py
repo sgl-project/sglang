@@ -450,8 +450,7 @@ class SchedulerWeightUpdaterManager:
                 tensor, torch.Tensor
             ), f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
             if copy_tensors:
-                # The stash outlives this RPC, but an IPC sender may reuse the
-                # shared bucket as soon as the RPC replies.
+                # the stash outlives this RPC, but an IPC sender may reuse the bucket once it replies
                 tensor = tensor.clone()
                 if tensor.is_cuda:
                     copied_devices.add(tensor.device)

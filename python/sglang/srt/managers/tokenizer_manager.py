@@ -679,9 +679,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if get_lora().lora_paths is not None:
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
-        # Adapters registered with defer_publish, keyed by name: their backends
-        # hold zeroed identities, but the names stay out of the serving registry
-        # until end_weight_update commits the session that streams their weights.
+        # defer_publish registrations: zeroed identities on the backends, names
+        # unservable until end_weight_update commits their session
         self._pending_lora_publications: Dict[str, LoRARef] = {}
 
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
@@ -3463,16 +3462,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 continue
 
             if lora_path in self._pending_lora_publications:
-                # A staged session is streaming this name; loading it from disk
-                # now would give one name two identities at commit time.
+                # a staged session is streaming this name; a disk load now would give it two identities
                 raise ValueError(
                     f"LoRA adapter '{lora_path}' is awaiting publication and "
                     "cannot be served or backfilled yet."
                 )
             if lora_path not in self.lora_ref_cache:
-                # A request-carried backfill path makes the request
-                # self-sufficient: a fresh or restarted engine can serve any
-                # published version without prior state.
+                # a request-carried path lets a fresh or restarted engine serve any published version
                 if lora_path in backfill_paths:
                     self.lora_ref_cache[lora_path] = LoRARef(
                         lora_name=lora_path,

@@ -265,9 +265,7 @@ class GenerateReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
-    # {lora_name: disk path}: where to (re)load a requested adapter from when
-    # this engine does not hold it — the request is self-sufficient, so a fresh
-    # or restarted engine can serve any published version without prior state.
+    # {lora_name: disk path}: backfill source when this engine does not hold the adapter
     lora_backfill_paths: Optional[Dict[str, str]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
@@ -1137,9 +1135,7 @@ class EmbeddingReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
-    # {lora_name: disk path}: where to (re)load a requested adapter from when
-    # this engine does not hold it — the request is self-sufficient, so a fresh
-    # or restarted engine can serve any published version without prior state.
+    # {lora_name: disk path}: backfill source when this engine does not hold the adapter
     lora_backfill_paths: Optional[Dict[str, str]] = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
@@ -2057,9 +2053,7 @@ class EndWeightUpdateReqInput(BaseReq, kw_only=True):
     # {lora_name: {hf_key: sha256}}; when set, each stashed adapter is verified
     # (set equality + per-tensor checksum) before it is applied.
     expected_lora_checksums: Optional[Dict[str, Dict[str, str]]] = None
-    # Discard the streamed LoRA stash instead of applying it, and drop any
-    # deferred publications. Base tensors already written in place this session
-    # are not rolled back.
+    # discard the streamed LoRA stash and deferred publications; in-place base writes are not rolled back
     abort: bool = False
 
 
@@ -2388,9 +2382,7 @@ class RegisterLoRAAdapterReqInput(BaseReq, kw_only=True):
     # Disk artifact holding the same adapter (PEFT dir). With a path the
     # adapter is reloadable: it may be LRU-evicted and refilled from disk.
     lora_path: Optional[str] = None
-    # Keep the name out of the serving registry until end_weight_update
-    # commits the session that streams its weights. Fresh names only: a
-    # published name has readers and must not be staged over.
+    # keep the name unservable until end_weight_update commits its session; fresh names only
     defer_publish: bool = False
 
     def to_ref(self) -> LoRARef:
@@ -2407,9 +2399,7 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
-    # Acknowledges a defer_publish registration. The trainer fails closed on a
-    # missing ack: an engine that ignored defer_publish would serve the name
-    # while its weights stream.
+    # acks a defer_publish registration; the trainer fails closed without it
     pending: bool = False
 
 

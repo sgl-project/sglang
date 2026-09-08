@@ -505,9 +505,7 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         pending = dict(self._pending_lora_publications)
         if pending and not obj.abort:
-            # Fail closed: a deferred publication commits only under a full
-            # checksum manifest — without one a lost bucket would publish a
-            # silently incomplete adapter.
+            # fail closed: without a full manifest a lost bucket would publish an incomplete adapter
             missing = set(pending) - set(obj.expected_lora_checksums or {})
             if missing:
                 obj.abort = True
@@ -590,8 +588,7 @@ class TokenizerControlMixin:
         if staged and (
             obj.flush_cache or obj.abort_all_requests or obj.weight_version is not None
         ):
-            # The reader lock lets generation run through the update; anything
-            # that mutates serving state needs the writer lock it gave up.
+            # the reader lock gave up exclusivity; serving-state mutations need the writer lock
             return False, "a staged adapter session cannot change serving state"
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
@@ -662,8 +659,7 @@ class TokenizerControlMixin:
         if staged and (
             obj.flush_cache or obj.abort_all_requests or obj.weight_version is not None
         ):
-            # The reader lock lets generation run through the update; anything
-            # that mutates serving state needs the writer lock it gave up.
+            # the reader lock gave up exclusivity; serving-state mutations need the writer lock
             return False, "a staged adapter session cannot change serving state"
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
