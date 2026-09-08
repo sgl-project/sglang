@@ -293,17 +293,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         started = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
-            for transfers in request_transfers:
+            batch_rids: dict[PoolName, list[str]] = {}
+            for rid, transfers in request_transfers:
                 for transfer in transfers:
                     keys, locations = batches.setdefault(transfer.name, ([], []))
                     component_keys, _ = self.storage._get_hybrid_page_component_keys(
                         list(transfer.keys), transfer
                     )
-                    keys.extend(self.storage._tag_keys(component_keys))
+                    tagged_keys = self.storage._tag_keys(component_keys)
+                    keys.extend(tagged_keys)
                     locations.extend(
                         self.pools[transfer.name].prepare_locations(
                             transfer.host_indices
                         )
+                    )
+                    batch_rids.setdefault(transfer.name, []).extend(
+                        [rid] * len(tagged_keys)
                     )
             for keys, _ in batches.values():
                 result = self.storage.store.batch_get_session_start(keys)
@@ -313,6 +318,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"results={result}"
                     )
                 started.append(keys)
+
+            if self.enable_page_wise_load and any(
+                len(keys) >= self.page_wise_load_threshold
+                for keys, _ in batches.values()
+            ):
+                request_success = self._load_page_wise(
+                    counter_index, request_transfers, batches, batch_rids
+                )
+                if not all(request_success.values()):
+                    request_success = {rid: False for rid, _ in request_transfers}
+                    raise RuntimeError(
+                        "Mooncake page-wise load failed for one or more requests."
+                    )
+                return
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
@@ -350,6 +369,152 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+
+    def _load_page_wise(
+        self,
+        counter_index: int,
+        request_transfers: list[tuple[str, list[PoolTransfer]]],
+        batches: dict[PoolName, tuple[list[str], list[int]]],
+        batch_rids: dict[PoolName, list[str]],
+    ) -> dict[str, bool]:
+        """Load complete pages before releasing their layers to the consumer."""
+        request_success = {rid: True for rid, _ in request_transfers}
+
+        # Keep failure attribution conservative.  The batch lists are expected
+        # to stay aligned with ``batch_rids``; if a backend/component violates
+        # that contract, a failed object cannot be safely assigned to one rid.
+        # Treat the whole batch as failed instead of accidentally completing the
+        # layer counter for an affected request.
+        mapping_valid = all(
+            len(batch_rids.get(name, ())) == len(keys)
+            for name, (keys, _) in batches.items()
+        )
+        if not mapping_valid:
+            logger.error(
+                "Mooncake page-wise request attribution mismatch; "
+                "marking the whole batch failed."
+            )
+            raise ValueError("Mooncake page-wise request attribution mismatch.")
+
+        all_keys: list[str] = []
+        all_ptrs: list[list[int]] = []
+        all_sizes: list[list[int]] = []
+        all_offsets: list[list[int]] = []
+        all_rids: list[str | None] = []
+        all_pools: list[PoolName] = []
+        for name, (keys, locations) in batches.items():
+            ptrs: list[list[int]] = [[] for _ in keys]
+            sizes: list[list[int]] = [[] for _ in keys]
+            offsets: list[list[int]] = [[] for _ in keys]
+
+            for layer in range(self.num_layers):
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+                if meta is None:
+                    continue
+                layer_ptrs, layer_sizes, layer_offsets = meta
+                if not (
+                    len(layer_ptrs)
+                    == len(layer_sizes)
+                    == len(layer_offsets)
+                    == len(keys)
+                ):
+                    raise ValueError(
+                        f"Mooncake pool={name} layer={layer} produced "
+                        f"{len(layer_ptrs)} range entries for {len(keys)} keys."
+                    )
+                for index in range(len(keys)):
+                    ptrs[index].extend(layer_ptrs[index])
+                    sizes[index].extend(layer_sizes[index])
+                    offsets[index].extend(layer_offsets[index])
+
+            rids = batch_rids.get(name, [None] * len(keys))
+            all_keys.extend(keys)
+            all_ptrs.extend(ptrs)
+            all_sizes.extend(sizes)
+            all_offsets.extend(offsets)
+            all_rids.extend(rids)
+            all_pools.extend([name] * len(keys))
+
+        lengths = {
+            "keys": len(all_keys),
+            "ptrs": len(all_ptrs),
+            "sizes": len(all_sizes),
+            "offsets": len(all_offsets),
+            "rids": len(all_rids),
+            "pools": len(all_pools),
+        }
+        if len(set(lengths.values())) != 1:
+            raise ValueError(
+                f"Mooncake page-wise aggregated metadata mismatch: {lengths}."
+            )
+
+        # Mooncake's range API is key-major and does not take a pool argument,
+        # so differently suffixed physical-pool objects can share one call.
+        pool_counts = {
+            str(name): len(keys) for name, (keys, _) in batches.items()
+        }
+        unique_rids = sorted({rid for rid in all_rids if rid is not None})
+        logger.debug(
+            "01 Mooncake range get start: counter=%d rids=%s rids_size=%d "
+            "pools=%s complete_page objects=%d",
+            counter_index,
+            unique_rids,
+            len(all_rids),
+            pool_counts,
+            len(all_keys),
+        )
+        result = self.storage.store.batch_get_into_multi_buffer_ranges(
+            all_keys, all_ptrs, all_sizes, all_offsets
+        )
+        expected = [sum(item) for item in all_sizes]
+        transferred = (
+            None if result is None or isinstance(result, int) else list(result)
+        )
+        if transferred is None or transferred != expected:
+            failed_objects = []
+            for index, key in enumerate(all_keys):
+                actual = (
+                    result
+                    if result is None or isinstance(result, int)
+                    else transferred[index]
+                    if index < len(transferred)
+                    else None
+                )
+                wanted = expected[index] if index < len(expected) else None
+                if actual != wanted:
+                    rid = all_rids[index] if index < len(all_rids) else None
+                    pool = all_pools[index] if index < len(all_pools) else None
+                    if rid is None:
+                        request_success = {
+                            request_rid: False
+                            for request_rid, _ in request_transfers
+                        }
+                    else:
+                        request_success[rid] = False
+                    failed_objects.append(
+                        {
+                            "key": key,
+                            "rid": rid,
+                            "pool": pool,
+                            "transferred": actual,
+                            "expected": wanted,
+                        }
+                    )
+            logger.error(
+                "Mooncake page-wise aggregated range get failed: "
+                "failed_objects=%s",
+                failed_objects,
+            )
+
+        # Page-wise loading intentionally gives up layer overlap: sessions must
+        # be released only after every page is complete, and before any layer is
+        # made visible to the model.
+        for rid, _ in request_transfers:
+            self.abort_prepared_load(rid)
+        if all(request_success.values()):
+            for layer in range(self.num_layers):
+                self.layer_done_counter.complete(counter_index, layer)
+        return request_success
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
