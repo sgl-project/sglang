@@ -10,9 +10,41 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models import (  # noqa: F401
     sensenova_u1 as _sensenova_u1,
 )
+from sglang.multimodal_gen.runtime.models.sensenova_u1.pe_client import (
+    SenseNovaU1PEClient,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+logger = init_logger(__name__)
+
+
+def load_pe_client(server_args: ServerArgs) -> SenseNovaU1PEClient | None:
+    """Build the optional SenseNova-U1 prompt-enhancement (PE) client.
+
+    SenseNova-U1 ships no local PE checkpoint; enhancement is always a
+    remote OpenAI-compatible chat/completions call. Returns None when no
+    PE API key is configured, so prompt enhancement stays opt-in.
+    """
+    if server_args.pe_api_key is None:
+        return None
+    if server_args.pe_backend != "chat_completions":
+        raise ValueError(
+            f"Unsupported SenseNova-U1 PE backend {server_args.pe_backend!r}; "
+            "only 'chat_completions' is currently supported."
+        )
+    logger.info(
+        "Using remote SenseNova-U1 PE endpoint: %s (model=%s)",
+        server_args.pe_endpoint,
+        server_args.pe_model_name,
+    )
+    return SenseNovaU1PEClient(
+        endpoint=server_args.pe_endpoint,
+        model=server_args.pe_model_name,
+        api_key=server_args.pe_api_key,
+    )
 
 
 def load_model_and_tokenizer(
@@ -39,4 +71,8 @@ def load_model_and_tokenizer(
     device = get_local_torch_device()
     current_platform.set_device(device)
     model = model.to(device)
-    return {"model": model, "tokenizer": tokenizer}
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
+        "pe": load_pe_client(server_args),
+    }
