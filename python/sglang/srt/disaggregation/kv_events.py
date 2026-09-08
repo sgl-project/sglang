@@ -263,6 +263,12 @@ class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
     cache_salt: str
 
 
+# Canonical on-wire component names for ``BlockStored.component_types``.
+KV_COMPONENT_FULL = "full"
+KV_COMPONENT_SWA = "swa"
+KV_COMPONENT_MAMBA = "mamba"
+
+
 class OffloadedState(msgspec.Struct):
     """Decode-side offload progress for one request, keyed by Req in the manager."""
 
@@ -279,6 +285,7 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+    component_types: Optional[list[str]] = None
 
 
 class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):

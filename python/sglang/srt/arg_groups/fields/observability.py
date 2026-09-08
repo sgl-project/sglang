@@ -152,6 +152,15 @@ class Observability:
         Optional[str],
         "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint.",
     ] = None
+    enable_kv_events_component_types: A[
+        bool,
+        "Include the per-component (full/swa/mamba) placement snapshot in KV "
+        "events emitted via --kv-events-config; only component-aware caches (the "
+        "unified radix tree) honor it. Off by default: the component_types list "
+        "occupies a trailing positional slot that subscribers sharing the vLLM "
+        "event layout read as a different field, so only enable it for a "
+        "subscriber known to understand it (sgl-router ignores it either way).",
+    ] = False
     load_publish_endpoint: A[
         Optional[str],
         "Opt in to the runtime-load PUB socket that load-aware routers subscribe to. Off by default (unset or 'off'). Use 'auto' to reserve the dp_size ports packed after the --kv-events-config range, or a wildcard-host TCP address (e.g. tcp://*:6000) to place it explicitly; rank r binds port+r and /server_info advertises the base under the kv_events block. Requires --kv-events-config to describe a publisher (routers discover the base through /server_info); startup fails if this is set without one, is not bindable, or overlaps the KV range. Note: 'auto' reserves 2*dp_size ports from the KV base — space co-hosted engines accordingly. The router-facing update cadence follows --load-snapshot-publish-interval (shared to avoid double-collecting the snapshot), so a large value there also staleness-caps this feed.",
