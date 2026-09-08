@@ -125,13 +125,16 @@ __global__ void qwen_qkv_epilogue_kernel(const Params __grid_constant__ params) 
     const auto* cache = static_cast<const float*>(is_text ? params.txt_cache : params.img_cache);
     const auto* cos_ptr = cache + source_token * kHeadDim;
     const auto* sin_ptr = cos_ptr + kHeadDim / 2;
+    // Each lane consumes two adjacent cache entries. Loading them together
+    // avoids the half-used sectors from two stride-2 scalar loads.
+    const auto cos_pair = __ldg(reinterpret_cast<const float2*>(cos_ptr) + lane);
+    const auto sin_pair = __ldg(reinterpret_cast<const float2*>(sin_ptr) + lane);
 #pragma unroll
     for (uint32_t i = 0; i < kElemsPerThread; i += 2) {
       const float x = elems[i];
       const float y = elems[i + 1];
-      const uint32_t cache_idx = (lane * kElemsPerThread + i) / 2;
-      const float cos = __ldg(cos_ptr + cache_idx);
-      const float sin = __ldg(sin_ptr + cache_idx);
+      const float cos = i == 0 ? cos_pair.x : cos_pair.y;
+      const float sin = i == 0 ? sin_pair.x : sin_pair.y;
       elems[i] = x * cos - y * sin;
       elems[i + 1] = y * cos + x * sin;
     }

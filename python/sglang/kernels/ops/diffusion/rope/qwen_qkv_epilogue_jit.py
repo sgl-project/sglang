@@ -122,6 +122,8 @@ def try_fused_qwen_qkv_epilogue(
         and txt_cache.shape[0] >= txt_q.shape[1]
         and img_cache.is_contiguous()
         and txt_cache.is_contiguous()
+        and img_cache.data_ptr() % 8 == 0
+        and txt_cache.data_ptr() % 8 == 0
     ):
         return None
 
