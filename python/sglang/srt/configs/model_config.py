@@ -372,14 +372,12 @@ class ModelConfig:
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
-        is_draft_quantization_explicit: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
-        self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
@@ -715,17 +713,6 @@ class ModelConfig:
             language_model_only=cfg.language_model_only,
             encoder_only=cfg.encoder_only,
             is_draft_model=is_draft_model,
-            # The record, not `cfg`: "did the operator type a draft
-            # quantization" is a question about the input, and resolution
-            # answers `cfg` with the target model's value when they did not.
-            # The record cannot go stale here -- the write seal freezes every
-            # field the moment resolution starts -- so this read is pinned in
-            # `test_supplied_instance_exposure_ratchet.py` rather than routed
-            # through an accessor that would return the same value.
-            is_draft_quantization_explicit=(
-                is_draft_model
-                and server_args.speculative_draft_model_quantization is not None
-            ),
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,

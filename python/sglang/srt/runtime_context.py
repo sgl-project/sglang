@@ -208,6 +208,24 @@ def parallel_widths_of(cfg: Any) -> dict:
     )
 
 
+def is_draft_quantization_explicit_of(cfg: Any) -> bool:
+    """Whether the operator asked for a draft-model quantization.
+
+    Resolution declares the target model's quantization for the draft when they
+    did not, so every decided surface answers with a value either way and only
+    the input separates the two. The record is the input -- its fields are
+    sealed the moment resolution starts -- and `_raw_input` is the snapshot
+    taken at that point, which the view falls through to.
+
+    A config that never ran the pipeline has no snapshot and no declarations
+    either, so its field is the input.
+    """
+    raw = getattr(cfg, "_raw_input", None)
+    if raw is not None:
+        return raw.get("speculative_draft_model_quantization") is not None
+    return getattr(cfg, "speculative_draft_model_quantization", None) is not None
+
+
 def attn_tp_size_of(cfg: Any):
     """`attn_tp_size`, computed at publish. See `parallel_widths_of`."""
     return parallel_widths_of(cfg)["attn_tp_size"]

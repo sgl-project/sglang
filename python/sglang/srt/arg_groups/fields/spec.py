@@ -18,6 +18,7 @@ from typing import (
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    Derived,
 )
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
@@ -31,6 +32,12 @@ class Spec:
     """Namespace ``spec``."""
 
     _NS_PATH = "spec"
+
+    is_draft_quantization_explicit = Derived(
+        fn="sglang.srt.runtime_context.is_draft_quantization_explicit_of",
+        doc="Whether the operator asked for a draft-model quantization, as "
+        "opposed to resolution inheriting the target model's.",
+    )
     # -------------------------------------------------------------------------
     # Speculative decoding
     # -------------------------------------------------------------------------

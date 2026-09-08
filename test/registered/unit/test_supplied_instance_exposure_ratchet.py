@@ -134,29 +134,12 @@ _ENV_MATRIX = (({}, {"SGLANG_IS_IN_CI": "true"}),)
 # are step-12 exposure like any other pair.
 _PASSED = frozenset({"model_path", "device", "random_seed"})
 
-# Two reasons put a pair here, and each entry carries its own.
-#
-# One: the reader has no bag to read -- it runs before its process publishes --
-# and cannot use `resolving_view` either. The launcher's pre-publish reads
-# (`_set_envs_and_config`, the auto-parser gate) and the late-resolution
-# detection it calls all read the declarations now, so nothing qualifies today.
-#
-# Two: the reader wants the operator's *input*, which is exactly what the
-# record answers. The write seal freezes every field the moment resolution
-# starts, so the record cannot drift from the input -- the read is correct, and
-# it is pinned here because this census cannot tell it apart from the mistake
-# it exists to catch: reading the record for a value resolution decides. The
-# read has to say so in a comment at the call site.
-_EXPOSED: frozenset = frozenset(
-    {
-        # Reason two. `ModelConfig` carries a provenance bit for the draft
-        # model, and resolution declares the target's quantization for the
-        # draft when the operator typed none -- so every decided surface
-        # answers with a value either way, and only the input separates
-        # "inherited" from "asked for".
-        ("configs/model_config.py", "speculative_draft_model_quantization"),
-    }
-)
+# Empty. A pair belongs here when a reader has no bag to read -- it runs before
+# its process publishes -- and cannot use `resolving_view` either. The launcher's
+# pre-publish reads (`_set_envs_and_config`, the auto-parser gate) and the
+# late-resolution detection it calls all read the declarations now, so nothing
+# qualifies. A new entry needs that kind of reason next to it.
+_EXPOSED: frozenset = frozenset()
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
 # `is_cuda()` gated): asserted on the CUDA registration, invisible to the CPU

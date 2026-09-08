@@ -243,10 +243,8 @@ class TestPrepareServerArgs(CustomTestCase):
         # the evidence of what was asked for.
         self.assertIsNone(inherited.speculative_draft_model_quantization)
 
-        # And it survives the hop that matters: the scheduler and the draft
-        # worker rebuild the record from its fields, and `from_server_args`
-        # reads it there to tell an inherited draft quantization from one the
-        # operator asked for.
+        # And across the hop that matters: the scheduler and the draft worker
+        # rebuild the record from its fields.
         rebuilt = ServerArgs(**dataclasses.asdict(inherited))
         self.assertIsNone(rebuilt.speculative_draft_model_quantization)
 
