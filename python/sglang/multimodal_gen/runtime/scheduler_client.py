@@ -1,19 +1,24 @@
+import asyncio
 import itertools
 import pickle
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import zmq
 import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsChecksumReqInput,
+    InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
@@ -35,6 +40,12 @@ from sglang.multimodal_gen.runtime.utils.request_logger import (
 )
 
 logger = init_logger(__name__)
+
+_COLLECTIVE_REQ_TYPES = (
+    InitWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqInput,
+    UpdateWeightsFromDistributedReqInput,
+)
 
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
 # DP they must reach every replica rather than one.
@@ -187,7 +198,15 @@ class SchedulerClient:
     def _forward_routed(self, batch: Any, timeout_ms: int | None) -> Any:
         self.request_logger.log_received_request(batch)
         endpoints = self.server_args.scheduler_endpoints
-        if isinstance(batch, _CONTROL_REQ_TYPES):
+        if isinstance(batch, _COLLECTIVE_REQ_TYPES):
+            with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+                results = list(
+                    executor.map(
+                        lambda ep: self._forward_one(ep, batch, timeout_ms), endpoints
+                    )
+                )
+            output_batch = _merge_fanout_results(results)
+        elif isinstance(batch, _CONTROL_REQ_TYPES):
             results = [self._forward_one(ep, batch, timeout_ms) for ep in endpoints]
             output_batch = _merge_fanout_results(results)
         else:
@@ -261,7 +280,12 @@ class AsyncSchedulerClient:
             )
 
         endpoints = self.server_args.scheduler_endpoints
-        if isinstance(batch, _CONTROL_REQ_TYPES):
+        if isinstance(batch, _COLLECTIVE_REQ_TYPES):
+            results = await asyncio.gather(
+                *(self._forward_one(ep, batch, timeout_ms) for ep in endpoints)
+            )
+            output_batch = _merge_fanout_results(results)
+        elif isinstance(batch, _CONTROL_REQ_TYPES):
             # replica state (weights, LoRA, memory) must change everywhere
             results = [
                 await self._forward_one(ep, batch, timeout_ms) for ep in endpoints

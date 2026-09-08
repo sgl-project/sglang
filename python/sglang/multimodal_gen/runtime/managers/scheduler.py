@@ -17,12 +17,15 @@ from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsChecksumReqInput,
+    InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GetDisaggStatsReq,
@@ -154,6 +157,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self._handle_update_weights_from_tensor_checker
             ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            InitWeightsUpdateGroupReqInput: self._handle_init_weights_update_group,
+            DestroyWeightsUpdateGroupReqInput: self._handle_destroy_weights_update_group,
+            UpdateWeightsFromDistributedReqInput: self._handle_update_weights_from_distributed,
             ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
             ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }
