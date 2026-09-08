@@ -5,9 +5,24 @@ import torch
 
 import sglang.kernels.ops.layernorm.mhc as mhc
 from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+
+
+def _bypass_tp_group(monkeypatch):
+    """These are single-process kernel unit tests with no TP group initialized.
+
+    mhc_pre / mhc_fused_post_pre allocate the MoE input in the symmetric-memory
+    pool via use_symmetric_memory(get_tp_group(), ...); bypass that path so the
+    kernel runs with a plain torch.empty allocation. Mirrors the workaround in
+    test_mxfp4_sm90_cutlass.py for the same TP-group-not-initialized case.
+    """
+    monkeypatch.setattr(mhc, "is_dsa_prefill_cp_round_robin_split", lambda: False)
+    monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(mhc, "get_tp_group", lambda: None)
 
 
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
@@ -19,15 +34,7 @@ def test_mhc_fused_post_pre_matches_unfused(
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TileLang mHC kernels")
 
-    monkeypatch.setattr(mhc, "is_dsa_prefill_cp_round_robin_split", lambda: False)
-    # This is a single-process kernel unit test with no TP group initialized.
-    # mhc_pre / mhc_fused_post_pre allocate the MoE input in the symmetric-memory
-    # pool via use_symmetric_memory(get_tp_group(), ...); bypass that path so the
-    # kernel runs with a plain torch.empty allocation. Mirrors the workaround in
-    # test_mxfp4_sm90_cutlass.py for the same TP-group-not-initialized case.
-    monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
-    monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(mhc, "get_tp_group", lambda: None)
+    _bypass_tp_group(monkeypatch)
     torch.manual_seed(0)
     device = torch.device("cuda")
     hc_mult = 4
@@ -122,6 +129,101 @@ def test_mhc_fused_post_pre_matches_unfused(
     layer_atol = 2e-2 if use_norm else 2e-3
     layer_rtol = 2e-2 if use_norm else 2e-3
     torch.testing.assert_close(layer_out, layer_ref, atol=layer_atol, rtol=layer_rtol)
+
+
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize("num_tokens", [40, 64])
+def test_mhc_fused_post_pre_no_deepgemm_matches_mhc_pre(
+    monkeypatch, hidden_size, num_tokens
+):
+    """Without DeepGEMM the fused boundary must run mhc_pre's pre-norm GEMM.
+
+    num_tokens is above mhc_fused_post_pre's FMA threshold and below mhc_pre's
+    split-K token limit, so both paths belong on the split-K kernel. Taking the
+    plain kernel instead is correct but launches only ceil(num_tokens / 32)
+    blocks, which is a large slowdown at decode batch sizes, so assert on the
+    branch rather than on the outputs alone.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TileLang mHC kernels")
+
+    _bypass_tp_group(monkeypatch)
+    plain_gemm_calls = 0
+    real_dispatch = mhc._mhc_pre_gemm_sqrsum_dispatch
+
+    def counting_dispatch():
+        nonlocal plain_gemm_calls
+        plain_gemm_calls += 1
+        return real_dispatch()
+
+    monkeypatch.setattr(mhc, "_mhc_pre_gemm_sqrsum_dispatch", counting_dispatch)
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    hc_mult = 4
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    hc_hidden_size = hc_mult * hidden_size
+    assert hc_hidden_size in mhc.MHC_PRE_SPLITK_HIDDEN_BLOCK
+    assert num_tokens <= mhc.MHC_PRE_SPLITK_MAX_TOKENS
+
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) * 0.1
+    residual = (
+        torch.randn(
+            num_tokens, hc_mult, hidden_size, device=device, dtype=torch.bfloat16
+        )
+        * 0.1
+    )
+    post_prev = torch.rand(num_tokens, hc_mult, 1, device=device, dtype=torch.float32)
+    comb_prev = (
+        torch.rand(num_tokens, hc_mult, hc_mult, device=device, dtype=torch.float32)
+        * 0.25
+    )
+    fn = (
+        torch.randn(hc_mult3, hc_hidden_size, device=device, dtype=torch.float32) * 0.01
+    )
+    hc_scale = torch.tensor([0.5, 0.25, 0.25], device=device, dtype=torch.float32)
+    hc_base = torch.zeros(hc_mult3, device=device, dtype=torch.float32)
+    rms_eps = hc_eps = 1e-6
+    sinkhorn_repeat = 2
+
+    with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(False):
+        residual_ref = mhc_post(x, residual, post_prev, comb_prev)
+        post_ref, comb_ref, layer_ref = mhc_pre(
+            residual_ref,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            hc_eps,
+            2.0,
+            sinkhorn_repeat,
+        )
+        assert plain_gemm_calls == 0, "mhc_pre took the plain pre-norm GEMM"
+
+        residual_out, post_out, comb_out, layer_out = mhc_fused_post_pre(
+            x,
+            residual,
+            post_prev,
+            comb_prev,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            hc_eps,
+            2.0,
+            sinkhorn_repeat,
+        )
+    torch.cuda.synchronize()
+    assert plain_gemm_calls == 0, (
+        "mhc_fused_post_pre took the plain pre-norm GEMM where mhc_pre uses split-K"
+    )
+
+    torch.testing.assert_close(residual_out, residual_ref, atol=0, rtol=0)
+    torch.testing.assert_close(post_out, post_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(comb_out, comb_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(layer_out, layer_ref, atol=2e-3, rtol=2e-3)
 
 
 if __name__ == "__main__":

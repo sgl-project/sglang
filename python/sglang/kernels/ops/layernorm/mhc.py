@@ -735,6 +735,49 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
     )
 
 
+# Token counts above this keep the plain (non split-K) pre-norm GEMM: with that
+# many tokens the ceil(num_tokens / 32) grid already fills the device.
+MHC_PRE_SPLITK_MAX_TOKENS = 2048
+# hc_hidden_size -> hidden_block for mhc_pre_gemm_sqrsum_splitk_kernel.
+MHC_PRE_SPLITK_HIDDEN_BLOCK = {16384: 256, 28672: 128}
+
+
+def _mhc_pre_gemm_sqrsum_splitk(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    hc_mult3: int,
+    hc_hidden_size: int,
+    split_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split-K pre-norm GEMM and RMS square sums, left as per-split partials.
+
+    Shared by mhc_pre and mhc_fused_post_pre so the two cannot drift apart. The
+    stage_1 reduction is folded into mhc_pre_big_fuse, which is why the caller
+    passes ``split_k`` as its ``n_splits`` and ``32`` as its last GEMM dim.
+    """
+    hidden_block = MHC_PRE_SPLITK_HIDDEN_BLOCK.get(hc_hidden_size)
+    if hidden_block is None:
+        raise NotImplementedError(
+            f"mhc_pre splitk kernel only supports hc_hidden_size in "
+            f"{sorted(MHC_PRE_SPLITK_HIDDEN_BLOCK)}, got {hc_hidden_size}"
+        )
+    kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
+        hc_mult3,
+        hc_hidden_size,
+        split_k=split_k,
+        token_block=32,
+        hidden_block=hidden_block,
+    )
+    partial_out = torch.empty(
+        split_k, x.shape[0], 32, dtype=torch.float32, device=x.device
+    )
+    partial_sqrsum = torch.empty(
+        split_k, x.shape[0], dtype=torch.float32, device=x.device
+    )
+    kernel_0(x, fn, partial_out, partial_sqrsum)
+    return partial_out, partial_sqrsum
+
+
 def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     block_m, block_k = 64, 64
     grid_size = (num_tokens + block_m - 1) // block_m
@@ -1053,43 +1096,16 @@ def mhc_pre(
         gemm_last_dim = hc_mult3
         big_fuse_n_splits = n_splits
     else:
-        if num_tokens <= 2048:
+        if num_tokens <= MHC_PRE_SPLITK_MAX_TOKENS:
             assert n_splits == 1
-            if hc_hidden_size == 16384:
-                hidden_block = 256
-            elif hc_hidden_size == 28672:
-                hidden_block = 128
-            else:
-                raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
-                    f"got {hc_hidden_size}"
-                )
-            kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
-                hc_mult3,
-                hc_hidden_size,
-                split_k=n_splits_pre,
-                token_block=32,
-                hidden_block=hidden_block,
-            )
-            partial_out = torch.empty(
-                n_splits_pre,
-                num_tokens,
-                32,
-                dtype=torch.float32,
-                device=residual.device,
-            )
-            partial_sqrsum = torch.empty(
-                n_splits_pre, num_tokens, dtype=torch.float32, device=residual.device
-            )
-            kernel_0(
-                residual_flat.view(num_tokens, hc_hidden_size),
-                fn_flat,
-                partial_out,
-                partial_sqrsum,
-            )
             # Stage_1 reduction is folded into big_fuse below; skip launching it.
-            gemm_out_mul = partial_out
-            gemm_out_sqrsum = partial_sqrsum
+            gemm_out_mul, gemm_out_sqrsum = _mhc_pre_gemm_sqrsum_splitk(
+                x=residual_flat.view(num_tokens, hc_hidden_size),
+                fn=fn_flat,
+                hc_mult3=hc_mult3,
+                hc_hidden_size=hc_hidden_size,
+                split_k=n_splits_pre,
+            )
             gemm_last_dim = 32
             big_fuse_n_splits = n_splits_pre
         else:
@@ -1520,6 +1536,7 @@ def mhc_fused_post_pre(
     sinkhorn_repeat: int,
     n_splits: int = 1,
     tile_n: int = 1,
+    n_splits_pre: int = 32,
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
@@ -1611,6 +1628,7 @@ def mhc_fused_post_pre(
         device=residual.device,
     )
     residual_cur = torch.empty_like(residual_flat)
+    gemm_last_dim = hc_mult3
 
     if num_tokens <= fma_token_threshold:
         # Small-batch path: one TileLang launch computes hc_post, the bf16
@@ -1653,8 +1671,28 @@ def mhc_fused_post_pre(
                 gemm_out_sqrsum,
                 num_splits=n_splits,
             )
+        elif (
+            num_tokens <= MHC_PRE_SPLITK_MAX_TOKENS
+            and hc_hidden_size in MHC_PRE_SPLITK_HIDDEN_BLOCK
+        ):
+            # Fallback mirrors mhc_pre when DeepGEMM prenorm is disabled: same
+            # split-K kernel, same folded stage_1 reduction. The plain kernel
+            # below launches only ceil(num_tokens / 32) blocks, so a decode
+            # batch just past fma_token_threshold streams the whole fn matrix
+            # through two SMs.
+            n_splits = n_splits_pre
+            gemm_out_mul, gemm_out_sqrsum = _mhc_pre_gemm_sqrsum_splitk(
+                x=residual_cur.view(num_tokens, hc_hidden_size),
+                fn=fn,
+                hc_mult3=hc_mult3,
+                hc_hidden_size=hc_hidden_size,
+                split_k=n_splits_pre,
+            )
+            gemm_last_dim = 32
         else:
-            # Fallback mirrors mhc_pre when DeepGEMM prenorm is disabled.
+            # hc_hidden_size the split-K kernel is not specialized for, or a
+            # batch large enough that ceil(num_tokens / 32) already fills the
+            # device: plain GEMM, as in mhc_pre above MHC_PRE_SPLITK_MAX_TOKENS.
             n_splits = 1
             gemm_out_mul_2d = torch.empty(
                 num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
@@ -1727,7 +1765,7 @@ def mhc_fused_post_pre(
             norm_eps,
             n_splits,
             hc_mult,
-            hc_mult3,
+            gemm_last_dim,
         )
     else:
         # Same mhc_pre finalization without the model-layer RMSNorm.
@@ -1748,7 +1786,7 @@ def mhc_fused_post_pre(
             sinkhorn_repeat,
             n_splits,
             hc_mult,
-            hc_mult3,
+            gemm_last_dim,
         )
 
     return (
