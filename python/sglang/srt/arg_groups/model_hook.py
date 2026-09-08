@@ -244,6 +244,21 @@ def handle_model_specific_adjustments(server_args: Any):
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
 
+            elif get_platform().is_xpu:
+                run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
+                run_post_process_pass(server_args, _dsa_split_backend_resolution)
+                # Disable fused topk (requires sgl-kernel ops not available on XPU)
+                if (
+                    envs.SGLANG_DSA_FUSE_TOPK.is_set()
+                    and envs.SGLANG_DSA_FUSE_TOPK.get()
+                ):
+                    logger.warning(
+                        "Disabling fused topk for DeepSeek DSA on XPU (SGLANG_DSA_FUSE_TOPK=0). Not supported yet."
+                    )
+                envs.SGLANG_DSA_FUSE_TOPK.set(False)
+                # Disable CUDA-JIT topk-v2 (TileLang/TVM-based, requires CUDA)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+
             if cfg.enable_prefill_cp:
                 assert cfg.disaggregation_mode != "decode", (
                     "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
@@ -269,9 +284,7 @@ def handle_model_specific_adjustments(server_args: Any):
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split requires "
-                    "--enable-prefill-cp and --cp-strategy interleave "
-                    "(or legacy --enable-nsa-prefill-context-parallel with "
-                    "--nsa-prefill-cp-mode round-robin-split)."
+                    "--enable-prefill-cp and --cp-strategy interleave."
                 )
             # Layer split relies on the mooncake all-CP-rank KV/indexer
             # transfer path. mori/nixl support is a temporary limitation
