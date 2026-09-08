@@ -458,7 +458,9 @@ class DSparkWorkerV2(BaseSpecWorker):
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
         return self._observers.block_accept_estimate_log_suffix()
 
-    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+    def note_request_finished(
+        self, *, rid: str, natural_stop: bool, normal_completion: bool
+    ) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
     def forward_batch_generation(

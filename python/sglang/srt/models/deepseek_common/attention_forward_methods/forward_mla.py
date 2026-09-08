@@ -153,19 +153,75 @@ class DeepseekMLAForwardMixin:
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         prev_topk_indices: Optional[torch.Tensor],
+        self_topk_indices: Optional[torch.Tensor] = None,
     ) -> None:
         """Run the explicitly armed eager-only shadow observer, if any."""
         callback = getattr(forward_batch, "_dsa_topk_shadow_callback", None)
         if callback is None or prev_topk_indices is None or not self.is_nextn:
             return
-        callback(
-            indexer=self.indexer,
-            x=hidden_states,
+        if self_topk_indices is not None:
+            callback(self_topk=self_topk_indices, layer_id=self.layer_id)
+        else:
+            callback(
+                indexer=self.indexer,
+                x=hidden_states,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+            )
+
+    def _resolve_dsa_topk(
+        self: DeepseekV2AttentionMLA,
+        *,
+        hidden_states: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prev_topk_indices: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return (attention TopK, TopK published to the next consumer).
+
+        IndexShare normally makes these the same tensor. The opt-in recurrent
+        refresh mode is intentionally different: current attention consumes
+        the carried request-relative TopK, while the current token's indexer
+        result (and index-K cache write) becomes the next draft step's carry.
+        """
+        refresh = bool(
+            self.is_nextn
+            and prev_topk_indices is not None
+            and getattr(forward_batch, "refresh_dsa_topk_indices", False)
+        )
+        if self.should_run_indexer(prev_topk_indices) or refresh:
+            self_topk_indices = self.indexer(
+                x=hidden_states,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+            )
+            if refresh:
+                self._maybe_compare_carried_dsa_topk(
+                    hidden_states=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    prev_topk_indices=prev_topk_indices,
+                    self_topk_indices=self_topk_indices,
+                )
+                consumed = maybe_capture_indexer_topk(self.layer_id, prev_topk_indices)
+                return consumed, self_topk_indices
+            return self_topk_indices, self_topk_indices
+
+        self._maybe_compare_carried_dsa_topk(
+            hidden_states=hidden_states,
             q_lora=q_lora,
             positions=positions,
             forward_batch=forward_batch,
-            layer_id=self.layer_id,
+            prev_topk_indices=prev_topk_indices,
         )
+        carried = maybe_capture_indexer_topk(self.layer_id, prev_topk_indices)
+        return carried, carried
 
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
@@ -332,6 +388,7 @@ class DeepseekMLAForwardMixin:
             fuse_bmm_attention = False
         q_lora = None
         topk_indices = None
+        published_topk_indices = None
         q_nope = None
         q_pe = None
         k_pe = None
@@ -377,27 +434,13 @@ class DeepseekMLAForwardMixin:
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
                     q = self.q_b_proj_forward(q)
-                if self.should_run_indexer(prev_topk_indices):
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
-                    )
-                else:
-                    self._maybe_compare_carried_dsa_topk(
-                        hidden_states=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        prev_topk_indices=prev_topk_indices,
-                    )
-                    # skip_topk reuses prev layer's indices; mirror into this
-                    # layer's slot so the captured buffer matches what's used.
-                    topk_indices = maybe_capture_indexer_topk(
-                        self.layer_id, prev_topk_indices
-                    )
+                topk_indices, published_topk_indices = self._resolve_dsa_topk(
+                    hidden_states=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    prev_topk_indices=prev_topk_indices,
+                )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -459,25 +502,13 @@ class DeepseekMLAForwardMixin:
                         self._q8kv8_qprep_overlap_pending = True
 
                 if q_lora is not None:
-                    if self.should_run_indexer(prev_topk_indices):
-                        topk_indices = self.indexer(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=self.layer_id,
-                        )
-                    else:
-                        self._maybe_compare_carried_dsa_topk(
-                            hidden_states=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            prev_topk_indices=prev_topk_indices,
-                        )
-                        topk_indices = maybe_capture_indexer_topk(
-                            self.layer_id, prev_topk_indices
-                        )
+                    topk_indices, published_topk_indices = self._resolve_dsa_topk(
+                        hidden_states=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        prev_topk_indices=prev_topk_indices,
+                    )
         else:
             if q_replicate_active:
                 q = torch.nn.functional.linear(
@@ -701,6 +732,7 @@ class DeepseekMLAForwardMixin:
             zero_allocator,
             positions,
             topk_indices,
+            published_topk_indices,
             llama_4_scaling,
             fusion_plan,
         )
@@ -715,6 +747,7 @@ class DeepseekMLAForwardMixin:
         zero_allocator,
         positions,
         topk_indices,
+        published_topk_indices,
         llama_4_scaling,
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
         gate: Optional[torch.Tensor] = None,
@@ -958,7 +991,7 @@ class DeepseekMLAForwardMixin:
         if not self.next_skip_topk:
             return output, None
         else:
-            return output, topk_indices
+            return output, published_topk_indices
 
     def _fuse_rope_for_trtllm_mla(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch

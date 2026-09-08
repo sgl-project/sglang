@@ -76,6 +76,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _spec_worker_finish_flags(finished_reason) -> tuple[bool, bool]:
+    """Return DSpark natural-stop and observer normal-completion flags."""
+    return (
+        isinstance(finished_reason, FINISH_MATCHED_TOKEN),
+        not isinstance(finished_reason, FINISH_ABORT),
+    )
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -1198,9 +1206,13 @@ class SchedulerBatchResultProcessor:
             # isinstance narrowing: create_worker may also return plain
             # TpModelWorker-based drafts, which carry no spec-worker hooks.
             if isinstance(self.draft_worker, BaseSpecWorker):
+                natural_stop, normal_completion = _spec_worker_finish_flags(
+                    req.finished_reason
+                )
                 self.draft_worker.note_request_finished(
                     rid=req.rid,
-                    natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
+                    natural_stop=natural_stop,
+                    normal_completion=normal_completion,
                 )
 
             # delete feature to save memory

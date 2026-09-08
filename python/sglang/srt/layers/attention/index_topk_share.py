@@ -70,12 +70,14 @@ class IndexTopKShareState:
         forward_batch: ForwardBatch,
         enabled: bool = True,
         keep_carry_seed: bool = False,
+        refresh_carry: bool = False,
     ) -> Iterator[Optional[IndexTopKShareState]]:
         if not enabled:
             yield None
             return
         spec_info = forward_batch.spec_info
         forward_batch.reuse_dsa_topk_indices = True
+        forward_batch.refresh_dsa_topk_indices = refresh_carry
         # Keep the draft-extend seed so step 0 reuses it; else recompute it.
         if not (keep_carry_seed and spec_info.dsa_topk_indices is not None):
             spec_info.dsa_topk_indices = None
@@ -84,3 +86,4 @@ class IndexTopKShareState:
         finally:
             spec_info.dsa_topk_indices = None
             forward_batch.reuse_dsa_topk_indices = False
+            forward_batch.refresh_dsa_topk_indices = False

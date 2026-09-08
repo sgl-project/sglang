@@ -1477,6 +1477,12 @@ class Envs:
     # this off selects the legacy request-relative/unfused seed contract and
     # therefore also keeps the seed-bearing draft decode/extend phases eager.
     SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK = EnvBool(True)
+    # Experimental GLM MTP correctness gate. When enabled, each eager NextN
+    # forward still consumes the carried TopK for its current attention, but
+    # computes and publishes a same-input TopK for the following recurrent
+    # draft step. Default off until model/topology-specific acceptance is
+    # validated; the owning worker keeps this mode out of CUDA graphs.
+    SGLANG_DSA_MTP_REFRESH_TOPK = EnvBool(False)
     # Diagnostic-only comma-separated EAGLE checkpoints at which the current
     # CUDA compute stream is synchronized. The runtime rejects unknown checkpoints.
     # Keep unset outside targeted fault localization because synchronization

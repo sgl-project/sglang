@@ -345,11 +345,14 @@ class BaseSpecWorker(ABC):
         """
         pass
 
-    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+    def note_request_finished(
+        self, *, rid: str, natural_stop: bool, normal_completion: bool
+    ) -> None:
         """Hook called by the batch-result processor when a request finishes.
 
-        Default no-op. DSpark overrides this to settle / censor its
-        block-accept estimator state for the finished request.
+        Default no-op. ``natural_stop`` preserves DSpark's matched-token/EOS
+        semantics; ``normal_completion`` distinguishes success (including a
+        length cap) from abort for request-scoped observers.
         """
         pass
 

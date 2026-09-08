@@ -432,6 +432,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.dsa_seed_cuda_graph_compatible = should_use_pd_dsa_seed_cuda_graph(
             self.seed_dsa_topk_from_draft_extend
         )
+        self.refresh_dsa_topk_each_step = bool(
+            self.seed_dsa_topk_from_draft_extend
+            and envs.SGLANG_DSA_MTP_REFRESH_TOPK.get()
+        )
 
     def init_token_map(self):
         # Load hot token ids
@@ -836,6 +840,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch,
             enabled=self.index_share_for_mtp_iteration,
             keep_carry_seed=self.seed_dsa_topk_from_draft_extend,
+            refresh_carry=self.refresh_dsa_topk_each_step,
         ):
             for i in range(self.speculative_num_steps):
                 if draft_tokens_topk1 is not None:
@@ -1364,6 +1369,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         shadow_probe = getattr(self._draft_worker, "dsa_topk_shadow_probe", None)
         if shadow_probe is not None and shadow_probe.matches_schedule_batch(batch):
             return True
+        if getattr(self._draft_worker, "refresh_dsa_topk_each_step", False):
+            return True
         if not self._draft_worker.seed_dsa_topk_from_draft_extend:
             return False
         if not self._draft_worker.dsa_seed_cuda_graph_compatible:
@@ -1382,10 +1389,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             has_seed = getattr(draft_input, "dsa_topk_indices", None) is not None
         return not has_seed
 
-    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+    def note_request_finished(
+        self, *, rid: str, natural_stop: bool, normal_completion: bool
+    ) -> None:
         shadow_probe = getattr(self._draft_worker, "dsa_topk_shadow_probe", None)
         if shadow_probe is not None:
-            shadow_probe.finish(rid=rid, natural_stop=natural_stop)
+            shadow_probe.finish(rid=rid, natural_stop=normal_completion)
 
     @property
     def spec_v2_attn_backends(self) -> tuple:

@@ -536,6 +536,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
+    # During an eager MTP iteration, compute the current NextN indexer result
+    # for publication while attention continues to consume the carried value.
+    refresh_dsa_topk_indices: Optional[bool] = False
     # MegaMoE is a rank-symmetric collective. A sparse EAGLE draft iteration
     # therefore gives an idle DP rank padded rows to enter the same dispatch as
     # active peers. These rows are valid for MoE routing but have no request KV.

@@ -197,20 +197,39 @@ class DSATopKShadowProbe:
         *,
         step: int,
         carried: torch.Tensor,
-        indexer,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
+        self_topk: Optional[torch.Tensor] = None,
+        indexer=None,
+        x: Optional[torch.Tensor] = None,
+        q_lora: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
         layer_id: int,
     ) -> None:
-        """Compute same-input TopK, restore index-K, and accumulate on GPU."""
+        """Compare a production self TopK, or compute one for legacy probes."""
         if not self.can_probe:
             return
         if get_is_capture_mode():
             self._reject("shadow callback entered CUDA graph capture/replay")
             return
         x_meta = x[0] if isinstance(x, tuple) else x
+        if self_topk is not None:
+            if carried.ndim != 2 or self_topk.shape != carried.shape:
+                self._reject(
+                    "self TopK shape mismatch: "
+                    f"self={tuple(self_topk.shape)}, carried={tuple(carried.shape)}"
+                )
+                return
+            self._accumulate(step, layer_id, carried, self_topk)
+            return
+        if (
+            x_meta is None
+            or q_lora is None
+            or positions is None
+            or forward_batch is None
+            or indexer is None
+        ):
+            self._reject("legacy shadow comparison is missing indexer inputs")
+            return
         if carried.ndim != 2 or carried.shape[0] != x_meta.shape[0]:
             self._reject(
                 "carried TopK shape mismatch: "

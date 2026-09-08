@@ -15,6 +15,7 @@ def _batch(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         reuse_dsa_topk_indices=reuse,
+        refresh_dsa_topk_indices=False,
         forward_mode=SimpleNamespace(
             is_extend=lambda include_draft_extend_v2: is_extend
         ),
@@ -156,6 +157,39 @@ def test_mtp_iteration_clears_missing_draft_extend_seed():
         assert batch.spec_info.dsa_topk_indices is None
 
     assert not batch.reuse_dsa_topk_indices
+    assert batch.spec_info.dsa_topk_indices is None
+
+
+def test_mtp_iteration_refreshes_carried_topk_only_inside_scope():
+    batch = _batch(reuse=False, carried="extend-seed")
+
+    with IndexTopKShareState.mtp_iteration(
+        batch, keep_carry_seed=True, refresh_carry=True
+    ) as state:
+        assert state is not None
+        assert state.topk_indices == "extend-seed"
+        assert batch.refresh_dsa_topk_indices
+        state.update("step-0-self")
+        state.publish()
+        assert batch.spec_info.dsa_topk_indices == "step-0-self"
+
+    assert not batch.reuse_dsa_topk_indices
+    assert not batch.refresh_dsa_topk_indices
+    assert batch.spec_info.dsa_topk_indices is None
+
+
+def test_mtp_iteration_clears_refresh_flag_on_exception():
+    batch = _batch(reuse=False, carried="extend-seed")
+
+    with pytest.raises(RuntimeError, match="draft step blew up"):
+        with IndexTopKShareState.mtp_iteration(
+            batch, keep_carry_seed=True, refresh_carry=True
+        ):
+            assert batch.refresh_dsa_topk_indices
+            raise RuntimeError("draft step blew up")
+
+    assert not batch.reuse_dsa_topk_indices
+    assert not batch.refresh_dsa_topk_indices
     assert batch.spec_info.dsa_topk_indices is None
 
 

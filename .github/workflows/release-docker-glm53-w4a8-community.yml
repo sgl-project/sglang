@@ -239,6 +239,8 @@ jobs:
               /glm53-community/sglang/test/registered/unit/layers/attention/test_dsa_padding.py \
               /glm53-community/sglang/test/registered/unit/layers/attention/test_dsa_multistep_decode.py \
               /glm53-community/sglang/test/registered/unit/layers/attention/test_dsa_topk_shadow.py \
+              /glm53-community/sglang/test/registered/unit/layers/attention/test_index_topk_share.py \
+              /glm53-community/sglang/test/registered/unit/managers/test_spec_worker_finish_flags.py \
               /glm53-community/sglang/test/registered/unit/model_executor/test_cuda_graph_buffer_registry.py \
               /glm53-community/sglang/test/registered/unit/managers/scheduler_components/test_dp_attn.py \
               /glm53-community/sglang/test/registered/unit/spec/test_eagle_draft_dp_padding.py \

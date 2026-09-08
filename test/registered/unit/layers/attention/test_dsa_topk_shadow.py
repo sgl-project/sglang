@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -158,6 +159,97 @@ def test_mla_shadow_callback_requires_nextn_carry_and_explicit_arm(
         }
 
 
+def test_mla_refresh_consumes_carry_and_publishes_self_topk(monkeypatch):
+    carried = torch.tensor([[10, 11]], dtype=torch.int32)
+    self_topk = torch.tensor([[10, 12]], dtype=torch.int32)
+    indexer = MagicMock(return_value=self_topk)
+    compare = MagicMock()
+    attention = SimpleNamespace(
+        is_nextn=True,
+        layer_id=7,
+        indexer=indexer,
+        should_run_indexer=lambda _prev: False,
+        _maybe_compare_carried_dsa_topk=compare,
+    )
+    batch = SimpleNamespace(refresh_dsa_topk_indices=True)
+    monkeypatch.setattr(
+        "sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla.maybe_capture_indexer_topk",
+        lambda _layer_id, topk: topk,
+    )
+
+    consumed, published = DeepseekMLAForwardMixin._resolve_dsa_topk(
+        attention,
+        hidden_states=torch.zeros((1, 4)),
+        q_lora=torch.ones((1, 2)),
+        positions=torch.tensor([3]),
+        forward_batch=batch,
+        prev_topk_indices=carried,
+    )
+
+    assert consumed is carried
+    assert published is self_topk
+    indexer.assert_called_once()
+    compare.assert_called_once()
+    assert compare.call_args.kwargs["prev_topk_indices"] is carried
+    assert compare.call_args.kwargs["self_topk_indices"] is self_topk
+
+
+def test_mla_default_carry_path_does_not_run_indexer(monkeypatch):
+    carried = torch.tensor([[10, 11]], dtype=torch.int32)
+    indexer = MagicMock()
+    attention = SimpleNamespace(
+        is_nextn=True,
+        layer_id=7,
+        indexer=indexer,
+        should_run_indexer=lambda _prev: False,
+        _maybe_compare_carried_dsa_topk=MagicMock(),
+    )
+    batch = SimpleNamespace(refresh_dsa_topk_indices=False)
+    monkeypatch.setattr(
+        "sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla.maybe_capture_indexer_topk",
+        lambda _layer_id, topk: topk,
+    )
+
+    consumed, published = DeepseekMLAForwardMixin._resolve_dsa_topk(
+        attention,
+        hidden_states=torch.zeros((1, 4)),
+        q_lora=torch.ones((1, 2)),
+        positions=torch.tensor([3]),
+        forward_batch=batch,
+        prev_topk_indices=carried,
+    )
+
+    assert consumed is carried
+    assert published is carried
+    indexer.assert_not_called()
+
+
+def test_mla_default_indexer_path_consumes_and_publishes_self_topk():
+    self_topk = torch.tensor([[10, 12]], dtype=torch.int32)
+    indexer = MagicMock(return_value=self_topk)
+    attention = SimpleNamespace(
+        is_nextn=True,
+        layer_id=7,
+        indexer=indexer,
+        should_run_indexer=lambda _prev: True,
+        _maybe_compare_carried_dsa_topk=MagicMock(),
+    )
+
+    consumed, published = DeepseekMLAForwardMixin._resolve_dsa_topk(
+        attention,
+        hidden_states=torch.zeros((1, 4)),
+        q_lora=torch.ones((1, 2)),
+        positions=torch.tensor([3]),
+        forward_batch=SimpleNamespace(refresh_dsa_topk_indices=False),
+        prev_topk_indices=None,
+    )
+
+    assert consumed is self_topk
+    assert published is self_topk
+    indexer.assert_called_once()
+    attention._maybe_compare_carried_dsa_topk.assert_not_called()
+
+
 def test_probe_tracks_seed_then_step_zero_publish_in_order(monkeypatch):
     probe = DSATopKShadowProbe("probe-rid")
     batch = _forward_batch(carried=torch.tensor([[10, 11]], dtype=torch.int32))
@@ -173,13 +265,29 @@ def test_probe_tracks_seed_then_step_zero_publish_in_order(monkeypatch):
     ):
         batch.spec_info.dsa_topk_indices = carried
         with probe.forward_scope(batch, step=step, using_cuda_graph=False):
-            batch._dsa_topk_shadow_callback(indexer=None)
+            batch._dsa_topk_shadow_callback(
+                self_topk=torch.tensor([[30, 31]], dtype=torch.int32), layer_id=7
+            )
 
     assert [step for step, _ in calls] == [0, 1]
     assert torch.equal(calls[0][1], torch.tensor([[10, 11]], dtype=torch.int32))
     assert torch.equal(calls[1][1], torch.tensor([[20, 21]], dtype=torch.int32))
     assert batch._dsa_topk_shadow_callback is None
     assert batch._dsa_topk_shadow_step is None
+
+
+def test_shadow_accepts_precomputed_self_topk_without_rerunning_indexer():
+    probe = DSATopKShadowProbe("probe-rid")
+    carried = torch.tensor([[10, -1]], dtype=torch.int32)
+    batch = _forward_batch(carried=carried)
+
+    with probe.forward_scope(batch, step=0, using_cuda_graph=False):
+        batch._dsa_topk_shadow_callback(
+            self_topk=torch.tensor([[10, 20]], dtype=torch.int32), layer_id=7
+        )
+
+    metrics = next(iter(probe._buckets.values())).tolist()
+    assert metrics == [0, 1, 1, 1, 2, 1, 11, 53]
 
 
 @pytest.mark.parametrize(

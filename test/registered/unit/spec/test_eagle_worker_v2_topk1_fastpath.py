@@ -227,6 +227,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 with (
                     envs.SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED.override(seed_gate),
                     envs.SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK.override(fused_gate),
+                    envs.SGLANG_DSA_MTP_REFRESH_TOPK.override(False),
                 ):
                     worker._init_dsa_index_share_state()
                 override.restore()
@@ -235,6 +236,42 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 self.assertEqual(worker.dsa_index_topk, 2048)
                 self.assertEqual(worker.seed_dsa_topk_from_draft_extend, expected_seed)
                 self.assertEqual(worker.dsa_seed_cuda_graph_compatible, expected_graph)
+                self.assertFalse(worker.refresh_dsa_topk_each_step)
+
+    def test_recurrent_topk_refresh_requires_seed_and_explicit_gate(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.topk = 1
+        worker.draft_runner = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    index_share_for_mtp_iteration=True, index_topk=2048
+                )
+            )
+        )
+
+        for seed_gate, refresh_gate, expected in (
+            (False, True, False),
+            (True, False, False),
+            (True, True, True),
+        ):
+            with self.subTest(
+                seed_gate=seed_gate, refresh_gate=refresh_gate, expected=expected
+            ):
+                override = get_context().override_server_args(
+                    disaggregation_mode="decode"
+                )
+                override.install()
+                try:
+                    with (
+                        envs.SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED.override(seed_gate),
+                        envs.SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK.override(False),
+                        envs.SGLANG_DSA_MTP_REFRESH_TOPK.override(refresh_gate),
+                    ):
+                        worker._init_dsa_index_share_state()
+                finally:
+                    override.restore()
+
+                self.assertEqual(worker.refresh_dsa_topk_each_step, expected)
 
     def test_dp_attention_eager_vote_uses_resolved_seed_contract(self):
         worker = object.__new__(EAGLEWorkerV2)
@@ -312,6 +349,25 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             )
         )
 
+    def test_dp_attention_eager_vote_for_recurrent_topk_refresh(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._draft_worker = SimpleNamespace(
+            dsa_topk_shadow_probe=None,
+            refresh_dsa_topk_each_step=True,
+            seed_dsa_topk_from_draft_extend=True,
+            dsa_seed_cuda_graph_compatible=True,
+        )
+
+        self.assertTrue(
+            worker.requires_dp_attention_eager_forward(
+                SimpleNamespace(
+                    spec_info=SimpleNamespace(
+                        dsa_topk_indices=object(), future_indices=None
+                    )
+                )
+            )
+        )
+
     def test_note_request_finished_delegates_to_shadow_probe(self):
         worker = object.__new__(EAGLEWorkerV2)
         finish = MagicMock()
@@ -319,7 +375,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             dsa_topk_shadow_probe=SimpleNamespace(finish=finish)
         )
 
-        worker.note_request_finished(rid="probe-rid", natural_stop=True)
+        worker.note_request_finished(
+            rid="probe-rid", natural_stop=False, normal_completion=True
+        )
 
         finish.assert_called_once_with(rid="probe-rid", natural_stop=True)
 
