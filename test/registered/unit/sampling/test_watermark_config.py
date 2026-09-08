@@ -15,6 +15,7 @@ from sglang.srt.managers.tokenizer_manager import (
     TokenizerManager,
     _validate_watermark_request,
 )
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermark import (
     redact_watermark_command_line,
@@ -24,7 +25,7 @@ from sglang.srt.sampling.watermark_config import (
     WatermarkConfigError,
     load_watermark_config,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, prepare_server_args
 from sglang.srt.utils.request_logger import (
     _dataclass_to_string_truncated,
     _transform_data_for_logging,
@@ -62,7 +63,11 @@ def test_file_config_resolution_contract(tmp_path):
 
     manager = object.__new__(TokenizerManager)
     manager.server_args = server_args
-    assert b"0123456789abcdef" not in pickle.dumps(manager._server_args_for_dump())
+    publish(server_args, role="test")
+    try:
+        assert b"0123456789abcdef" not in pickle.dumps(manager._server_args_for_dump())
+    finally:
+        reset_context()
 
 
 def test_default_key_source_validation(tmp_path, monkeypatch):
@@ -223,6 +228,18 @@ def test_config_errors_and_logs_do_not_expose_secrets(tmp_path, caplog):
     )
     assert secret not in command
     assert "/run/secrets/watermark.json" not in command
+
+    server_args = prepare_server_args(
+        [
+            "--model-path",
+            "dummy",
+            "--watermark-key",
+            secret,
+            "--watermark-config=/run/secrets/watermark.json",
+        ]
+    )
+    assert secret not in server_args.launch_command
+    assert "/run/secrets/watermark.json" not in server_args.launch_command
 
 
 def test_config_file_security_guards(tmp_path, caplog):

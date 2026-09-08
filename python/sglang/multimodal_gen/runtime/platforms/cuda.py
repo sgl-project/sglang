@@ -45,6 +45,12 @@ pynvml = import_pynvml()  # type: ignore[no-untyped-call]
 torch.backends.cuda.enable_cudnn_sdp(False)
 
 
+@lru_cache(maxsize=None)
+def _device_is_integrated(device_index: int) -> bool:
+    # A static device property, asked on every planner cost evaluation.
+    return bool(torch.cuda.get_device_properties(device_index).is_integrated)
+
+
 def device_id_to_physical_device_id(device_id: int) -> int:
     if "CUDA_VISIBLE_DEVICES" in os.environ:
         device_ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
@@ -629,6 +635,15 @@ class CudaPlatformBase(Platform):
         return free_gpu_memory / (1 << 30)
 
     @classmethod
+    def device_shares_host_memory(cls) -> bool:
+        if not torch.cuda.is_available():
+            return False
+        try:
+            return _device_is_integrated(torch.cuda.current_device())
+        except (RuntimeError, AssertionError):
+            return False
+
+    @classmethod
     def _resolve_default_attn_backend(cls) -> AttentionBackendEnum:
         if cls.is_sm120():
             # On SM12.x, the sgl-kernel FlashAttention wheels may not include
@@ -745,8 +760,8 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan VAE decoder
-        fast paths.
+        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image
+        VAE decoder fast paths.
 
         Requests with quality="extra-high" or "high" run the fast paths; the
         "lossless" default runs the original module path bit-for-bit. See
@@ -758,12 +773,14 @@ class CudaPlatformBase(Platform):
                 maybe_optimize_flux2_vae,
             )
             from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
+                maybe_optimize_qwen_image_vae,
                 maybe_optimize_wan_vae,
             )
 
             vae = maybe_optimize_flux2_vae(vae)
             vae = maybe_optimize_autoencoder_kl(vae)
             vae = maybe_optimize_wan_vae(vae)
+            vae = maybe_optimize_qwen_image_vae(vae)
         except Exception:
             logger.warning(
                 "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",

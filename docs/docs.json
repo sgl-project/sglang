@@ -925,6 +925,7 @@
               "docs/advanced_features/overview",
               "docs/advanced_features/server_arguments",
               "docs/advanced_features/session_radix_cache",
+              "docs/advanced_features/radix_eviction_policy",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/text_watermarking",
               "docs/advanced_features/attention_backend",
@@ -1378,6 +1379,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-3.0-flash-VL",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-tiny",
                       "cookbook/autoregressive/InclusionAI/Ring-2.6-1T",
@@ -1404,6 +1406,7 @@
                   {
                     "group": "OpenBMB",
                     "pages": [
+                      "cookbook/autoregressive/OpenBMB/MiniCPM5-2B",
                       "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_6"
                     ]
                   },
