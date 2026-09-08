@@ -300,7 +300,7 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams& par
         cute::warpgroup_wait<0>();
         plan.bar_k_avail[buf_idx].arrive();
         if (block_idx != args.end_block_idx - 1)
-          NamedBarrier(256, NamedBarriers::sScale_and_sS_free).arrive_unaligned();
+          NamedBarrier(256, NamedBarriers::sScale_and_sS_free).arrive_and_wait_unaligned();
       }
       NamedBarrier(256, NamedBarriers::oBuf_free_and_sL_ready).arrive_and_wait_unaligned();
       float o_scales[2];
