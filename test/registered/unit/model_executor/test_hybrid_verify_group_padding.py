@@ -79,8 +79,6 @@ def _prepare(
     attn_tp_size: int = 8,
     attn_dp_rank: int = 0,
     attn_dp_size: int = 1,
-    cp_align: int = 1,
-    cp_v2: bool = False,
 ):
     calls = {}
     exec_ctx = SimpleNamespace(
@@ -118,15 +116,6 @@ def _prepare(
                     runner, "_hybrid_config", None
                 ),
             )
-        )
-        stack.enter_context(
-            patch(
-                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
-                return_value=cp_align,
-            )
-        )
-        stack.enter_context(
-            patch("sglang.srt.layers.cp.utils.enable_cp_v2", return_value=cp_v2)
         )
         stack.enter_context(
             patch(
@@ -191,15 +180,6 @@ class TestHybridVerifyGroupPadding(CustomTestCase):
         self.assertEqual(fb.req_pool_indices.shape[0], 40)
         self.assertEqual(fb.seq_lens.shape[0], 40)
         self.assertEqual(fb.seq_lens_cpu.shape[0], 40)
-
-    def test_context_parallel_alignment_is_composed_with_request_width(self):
-        fb = _batch(batch_size=33, spec=_spec())
-
-        _prepare(fb, _model_runner(), cp_align=40)
-
-        self.assertEqual(fb.global_num_tokens_cpu, [240])
-        self.assertEqual(fb.input_ids.shape[0], 240)
-        self.assertEqual(fb.batch_size, 40)
 
     def test_dp_max_len_pads_active_and_idle_ranks_to_same_group_boundary(self):
         global_tokens = [33 * 6, 0]

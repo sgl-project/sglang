@@ -1355,8 +1355,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             token_alignment = math.lcm(
                 token_alignment, self.spec_info.num_tokens_per_req
             )
-            if not enable_cp_v2():
-                token_alignment = math.lcm(token_alignment, get_cp_padding_align_size())
 
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
