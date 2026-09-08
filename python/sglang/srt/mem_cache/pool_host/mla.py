@@ -19,7 +19,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, MLATokenToKVPoolFP4
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -226,6 +226,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         therefore match the target's row, and every packed draft pool must
         have the target's row geometry. Runs before any host allocation.
         """
+        # FP4 retains a logical kv_cache_dim but packs two values per byte and
+        # stores scales separately. Neither buffer follows this host layout.
+        if any(
+            isinstance(pool, MLATokenToKVPoolFP4)
+            for pool in (device_pool, *self.mtp_draft_device_pools)
+        ):
+            raise NotImplementedError(
+                "HiCache does not support FP4 MLA KV rows and their separate scale buffers."
+            )
         host_dim = self._host_kv_cache_dim(device_pool)
         target_dtype = device_pool.store_dtype
         # MLATokenToKVPool and its subclasses always set kv_cache_dim (a packed

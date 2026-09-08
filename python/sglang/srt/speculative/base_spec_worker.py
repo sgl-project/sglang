@@ -57,6 +57,36 @@ def _can_pack_hicache_mtp(
     return is_nextn_mtp or is_dspark_dsv4
 
 
+def _hicache_mla_rows_match(target_pool, draft_pools) -> bool:
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MLATokenToKVPool,
+        MLATokenToKVPoolFP4,
+    )
+
+    def unwrap(pool):
+        return pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+
+    target_pool = unwrap(target_pool)
+    draft_pools = tuple(map(unwrap, draft_pools))
+    if any(
+        isinstance(pool, MLATokenToKVPoolFP4) for pool in (target_pool, *draft_pools)
+    ):
+        raise NotImplementedError(
+            "HiCache does not support FP4 MLA KV rows and their separate scale buffers."
+        )
+    if not isinstance(target_pool, MLATokenToKVPool):
+        return True
+    # Packed MLA host layers share one element type and row stride. Separate
+    # draft KV precision can change both, even for the model's own MTP layer.
+    return all(
+        isinstance(pool, MLATokenToKVPool)
+        and pool.store_dtype == target_pool.store_dtype
+        and pool.kv_cache_dim == target_pool.kv_cache_dim
+        for pool in draft_pools
+    )
+
+
 class EagleDraftWorkerBase(ABC):
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
@@ -270,11 +300,22 @@ class BaseSpecWorker(ABC):
             )
 
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
-            target_model_runner.mtp_draft_device_pools = draft_pools
-            return HiCacheDraftPlan(
-                mode=HiCacheDraftMode.PACKED,
-                device_pools=draft_pools,
-            )
+            if _hicache_mla_rows_match(
+                target_model_runner.token_to_kv_pool, draft_pools
+            ):
+                target_model_runner.mtp_draft_device_pools = draft_pools
+                return HiCacheDraftPlan(
+                    mode=HiCacheDraftMode.PACKED,
+                    device_pools=draft_pools,
+                )
+            if len(draft_pools) > 1:
+                # The sidecar builder supports one runner. Do not silently
+                # omit later MTP depths through the legacy first-runner plan.
+                raise NotImplementedError(
+                    "HiCache with multiple MTP draft runners requires matching "
+                    "target and draft MLA KV row dimensions and storage dtypes. "
+                    "The sidecar fallback supports one draft runner."
+                )
 
         return HiCacheDraftPlan(
             mode=HiCacheDraftMode.SIDECAR,

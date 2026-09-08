@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_full_draft_pools,
     build_hybrid_mamba_stack,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPoolFP4
 from sglang.srt.mem_cache.pool_host.common import alloc_with_host_register
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -350,6 +350,37 @@ class TestMLAHostPoolRowGeometry(_PackedRowGeometryFixtures, CustomTestCase):
                 device="cpu",
                 **kwargs,
             )
+
+    def test_fp4_rows_are_rejected_before_host_allocation(self):
+        fp4 = object.__new__(MLATokenToKVPoolFP4)
+        fp4.__dict__.update(self._fake_packed_device_pool(layer_num=1).__dict__)
+        # The logical dimension agrees, but the physical values use half a
+        # byte per element and scales live in a different buffer.
+        fp4.kv_buffer = [torch.zeros((68, 1, 8), dtype=torch.uint8)]
+        fp4.kv_scale_buffer = [torch.zeros((68, 1, 1), dtype=torch.uint8)]
+        ordinary = self._fake_packed_device_pool(layer_num=1)
+        for target, drafts in ((fp4, ()), (ordinary, (fp4,))):
+            with self.subTest(target_fp4=target is fp4):
+                allocate = MagicMock(side_effect=self._alloc_unpinned)
+                with (
+                    patch(
+                        "sglang.srt.mem_cache.pool_host.mla.ALLOC_MEMORY_FUNCS",
+                        {"cpu": allocate},
+                    ),
+                    self.assertRaisesRegex(NotImplementedError, "FP4 MLA KV"),
+                ):
+                    MLATokenToKVPoolHost(
+                        target,
+                        host_to_device_ratio=2,
+                        host_size=0,
+                        page_size=self.PAGE_SIZE,
+                        layout="layer_first",
+                        pin_memory=False,
+                        device="cpu",
+                        override_kv_cache_dim=target.kv_cache_dim,
+                        mtp_draft_device_pools=drafts,
+                    )
+                allocate.assert_not_called()
 
     def test_packed_device_pool_without_override_is_rejected(self):
         kv_pool = self._fake_packed_device_pool()
