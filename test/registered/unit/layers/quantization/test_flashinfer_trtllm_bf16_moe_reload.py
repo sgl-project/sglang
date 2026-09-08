@@ -60,8 +60,8 @@ def _mock_flashinfer():
     core._maybe_get_cached_w3_w1_permute_indices = (
         lambda cache, weight_u8, tile_m, **kwargs: _fake_permute_indices(weight_u8)
     )
-    core.get_w2_permute_indices_with_cache = (
-        lambda cache, weight_u8, tile_m: _fake_permute_indices(weight_u8)
+    core.get_w2_permute_indices_with_cache = lambda cache, weight_u8, tile_m: (
+        _fake_permute_indices(weight_u8)
     )
     core.convert_to_block_layout = _fake_convert_to_block_layout
 
@@ -287,9 +287,10 @@ class TestFlashInferTrtllmBf16MoEReload(unittest.TestCase):
         method, layer = self._cold_load(seed=0)
         not_a_bijection = lambda w: torch.zeros(w.shape[0], dtype=torch.long)
 
-        with patch(
-            f"{__name__}._fake_permute_indices", not_a_bijection
-        ), self.assertRaises(RuntimeError) as ctx:
+        with (
+            patch(f"{__name__}._fake_permute_indices", not_a_bijection),
+            self.assertRaises(RuntimeError) as ctx,
+        ):
             self._restore_for_load(method, layer, param_names=("w13",))
         self.assertIn("not a bijection", str(ctx.exception))
 
@@ -335,14 +336,16 @@ class TestRepackRunsOnFailedUpdate(unittest.TestCase):
         model = self._FailingModel()
         repacked = []
 
-        with patch.object(
-            weight_updater,
-            "_repack_weights_after_hot_update",
-            lambda m: repacked.append(m),
-        ), patch.object(
-            weight_updater, "_unsupported_derived_weight_cache_error", lambda: None
-        ), patch.object(
-            weight_updater, "monkey_patch_torch_reductions", lambda: None
+        with (
+            patch.object(
+                weight_updater,
+                "_repack_weights_after_hot_update",
+                lambda m: repacked.append(m),
+            ),
+            patch.object(
+                weight_updater, "_unsupported_derived_weight_cache_error", lambda: None
+            ),
+            patch.object(weight_updater, "monkey_patch_torch_reductions", lambda: None),
         ):
             with self.assertRaises(self._LoadFailed):
                 self._make_updater(model).update_weights_from_tensor(
