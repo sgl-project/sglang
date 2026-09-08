@@ -145,9 +145,92 @@ class TestXPUFP8Linear(CustomTestCase):
             N // 128, K // 128, dtype=torch.float32, device=self.device
         )
 
-        out = torch_w8a8_block_fp8_linear(
-            qx_strided, weight, block_size, weight_scale, input_scale=scale_strided
+        out_q_strided = torch_w8a8_block_fp8_linear(
+            qx_strided,
+            weight,
+            block_size,
+            weight_scale,
+            input_scale=scale_strided.contiguous(),
         )
+        self.assertEqual(out_q_strided.shape, (M, N))
+
+        out_scale_strided = torch_w8a8_block_fp8_linear(
+            qx_strided.contiguous(),
+            weight,
+            block_size,
+            weight_scale,
+            input_scale=scale_strided,
+        )
+        torch.testing.assert_close(out_scale_strided, out_q_strided)
+
+        scale_transpose_contiguous = scale_strided.t().contiguous().t()
+        self.assertFalse(scale_transpose_contiguous.is_contiguous())
+        self.assertTrue(scale_transpose_contiguous.t().is_contiguous())
+        out_scale_transpose_contiguous = torch_w8a8_block_fp8_linear(
+            qx_strided.contiguous(),
+            weight,
+            block_size,
+            weight_scale,
+            input_scale=scale_transpose_contiguous,
+        )
+        torch.testing.assert_close(out_scale_transpose_contiguous, out_q_strided)
+
+        weight_noncontiguous = torch.empty(
+            N * 2, K, dtype=torch.float8_e4m3fn, device=self.device
+        )
+        weight_noncontiguous[::2] = weight
+        weight_noncontiguous = weight_noncontiguous[::2]
+        self.assertFalse(weight_noncontiguous.is_contiguous())
+        self.assertEqual(weight_noncontiguous.stride(-1), 1)
+        weight_scale_noncontiguous = weight_scale.t().contiguous().t()
+        out_weight_views = torch_w8a8_block_fp8_linear(
+            qx_strided.contiguous(),
+            weight_noncontiguous,
+            block_size,
+            weight_scale_noncontiguous,
+            input_scale=scale_strided.contiguous(),
+        )
+        self.assertEqual(out_weight_views.shape, (M, N))
+        torch.testing.assert_close(out_weight_views, out_q_strided)
+
+        weight_last_dim_strided = torch.empty(
+            N, K, 2, dtype=torch.float8_e4m3fn, device=self.device
+        )
+        weight_last_dim_strided[..., 0] = weight
+        weight_last_dim_strided = weight_last_dim_strided[..., 0]
+        self.assertFalse(weight_last_dim_strided.is_contiguous())
+        self.assertNotEqual(weight_last_dim_strided.stride(-1), 1)
+        out_weight_strided = torch_w8a8_block_fp8_linear(
+            qx_strided.contiguous(),
+            weight_last_dim_strided,
+            block_size,
+            weight_scale,
+            input_scale=scale_strided.contiguous(),
+        )
+        torch.testing.assert_close(out_weight_strided, out_q_strided)
+
+    def test_torch_w8a8_block_fp8_linear_rejects_invalid_block_size(self):
+        x = torch.randn(8, 256, dtype=torch.bfloat16, device=self.device)
+        weight = torch.randn(256, 256, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.ones(2, 2, dtype=torch.float32, device=self.device)
+        for block_size in ([], [128], [128, 128, 128], [64, 64]):
+            with self.subTest(block_size=block_size), self.assertRaises(ValueError):
+                torch_w8a8_block_fp8_linear(x, weight, block_size, weight_scale)
+
+    def test_torch_w8a8_block_fp8_linear_non_square_weight_scale(self):
+        """Keep the public v2 weight-scale orientation correct when N != K."""
+        M, K, N = 8, 256, 384
+        block_size = [128, 128]
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.ones(
+            N // 128, K // 128, dtype=torch.float32, device=self.device
+        )
+        out = torch_w8a8_block_fp8_linear(x, weight, block_size, weight_scale)
         self.assertEqual(out.shape, (M, N))
 
     def test_torch_w8a8_block_fp8_linear_numerical_accuracy(self):

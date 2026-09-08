@@ -582,7 +582,23 @@ def torch_w8a8_block_fp8_linear(
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run block-FP8 linear with Torch's scaled_mm implementation."""
-    _, block_k = block_size
+    if not isinstance(block_size, (list, tuple)) or len(block_size) != 2:
+        raise ValueError(
+            f"XPU block-FP8 scaled_mm expects a two-dimensional weight_block_size, "
+            f"but got {block_size}"
+        )
+    block_n, block_k = block_size
+    if block_k != 128 or block_n not in (1, 128):
+        raise ValueError(
+            "XPU block-FP8 scaled_mm supports weight_block_size [1, 128] or "
+            f"[128, 128], but got {block_size}"
+        )
+
+    scale_b_recipe = (
+        torch.nn.functional.ScalingType.BlockWise1x128
+        if block_n == 1
+        else torch.nn.functional.ScalingType.BlockWise128x128
+    )
     input_2d = input.view(-1, input.shape[-1])
     if input_scale is None:
         q_input, activation_scale = per_token_group_quant_fp8(input_2d, block_k)
@@ -590,22 +606,22 @@ def torch_w8a8_block_fp8_linear(
         q_input = input_2d
         activation_scale = input_scale.view(-1, input_scale.shape[-1])
 
-    if not q_input.is_contiguous():
+    if q_input.stride(-1) != 1:
         q_input = q_input.contiguous()
-    if not activation_scale.is_contiguous():
-        activation_scale = activation_scale.contiguous()
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
     weight_t = weight.t()
-    weight_scale_t = weight_scale.t()
-    output = torch._scaled_mm(
+    scale_b = weight_scale if block_n == 1 else weight_scale.t()
+    output = torch.nn.functional.scaled_mm(
         q_input,
         weight_t,
-        scale_a=activation_scale,
-        scale_b=weight_scale_t,
-        out_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        activation_scale,
+        torch.nn.functional.ScalingType.BlockWise1x128,
+        scale_b,
+        scale_b_recipe,
         bias=bias,
+        output_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
     )
-    if isinstance(output, tuple):
-        output = output[0]
     return output.view(*input.shape[:-1], weight.shape[0])
 
 
@@ -2088,8 +2104,9 @@ def apply_fp8_linear(
             and weight_scale.ndim == 2
             and weight_scale.shape[1] == 1
             and weight_scale.t().is_contiguous()
-            # XPU fused rowwise scaled_mm is slower for decode and small prefills.
-            and qinput.shape[0] >= 64
+            # Keep the decode M=1 fallback; on B60, fused rowwise scaled_mm
+            # wins from M=8 onward for representative projection shapes.
+            and qinput.shape[0] >= 8
         )
     )
     if (
