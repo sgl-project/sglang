@@ -59,13 +59,16 @@ __global__ void qwen_qkv_epilogue_kernel(const Params __grid_constant__ params) 
   const uint32_t workers = gridDim.x * kWarps;
   const uint32_t total_tokens = params.txt_tokens + params.img_tokens;
   const uint32_t token_head_works = total_tokens * params.num_heads;
-  const uint32_t total_works = 3 * token_head_works;
+  const uint32_t v_heads = div_ceil(params.num_heads, uint32_t(2));
+  const uint32_t total_works = 2 * token_head_works + total_tokens * v_heads;
 
   for (uint32_t work = start; work < total_works; work += workers) {
-    const uint32_t kind = work / token_head_works;  // 0: Q, 1: K, 2: V.
-    const uint32_t token_head = work % token_head_works;
-    const uint32_t joint_token = token_head / params.num_heads;
-    const uint32_t head = token_head % params.num_heads;
+    const bool is_value = work >= 2 * token_head_works;
+    const uint32_t kind = is_value ? 2 : work / token_head_works;
+    const uint32_t token_head = is_value ? work - 2 * token_head_works : work % token_head_works;
+    const uint32_t heads_per_token = is_value ? v_heads : params.num_heads;
+    const uint32_t joint_token = token_head / heads_per_token;
+    const uint32_t head = (token_head % heads_per_token) * (is_value ? 2 : 1);
     const bool is_text = joint_token < params.txt_tokens;
     const uint32_t source_token = is_text ? joint_token : joint_token - params.txt_tokens;
 
@@ -88,11 +91,20 @@ __global__ void qwen_qkv_epilogue_kernel(const Params __grid_constant__ params) 
     void* output =
         pointer::offset(output_base, joint_token * params.output_token_stride_bytes, head * params.head_stride_bytes);
 
-    auto input_vec = load_as<Storage>(input, lane);
     if (kind == 2) {
-      store_as<Storage>(output, input_vec, lane);
+      // One warp copies two adjacent heads, keeping all V workers active while
+      // issuing twice as many bytes per memory instruction.
+      if (head + 1 < params.num_heads) {
+        using CopyStorage = AlignedVector<Packed, 2 * kVecSize>;
+        const auto input_vec = load_as<CopyStorage>(input, lane);
+        store_as<CopyStorage>(output, input_vec, lane);
+      } else {
+        const auto input_vec = load_as<Storage>(input, lane);
+        store_as<Storage>(output, input_vec, lane);
+      }
       continue;
     }
+    auto input_vec = load_as<Storage>(input, lane);
 
     const void* weight_base;
     if (kind == 0) {
@@ -226,7 +238,7 @@ struct QwenQKVEpilogueKernel {
     const uint32_t img_tokens = static_cast<uint32_t>(NI.unwrap());
     const uint32_t txt_tokens = static_cast<uint32_t>(NT.unwrap());
     const uint32_t num_heads = static_cast<uint32_t>(H.unwrap());
-    const uint32_t total_works = 3 * (img_tokens + txt_tokens) * num_heads;
+    const uint32_t total_works = (img_tokens + txt_tokens) * (2 * num_heads + div_ceil(num_heads, uint32_t(2)));
     if (total_works == 0) return;
 
     const int64_t head_stride_bytes = kHeadDim * sizeof(bf16_t);

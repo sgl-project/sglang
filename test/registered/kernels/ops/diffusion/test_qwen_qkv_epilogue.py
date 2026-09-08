@@ -26,7 +26,10 @@ def _seed_cuda():
     torch.cuda.manual_seed(0)
 
 
-@pytest.mark.parametrize("img_tokens,txt_tokens,heads", [(17, 7, 4), (8152, 1365, 24)])
+@pytest.mark.parametrize(
+    "img_tokens,txt_tokens,heads",
+    [(17, 7, 1), (17, 7, 3), (17, 7, 4), (8152, 1365, 24)],
+)
 def test_qwen_qkv_epilogue_is_bit_exact(img_tokens, txt_tokens, heads):
     head_dim = 128
     img_qkv = [
