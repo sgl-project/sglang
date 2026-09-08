@@ -15,6 +15,9 @@ from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+    SenseNovaU1SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
     _fallback_image_urls,
@@ -58,6 +61,40 @@ def test_url_response_returns_one_item_per_output_path():
         os.path.abspath("first.png"),
         os.path.abspath("second.png"),
     ]
+
+
+def test_revised_prompt_defaults_to_the_original_prompt():
+    response = _build_image_response_kwargs(
+        ["first.png"],
+        "url",
+        "a lantern",
+        "req-123",
+        OutputBatch(),
+        cloud_urls=["https://cdn.example/first.png"],
+        fallback_urls=_fallback_image_urls("req-123", 1, True),
+        is_persistent=True,
+    )
+
+    assert response["data"][0].revised_prompt == "a lantern"
+
+
+def test_revised_prompt_uses_enhanced_prompt_from_usage_when_present():
+    response = _build_image_response_kwargs(
+        ["first.png"],
+        "url",
+        "a lantern",
+        "req-123",
+        OutputBatch(
+            usage={"enhanced_prompt": "a vintage brass lantern, glowing warmly"}
+        ),
+        cloud_urls=["https://cdn.example/first.png"],
+        fallback_urls=_fallback_image_urls("req-123", 1, True),
+        is_persistent=True,
+    )
+
+    assert (
+        response["data"][0].revised_prompt == "a vintage brass lantern, glowing warmly"
+    )
 
 
 def test_runtime_sampling_quality_preserves_the_openai_default():
@@ -113,6 +150,7 @@ def test_other_image_extensions_remain_model_specific():
         (Cosmos3SamplingParams, "guidance_interval", [400.0, 1000.0]),
         (Cosmos3SamplingParams, "use_guardrails", False),
         (ErnieImageSamplingParams, "use_pe", False),
+        (SenseNovaU1SamplingParams, "use_pe", True),
         (Ideogram4SamplingParams, "preset", "V4_TURBO_12"),
     )
     base_fields = {field.name for field in fields(SamplingParams)}
@@ -131,6 +169,18 @@ def test_other_image_extensions_remain_model_specific():
             field_name: value
         }
         assert _image_request_model_kwargs(request, SamplingParams) == {}
+
+
+def test_sensenova_u1_use_pe_extracted_from_top_level_request_field():
+    """Regression: use_pe must work as a top-level JSON key (not nested under
+    extra_body), matching how the docs and real clients actually send it --
+    image_request_extra_fields() controls this, separately from
+    supported_override_fields() which only gates the CLI."""
+    request = ImageGenerationsRequest(prompt="a lantern", use_pe=True)
+
+    assert _image_request_model_kwargs(request, SenseNovaU1SamplingParams) == {
+        "use_pe": True
+    }
 
 
 def test_cosmos_image_guardrails_alias_is_preserved():

@@ -2,8 +2,10 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import requests
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
@@ -14,6 +16,7 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     SenseNovaU1SamplingParams,
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
+    DEFAULT_PE_SYSTEM_PROMPT,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
 )
 from sglang.multimodal_gen.registry import (
@@ -22,6 +25,7 @@ from sglang.multimodal_gen.registry import (
     get_non_diffusers_pipeline_name,
     is_registered_diffusion_model_path,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
 )
@@ -35,6 +39,10 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation im
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     _randn_with_seed,
 )
+from sglang.multimodal_gen.runtime.models.sensenova_u1.pe_client import (
+    SenseNovaU1PEClient,
+)
+from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import SenseNovaU1Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
@@ -44,6 +52,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
     SenseNovaU1GenerationStage,
+    SenseNovaU1PromptEnhancementStage,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
@@ -318,6 +327,7 @@ def test_sensenova_u1_sampling_params_keep_private_defaults_internal():
         "cfg_interval": (0.0, 1.0),
         "t_eps": 0.02,
         "think_mode": False,
+        "use_pe": False,
     }
 
 
@@ -624,6 +634,29 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
     assert model.call_kwargs["seed"] == 123
+    assert output.usage is None
+
+
+def test_sensenova_u1_generation_stage_surfaces_enhanced_prompt_in_usage():
+    sampling = SenseNovaU1SamplingParams(prompt="a cat", width=2304, height=4096)
+    extra = sampling.build_request_extra()
+    extra[SENSENOVA_U1_REQUEST_EXTRA_KEY]["enhanced_prompt"] = "a detailed cat portrait"
+    batch = SimpleNamespace(
+        prompt="a detailed cat portrait",
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        extra=extra,
+        metrics=None,
+    )
+    stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
+
+    output = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert output.usage == {"enhanced_prompt": "a detailed cat portrait"}
 
 
 def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
@@ -849,3 +882,289 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+# --- Prompt enhancement (PE): use_pe parameter passing ---
+
+
+@pytest.mark.parametrize(("use_pe", "expected"), [(True, True), (False, False)])
+def test_sensenova_u1_sampling_params_use_pe_round_trips_through_request_extra(
+    use_pe, expected
+):
+    sampling = SenseNovaU1SamplingParams(prompt="a cat", use_pe=use_pe)
+
+    extra = sampling.build_request_extra()
+
+    assert extra[SENSENOVA_U1_REQUEST_EXTRA_KEY]["use_pe"] is expected
+
+
+def test_sensenova_u1_sampling_params_use_pe_defaults_to_false():
+    """Matches upstream: OpenSenseNova/SenseNova-U1 gates PE behind --enhance,
+    which defaults to off (action="store_true")."""
+    sampling = SenseNovaU1SamplingParams(prompt="a cat")
+
+    assert sampling.use_pe is False
+    extra = sampling.build_request_extra()
+    assert extra[SENSENOVA_U1_REQUEST_EXTRA_KEY]["use_pe"] is False
+
+
+# --- Prompt enhancement (PE): SenseNovaU1PEClient, HTTP fully mocked ---
+
+
+class _FakePEResponse:
+    def __init__(self, json_data=None, http_error=None):
+        self._json_data = json_data
+        self._http_error = http_error
+
+    def raise_for_status(self):
+        if self._http_error is not None:
+            raise self._http_error
+
+    def json(self):
+        return self._json_data
+
+
+def _make_pe_client():
+    return SenseNovaU1PEClient(
+        endpoint="https://example.com/v1/chat/completions",
+        model="test-model",
+        api_key="sk-test",
+    )
+
+
+def test_sensenova_u1_pe_client_sends_expected_request_and_parses_response():
+    with patch(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.pe_client.requests.post"
+    ) as mock_post:
+        mock_post.return_value = _FakePEResponse(
+            json_data={"choices": [{"message": {"content": "enhanced cat prompt"}}]}
+        )
+        client = _make_pe_client()
+
+        result = client.enhance(system_prompt="sys prompt", user_prompt="a cat")
+
+    assert result == "enhanced cat prompt"
+    _, kwargs = mock_post.call_args
+    assert kwargs["json"] == {
+        "model": "test-model",
+        "messages": [
+            {"role": "system", "content": "sys prompt"},
+            {"role": "user", "content": "a cat"},
+        ],
+    }
+    assert kwargs["headers"]["Authorization"] == "Bearer sk-test"
+
+
+def test_sensenova_u1_pe_client_strips_surrounding_whitespace_from_content():
+    with patch(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.pe_client.requests.post"
+    ) as mock_post:
+        mock_post.return_value = _FakePEResponse(
+            json_data={
+                "choices": [{"message": {"content": "  enhanced cat prompt  \n"}}]
+            }
+        )
+        client = _make_pe_client()
+
+        result = client.enhance(system_prompt="sys", user_prompt="a cat")
+
+    assert result == "enhanced cat prompt"
+
+
+def test_sensenova_u1_pe_client_raises_on_missing_choices():
+    with patch(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.pe_client.requests.post"
+    ) as mock_post:
+        mock_post.return_value = _FakePEResponse(json_data={"choices": []})
+        client = _make_pe_client()
+
+        with pytest.raises(RuntimeError, match="no valid choices"):
+            client.enhance(system_prompt="sys", user_prompt="a cat")
+
+
+@pytest.mark.parametrize(
+    ("json_data", "expected_match"),
+    [
+        ({"choices": [None]}, "invalid choice"),
+        ({"choices": [{}]}, "missing message"),
+        ({"choices": [{"message": {}}]}, "missing message.content"),
+        ({"choices": [{"message": {"content": None}}]}, "missing message.content"),
+        ({"choices": [{"message": {"content": ""}}]}, "empty message.content"),
+        ({"choices": [{"message": {"content": "   "}}]}, "empty message.content"),
+    ],
+)
+def test_sensenova_u1_pe_client_raises_on_malformed_message_shape(
+    json_data, expected_match
+):
+    with patch(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.pe_client.requests.post"
+    ) as mock_post:
+        mock_post.return_value = _FakePEResponse(json_data=json_data)
+        client = _make_pe_client()
+
+        with pytest.raises(RuntimeError, match=expected_match):
+            client.enhance(system_prompt="sys", user_prompt="a cat")
+
+
+def test_sensenova_u1_pe_client_propagates_http_error():
+    with patch(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.pe_client.requests.post"
+    ) as mock_post:
+        mock_post.return_value = _FakePEResponse(
+            http_error=requests.HTTPError("401 Unauthorized")
+        )
+        client = _make_pe_client()
+
+        with pytest.raises(requests.HTTPError):
+            client.enhance(system_prompt="sys", user_prompt="a cat")
+
+
+def test_sensenova_u1_pe_client_propagates_timeout():
+    with patch(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.pe_client.requests.post"
+    ) as mock_post:
+        mock_post.side_effect = requests.Timeout("timed out")
+        client = _make_pe_client()
+
+        with pytest.raises(requests.Timeout):
+            client.enhance(system_prompt="sys", user_prompt="a cat")
+
+
+# --- Prompt enhancement (PE): SenseNovaU1PromptEnhancementStage ---
+
+
+class _FakePEClient:
+    def __init__(self, enhanced_text=None):
+        self._enhanced_text = enhanced_text
+        self.calls = []
+
+    def enhance(self, system_prompt, user_prompt):
+        self.calls.append((system_prompt, user_prompt))
+        if self._enhanced_text is not None:
+            return self._enhanced_text
+        return f"ENHANCED: {user_prompt}"
+
+
+def _pe_batch(prompt, use_pe=True):
+    return SimpleNamespace(
+        prompt=prompt,
+        extra={SENSENOVA_U1_REQUEST_EXTRA_KEY: {"use_pe": use_pe}},
+    )
+
+
+def test_sensenova_u1_prompt_enhancement_stage_rewrites_prompt_when_enabled():
+    pe_client = _FakePEClient(
+        enhanced_text="a cinematic photograph of a cat, dramatic lighting"
+    )
+    stage = SenseNovaU1PromptEnhancementStage(pe_client=pe_client)
+    batch = _pe_batch("a cat", use_pe=True)
+
+    out = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert out.prompt == "a cinematic photograph of a cat, dramatic lighting"
+    assert pe_client.calls == [(DEFAULT_PE_SYSTEM_PROMPT, "a cat")]
+
+
+def test_sensenova_u1_prompt_enhancement_stage_stores_enhanced_prompt_in_extra():
+    """usage["enhanced_prompt"] (surfaced by the generation stage) reads this."""
+    pe_client = _FakePEClient(enhanced_text="a detailed cat portrait")
+    stage = SenseNovaU1PromptEnhancementStage(pe_client=pe_client)
+    batch = _pe_batch("a cat", use_pe=True)
+
+    out = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert (
+        out.extra[SENSENOVA_U1_REQUEST_EXTRA_KEY]["enhanced_prompt"]
+        == "a detailed cat portrait"
+    )
+
+
+def test_sensenova_u1_prompt_enhancement_stage_skips_storing_enhanced_prompt_when_disabled():
+    pe_client = _FakePEClient()
+    stage = SenseNovaU1PromptEnhancementStage(pe_client=pe_client)
+    batch = _pe_batch("a cat", use_pe=False)
+
+    out = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert "enhanced_prompt" not in out.extra[SENSENOVA_U1_REQUEST_EXTRA_KEY]
+
+
+def test_sensenova_u1_prompt_enhancement_stage_skips_when_disabled():
+    pe_client = _FakePEClient()
+    stage = SenseNovaU1PromptEnhancementStage(pe_client=pe_client)
+    batch = _pe_batch("a cat", use_pe=False)
+
+    out = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert out.prompt == "a cat"
+    assert pe_client.calls == []
+
+
+def test_sensenova_u1_prompt_enhancement_stage_raises_when_no_pe_client_configured():
+    """use_pe=True with no configured backend must fail loudly, not silently skip."""
+    stage = SenseNovaU1PromptEnhancementStage(pe_client=None)
+    batch = _pe_batch("a cat", use_pe=True)
+
+    with pytest.raises(RuntimeError, match="no PE backend is configured"):
+        stage.forward(batch, server_args=SimpleNamespace())
+
+
+def test_sensenova_u1_prompt_enhancement_stage_skips_without_error_when_disabled_and_no_client():
+    """use_pe=False must stay a no-op even with no PE client configured."""
+    stage = SenseNovaU1PromptEnhancementStage(pe_client=None)
+    batch = _pe_batch("a cat", use_pe=False)
+
+    out = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert out.prompt == "a cat"
+
+
+def test_sensenova_u1_prompt_enhancement_stage_handles_independent_requests_differently():
+    """Successive requests with different use_pe must not leak state between calls."""
+    pe_client = _FakePEClient()
+    stage = SenseNovaU1PromptEnhancementStage(pe_client=pe_client)
+
+    out_a = stage.forward(
+        _pe_batch("a cat", use_pe=True), server_args=SimpleNamespace()
+    )
+    out_b = stage.forward(
+        _pe_batch("a dog", use_pe=False), server_args=SimpleNamespace()
+    )
+
+    assert out_a.prompt == "ENHANCED: a cat"
+    assert out_b.prompt == "a dog"
+    assert pe_client.calls == [(DEFAULT_PE_SYSTEM_PROMPT, "a cat")]
+
+
+# --- Prompt enhancement (PE): pipeline stage wiring ---
+
+
+def _build_pipeline_for_stage_order(pe_client):
+    pipeline = SenseNovaU1Pipeline.__new__(SenseNovaU1Pipeline)
+    pipeline.model_path = "dummy/model"
+    pipeline.modules = {"model": object(), "tokenizer": object(), "pe": pe_client}
+    pipeline._stages = []
+    pipeline._stage_name_mapping = {}
+    pipeline._disagg_role = RoleType.MONOLITHIC
+    pipeline.create_pipeline_stages(SimpleNamespace())
+    return pipeline
+
+
+def test_sensenova_u1_pipeline_wires_pe_stage_when_configured():
+    pipeline = _build_pipeline_for_stage_order(pe_client=_FakePEClient())
+
+    stage_names = [type(stage).__name__ for stage in pipeline._stages]
+
+    assert stage_names == [
+        "InputValidationStage",
+        "SenseNovaU1PromptEnhancementStage",
+        "SenseNovaU1GenerationStage",
+    ]
+
+
+def test_sensenova_u1_pipeline_omits_pe_stage_when_not_configured():
+    pipeline = _build_pipeline_for_stage_order(pe_client=None)
+
+    stage_names = [type(stage).__name__ for stage in pipeline._stages]
+
+    assert stage_names == ["InputValidationStage", "SenseNovaU1GenerationStage"]
