@@ -72,8 +72,7 @@ jobs:
             --queue-series-out queue-series.json
 
       # The card rides on the scan above rather than running its own: a 24h
-      # window is ~5000 API calls, the whole hourly budget of the PAT that
-      # ci-lark-notify.yml uses.
+      # window is ~5000 API calls, the whole hourly budget of ci-lark-notify's PAT.
       - name: Post queue timeline card
         if: >-
           github.repository == 'sgl-project/sglang' &&

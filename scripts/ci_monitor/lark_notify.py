@@ -191,9 +191,8 @@ def button(text: str, url: str) -> dict:
 
 
 def chart(spec: dict, aspect_ratio: str = "16:9") -> dict:
-    # Native chart component: the spec is VChart JSON rendered by the Lark
-    # client, so no image upload (and no Lark app credentials) is involved.
-    # Needs Lark client 7.1+.
+    # The spec is VChart JSON rendered by the Lark client, so no image upload
+    # (hence no Lark app credentials) is involved. Needs Lark client 7.1+.
     return {
         "tag": "chart",
         "aspect_ratio": aspect_ratio,
@@ -707,13 +706,10 @@ def cmd_queue_digest(args: argparse.Namespace, gh: GitHub) -> None:
 def merge_timeline(series: dict) -> list:
     """Fold the per-label series into one CUDA-wide series, bucket by bucket.
 
-    Backlog sums across pools (a job waits in exactly one pool) while the wait
-    is a max of the per-pool p90s: averaging them would let idle pools mask the
-    one pool that is actually stuck, which is the number worth alerting on.
-
-    Merging costs the answer to "which pool?" -- the deepest backlog and the
-    longest wait routinely come from different pools -- so each bucket keeps
-    the label behind both, for the card to name under the chart.
+    Backlog sums across pools; the wait takes the max of the per-pool p90s,
+    since averaging would let idle pools mask the one pool that is stuck. The
+    merge costs the answer to "which pool?", so each bucket keeps the label
+    behind the deepest backlog and the longest wait -- routinely not the same.
     """
     buckets: dict = {}
     for label, rows in series.get("labels", {}).items():

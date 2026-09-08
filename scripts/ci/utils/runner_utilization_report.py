@@ -478,16 +478,14 @@ def queue_timeline(
 ) -> list[dict]:
     """Per-bucket queue backlog and wait p90, for the Lark timeline card.
 
-    `backlog` is the same sweep-line counter calculate_concurrency_metrics
-    reduces to a single peak, kept per bucket instead: the highest number of
-    jobs simultaneously waiting for a runner at any instant inside the bucket.
-    `p90_wait_min` covers the jobs a runner picked up during the bucket, so a
-    bucket can show a deep backlog and no p90 at all when nothing got picked up.
+    `backlog` is the sweep-line counter calculate_concurrency_metrics reduces
+    to a single peak, kept per bucket; `p90_wait_min` covers only the jobs
+    picked up inside the bucket, so a bucket can show a deep backlog and no
+    p90 at all.
     """
-    # Buckets start on the hour so the chart's x-axis labels mean what they
-    # say. The hour window_start falls into is only partly covered, which both
-    # under-counts it and gives a 24h window a 25th bucket repeating the first
-    # label, so that hour is dropped rather than reported short.
+    # Buckets start on the hour so the x-axis labels mean what they say. The
+    # partly-covered hour window_start lands in is dropped rather than reported
+    # short; on a 24h window it would also repeat the last bucket's label.
     bucket = timedelta(minutes=bucket_minutes)
     origin = window_start.replace(minute=0, second=0, microsecond=0)
     if origin < window_start:
