@@ -224,7 +224,16 @@ class SparDAKVPrefetcher:
             block_ids,
             context,
         )
-        if resolved is None or not resolved.transfers:
+        if resolved is None:
+            self._metrics["fallback"] += 1
+            return None
+        if not resolved.transfers:
+            # The resolver may allocate a lease before discovering that the
+            # selected blocks are already resident or otherwise unavailable.
+            # There is no transfer completion to guard that lease, so release
+            # it before taking the normal attention path.
+            if resolved.lease is not None:
+                resolved.lease.release()
             self._metrics["fallback"] += 1
             return None
         return self.submit(

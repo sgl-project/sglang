@@ -180,6 +180,19 @@ class TestSparDAPrefetcher(CustomTestCase):
         self.assertGreaterEqual(prefetcher.metrics()["fallback"], 1)
         self.assertFalse(prefetcher.wait_for_layer("request-a", 0, 3))
 
+    def test_empty_transfer_plan_releases_lease(self):
+        engine = _TransferEngine()
+        releases = []
+        lease = CallbackPageLease(lambda: releases.append(True))
+        resolver = CallbackPrefetchResolver(
+            lambda *_args: ResolvedPrefetch((), layer_num=1, lease=lease)
+        )
+        prefetcher = SparDAKVPrefetcher(engine, resolver)
+
+        self.assertIsNone(prefetcher.prefetch_forecast("request-a", 0, 1, [4]))
+        self.assertEqual(releases, [True])
+        self.assertEqual(prefetcher.active_tickets(), ())
+
     def test_callback_page_lease_is_idempotent(self):
         releases = []
         lease = CallbackPageLease(lambda: releases.append(True))
