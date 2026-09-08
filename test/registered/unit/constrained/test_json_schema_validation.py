@@ -57,6 +57,23 @@ class TestXGrammarJSONSchemaValidation(unittest.TestCase):
         ):
             validate_xgrammar_json_schema({"type": "string", "format": "regex"})
 
+    def test_accepts_non_string_format(self):
+        validate_xgrammar_json_schema({"type": "integer", "format": "int64"})
+        validate_xgrammar_json_schema({"type": "number", "format": "double"})
+        validate_xgrammar_json_schema({"type": ["integer", "null"], "format": "int64"})
+
+    def test_checks_format_when_schema_can_describe_string(self):
+        for schema in (
+            {"format": "markdown"},
+            {"type": ["string", "null"], "format": "markdown"},
+        ):
+            with self.subTest(schema=schema):
+                with self.assertRaisesRegex(
+                    UnsupportedJSONSchemaFeature,
+                    "format 'markdown' is not implemented",
+                ):
+                    validate_xgrammar_json_schema(schema)
+
     def test_rejects_lossy_string_constraint_combinations(self):
         cases = (
             {"type": "string", "pattern": "^[a-z]+$", "minLength": 2},
@@ -151,6 +168,16 @@ class TestOutlinesJSONSchemaValidation(unittest.TestCase):
             with self.subTest(schema=schema):
                 with self.assertRaises(UnsupportedJSONSchemaFeature):
                     validate_outlines_json_schema(schema)
+
+    def test_accepts_non_string_format_and_string_keywords(self):
+        validate_outlines_json_schema(
+            {
+                "type": "integer",
+                "format": "int64",
+                "pattern": "ignored-for-integers",
+                "minLength": 1,
+            }
+        )
 
     def test_escapes_nested_json_pointer(self):
         with self.assertRaisesRegex(

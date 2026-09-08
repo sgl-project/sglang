@@ -343,6 +343,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
+                # Inspect the decoded schema for semantic loss, then give the
+                # original string to XGrammar to preserve its parser behavior.
                 schema = json.loads(key_string)
                 validate_xgrammar_json_schema(schema)
                 ctx = self.grammar_compiler.compile_json_schema(
