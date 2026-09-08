@@ -8,7 +8,7 @@ worker logic is identical regardless of CC (CC only changes whether the
 scheduler routes the readback through the worker). To exercise the worker on an
 ordinary GPU, run inside the sglang container:
 
-    python -m pytest test/registered/core/test_async_d2h_copy_worker.py -v
+    python -m pytest test/registered/unit/managers/test_async_d2h_copy_worker.py -v
 """
 
 import os
