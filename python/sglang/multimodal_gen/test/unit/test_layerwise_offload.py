@@ -1375,15 +1375,45 @@ def test_mapped_layers_ship_through_the_courier(tmp_path, monkeypatch):
 
     manager.prefetch_layer(0, non_blocking=True)
     assert 0 in manager._courier_inflight, "an async prefetch hands the layer over"
-    assert (
-        0 not in manager._gpu_layers
-    ), "the layer is not ready until its tensors are bound on this thread"
+    assert 0 not in manager._gpu_layers, (
+        "the layer is not ready until its tensors are bound on this thread"
+    )
 
     manager.prefetch_layer(0, non_blocking=False)
     assert 0 in manager._gpu_layers and not manager._courier_inflight
-    assert torch.equal(
-        model.blocks[0].weight.detach().cpu(), expected
-    ), "the bytes that went through the courier's slot must be the checkpoint's"
+    assert torch.equal(model.blocks[0].weight.detach().cpu(), expected), (
+        "the bytes that went through the courier's slot must be the checkpoint's"
+    )
+
+
+def test_collected_mapped_weights_record_the_compute_stream(monkeypatch):
+    """Courier tensors must stay live until their compute-stream kernels finish."""
+    compute_stream = _FakeStream()
+    recorded_streams = []
+    gpu_tensor = SimpleNamespace(
+        device=torch.device("cuda"), record_stream=recorded_streams.append
+    )
+    monkeypatch.setattr(
+        _FakeDeviceModule, "current_stream", staticmethod(lambda: compute_stream)
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+
+    manager = object.__new__(LayerwiseOffloadManager)
+    target = torch.nn.Parameter(torch.zeros(1))
+    manager._mapped_courier = SimpleNamespace(
+        collect=lambda _layer_idx: (_FakeEvent(), {"weight": gpu_tensor})
+    )
+    manager._named_parameters = {"weight": target}
+    manager._named_buffers = {}
+    manager._wrap_for_target = lambda _target, _tensor: target.data
+    manager._courier_inflight = {0}
+    manager._gpu_layers = set()
+
+    manager._collect_mapped_layer(0)
+
+    assert recorded_streams == [compute_stream]
 
 
 def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypatch):
@@ -1397,9 +1427,9 @@ def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypat
     manager.release_all()
     manager.prefetch_layer(0, non_blocking=True)
     assert not manager._courier_inflight and manager._mapped_courier is None
-    assert (
-        0 in manager._gpu_layers
-    ), "with the courier disabled the direct synchronous path serves the layer"
+    assert 0 in manager._gpu_layers, (
+        "with the courier disabled the direct synchronous path serves the layer"
+    )
 
 
 def test_release_all_drains_the_courier(tmp_path, monkeypatch):
@@ -1870,6 +1900,36 @@ def test_host_copies_are_given_back_when_room_appears(monkeypatch):
     _headroom(monkeypatch, 400)
     comp.park_non_layer_weights()
     assert not comp._parked_non_layer_weights, "host copies should be released"
+
+
+def test_releasing_host_copies_restores_placeholders(monkeypatch):
+    """When room appears, release host copies but restore parameters from placeholders."""
+    local_device = layerwise_offload_mod.current_platform.get_local_torch_device()
+    if local_device.type == "cpu":
+        pytest.skip("parking targets device-resident parameters")
+
+    # The parking path is for the non-MPS accelerator path, so bypass the
+    # MPS-specific early return while still using the real local device.
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "is_mps", lambda: False)
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    assert comp.non_layer.device.type == local_device.type
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    assert comp._parked_non_layer_weights
+    comp.restore_non_layer_weights()
+
+    _headroom(monkeypatch, 400)
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights
+    # Only the non-layer parameter must be restored; streamed layer weights are
+    # intentionally left as placeholders by the layerwise manager.
+    assert comp.non_layer.shape != (1,), (
+        "non_layer left as a (1,) placeholder after host copies were released"
+    )
 
 
 def test_park_placeholders_are_shared(monkeypatch):
