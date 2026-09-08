@@ -1,22 +1,28 @@
 """CPU-only metadata tests for explicit DP-attention LoRA routing."""
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
     TritonLoRABackend,
     gather_dp_attention_lora_batch_info,
 )
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import LoRABatchLayout, get_forward
+from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -58,6 +64,82 @@ def _routes(batch_info: LoRABatchInfo) -> list[int]:
     unsorted_routes = torch.empty_like(routes)
     unsorted_routes[batch_info.permutation.long()] = routes
     return unsorted_routes.tolist()
+
+
+class _LocalOnlyLoRABackend(BaseLoRABackend):
+    supports_dp_attention = True
+
+    def prepare_lora_batch(
+        self,
+        forward_batch,
+        weight_indices,
+        lora_ranks,
+        scalings,
+        use_cuda_graph,
+        use_prefill_cuda_graph=False,
+    ):
+        self.batch_info = _batch_info(weight_indices, [1] * forward_batch.batch_size)
+        self.batch_info.lora_ranks = torch.tensor(lora_ranks, dtype=torch.int32)
+        self.batch_info.scalings = torch.tensor(scalings, dtype=torch.float32)
+
+
+class TestDPAttentionBackendContract(CustomTestCase):
+    def test_manager_requires_global_routing_only_for_dp_attention(self):
+        """DPA must not proceed with local-only routing; non-DPA remains supported."""
+        for enable_dp_attention in (False, True):
+            with self.subTest(enable_dp_attention=enable_dp_attention):
+                backend = _LocalOnlyLoRABackend(
+                    max_loras_per_batch=3, device=torch.device("cpu")
+                )
+                pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+                pool.max_loras_per_batch = 3
+                pool.uid_to_buffer_id = {None: 0, "adapter": 1}
+                manager = LoRAManager.__new__(LoRAManager)
+                manager.enable_dp_attention = enable_dp_attention
+                manager.max_loras_per_batch = 3
+                manager.num_pinned_loras = 1
+                manager.lora_backend = backend
+                manager.memory_pool = pool
+                manager.loras = {
+                    "adapter": SimpleNamespace(config=SimpleNamespace(r=8), scaling=2.0)
+                }
+                manager.lora_refs = {"adapter": LoRARef(lora_id="adapter", pinned=True)}
+                manager.lora_modules = []
+                manager.embed_tokens_module = None
+                manager.lm_head_module = None
+                tokens = torch.zeros(2, dtype=torch.int64)
+                forward_batch = ForwardBatch(
+                    forward_mode=ForwardMode.DECODE,
+                    batch_size=2,
+                    input_ids=tokens,
+                    req_pool_indices=tokens,
+                    seq_lens=tokens,
+                    out_cache_loc=tokens,
+                    seq_lens_sum=0,
+                    lora_ids=[None, "adapter"],
+                )
+                tp_group = SimpleNamespace(
+                    all_gather_object=lambda ids: [ids, ["adapter"]]
+                )
+                expectation = (
+                    self.assertRaisesRegex(
+                        NotImplementedError,
+                        "_LocalOnlyLoRABackend.*prepare_global_lora_batch",
+                    )
+                    if enable_dp_attention
+                    else nullcontext()
+                )
+                with (
+                    get_parallel().override(tp_group=tp_group),
+                    patch.object(pool, "prepare_lora_batch"),
+                    expectation,
+                ):
+                    manager.prepare_lora_batch(forward_batch)
+
+                self.assertEqual(_routes(backend.batch_info), [0, 1])
+                self.assertEqual(backend.batch_info.lora_ranks.tolist(), [0, 8, 0])
+                self.assertEqual(backend.batch_info.scalings.tolist(), [0.0, 2.0, 0.0])
+                self.assertTrue(backend.batch_info.has_active_lora)
 
 
 def test_layout_selects_routing_without_shape_inference():

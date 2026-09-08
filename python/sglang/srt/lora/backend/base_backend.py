@@ -72,7 +72,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
     def prepare_global_lora_batch(self, forward_batch: ForwardBatch) -> None:
         """Prepare routing for TP-global sections of a DP-attention forward."""
-        pass
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} must implement "
+            "prepare_global_lora_batch() to support DP attention."
+        )
 
     def validate_lora_targets(
         self,
