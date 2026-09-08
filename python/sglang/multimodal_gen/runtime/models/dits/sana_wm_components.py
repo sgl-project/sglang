@@ -13,10 +13,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    fused_bias_glu,
+    fused_bias_silu,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_SANA_WM_CONV_POST = BitExactFusionGate(
+    "SANA-WM conv post-processing", per_signature=True
+)
 
 _SANA_WM_TRITON_GDN_DISABLED_REASON: Optional[str] = None
 _SANA_WM_TRITON_GDN_FALLBACK_LOGGED = False
@@ -1032,11 +1041,66 @@ class GLUMBConvTemp(nn.Module):
         )
         nn.init.zeros_(self.t_conv.weight)
 
-    def _apply_spatial(self, x: torch.Tensor) -> torch.Tensor:
+    def _spatial_glu_reference(self, x: torch.Tensor) -> torch.Tensor:
         x = self.inverted_conv(x)
         x = self.depth_conv(x)
         a, g = x.chunk(2, dim=1)
-        return self.point_conv(a * self.glu_act(g))
+        return a * self.glu_act(g)
+
+    def _spatial_glu(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            not _SANA_WM_CONV_POST.disabled
+            and x.is_cuda
+            and x.dtype is torch.bfloat16
+            and x.is_contiguous()
+            and x.numel() > 0
+            and not torch.compiler.is_compiling()
+        ):
+            conv = self.inverted_conv.conv
+            sig = (
+                x.shape,
+                x.stride(),
+                x.device,
+                x.dtype,
+                conv.weight.shape,
+                conv.weight.stride(),
+                self.depth_conv.conv.weight.stride(),
+                torch.backends.cudnn.enabled,
+                torch.backends.cudnn.benchmark,
+                torch.backends.cudnn.deterministic,
+                torch.backends.cudnn.allow_tf32,
+            )
+            verified = _SANA_WM_CONV_POST.is_verified(sig)
+            if verified or not torch.cuda.is_current_stream_capturing():
+                try:
+                    raw = F.conv2d(
+                        x,
+                        conv.weight,
+                        None,
+                        conv.stride,
+                        conv.padding,
+                        conv.dilation,
+                        conv.groups,
+                    )
+                    hidden = fused_bias_silu(raw, conv.bias)
+                    # Native depthwise conv accumulates bias before rounding;
+                    # preserve it and fuse only its following SiLU/multiply.
+                    out = fused_bias_glu(self.depth_conv(hidden), None)
+                except Exception as exc:
+                    _SANA_WM_CONV_POST.on_exception(exc, logger=logger)
+                else:
+                    if verified:
+                        return out
+                    return _SANA_WM_CONV_POST.accept_or_fallback(
+                        out,
+                        self._spatial_glu_reference(x),
+                        sig=sig,
+                        logger=logger,
+                    )
+        return self._spatial_glu_reference(x)
+
+    def _apply_spatial(self, x: torch.Tensor) -> torch.Tensor:
+        return self.point_conv(self._spatial_glu(x))
 
     def _apply_spatial_autochunked(self, x: torch.Tensor) -> torch.Tensor:
         """Avoid oversized Conv2d calls on long videos while keeping short path fused."""
@@ -1871,9 +1935,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
     ) -> None:
         super().__init__()
         out_dim = heads * head_dim
-        assert out_dim == in_dim, (
-            f"in_dim ({in_dim}) must equal heads*head_dim ({out_dim})"
-        )
+        assert (
+            out_dim == in_dim
+        ), f"in_dim ({in_dim}) must equal heads*head_dim ({out_dim})"
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.heads = heads
