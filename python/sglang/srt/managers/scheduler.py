@@ -4676,6 +4676,16 @@ class Scheduler(
         # post-flush below.
         fully_idle = self.is_fully_idle()
         if not fully_idle:
+            if (
+                self.enable_hicache_storage
+                and get_memory().hicache_host_memory_mode == "buffer_only"
+                and (
+                    self.tree_cache.ongoing_prefetch
+                    or self.tree_cache.buffer_pipeline.ongoing_backup
+                )
+            ):
+                # Storage workers need the GIL to finish IO while no batch can run.
+                time.sleep(0.001)
             self.metrics_reporter.record_scheduler_active()
             now = time.monotonic()
             if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:

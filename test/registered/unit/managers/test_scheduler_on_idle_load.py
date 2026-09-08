@@ -22,6 +22,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 class TestOnIdleStallPublish(CustomTestCase):
     def _stalled_scheduler(self) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
+        s.enable_hicache_storage = False
         s.scheduler_stage_metrics = None
         s.maybe_send_health_check_signal = MagicMock()
         s.is_fully_idle = MagicMock(return_value=False)  # stalled, not idle
