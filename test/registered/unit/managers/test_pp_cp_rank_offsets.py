@@ -63,6 +63,7 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
         max_recv_per_poll=-1,
         stream_output=lambda *args, **kwargs: None,
         get_last_batch=lambda: None,
+        poll_timeout_aborts=lambda: [],
     )
 
 
@@ -128,9 +129,10 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
                 return_value=parallel,
             ),
             patch(
-                "sglang.srt.managers.scheduler_components.request_receiver."
-                "is_ep_scale_joiner",
-                return_value=False,
+                "sglang.srt.managers.scheduler_components.request_receiver.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver."
