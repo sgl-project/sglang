@@ -313,22 +313,32 @@ class TestDreamCudaGraphPath(CustomTestCase):
         )
         return args
 
-    @patch("sglang.srt.arg_groups.overrides.run_post_process_pass")
-    def test_server_guard_selects_dream_graph_backend(self, run_post_process_pass):
+    @patch("sglang.srt.arg_groups.dllm_hook.run_post_process_pass")
+    @patch("sglang.srt.arg_groups.dllm_hook.model_config_of")
+    @patch("sglang.srt.arg_groups.dllm_hook.get_platform")
+    def test_server_guard_selects_dream_graph_backend(
+        self, get_platform, model_config_of, run_post_process_pass
+    ):
+        get_platform.return_value.is_hip = False
+        model_config_of.return_value.hf_config.architectures = ["DreamModel"]
+
+        from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
+        from sglang.srt.arg_groups.overrides import resolving_view
+
         for disable_cuda_graph in (False, True):
             with self.subTest(disable_cuda_graph=disable_cuda_graph):
                 args = self._make_server_args_for_graph_test(disable_cuda_graph)
-                with patch("sglang.srt.server_args.is_hip", return_value=False):
-                    args._handle_dllm_inference()
+                handle_dllm_inference(args)
+                resolved = resolving_view(args)
 
-                self.assertTrue(args.disable_radix_cache)
-                self.assertTrue(args.dllm_fdfo)
+                self.assertTrue(resolved.disable_radix_cache)
+                self.assertTrue(resolved.dllm_fdfo)
                 self.assertEqual(
-                    args.cuda_graph_config.decode.backend,
+                    resolved.cuda_graph_config.decode.backend,
                     Backend.DISABLED,
                 )
                 self.assertEqual(
-                    args.cuda_graph_config.prefill.backend,
+                    resolved.cuda_graph_config.prefill.backend,
                     Backend.DISABLED if disable_cuda_graph else Backend.BREAKABLE,
                 )
                 self.assertEqual(run_post_process_pass.call_count, 3)

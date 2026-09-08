@@ -53,10 +53,21 @@ def handle_dllm_inference(server_args: Any):
 
     cfg = resolving_view(server_args)
     architectures = model_config_of(server_args).hf_config.architectures
-    if (
-        "DreamModel" in architectures
-        and cfg.cuda_graph_config.decode.backend != Backend.DISABLED
-    ):
+    is_dream = "DreamModel" in architectures
+    if is_dream:
+        if cfg.tp_size != 1:
+            raise ValueError("Dream dLLM currently only supports TP=1")
+        if cfg.pp_size != 1:
+            raise ValueError("Dream dLLM currently only supports PP=1")
+        if not cfg.disable_radix_cache:
+            logger.warning("Dream dLLM is experimental: disabling radix prefix cache")
+            declare_resolution(
+                server_args,
+                "_handle_dllm_inference",
+                disable_radix_cache=True,
+            )
+
+    if is_dream and cfg.cuda_graph_config.decode.backend != Backend.DISABLED:
         logger.warning(
             "Decode CUDA graph is disabled because Dream requires full per-request prefill."
         )
@@ -68,6 +79,7 @@ def handle_dllm_inference(server_args: Any):
             ),
         )
 
+    cfg = resolving_view(server_args)
     run_post_process_pass(server_args, _dllm_attention_backend)
     run_post_process_pass(server_args, _dllm_overlap_disable)
 
