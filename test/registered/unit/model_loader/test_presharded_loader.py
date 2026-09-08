@@ -15,6 +15,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.model_loader.loader import PreshardedModelLoader
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -373,7 +374,10 @@ class TestBuildDumpPlan(unittest.TestCase):
         # and depend on (name, content-SHA) pairs of every tensor a rank
         # owns. Permuting the manifest's insertion order must not change
         # the rank checksum.
-        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+        with (
+            tempfile.TemporaryDirectory() as tmp_a,
+            tempfile.TemporaryDirectory() as tmp_b,
+        ):
             base_entries = {
                 "alpha.weight": {
                     "checksum": "h_alpha",
@@ -402,7 +406,10 @@ class TestBuildDumpPlan(unittest.TestCase):
 
     def test_rank_checksum_distinguishes_content(self):
         # Changing one tensor's content-SHA must change the rank checksum.
-        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+        with (
+            tempfile.TemporaryDirectory() as tmp_a,
+            tempfile.TemporaryDirectory() as tmp_b,
+        ):
             entries_a = {
                 "x.weight": {
                     "checksum": "ha",
@@ -536,10 +543,10 @@ class TestBuildDumpPlan(unittest.TestCase):
         # read-only dump root (HF cache mounts). Mock OSError because root
         # can often still write to mode-0555 dirs under CAP_DAC_OVERRIDE.
         loader = object.__new__(PreshardedModelLoader)
-        with mock.patch.object(
-            loader, "_world_rank_and_size", return_value=(0, 1)
-        ), mock.patch.object(loader, "_world_barrier"), mock.patch(
-            "os.makedirs", side_effect=OSError("Read-only file system")
+        with (
+            mock.patch.object(loader, "_world_rank_and_size", return_value=(0, 1)),
+            mock.patch.object(loader, "_world_barrier"),
+            mock.patch("os.makedirs", side_effect=OSError("Read-only file system")),
         ):
             with self.assertRaises(RuntimeError) as ctx:
                 loader._ensure_presharded_dir_writable("/ro/presharded")
@@ -550,9 +557,10 @@ class TestBuildDumpPlan(unittest.TestCase):
         loader = object.__new__(PreshardedModelLoader)
         with tempfile.TemporaryDirectory() as tmp:
             leaf = os.path.join(tmp, "TP-8-sig-test")
-            with mock.patch.object(
-                loader, "_world_rank_and_size", return_value=(0, 1)
-            ), mock.patch.object(loader, "_world_barrier") as barrier:
+            with (
+                mock.patch.object(loader, "_world_rank_and_size", return_value=(0, 1)),
+                mock.patch.object(loader, "_world_barrier") as barrier,
+            ):
                 loader._ensure_presharded_dir_writable(leaf)
             self.assertTrue(os.path.isdir(leaf))
             barrier.assert_called_once()
@@ -604,15 +612,21 @@ class TestStructuralSignature(unittest.TestCase):
 
         loader = object.__new__(PreshardedModelLoader)
         loader.load_config = SimpleNamespace()
-        with mock.patch(
-            "sglang.srt.model_loader.loader._get_quantization_config",
-            return_value=None,
-        ), mock.patch(
-            "sglang.srt.model_loader.loader._initialize_model",
-            side_effect=_init_stub,
-        ), mock.patch(
-            "sglang.srt.model_loader.loader.set_default_torch_dtype",
-            return_value=mock.MagicMock(__enter__=mock.Mock(), __exit__=mock.Mock()),
+        with (
+            mock.patch(
+                "sglang.srt.model_loader.loader._get_quantization_config",
+                return_value=None,
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader._initialize_model",
+                side_effect=_init_stub,
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader.set_default_torch_dtype",
+                return_value=mock.MagicMock(
+                    __enter__=mock.Mock(), __exit__=mock.Mock()
+                ),
+            ),
         ):
             sig_ab = loader._compute_local_structural_signature(
                 SimpleNamespace(
@@ -693,15 +707,21 @@ class TestStructuralSignature(unittest.TestCase):
         def _initialize_model_stub(model_config, load_config, quant_config):
             return nn.Linear(4, model_config.width, bias=False)
 
-        with mock.patch(
-            "sglang.srt.model_loader.loader._get_quantization_config",
-            return_value=None,
-        ), mock.patch(
-            "sglang.srt.model_loader.loader._initialize_model",
-            side_effect=_initialize_model_stub,
-        ), mock.patch(
-            "sglang.srt.model_loader.loader.set_default_torch_dtype",
-            return_value=mock.MagicMock(__enter__=mock.Mock(), __exit__=mock.Mock()),
+        with (
+            mock.patch(
+                "sglang.srt.model_loader.loader._get_quantization_config",
+                return_value=None,
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader._initialize_model",
+                side_effect=_initialize_model_stub,
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader.set_default_torch_dtype",
+                return_value=mock.MagicMock(
+                    __enter__=mock.Mock(), __exit__=mock.Mock()
+                ),
+            ),
         ):
             loader_narrow = FakeModelLoader(width=2)
             loader_wide = FakeModelLoader(width=8)
@@ -737,15 +757,21 @@ class TestStructuralSignature(unittest.TestCase):
         loader = object.__new__(PreshardedModelLoader)
         loader.load_config = SimpleNamespace()
 
-        with mock.patch(
-            "sglang.srt.model_loader.loader._get_quantization_config",
-            return_value=None,
-        ), mock.patch(
-            "sglang.srt.model_loader.loader._initialize_model",
-            side_effect=RuntimeError("simulated init failure"),
-        ), mock.patch(
-            "sglang.srt.model_loader.loader.set_default_torch_dtype",
-            return_value=mock.MagicMock(__enter__=mock.Mock(), __exit__=mock.Mock()),
+        with (
+            mock.patch(
+                "sglang.srt.model_loader.loader._get_quantization_config",
+                return_value=None,
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader._initialize_model",
+                side_effect=RuntimeError("simulated init failure"),
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader.set_default_torch_dtype",
+                return_value=mock.MagicMock(
+                    __enter__=mock.Mock(), __exit__=mock.Mock()
+                ),
+            ),
         ):
             result = loader._compute_structural_signature(
                 SimpleNamespace(quantization=None, dtype=torch.float32)
@@ -803,34 +829,38 @@ class TestShardConfig(unittest.TestCase):
             "init_expert_location",
             "structural_signature",
         }
-        # Both tiers on one stand-in: bare names are the live groups, `config`
-        # is the published parallel bag.
-        parallel = SimpleNamespace(
+        # The sizes go through both channels: some entries read the published
+        # leaf, others the live property. `get_moe_cp_size` is imported inside
+        # `_collect_shard_config`, so it is patched where it is defined.
+        override = get_context().override_server_args(
             tp_size=8,
-            moe_dp_size=2,
-            moe_ep_size=4,
             pp_size=1,
-            config=SimpleNamespace(
-                moe_dp_size=2,
-                moe_dense_tp_size=1,
-                enable_dp_lm_head=True,
-            ),
+            moe_dp_size=2,
+            moe_dense_tp_size=1,
+            enable_dp_lm_head=True,
         )
-        with mock.patch(
-            "sglang.srt.model_loader.loader.get_parallel",
-            return_value=parallel,
-        ), mock.patch(
-            "sglang.srt.model_loader.loader.get_exec",
-            return_value=SimpleNamespace(
-                features=SimpleNamespace(enable_fp32_lm_head=True),
-                moe=SimpleNamespace(
-                    ep_num_redundant_experts=4,
-                    enable_eplb=True,
-                    init_expert_location="trivial",
+        override.install()
+        self.addCleanup(override.restore)
+        with (
+            get_parallel().override(tp_size=8, pp_size=1, moe_dp_size=2, moe_ep_size=4),
+            mock.patch(
+                "sglang.srt.layers.dp_attention.get_moe_cp_size",
+                return_value=2,
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader.get_exec",
+                return_value=SimpleNamespace(
+                    features=SimpleNamespace(enable_fp32_lm_head=True),
+                    moe=SimpleNamespace(
+                        ep_num_redundant_experts=4,
+                        enable_eplb=True,
+                        init_expert_location="trivial",
+                    ),
                 ),
             ),
-        ), mock.patch.object(
-            loader, "_compute_structural_signature", return_value="sig16"
+            mock.patch.object(
+                loader, "_compute_structural_signature", return_value="sig16"
+            ),
         ):
             cfg = loader._collect_shard_config(model_config)
         self.assertEqual(required, set(cfg.keys()))
@@ -929,23 +959,28 @@ class TestShardConfig(unittest.TestCase):
 
             # Force rank 0 / world 1 so the method runs the rank-0 prologue
             # and then fails early on empty state (no need for full dump).
-            with mock.patch.object(
-                PreshardedModelLoader,
-                "_world_rank_and_size",
-                return_value=(0, 1),
-            ), mock.patch.object(
-                PreshardedModelLoader, "_world_barrier", return_value=None
-            ), mock.patch.object(
-                PreshardedModelLoader,
-                "_build_dump_plan",
-                return_value={
-                    "version": PreshardedModelLoader.PLAN_VERSION,
-                    "files": [],
-                    "rank_to_reads": {"0": []},
-                    "rank_checksums": {"0": "0"},
-                },
-            ), mock.patch.object(
-                PreshardedModelLoader, "_dump_files_for_rank", return_value=None
+            with (
+                mock.patch.object(
+                    PreshardedModelLoader,
+                    "_world_rank_and_size",
+                    return_value=(0, 1),
+                ),
+                mock.patch.object(
+                    PreshardedModelLoader, "_world_barrier", return_value=None
+                ),
+                mock.patch.object(
+                    PreshardedModelLoader,
+                    "_build_dump_plan",
+                    return_value={
+                        "version": PreshardedModelLoader.PLAN_VERSION,
+                        "files": [],
+                        "rank_to_reads": {"0": []},
+                        "rank_checksums": {"0": "0"},
+                    },
+                ),
+                mock.patch.object(
+                    PreshardedModelLoader, "_dump_files_for_rank", return_value=None
+                ),
             ):
                 loader._dump_state_to_disk(
                     state_dict={},

@@ -47,8 +47,8 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
     run_dsv4_eagle_verify_cuda_graph_case,
 )
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -444,8 +444,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True),
                     envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(False),
                     mock.patch(
-                        "sglang.srt.layers.attention.deepseek_v4_backend._is_sm120",
-                        False,
+                        "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                        return_value=SimpleNamespace(is_sm120=False),
                     ),
                 ):
                     backend.prepare_prefill_shared_read_snapshot(
@@ -490,7 +490,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True),
             envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
             mock.patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend._is_sm120", False
+                "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                return_value=SimpleNamespace(is_sm120=False),
             ),
             self.assertRaisesRegex(RuntimeError, "snapshot failed"),
         ):

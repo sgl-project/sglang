@@ -8,6 +8,8 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress
 
 try:
@@ -22,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 
 class AscendTransferEngine(MooncakeTransferEngine):
-
     def __init__(
         self,
         hostname: str,
@@ -64,6 +65,10 @@ class AscendTransferEngine(MooncakeTransferEngine):
         transfer_protocol = self._get_transfer_protocol()
         if transfer_protocol is None or transfer_protocol == "sdma":
             trans_op_type = TransferEngine.TransDataOpType.SDMA
+        elif transfer_protocol == "device_urma":
+            trans_op_type = TransferEngine.TransDataOpType.DEVICE_URMA
+        elif transfer_protocol == "device_uboe":
+            trans_op_type = TransferEngine.TransDataOpType.DEVICE_UBOE
         else:
             trans_op_type = TransferEngine.TransDataOpType.DEVICE_RDMA
             """with device RDMA for PD transfer"""
@@ -76,8 +81,12 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 output_tensor_list, tmp_tensor, group=get_world_group().device_group
             )
         """Initialize the ascend transfer instance."""
-        ret_value = self.engine.initialize(
-            self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+        ret_value = run_with_deadline(
+            lambda: self.engine.initialize(
+                self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+            ),
+            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
+            what=f"Ascend TransferEngine.initialize({self.store_url!r}, {self.session_id!r})",
         )
         if ret_value != 0:
             logger.error("Ascend Transfer Engine initialization failed.")
@@ -95,7 +104,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     @staticmethod
     def _get_transfer_protocol():
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
-        allowed_protocols = {"device_rdma", "sdma"}
+        allowed_protocols = {"device_rdma", "sdma", "device_urma", "device_uboe"}
         if protocol and protocol.lower() in allowed_protocols:
             return protocol.lower()
         else:

@@ -410,8 +410,9 @@ export const Qwen35Deployment = () => {
       }
     }
 
-    // Enable NCCL symmetric memory for H100 FP8 deployments.
-    if (hardware === 'h100' && quantization === 'fp8' && hwConfig.tp > 1) {
+    // Enable NCCL symmetric memory for H100 and Blackwell FP8 deployments.
+    const symmMemFp8Hw = ['h100', 'b200', 'b300'];
+    if (symmMemFp8Hw.includes(hardware) && quantization === 'fp8' && hwConfig.tp > 1) {
       cmd += ` \\\n  --enable-symm-mem`;
     }
 
@@ -438,12 +439,31 @@ export const Qwen35Deployment = () => {
       }
     }
 
+    // B200 NVFP4 with MTP runs TP2/EP2 (set above). Keep Triton as the base
+    // linear-attention backend while routing GDN decode and prefill through
+    // FlashInfer.
+    if (model === '397b' && hardware === 'b200' && quantization === 'fp4' && speculative === 'enabled') {
+      cmd += ` \\\n  --linear-attn-backend triton`;
+      cmd += ` \\\n  --linear-attn-decode-backend flashinfer`;
+      cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
+    }
+
     // Append backend configurations
     if (hardware === 'b200' || (hardware === 'b300' && quantization === 'fp4')) {
       cmd += ` \\\n  --attention-backend trtllm_mha`;
     }
     if (hardware === 'b300' && quantization !== 'fp4') {
       cmd += ` \\\n  --attention-backend flashinfer`;
+    }
+
+    // Enable FlashInfer GDN (linear attention) prefill for Blackwell FP8 deployments.
+    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8') {
+      cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
+    }
+
+    // Enable FlashInfer trtllm MoE for FP8 Blackwell deployments for MoE models.
+    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8' && MOE_MODELS.has(model)) {
+      cmd += ` \\\n  --moe-runner-backend flashinfer_trtllm`;
     }
 
     // Append AMD GPU-specific backend configurations.

@@ -71,7 +71,7 @@ def should_use_zmq() -> bool:
     ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ`` forces zmq mode for testing.
     """
     return (
-        get_parallel().config.enable_dp_attention and get_parallel().config.nnodes > 1
+        get_parallel().enable_dp_attention and get_parallel().nnodes > 1
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
@@ -116,15 +116,15 @@ def zmq_reader_owner(caller: str) -> bool:
     """
     if not should_use_zmq():
         return False
-    if get_parallel().config.node_rank != 0:
+    if get_parallel().node_rank != 0:
         return False
     if caller == "DataParallelController":
         return (
-            get_parallel().config.dp_size > 1
-            and get_parallel().config.load_balance_method.lower() in _LOAD_AWARE_METHODS
+            get_parallel().dp_size > 1
+            and get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
         )
-    if get_parallel().config.dp_size > 1 and (
-        get_parallel().config.load_balance_method.lower() in _LOAD_AWARE_METHODS
+    if get_parallel().dp_size > 1 and (
+        get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
     ):
         return False
     return caller == _tokenizer_load_snapshot_owner_caller()
@@ -202,6 +202,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
     # outside disaggregated decode).
     num_active_tokens: int = 0
+    num_prealloc_ready_tokens: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0
@@ -658,7 +659,7 @@ def create_load_snapshot_reader(port_args, caller: str):
             ``"MultiTokenizerRouter"`` -- determines who binds the zmq PULL
             socket when zmq mode is active.
     """
-    dp_size = get_parallel().config.dp_size
+    dp_size = get_parallel().dp_size
     if zmq_reader_owner(caller):
         return ZmqShmLoadSnapshotReader(
             _zmq_addr_for(port_args), shm_path_for(port_args.instance_id), dp_size

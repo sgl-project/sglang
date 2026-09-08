@@ -238,7 +238,6 @@ class MiMoV2ModelNextN(nn.Module):
 
 
 class MiMoV2MTP(MiMoV2ForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -259,7 +258,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -320,7 +319,6 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-
                 if f".{weight_name}." not in name:
                     continue
                 if "mtp_block" not in name:
