@@ -27,7 +27,6 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
-    resolve_dsa_indexer_layer_ids,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
@@ -1518,10 +1517,13 @@ class KVCacheConfigurator:
         )
         indexer_layer_ids = None
         if is_glm_compact_rollout:
-            indexer_layer_ids = resolve_dsa_indexer_layer_ids(
-                self.model_config.hf_config,
-                self.layer_info.start_layer,
-                self.layer_info.end_layer,
+            indexer_layer_ids = tuple(
+                layer_id
+                for layer_id in range(
+                    self.layer_info.start_layer,
+                    self.layer_info.end_layer,
+                )
+                if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35

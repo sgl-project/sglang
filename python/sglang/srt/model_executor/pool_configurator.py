@@ -31,7 +31,6 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
-    resolve_dsa_indexer_layer_ids,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
@@ -483,9 +482,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
             )
             num_indexer_layers = (
-                len(
-                    resolve_dsa_indexer_layer_ids(
-                        kvc.model_config.hf_config,
+                sum(
+                    not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                    for layer_id in range(
                         kvc.layer_info.start_layer,
                         kvc.layer_info.end_layer,
                     )

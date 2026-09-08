@@ -315,22 +315,6 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     return max(layer_id - 1, 0) % freq != 0
 
 
-def resolve_dsa_indexer_layer_ids(
-    config: PretrainedConfig,
-    start_layer: int,
-    end_layer: int,
-    is_nextn: bool = False,
-) -> tuple[int, ...]:
-    """Absolute layer ids that own an Indexer, not logical top-k capture slots."""
-    assert is_deepseek_dsa(config)
-    assert 0 <= start_layer <= end_layer
-    return tuple(
-        layer_id
-        for layer_id in range(start_layer, end_layer)
-        if is_nextn or not dsa_layer_skips_topk(config, layer_id)
-    )
-
-
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads
