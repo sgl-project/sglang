@@ -893,18 +893,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         torch.npu.synchronize()
         return kv_cache_cpu
 
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # MTP branch-prefix/accepted-token relocation uses token slots, whereas
-        # NPU storage is paged and has separate physical Indexer buffers.
-        if tgt_loc.numel() == 0:
-            return
-        tgt_loc = tgt_loc.reshape(-1).long()
-        src_loc = src_loc.reshape(-1).long()
-        for local_layer_id in range(self.layer_num):
-            for buffer in self._get_cpu_offload_layer_buffers(local_layer_id):
-                if buffer.shape[-1] != 0:
-                    buffer[tgt_loc] = buffer[src_loc]
-
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
