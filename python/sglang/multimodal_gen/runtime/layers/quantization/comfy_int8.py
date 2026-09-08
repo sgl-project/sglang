@@ -12,6 +12,19 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
+try:
+    from comfy_kitchen import registry
+
+    _cuda_embedding = (
+        torch.ops.comfy_kitchen.dequantize_int8_embedding
+        if registry.is_available("cuda")
+        else None
+    )
+except (ImportError, AttributeError):
+    _cuda_embedding = None
+
+_OUTPUT_DTYPE_CODE = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
+
 
 def is_comfy_int8_embedding(marker: dict[str, Any] | None) -> bool:
     return bool(
@@ -65,6 +78,14 @@ class ComfyInt8EmbeddingMethod(QuantizeMethodBase):
         raise NotImplementedError("Comfy INT8 embeddings support lookup only")
 
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        if self.tensorwise and layer.weight.is_cuda and _cuda_embedding is not None:
+            return _cuda_embedding(
+                layer.weight,
+                layer.weight_scale,
+                input_,
+                0,
+                _OUTPUT_DTYPE_CODE[self.output_dtype],
+            )
         weight = F.embedding(input_, layer.weight)
         if self.tensorwise:
             # scalar-scale exports multiply in FP32 before rounding to the activation dtype

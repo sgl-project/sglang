@@ -14,8 +14,6 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     w4a8_int8_linear = None
 
-_OUTPUT_DTYPE_CODE = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
-
 
 def _register_weight(
     layer: torch.nn.Module,

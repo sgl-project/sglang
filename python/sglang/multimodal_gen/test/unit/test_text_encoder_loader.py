@@ -196,9 +196,7 @@ def test_comfy_scalar_embedding_matches_kitchen_kernel():
     )
     layer.weight_scale.data.fill_(0.0137)
     indices = torch.tensor([0, 63, 127, 0], device="cuda")
-    expected = torch.ops.comfy_kitchen.dequantize_int8_embedding(
-        layer.weight, layer.weight_scale, indices, 0, 2
-    )
+    expected = (layer.weight[indices].float() * layer.weight_scale).bfloat16()
     torch.testing.assert_close(
         method.embedding(layer, indices), expected, rtol=0, atol=0
     )
