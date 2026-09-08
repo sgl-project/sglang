@@ -79,9 +79,9 @@ class VDNH3Layout(msgspec.Struct, frozen=True):
     ``[text L | cond C | audio A | video V | pad P]``.
 
     ``used`` is ``cu_seqlens[1]``: rows at and past it are padding and sit
-    outside every attention mask. Text and audio rows are "global" for the
-    softmax branch (dense both ways); only the text rows seed the linear
-    branch's state.
+    outside every attention mask. Text, condition and audio rows are "global"
+    for the softmax branch (dense both ways); only the text rows seed the
+    linear branch's state.
     """
 
     seq_len: int

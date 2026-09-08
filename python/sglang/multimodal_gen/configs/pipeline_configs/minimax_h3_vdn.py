@@ -16,8 +16,8 @@ from sglang.multimodal_gen.runtime.platforms import (
 @dataclass
 class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
     """VDN-H3 (hybrid window-softmax + Video Delta linear attention, 8-NFE DMD2
-    distill, t2va only): the deployment envelope; the arch config comes from
-    the materialized ``transformer/config.json``."""
+    distill; t2va and fl2va on one fl2va partition): the deployment envelope;
+    the arch config comes from the materialized ``transformer/config.json``."""
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
@@ -29,9 +29,9 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         if server_args.model_variant is not None:
             raise ValueError(
-                "VDN-H3 ships one t2va weight partition; --model-variant does "
-                "not apply. FL2VA and Ref2VA tasks were not trained; use "
-                "MiniMaxAI/MiniMax-H3 for those."
+                "VDN-H3 ships one weight partition (fl2va, serving t2va and "
+                "fl2va); --model-variant does not apply. Ref2VA was not trained; "
+                "use MiniMaxAI/MiniMax-H3 --model-variant ref2va."
             )
         quantization = (server_args.quantization or "").lower()
         if quantization in ("none", "bf16"):
