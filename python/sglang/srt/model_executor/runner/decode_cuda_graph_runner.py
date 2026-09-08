@@ -724,14 +724,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 is_bs_supported and forward_batch.can_run_decode_cuda_graph
             )
 
-        # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
-        # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
-        # because the full_text_row_masked_out_mask tensor will always be ones
-        is_encoder_lens_supported = (
-            torch.all(forward_batch.encoder_lens > 0)
-            if self.is_encoder_decoder
-            else True
-        )
+        # NOTE: cuda graph cannot handle a mixed batch where some requests have
+        # an encoder (encoder_lens > 0) and some do not (encoder_lens = 0),
+        # because the cross-attention path differs. However, a batch where ALL
+        # requests are text-only (encoder_lens uniformly 0) is safe for graph
+        # replay: the graph was captured with cross-attention included, and at
+        # replay time full_text_row_masked_out_mask zeros the cross-attention
+        # output, making it equivalent to skipping. Allow graph replay when
+        # encoder lengths are uniformly zero or uniformly positive, but reject
+        # mixed batches.
+        if self.is_encoder_decoder:
+            encoder_lens = forward_batch.encoder_lens
+            is_encoder_lens_supported = bool(
+                (encoder_lens == 0).all() or (encoder_lens > 0).all()
+            )
+        else:
+            is_encoder_lens_supported = True
 
         is_tbo_supported = (
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
@@ -766,11 +774,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.can_run_decode_cuda_graph if self.require_mlp_sync else True
         )
 
-        is_encoder_lens_supported = (
-            torch.all(forward_batch.encoder_lens > 0)
-            if self.is_encoder_decoder
-            else True
-        )
+        if self.is_encoder_decoder:
+            encoder_lens = forward_batch.encoder_lens
+            is_encoder_lens_supported = bool(
+                (encoder_lens == 0).all() or (encoder_lens > 0).all()
+            )
+        else:
+            is_encoder_lens_supported = True
 
         capture_hidden_mode_matches = (
             forward_batch.capture_hidden_mode <= self.capture_hidden_mode
