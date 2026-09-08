@@ -106,8 +106,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 c.pp_prefetch_command_queue.put.assert_not_called()
                 c.pp_prefetch_command_queue.join.assert_not_called()
                 self.assertFalse(c.get_prefetch_submission("hit").decision)
-                self.assertIsNone(c.get_prefetch_submission("hit"))
+                self.assertFalse(c.get_prefetch_submission("hit").decision)
                 self.assertFalse(c.release_pp_prefetch("hit"))
+                self.assertIsNone(c.get_prefetch_submission("hit"))
 
     def test_query_failure_falls_back_to_miss(self):
         c = self.controller
@@ -161,6 +162,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.pp_prefetch_command_queue.put.assert_called_once()
         c.pp_prefetch_command_queue.join.assert_called_once_with()
         self.assertFalse(c.is_pp_prefetch_ready("hit"))
+        self.assertTrue(c.get_prefetch_submission("hit").decision)
         self.assertTrue(c.get_prefetch_submission("hit").decision)
 
     def test_duplicate_ticket_is_rejected_without_second_broadcast(self):
@@ -441,6 +443,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         state.ready_event = Mock(spec=threading.Event)
         self.assertIs(c.take_ready_pp_prefetch("hit"), state)
         state.ready_event.wait.assert_called_once_with()
+        self.assertIsNone(c.get_prefetch_submission("hit"))
         self.assertIsNone(c.take_ready_pp_prefetch("hit"))
         self.assertFalse(c.release_pp_prefetch("hit"))
         c.mem_pool_host.free.assert_not_called()
@@ -463,6 +466,9 @@ class TestPPTicketAdmission(unittest.TestCase):
         self.cache = cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.pp_rank = 1
         cache.cache_controller = Mock()
+        cache.cache_controller.pp_prefetch_state_lock = threading.Lock()
+        cache.cache_controller.pp_prefetch_decisions = {}
+        cache.bind_prefetch_ticket("hit")
         cache.buffer_pipeline = Mock()
         cache._all_reduce = Mock()
         cache.ongoing_prefetch = {}
@@ -473,9 +479,8 @@ class TestPPTicketAdmission(unittest.TestCase):
     def test_local_downstream_ready_cannot_admit_before_pp0(self):
         cache = self.cache
         cache.cache_controller.is_pp_prefetch_ready.return_value = True
-        self.assertFalse(
-            cache.check_prefetch_progress("hit", pp_prefetch_ticketed=True)
-        )
+        self.assertFalse(cache.check_prefetch_progress("hit"))
+        self.assertTrue(cache.cache_controller.pp_prefetch_decisions["hit"])
         self.assertEqual(cache._all_reduce.call_args.args[0].item(), 0)
         cache.cache_controller.is_pp_prefetch_ready.assert_not_called()
         cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
@@ -484,9 +489,8 @@ class TestPPTicketAdmission(unittest.TestCase):
         cache = self.cache
         cache.pp_rank = 0
         cache.cache_controller.is_pp_prefetch_ready.return_value = False
-        self.assertFalse(
-            cache.check_prefetch_progress("hit", pp_prefetch_ticketed=True)
-        )
+        self.assertFalse(cache.check_prefetch_progress("hit"))
+        self.assertTrue(cache.cache_controller.pp_prefetch_decisions["hit"])
         cache.cache_controller.is_pp_prefetch_ready.assert_called_once_with("hit")
         cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
 
@@ -500,7 +504,7 @@ class TestPPTicketAdmission(unittest.TestCase):
             ticket, operation
         )
         cache._all_reduce.side_effect = lambda tensor, _: tensor.fill_(1)
-        self.assertTrue(cache.check_prefetch_progress("hit", pp_prefetch_ticketed=True))
+        self.assertTrue(cache.check_prefetch_progress("hit"))
         cache.cache_controller.take_ready_pp_prefetch.assert_called_once_with("hit")
         cache.buffer_pipeline.set_prefix_ctx.assert_called_once_with(
             "hit",
@@ -516,6 +520,14 @@ class TestPPTicketAdmission(unittest.TestCase):
         tail = cache.cache_controller.append_host_mem_release.call_args.args[0]
         self.assertEqual(tail.tolist(), [4, 5, 6, 7])
         cache._handle_prefetch_result.assert_called_once_with(operation)
+
+    def test_miss_admission_clears_decision_without_collective(self):
+        cache = self.cache
+        cache.cache_controller.pp_prefetch_decisions["miss"] = False
+        self.assertTrue(cache.check_prefetch_progress("miss"))
+        self.assertNotIn("miss", cache.cache_controller.pp_prefetch_decisions)
+        cache._all_reduce.assert_not_called()
+        cache.cache_controller.take_ready_pp_prefetch.assert_not_called()
 
 
 if __name__ == "__main__":

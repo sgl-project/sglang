@@ -1002,7 +1002,6 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv = ReqKvInfo()
-        self.pp_prefetch_ticketed = False
 
         # Full-KV-derived boundary whose SWA window should be inserted after
         # the current prefill pass.

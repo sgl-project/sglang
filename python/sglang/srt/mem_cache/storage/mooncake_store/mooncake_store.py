@@ -455,9 +455,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     )
                     device_name = ""
             if self.config.standalone_storage:
-                if getattr(mem_pool, "kv_buffer", None) is not None and not isinstance(
-                    mem_pool.allocator, MooncakeHostTensorAllocator
-                ):
+                if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
                     raise RuntimeError(
                         "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
                         "Please set standalone_storage=False "

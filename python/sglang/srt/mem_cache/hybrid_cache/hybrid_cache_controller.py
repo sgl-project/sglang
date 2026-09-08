@@ -687,7 +687,7 @@ class HybridCacheController(BaseHiCacheController):
         with self.pp_prefetch_state_lock:
             if rid not in self.pp_prefetch_decisions:
                 return None
-            decision = self.pp_prefetch_decisions.pop(rid)
+            decision = self.pp_prefetch_decisions[rid]
         return PrefetchSubmission(decision=decision)
 
     def submit_prefetch(
@@ -878,6 +878,7 @@ class HybridCacheController(BaseHiCacheController):
             if self.pp_prefetch_states.get(rid) is not state:
                 return None
             self.pp_prefetch_states.pop(rid)
+            self.pp_prefetch_decisions.pop(rid, None)
             if (
                 state.operation.host_indices is None
                 or state.operation.completed_tokens == 0
