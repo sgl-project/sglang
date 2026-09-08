@@ -10,10 +10,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.arg_groups.model_override_base import (
+    ep_scale_joiner_of,
+    resolving_view,
+)
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_cp_group,
-    get_attn_cp_overlap_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
@@ -214,6 +217,21 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
+    def get_local_dp_buffer_mhc(
+        cls, group: GroupCoordinator, n: int = 1
+    ) -> torch.Tensor:
+        from sglang.srt.runtime_context import get_flags
+
+        dp = get_flags().dp
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
+            buffer = torch.empty(
+                (cls._local_dp_buffer_len, dp.buffer_hidden_size * n),
+                dtype=dp.buffer_dtype,
+                device=dp.buffer_device,
+            )
+        return buffer
+
+    @classmethod
     def get_global_dp_buffer_len(cls) -> int:
         return cls._global_dp_buffer_len
 
@@ -275,6 +293,10 @@ def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
 
 def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
     return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
+
+
+def get_local_dp_buffer_mhc(group: GroupCoordinator, n: int = 1) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer_mhc(group=group, n=n)
 
 
 def get_global_dp_buffer_len() -> int:
@@ -373,7 +395,12 @@ def initialize_dp_attention(
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
         _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
-        if server_args.is_ep_scale_joiner:
+        # Reads the resolution, not a bag: this runs under
+        # `initialize_dp_attention`, which the weight-cache daemon calls from
+        # `_init_distributed` -- and other callers reach it from processes
+        # whose publish is not guaranteed to have happened yet. (The daemon
+        # itself publishes first, at `daemon.py:284`, before `:320`.)
+        if ep_scale_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
     _DpGatheredBufferWrapper.set_metadata(
@@ -1017,14 +1044,6 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_group().all_gather_into_tensor(output, input)
-
-
-def attn_cp_overlap_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attn_cp_overlap_group().all_gather_into_tensor(output, input)
-
-
-def attn_cp_overlap_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attn_cp_overlap_group().reduce_scatter_tensor(output, input)
 
 
 def get_moe_cp_group() -> GroupCoordinator:

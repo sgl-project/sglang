@@ -56,7 +56,7 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
 )
 
-_EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
+_EVICTION_POLICY_FACTORIES: dict[str, Callable[..., EvictionStrategy]] = {
     "lru": LRUStrategy,
     "lfu": LFUStrategy,
     "fifo": FIFOStrategy,
@@ -67,15 +67,19 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
 }
 
 
-def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
+def get_eviction_strategy(
+    eviction_policy: str, config: Optional[dict[str, Any]] = None
+) -> EvictionStrategy:
+    """Build the eviction strategy; ``config`` is passed to it as keyword arguments."""
     policy = eviction_policy.lower()
     try:
-        return _EVICTION_POLICY_FACTORIES[policy]()
+        factory = _EVICTION_POLICY_FACTORIES[policy]
     except KeyError:
         supported = "', '".join(_EVICTION_POLICY_FACTORIES)
         raise ValueError(
             f"Unknown eviction policy: {policy}. Supported policies: '{supported}'."
         ) from None
+    return factory(**config) if config else factory()
 
 
 def maybe_init_custom_mem_pool(

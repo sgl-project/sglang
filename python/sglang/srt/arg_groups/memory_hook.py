@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +280,11 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
                 reserved_mem = max(reserved_mem, 10 * 1024)
             # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
             reserved_mem += reserve_for_deepep_a2a_mb(server_args)
+            # XPU: oneDNN allocates scratch space for matmul when
+            # M is not a power-of-2-aligned value (e.g. M=2100).  Reserve extra
+            # headroom so non-aligned prefill lengths don't hit OOM.
+            if get_platform().is_xpu:
+                reserved_mem += 2 * 1024
 
         mem_fraction_static = (
             round((gpu_mem - reserved_mem) / gpu_mem, 3)
