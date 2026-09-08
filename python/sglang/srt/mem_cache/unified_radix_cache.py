@@ -464,8 +464,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # State initialization
         if self.buffer_pipeline is not None:
-            self.cache_controller.host_write_staged_tokens_fn = (
-                lambda: self.buffer_pipeline.write_staged_tokens_
+            self.cache_controller.host_write_staged_tokens_fn = lambda: (
+                self.buffer_pipeline.write_staged_tokens_
             )
         self.write_through_threshold = (
             1 if get_memory().hicache_write_policy == "write_through" else 2
@@ -632,15 +632,6 @@ class UnifiedRadixCache(BasePrefixCache):
             available_size_targets=available_size_targets,
         )
 
-        return self._finish_eviction(tracker, start_time)
-
-    def _finish_eviction(
-        self,
-        tracker: dict[ComponentType, int],
-        start_time: float,
-    ) -> EvictResult:
-        """Finish write-back bookkeeping and build the public result."""
-
         if (
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
@@ -693,9 +684,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 return result.node_id, result.made_progress
 
             assert result.node_id is None
-            assert (
-                self.buffer_pipeline is None
-            ), "SWA write-back eviction barriers are cache-mode only"
+            assert self.buffer_pipeline is None, (
+                "SWA write-back eviction barriers are cache-mode only"
+            )
             written = self._execute_and_commit_kv_backup(
                 result.backup_kv, write_back=True
             )
@@ -1047,12 +1038,12 @@ class UnifiedRadixCache(BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert (
-            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        )
+        assert new_prefix_len <= len(new_indices), (
+            f"{new_prefix_len=}, {len(new_indices)=}"
+        )
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
@@ -1256,9 +1247,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     window_indices
                 )
             )
-            assert bool(
-                (swa_indices > 0).all()
-            ), f"unmapped SWA window positions for request {req.rid}"
+            assert bool((swa_indices > 0).all()), (
+                f"unmapped SWA window positions for request {req.rid}"
+            )
             swa_indices = self._pad_retraction_indices(swa_indices, self.page_size)
             component_transfers[ComponentType.SWA] = [
                 PoolTransfer(
@@ -2533,7 +2524,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
                     self.revoke_pending_prefetch(req_id)
                     return True
-            alloc_len = operation.storage_hit_count
+            alloc_len = hit_tokens
             if buffer_mode and not cc.can_fit_prefetch_host_buffers(
                 operation, alloc_len
             ):
@@ -2900,9 +2891,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
-        assert (
-            count_values[-2] == -count_values[-1]
-        ), "write_back duplicate-reclaim victims diverged across TP ranks"
+        assert count_values[-2] == -count_values[-1], (
+            "write_back duplicate-reclaim victims diverged across TP ranks"
+        )
         return (
             count_values[0],
             count_values[1],
@@ -2986,9 +2977,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
-            assert (
-                sync_tensor[1].item() == -sync_tensor[2].item()
-            ), "write_back duplicate-reclaim victims diverged across TP ranks"
+            assert sync_tensor[1].item() == -sync_tensor[2].item(), (
+                "write_back duplicate-reclaim victims diverged across TP ranks"
+            )
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)

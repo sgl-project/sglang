@@ -334,9 +334,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.num_pages = max_slots // self.pool_page_size
         # `min_page_index` = ceil(min_slot_index / pool_page_size), keeping the
         # reserved-sink invariant (min_page_index * entry_bytes_per_page >= entry_max).
-        assert (
-            virtual_num_pages is None or not is_id_owner
-        ), "only a non-owner allocator may use another pool's virtual-id space"
+        assert virtual_num_pages is None or not is_id_owner, (
+            "only a non-owner allocator may use another pool's virtual-id space"
+        )
         # An ID owner has one virtual page per physical page. A non-owner may
         # deliberately have a different physical capacity while indexing the
         # owner's virtual page space (the unified SWA allocator does this).
@@ -374,9 +374,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.high_peer: Optional[MultiEndedAllocator] = None
 
         # Inverse history of relocations (spec rollback), at PAGE granularity.
-        self._inverse_history: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
-            []
-        )
+        self._inverse_history: List[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
 
         # --- Lazy compaction state (all unused when lazy_compaction=False) ---
         # `_free_phys_pages`: GPU free list of physical PAGE ids, sorted at `_flush`.
@@ -1276,8 +1276,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """Release physical token slots reserved by :meth:`alloc_physical`."""
         if free_index is None or free_index.numel() == 0:
             return
-        physical_pages = torch.unique(
-            free_index.detach().to(torch.int64) // self.page_size
+        assert free_index.numel() % self.page_size == 0, (
+            f"MultiEndedAllocator({self.sub_pool_name!r}).free_physical: "
+            f"{free_index.numel()} tokens must contain whole pages of "
+            f"size {self.page_size}"
+        )
+        physical_pages = (
+            free_index.detach().to(torch.int64)[:: self.page_size] // self.page_size
         )
         if self.lazy_compaction:
             num_pages = int(physical_pages.shape[0])
@@ -1320,9 +1325,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         v2p stays -1 and translation yields negative ids → CUDA OOB.
         """
         with record_function("MultiEndedAlloc.alloc_extend"):
-            assert (
-                self.is_id_owner
-            ), f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
+            assert self.is_id_owner, (
+                f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
+            )
             if num_new_pages is None:
                 num_new_pages = get_num_new_pages(
                     seq_lens=seq_lens_cpu,
@@ -1384,9 +1389,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         virtual page on THIS sub-allocator (else v2p stays -1 → CUDA OOB).
         """
         with record_function("MultiEndedAlloc.alloc_decode"):
-            assert (
-                self.is_id_owner
-            ), f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
+            assert self.is_id_owner, (
+                f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
+            )
             bs = len(seq_lens)
             # CPU-only count BEFORE the kernel, to snapshot the exact slice the
             # kernel will consume.

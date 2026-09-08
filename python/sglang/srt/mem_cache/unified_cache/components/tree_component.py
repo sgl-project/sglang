@@ -511,9 +511,9 @@ class TreeComponent(ABC):
 
     def evict_device_start(self, request_cnt: int) -> None:
         """Begin this component's device-eviction walk (build its cursor/heap)."""
-        assert (
-            not self.is_evict_device_ongoing
-        ), f"{self.component_type} device eviction already in progress"
+        assert not self.is_evict_device_ongoing, (
+            f"{self.component_type} device eviction already in progress"
+        )
         assert self._evict_device_backup_node_id is None
         self._evict_device_start(request_cnt)
         self.is_evict_device_ongoing = True
@@ -529,16 +529,16 @@ class TreeComponent(ABC):
         Implementations must return after one allocator-relevant internal
         mutation so the caller can drain pending frees before continuing.
         """
-        assert (
-            self.is_evict_device_ongoing
-        ), f"{self.component_type} device eviction not started"
+        assert self.is_evict_device_ongoing, (
+            f"{self.component_type} device eviction not started"
+        )
         return self._evict_device_next_node(tracker, device_frees, host_frees)
 
     def evict_device_end(self) -> None:
         """Clear this component's device-eviction walk state."""
-        assert (
-            self.is_evict_device_ongoing
-        ), f"{self.component_type} device eviction not started"
+        assert self.is_evict_device_ongoing, (
+            f"{self.component_type} device eviction not started"
+        )
         self._evict_device_end()
         self.is_evict_device_ongoing = False
         self._evict_device_backup_node_id = None
