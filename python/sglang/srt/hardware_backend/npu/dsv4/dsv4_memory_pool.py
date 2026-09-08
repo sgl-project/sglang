@@ -393,12 +393,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
 
     def iter_kv_regions(self):
-        # The base region list would describe the packed CUDA-compat
-        # index_k_with_scale_buffer while the live data sits in the NPU-only
-        # index_k_buffer / index_scale_buffer, and the NPU pools are paged by
-        # kernel_page_size rather than the model page_size. Both would offload
-        # silently wrong rows, so keep NPU on the recompute path until the NPU
-        # regions are described explicitly.
+        # NPU keeps live index data in index_k_buffer / index_scale_buffer, not the
+        # packed index_k_with_scale_buffer the base regions describe, and pages by
+        # kernel_page_size rather than page_size; both would offload wrong rows.
         raise NotImplementedError(
             "DSV4 NPU pools do not support host offload; retracted requests "
             "recompute their prefix KV instead."

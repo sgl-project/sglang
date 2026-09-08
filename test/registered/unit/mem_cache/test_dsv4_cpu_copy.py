@@ -1,12 +1,7 @@
-"""Tests for DeepSeek-V4 host offload of a retracted request's KV + state.
+"""CPU-only tests for DeepSeek-V4 host offload of a retracted request's KV + state.
 
-CPU-only. ``_StubDSV4Pool`` supplies the buffers that
-``DeepSeekV4TokenToKVPool.iter_kv_regions`` reads, so the region wiring, the
-stride derivation and the full save/load round trip are covered without a GPU or
-a published runtime config. The device path is covered end to end by the PD
-decode retract tests.
-
-    python -m pytest test/registered/mem_cache/test_dsv4_cpu_copy.py -v
+``_StubDSV4Pool`` supplies the buffers ``iter_kv_regions`` reads, covering the
+region wiring, the stride derivation and the save/load round trip without a GPU.
 """
 
 import unittest
@@ -73,11 +68,9 @@ class _StubStatePool:
 class _StubDSV4Pool(DeepSeekV4TokenToKVPool):
     """Attribute-level fixture for the offload region wiring.
 
-    Deliberately skips ``DeepSeekV4TokenToKVPool.__init__``: the real buffers
-    need a GPU and ``get_ring_size`` reads the published spec namespace, while
-    ``iter_kv_regions`` only reads the attributes set here. This is also the
-    shape a sibling pool takes -- it overrides buffers and inherits
-    ``get_cpu_copy`` / ``load_cpu_copy`` unchanged.
+    Deliberately skips ``DeepSeekV4TokenToKVPool.__init__``: the real buffers need
+    a GPU and ``get_ring_size`` reads the published spec namespace, while
+    ``iter_kv_regions`` only reads the attributes set here.
     """
 
     def __init__(self, *, mapping: torch.Tensor, with_mtp_pending: bool = False):
@@ -255,8 +248,7 @@ class TestDSV4RoundTrip(unittest.TestCase):
     def test_row_counts_match_the_geometry(self):
         host = self.pool.get_cpu_copy(_indices(SAVE_START, SEQ_LEN), req_pool_index=1)
         # 600 tokens over a 256-token row -> 3 rows; the 512-token SWA tail -> 2
-        # pages; each SWA page carries one ring block of C4 state; offline C128
-        # state moves a whole 128-row block of the request's ring.
+        # pages, each carrying one C4 ring block; offline C128 state moves a block.
         self.assertEqual(host["c4_kv"][0][0].shape[0], 3)
         self.assertEqual(host["c128_kv"][0][0].shape[0], 3)
         self.assertEqual(host["c4_indexer_kv"][0][0].shape[0], 3)

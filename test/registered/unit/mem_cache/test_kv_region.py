@@ -1,10 +1,6 @@
-"""Tests for the model-agnostic KV region descriptors (host offload addressing).
-
-CPU-only: these exercise the four addressing schemes and the save/load engine on
-plain tensors, plus a cross-check that ``ReqScoped`` reproduces the row math the
+"""CPU-only tests for the KV region descriptors: the four addressing schemes, the
+save/load engine, and a cross-check that ``ReqScoped`` reproduces the row math the
 PD disaggregation path already uses for DSV4 C128 state.
-
-    python -m pytest test/registered/mem_cache/test_kv_region.py -v
 """
 
 import unittest
@@ -79,9 +75,8 @@ class TestSwaMapped(unittest.TestCase):
         self.assertEqual(rows.numel(), 0)
 
     def test_load_restores_only_pages_mapped_on_both_sides(self):
-        """Regression: a request retracted with three SWA pages live can resume
-        with only one still mapped -- the allocator's ring state decides, not
-        seq_len. The load side must restore the intersection and pick the
+        """A request retracted with three SWA pages live can resume with only one
+        still mapped; the load side must restore the intersection and pick the
         matching saved rows instead of assuming the counts agree."""
         save_side = SwaMapped(mapping=self._mapping(300), page_size=100)
         load_side = SwaMapped(mapping=self._mapping(500), page_size=100)
@@ -163,9 +158,8 @@ class TestReqScoped(unittest.TestCase):
         self.assertEqual(rows[0].item(), 2 * 256 + 128)
 
     def test_matches_pd_c128_state_indices(self):
-        """``get_dsv4_c128_state_indices`` returns a *block* index (the PD state
-        component's item is 128 rows offline, 1 row online); check the rows we
-        touch are exactly that block."""
+        """``get_dsv4_c128_state_indices`` returns a *block* index (128 rows
+        offline, 1 online); the rows we touch must be exactly that block."""
         from sglang.srt.disaggregation.utils import get_dsv4_c128_state_indices
 
         for req_pool_idx in (0, 3, 11):

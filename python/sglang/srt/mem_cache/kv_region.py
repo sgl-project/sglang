@@ -11,8 +11,6 @@ LoadPlan = Tuple[torch.Tensor, Optional[torch.Tensor]]
 
 
 class RequestCtx(msgspec.Struct, frozen=True):
-    """Addressing inputs for one request's save or load."""
-
     token_indices: torch.Tensor
     req_pool_idx: int
 
@@ -22,14 +20,9 @@ class RequestCtx(msgspec.Struct, frozen=True):
 
 
 class PageAligned(msgspec.Struct, frozen=True):
-    """Paged buffer whose single row holds ``stride`` consecutive logical tokens.
-
-    ``stride == compression_ratio * pool_page_size``: a compressed pool folds
-    ``ratio`` tokens into one entry and packs ``pool_page_size`` entries per row.
-
-    Sampling every ``stride``-th token instead of ``torch.unique`` keeps the row
-    count a function of ``seq_len`` alone, which is what makes save and load
-    positionally symmetric. Mirrors ``IndexKeyCache.cpu_copy``.
+    """Paged buffer whose row holds ``stride == compression_ratio * pool_page_size``
+    consecutive tokens. Sampling every ``stride``-th token keeps the row count a
+    function of ``seq_len`` alone, which is what makes save and load symmetric.
     """
 
     stride: int
@@ -48,11 +41,8 @@ class PageAligned(msgspec.Struct, frozen=True):
 def _swa_page_state(
     mapping: torch.Tensor, ctx: RequestCtx, page_size: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per *token page* of the request: its SWA page, and whether it is mapped.
-
-    One representative token per page block, so the result is indexed by page
-    ``k`` of the request on both the save and the load side regardless of how the
-    SWA ring happens to be laid out (it can wrap).
+    """Each token page's SWA page and whether it is mapped, keyed by page ``k`` of
+    the request so save and load agree however the ring is laid out (it can wrap).
     """
     representatives = ctx.token_indices[::page_size]
     swa_locs = mapping[representatives]
@@ -60,13 +50,10 @@ def _swa_page_state(
 
 
 class SwaMapped(msgspec.Struct, frozen=True):
-    """SWA ring pages reached through ``full_to_swa_index_mapping``.
-
-    Slot 0 is the reserved dummy slot: tail-only SWA allocation leaves
-    out-of-window tokens unmapped. Which token pages are mapped depends on the
-    allocator's ring state, so save and load can disagree; only pages mapped on
-    both sides are restored (a page unmapped at save time had already left the
-    window, and one unmapped at load time will not be read).
+    """SWA ring pages via ``full_to_swa_index_mapping``; slot 0 is the reserved
+    dummy for out-of-window tokens. Save and load can see different pages mapped,
+    so only both-mapped pages are restored -- one unmapped at save had already
+    left the window, one unmapped at load will not be read.
     """
 
     mapping: torch.Tensor
@@ -87,12 +74,9 @@ class SwaMapped(msgspec.Struct, frozen=True):
 
 
 class SwaPageRing(msgspec.Struct, frozen=True):
-    """Compress-state rows: one whole ``ring_size`` block per SWA page.
-
-    Matches ``CompressStatePool.translate_from_swa_loc_to_state_loc``, which maps
-    a SWA location to ``(swa_loc // swa_page_size) * ring_size + ...``; the ring
-    block moves as a unit because the live slot within it depends on positions
-    that resume rewrites. Mapped-page bookkeeping mirrors :class:`SwaMapped`.
+    """Compress-state rows: one whole ``ring_size`` block per SWA page, matching
+    ``CompressStatePool.translate_from_swa_loc_to_state_loc``. The block moves as
+    a unit: the live slot inside it depends on positions that resume rewrites.
     """
 
     mapping: torch.Tensor
@@ -117,14 +101,11 @@ class SwaPageRing(msgspec.Struct, frozen=True):
 
 
 class ReqScoped(msgspec.Struct, frozen=True):
-    """State addressed by ``req_pool_idx`` rather than by token location.
-
-    Each request slot owns ``rows_per_req`` consecutive rows. Those rows are
-    grouped into blocks of ``block_rows``; with ``block_tokens == 0`` the slot is
-    a single block, otherwise the block holding the sequence's live remainder is
-    selected. A sequence ending exactly on a ``block_tokens`` boundary owns no
-    partial state and yields no rows -- the same rule as
-    ``get_dsv4_c128_state_indices``, whose returned index counts whole blocks.
+    """State addressed by ``req_pool_idx``: each slot owns ``rows_per_req`` rows in
+    blocks of ``block_rows``. With ``block_tokens == 0`` the slot is one block;
+    otherwise the block holding the sequence's live remainder is selected, and a
+    sequence ending exactly on a ``block_tokens`` boundary owns no partial state
+    and yields no rows -- the same rule as ``get_dsv4_c128_state_indices``.
     """
 
     rows_per_req: int = 1
@@ -165,9 +146,8 @@ class KVRegion(msgspec.Struct, frozen=True):
     name: str
     tensors: tuple
     addressing: Addressing
-    # Called with req_pool_idx before loading, for state whose stale rows would
-    # otherwise leak into the resumed request (see DecodePreallocQueue's
-    # clear_c128_req_state call on the PD path).
+    # Called with req_pool_idx before loading; without it stale rows leak into the
+    # resumed request (see clear_c128_req_state on the PD path).
     reset_before_load: Optional[Callable[[int], None]] = None
 
 
@@ -194,8 +174,8 @@ def save_regions(*, regions: Iterable[KVRegion], ctx: RequestCtx) -> HostBlob:
 def load_regions(
     *, regions: Iterable[KVRegion], host: HostBlob, ctx: RequestCtx
 ) -> None:
-    """Write a :func:`save_regions` result back, using this request's *current*
-    token indices and req_pool_idx (both differ from the save side)."""
+    """Write a ``save_regions`` result back using this request's *current* token
+    indices and req_pool_idx, which both differ from the save side."""
     for region in regions:
         if region.reset_before_load is not None:
             region.reset_before_load(ctx.req_pool_idx)

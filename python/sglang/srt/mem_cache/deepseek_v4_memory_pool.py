@@ -901,12 +901,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     # ---- Host offload of one request's KV + compress state -----------------
 
     def iter_kv_regions(self) -> List[KVRegion]:
-        """Describe every buffer holding this model's per-request state, paired
-        with how to address it.
-
-        Single choke point for host offload: a subclass that changes buffer
-        layout or adds a compression kind overrides this and inherits
-        ``get_cpu_copy`` / ``load_cpu_copy`` unchanged.
+        """Every buffer holding per-request state, paired with how to address it.
+        A subclass that changes buffer layout overrides only this and inherits
+        ``get_cpu_copy`` / ``load_cpu_copy``.
         """
         if self._unified_kv:
             raise NotImplementedError(
@@ -1044,9 +1041,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 # A per-request ring of raw token states, cleared and addressed a
                 # whole 128-row block at a time (see clear_c128_req_state).
                 ring_size = self.get_ring_size(128)
-                assert (
-                    ring_size % 128 == 0
-                ), f"C128 ring_size must be 128-aligned, got {ring_size}"
+                assert ring_size % 128 == 0, (
+                    f"C128 ring_size must be 128-aligned, got {ring_size}"
+                )
                 addressing = ReqScoped(
                     rows_per_req=ring_size, block_rows=128, block_tokens=128
                 )
@@ -1221,9 +1218,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         compress_state_pool = self.compress_state_pools[layer_id]
-        assert (
-            compress_state_pool is not None
-        ), "Only c4/c128 layers have attention states."
+        assert compress_state_pool is not None, (
+            "Only c4/c128 layers have attention states."
+        )
         return compress_state_pool
 
     def get_online_c128_mtp_state_slot_offset(self) -> int:
@@ -1320,9 +1317,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
-        assert (
-            indexer_compress_state_pool is not None
-        ), "Only c4 layers have indexer states."
+        assert indexer_compress_state_pool is not None, (
+            "Only c4 layers have indexer states."
+        )
         return indexer_compress_state_pool
 
     def _swa_local_layer_id(self, layer_id: int) -> int:
