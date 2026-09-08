@@ -181,6 +181,10 @@ class SparDAKVPrefetcher:
         self._lock = threading.RLock()
         self._tickets: dict[tuple[str, int, int], PrefetchTicket] = {}
         self._latest_generation: dict[str, int] = {}
+        # Keep a tombstone for generations retired by request cleanup.  A
+        # resolver runs outside the runtime lock, so cleanup can race with a
+        # resolver that is about to return a transfer plan.
+        self._retired_generations: dict[str, int] = {}
         self._metrics = Counter()
 
     def prefetch_forecast(
@@ -206,10 +210,12 @@ class SparDAKVPrefetcher:
 
         with self._lock:
             latest = self._latest_generation.get(request_id)
-            if latest is not None and generation < latest:
+            if self._is_stale_generation_locked(request_id, generation):
                 self._metrics["stale_prediction"] += 1
                 return None
-            self._latest_generation[request_id] = max(generation, latest or 0)
+            self._latest_generation[request_id] = max(
+                generation, latest if latest is not None else -1
+            )
             key = (request_id, generation, layer_id)
             previous = self._tickets.get(key)
             if previous is not None:
@@ -247,7 +253,11 @@ class SparDAKVPrefetcher:
     def begin_request(self, request_id: str) -> int:
         """Start a new request generation and invalidate older tickets."""
         with self._lock:
-            generation = self._latest_generation.get(request_id, -1) + 1
+            generation = max(
+                self._latest_generation.get(request_id, -1),
+                self._retired_generations.get(request_id, -1),
+            ) + 1
+            self._retired_generations.pop(request_id, None)
             self.invalidate_generation(request_id, generation)
         return generation
 
@@ -304,7 +314,7 @@ class SparDAKVPrefetcher:
         key = (request_id, generation, layer_id)
         with self._lock:
             latest = self._latest_generation.get(request_id)
-            if latest is not None and generation < latest:
+            if self._is_stale_generation_locked(request_id, generation):
                 self._metrics["stale_prediction"] += 1
                 if resolved.lease is not None:
                     resolved.lease.release()
@@ -499,12 +509,30 @@ class SparDAKVPrefetcher:
             for ticket in tickets:
                 self._cancel_locked(ticket)
             if generation is None:
+                latest = self._latest_generation.get(request_id)
+                if latest is not None:
+                    self._retired_generations[request_id] = max(
+                        latest,
+                        self._retired_generations.get(request_id, -1),
+                    )
                 self._latest_generation.pop(request_id, None)
+            else:
+                self._retired_generations[request_id] = max(
+                    generation,
+                    self._retired_generations.get(request_id, -1),
+                )
+                latest = self._latest_generation.get(request_id)
+                if latest is not None and latest <= generation:
+                    self._latest_generation.pop(request_id, None)
 
     def cleanup_all(self) -> None:
         """Cancel every outstanding ticket before cache pools are reset."""
         with self._lock:
-            request_ids = {ticket.request_id for ticket in self._tickets.values()}
+            request_ids = (
+                {ticket.request_id for ticket in self._tickets.values()}
+                | set(self._latest_generation)
+                | set(self._retired_generations)
+            )
         for request_id in request_ids:
             self.cleanup_request(request_id)
 
@@ -513,9 +541,13 @@ class SparDAKVPrefetcher:
         if generation < 0:
             raise ValueError(f"generation must be non-negative, got {generation}")
         with self._lock:
+            retired = self._retired_generations.get(request_id)
+            if retired is not None and generation <= retired:
+                return
             current = self._latest_generation.get(request_id)
             if current is not None and generation < current:
                 return
+            self._retired_generations.pop(request_id, None)
             self._latest_generation[request_id] = generation
             for ticket in list(self._tickets.values()):
                 if ticket.request_id == request_id and ticket.generation < generation:
@@ -530,6 +562,13 @@ class SparDAKVPrefetcher:
         """Return tickets retained for an unfinished request."""
         with self._lock:
             return tuple(self._tickets.values())
+
+    def _is_stale_generation_locked(self, request_id: str, generation: int) -> bool:
+        latest = self._latest_generation.get(request_id)
+        if latest is not None and generation < latest:
+            return True
+        retired = self._retired_generations.get(request_id)
+        return retired is not None and generation <= retired
 
     def _cancel_locked(self, ticket: PrefetchTicket) -> bool:
         with ticket._lock:

@@ -158,6 +158,29 @@ class TestSparDAPrefetcher(CustomTestCase):
         self.assertEqual(len(prefetcher.active_tickets()), 1)
         self.assertEqual(prefetcher.active_tickets()[0].request_id, "request-b")
 
+    def test_cleanup_rejects_a_late_resolver_result(self):
+        engine = _TransferEngine()
+        releases = []
+        prefetcher = None
+
+        def resolve(*_args):
+            prefetcher.cleanup_request("request-a")
+            return ResolvedPrefetch(
+                transfers=(object(),),
+                layer_num=1,
+                lease=CallbackPageLease(lambda: releases.append(True)),
+            )
+
+        prefetcher = SparDAKVPrefetcher(
+            engine, CallbackPrefetchResolver(resolve)
+        )
+        ticket = prefetcher.prefetch_forecast("request-a", 0, 1, [4])
+
+        self.assertEqual(ticket.state, PrefetchTicketState.CANCELLED)
+        self.assertEqual(releases, [True])
+        self.assertEqual(prefetcher.active_tickets(), ())
+        self.assertEqual(prefetcher.begin_request("request-a"), 1)
+
     def test_forecast_query_and_missing_prediction_fallback(self):
         engine = _TransferEngine()
         observed = []
