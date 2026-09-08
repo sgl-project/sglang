@@ -203,7 +203,7 @@ class ServerArgs:
        registered manually in ``add_cli_args``:
 
        - **Deprecated flags** that redirect to another field via
-         ``DeprecatedAction`` / ``DeprecatedAliasStoreAction`` / etc.
+         ``DeprecatedStoreTrueAction``.
        - **Dynamic choices** computed at runtime (e.g. ``reasoning_parser``
          whose choices come from a plugin registry).
        - The ``--config`` meta-argument (not a dataclass field).
@@ -426,13 +426,8 @@ class ServerArgs:
         )
 
         # --- Deprecated argument registrations ---
-        # One alias is kept on purpose. The other seventeen were removed once
-        # their replacements had been in place long enough, and a reader who
-        # finds none at all has nothing to copy when the next flag is retired:
-        # `Deprecated*Action` plus `new_flag=` is the shape, and the warning
-        # naming the replacement is the part that matters. This one also earns
-        # its keep -- `disable_cuda_graph` is `no_cli=True`, so the deprecated
-        # spelling is its only command-line entry point.
+        # `disable_cuda_graph` is `no_cli=True`, so this deprecated spelling is
+        # its only command-line entry point.
         parser.add_argument(
             "--disable-cuda-graph",
             action=DeprecatedStoreTrueAction,
