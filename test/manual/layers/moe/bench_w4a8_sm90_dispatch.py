@@ -2,8 +2,8 @@
 
 Times ``cutlass_w4a8_moe`` (the full MoE-layer call: preprocess+reorder+quant,
 GEMM1, silu+requant, GEMM2, post-reorder) across GLM-5.2's two production
-sharding layouts, at the shapes ``dispatch_w4a8_moe_mm_sm90``
-(``python/sglang/kernels/aot/csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu:88``)
+sharding layouts, at the shapes ``try_dispatch_w4a8_moe_mm_h200``
+(``python/sglang/kernels/aot/csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu``)
 is tuned for -- hidden=6144, moe_intermediate_size=2048, E=256, topk=8:
 
 - **TP-8** (``mode="tp"``): all 256 experts present locally, the

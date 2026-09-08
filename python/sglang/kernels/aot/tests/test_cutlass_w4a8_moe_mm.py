@@ -163,10 +163,35 @@ def _per_tensor_quant_fp8(
     reason="cutlass_w4a8_moe_mm is only supported on sm90",
 )
 @pytest.mark.parametrize("batch_size", [2, 4, 8, 16, 32])
-@pytest.mark.parametrize("k", [256, 512, 1024, 2048, 4096, 6144, 7168])
-@pytest.mark.parametrize("n", [256, 512, 1024, 2048, 4096, 6144, 7168])
+@pytest.mark.parametrize("k", [256, 512, 1024, 2048, 4096, 7168])
+@pytest.mark.parametrize("n", [256, 512, 1024, 2048, 7168])
 @pytest.mark.parametrize("num_experts", [2, 4, 6, 8])
 def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts):
+    _check_int4_fp8_grouped_gemm(batch_size, k, n, num_experts)
+
+
+# M is the original token count; the kernel receives M * topk routed rows.
+_GLM_DISPATCH_CASES = [
+    (n, k, m)
+    for n, k, thresholds in (
+        (6144, 256, (256, 512, 4096)),
+        (512, 6144, (256, 2048)),
+        (4096, 6144, (256, 1024)),
+        (6144, 2048, (256, 1024)),
+    )
+    for m in [8]
+    + [value for threshold in thresholds for value in (threshold, threshold + 1)]
+]
+
+
+@pytest.mark.skipif(not is_hopper(), reason="Requires SM90")
+@pytest.mark.parametrize("n,k,m", _GLM_DISPATCH_CASES + [(1024, 512, 257)])
+def test_int4_fp8_grouped_gemm_dispatch_boundaries(n, k, m):
+    # Run on any Hopper GPU: H200 exercises the tuned table, others the fallback.
+    _check_int4_fp8_grouped_gemm(m * 8, k, n, num_experts=2)
+
+
+def _check_int4_fp8_grouped_gemm(batch_size, k, n, num_experts):
     torch.manual_seed(0)
     dtype = torch.bfloat16
     device = "cuda"
