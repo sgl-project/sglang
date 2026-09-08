@@ -810,6 +810,9 @@ class HiCacheController:
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
+        # Rejoin the D2H stream onto the current scheduler stream so subsequent
+        # forward work cannot overtake the backup. Event waits are host-asynchronous.
+        completion.finish_event.wait()
 
         self.ack_write_queue.append(
             HiCacheAck(
