@@ -198,7 +198,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         )
 
         def parser_with(**kwargs):
-            parser = argparse.ArgumentParser(exit_on_error=False)
+            parser = argparse.ArgumentParser()
             parser.add_argument("--old", **kwargs)
             return parser
 

@@ -607,12 +607,6 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     )
 
 
-# NOTE: The process-wide ServerArgs is owned by the runtime context
-# (sglang.srt.runtime_context). The two publish functions below are LEGACY
-# shims kept for the existing call-sites; they hand over the same live object
-# by reference. Do not add new call-sites. The third function is retired and
-# only raises.
-# Imports are in-function so the two modules stay cycle-free at import time.
 @functools.lru_cache(maxsize=1)
 def _underscore_field_names() -> frozenset:
     """Real dataclass fields whose names start with an underscore.
@@ -630,6 +624,12 @@ def _underscore_field_names() -> frozenset:
     )
 
 
+# NOTE: The process-wide ServerArgs is owned by the runtime context
+# (sglang.srt.runtime_context). The two publish functions below are LEGACY
+# shims kept for the existing call-sites; they hand over the same live object
+# by reference. Do not add new call-sites. The third function is retired and
+# only raises.
+# Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
     ``runtime_context.publish(server_args, role=...)`` in new code."""
