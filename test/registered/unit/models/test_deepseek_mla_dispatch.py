@@ -14,6 +14,11 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.layers.cp import base as cp_base
+from sglang.srt.layers.cp import utils as cp_utils
+from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.layers.utils import cp_utils as platform_cp_utils
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
@@ -93,6 +98,56 @@ class TestResolveRocmForwardMethod(CustomTestCase):
         with mock.patch.object(abh, "_is_hip", False):
             for method in AttnForwardMethod:
                 self.assertEqual(abh.resolve_rocm_forward_method(method), method)
+
+
+class TestCPMLADispatch(CustomTestCase):
+    def test_strategy_cp_uses_absorbed_mla_without_legacy_flags(self):
+        # Normal MHA writes rank-local KV against full out_cache_loc before
+        # the CP backend can gather it. Both one-shot and chunked MHA must
+        # therefore be bypassed for an active strategy-based CP batch.
+        attn = SimpleNamespace(
+            chunked_prefix_cache_threshold=0,
+            disable_chunked_prefix_cache=False,
+            flashinfer_mla_disable_ragged=False,
+        )
+        with (
+            mock.patch.object(abh, "_is_hip", False),
+            mock.patch.object(cp_utils, "enable_cp_v2", return_value=True),
+            mock.patch.object(cp_base, "_STRATEGY", ZigzagCPStrategy(cp_size=4)),
+            mock.patch.object(
+                platform_cp_utils,
+                "get_parallel",
+                return_value=SimpleNamespace(enable_prefill_context_parallel=False),
+            ),
+        ):
+            for prefix in (0, 32):
+                for capacity in (0, 8192):
+                    for num_tokens in (1, 3952):
+                        with self.subTest(
+                            prefix=prefix, capacity=capacity, num_tokens=num_tokens
+                        ):
+                            batch = SimpleNamespace(
+                                forward_mode=ForwardMode.EXTEND,
+                                input_ids=range(num_tokens),
+                                attn_cp_metadata=None,
+                                extend_prefix_lens_cpu=[prefix],
+                                extend_seq_lens_cpu=[num_tokens],
+                                seq_lens_cpu=[prefix + num_tokens],
+                                get_max_chunk_capacity=lambda: capacity,
+                            )
+                            expected = (
+                                AttnForwardMethod.MLA
+                                if num_tokens == 3952
+                                else (
+                                    AttnForwardMethod.MHA_ONE_SHOT
+                                    if capacity == 8192
+                                    else AttnForwardMethod.MHA_CHUNKED_KV
+                                )
+                            )
+                            self.assertEqual(
+                                abh._handle_attention_backend(attn, batch, "fa3"),
+                                expected,
+                            )
 
 
 if __name__ == "__main__":

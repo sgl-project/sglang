@@ -203,9 +203,7 @@ def _create_scheduler_actor(
         rank0_node_ip: IP of rank-0's node, used for NCCL rendezvous.
         dist_init_addr: Distributed init address (tcp://rank0_node_ip:nccl_port).
     """
-    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-        server_args, tp_rank
-    )
+    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(tp_rank)
 
     return SchedulerActor.options(
         num_cpus=0,

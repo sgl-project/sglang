@@ -4,14 +4,13 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_parallel,
     get_schedule,
     get_serving,
     get_spec,
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
-    mamba_extra_buffer_enabled,
-    mamba_extra_buffer_lazy_enabled,
     mamba_track_grid,
 )
 from sglang.srt.utils.common import (
@@ -2682,7 +2681,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.already_computed = seq_len
             req.is_retracted = False
 
-            if mamba_extra_buffer_enabled():
+            if get_exec().mamba.enable_mamba_extra_buffer:
                 track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
@@ -2787,7 +2786,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        if mamba_extra_buffer_enabled():
+        if get_exec().mamba.enable_mamba_extra_buffer:
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -2883,7 +2882,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # allocated yet; it will be allocated on demand at the track boundary
             # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
             req.kv.mamba_last_track_idx = req.kv.mamba_next_track_idx
-            if not mamba_extra_buffer_lazy_enabled():
+            if not get_exec().mamba.enable_mamba_extra_buffer_lazy:
                 req.kv.mamba_next_track_idx = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                         req.kv.mamba_next_track_idx
@@ -3398,7 +3397,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        if mamba_extra_buffer_enabled():
+        if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
             if len(self.reqs) == 0:
@@ -3407,7 +3406,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 self.mamba_track_buffer_indices = []
             else:
-                if mamba_extra_buffer_lazy_enabled():
+                if get_exec().mamba.enable_mamba_extra_buffer_lazy:
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 
