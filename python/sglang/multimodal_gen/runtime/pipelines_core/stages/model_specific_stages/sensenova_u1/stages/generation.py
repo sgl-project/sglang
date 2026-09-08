@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
+    DEFAULT_USE_PE,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -37,6 +38,7 @@ class SenseNovaU1GenerationOptions:
     cfg_interval: tuple[float, float] = DEFAULT_CFG_INTERVAL
     t_eps: float = DEFAULT_T_EPS
     think_mode: bool = DEFAULT_THINK_MODE
+    use_pe: bool = DEFAULT_USE_PE
 
     @classmethod
     def from_batch(cls, batch: Req) -> SenseNovaU1GenerationOptions:
@@ -50,6 +52,7 @@ class SenseNovaU1GenerationOptions:
             cfg_interval=tuple(extra.get("cfg_interval", DEFAULT_CFG_INTERVAL)),
             t_eps=float(extra.get("t_eps", DEFAULT_T_EPS)),
             think_mode=bool(extra.get("think_mode", DEFAULT_THINK_MODE)),
+            use_pe=bool(extra.get("use_pe", DEFAULT_USE_PE)),
         )
 
 
