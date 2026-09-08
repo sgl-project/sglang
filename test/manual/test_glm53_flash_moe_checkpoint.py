@@ -13,6 +13,7 @@ import struct
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -531,18 +532,23 @@ class TestGLM53FlashMoECheckpoint(CustomTestCase):
                     * norm.float()
                 ).bfloat16()
 
-                moe_input, h_res, h_post, norm_fused = mhc.hc_pre(
-                    residual_flat,
-                    fn,
-                    scale,
-                    bias,
-                    hc_mult=4,
-                    rms_eps=self.rms_eps,
-                    hc_eps=self.hc_eps,
-                    sinkhorn_iters=self.sinkhorn_iters,
-                    out_norm_weight=norm,
-                    out_norm_eps=self.rms_eps,
-                )
+                with patch.object(
+                    mhc.envs.SGLANG_OPT_USE_TILELANG_MHC_PRE,
+                    "get",
+                    return_value=False,
+                ):
+                    moe_input, h_res, h_post, norm_fused = mhc.hc_pre(
+                        residual_flat,
+                        fn,
+                        scale,
+                        bias,
+                        hc_mult=4,
+                        rms_eps=self.rms_eps,
+                        hc_eps=self.hc_eps,
+                        sinkhorn_iters=self.sinkhorn_iters,
+                        out_norm_weight=norm,
+                        out_norm_eps=self.rms_eps,
+                    )
                 if not norm_fused:
                     moe_input = (
                         moe_input.float()
@@ -576,13 +582,18 @@ class TestGLM53FlashMoECheckpoint(CustomTestCase):
                 joint_ref = mhc._mhc_post_torch(
                     moe_output_ref, residual, post_ref, comb_ref
                 ).reshape(2, 4 * self.hidden_size)
-                joint = mhc.hc_post(
-                    moe_output,
-                    residual_flat,
-                    h_post,
-                    h_res,
-                    hc_mult=4,
-                )
+                with patch.object(
+                    mhc.envs.SGLANG_OPT_USE_TILELANG_MHC_POST,
+                    "get",
+                    return_value=False,
+                ):
+                    joint = mhc.hc_post(
+                        moe_output,
+                        residual_flat,
+                        h_post,
+                        h_res,
+                        hc_mult=4,
+                    )
                 self.assertEqual(joint.shape, residual_flat.shape)
                 self.assertEqual(joint.dtype, torch.bfloat16)
                 self._assert_numerics(joint, joint_ref)
