@@ -2,7 +2,7 @@
 
 Balanced recipe (TP=4, DeepEP, EAGLE) plus --attn-cp-size=4 with the
 DSA prefill-CP interleave strategy. Split out of
-models_e2e/test_deepseek_v4_flash_fp4_b200.py so the `cp` group covers
+e2e/models/test_deepseek_v4_flash_fp4_b200.py so the `cp` group covers
 all context-parallel tests.
 
 Registry: extra-b-test-4-gpu-b200 (label-gated extra CI, 4x B200)
@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=235, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=689, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
