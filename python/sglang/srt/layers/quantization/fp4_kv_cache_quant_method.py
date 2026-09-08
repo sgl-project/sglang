@@ -924,9 +924,9 @@ _FP4_MX_SCALE = "fp4_mx_block16"
 _FP8_E4M3 = torch.float8_e4m3fn
 _TORCH_FP4 = getattr(torch, "float4_e2m1fn_x2", None)
 _BF16 = torch.bfloat16
-_NVFP4_DQ_PREFILL_BACKENDS = frozenset({"flashinfer"})
-_NVFP4_NATIVE_BACKENDS = frozenset({"trtllm_mha"})
-_NVFP4_DECODE_BACKENDS = frozenset({"trtllm_mha"})
+_NVFP4_DQ_KV_PREFILL_BACKENDS = frozenset({"flashinfer"})
+_NVFP4_KV_PREFILL_BACKENDS = frozenset({"trtllm_mha"})
+_NVFP4_KV_DECODE_BACKENDS = frozenset({"trtllm_mha"})
 _FP4_MX_MHA_BACKENDS = frozenset(
     {"triton", "torch_native", "flex_attention", "trtllm_mha"}
 )
@@ -999,9 +999,9 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_DECODE, _CPU_FP8_BACKENDS),
     ),
     NVFP4KVCacheMethod.name: (
-        _dq_workspace(_PREFILL, _NVFP4_DQ_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
-        _native_fp4(_PREFILL, _NVFP4_NATIVE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
-        _native_fp4(_DECODE, _NVFP4_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
+        _dq_workspace(_PREFILL, _NVFP4_DQ_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
+        _native_fp4(_PREFILL, _NVFP4_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
+        _native_fp4(_DECODE, _NVFP4_KV_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
     ),
     FP4MXBlock16KVCacheMethod.name: (
         _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),

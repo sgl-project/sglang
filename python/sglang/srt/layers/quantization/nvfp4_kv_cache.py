@@ -37,6 +37,13 @@ def nvfp4_v_scale_swizzle_indices(
 
     This small torch reference is intentionally device agnostic so the layout
     contract can be unit-tested without a GPU. ``scale_dim`` is head_dim / 16.
+
+    FlashInfer's ``nvfp4_block_scale_interleave`` is the 128x4 scale layout for
+    GEMM/MoE and is not this KV-cache layout. Its slot-mapping paged-KV append
+    writes linear V scales; its complete-cache conversion helper applies this
+    four-token permutation, but only while rewriting the whole cache. The kernel
+    below instead fuses the permutation with SGLang's incremental slot scatter
+    so it does not materialize another cache-sized scale tensor.
     """
     if scale_dim % 4 != 0:
         raise ValueError(f"NVFP4 scale_dim must be divisible by 4, got {scale_dim}.")
