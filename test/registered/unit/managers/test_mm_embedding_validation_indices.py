@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch  # noqa: E402
 from sglang.srt.managers.tp_worker import _mm_embedding_validation_indices  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.runtime_context import get_context  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -121,6 +122,7 @@ def test_batchless_worker_validation_respects_forward_mode(forward_mode, expecte
 )
 def test_disagg_prepare_merge_decode_lifecycle_skips_validation(multimodal_inputs):
     with (
+        get_context().override_server_args(tp_size=1),
         patch(
             "sglang.srt.disaggregation.decode_schedule_batch_mixin."
             "SamplingBatchInfo.from_schedule_batch",
@@ -132,10 +134,6 @@ def test_disagg_prepare_merge_decode_lifecycle_skips_validation(multimodal_input
         patch(
             "sglang.srt.managers.schedule_batch.alloc_for_decode",
             side_effect=lambda batch, **_kwargs: torch.arange(len(batch.reqs)),
-        ),
-        patch(
-            "sglang.srt.managers.schedule_batch.mamba_extra_buffer_enabled",
-            return_value=False,
         ),
     ):
         running_batch = _disagg_batch([_disagg_req(0, multimodal_inputs[0])])

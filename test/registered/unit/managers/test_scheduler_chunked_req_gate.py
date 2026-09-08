@@ -124,6 +124,7 @@ def _scheduler_for_raw_prefill(*, chunked_req, waiting_queue) -> Scheduler:
     s.min_free_slots_delayer = None
     s.get_num_allocatable_reqs = MagicMock(return_value=1)
     s.policy = MagicMock()
+    s.processed_tokens_counter = 0
     s.dynamic_chunk_sizer = None
     s.chunked_prefill_size = 8
     s.tp_worker = SimpleNamespace(

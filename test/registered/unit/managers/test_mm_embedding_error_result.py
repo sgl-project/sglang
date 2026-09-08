@@ -398,6 +398,7 @@ def test_run_batch_registers_validation_before_optional_early_send():
     send_kv_chunk = Mock()
     scheduler = SimpleNamespace(
         forward_ct=0,
+        processed_tokens_counter=0,
         metrics_reporter=Mock(),
         _sched_idled=False,
         scripted_scheduler_hook=None,
@@ -434,6 +435,7 @@ def test_run_batch_registers_validation_before_optional_early_send():
             is_split_prefill=lambda: False,
         ),
         reqs=[validation_req, plain_req],
+        extend_num_tokens=8,
         mm_embedding_validation_indices=lambda: [0],
         spec_algorithm=SimpleNamespace(is_none=lambda: True),
     )
@@ -476,8 +478,7 @@ def test_pp_disagg_prefill_drains_pending_abort_before_chunk_processing():
         running_mbs=[SimpleNamespace()],
         last_mbs=[None],
         ps=SimpleNamespace(pp_size=1),
-        request_receiver=SimpleNamespace(recv_requests=Mock(return_value=[])),
-        process_input_requests=Mock(),
+        ingest_requests=Mock(return_value=[]),
         pp_group=SimpleNamespace(is_last_rank=True),
         _pp_pd_get_bootstrapped_ids=Mock(return_value=[]),
         _pp_commit_comm_work=Mock(),
