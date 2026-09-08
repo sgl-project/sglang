@@ -855,6 +855,11 @@ def build_hybrid_mamba_swa_stack(
         full_layer_mapping | swa_layer_mapping | mamba_layer_mapping
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+    swa_indices_from_anchor_fn = (
+        params.token_to_kv_pool_allocator.bind_swa_for_loaded_rows
+        if get_memory().enable_unified_memory
+        else None
+    )
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
@@ -899,8 +904,18 @@ def build_hybrid_mamba_swa_stack(
             transfer_layer_num=transfer_layer_num,
             host_evict_fn=host_swa_evict_fn,
             device_evict_fn=device_swa_evict_fn,
-            device_alloc_fn=swa_attn_allocator.alloc,
-            device_free_fn=swa_attn_allocator.free,
+            # Unified pool: SWA rows are bound for the anchor's ids, not allocated.
+            device_alloc_fn=(
+                None
+                if swa_indices_from_anchor_fn is not None
+                else swa_attn_allocator.alloc
+            ),
+            device_free_fn=(
+                (lambda _indices: None)
+                if swa_indices_from_anchor_fn is not None
+                else swa_attn_allocator.free
+            ),
+            device_indices_from_anchor_fn=swa_indices_from_anchor_fn,
         ),
         build_pool_entry(
             name=PoolName.MAMBA,
