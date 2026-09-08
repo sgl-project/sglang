@@ -2358,6 +2358,42 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             num_tokens
         )
 
+    # The kv_age hooks run per matched / evicted node on the scheduler thread,
+    # so the label children are resolved once per label combination (a handful
+    # of series) instead of paying prometheus_client's labels() lookup each time.
+    def _kv_age_child(self, event: str, tier: str, outcome: str):
+        cache = self.__dict__.setdefault("_kv_age_children", {})
+        key = (event, tier, outcome)
+        child = cache.get(key)
+        if child is None:
+            child = cache[key] = self.kv_age_seconds.labels(
+                **self.labels, event=event, tier=tier, outcome=outcome
+            )
+        return child
+
+    def _kv_age_tokens_child(self, event: str, tier: str, outcome: str, age_le: str):
+        cache = self.__dict__.setdefault("_kv_age_tokens_children", {})
+        key = (event, tier, outcome, age_le)
+        child = cache.get(key)
+        if child is None:
+            child = cache[key] = self.kv_age_tokens.labels(
+                **self.labels, event=event, tier=tier, outcome=outcome, age_le=age_le
+            )
+        return child
+
+    def _kv_eviction_children(self, tier: str, outcome: str):
+        cache = self.__dict__.setdefault("_kv_eviction_children", {})
+        key = (tier, outcome)
+        pair = cache.get(key)
+        if pair is None:
+            pair = cache[key] = (
+                self.kv_lifetime_seconds.labels(
+                    **self.labels, tier=tier, outcome=outcome
+                ),
+                self.kv_reuses.labels(**self.labels, tier=tier, outcome=outcome),
+            )
+        return pair
+
     def observe_kv_age(
         self,
         age_seconds: float,
@@ -2366,16 +2402,10 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         tier: str,
         outcome: str,
     ) -> None:
-        self.kv_age_seconds.labels(
-            **self.labels, event=event, tier=tier, outcome=outcome
-        ).observe(age_seconds)
-        self.kv_age_tokens.labels(
-            **self.labels,
-            event=event,
-            tier=tier,
-            outcome=outcome,
-            age_le=kv_age_bucket(age_seconds),
-        ).inc(num_tokens)
+        self._kv_age_child(event, tier, outcome).observe(age_seconds)
+        self._kv_age_tokens_child(event, tier, outcome, kv_age_bucket(age_seconds)).inc(
+            num_tokens
+        )
 
     def observe_kv_eviction(
         self,
@@ -2389,10 +2419,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.observe_kv_age(
             age_seconds, num_tokens, event="evict", tier=tier, outcome=outcome
         )
-        self.kv_lifetime_seconds.labels(
-            **self.labels, tier=tier, outcome=outcome
-        ).observe(lifetime_seconds)
-        self.kv_reuses.labels(**self.labels, tier=tier, outcome=outcome).observe(reuses)
+        lifetime, reuses_h = self._kv_eviction_children(tier, outcome)
+        lifetime.observe(lifetime_seconds)
+        reuses_h.observe(reuses)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):
