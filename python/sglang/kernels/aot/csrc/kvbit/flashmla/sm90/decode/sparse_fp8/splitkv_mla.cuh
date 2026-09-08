@@ -178,7 +178,7 @@ KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams& par
         save_rPb_to_sP(rS, sS, idx_in_warpgroup);
         fence_view_async_shared();
         gemm<false, -1>(tiled_mma_PV, rS, thr_mma_PV.partition_fragment_B(sV), rO);
-        NamedBarrier(256, NamedBarriers::sScale_and_sS_ready).arrive_unaligned();
+        NamedBarrier(256, NamedBarriers::sScale_and_sS_ready).arrive_and_wait_unaligned();
         cute::warpgroup_wait<0>();
         plan.bar_k_avail[buf_idx].arrive();
       }
