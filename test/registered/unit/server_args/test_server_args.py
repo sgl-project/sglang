@@ -49,8 +49,6 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     handle_data_parallelism,
-    handle_legacy_cp_runtime_compatibility,
-    handle_platform_cp_compatibility,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import (
@@ -1026,13 +1024,9 @@ class TestContextParallelServerArgs(CustomTestCase):
     def _new_cp_args(self, **overrides):
         server_args = object.__new__(ServerArgs)
         defaults = dict(
-            enable_prefill_context_parallel=False,
-            enable_dsa_prefill_context_parallel=False,
             enable_prefill_cp=False,
             cp_strategy=None,
             model_path="instance://127.0.0.1:8000/dummy",
-            dsa_prefill_cp_mode="round-robin-split",
-            prefill_cp_mode="in-seq-split",
             attn_cp_size=1,
             tp_size=1,
             dp_size=1,
@@ -1075,52 +1069,11 @@ class TestContextParallelServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "DeepSeek V3.2.*interleave"):
             handle_context_parallelism(server_args)
 
-    @override_platform(is_hip=False, is_npu=False, is_musa=False)
-    def test_generic_canonical_cp_does_not_enable_platform_runtime_fields(self):
-        cases = (
-            (
-                "zigzag_mla_or_gqa",
-                "zigzag",
-                "fa3",
-            ),
-            (
-                "interleave_dsa",
-                "interleave",
-                "dsa",
-            ),
-        )
-
-        for name, strategy, backend in cases:
-            with self.subTest(name=name):
-                server_args = self._new_cp_args(
-                    enable_prefill_cp=True,
-                    cp_strategy=strategy,
-                    attention_backend=backend,
-                )
-
-                handle_platform_cp_compatibility(server_args)
-                handle_legacy_cp_runtime_compatibility(server_args)
-
-                self.assertFalse(
-                    resolution_result(server_args, "enable_prefill_context_parallel")
-                )
-                self.assertFalse(
-                    resolution_result(
-                        server_args, "enable_dsa_prefill_context_parallel"
-                    )
-                )
-
-    @override_platform(is_hip=False, is_npu=False, is_musa=False)
-    def test_non_platform_legacy_prefill_cp_is_rejected(self):
-        server_args = ServerArgs(
-            model_path="instance://127.0.0.1:8000/dummy",
-            enable_prefill_context_parallel=True,
-        )
-        with self.assertRaisesRegex(ValueError, "protected HIP, Ascend NPU, or MUSA"):
-            handle_platform_cp_compatibility(server_args)
-
     def test_generic_v1_cp_options_are_not_public_cli(self):
         removed_options = (
+            ("--enable-prefill-context-parallel", []),
+            ("--enable-nsa-prefill-context-parallel", []),
+            ("--nsa-prefill-cp-mode", ["round-robin-split"]),
             ("--enable-dsa-prefill-context-parallel", []),
             ("--dsa-prefill-cp-mode", ["round-robin-split"]),
             ("--prefill-cp-mode", ["in-seq-split"]),
@@ -1129,55 +1082,6 @@ class TestContextParallelServerArgs(CustomTestCase):
         for option, values in removed_options:
             with self.subTest(option=option), self.assertRaises(SystemExit):
                 self.parser.parse_args(["--model", "dummy", option, *values])
-
-    def test_npu_cp_compatibility_options_remain_public_cli(self):
-        args = self.parser.parse_args(
-            [
-                "--model",
-                "dummy",
-                "--enable-prefill-context-parallel",
-                "--enable-nsa-prefill-context-parallel",
-                "--nsa-prefill-cp-mode",
-                "round-robin-split",
-            ]
-        )
-
-        self.assertTrue(resolution_result(args, "enable_prefill_context_parallel"))
-        self.assertTrue(resolution_result(args, "enable_dsa_prefill_context_parallel"))
-        self.assertEqual(
-            resolution_result(args, "dsa_prefill_cp_mode"), "round-robin-split"
-        )
-
-    def test_platform_interleave_cp_mirrors_to_dsa_runtime_aliases(self):
-        for platform in ("is_hip", "is_npu", "is_musa"):
-            facts = dict(is_hip=False, is_npu=False, is_musa=False)
-            facts[platform] = True
-            with self.subTest(platform=platform), override_platform(**facts):
-                server_args = self._new_cp_args(
-                    enable_prefill_cp=True,
-                    cp_strategy="interleave",
-                    attention_backend="dsa",
-                )
-
-                handle_legacy_cp_runtime_compatibility(server_args)
-                handle_context_parallelism(server_args)
-
-                self.assertTrue(
-                    resolution_result(
-                        server_args, "enable_dsa_prefill_context_parallel"
-                    )
-                )
-                self.assertFalse(
-                    resolution_result(server_args, "enable_prefill_context_parallel")
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "dsa_prefill_cp_mode"),
-                    "round-robin-split",
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "prefill_cp_mode"),
-                    "round-robin-split",
-                )
 
     def test_context_parallel_handler_initializes_cp_strategy(self):
         server_args = self._new_cp_args(
