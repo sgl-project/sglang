@@ -1268,14 +1268,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.kv_events.record_store(node, medium=StorageMedium.GPU)
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
-        """Update both device and host leaf sets for a node."""
+        """Update both device and host leaf sets for a node. Additions also
+        feed the full component's persistent eviction heaps; removals are
+        handled lazily at pop time."""
+        full = self.components_by_type[BASE_COMPONENT_TYPE]
         if self._is_device_leaf(node):
-            self.evictable_device_leaves.add(node)
+            if node not in self.evictable_device_leaves:
+                self.evictable_device_leaves.add(node)
+                full.on_evictable_leaf_added(node, EvictLayer.DEVICE)
         else:
             self.evictable_device_leaves.discard(node)
 
         if self._is_host_leaf(node):
-            self.evictable_host_leaves.add(node)
+            if node not in self.evictable_host_leaves:
+                self.evictable_host_leaves.add(node)
+                full.on_evictable_leaf_added(node, EvictLayer.HOST)
         else:
             self.evictable_host_leaves.discard(node)
 
