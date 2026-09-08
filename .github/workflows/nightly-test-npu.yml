@@ -326,7 +326,10 @@ jobs:
 
   nightly-acc-16-npu-a5:
     name: nightly-acc-16-npu-a5
-    if: ${{ !cancelled() }}
+    # Disabled: a5 nightly image (cann9.1.0-950-nightly) lacks the
+    # kv_compress_epilog op in its sgl-kernel-npu (< 2026.9.0), so DSV4 decode
+    # graph capture crashes. Re-enable after the image is rebuilt.
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -343,8 +346,6 @@ jobs:
   # Suites suffixed with `-cann910` run against the CANN 9.1.0 image.
   nightly-perf-16-npu-a3-cann910:
     name: nightly-perf-16-npu-a3-cann910
-    # Disabled: only run the new a5 accuracy testcase.
-    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -361,8 +362,6 @@ jobs:
 
   nightly-acc-16-npu-a3-cann910:
     name: nightly-acc-16-npu-a3-cann910
-    # Disabled: only run the new a5 accuracy testcase.
-    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -426,10 +425,10 @@ jobs:
   
   nightly-poc-multi-node-tests-cann910:
     name: multi-node-poc-cann910
-    # Disabled: only run the new a5 accuracy testcase.
-    if: ${{ false }}
-    # Multi-node jobs run strictly one at a time to avoid contending for the
-    # same A3 multi-node resources: 9.0.0 multi -> 9.0.0 mix -> cann910 multi -> cann910 mix.
+    # Upstream 9.0.0 multi-node jobs are currently disabled (skipped), so use
+    # !cancelled() to let this job still run; keeps serial execution with the
+    # mix-tests-cann910 job below to avoid A3 multi-node resource contention.
+    if: ${{ !cancelled() }}
     needs: [set-image-config, nightly-poc-multi-node-tests, nightly-poc-multi-node-mix-tests]
     strategy:
       fail-fast: false
@@ -494,7 +493,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests-cann910:
     name: multi-node-mix-poc-cann910
-    if: ${{ false }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config, nightly-poc-multi-node-tests-cann910]
     strategy:
       fail-fast: false
