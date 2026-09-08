@@ -62,13 +62,14 @@ sglang serve \
   --num-gpus 1
 ```
 
-With `--performance-mode auto`, a Cosmos3 checkpoint keeps its DiT and VAE
-resident when every selected GPU has at least 120 GiB available at startup.
-Below that threshold, auto mode retains the conservative DiT
-component-offload policy. Cosmos3 runs one DiT per pipeline, so component
-offload above the threshold only pays to copy the weights out to host memory
-and back on every request. Serve `Cosmos3-Super` across multiple GPUs as
-shown below so each rank holds a shard of the weights.
+With `--performance-mode auto`, Cosmos3 Nano keeps its DiT and VAE resident
+when every selected GPU has at least 90 GiB available at startup. Other
+Cosmos3 checkpoints use a 120 GiB threshold. Below the applicable threshold,
+auto mode retains the conservative DiT component-offload policy. Cosmos3 runs
+one DiT per pipeline, so component offload above the threshold only pays to
+copy the weights out to host memory and back on every request. Serve
+`Cosmos3-Super` across multiple GPUs as shown below so each rank holds a shard
+of the weights.
 
 For `Cosmos3-Super`, split the model across multiple GPUs:
 

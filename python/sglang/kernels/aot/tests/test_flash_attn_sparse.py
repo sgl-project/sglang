@@ -251,12 +251,14 @@ def test_sparse_attention(
 
     ref_out, ref_lse = ref_attn(q, k, v)
 
-    torch.testing.assert_close(
-        out, ref_out, atol=2e-2, rtol=1e-2
-    ), f"{torch.max(torch.abs(out - ref_out))}"
-    torch.testing.assert_close(
-        lse, ref_lse, atol=2e-2, rtol=1e-2
-    ), f"{torch.max(torch.abs(lse - ref_lse))}"
+    (
+        torch.testing.assert_close(out, ref_out, atol=2e-2, rtol=1e-2),
+        f"{torch.max(torch.abs(out - ref_out))}",
+    )
+    (
+        torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2),
+        f"{torch.max(torch.abs(lse - ref_lse))}",
+    )
 
 
 # sparse attention utils

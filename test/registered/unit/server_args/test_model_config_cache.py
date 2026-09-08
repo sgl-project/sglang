@@ -1,4 +1,4 @@
-"""`get_model_config()` caches, and the key is the path the record carried.
+"""`model_config_of()` caches, and the key is the path the record carried.
 
 Two movements of a `model_path` reach this cache, and only the first one means
 the cached configuration describes the wrong checkpoint:
@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.arg_groups.overrides import declare_resolution, model_config_of
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
@@ -117,7 +118,7 @@ class TestTheModelConfigCache(CustomTestCase):
         self.assertEqual(server_args.model_path, _OBJECT_STORE_URI)
         self.assertEqual(cached.model_path, pulled)
 
-        self.assertIs(server_args.get_model_config(), cached)
+        self.assertIs(model_config_of(server_args), cached)
 
     def test_a_declared_model_path_rebuilds_the_configuration(self):
         """The GGUF and ModelScope shape: the record's own path moved."""
@@ -125,14 +126,15 @@ class TestTheModelConfigCache(CustomTestCase):
         second_checkpoint = self._checkpoint()
 
         server_args = ServerArgs(model_path=first_checkpoint, device="cuda")
-        first = server_args.get_model_config()
+        first = model_config_of(server_args)
         self.assertEqual(first.model_path, first_checkpoint)
 
-        server_args._declare(
+        declare_resolution(
+            server_args,
             "test_a_declared_model_path_rebuilds_the_configuration",
             model_path=second_checkpoint,
         )
-        second = server_args.get_model_config()
+        second = model_config_of(server_args)
         self.assertIsNot(second, first)
         self.assertEqual(second.model_path, second_checkpoint)
 
@@ -151,11 +153,11 @@ class TestTheModelConfigCache(CustomTestCase):
             model_path=second_checkpoint,
         )
 
-        rebuilt = copy_.get_model_config()
+        rebuilt = model_config_of(copy_)
         self.assertEqual(rebuilt.model_path, second_checkpoint)
-        self.assertIs(copy_.get_model_config(), rebuilt)
+        self.assertIs(model_config_of(copy_), rebuilt)
         # The parent keeps the configuration it resolved with.
-        self.assertEqual(server_args.get_model_config().model_path, first_checkpoint)
+        self.assertEqual(model_config_of(server_args).model_path, first_checkpoint)
 
     def test_a_supplied_configuration_is_handed_back(self):
         """A configuration nothing in here built carries no key, so nothing
@@ -164,7 +166,7 @@ class TestTheModelConfigCache(CustomTestCase):
         stand_in = SimpleNamespace(model_path="somewhere/else")
         server_args._model_config = stand_in
 
-        self.assertIs(server_args.get_model_config(), stand_in)
+        self.assertIs(model_config_of(server_args), stand_in)
 
 
 if __name__ == "__main__":
