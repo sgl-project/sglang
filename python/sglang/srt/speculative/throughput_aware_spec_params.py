@@ -265,13 +265,14 @@ def format_score_rows(rows: list[dict], best_steps: int) -> str:
         expected = row["expected"]
         cost_ms = row["cost_ms"]
         score = row["score"]
-        marker = "★" if s == best_steps else ""
+        marker = " (best)" if s == best_steps else ""
         if score is not None:
             parts.append(
-                f"S={s}:E={expected:.2f}/cost={cost_ms:.1f}ms→{score:.4f}{marker}"
+                f"S={s}: expected={expected:.2f}, cost={cost_ms:.1f}ms, "
+                f"score={score:.4f}{marker}"
             )
         elif expected is not None:
-            parts.append(f"S={s}:E={expected:.2f}/cost=?{marker}")
+            parts.append(f"S={s}: expected={expected:.2f}, cost=?, score=?{marker}")
         else:
-            parts.append(f"S={s}:?{marker}")
-    return "[" + ", ".join(parts) + "]"
+            parts.append(f"S={s}: unavailable{marker}")
+    return "[" + " | ".join(parts) + "]"
