@@ -17,6 +17,8 @@ class _FakeAllocator:
         self.freed = []
 
     def free(self, indices):
+        if indices.numel() == 0:
+            return
         self.freed.append(indices.detach().cpu().tolist())
 
 
