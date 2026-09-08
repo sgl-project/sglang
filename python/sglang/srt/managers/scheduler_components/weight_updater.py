@@ -423,9 +423,13 @@ class SchedulerWeightUpdaterManager:
             run_post_load = not self._weight_update_loaded
             for _, runner in self.get_model_runners(self._weight_update_selector):
                 runner.end_weight_update(run_post_load=run_post_load)
-        success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
+        if recv_req.abort:
+            self._lora_stash = {}
+            success, message = True, "Aborted: streamed adapters discarded"
+        else:
+            success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
         self._weight_update_in_progress = False
-        if success:
+        if success and not recv_req.abort:
             self.record_weight_version_after_update(self._weight_update_pending_version)
         self._weight_update_pending_version = None
         torch.distributed.barrier(group=self.tp_cpu_group)

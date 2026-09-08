@@ -490,14 +490,72 @@ class TokenizerControlMixin:
         obj: EndWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        pending = dict(self._pending_lora_publications)
+        if pending and not obj.abort:
+            # Fail closed: a deferred publication commits only under a full
+            # checksum manifest — without one a lost bucket would publish a
+            # silently incomplete adapter.
+            missing = set(pending) - set(obj.expected_lora_checksums or {})
+            if missing:
+                obj.abort = True
+                await self._weight_update_session_call(
+                    self.end_weight_update_communicator, obj
+                )
+                self._weight_update_session_open = False
+                self._weight_update_pending_version = None
+                await self._discard_pending_publications()
+                return False, (
+                    f"deferred adapters {sorted(missing)} have no checksum "
+                    "manifest; session aborted"
+                )
         success, message = await self._weight_update_session_call(
             self.end_weight_update_communicator, obj
         )
         self._weight_update_session_open = False
-        if success:
+        if success and not obj.abort:
             self._update_weight_version_if_provided(self._weight_update_pending_version)
         self._weight_update_pending_version = None
+        if obj.abort or not success:
+            await self._discard_pending_publications()
+        elif pending:
+            await self._publish_pending_adapters()
         return success, message
+
+    async def _discard_pending_publications(self: TokenizerManager) -> None:
+        """Drop deferred publications after an aborted or failed session: the
+        names never reached the serving registry, but the backends hold their
+        zeroed identities and must forget them."""
+        pending, self._pending_lora_publications = self._pending_lora_publications, {}
+        async with self.lora_update_lock:
+            for ref in pending.values():
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(
+                        UnloadLoRAAdapterReqInput(
+                            lora_name=ref.lora_name, lora_id=ref.lora_id
+                        )
+                    )
+                )
+                if not result.success:
+                    logger.warning(
+                        "Failed to discard unpublished LoRA adapter %r: %s",
+                        ref.lora_name,
+                        result.error_message,
+                    )
+
+    async def _publish_pending_adapters(self: TokenizerManager) -> None:
+        """Commit deferred publications: the session applied and verified their
+        weights, so the names become servable atomically here."""
+        pending, self._pending_lora_publications = self._pending_lora_publications, {}
+        async with self.lora_update_lock:
+            for name, ref in pending.items():
+                await self.lora_registry.register(ref)
+                self.lora_ref_cache[name] = ref
+            try:
+                await self._evict_lru_over_cap()
+            except ValueError:
+                # The publish is already committed; an unevictable over-cap
+                # pool is a capacity problem, not a publication failure.
+                logger.exception("LRU eviction after LoRA publication failed")
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
@@ -694,35 +752,8 @@ class TokenizerControlMixin:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
 
-                if self.server_args.max_loaded_loras is not None:
-                    while (
-                        self.lora_registry.num_registered_loras
-                        > self.server_args.max_loaded_loras
-                    ):
-                        lru_lora_name = await self.lora_registry.lru_lora_name(
-                            exclude_pinned=True
-                        )
-                        if lru_lora_name is None:
-                            raise ValueError(
-                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
-                                f"LoRA registry is: {self.lora_registry._registry}"
-                            )
-
-                        logger.info(
-                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
-                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {self.server_args.max_loaded_loras})"
-                        )
-
-                        unload_result = await self._unload_lora_adapter_locked(
-                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
-                        )
-                        if not unload_result.success:
-                            raise ValueError(
-                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
-                                f"{unload_result.error_message}"
-                            )
-                        del result.loaded_adapters[lru_lora_name]
+                for evicted in await self._evict_lru_over_cap():
+                    del result.loaded_adapters[evicted]
 
                 return result
         except ValueError as e:
@@ -730,6 +761,40 @@ class TokenizerControlMixin:
                 success=False,
                 error_message=str(e),
             )
+
+    async def _evict_lru_over_cap(self: TokenizerManager) -> list:
+        """Unload LRU adapters until the registry is back under
+        --max-loaded-loras; returns the evicted names. Caller must hold
+        lora_update_lock."""
+        evicted = []
+        if self.server_args.max_loaded_loras is None:
+            return evicted
+        while (
+            self.lora_registry.num_registered_loras > self.server_args.max_loaded_loras
+        ):
+            lru_lora_name = await self.lora_registry.lru_lora_name(exclude_pinned=True)
+            if lru_lora_name is None:
+                raise ValueError(
+                    "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
+                    f"LoRA registry is: {self.lora_registry._registry}"
+                )
+
+            logger.info(
+                f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
+                f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
+                f"max allowed: {self.server_args.max_loaded_loras})"
+            )
+
+            unload_result = await self._unload_lora_adapter_locked(
+                UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
+            )
+            if not unload_result.success:
+                raise ValueError(
+                    f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
+                    f"{unload_result.error_message}"
+                )
+            evicted.append(lru_lora_name)
+        return evicted
 
     def _validate_lora_upsert_supported(self: TokenizerManager) -> None:
         """Upsert resolves lora_name -> lora_id through this process's registry.
@@ -770,19 +835,34 @@ class TokenizerControlMixin:
                 )
             async with self.lora_update_lock:
                 self._validate_lora_upsert_supported()
-                new_adapter, reused = await self.lora_registry.register_or_reuse(
-                    LoRARef(
-                        lora_name=obj.lora_name,
-                        lora_path="__stream__",
-                        pinned=obj.pinned,
-                        reloadable=False,
-                    ),
-                    upsert=True,
+                ref = LoRARef(
+                    lora_name=obj.lora_name,
+                    lora_path=obj.lora_path or "__stream__",
+                    pinned=obj.pinned,
+                    reloadable=obj.lora_path is not None,
                 )
+                if obj.defer_publish:
+                    if (
+                        await self.lora_registry.get_lora_id(obj.lora_name) is not None
+                        or obj.lora_name in self._pending_lora_publications
+                    ):
+                        raise ValueError(
+                            f"defer_publish requires a fresh adapter name, but "
+                            f"'{obj.lora_name}' is already registered or pending "
+                            "publication: a published name has readers and must "
+                            "not be staged over."
+                        )
+                    new_adapter, reused = ref, False
+                else:
+                    new_adapter, reused = await self.lora_registry.register_or_reuse(
+                        ref, upsert=True
+                    )
                 # No path to reload a streamed adapter from: eviction would lose the
-                # only engine-side copy, so the cap rejects new names instead.
+                # only engine-side copy, so the cap rejects new non-reloadable names
+                # instead. Reloadable names resolve over-cap by LRU eviction.
                 if (
                     not reused
+                    and not new_adapter.reloadable
                     and self.server_args.max_loaded_loras is not None
                     and self.lora_registry.num_registered_loras
                     >= self.server_args.max_loaded_loras
@@ -800,11 +880,15 @@ class TokenizerControlMixin:
                 )
 
                 if result.success:
-                    if reused:
-                        await self.lora_registry.refresh(new_adapter)
+                    if obj.defer_publish:
+                        self._pending_lora_publications[obj.lora_name] = new_adapter
                     else:
-                        await self.lora_registry.register(new_adapter)
-                    self.lora_ref_cache[obj.lora_name] = new_adapter
+                        if reused:
+                            await self.lora_registry.refresh(new_adapter)
+                        else:
+                            await self.lora_registry.register(new_adapter)
+                        self.lora_ref_cache[obj.lora_name] = new_adapter
+                        await self._evict_lru_over_cap()
                 return result
         except ValueError as e:
             return RegisterLoRAAdapterReqOutput(

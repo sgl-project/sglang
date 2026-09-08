@@ -2049,6 +2049,10 @@ class EndWeightUpdateReqInput(BaseReq, kw_only=True):
     # {lora_name: {hf_key: sha256}}; when set, each stashed adapter is verified
     # (set equality + per-tensor checksum) before it is applied.
     expected_lora_checksums: Optional[Dict[str, Dict[str, str]]] = None
+    # Discard the streamed LoRA stash instead of applying it, and drop any
+    # deferred publications. Base tensors already written in place this session
+    # are not rolled back.
+    abort: bool = False
 
 
 class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2373,13 +2377,21 @@ class RegisterLoRAAdapterReqInput(BaseReq, kw_only=True):
     # and pinning every slot would trip the anti-starvation check.
     pinned: bool = False
     lora_id: Optional[str] = None
+    # Disk artifact holding the same adapter (PEFT dir). With a path the
+    # adapter is reloadable: it may be LRU-evicted and refilled from disk.
+    lora_path: Optional[str] = None
+    # Keep the name out of the serving registry until end_weight_update
+    # commits the session that streams its weights. Fresh names only: a
+    # published name has readers and must not be staged over.
+    defer_publish: bool = False
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
             lora_id=self.lora_id,
             lora_name=self.lora_name,
-            lora_path="__stream__",
+            lora_path=self.lora_path or "__stream__",
             pinned=self.pinned,
+            reloadable=self.lora_path is not None,
         )
 
 

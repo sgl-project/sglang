@@ -676,6 +676,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if get_lora().lora_paths is not None:
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
+        # Adapters registered with defer_publish, keyed by name: their backends
+        # hold zeroed identities, but the names stay out of the serving registry
+        # until end_weight_update commits the session that streams their weights.
+        self._pending_lora_publications: Dict[str, LoRARef] = {}
 
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
