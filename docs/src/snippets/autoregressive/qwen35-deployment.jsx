@@ -458,6 +458,17 @@ export const Qwen35Deployment = () => {
       cmd += ` \\\n  --attention-backend flashinfer`;
     }
 
+    // FP8 on Blackwell routes GDN (linear attention) prefill through FlashInfer.
+    // SGLang auto-selects this only inside a narrow validated domain
+    // (gdn_backend.flashinfer_gdn_prefill_default: chunked-prefill-size <= 8192
+    // and a bf16 mamba state pool, among others), which these FP8 recipes fall
+    // outside of, so the override is explicit. The SM100 kernel takes the fp32
+    // state pool directly; it does require CUDA 13+ (SGLang errors at startup
+    // otherwise) and flashinfer >= 0.6.14.
+    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8') {
+      cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
+    }
+
     // FP8 MoE on Blackwell runs the trtllm-gen fused MoE. This is not a default:
     // the auto-promotion to flashinfer_trtllm in arg_groups/overrides.py is gated
     // to the DeepSeek arch family, and Fp8MoEMethod.create_moe_runner resolves
