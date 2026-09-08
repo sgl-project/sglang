@@ -224,7 +224,7 @@ The import check validates packaging and binary loading, but not communication c
 python3 DeepEP-source/tests/elastic/test_ep.py --num-processes 8
 ```
 
-Adjust `--num-processes` to the available GPUs and run the internode or low-latency tests when those transports changed. After local validation, ask the SGLang team to run the [sgl-deep-ep release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepep.yml) with the new version, CUDA target, and packaging ref. After verifying the published wheels for the supported Python versions and architectures, update the `sgl-deep-ep` pin in `python/pyproject.toml` before landing dependent SGLang changes.
+Adjust `--num-processes` to the available GPUs and run the internode or low-latency tests when those transports changed. After local validation, ask the SGLang team to run the [sgl-deep-ep release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepep.yml) with the new version and packaging ref. After verifying the published wheels for the supported Python versions and architectures, update the `sgl-deep-ep` pin in `python/pyproject.toml` before landing dependent SGLang changes.
 
 ## Tips for newcomers
 
