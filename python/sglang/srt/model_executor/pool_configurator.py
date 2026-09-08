@@ -23,6 +23,7 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
+    ModelConfig,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
@@ -45,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -229,7 +231,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size, except
-        # that NPU DSA accounts for the draft's independently configured KV dtype.
+        # that NPU arch35 DSA accounts for the draft's independently configured KV dtype.
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
@@ -241,46 +243,60 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
                 if is_deepseek_dsa(kvc.model_config.hf_config):
+                    target_indexer_size = self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=num_layers,
+                    )
+                    target_kv_size = self._cell_size - target_indexer_size
+                    from sglang.srt.layers.cp.utils import (
+                        get_glm_dsa_layer_split_effective_num_layers,
+                    )
+
+                    target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
+                        kvc, num_layers
+                    )
+                    draft_kv_size = int(
+                        target_kv_size * draft_num_layers / target_kv_num_layers
+                    )
                     draft_dtype = None
                     if _is_npu:
                         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-                        from sglang.srt.mem_cache.kv_cache_configurator import (
-                            calculate_mla_kv_cache_dim,
-                        )
 
-                        draft_dtype = kvc.spec_aux_config.eagle_draft_kv_cache_dtype
-                        model_config = kvc.model_config
-                        use_c8 = draft_dtype == torch.float8_e4m3fn and is_npu_arch35()
-                        draft_main_bytes = (
-                            calculate_mla_kv_cache_dim(
-                                model_config=model_config, kv_cache_dtype=draft_dtype
+                        if is_npu_arch35():
+                            from sglang.srt.mem_cache.kv_cache_dtype import (
+                                configure_kv_cache_dtype,
                             )
-                            if use_c8
-                            else (
-                                model_config.kv_lora_rank
-                                + model_config.qk_rope_head_dim
-                            )
-                            * torch._utils._element_size(draft_dtype)
-                        )
-                        draft_kv_size = draft_num_layers * draft_main_bytes
-                    else:
-                        target_indexer_size = self._compute_dsa_indexer_cell_size(
-                            kvc=kvc,
-                            num_layers=num_layers,
-                        )
-                        target_kv_size = self._cell_size - target_indexer_size
-                        from sglang.srt.layers.cp.utils import (
-                            get_glm_dsa_layer_split_effective_num_layers,
-                        )
 
-                        target_kv_num_layers = (
-                            get_glm_dsa_layer_split_effective_num_layers(
-                                kvc, num_layers
+                            draft_model_config = kvc.model_config
+                            if get_spec().speculative_draft_model_path:
+                                draft_model_config = ModelConfig.from_server_args(
+                                    kvc.server_args,
+                                    model_path=get_spec().speculative_draft_model_path,
+                                    model_revision=get_spec().speculative_draft_model_revision,
+                                    is_draft_model=True,
+                                )
+                            _, draft_dtype = configure_kv_cache_dtype(
+                                server_args_kv_cache_dtype=get_model().kv_cache_dtype,
+                                speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+                                model=None,
+                                model_dtype=draft_model_config.dtype,
+                                is_draft_worker=True,
+                                is_dflash=False,
+                                speculative_draft_attention_backend=get_spec().speculative_draft_attention_backend,
                             )
-                        )
-                        draft_kv_size = int(
-                            target_kv_size * draft_num_layers / target_kv_num_layers
-                        )
+                            if draft_dtype != kvc.kv_cache_dtype:
+                                from sglang.srt.mem_cache.kv_cache_configurator import (
+                                    calculate_mla_kv_cache_dim,
+                                )
+
+                                draft_kv_size = (
+                                    calculate_mla_kv_cache_dim(
+                                        model_config=kvc.model_config,
+                                        kv_cache_dtype=draft_dtype,
+                                    )
+                                    * torch._utils._element_size(draft_dtype)
+                                    * draft_num_layers
+                                )
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
@@ -322,24 +338,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
-        if _is_npu and kvc.use_mla_backend and is_deepseek_dsa(model_config.hf_config):
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-            from sglang.srt.mem_cache.kv_cache_configurator import (
-                calculate_mla_kv_cache_dim,
-            )
-
-            use_c8 = kv_cache_dtype == torch.float8_e4m3fn and is_npu_arch35()
-            main_bytes = (
-                calculate_mla_kv_cache_dim(
-                    model_config=model_config, kv_cache_dtype=kv_cache_dtype
-                )
-                if use_c8
-                else (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * torch._utils._element_size(kv_cache_dtype)
-            )
-            return main_bytes * num_layers + self._compute_dsa_indexer_cell_size(
-                kvc=kvc, num_layers=num_layers
-            )
         from sglang.srt.layers.cp.utils import (
             get_glm_dsa_layer_split_effective_num_layers,
         )
@@ -462,47 +460,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kv_cache_dtype: Optional[torch.dtype] = None,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-            from sglang.srt.mem_cache.kv_cache_configurator import (
-                _should_elide_dsa_index_k,
-            )
-
-            dtype = kvc.kv_cache_dtype if kv_cache_dtype is None else kv_cache_dtype
-            is_arch35 = is_npu_arch35()
-            use_c8 = dtype == torch.float8_e4m3fn and is_arch35
-            architectures = (
-                getattr(kvc.model_config.hf_config, "architectures", ()) or ()
-            )
-            primary_arch = architectures[0] if architectures else None
-            is_glm_compact_rollout = (
-                not allocate_all_layers
-                and primary_arch == "GlmMoeDsaForCausalLM"
-                and is_arch35
-                and _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
-            )
-            num_indexer_layers = (
-                sum(
-                    not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
-                    for layer_id in range(
-                        kvc.layer_info.start_layer,
-                        kvc.layer_info.end_layer,
-                    )
-                )
-                if is_glm_compact_rollout
-                else num_layers
-            )
-            return num_indexer_layers * (
-                index_head_dim + 4
-                if use_c8
-                else index_head_dim * torch._utils._element_size(dtype)
-            )
         indexer_size_per_token = (
             index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
         )
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            if is_npu_arch35():
+                dtype = kvc.kv_cache_dtype if kv_cache_dtype is None else kv_cache_dtype
+                if dtype != torch.float8_e4m3fn:
+                    indexer_size_per_token = index_head_dim
+                    element_size = torch._utils._element_size(dtype)
+                architectures = (
+                    getattr(kvc.model_config.hf_config, "architectures", ()) or ()
+                )
+                # Match the compact-layout rollout in the NPU pool factory.
+                if not architectures or architectures[0] != "GlmMoeDsaForCausalLM":
+                    allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
