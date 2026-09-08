@@ -2582,15 +2582,14 @@ def _fwd_kernel_fill_m_indices_from_psum(
     ALIGN: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    # psum is the alignment-padded exclusive prefix sum; padding rows get a real
-    # expert id (not a sentinel) so every m_indices entry stays valid.
+    # psum is DeepEP's inclusive per-expert count: psum[i] = align(psum[i-1]) +
+    # count_i (only earlier experts aligned), so both start and seg_end round up.
+    # Padding rows get a real expert id (not a sentinel) so every entry stays valid.
     e = tl.program_id(0)
     prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
     start = ((prev_end + ALIGN - 1) // ALIGN) * ALIGN
     end = tl.load(psum_ptr + e)
     seg_end = ((end + ALIGN - 1) // ALIGN) * ALIGN
-    if e == num_local_experts - 1:
-        seg_end = total_rows
     count = seg_end - start
     off = tl.arange(0, BLOCK_M)
     for base in tl.range(0, count, BLOCK_M):
@@ -2611,6 +2610,11 @@ def fill_m_indices_from_psum(
     alignment-padded per-expert prefix sum, so this only labels rows (no cumsum,
     no H2D, no hidden data moved).
     """
+    # do_cpu_sync=True sizes recv_x to align(psum[-1]); the last expert's segment
+    # therefore ends exactly at total_rows (no capacity tail to skip).
+    assert total_rows % expert_alignment == 0, (
+        f"total_rows {total_rows} not a multiple of expert_alignment {expert_alignment}"
+    )
     m_indices = torch.empty(
         (total_rows,),
         device=psum_num_recv_tokens_per_expert.device,
@@ -2667,12 +2671,15 @@ def scale_expanded_rows_(
     deepep_v2 `do_expand=True` prefill path: folds the top-k weights into the
     expanded GEMM output (or, folded earlier, into down_proj's transposed fp8
     input scale) before ElasticBuffer.combine (which ignores topk_weights in
-    expand mode). The weight normalizations below are no-ops on the hot path
-    (DeepEP hands back a 1D contiguous fp32 tensor).
+    expand mode). `row_weights` must be a 1-D `[rows]` tensor (what DeepEP hands
+    back); the dtype/contiguous normalizations are no-ops on the hot path.
     """
     assert x.dim() == 2, f"expected 2D x, got {tuple(x.shape)}"
     rows, hidden = x.shape
-    assert row_weights.numel() >= rows, (
+    assert row_weights.dim() == 1, (
+        f"expected 1-D row_weights, got {row_weights.dim()}-D {tuple(row_weights.shape)}"
+    )
+    assert row_weights.numel() == rows, (
         f"row_weights has {row_weights.numel()} entries but x has {rows} rows"
     )
 
@@ -2682,8 +2689,6 @@ def scale_expanded_rows_(
     block_h = 2048 if hidden >= 2048 else triton.next_power_of_2(hidden)
 
     weights = row_weights
-    if weights.dim() != 1:
-        weights = weights.reshape(-1)
     if weights.dtype != torch.float32:
         weights = weights.to(torch.float32)
     if not weights.is_contiguous():

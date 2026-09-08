@@ -554,12 +554,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 expanded contig activation returned")
 
-        # down_proj is linear and fp8 dequant is q*scale, so folding the per-row topk
-        # weight into down_input's fp32 scale is exact and skips weighting the bf16
-        # down_output. ue8m0 scale is a power of two, so it weights down_output instead.
         deepep_v2_expanded = running_state.get(
             "deepep_v2_expanded", False
         ) and not running_state.get("deepep_v2_masked", False)
+        # ue8m0 scale is a power of two; folding w into it would need re-rounding.
         fuse_weight_into_scale = (
             deepep_v2_expanded
             and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
@@ -1763,9 +1761,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
             all_tokens,
             deepep_v2_expert_alignment,
         )
-        # Leave hidden_states_scale_tma_aligned at its default False: DeepEP's
-        # expanded recv scale is not in the contiguous GEMM's TMA-aligned layout,
-        # so _run_contiguous_gemm must still run tma_align_input_scale on it.
+        # Expanded DeepEP recv scales are not in the contiguous-GEMM TMA layout;
+        # _run_contiguous_gemm aligns them (hidden_states_scale_tma_aligned stays False).
         return DeepGemmRunnerInput(
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
@@ -1850,7 +1847,9 @@ def post_permute_deep_gemm_to_deepep_v2(
             "deepep_v2_weight_prefused", False
         ):
             # Weight the expanded rows before combine (skipped when already folded
-            # into down_input's scale); combine ignores topk_weights in expand mode.
+            # into down_input's scale). DeepEP 2.0.0 combine ignores topk_weights in
+            # expand mode; 2.1.0+ (#674) accepts a 1-D weight there, so a follow-up
+            # can gate on version and pass recv_topk_weights straight to combine.
             from sglang.kernels.ops.moe.ep_moe_kernels import scale_expanded_rows_
 
             scale_expanded_rows_(hidden_states, topk_weights)

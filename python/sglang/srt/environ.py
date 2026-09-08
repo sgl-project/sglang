@@ -1139,10 +1139,7 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     # Prefill: True uses DeepEP's expanded layout (skips ep_scatter); False uses
     # the non-expand ep_scatter/ep_gather path.
-    SGLANG_DEEPEP_V2_PREFILL_DO_EXPAND = EnvBool(True)
-    # GPU-side ElasticBuffer barrier timeout (seconds); raise it so idle ranks
-    # tolerate the first-request JIT compile. 0 keeps DeepEP's default (100s).
-    SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS = EnvInt(0)
+    SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(True)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only
     # by the model-specific dispatcher configuration; all other paths retain

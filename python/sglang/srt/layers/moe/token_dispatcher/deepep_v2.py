@@ -117,9 +117,20 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-    # Multi-node needs scale-out (hybrid); direct is NVLink-only and hangs across
-    # nodes. Honor an explicit "hybrid" too so a single node can opt in.
-    return get_exec().moe.deepep_v2_mode == "hybrid" or get_parallel().nnodes > 1
+    # direct is NVLink-only and hangs across nodes, so reject explicit direct on
+    # multi-node; unset/auto defaults to hybrid when nnodes > 1.
+    mode = get_exec().moe.deepep_v2_mode
+    nnodes = get_parallel().nnodes
+    if mode == "direct":
+        if nnodes > 1:
+            raise ValueError(
+                "--deepep-v2-mode direct is NVLink-only and cannot run across "
+                f"nodes (nnodes={nnodes}); use hybrid or leave it unset (auto)."
+            )
+        return False
+    if mode == "hybrid":
+        return True
+    return nnodes > 1
 
 
 def _quantize_for_deepep_v2_dispatch(
@@ -184,12 +195,6 @@ class DeepEPv2Buffer:
 
         # Communicator reuse requires a device-bound process group.
         os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
-        # Raise the GPU barrier timeout so idle ranks tolerate the first-request
-        # JIT compile on the token-owning rank; 0 keeps DeepEP's default.
-        gpu_timeout_secs = envs.SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS.get()
-        extra_kwargs = (
-            {"num_gpu_timeout_secs": gpu_timeout_secs} if gpu_timeout_secs > 0 else {}
-        )
         buffer = ElasticBuffer(
             group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
@@ -199,7 +204,6 @@ class DeepEPv2Buffer:
             allow_hybrid_mode=allow_hybrid_mode,
             sl_idx=0,
             prefer_overlap_with_compute=False,
-            **extra_kwargs,
         )
         state.buffer = buffer
         state.key = key
@@ -245,7 +249,7 @@ class _DeepEPv2Impl:
         self.rank = dist.get_rank(group)
         self._handle = None
         self._pad_empty_combine = False
-        self._prefill_expand_enabled = envs.SGLANG_DEEPEP_V2_PREFILL_DO_EXPAND.get()
+        self._prefill_expand_enabled = envs.SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND.get()
 
     def _destroy_handle(self) -> None:
         self._handle = None
@@ -343,11 +347,6 @@ class _DeepEPv2Impl:
             do_cpu_sync_val = False
 
         buffer = self._get_buffer()
-        # dispatch has no num_sms=0 fallback (unlike combine), so 0 launches the
-        # comm kernel with zero SMs and hangs; derive the theoretical count.
-        num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
-        if num_sms <= 0:
-            num_sms = buffer.get_theoretical_num_sms(self.num_experts, self.router_topk)
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             dispatch_x,
             topk_idx=topk_ids,
@@ -355,7 +354,7 @@ class _DeepEPv2Impl:
             num_experts=self.num_experts,
             num_max_tokens_per_rank=num_max_tokens,
             expert_alignment=_EXPERT_ALIGNMENT,
-            num_sms=num_sms,
+            num_sms=envs.SGLANG_DEEPEP_V2_NUM_SMS.get(),
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,

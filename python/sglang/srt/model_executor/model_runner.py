@@ -146,7 +146,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
     init_lplb_solvers,
-    prebuild_deepep_v2_buffers,
+    maybe_prebuild_deepep_v2_buffers,
     prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
@@ -175,7 +175,6 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
-    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -1093,17 +1092,10 @@ class ModelRunner:
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
 
-        decode_runner_captured = (
-            self.decode_cuda_graph_runner is not None
-            and not isinstance(self.decode_cuda_graph_runner, EagerRunner)
+        maybe_prebuild_deepep_v2_buffers(
+            model=self.model,
+            decode_cuda_graph_runner=self.decode_cuda_graph_runner,
         )
-        if not decode_runner_captured:
-            prebuild_deepep_v2_buffers(
-                model=self.model,
-                disaggregation_mode=get_disagg().disaggregation_mode,
-                chunked_prefill_size=get_schedule().chunked_prefill_size,
-                attn_tp_size=get_parallel().attn_tp_size,
-            )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
