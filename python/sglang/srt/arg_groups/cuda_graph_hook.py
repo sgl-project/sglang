@@ -88,7 +88,11 @@ def parse_cuda_graph_config(server_args: Any):
         _set(Phase.DECODE, "tc_compiler", cfg.cuda_graph_tc_compiler)
         _set(Phase.PREFILL, "tc_compiler", cfg.cuda_graph_tc_compiler)
     if cfg.cuda_graph_context_bucket_prefill is not None:
-        _set(Phase.PREFILL, "context_buckets", cfg.cuda_graph_context_bucket_prefill)
+        _set(
+            Phase.PREFILL,
+            "max_context_size",
+            cfg.cuda_graph_context_bucket_prefill,
+        )
 
     # ---- Explicit JSON config (highest precedence) ----
     for phase, phase_config in explicit_input.items():
@@ -246,10 +250,6 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             lambda: resolved_view(server_args).attn_cp_size > 1,
         ),
         ("CUDA graph debug mode", lambda: cfg.debug_cuda_graph),
-        (
-            "DSA prefill context parallelism",
-            lambda: cfg.enable_dsa_prefill_context_parallel,
-        ),
         # Capture builds a dummy extend forward with attn_dcp_metadata=None.
         (
             "decode context parallel (dcp_size > 1)",

@@ -1444,7 +1444,7 @@ class DeepseekV4AttnBackend(
                 actual_max_seq_len = int(seq_lens_cpu.max().item())
                 if actual_max_seq_len > max_seq_len:
                     raise ValueError(
-                        "Prefill CUDA graph context bucket is smaller than the "
+                        "Prefill CUDA graph max context size is smaller than the "
                         f"live context: {max_seq_len=} < {actual_max_seq_len=}"
                     )
         elif seq_lens_cpu is not None:

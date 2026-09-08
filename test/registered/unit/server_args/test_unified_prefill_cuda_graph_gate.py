@@ -55,6 +55,7 @@ def _run_handler(*, prefill_backend, explicit):
         "speculative_eagle_topk": None,
         "enable_hierarchical_cache": False,
         "enable_lmcache": False,
+        "enable_two_batch_overlap": False,
         "dcp_size": 1,
         "cuda_graph_config": cg,
         "cuda_graph_backend_prefill": prefill_backend if explicit else None,

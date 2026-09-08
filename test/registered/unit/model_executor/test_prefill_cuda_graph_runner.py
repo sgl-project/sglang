@@ -211,7 +211,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
     def test_static_batch_preserves_consumed_multimodal_embeddings(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
-        runner.capture_context_sizes = ()
+        runner.max_context_size = None
         runner.buffer_registry = _FakeBatchRegistry()
         runner.model_runner = SimpleNamespace(attn_tp_sequence_sharded=lambda _: False)
         runner.enable_cp_v2_bcg_capture = False
@@ -445,7 +445,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.max_num_tokens = 32
         runner.capture_num_tokens = [4]
-        runner.capture_context_sizes = ()
+        runner.max_context_size = None
         runner.backend = SimpleNamespace()
         runner.prefill_backend_name = Backend.FULL
         runner.has_mha_companion_layers = False

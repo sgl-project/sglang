@@ -72,7 +72,7 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # For prefill, bs carries aggregate-token capture buckets for every backend;
 # full_prefill_max_req separately controls Full's fixed request-slot count.
 # full_prefill_max_req and full_prefill_prefix_chunk_tokens are prefill-only and
-# only meaningful when backend == full. context_buckets is shared by the
+# only meaningful when backend == full. max_context_size is shared by the
 # breakable and full prefill body-capture backends.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
@@ -81,7 +81,7 @@ ALLOWED_KEYS_PER_PHASE = {
         "max_bs",
         "bs",
         "tc_compiler",
-        "context_buckets",
+        "max_context_size",
         "full_prefill_max_req",
         "full_prefill_prefix_chunk_tokens",
     ),
@@ -97,10 +97,10 @@ class PhaseConfig:
     bs: Optional[List[int]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
-    # Effective for both full and breakable backend and currently only DSV4: maximum captured context length.
-    # Replay rounds the largest seq_len in the batch up to one of these buckets, using to
-    # avoid padding every graph to the model's maximum context.
-    context_buckets: Optional[List[int]] = None
+    # Effective for both full and breakable backends and currently only DSV4:
+    # fixed maximum context length used by context-shaped prefill graph metadata.
+    # Every token bucket shares this size; larger live contexts run eagerly.
+    max_context_size: Optional[int] = None
     # Only meaningful for the prefill phase with backend == full: max number of
     # request slots baked into each captured graph. Real bs <= full_prefill_max_req
     # reuses the graph (unused slots become zero-length sentinels); larger

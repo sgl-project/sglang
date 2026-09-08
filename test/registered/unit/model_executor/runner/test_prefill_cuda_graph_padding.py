@@ -31,7 +31,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner.has_mha_companion_layers = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
-        runner.capture_context_sizes = ()
+        runner.max_context_size = None
         runner.max_num_tokens = 16
         return runner
 
@@ -80,34 +80,32 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             forward_batch, num_qo_tokens=16
         )
 
-    def test_context_bucket_is_a_graph_key_axis(self):
+    def test_max_context_size_is_not_a_graph_key_axis(self):
         runner = self._make_runner()
-        runner.capture_context_sizes = (256, 1024)
+        runner.max_context_size = 1024
 
         short = self._make_forward_batch(4)
         short.seq_lens_cpu.fill_(200)
         self.assertTrue(runner.can_run_graph(short))
-        self.assertEqual(runner._shape_key(4, short).context_size, 256)
 
         medium = self._make_forward_batch(4)
         medium.seq_lens_cpu.fill_(600)
         self.assertTrue(runner.can_run_graph(medium))
-        self.assertEqual(runner._shape_key(4, medium).context_size, 1024)
-        self.assertNotEqual(runner._shape_key(4, short), runner._shape_key(4, medium))
+        self.assertEqual(runner._shape_key(4, short), runner._shape_key(4, medium))
 
-    def test_rejects_excessive_or_uncovered_context_padding(self):
+    def test_rejects_context_above_fixed_maximum(self):
         runner = self._make_runner()
-        runner.capture_context_sizes = (256, 1024)
+        runner.max_context_size = 1024
 
-        excessive = self._make_forward_batch(4)
-        excessive.seq_lens_cpu.fill_(300)
-        self.assertFalse(runner.can_run_graph(excessive))
+        much_shorter = self._make_forward_batch(4)
+        much_shorter.seq_lens_cpu.fill_(200)
+        self.assertTrue(runner.can_run_graph(much_shorter))
 
         uncovered = self._make_forward_batch(4)
         uncovered.seq_lens_cpu.fill_(1025)
         self.assertFalse(runner.can_run_graph(uncovered))
 
-    def test_context_buckets_are_page_aligned_and_bounded(self):
+    def test_max_context_size_is_page_aligned_and_bounded(self):
         model_runner = SimpleNamespace(
             page_size=256,
             model_config=SimpleNamespace(context_len=4096),
@@ -117,22 +115,20 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         )
 
         self.assertEqual(
-            PrefillCudaGraphRunner._resolve_context_buckets(
-                model_runner, [700, 256, 257]
-            ),
-            (256, 512, 768),
+            PrefillCudaGraphRunner._resolve_max_context_size(model_runner, 700),
+            768,
         )
         with self.assertRaisesRegex(ValueError, "maximum addressable context"):
-            PrefillCudaGraphRunner._resolve_context_buckets(model_runner, [4097])
+            PrefillCudaGraphRunner._resolve_max_context_size(model_runner, 4097)
+        with self.assertRaisesRegex(ValueError, "exactly one integer"):
+            PrefillCudaGraphRunner._resolve_max_context_size(model_runner, [256, 1024])
 
-    def test_capture_fills_token_context_cartesian_product(self):
+    def test_capture_has_only_token_axis(self):
         runner = self._make_runner()
-        runner.capture_context_sizes = (256, 1024)
+        runner.max_context_size = 1024
         runner.model_runner = SimpleNamespace(device="cpu", gpu_id=0)
         calls = []
-        runner.capture_one_shape = lambda size, **kwargs: calls.append(
-            (size, kwargs["context_size"])
-        )
+        runner.capture_one_shape = lambda size, **kwargs: calls.append(size)
 
         with (
             patch.object(runner_module, "get_available_gpu_memory", return_value=1.0),
@@ -144,10 +140,17 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         ):
             runner._capture_one_stream()
 
-        self.assertEqual(
-            calls,
-            [(16, 1024), (16, 256), (4, 1024), (4, 256)],
-        )
+        self.assertEqual(calls, [16, 4])
+
+    def test_unsupported_path_ignores_max_context_size(self):
+        runner = self._make_runner()
+        runner.max_context_size = 1024
+
+        with self.assertLogs(runner_module.logger, level="WARNING") as logs:
+            runner._ignore_max_context_size("test path")
+
+        self.assertIsNone(runner.max_context_size)
+        self.assertIn("fixed metadata extent", "\n".join(logs.output))
 
 
 if __name__ == "__main__":
