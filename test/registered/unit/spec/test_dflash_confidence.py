@@ -5,6 +5,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.managers import overlap_utils
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.speculative.dflash_confidence import (
     select_sps_verify_token_budget,
     selector_selected_path_confidence,
@@ -27,7 +28,9 @@ from sglang.srt.speculative.dflash_worker_v2 import (
     _require_dflash_ragged_graph_coverage,
     _verify_logits_adjustments_are_noop,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    generate_decode_cuda_graph_batch_sizes,
+)
 from sglang.srt.speculative.dspark_components.dspark_sps import SpsCostTable
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
@@ -63,23 +66,24 @@ class TestDFlashConfidence(unittest.TestCase):
             forward_batch.spec_info.num_tokens_per_req, runner.captured_req_width
         )
 
-    def test_confidence_relay_follows_dflash_server_args_not_ragged_env(self):
+    def test_confidence_relay_follows_dflash_runtime_config_not_ragged_env(self):
         server_args = SimpleNamespace(
             speculative_dflash_confidence_target_verify_tokens=4,
             speculative_dflash_confidence_sps_table_path=None,
         )
-        with mock.patch.object(
-            overlap_utils,
-            "get_spec",
-            return_value=SimpleNamespace(speculative_algorithm="DFLASH_CONFIDENCE"),
-        ):
+        runtime_spec = SimpleNamespace(
+            speculative_algorithm="DFLASH_CONFIDENCE",
+            speculative_dflash_confidence_target_verify_tokens=4,
+            speculative_dflash_confidence_sps_table_path=None,
+        )
+        with mock.patch.object(overlap_utils, "get_spec", return_value=runtime_spec):
+            self.assertTrue(overlap_utils.decide_needs_confidence_relay())
             self.assertTrue(overlap_utils.decide_needs_confidence_relay(server_args))
+
         server_args.speculative_dflash_confidence_target_verify_tokens = 0
-        with mock.patch.object(
-            overlap_utils,
-            "get_spec",
-            return_value=SimpleNamespace(speculative_algorithm="DFLASH_CONFIDENCE"),
-        ):
+        runtime_spec.speculative_dflash_confidence_target_verify_tokens = 0
+        with mock.patch.object(overlap_utils, "get_spec", return_value=runtime_spec):
+            self.assertFalse(overlap_utils.decide_needs_confidence_relay())
             self.assertFalse(overlap_utils.decide_needs_confidence_relay(server_args))
 
     def test_selector_confidence_uses_the_selected_path(self):
@@ -108,12 +112,8 @@ class TestDFlashConfidence(unittest.TestCase):
         torch.testing.assert_close(confidence, expected)
 
     def test_compact_graph_coverage_rejects_schedulable_bucket_miss(self):
-        server_args = SimpleNamespace(
-            disable_cuda_graph=False,
-            max_running_requests=32,
-            cuda_graph_config=SimpleNamespace(
-                decode=SimpleNamespace(bs=[1, 2, 4, 8, 16])
-            ),
+        graph_config = SimpleNamespace(
+            decode=SimpleNamespace(backend=Backend.FULL, bs=[1, 2, 4, 8, 16])
         )
         with mock.patch(
             "sglang.srt.speculative.dflash_worker_v2.get_spec",
@@ -121,29 +121,39 @@ class TestDFlashConfidence(unittest.TestCase):
         ), mock.patch(
             "sglang.srt.speculative.dflash_worker_v2.ragged_verify_compact_enabled",
             return_value=True,
+        ), mock.patch(
+            "sglang.srt.speculative.dflash_worker_v2.get_exec",
+            return_value=SimpleNamespace(
+                graph=SimpleNamespace(cuda_graph_config=graph_config)
+            ),
+        ), mock.patch(
+            "sglang.srt.speculative.dflash_worker_v2.get_schedule",
+            return_value=SimpleNamespace(max_running_requests=32),
         ):
             with self.assertRaisesRegex(ValueError, "max_running_requests=32"):
-                _require_dflash_ragged_graph_coverage(server_args, block_size=8)
-            server_args.cuda_graph_config.decode.bs.append(32)
-            _require_dflash_ragged_graph_coverage(server_args, block_size=8)
+                _require_dflash_ragged_graph_coverage(None, block_size=8)
+            graph_config.decode.bs.append(32)
+            _require_dflash_ragged_graph_coverage(None, block_size=8)
 
     def test_dflash_confidence_uses_dense_cuda_graph_tiers(self):
-        args = object.__new__(ServerArgs)
-        args.disable_cuda_graph_padding = False
-        args.speculative_algorithm = "DFLASH_CONFIDENCE"
+        args = SimpleNamespace(
+            disable_cuda_graph_padding=False,
+            speculative_algorithm="DFLASH_CONFIDENCE",
+        )
         self.assertEqual(
-            args._generate_decode_cuda_graph_batch_sizes(80),
+            generate_decode_cuda_graph_batch_sizes(args, 80),
             list(range(1, 17))
             + list(range(18, 65, 2))
             + list(range(68, 81, 4)),
         )
 
     def test_other_speculative_algorithms_keep_generic_cuda_graph_tiers(self):
-        args = object.__new__(ServerArgs)
-        args.disable_cuda_graph_padding = False
-        args.speculative_algorithm = "DSPARK"
+        args = SimpleNamespace(
+            disable_cuda_graph_padding=False,
+            speculative_algorithm="DSPARK",
+        )
         self.assertEqual(
-            args._generate_decode_cuda_graph_batch_sizes(80),
+            generate_decode_cuda_graph_batch_sizes(args, 80),
             list(range(1, 9))
             + list(range(10, 33, 2))
             + list(range(40, 65, 4))
@@ -357,6 +367,7 @@ class TestDFlashConfidence(unittest.TestCase):
         # grows. It is not a global eight-token batch budget.
         worker = object.__new__(DFlashWorkerV2)
         worker.block_size = 8
+        worker._forced_confidence_budget_frac = None
         worker._confidence_sps_table = None
         worker.server_args = SimpleNamespace(
             speculative_dflash_confidence_target_verify_tokens=8

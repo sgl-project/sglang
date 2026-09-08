@@ -262,17 +262,23 @@ def _require_dflash_ragged_graph_coverage(server_args, block_size: int) -> None:
     if (
         get_spec().speculative_algorithm != "DFLASH_CONFIDENCE"
         or not ragged_verify_compact_enabled()
-        or server_args.disable_cuda_graph
     ):
         return
-    capture_bs = sorted(set(server_args.cuda_graph_config.decode.bs))
+
+    # ServerArgs retains raw input fields after resolution; runtime readers must
+    # instead use the published config bags. This check runs while the worker is
+    # initialized, after those resolved bags have been installed.
+    graph_config = get_exec().graph.cuda_graph_config
+    if graph_config is None or graph_config.decode.backend == Backend.DISABLED:
+        return
+    capture_bs = sorted(set(graph_config.decode.bs or []))
     if not capture_bs:
         raise ValueError(
             "DFLASH_CONFIDENCE compact verify requires decode CUDA graph "
             "capture tiers; configure --cuda-graph-bs-decode or "
             "--cuda-graph-max-bs-decode."
         )
-    requested_bs = server_args.max_running_requests
+    requested_bs = get_schedule().max_running_requests
     if requested_bs is not None and max(capture_bs) < int(requested_bs):
         raise ValueError(
             "DFLASH_CONFIDENCE compact verify requires target CUDA graph "
@@ -712,14 +718,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
         self._compact_verify_epilogue: Optional[DFlashCompactVerifyEpilogue] = None
+        graph_config = get_exec().graph.cuda_graph_config
         if (
             get_spec().speculative_algorithm == "DFLASH_CONFIDENCE"
             and ragged_verify_compact_enabled()
-            and not server_args.disable_cuda_graph
+            and graph_config is not None
+            and graph_config.decode.backend != Backend.DISABLED
             and is_cuda()
         ):
             self._compact_verify_epilogue = DFlashCompactVerifyEpilogue(
-                max_bs=max(server_args.cuda_graph_config.decode.bs),
+                max_bs=max(graph_config.decode.bs),
                 stride=self.block_size,
                 device=self.device,
                 draft_model=self.draft_model,
