@@ -1601,6 +1601,10 @@ class UnifiedRadixCacheSuite:
             )
 
         prompt_aligned = (len(prompt_ids) // ps) * ps
+        # A checkpoint taken after the stripped output cannot describe the
+        # shorter prompt. It must be freed instead of donated under that key.
+        if self.cfg.has_mamba and self.cfg.enable_mamba_extra_buffer:
+            prompt_aligned = 0
         # Thinking+answer must not be reachable past the prompt.
         m = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", prompt_ids + output_ids)))
@@ -1807,7 +1811,9 @@ class UnifiedRadixCacheSuite:
             len(req.prefix_indices), len(req.full_untruncated_fill_ids)
         )
         if self.cfg.has_mamba:
-            req.kv.mamba_last_track_seqlen = kv_len
+            # The real producer checkpoints at an aligned boundary, not at
+            # the end of the partial page whose KV is about to be freed.
+            req.kv.mamba_last_track_seqlen = kv_len // ps * ps
 
         avail_before = allocator.available_size()
         cache.cache_finished_req(

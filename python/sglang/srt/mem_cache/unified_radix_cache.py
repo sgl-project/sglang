@@ -995,17 +995,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 rotation_base=req.kv_rotation_base,
             )
 
-            # components prepare insert data + return effective cache_len
-            effective_cache_len = len(token_ids)
-            for comp in self._components_tuple:
-                cl = comp.prepare_for_caching_req(
-                    req=req,
-                    insert_params=insert_params,
-                    token_ids_len=len(token_ids),
-                    is_finished=True,
-                )
-                if cl is not None:
-                    effective_cache_len = min(effective_cache_len, cl)
+            effective_cache_len = self._prepare_for_caching_req(
+                req, insert_params, len(token_ids), is_finished=True
+            )
 
             # Truncate if needed; the tail free is deferred and batched with
             # the unaligned tail below so a shared boundary page is emitted once.
@@ -1091,16 +1083,9 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=getattr(req, "priority", 0) or 0,
             rotation_base=req.kv_rotation_base,
         )
-        effective_cache_len = len(token_ids)
-        for comp in self._components_tuple:
-            cl = comp.prepare_for_caching_req(
-                req=req,
-                insert_params=insert_params,
-                token_ids_len=len(token_ids),
-                is_finished=False,
-            )
-            if cl is not None:
-                effective_cache_len = min(effective_cache_len, cl)
+        effective_cache_len = self._prepare_for_caching_req(
+            req, insert_params, len(token_ids), is_finished=False
+        )
 
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
@@ -1210,6 +1195,51 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     # ---- Internal Helpers ----
+
+    def _prepare_for_caching_req(
+        self,
+        req: Req,
+        insert_params: InsertParams,
+        token_ids_len: int,
+        *,
+        is_finished: bool,
+    ) -> int:
+        effective_cache_len = token_ids_len
+        checkpoint_component = None
+        for comp in self._components_tuple:
+            if comp.component_type == ComponentType.MAMBA:
+                checkpoint_component = comp
+                continue
+            cl = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=token_ids_len,
+                is_finished=is_finished,
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+
+        # Resolve every other key cap before validating or donating an immutable
+        # recurrent checkpoint. An SWA branch may be shorter than the input and
+        # fall between available recurrent snapshots; its key cannot own a
+        # later state. This ordering must not depend on tree_components order.
+        if checkpoint_component is not None:
+            if (
+                not self.enable_mamba_extra_buffer
+                and effective_cache_len < token_ids_len
+            ):
+                # The no-buffer state belongs to the full processed prefix.
+                # Passing a shorter length would relabel it, not rewind it.
+                return 0
+            cl = checkpoint_component.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=effective_cache_len,
+                is_finished=is_finished,
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+        return effective_cache_len
 
     def _apply_cache_actions(
         self, actions: list[CacheAction | ComponentAction]
