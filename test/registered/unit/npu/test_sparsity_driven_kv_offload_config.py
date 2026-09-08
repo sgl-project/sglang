@@ -28,11 +28,6 @@ def _make_glm51_model_config():
 
 class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
     def test_glm_dsa_model_enables_sparse_kv_offload(self):
-        server_args = SimpleNamespace(
-            attention_backend="ascend",
-            max_running_requests=8,
-        )
-
         with (
             patch.dict(
                 os.environ,
@@ -42,13 +37,20 @@ class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
                 return_value=True,
             ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.attention_backends",
+                return_value=("ascend", "ascend"),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_schedule",
+                return_value=SimpleNamespace(max_running_requests=8),
+            ),
         ):
             model_config = _make_glm51_model_config()
 
             self.assertTrue(
                 is_sparsity_driven_kv_offload_enabled(
                     model_config=model_config,
-                    server_args=server_args,
                     use_mla_backend=True,
                 )
             )
@@ -61,13 +63,58 @@ class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
             self.assertEqual(
                 get_sparsity_driven_kv_offload_cell_size(
                     model_config=model_config,
-                    server_args=server_args,
                     use_mla_backend=True,
                     num_layers=2,
                     element_size=2,
                 ),
                 512,
             )
+
+    def test_split_attention_backend_rejects_sparse_kv_offload(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1"},
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.attention_backends",
+                return_value=("ascend", "torch_native"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "Ascend MLA attention backend"):
+                is_sparsity_driven_kv_offload_enabled(
+                    model_config=_make_glm51_model_config(),
+                    use_mla_backend=True,
+                )
+
+    def test_missing_request_capacity_rejects_sparse_kv_offload(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1"},
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.attention_backends",
+                return_value=("ascend", "ascend"),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_schedule",
+                return_value=SimpleNamespace(max_running_requests=None),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "max_running_requests"):
+                is_sparsity_driven_kv_offload_enabled(
+                    model_config=_make_glm51_model_config(),
+                    use_mla_backend=True,
+                )
 
 
 if __name__ == "__main__":

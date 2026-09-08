@@ -318,7 +318,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
                 offload_cell_size = get_sparsity_driven_kv_offload_cell_size(
                     model_config=model_config,
-                    server_args=kvc.server_args,
                     use_mla_backend=kvc.use_mla_backend,
                     num_layers=num_layers,
                     element_size=kv_size,

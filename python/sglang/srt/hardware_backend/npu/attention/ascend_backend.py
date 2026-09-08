@@ -347,7 +347,6 @@ class AscendAttnBackend(AttentionBackend):
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
             model_config=model_runner.model_config,
-            server_args=model_runner.server_args,
             use_mla_backend=model_runner.use_mla_backend,
         )
         self.sparse_kv_manager = None

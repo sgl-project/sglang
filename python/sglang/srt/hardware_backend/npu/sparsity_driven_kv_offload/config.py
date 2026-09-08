@@ -10,25 +10,26 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import attention_backends, get_schedule
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
 
 
 def is_sparsity_driven_kv_offload_enabled(
     *,
     model_config: ModelConfig,
-    server_args: ServerArgs,
     use_mla_backend: bool,
 ) -> bool:
     if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
         return False
 
+    prefill_attention_backend, decode_attention_backend = attention_backends()
     if not (
         is_npu()
-        and server_args.attention_backend == "ascend"
+        and prefill_attention_backend == "ascend"
+        and decode_attention_backend == "ascend"
         and use_mla_backend
         and is_deepseek_dsa(model_config.hf_config)
     ):
@@ -38,10 +39,10 @@ def is_sparsity_driven_kv_offload_enabled(
             "(for example DeepSeek V3.2 or GLM-5.x) using the Ascend MLA "
             "attention backend."
         )
-    if server_args.max_running_requests is None:
+    if get_schedule().max_running_requests is None:
         raise ValueError(
-            "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD requires an explicit "
-            "--max-running-requests to bound the per-process host KV allocation."
+            "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD requires max_running_requests "
+            "to be set to bound the per-process host KV allocation."
         )
     return True
 
@@ -79,14 +80,12 @@ def get_sparsity_driven_kv_offload_index_head_dim(
 def get_sparsity_driven_kv_offload_cell_size(
     *,
     model_config: ModelConfig,
-    server_args: ServerArgs,
     use_mla_backend: bool,
     num_layers: int,
     element_size: int,
 ) -> Optional[int]:
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
-        server_args=server_args,
         use_mla_backend=use_mla_backend,
     ):
         return None
