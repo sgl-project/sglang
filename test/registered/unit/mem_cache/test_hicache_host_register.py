@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
 from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _CUDA_HOST_REGISTERED_RANGES_ATTR,
     _cuda_host_register,
     _cuda_host_unregister,
 )
@@ -63,6 +64,37 @@ class _FakeCudart:
 
     def cudaGetErrorString(self, rc: int) -> str:
         return "injected error"
+
+
+class _FakeCudaError:
+    """Mimics the torch._C._cudart.cudaError pybind enum: int(rc) works,
+    but the object is not an int instance."""
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def __int__(self) -> int:
+        return self.value
+
+
+class _FakePybindCudart:
+    """cudaGetErrorString mimics the real pybind binding, which accepts only
+    the cudaError enum and raises TypeError on a plain int."""
+
+    def __init__(self, register_rc: int = 0, unregister_rc: int = 0):
+        self.register_rc = register_rc
+        self.unregister_rc = unregister_rc
+
+    def cudaHostRegister(self, ptr: int, size: int, flags: int) -> _FakeCudaError:
+        return _FakeCudaError(self.register_rc)
+
+    def cudaHostUnregister(self, ptr: int) -> _FakeCudaError:
+        return _FakeCudaError(self.unregister_rc)
+
+    def cudaGetErrorString(self, rc) -> str:
+        if isinstance(rc, int):
+            raise TypeError("cudaGetErrorString(): incompatible function arguments")
+        return "invalid argument"
 
 
 class TestHiCacheHostRegister(unittest.TestCase):
@@ -353,6 +385,46 @@ class TestHiCacheHostRegister(unittest.TestCase):
             [(base, gib, 0), (base + gib, gib, 0)],
         )
         self.assertEqual(cudart.unregistrations, [base])
+
+    def test_register_failure_reports_cuda_error_string(self):
+        """Regression: the error path must hand the cudaError enum to
+        cudaGetErrorString. Passing int(rc) raises TypeError in the pybind
+        binding, so the real failure (rc/offset/size) never surfaces and
+        startup dies with a bare TypeError."""
+        base = 0x10000000
+        buffer = _FakeBuffer(base, 4096)
+        cudart = _FakePybindCudart(register_rc=1)
+
+        with (
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"cudaHostRegister failed \(rc=1, invalid argument\) "
+                r"at offset=0 size=4096",
+            ),
+        ):
+            _cuda_host_register(buffer)
+
+    def test_unregister_failure_reports_cuda_error_string(self):
+        """Same enum contract on the unregister warning path: a failed
+        cudaHostUnregister must log the CUDA error string and keep the
+        range for a later retry, not crash with TypeError."""
+        base = 0x10000000
+        buffer = _FakeBuffer(base, 4096)
+        cudart = _FakePybindCudart(register_rc=0, unregister_rc=1)
+
+        with mock.patch.object(torch.cuda, "cudart", return_value=cudart):
+            _cuda_host_register(buffer)
+            with self.assertLogs(
+                "sglang.srt.mem_cache.pool_host.common", level="WARNING"
+            ) as logs:
+                _cuda_host_unregister(buffer)
+
+        self.assertIn("invalid argument", "\n".join(logs.output))
+        self.assertEqual(
+            getattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR),
+            [(base, 4096)],
+        )
 
     def test_missing_copy_granularity_preserves_single_registration(self):
         gib = 1024**3
