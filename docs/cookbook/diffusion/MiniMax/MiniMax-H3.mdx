@@ -770,9 +770,10 @@ and a frame-wise linear-attention branch (the Video Delta rule, scanned
 forward and backward over frames) that covers exactly the rest. The released
 `stage-dmd-step-250` checkpoint is an 8-NFE DMD2 distill and adds a 4.3 GB
 linear branch plus two small LoRA adapters on top of the untouched MiniMax-H3
-backbone. Only T2VA was trained: requests must use `task: "t2va"`, and `fl2va`
-/ `ref2va` requests are rejected. The weights inherit the MiniMax-H3 Community
-License, including its territorial exclusions.
+backbone. The weights are the FL2VA partition, so the deployment serves `t2va`
+and `fl2va` (first / last keyframes); the keyframe rows are attended densely,
+like text and audio. `ref2va` was not trained and is rejected. The weights
+inherit the MiniMax-H3 Community License, including its territorial exclusions.
 
 Pass the repository directly to `--model-path`. A registered model overlay
 materializes the base-H3 layout once: both LoRA adapters are prefused into the
@@ -800,8 +801,12 @@ forward of the first longer request pays allocator growth and kernel setup
 in every DiT block (2 to 3 s on this workload, for base H3 as well).
 
 Requests use the same asynchronous video endpoint as the base model, with
-`task: "t2va"`, `conditions: []`, and a target such as
-`{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 14.375}`. The
+`task: "t2va"`, `conditions: []` (or `task: "fl2va"` with the keyframe
+conditions of the [FL2VA request](#4-generate-video-and-audio)), and a target such as
+`{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 14.375}`. Each
+keyframe adds about 2,000 global rows (the conditioner's image tokens plus the
+latent keyframe), dense both ways in the window softmax, so an `fl2va` forward
+costs more than a `t2va` one. The
 request default is `num_inference_steps: 9`: nine points on the standard
 shift-12/shift-3 sigma grid, i.e. the eight distilled DiT evaluations (VDN
 counts NFEs, SGLang counts grid points). Any other step count is rejected. The
