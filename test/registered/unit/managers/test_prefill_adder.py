@@ -170,6 +170,7 @@ class TestPrefillAdder(CustomTestCase):
             "retracted-storage-hit"
         )
         self.mock_tree_cache.finish_storage_prefetch_admission.assert_not_called()
+
     def _create_dream_req(self, rid, canvas_len):
         req = self.create_mock_req(rid, priority=0, max_new_tokens=0)
         req.full_untruncated_fill_ids = list(range(canvas_len))
@@ -209,6 +210,9 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, reqs)
         self.assertEqual(results, [AddReqResult.CONTINUE, AddReqResult.CONTINUE])
         self.assertEqual([req.extend_range.length for req in reqs], [4, 4])
+        self.assertEqual(
+            self.mock_tree_cache.finish_storage_prefetch_admission.call_count, 2
+        )
 
         self.mock_token_allocator.available_size.return_value = 10
         constrained_adder = self.create_adder(

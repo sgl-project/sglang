@@ -969,9 +969,8 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-            host_hit_len=req.host_hit_length,
-            storage_hit_len=req.storage_hit_length,
         )
+        self._account_prefill_cache_admission(req, prefix_len)
 
     # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
     # the diffusion unmask process may have some problems
@@ -1047,9 +1046,9 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
-        assert (
-            self.dllm_config is None or not self.dllm_config.needs_full_prefill
-        ), "A full-generation dLLM canvas cannot use chunked prefill"
+        assert self.dllm_config is None or not self.dllm_config.needs_full_prefill, (
+            "A full-generation dLLM canvas cannot use chunked prefill"
+        )
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
