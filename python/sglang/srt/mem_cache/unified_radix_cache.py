@@ -439,7 +439,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_memory_mode == "buffer_only":
             swa = self.components.get(ComponentType.SWA)
             validate_buffer_only_stack(
-                sidecar_pool_specs=self.sidecar_pool_specs, swa_component=swa
+                sidecar_pool_specs=self.sidecar_pool_specs,
+                host_pool_group=self.host_pool_group,
+                swa_component=swa,
             )
             self.buffer_pipeline = BufferModePipeline(
                 cache=self,
@@ -1097,7 +1099,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, FreeDeviceKVFullOnly):
             for indices in action.indices:
-                self.token_to_kv_pool_allocator.free_full(indices)
+                self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
                 self.linker.offload_nodes(action.node_ids)
@@ -1370,9 +1372,25 @@ class UnifiedRadixCache(BasePrefixCache):
             lock_params = None
             if not write_back:
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
-            self._track_write_through_node(node_id, lock_params)
+            publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
+            self._track_write_through_node(
+                node_id, lock_params, publish_node_ids=publish_node_ids
+            )
             written = len(host_indices)
         return written
+
+    @staticmethod
+    def _backup_publish_node_ids(
+        node_id: NodeId, comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    ) -> list[NodeId]:
+        """The acked node plus every node a component backup transfer covers."""
+        publish_node_ids: list[NodeId] = []
+        for transfers in comp_xfers.values():
+            for transfer in transfers:
+                publish_node_ids.extend(transfer.nodes_to_load or ())
+        if node_id not in publish_node_ids:
+            publish_node_ids.append(node_id)
+        return list(dict.fromkeys(publish_node_ids))
 
     def _build_backup_sidecar(self, device_value, comp_xfers):
         """Gather sidecar transfer spec."""
@@ -1399,10 +1417,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         node_id: NodeId,
         lock_params: Optional[DecLockRefParams],
+        publish_node_ids: list[NodeId],
     ) -> None:
-        self.tree_core.mark_write_through_pending(node_id)
+        publish_node_ids = self.tree_core.mark_write_through_pending(
+            publish_node_ids, ack_id=node_id
+        )
         self.ongoing_write_through[node_id] = _OngoingWriteThrough(
-            node_id, lock_params, [node_id]
+            node_id, lock_params, publish_node_ids
         )
 
     def _replace_pending_write_through_node(
@@ -3050,20 +3071,28 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_reprefill_tail_tokens(self) -> int:
         """
-        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
-        (state_slot/pos), not content-stable and never offloaded to host, so a
+        Only unified_kv needs this: SWA lives in a per-request ring
+        (state_slot/pos), not content-stable and never stored in the tree, so a
         reused prefix's trailing sliding window would read another request's
-        stale ring slots. Re-prefilling that window rewrites this request's ring
-        (what plain radix reuse does via its SWA match gate). 0 for every other
-        layout.
+        stale ring slots. Re-prefilling that window rewrites this request's ring.
+
+        Applies to plain radix reuse as well as HiCache -- the ring is stale
+        either way. Returns 0 once SWA has a host pool to restore exact contents
+        from, and for every non-unified_kv layout, whose SWA slots are
+        content-stable.
         """
-        swa = self.components.get(ComponentType.SWA)
-        unified_compress_only_hicache = (
-            self.cache_controller is not None
-            and swa is not None
-            and not self.tree_core.has_swa_host_pool
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
         )
-        return swa.sliding_window_size if unified_compress_only_hicache else 0
+
+        swa = self.components.get(ComponentType.SWA)
+        if swa is None or not swa.sliding_window_size:
+            return 0
+        if not is_unified_kv_triton():
+            return 0
+        if self.tree_core.has_swa_host_pool:
+            return 0
+        return swa.sliding_window_size
 
     def swa_retain_floor(self, req) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:

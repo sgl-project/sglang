@@ -33,7 +33,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
     SchedulerRequestReceiver,
 )
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 
 
 class _CloneFailure:
@@ -121,6 +121,7 @@ def _receiver(tp_size: int = 1) -> SchedulerRequestReceiver:
         max_recv_per_poll=-1,
         stream_output=lambda *args, **kwargs: None,
         get_last_batch=lambda: None,
+        poll_timeout_aborts=lambda: [],
     )
 
 
