@@ -47,10 +47,7 @@ export const config = {
   },
 
   benchmarkCommands: {
-    // The remote processor imports its helper module by absolute name, so the
-    // checkpoint directory must be importable for the client-side token count too.
-    speed: `# When the checkpoint is a local snapshot: export PYTHONPATH=<snapshot-dir>
-python3 -m sglang.bench_serving \\
+    speed: `python3 -m sglang.bench_serving \\
   --backend sglang-oai-chat \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
