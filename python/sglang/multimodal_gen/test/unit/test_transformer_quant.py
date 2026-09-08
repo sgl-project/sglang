@@ -59,13 +59,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
-
-# kitchen_int8 picks its kernel backend from the GPU; pin comfy_kitchen so these
-# cases do not depend on the runner.
-_KITCHEN_SGL_AVAILABLE = (
-    "sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config."
-    "_sgl_kernel_available"
-)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
 )
@@ -145,6 +138,13 @@ from sglang.srt.layers.quantization.bitsandbytes import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod as SRTFp8LinearMethod
+
+# kitchen_int8 picks its kernel backend from the GPU; pin comfy_kitchen so these
+# cases do not depend on the runner.
+_KITCHEN_SGL_AVAILABLE = (
+    "sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config."
+    "_sgl_kernel_available"
+)
 
 
 class _FakeFluxTransformer:

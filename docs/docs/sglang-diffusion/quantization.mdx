@@ -125,9 +125,9 @@ backend.
       <td><code>kitchen_int8</code> (online quantization)</td>
       <td>Unquantized BF16/FP16 checkpoint</td>
       <td><code>--component-quantizations.&lt;component&gt; kitchen_int8</code></td>
-      <td>MiniMax-H3 (validated on 1× RTX 4090 24 GB and GB200), Qwen-Image and Qwen-Image-Edit (quality-validated); other BF16 DiTs load but are not quality-validated</td>
+      <td>MiniMax-H3, Qwen-Image, Qwen-Image-Edit (quality-validated); other BF16 DiTs load but are not quality-validated</td>
       <td><code>sgl-kernel</code> (bundled) or <code>comfy-kitchen</code></td>
-      <td>Data-free INT8 ConvRot W8A8 at load time. The kernel backend is picked per layer: the fused <code>convrot_int8_*</code> ops in <code>sgl-kernel</code> on CC 9.0, 10.0, 12.0 and 12.1 (output width a multiple of 8), else <code>comfy_kitchen.int8_linear</code> (Turing+, needs <code>comfy-kitchen</code>); <code>SGLANG_DIFFUSION_KITCHEN_INT8_BACKEND</code> forces one. Layers whose input dim is not divisible by the group size stay in BF16; under TP every row-parallel input shard must also divide it (keep such layers in BF16 with <code>--quantization-ignored-layers</code>). LoRA runs in dynamic mode; FSDP uses the <code>comfy_kitchen</code> backend; loading needs the BF16 checkpoint's VRAM even with offload.</td>
+      <td>Data-free INT8 ConvRot W8A8 at load time, per layer on the fused <code>sgl-kernel</code> ops (CC 9.0, 10.0, 12.0, 12.1) or on <code>comfy_kitchen.int8_linear</code> (Turing+); <code>SGLANG_DIFFUSION_KITCHEN_INT8_BACKEND</code> forces one. Layers whose input dim is not divisible by the group size stay in BF16. TP, LoRA, FSDP and memory notes under Kitchen INT8 below.</td>
     </tr>
     <tr>
       <td><code>fp8</code> (offline quantization)</td>
@@ -182,8 +182,8 @@ backend.
       <td>One selected safetensors file with per-layer <code>int8_tensorwise</code> and ConvRot metadata</td>
       <td><code>--component-weights-paths.&lt;component&gt;</code></td>
       <td>Native DiTs and encoders whose parameter mappings preserve each marked linear; MiniMax-H3 DiT and Qwen3-VL encoder checkpoints have validated tensor contracts</td>
-      <td><code>comfy-kitchen</code></td>
-      <td>CUDA; auto-detected; each layer runs on the <code>sgl-kernel</code> ConvRot ops where they apply (CC 9.0/10.0/12.0/12.1, group size 64 or 256) and on the fused Kitchen INT8 kernel otherwise; weight/scale layout is validated before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary. The H3 256-group DiT supports TP1/2/4, not TP8; its Qwen3-VL encoder keeps TP8 by replicating only incompatible row projections. Offload is supported; FSDP is not.</td>
+      <td><code>sgl-kernel</code> (bundled) or <code>comfy-kitchen</code></td>
+      <td>CUDA; auto-detected; each layer runs on the <code>sgl-kernel</code> ConvRot ops where they apply (CC 9.0/10.0/12.0/12.1, group size 64 or 256) and on <code>comfy_kitchen.int8_linear</code> otherwise; weight/scale layout is validated before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary. The H3 256-group DiT supports TP1/2/4, not TP8; its Qwen3-VL encoder keeps TP8 by replicating only incompatible row projections. Offload is supported; FSDP is not.</td>
     </tr>
     <tr>
       <td><code>mxfp8</code></td>
@@ -402,30 +402,30 @@ Two kernel backends implement the same quantization and consume the same INT8
 weights and per-row scales, so the choice is made per layer at load time:
 
 - `sgl_kernel`: the `convrot_int8_*` ops shipped in `sgl-kernel`, no extra
-  package. Hopper (CC 9.0), Blackwell data-center parts (CC 10.0) and Blackwell
-  workstation and consumer parts (CC 12.0 and 12.1: RTX PRO 6000 Blackwell,
-  RTX 50 series, DGX Spark); group size 64, 128, 256 or 512; output width a
-  multiple of 8. Where several linears share one input (the Q/K/V projections
-  of a block) the activation is rotated and quantized once (Qwen-Image, FLUX and
-  HunyuanVideo attention), and the Qwen-Image FFN down-projection folds its
-  preceding GELU(tanh) into the same rotate kernel; both are bitwise identical
-  to the per-linear ops. CC 10.3 (B300, GB300) is refused on purpose: Blackwell
+  package. CC 9.0 (Hopper), 10.0 (B200, GB200) and 12.0 / 12.1 (RTX PRO 6000
+  Blackwell, RTX 50 series, DGX Spark); group size 64, 128, 256 or 512; output
+  width a multiple of 8. CC 10.3 (B300, GB300) is refused on purpose: Blackwell
   Ultra cuts INT8 tensor-core throughput to a fraction of its BF16 rate, so use
-  FP8 or NVFP4 there. On CC 12.x the dequant GEMM runs on the CUTLASS mma.sync
-  kernels sgl-kernel already uses for its sm89 INT8 GEMM.
+  FP8 or NVFP4 there. Linears sharing one input (a block's Q/K/V projections)
+  rotate and quantize it once, and the Qwen-Image FFN down-projection folds its
+  GELU(tanh) into the rotate kernel; both are bitwise identical to the
+  per-linear ops.
 - `comfy_kitchen`: `comfy_kitchen.int8_linear` from the optional
   `comfy-kitchen` package (`pip install comfy-kitchen`). Turing and later
   (SM75); group size 16, 64 or 256.
 
 The default `auto` takes `sgl_kernel` wherever its ops run and `comfy_kitchen`
-where that package is installed (a layer whose output width is not a multiple
-of 8 goes to `comfy_kitchen` when it is installed and stays BF16 otherwise);
+otherwise; loading stops with an install hint if `comfy-kitchen` is then
+missing. A layer whose output width is not a multiple of 8 goes to
+`comfy_kitchen` when it is installed and stays BF16 otherwise.
 `SGLANG_DIFFUSION_KITCHEN_INT8_BACKEND=sgl_kernel` or `=comfy_kitchen` forces
-one backend. Serialized Comfy ConvRot INT8 DiTs and native encoders use
-`--component-weights-paths.<component>`; they are auto-detected from per-layer
-markers, load INT8 weights and row scales directly (omit online quantization),
-and follow the same per-layer backend choice. `--transformer-weights-path`
-remains the primary-DiT convenience spelling.
+one backend. LoRA adapters run in dynamic mode (they cannot be merged into
+rotated INT8 weights); under FSDP `auto` resolves to `comfy_kitchen` and an
+explicit `sgl_kernel` is refused. Serialized Comfy ConvRot INT8 DiTs and native
+encoders use `--component-weights-paths.<component>`; they are auto-detected
+from per-layer markers, load INT8 weights and row scales directly (omit online
+quantization), and follow the same per-layer backend choice.
+`--transformer-weights-path` remains the primary-DiT convenience spelling.
 
 ```bash
 sglang generate \
@@ -452,57 +452,42 @@ sglang generate \
 
 Quantization runs after the model's weight loaders, so MiniMax-H3's grouped
 `qkv` reorder is already applied. Layers whose input dim is not divisible by
-the group size (256) stay in BF16 instead of failing the load; H3's AdaLN
-projections take that path. Under TP every row-parallel input shard must also
-divide the group size, or the load stops with the layer named; keep such
-layers in BF16 with `--quantization-ignored-layers`. Every other eligible
-linear is quantized: the
-Qwen-Image DiT weights halve (38.0 to 19.0 GiB) and peak GPU memory at
-1024x1024 drops from 56 GB to 37 GB. The quantization happens after the BF16
-weights are on the GPU, so loading still needs the BF16 checkpoint's worth of
-free VRAM (38 GiB for Qwen-Image), with or without CPU offload; the saving
-applies once the model is loaded. Adding `--quantization-ignored-layers img_mod
-txt_mod txt_mlp.net.2` keeps the three Qwen-Image shapes whose GEMMs see only a
-handful of rows (AdaLN modulation, text-stream FFN down-projection) in BF16. It
-saves less memory (45.5 GB peak) and its speed relative to full quantization was
-host-dependent in our measurements, so the default quantizes everything.
+the group size stay in BF16 instead of failing the load (H3's AdaLN
+projections take that path); under TP every row-parallel input shard must also
+divide it, or the load stops naming the layer, which
+`--quantization-ignored-layers` keeps in BF16. Loading stages the BF16 weights
+on the GPU before quantizing them, so it needs the BF16 checkpoint's worth of
+free VRAM (38 GiB for Qwen-Image) with or without CPU offload; the saving
+applies once the model is loaded. `--quantization-ignored-layers img_mod
+txt_mod txt_mlp.net.2` keeps the few-row Qwen-Image GEMMs (AdaLN modulation,
+text-stream FFN down-projection) in BF16 at the cost of memory (45.5 GB peak)
+for no consistent speed gain, so the default quantizes everything.
 
-Measured end to end against BF16 on GB200 with the `sgl_kernel` backend in the
-default eager execution and every layer quantized: Qwen-Image (1024x1024, 50
-steps, CFG 4) 1.19x on one GPU and 1.13x on two GPUs with CFG parallelism;
-Qwen-Image-Edit (1024x1024 input) 1.32x on one GPU. Eager Qwen-Image on one GPU
-is close to launch-bound on GB200 and shows the least of the gain; the edit
-model, with twice the tokens per pass, is GPU-bound. At the kernel level the
-fused op runs 1.28x faster than the cuBLAS BF16 GEMM (geometric mean over the
-Qwen-Image shapes at image-token row counts, 1.69x on the FFN up-projection).
-A separate, later change to how the denoising loop is executed (not part of
-this feature) widens these margins on 1, 2 and 4 GPUs; its numbers are reported
-with that change.
+Measured against BF16 on GB200 in eager execution with every eligible layer
+quantized:
 
-MiniMax-H3 on one GB200 (FL2VA, 1344x768, 24 fps, 5 s, 50 steps, `fa`
-attention, resident weights): BF16 206 s per request, `sgl_kernel` 193 s
-(1.07x, denoise 3.70 vs 3.94 s/step), `comfy_kitchen` 241 s (0.86x; its GEMM
-is a CUTLASS 2.x mma.sync kernel that does not reach Blackwell's INT8 rate).
-Both backends quantize the same 209 linears and cut peak GPU memory from 125 to
-107 GiB; with the cookbook's layerwise-offload recipe both keep the 19 GiB
-runtime peak and the same request times. Against BF16 over six prompt/seed
-pairs the two backends sit in the same quality class (video PSNR 23.4 vs 23.8
+| Model | Backend | Speedup vs BF16 | Peak GPU memory |
+| --- | --- | ---: | --- |
+| Qwen-Image 1024x1024, 50 steps, CFG 4, 1 GPU | `sgl_kernel` | 1.19x (1.13x on 2 GPUs, CFG parallel) | 56 -> 37 GB |
+| Qwen-Image-Edit 1024x1024, 1 GPU | `sgl_kernel` | 1.32x | |
+| MiniMax-H3 1344x768, 5 s, 50 steps, 1 GPU | `sgl_kernel` | 1.07x (1.15x on 4 GPUs, Ulysses 4) | 125 -> 107 GiB |
+| MiniMax-H3, same | `comfy_kitchen` | 0.86x | 125 -> 107 GiB |
+
+On MiniMax-H3 both backends quantize the same 209 linears and sit in the same
+quality class against BF16 over six prompt/seed pairs (video PSNR 23.4 vs 23.8
 dB, SSIM 0.80 vs 0.81, audio spectral similarity 0.96 vs 0.97; the same-seed
 distance between the two backends equals each one's distance to BF16). Loading
-an online-quantized model still stages the BF16 DiT on the GPU (65 GiB peak
-under offload); the serialized Comfy INT8 H3 checkpoint avoids that (31.7 GB
-DiT, 96 GiB load peak resident) and runs on the `sgl_kernel` backend at the
-same 192 s.
+an online-quantized H3 peaks at 115 GiB resident (66 GiB under layerwise
+offload); the serialized Comfy INT8 checkpoint loads at 96 GiB resident and
+runs on `sgl_kernel` at the same speed.
 
 <Warning>
-`kitchen_int8` is approximate: same-seed outputs are not bit-exact with BF16,
-so it is not a consistency ground-truth mode, and the two backends are not
-bit-exact with each other (both stay within INT8 quantization noise of the
-BF16 result). Quality was validated against BF16 on MiniMax-H3, Qwen-Image and
-Qwen-Image-Edit; other DiTs load but have not been quality-validated. LoRA
-adapters run in dynamic mode (they cannot be merged into rotated INT8 weights).
-FSDP inference uses the `comfy_kitchen` backend. The BF16 path is unchanged when
-neither backend applies. See the
+`kitchen_int8` is approximate: same-seed outputs are not bit-exact with BF16 or
+between the two backends (both stay within INT8 quantization noise of BF16), so
+it is not a consistency ground-truth mode. Quality was validated against BF16 on
+MiniMax-H3, Qwen-Image and Qwen-Image-Edit; other DiTs load but are not
+quality-validated. Without `kitchen_int8` neither backend is loaded and the BF16
+path is untouched. See the
 [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#8-feature-contracts-and-advanced-recipes)
 for the 24 GB offload recipe, including why `vae` must stay out of
 `--layerwise-offload-components`.

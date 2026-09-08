@@ -348,7 +348,7 @@ def test_fp16_parameters_are_cast_for_the_kernel_in_every_helper():
     x_bf16 = x.to(torch.bfloat16)
     apply_convrot_int8_shared_input_out(x=x_bf16, layers=layers, outs=outs)
     for out, layer in zip(outs, layers, strict=True):
-        assert torch.equal(out, layer(x_bf16)[0].to(torch.bfloat16))
+        assert torch.equal(out, layer(x_bf16)[0])
 
 
 @requires_kernel

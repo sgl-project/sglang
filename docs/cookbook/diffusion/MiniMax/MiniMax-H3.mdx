@@ -244,8 +244,8 @@ offload re-streams about 9 GiB on each of 167 decode tiles. Default
 attention stays `fa` (exact). Approximate backends are opt-in; see
 [Attention Backends](/docs/sglang-diffusion/attention_backends#sage-then-sol-hybrid).
 On the RTX 4090 (CC 8.9) `kitchen_int8` runs on `comfy-kitchen`, so install it
-first (`pip install comfy-kitchen`); on CC 9.0 and later it uses the ConvRot
-ops bundled in `sgl-kernel` instead.
+first (`pip install comfy-kitchen`); on CC 9.0, 10.0, 12.0 and 12.1 it uses the
+ConvRot ops bundled in `sgl-kernel` instead.
 
 ```bash 1×RTX 4090 24GB
 sglang generate \
@@ -1055,10 +1055,9 @@ H3 validation runs.
 
 On a single 24 GB card, use `kitchen_int8` instead of FP8. It quantizes the
 four GEMMs per DiT block online from the Hub BF16 weights (data-free, no
-calibration) and dispatches them through the `kitchen_int8` kernel backend:
-`comfy_kitchen.int8_linear` on the 4090, the ConvRot ops bundled in
-`sgl-kernel` on CC 9.0 and later (see
-[Quantization](/docs/sglang-diffusion/quantization#kitchen-int8)).
+calibration) and runs them on `comfy_kitchen.int8_linear` on the 4090 (CC 8.9)
+or on the ConvRot ops bundled in `sgl-kernel` on CC 9.0, 10.0, 12.0 and 12.1
+(see [Quantization](/docs/sglang-diffusion/quantization#kitchen-int8)).
 Quantization happens after H3's grouped `qkv` reorder, so do not load an
 externally pre-quantized INT8 checkpoint here.
 
@@ -1087,8 +1086,9 @@ and [Attention Backends](/docs/sglang-diffusion/attention_backends#sage-then-sol
 <Warning>
 `kitchen_int8` changes Linear numerics. `sol_attn` / `sage_attn` also change
 the attention algorithm. Neither is a consistency ground-truth mode. The
-BF16 path never depends on `comfy-kitchen`; `kitchen_int8` needs it only
-where the `sgl-kernel` ops do not run (CC below 9.0, CC 10.3).
+BF16 path never depends on `comfy-kitchen`; `kitchen_int8` needs it only on
+GPUs the `sgl-kernel` ops do not cover (any CC other than 9.0, 10.0, 12.0 and
+12.1).
 </Warning>
 
 Pre-quantized and compact H3 text encoders are listed once in

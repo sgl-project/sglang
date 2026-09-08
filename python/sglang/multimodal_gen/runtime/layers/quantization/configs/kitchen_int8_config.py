@@ -6,8 +6,10 @@ regular Hadamard rotation, per-row dynamic INT8 activations and per-output-
 channel INT8 weights, with interchangeable weight and scale tensors. ``auto``
 picks sgl-kernel's fused ``convrot_int8_*`` ops where they run (CC 9.0, 10.0,
 12.0 and 12.1; group size 64, 128, 256 or 512; output width a multiple of 8)
-and ``comfy_kitchen.int8_linear`` where that package is installed (Turing and
-later; group size 16, 64 or 256); a layer neither backend serves stays BF16.
+and ``comfy_kitchen.int8_linear`` otherwise (Turing and later; group size 16,
+64 or 256; the load fails with an install hint when the package is missing).
+Only a layer whose output width the sgl-kernel epilogue cannot store falls to
+comfy_kitchen or, without it, stays BF16.
 """
 
 from __future__ import annotations

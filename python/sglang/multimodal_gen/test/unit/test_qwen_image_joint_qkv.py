@@ -160,7 +160,7 @@ def _joint_flag(attn: QwenImageCrossAttention) -> str:
 
 
 class _JointQkvCase(CustomTestCase):
-    """Forward helpers shared by the unquantized and the ConvRot test classes."""
+    # Forward helpers shared by the unquantized and the ConvRot test classes.
 
     def setUp(self) -> None:
         torch.manual_seed(20260902)
@@ -348,9 +348,8 @@ class TestQwenImageJointQkvBuffers(_JointQkvCase):
     def test_eligibility_requires_one_dtype_across_streams_weights_and_autocast(
         self,
     ):
-        """The out= GEMMs neither promote nor autocast, so they may only stand
-        in for F.linear when every operand already has the dtype F.linear
-        would compute in."""
+        """The out= GEMMs neither promote nor autocast, so they stand in for
+        F.linear only when every operand already has the dtype it would use."""
         attn = _attention()
         hidden, encoder = _streams()
 
