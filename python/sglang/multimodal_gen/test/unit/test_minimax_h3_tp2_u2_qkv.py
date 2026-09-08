@@ -7,12 +7,11 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
+from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+    MiniMaxH3Attention,
     MiniMaxH3DiTModel,
     _can_use_ulysses_gather_qkv,
-    _copy_grouped_qkv_tp_ulysses_shard,
-    _reorder_grouped_qkv_to_qkv,
-    _reorder_grouped_qkv_to_ulysses_qkv,
 )
 
 _MODEL = "sglang.multimodal_gen.runtime.models.dits.minimax_h3"
@@ -117,108 +116,41 @@ def test_live_lora_cannot_bypass_sharded_qkv_projection():
         MiniMaxH3DiTModel.validate_lora_layers(model, ["blocks.0.attn.qkv_proj"])
 
 
-NUM_HEADS = 56
-TP_SIZE = 2
-ULYSSES_SIZE = 2
-HEAD_DIM = 2
-HIDDEN = 3
-
-
-def _dense_weight() -> torch.Tensor:
-    return torch.arange(
-        NUM_HEADS * 3 * HEAD_DIM * HIDDEN,
-        dtype=torch.bfloat16,
-    ).reshape(NUM_HEADS * 3 * HEAD_DIM, HIDDEN)
-
-
-def _rank_shard(
-    dense: torch.Tensor, *, tp_rank: int, ulysses_rank: int
-) -> torch.Tensor:
-    local_heads = NUM_HEADS // (TP_SIZE * ULYSSES_SIZE)
-    shard = torch.empty(
-        3 * local_heads * HEAD_DIM,
-        HIDDEN,
-        dtype=torch.bfloat16,
+@pytest.mark.parametrize("tp_rank,ulysses_rank", [(0, 0), (0, 1), (1, 0), (1, 1)])
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_installed_qkv_loader_preserves_head_ownership(
+    tp_rank, ulysses_rank, sharded, contiguous
+):
+    heads, head_dim, hidden = 8, 2, 3
+    partition = 2 if sharded else 1
+    projection = MergedColumnParallelLinear(
+        hidden,
+        [heads * head_dim // partition] * 3,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        tp_group=SimpleNamespace(world_size=2, rank_in_group=tp_rank),
     )
-    shard.output_dim = 0
-    assert _copy_grouped_qkv_tp_ulysses_shard(
-        shard,
-        dense,
-        num_query_groups=NUM_HEADS,
-        head_dim=HEAD_DIM,
-        tp_rank=tp_rank,
-        tp_size=TP_SIZE,
-        ulysses_rank=ulysses_rank,
-        ulysses_size=ULYSSES_SIZE,
+    attention = SimpleNamespace(
+        qkv_proj=projection,
+        tp_size=2,
+        _use_ulysses_gather_qkv=sharded,
+        _ulysses_size=2,
+        _ulysses_rank=ulysses_rank,
     )
-    return shard.reshape(3, local_heads, HEAD_DIM, HIDDEN)
-
-
-def test_tp2_u2_shards_reconstruct_dense_qkv() -> None:
-    dense = _dense_weight()
-    baseline = _reorder_grouped_qkv_to_qkv(
-        dense,
-        num_query_groups=NUM_HEADS,
-        heads_per_group=1,
-        head_dim=HEAD_DIM,
-    ).reshape(3, NUM_HEADS, HEAD_DIM, HIDDEN)
-    reconstructed = torch.cat(
-        [
-            torch.cat(
-                [
-                    _rank_shard(dense, tp_rank=tp_rank, ulysses_rank=ulysses_rank)
-                    for ulysses_rank in range(ULYSSES_SIZE)
-                ],
-                dim=1,
-            )
-            for tp_rank in range(TP_SIZE)
-        ],
-        dim=1,
+    MiniMaxH3Attention._install_qkv_weight_loader(
+        attention,
+        SimpleNamespace(num_attention_heads=heads, attention_head_dim=head_dim),
     )
-    torch.testing.assert_close(reconstructed, baseline, rtol=0, atol=0)
-
-    for ulysses_rank in range(ULYSSES_SIZE):
-        reordered = _reorder_grouped_qkv_to_ulysses_qkv(
-            dense,
-            num_query_groups=NUM_HEADS,
-            head_dim=HEAD_DIM,
-            tp_size=TP_SIZE,
-            ulysses_size=ULYSSES_SIZE,
-            ulysses_rank=ulysses_rank,
-        ).reshape(3, NUM_HEADS // ULYSSES_SIZE, HEAD_DIM, HIDDEN)
-        expected = torch.cat(
-            [
-                _rank_shard(dense, tp_rank=tp_rank, ulysses_rank=ulysses_rank)
-                for tp_rank in range(TP_SIZE)
-            ],
-            dim=1,
-        )
-        torch.testing.assert_close(reordered, expected, rtol=0, atol=0)
-
-
-def test_tp2_u2_gather_project_matches_tp_local_projection() -> None:
-    dense = _dense_weight()
-    gathered_x = torch.tensor(
-        [
-            [0.25, -0.50, 0.75],
-            [1.00, 0.50, -0.25],
-            [-1.00, 0.25, 0.50],
-            [0.75, -0.75, 0.25],
-        ],
-        dtype=torch.float32,
+    dense = torch.arange(heads * 3 * head_dim * hidden, dtype=torch.bfloat16).reshape(
+        -1, hidden
     )
-    for tp_rank in range(TP_SIZE):
-        u_weights = [
-            _rank_shard(dense, tp_rank=tp_rank, ulysses_rank=ulysses_rank)
-            for ulysses_rank in range(ULYSSES_SIZE)
-        ]
-        tp_weight = torch.cat(u_weights, dim=1)
-        baseline = torch.einsum("si,qhdi->sqhd", gathered_x, tp_weight.float())
-        candidate = torch.cat(
-            [
-                torch.einsum("si,qhdi->sqhd", gathered_x, weight.float())
-                for weight in u_weights
-            ],
-            dim=2,
-        )
-        torch.testing.assert_close(candidate, baseline, rtol=0, atol=0)
+    if not contiguous:
+        dense = dense.t().contiguous().t()
+    assert dense.is_contiguous() == contiguous
+    projection.weight.weight_loader(projection.weight, dense)
+    local_heads = heads // (2 * partition)
+    start = (tp_rank * partition + (ulysses_rank if sharded else 0)) * local_heads
+    expected = dense.reshape(heads, 3, head_dim, hidden)[start : start + local_heads]
+    expected = expected.permute(1, 0, 2, 3).reshape_as(projection.weight)
+    torch.testing.assert_close(projection.weight, expected, rtol=0, atol=0)
