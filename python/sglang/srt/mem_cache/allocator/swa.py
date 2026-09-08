@@ -463,17 +463,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # First token of every page the segment touches.
         reps = free_index[::ps]
         swa_tokens = self.full_to_swa_index_mapping[reps]
-        # A rep that reads as the padding slot (0) owns no SWA page. That is a
-        # legitimate state, not a caller bug: SWAComponent.evict_component
-        # deliberately hands us the FULL indices of nodes whose slots have no
-        # SWA pair -- window-evicted tails, and every prefix the external cache
-        # linker loaded with the SWA component skipped under unified KV.
-        # free_page_ids() does no dedup ("no page twice, no dedup"), so keeping
-        # these would push reserved page 0 once per unmapped rep and drive
-        # swa_attn_allocator.available_size() past .size -- the assert in
-        # free_group_end() -- and, unguarded, hand the padding slot out as a
-        # real KV page. Drop them, exactly as _release_swa() does on the
-        # set-shaped path.
+        # Reps with no SWA peer read as the padding slot 0 and are passed
+        # deliberately (see SWAComponent.evict_component). Drop them as
+        # _release_swa does: free_page_ids does not dedup, so page 0 would
+        # otherwise be freed once per unmapped rep.
         swa_tokens = swa_tokens[swa_tokens > 0]
 
         if ps == 1:
