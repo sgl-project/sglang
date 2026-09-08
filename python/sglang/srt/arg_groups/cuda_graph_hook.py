@@ -244,10 +244,6 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             lambda: resolved_view(server_args).attn_cp_size > 1,
         ),
         ("CUDA graph debug mode", lambda: cfg.debug_cuda_graph),
-        (
-            "DSA prefill context parallelism",
-            lambda: cfg.enable_dsa_prefill_context_parallel,
-        ),
         # Capture builds a dummy extend forward with attn_dcp_metadata=None.
         (
             "decode context parallel (dcp_size > 1)",
@@ -275,10 +271,17 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     """
 
     cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.configs.model_config import (
+        is_deepseek_v4,
+        uses_kda_attention,
+    )
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
     rules = [
+        (
+            "KDA hybrid linear attention",
+            lambda: uses_kda_attention(model_config_of(server_args).hf_config),
+        ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
         # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
         (
