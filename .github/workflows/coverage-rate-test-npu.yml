@@ -1,4 +1,4 @@
-name: PR Test (NPU)
+name: Coverage Rate Test (NPU)
 
 on:
   push:
