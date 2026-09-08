@@ -61,6 +61,39 @@ def token_req_indices(forward_batch) -> torch.Tensor:
     return torch.repeat_interleave(req, forward_batch.extend_seq_lens.to(torch.int64))
 
 
+def topk_from_scores(
+    s: torch.Tensor,
+    lens: torch.Tensor,
+    topk: int,
+    candidate_blocks: Optional[int] = None,
+    candidate_block_size: Optional[int] = None,
+    consume: Optional[torch.Tensor] = None,
+    select_candidate_blocks=None,
+):
+    """Masked two-level top-k over compressed-position scores.
+
+    s [rows, n]; lens [rows] = visible compressed length per row; returns
+    (idx [rows, k] in position order, reach [rows, k], candidate mask or None).
+    Pure torch so the NPU eager path and the CANNON device leg share it.
+    """
+    j = torch.arange(s.shape[-1], device=s.device)
+    s = s.masked_fill(j[None, :] >= lens[:, None], -torch.inf)
+    masks = None
+    if candidate_blocks:
+        masks = select_candidate_blocks(
+            s,
+            lens[:, None],
+            topk_blocks=candidate_blocks,
+            block_size=candidate_block_size,
+        )
+    elif consume is not None:
+        s = s.masked_fill(~consume, -torch.inf)
+    k = min(topk, s.shape[-1])
+    idx = s.topk(k, dim=-1, sorted=False).indices.sort(dim=-1).values
+    reach = idx < lens[:, None]
+    return idx, reach, masks
+
+
 def rope_tail(
     x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inverse: bool = False
 ) -> torch.Tensor:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
@@ -17,14 +18,16 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
-from sglang.srt.hardware_backend.npu.dsv4.dsv41_compressor import (
-    LowRatioCompressResult,
-    compress_low_ratio_batch,
-)
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.attention.dsv4.dsv41_compressor import (
+    last_token_per_request,
+)
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
+    token_req_indices,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -212,7 +215,7 @@ class CompressorAscendBackendMixin:
             setattr(fm, k, v)
         if not is_decode:
             for ratio in self._dsv4_compress_ratios:
-                if ratio in (4, 128):
+                if ratio in (1, 2, 4, 128):
                     if f"c{ratio}_loc" not in result:
                         setattr(fm, f"c{ratio}_loc", None)
             # _compute_compress_locs builds positions_cmp_padding / start_pos /
@@ -225,6 +228,27 @@ class CompressorAscendBackendMixin:
 
         if _verify_compress:
             self._build_npu_compress_metadata_verify(forward_batch)
+
+        # Compute c1/c2 loc from full loc (NPU allocator only covers c4/c128).
+        # Must run AFTER the None-overwrite block above. c{ratio}_loc =
+        # full_loc // ratio for tokens that complete a group; the
+        # _low_ratio_compress_torch group_mask filters the rest.
+        raw_loc = forward_batch.out_cache_loc
+        if raw_loc is not None and raw_loc.numel() > 0:
+            pos = forward_batch.positions.to(torch.int64)
+            for ratio in self._dsv4_compress_ratios:
+                if ratio not in (1, 2):
+                    continue
+                existing = getattr(fm, f"c{ratio}_loc", None)
+                if existing is not None:
+                    continue
+                completes = (pos + 1) % ratio == 0
+                loc = torch.where(
+                    completes,
+                    raw_loc.to(torch.int64) // ratio,
+                    torch.zeros_like(raw_loc, dtype=torch.int64),
+                )
+                setattr(fm, f"c{ratio}_loc", loc)
 
     def _build_npu_compress_metadata_prefill(self, forward_batch: ForwardBatch) -> None:
         # eager-only: prefill is never graph-captured, host reads (cu_cpu) are safe here
@@ -245,7 +269,7 @@ class CompressorAscendBackendMixin:
         )
         prefix_cpu = self._extend_prefix_lens_cpu(forward_batch)
         ratio_lists: dict = {
-            r: [] for r in self._dsv4_unique_compress_ratios if r in (4, 128)
+            r: [] for r in self._dsv4_unique_compress_ratios if r in (1, 2, 4, 128)
         }
         for idx in range(bs):
             start = int(cu_cpu[idx])
@@ -267,7 +291,7 @@ class CompressorAscendBackendMixin:
                         * ratio
                     )
 
-        for ratio in (4, 128):
+        for ratio in (1, 2, 4, 128):
             if ratio not in ratio_lists:
                 continue
             padding_size = min(t, t // ratio + bs)
@@ -301,11 +325,11 @@ class CompressorAscendBackendMixin:
         # densely packed in batch order to match cmp_kv. Valid under chunked prefill:
         # each chunk writes only the ratio-blocks it newly completed.
         bundle = forward_batch.out_cache_loc_dsv4
-        for ratio in (4, 128):
+        for ratio in (1, 2, 4, 128):
             if ratio not in ratio_lists:
                 continue
             bundle_loc = (
-                (bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc)
+                getattr(bundle, f"out_c{ratio}_loc", None)
                 if bundle is not None
                 else None
             )
@@ -340,7 +364,7 @@ class CompressorAscendBackendMixin:
         else:
             seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
         for ratio in self._dsv4_unique_compress_ratios:
-            if ratio not in (4, 128):
+            if ratio not in (1, 2, 4, 128):
                 continue
             bundle_loc = None
 
@@ -394,7 +418,7 @@ class CompressorAscendBackendMixin:
             valid = seq_lens > 0
             positions_last = torch.clamp(seq_lens - 1, min=0)
             for ratio in self._dsv4_unique_compress_ratios:
-                if ratio not in (4, 128):
+                if ratio not in (1, 2, 4, 128):
                     continue
                 padding_size = min(bs, bs // ratio + bs)
                 should_compress = ((seq_lens % ratio) == 0) & valid
@@ -409,63 +433,216 @@ class CompressorAscendBackendMixin:
 
         return result
 
+    def forward_low_ratio_sources(
+        self, *, layer, x, q_lora, positions, forward_batch: ForwardBatch
+    ) -> None:
+        """V4.1 ratio-1/2 orchestration (bond semantics, NPU carriers).
+
+        Extend/decode both run the torch pairing path for bring-up: the
+        data-dependent grouping is eager-only until aclgraph lands, and every
+        write goes through the NPU pool (PA_ND bf16 latents, quantized
+        indexer K) instead of the CUDA fused stores.
+        """
+        if forward_batch.forward_mode.is_idle():
+            return
+
+        req = token_req_indices(forward_batch)
+        pos = positions.to(torch.int64)
+        fm = self.forward_metadata
+        if layer.compressor is not None:
+            if is_npu_arch35():
+                self._low_ratio_compress_torch(layer, x, req, pos, fm, forward_batch)
+            else:
+                raise "Not supported"
+        if layer.indexer is not None:
+            if is_npu_arch35():
+                self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos, fm)
+            else:
+                raise "Not supported"
+
+    def _low_ratio_compress_torch(self, layer, x, req, pos, fm, forward_batch):
+        pool = self.token_to_kv_pool
+        ratio = layer.compress_ratio
+        kv, score = layer.compressor.project(x)
+        out_loc = getattr(fm, f"c{ratio}_loc", None)
+        if out_loc is None:
+            raise RuntimeError(
+                f"c{ratio}_loc missing from NPU DSV4 metadata; the allocator "
+                "must cover low ratios before the compressor can run"
+            )
+        if ratio == 1:
+            group_mask = torch.ones_like(pos, dtype=torch.bool)
+            group_pos = pos
+            pooled = kv
+        else:
+            odd = pos % 2 == 1
+            paired_in_batch = torch.zeros_like(odd)
+            paired_in_batch[1:] = (req[1:] == req[:-1]) & (pos[1:] == pos[:-1] + 1)
+            kv_partner = torch.empty_like(kv)
+            score_partner = torch.empty_like(score)
+            idx = (odd & paired_in_batch).nonzero().squeeze(1)
+            kv_partner[idx] = kv[idx - 1]
+            score_partner[idx] = score[idx - 1]
+            state_kv = pool.c2_pair_kv_state[layer.layer_id]
+            state_score = pool.c2_pair_score_state[layer.layer_id]
+            idx = (odd & ~paired_in_batch).nonzero().squeeze(1)
+            kv_partner[idx] = state_kv[req[idx]]
+            score_partner[idx] = state_score[req[idx]]
+            # The request's last even token waits in the state for its partner.
+            pending = last_token_per_request(~odd, req)
+            state_kv[req[pending]] = kv[pending]
+            state_score[req[pending]] = score[pending]
+            group_mask = odd
+            group_pos = pos[odd] - 1
+            pooled = layer.compressor.pool_pairs(
+                torch.stack([kv_partner[odd], kv[odd]], dim=1),
+                torch.stack([score_partner[odd], score[odd]], dim=1),
+            )
+        if not bool(group_mask.any()):
+            return
+        self._low_ratio_write_group(
+            layer, pooled, out_loc[group_mask], group_pos, forward_batch
+        )
+
+    def _low_ratio_write_group(self, layer, pooled, slots, group_pos, forward_batch):
+        """Pre-RoPE latent publishes indexer keys first, then rope + store.
+
+        A3 keeps the latent on the fp4 grid (reference parity) but stores the
+        bf16 PA_ND layout; A5 may swap in the fp4 store later.
+        """
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4
+
+        latent = layer.compressor.finish(pooled)
+        freqs = layer.freqs_cis[group_pos]
+        if layer.indexer is not None and layer.indexer.owns_k:
+            index_k = layer.indexer.index_keys(latent, freqs)
+            # A3 keeps the indexer K on andy's dedicated quantized buffer
+            # (li_kv_dtype routing inside the epilog); bf16 by default.
+            self._compressor_epilog_npu(
+                SimpleNamespace(
+                    ratio=layer.compress_ratio,
+                    is_in_indexer=True,
+                    layer_id=layer.layer_id,
+                    li_kv_dtype=getattr(layer.indexer, "li_kv_dtype", "bf16"),
+                ),
+                index_k,
+                forward_batch,
+                override_loc=slots,
+            )
+        # A3 stores the bf16 PA_ND latent on the fp4 grid (reference parity).
+        latent = _rope_fq4(latent, freqs, layer.rope_head_dim)
+        self._compressor_epilog_npu(
+            SimpleNamespace(
+                ratio=layer.compress_ratio,
+                is_in_indexer=False,
+                layer_id=layer.layer_id,
+                li_kv_dtype="bf16",
+            ),
+            latent,
+            forward_batch,
+            override_loc=slots,
+        )
+
+    def _low_ratio_index_topk_torch(self, layer, x, q_lora, req, pos, fm):
+        """Eager torch top-k for the low-ratio indexer (bond semantics; the
+        DeepGEMM paged decode path is CUDA-only and aclgraph-deferred).
+
+        Produces per-token top-k compressed-position indices (+ page rows) and
+        publishes candidate masks for the downstream candidate consumers; the
+        attention op consumes them through the metadata stashed on fm.
+        """
+        from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
+            topk_from_scores,
+        )
+        from sglang.srt.layers.attention.dsv4.indexer import (
+            select_candidate_blocks,
+        )
+
+        pool = self.token_to_kv_pool
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        total = int(req.numel())
+        topk = indexer.index_topk
+        page_indices = torch.full(
+            (total, topk), -1, dtype=torch.int32, device=x.device
+        )
+        raw_indices = torch.full_like(page_indices, -1)
+        compress_lens = (pos + 1) // ratio
+        q = indexer.queries(q_lora, layer.freqs_cis[pos])
+        weights = indexer.head_weights(x)
+        publish = [] if indexer.is_candidate_source else None
+        consume_masks = getattr(fm, "dsv41_candidate_masks", None)
+        for b, r in enumerate(torch.unique_consecutive(req).tolist()):
+            tok = (req == r).nonzero().squeeze(1)
+            lens = compress_lens[tok]
+            lc = int(lens.max().item())
+            if lc == 0:
+                continue
+            j = torch.arange(lc, device=pos.device)
+            slots_j = (
+                self.req_to_token[r, j * ratio].to(torch.int64) // ratio
+            )
+            # NPU stores indexer K in PA_ND buffer (bf16 or fp8 on A5).
+            # NPU does not support indexing on FP8, so view as uint8 first.
+            compress_ratio = layer.compress_ratio
+            indexer_pool = pool._indexer_pool(compress_ratio)
+            if hasattr(indexer_pool, "index_k_buffer"):
+                source = pool.latent_source_layer(layer.layer_id)
+                source_slot = pool.low_ratio_sources[compress_ratio].index(source)
+                buf = indexer_pool.get_index_k(source_slot)
+                d = buf.shape[-1]
+                if buf.dtype == torch.float8_e4m3fn:
+                    gathered = buf.view(torch.uint8).reshape(-1, d)[slots_j]
+                    index_k = gathered.view(torch.float8_e4m3fn).to(torch.bfloat16)
+                else:
+                    index_k = buf.reshape(-1, d)[slots_j].to(torch.bfloat16)
+            else:
+                index_k = pool.get_low_ratio_index_k_dequant(
+                    layer.layer_id, slots_j
+                )
+            k = min(topk, lc)
+            idx, reach, masks = topk_from_scores(
+                indexer.scores(q[tok], index_k, weights[tok]),
+                lens,
+                topk,
+                candidate_blocks=(
+                    indexer.candidate_topk_blocks
+                    if indexer.is_candidate_source
+                    else None
+                ),
+                candidate_block_size=indexer.candidate_block_size,
+                consume=(
+                    consume_masks[b][tok]
+                    if consume_masks is not None and indexer.uses_candidates
+                    else None
+                ),
+                select_candidate_blocks=select_candidate_blocks,
+            )
+            page_indices[tok, :k] = torch.where(reach, slots_j[idx], -1).to(
+                torch.int32
+            )
+            raw_indices[tok, :k] = torch.where(reach, idx, -1).to(torch.int32)
+            if publish is not None and masks is not None:
+                publish.append(masks)
+        fm.dsv41_low_ratio_topk_pages = page_indices
+        fm.dsv41_low_ratio_topk_raw = raw_indices
+        if publish is not None:
+            fm.dsv41_candidate_masks = (
+                torch.cat(publish) if len(publish) > 1 else publish[0]
+            )
+
     def forward_core_compressor(
         self,
         x: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
         compressor,
-    ) -> Optional[LowRatioCompressResult]:
-        """C4/C128 publish cache as before; C1/C2 return a pre-RoPE result.
-
-        Low-ratio callers must consume the result via the future V4.1 NPU
-        indexer/cache path; this is not a replacement for
-        ``forward_low_ratio_sources``, which also publishes index/top-k data.
-        """
+    ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        if getattr(compressor, "compress_ratio", None) in (1, 2):
-            return self.forward_low_ratio_compressor(
-                compressor=compressor,
-                x=x,
-                positions=forward_batch.positions,
-                forward_batch=forward_batch,
-                layer_id=layer_id,
-            )
         compressor(x, forward_batch)
-
-    def forward_low_ratio_compressor(
-        self,
-        *,
-        compressor,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-    ) -> Optional[LowRatioCompressResult]:
-        """Run C1/C2 only, returning normalized latents before RoPE/FP4.
-
-        Reuses the GPU model weights and source-owned C2 pending-pair state.
-        It does not use the C4/C128 fused-op state ABI or write those pools.
-        """
-        if forward_batch.forward_mode.is_idle():
-            return None
-        parallel = get_parallel()
-        if (
-            getattr(parallel, "attn_cp_size", 1) != 1
-            or getattr(parallel, "attn_dcp_size", 1) != 1
-        ):
-            raise NotImplementedError(
-                "NPU C1/C2 Compress does not support CP-sharded inputs"
-            )
-        return compress_low_ratio_batch(
-            compressor=compressor,
-            x=x,
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            token_to_kv_pool=self.token_to_kv_pool,
-        )
 
     def forward_compress(
         self,
@@ -1482,7 +1659,7 @@ class DeepseekV4AscendAttnBackend(
         fm = ctx.fm
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
         for ratio in self._dsv4_unique_compress_ratios:
-            if ratio not in (4, 128):
+            if ratio not in (1, 2, 4, 128):
                 continue
             loc = None
             if bundle is not None:
@@ -1492,7 +1669,7 @@ class DeepseekV4AscendAttnBackend(
         valid = ctx.live_seq_lens > 0
         positions_last = torch.clamp(ctx.live_seq_lens - 1, min=0)
         for ratio in self._dsv4_unique_compress_ratios:
-            if ratio not in (4, 128):
+            if ratio not in (1, 2, 4, 128):
                 continue
             should_compress = ((ctx.live_seq_lens % ratio) == 0) & valid
             dst = getattr(fm, f"positions_cmp_padding_c{ratio}")
@@ -1551,7 +1728,7 @@ class DeepseekV4AscendAttnBackend(
         if bundle is None:
             return
         for ratio in self._dsv4_unique_compress_ratios:
-            if ratio not in (4, 128):
+            if ratio not in (1, 2, 4, 128):
                 continue
             loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
             self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
@@ -1915,11 +2092,9 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
-        # todo
-        return torch.zeros_like(q)
-        if compress_ratio not in (0, 4, 128):
+        if compress_ratio not in (0, 1, 2, 4, 128):
             raise ValueError(
-                f"V4 attention expects compress_ratio in (0, 4, 128); got {compress_ratio}"
+                f"V4 attention expects compress_ratio in (0, 1, 2, 4, 128); got {compress_ratio}"
             )
         # idle ranks only feed the MoE collectives; skip attn + store_cache and return zeros
         if forward_batch.forward_mode.is_idle():
@@ -1930,10 +2105,195 @@ class DeepseekV4AscendAttnBackend(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
         if compress_ratio == 0:
+            if os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1":
+                return self._forward_swa_native(
+                    q, layer, forward_batch, attn_sink
+                )
             return self._forward_swa(q, layer, forward_batch, attn_sink)
+        if os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1":
+            return self._forward_compressed_native(
+                q, layer, forward_batch, attn_sink, compress_ratio
+            )
         return self._forward_compressed(
             q, layer, forward_batch, attn_sink, compress_ratio
         )
+
+    # ---- Native PyTorch attention fallback (SGLANG_DSV4_NATIVE_ATTN=1) ----
+
+    @staticmethod
+    def _gather_paged_kv(kv_buffer, block_table_row, kv_len, D):
+        """Gather KV from PA_ND paged buffer: (num_pages, page_size, 1, D)."""
+        page_size = kv_buffer.shape[1]
+        num_pages = (kv_len + page_size - 1) // page_size
+        page_ids = block_table_row[:num_pages].to(torch.int64).reshape(-1)
+        pages = kv_buffer[page_ids]
+        return pages.reshape(-1, D)[:kv_len]
+
+    def _forward_swa_native(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        attn_sink: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Pure PyTorch SWA attention — no NPU sparse kernel."""
+        fm = self.forward_metadata
+        pool = self.token_to_kv_pool
+        ori_kv = pool.get_swa_buffer(layer.layer_id)
+        cu_seqlens = fm.actual_seq_lengths_q_pa
+        kv_lens = fm.actual_seq_lengths_kv
+        block_table = fm.swa_page_table
+        swa_window = self._dsv4_sliding_window_size
+        T, H, D = q.shape
+        B = cu_seqlens.shape[0] - 1
+        scale = layer.scaling
+        outputs = []
+        for i in range(B):
+            q_start = int(cu_seqlens[i])
+            q_end = int(cu_seqlens[i + 1])
+            q_len_i = q_end - q_start
+            kv_len_i = int(kv_lens[i])
+            if q_len_i == 0:
+                continue
+            if kv_len_i == 0:
+                outputs.append(q.new_zeros(q_len_i, H, D))
+                continue
+            kv_seq = self._gather_paged_kv(ori_kv, block_table[i], kv_len_i, D)
+            q_i = q[q_start:q_end]
+            scores = torch.matmul(
+                q_i.transpose(0, 1).float(), kv_seq.transpose(0, 1).float()
+            ) * scale
+            q_pos = torch.arange(q_len_i, device=q.device)
+            k_pos = torch.arange(kv_len_i, device=q.device)
+            q_global = q_pos + (kv_len_i - q_len_i)
+            causal = k_pos[None, :] <= q_global[:, None]
+            swa_m = k_pos[None, :] >= (q_global[:, None] - swa_window + 1)
+            mask = causal & swa_m
+            if attn_sink is not None:
+                n_heads_eff = min(H, attn_sink.shape[0])
+                sink_bias = (
+                    attn_sink[:n_heads_eff]
+                    .float()
+                    .view(n_heads_eff, 1, 1)
+                    .expand(n_heads_eff, q_len_i, 1)
+                )
+                if n_heads_eff < H:
+                    pad = torch.zeros(H - n_heads_eff, q_len_i, 1, device=q.device)
+                    sink_bias = torch.cat([sink_bias, pad], dim=0)
+                scores = torch.cat([sink_bias, scores], dim=-1)
+                sink_mask = torch.ones(q_len_i, 1, dtype=torch.bool, device=q.device)
+                mask = torch.cat([sink_mask, mask], dim=-1)
+            scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+            attn = torch.softmax(scores, dim=-1)
+            if attn_sink is not None:
+                attn_kv = attn[..., 1:]
+            else:
+                attn_kv = attn
+            out_i = torch.matmul(
+                attn_kv, kv_seq.unsqueeze(0).float()
+            ).to(q.dtype).squeeze(0)
+            outputs.append(out_i.transpose(0, 1))
+        if not outputs:
+            return q.new_zeros(T, H, D)
+        return torch.cat(outputs, dim=0)
+
+    def _forward_compressed_native(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        attn_sink: Optional[torch.Tensor],
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        """Pure PyTorch compressed attention — no NPU sparse kernel."""
+        fm = self.forward_metadata
+        pool = self.token_to_kv_pool
+        ori_kv = pool.get_swa_buffer(layer.layer_id)
+        cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
+        cu_seqlens = fm.actual_seq_lengths_q_pa
+        kv_lens = fm.actual_seq_lengths_kv
+        swa_block_table = fm.swa_page_table
+        cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
+        swa_window = self._dsv4_sliding_window_size
+        T, H, D = q.shape
+        B = cu_seqlens.shape[0] - 1
+        scale = layer.scaling
+        outputs = []
+        for i in range(B):
+            q_start = int(cu_seqlens[i])
+            q_end = int(cu_seqlens[i + 1])
+            q_len_i = q_end - q_start
+            kv_len_i = int(kv_lens[i])
+            if q_len_i == 0:
+                continue
+            if kv_len_i == 0:
+                outputs.append(q.new_zeros(q_len_i, H, D))
+                continue
+            q_i = q[q_start:q_end]
+            # SWA KV
+            swa_kv = self._gather_paged_kv(
+                ori_kv, swa_block_table[i], kv_len_i, D
+            )
+            # Compressed KV
+            cmp_len_i = kv_len_i // compress_ratio
+            if cmp_len_i > 0 and cmp_kv is not None:
+                c_kv = self._gather_paged_kv(
+                    cmp_kv, cmp_block_table[i], cmp_len_i, D
+                )
+            else:
+                c_kv = None
+            # Build keys: [swa_kv; compressed_kv]
+            all_kv = swa_kv
+            if c_kv is not None:
+                all_kv = torch.cat([swa_kv, c_kv], dim=0)
+            n_keys = all_kv.shape[0]
+            scores = torch.matmul(
+                q_i.transpose(0, 1).float(), all_kv.transpose(0, 1).float()
+            ) * scale
+            q_pos = torch.arange(q_len_i, device=q.device)
+            k_pos = torch.arange(n_keys, device=q.device)
+            q_global = q_pos + (kv_len_i - q_len_i)
+            # SWA mask for first kv_len_i keys
+            swa_causal = k_pos[:kv_len_i][None, :] <= q_global[:, None]
+            swa_win = k_pos[:kv_len_i][None, :] >= (
+                q_global[:, None] - swa_window + 1
+            )
+            swa_mask = swa_causal & swa_win
+            # Compressed keys: attend to all positions up to kv_len
+            n_cmp = n_keys - kv_len_i if c_kv is not None else 0
+            if n_cmp > 0:
+                cmp_mask = k_pos[kv_len_i:][None, :] <= q_global[:, None]
+                full_mask = torch.cat([swa_mask, cmp_mask], dim=1)
+            else:
+                full_mask = swa_mask
+            # Attention sink
+            if attn_sink is not None:
+                n_heads_eff = min(H, attn_sink.shape[0])
+                sink_bias = (
+                    attn_sink[:n_heads_eff]
+                    .float()
+                    .view(n_heads_eff, 1, 1)
+                    .expand(n_heads_eff, q_len_i, 1)
+                )
+                if n_heads_eff < H:
+                    pad = torch.zeros(H - n_heads_eff, q_len_i, 1, device=q.device)
+                    sink_bias = torch.cat([sink_bias, pad], dim=0)
+                scores = torch.cat([sink_bias, scores], dim=-1)
+                sink_mask = torch.ones(q_len_i, 1, dtype=torch.bool, device=q.device)
+                full_mask = torch.cat([sink_mask, full_mask], dim=-1)
+            scores = scores.masked_fill(~full_mask.unsqueeze(0), float("-inf"))
+            attn = torch.softmax(scores, dim=-1)
+            if attn_sink is not None:
+                attn_kv = attn[..., 1:]
+            else:
+                attn_kv = attn
+            out_i = torch.matmul(
+                attn_kv, all_kv.unsqueeze(0).float()
+            ).to(q.dtype).squeeze(0)
+            outputs.append(out_i.transpose(0, 1))
+        if not outputs:
+            return q.new_zeros(T, H, D)
+        return torch.cat(outputs, dim=0)
 
     def _forward_swa(
         self,
@@ -2090,7 +2450,7 @@ class DeepseekV4AscendAttnBackend(
         # already pass expanded lengths and are not incremented again.
         verify_seq_lens_cpu = fm.seq_lens_cpu_int[:bs]
         padding_sizes = {}
-        for ratio in (4, 128):
+        for ratio in (1, 2, 4, 128):
             if ratio not in self._dsv4_compress_ratios:
                 continue
             padding_size = max(1, min(t, t // ratio + bs))
@@ -2107,7 +2467,7 @@ class DeepseekV4AscendAttnBackend(
         _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
         if _bundle is not None:
             for ratio in self._dsv4_unique_compress_ratios:
-                if ratio not in (4, 128):
+                if ratio not in (1, 2, 4, 128):
                     continue
                 bl = _bundle.out_c4_loc if ratio == 4 else _bundle.out_c128_loc
                 if bl is None:

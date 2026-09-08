@@ -16,6 +16,7 @@ There is no paged state allocator or ``cache_mode=1`` compatibility storage.
 from __future__ import annotations
 
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -69,7 +70,8 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
         if self.store_dtype != torch.bfloat16:
             return super().create_buffer(num_pages=num_pages)
-        if is_npu_arch35():
+        _native_attn = os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1"
+        if is_npu_arch35() and not _native_attn:
             kv_dim = self.a5_packed_kv_dim
             kv_dtype = torch.float8_e4m3fn
         else:
@@ -559,7 +561,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """
         # Index by raw layer_id (see get_swa_buffer) to avoid bucket collision.
         buf = self.swa_kv_pool.kv_buffer[layer_id]
-        if is_npu_arch35():
+        _native_attn = os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1"
+        if is_npu_arch35() and not _native_attn:
             self._write_a5_packed_kv(buf=buf, loc=loc, cache=cache)
             return
         buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
@@ -692,7 +695,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
             buf = compress_pool.kv_buffer[compress_layer_id]
-            if is_npu_arch35():
+            _native_attn = os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1"
+            if is_npu_arch35() and not _native_attn:
                 self._write_a5_packed_kv(buf=buf, loc=loc, cache=kv)
                 return
             buf_flat = buf.flatten(0, 1)
