@@ -2308,37 +2308,37 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
-        if _is_npu:
-            if not is_npu_arch35():
-                return torch.ops.custom.npu_hc_post(x, residual, post, comb)
-            # The A5 build of npu_hc_post is batched — it requires a leading
-            # batch axis on every operand.
-            return torch.ops.custom.npu_hc_post(
-                x.unsqueeze(0),
-                residual.unsqueeze(0),
-                post.unsqueeze(0),
-                comb.unsqueeze(0),
-            ).squeeze(0)
-
-        if _is_xpu:
-            return _get_mhc_ops().mhc_post(x, residual, post, comb)
-
-        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
-            from flashinfer.mhc import mhc_post
-
-            return mhc_post(x, residual, post, comb)
-
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            from sglang.kernels.ops.layernorm.mhc import mhc_post
-
-            return mhc_post(x, residual, post, comb)
-
-        elif _is_hip:
-            from aiter.ops.mhc import mhc_post
-
-            result = torch.empty_like(residual)
-            mhc_post(result, x, residual, post, comb)
-            return result
+        # if _is_npu:
+        #     if not is_npu_arch35():
+        #         return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+        #     # The A5 build of npu_hc_post is batched — it requires a leading
+        #     # batch axis on every operand.
+        #     return torch.ops.custom.npu_hc_post(
+        #         x.unsqueeze(0),
+        #         residual.unsqueeze(0),
+        #         post.unsqueeze(0),
+        #         comb.unsqueeze(0),
+        #     ).squeeze(0)
+        #
+        # if _is_xpu:
+        #     return _get_mhc_ops().mhc_post(x, residual, post, comb)
+        #
+        # if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
+        #     from flashinfer.mhc import mhc_post
+        #
+        #     return mhc_post(x, residual, post, comb)
+        #
+        # if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        #     from sglang.kernels.ops.layernorm.mhc import mhc_post
+        #
+        #     return mhc_post(x, residual, post, comb)
+        #
+        # elif _is_hip:
+        #     from aiter.ops.mhc import mhc_post
+        #
+        #     result = torch.empty_like(residual)
+        #     mhc_post(result, x, residual, post, comb)
+        #     return result
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
