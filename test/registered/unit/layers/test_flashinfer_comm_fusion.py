@@ -296,6 +296,252 @@ class TestFlashInferTrtllmMoeAllReduce(CustomTestCase):
         self.assertIs(second_residual, residual_out)
         run.assert_called_once()
 
+    def test_happy_path_defers_to_next_layer_without_duplicate_fusion(self):
+        from sglang.srt.layers import communicator as communicator_module
+        from sglang.srt.layers.communicator import LayerCommunicator
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            FlashInferTrtllmDeferredFinalizeOutput,
+        )
+        from sglang.srt.layers.moe.topk import TopKOutputFormat
+        from sglang.srt.models import deepseek_v2
+
+        class ForwardFlags:
+            flashinfer_trtllm_bypass = False
+            fuse_mlp_allreduce = False
+            mlp_reduce_scatter = False
+
+            @contextlib.contextmanager
+            def scoped(self, **kwargs):
+                previous = {name: getattr(self, name) for name in kwargs}
+                for name, value in kwargs.items():
+                    setattr(self, name, value)
+                try:
+                    yield self
+                finally:
+                    for name, value in previous.items():
+                        setattr(self, name, value)
+
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        hidden_states = torch.randn(1, 7168, device=device, dtype=dtype)
+        residual = torch.randn_like(hidden_states)
+        gemm2_out = torch.randn(8, 7168, device=device, dtype=dtype)
+        expert_weights = torch.randn(1, 8, device=device, dtype=dtype)
+        expanded_idx = torch.arange(8, device=device, dtype=torch.int32).view(1, 8)
+        shared_output = torch.randn_like(hidden_states)
+        workspace_ptrs = torch.zeros(13, device=device, dtype=torch.int64)
+
+        deferred_output = FlashInferTrtllmDeferredFinalizeOutput(
+            gemm2_out=gemm2_out,
+            expert_weights=expert_weights,
+            expanded_idx_to_permuted_idx=expanded_idx,
+            top_k=8,
+        )
+        experts = SimpleNamespace(
+            supports_deferred_finalize=True,
+            forward_deferred_finalize=MagicMock(return_value=deferred_output),
+            quant_method=object(),
+            moe_runner_config=SimpleNamespace(inplace=True),
+        )
+        moe = object.__new__(deepseek_v2.DeepseekV2MoE)
+        torch.nn.Module.__init__(moe)
+        object.__setattr__(moe, "_enable_a2a_moe", False)
+        object.__setattr__(moe, "_can_dual_stream_graph", MagicMock(return_value=False))
+        object.__setattr__(moe, "alt_stream", torch.cuda.Stream())
+        object.__setattr__(moe, "num_fused_shared_experts", 0)
+        object.__setattr__(moe, "_shared_expert_tp1", False)
+        object.__setattr__(
+            moe, "_maybe_quant_moe_input_once", MagicMock(return_value=None)
+        )
+        object.__setattr__(
+            moe,
+            "gate",
+            MagicMock(return_value=torch.zeros(1, 8, device=device)),
+        )
+        object.__setattr__(
+            moe,
+            "topk",
+            MagicMock(return_value=SimpleNamespace(format=TopKOutputFormat.BYPASSED)),
+        )
+        object.__setattr__(moe, "experts", experts)
+        object.__setattr__(
+            moe, "_forward_shared_experts", MagicMock(return_value=shared_output)
+        )
+
+        producer_communicator = SimpleNamespace(
+            prepare_attn_and_capture_last_layer_outputs=MagicMock(
+                return_value=(hidden_states, residual)
+            ),
+            prepare_mlp=MagicMock(return_value=(hidden_states, residual)),
+            should_fuse_mlp_allreduce_with_next_layer=MagicMock(return_value=True),
+            should_use_reduce_scatter=MagicMock(return_value=False),
+            postprocess_layer=MagicMock(),
+        )
+        self_attn = MagicMock(return_value=hidden_states)
+        self_attn.maybe_use_decode_attn_tp.return_value = contextlib.nullcontext()
+        producer = object.__new__(deepseek_v2.DeepseekV2DecoderLayer)
+        torch.nn.Module.__init__(producer)
+        object.__setattr__(producer, "layer_communicator", producer_communicator)
+        object.__setattr__(producer, "self_attn", self_attn)
+        object.__setattr__(producer, "layer_scatter_modes", object())
+        object.__setattr__(producer, "mlp", moe)
+        object.__setattr__(
+            producer, "_resolve_gfx95_quant_format", MagicMock(return_value="")
+        )
+
+        group = SimpleNamespace(device_group=object(), cpu_group=object())
+        manager = SimpleNamespace(
+            initialized=True,
+            backend="trtllm",
+            workspace=SimpleNamespace(
+                backend="trtllm", workspace_tensor=workspace_ptrs
+            ),
+            group=(group.device_group, group.cpu_group),
+            rank=0,
+            world_size=4,
+            dtype=dtype,
+            max_token_num=2048,
+            hidden_dim=7168,
+            is_buffer_size_sufficient=MagicMock(return_value=True),
+        )
+        parallel = SimpleNamespace(
+            tp_size=4,
+            moe_tp_size=4,
+            moe_tp_rank=0,
+            moe_ep_size=1,
+            attn_dp_size=1,
+            pp_size=1,
+            attn_cp_size=1,
+            dcp_size=1,
+        )
+        exec_config = SimpleNamespace(
+            comm=SimpleNamespace(flashinfer_allreduce_fusion_backend="trtllm"),
+            moe=SimpleNamespace(enable_eplb=False),
+        )
+        forward_flags = ForwardFlags()
+        attn_tp_context = SimpleNamespace(
+            input_scattered=False,
+            clear_attn_inputs=MagicMock(),
+        )
+        moe_backend = SimpleNamespace(is_flashinfer_trtllm=lambda: True)
+        pure_api = _FakePureMoeAllReduceAPI()
+        legacy_finalize = MagicMock()
+        legacy_collective = MagicMock()
+
+        with (
+            patch.object(fusion, "_flashinfer_trtllm_moe_allreduce", pure_api),
+            patch.object(fusion, "_flashinfer_allreduce_unavailable", False),
+            patch.object(fusion, "get_parallel", return_value=parallel),
+            patch.object(
+                fusion, "get_platform", return_value=SimpleNamespace(device_sm=100)
+            ),
+            patch.object(fusion, "get_exec", return_value=exec_config),
+            patch.object(
+                fusion,
+                "_is_flashinfer_trtllm_moe_allreduce_execution_route_supported",
+                return_value=True,
+            ),
+            patch.object(fusion, "get_moe_tp_group", return_value=group),
+            patch.object(fusion, "_get_workspace_manager", return_value=manager),
+            patch(
+                "sglang.srt.layers.moe.get_moe_runner_backend",
+                return_value=moe_backend,
+            ),
+            patch.object(deepseek_v2, "get_forward", return_value=forward_flags),
+            patch.object(deepseek_v2, "get_exec", return_value=exec_config),
+            patch.object(
+                deepseek_v2, "get_attn_tp_context", return_value=attn_tp_context
+            ),
+            patch.object(deepseek_v2, "get_is_capture_mode", return_value=True),
+            patch(
+                "sglang.srt.layers.moe.mega_moe.should_use_mega_moe",
+                return_value=False,
+            ),
+            patch.object(deepseek_v2, "_is_cuda", True),
+            patch.object(deepseek_v2, "maybe_prefetch_next_full_attention_kv"),
+            patch.object(
+                deepseek_v2,
+                "tensor_model_parallel_all_reduce",
+                legacy_collective,
+            ),
+            patch.object(torch.compiler, "is_compiling", return_value=False),
+            patch(
+                "sglang.srt.layers.moe.moe_runner.flashinfer_trtllm."
+                "trtllm_moe_enable_pdl",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.moe.moe_runner.flashinfer_trtllm."
+                "finalize_flashinfer_trtllm_deferred_output",
+                legacy_finalize,
+            ),
+        ):
+            payload, unchanged_residual, _ = producer.forward(
+                positions=torch.zeros(1, device=device, dtype=torch.int64),
+                hidden_states=hidden_states,
+                forward_batch=SimpleNamespace(),
+                residual=residual,
+                zero_allocator=MagicMock(),
+            )
+
+            self.assertIsInstance(
+                payload, fusion.FlashInferTrtllmMoeAllReducePayload
+            )
+            self.assertIs(unchanged_residual, residual)
+            self.assertFalse(hasattr(payload, "_sglang_needs_allreduce_fusion"))
+            experts.forward_deferred_finalize.assert_called_once()
+            legacy_finalize.assert_not_called()
+            producer_communicator.postprocess_layer.assert_not_called()
+            legacy_collective.assert_not_called()
+
+            consumer = object.__new__(deepseek_v2.DeepseekV2DecoderLayer)
+            torch.nn.Module.__init__(consumer)
+            object.__setattr__(
+                consumer,
+                "input_layernorm",
+                SimpleNamespace(
+                    weight=torch.ones(7168, device=device, dtype=dtype),
+                    variance_epsilon=1e-6,
+                ),
+            )
+            normalized, reduced_residual, consumed = (
+                consumer._consume_flashinfer_trtllm_moe_allreduce(
+                    payload, unchanged_residual
+                )
+            )
+
+        self.assertTrue(consumed)
+        self.assertEqual(len(pure_api.calls), 1)
+        torch.testing.assert_close(normalized, residual + 2)
+        torch.testing.assert_close(reduced_residual, residual + 1)
+
+        communication_tail = MagicMock(return_value=normalized)
+        duplicate_allreduce_rmsnorm = MagicMock()
+        next_communicator = object.__new__(LayerCommunicator)
+        next_communicator._context = object()
+        next_communicator.qkv_latent_func = None
+        next_communicator._communicate_simple_fn = communication_tail
+        next_communicator.prepare_attn = duplicate_allreduce_rmsnorm
+
+        with patch.object(
+            communicator_module,
+            "get_attn_tp_context",
+            return_value=SimpleNamespace(input_scattered=False),
+        ):
+            tail_output, tail_residual = (
+                next_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    normalized,
+                    reduced_residual,
+                    SimpleNamespace(),
+                    pre_normalized=True,
+                )
+            )
+
+        duplicate_allreduce_rmsnorm.assert_not_called()
+        communication_tail.assert_called_once()
+        self.assertIs(tail_output, normalized)
+        self.assertIs(tail_residual, reduced_residual)
+
 
 class TestFlashInferCommFusion(CustomTestCase):
     """The arch dispatch is `_resolve_backend(backend, is_multi_node)`.
