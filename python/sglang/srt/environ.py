@@ -720,6 +720,13 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # Run the host->device load-back *enqueue* on a dedicated loader thread
+    # instead of inline on the scheduler thread. With io_backend='direct' every
+    # layer's submission builds a batched-copy descriptor on the CPU (hundreds
+    # of milliseconds per burst on deep models), so by the time the forward
+    # launches every copy has already landed and the layer-wise pipeline
+    # overlaps nothing. Off keeps the synchronous path unchanged.
+    SGLANG_HICACHE_ASYNC_LOAD_ENQUEUE = EnvBool(False)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)

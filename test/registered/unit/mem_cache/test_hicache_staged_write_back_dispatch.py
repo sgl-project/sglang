@@ -1,5 +1,6 @@
 """Unit tests for HiCache staged write-back host-pool dispatch."""
 
+import threading
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -238,6 +239,15 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.l2_transfer_engine.submit_host_to_device.return_value = completion
         controller.layer_num = 2
         controller.ack_load_queue = []
+        # Inline (synchronous) load path: no loader thread, real burst body.
+        controller.load_enqueue_queue = None
+        controller._ack_load_lock = threading.Lock()
+        controller._enqueue_load_burst.side_effect = lambda *args, **kwargs: (
+            HiCacheController._enqueue_load_burst(controller, *args, **kwargs)
+        )
+        controller._append_load_ack.side_effect = lambda ack: (
+            HiCacheController._append_load_ack(controller, ack)
+        )
 
         self.assertEqual(HybridCacheController.start_loading(controller), 0)
 
