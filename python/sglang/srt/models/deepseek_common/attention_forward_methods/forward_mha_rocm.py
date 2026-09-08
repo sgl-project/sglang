@@ -53,7 +53,6 @@ if _use_aiter_gfx95:
 
 
 class DeepseekMHARocmForwardMixin:
-
     def forward_normal_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -265,6 +264,18 @@ class DeepseekMHARocmForwardMixin:
         zero_allocator: BumpAllocator,
     ):
         forward_batch.mha_one_shot = True
+        return self.forward_normal_rocm_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+
+    def forward_normal_chunked_kv_rocm_prepare(
+        self: DeepseekV2AttentionMLA,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        # First do normal mha forward to get output for extended part
         return self.forward_normal_rocm_prepare(
             positions, hidden_states, forward_batch, zero_allocator
         )

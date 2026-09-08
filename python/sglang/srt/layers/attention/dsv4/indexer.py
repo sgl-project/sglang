@@ -19,12 +19,14 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    plan_topk_v2,
     topk_transform_paged,
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_fp4,
+    logits_rows_per_chunk,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -33,6 +35,7 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
+    _SM120_INDEXER_M_CHUNK,
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
 )
@@ -213,9 +216,9 @@ def fp8_paged_mqa_logits_torch_sm120(
         )
 
     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
-    assert (
-        block_size == 64
-    ), "Vectorized torch impl hardcodes block_size=64 cache layout"
+    assert block_size == 64, (
+        "Vectorized torch impl hardcodes block_size=64 cache layout"
+    )
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
@@ -822,55 +825,6 @@ class C4IndexerBackendMixin:
                 c4_seq_lens=c4_seq_lens,
                 query_rows=query_rows,
             )
-        if use_aiter_fp4:
-            q_fp4, q_scale = q
-            logits = aiter_fp4_paged_mqa_logits(
-                q_fp4=q_fp4,
-                q_scale=q_scale,
-                k_payload=token_to_kv_pool.get_index_k_fp4_payload_buffer(
-                    c4_indexer.layer_id
-                ),
-                k_scale=token_to_kv_pool.get_index_k_fp4_scale_buffer(
-                    c4_indexer.layer_id
-                ),
-                weights=weights,
-                page_table=page_table,
-                c4_seq_lens=c4_seq_lens,
-                weight_scale=c4_indexer.weight_scale,
-                is_decode=forward_batch.forward_mode.is_decode(),
-                decode_workspace=metadata.fp4_decode_workspace,
-                prefill_workspace=metadata.fp4_prefill_workspace,
-            )
-        elif nonpaged_plan is not None:
-            assert isinstance(q_indexer, torch.Tensor)
-            logits = self._forward_nonpaged_indexer(
-                q_indexer=q_indexer,
-                weights=weights,
-                c4_indexer=c4_indexer,
-                token_to_kv_pool=token_to_kv_pool,
-                plan=nonpaged_plan,
-            )
-        else:
-            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=c4_indexer.layer_id,
-            )
-            assert c4_indexer_kv_cache.dim() == 2
-            head_dim_with_sf = 68 if use_fp4_indexer else 132
-            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
-            )
-            logits = fn(
-                q,
-                c4_indexer_kv_cache,
-                weights,
-                _c4sl,
-                page_table,
-                indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
-                False,
-            )
-
-        assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
             return
 
@@ -892,42 +846,142 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if self.dsa_topk_backend.is_torch():
-            topk_transform_pytorch_vectorized(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
+        all_rows = slice(0, _c4sl.shape[0])
+
+        def run_topk_transform(rows: slice, logits: torch.Tensor) -> None:
+            row_raw_indices = raw_indices[rows] if raw_indices is not None else None
+            if self.dsa_topk_backend.is_torch():
+                topk_transform_pytorch_vectorized(
+                    logits,
+                    c4_seq_lens[rows],
+                    page_table[rows],
+                    c4_sparse_page_indices[rows],
+                    indexer_metadata.c4_page_size,
+                    row_raw_indices,
+                )
+            elif self.dsa_topk_backend.is_flashinfer():
+                self.flashinfer_topk_transform(
+                    logits,
+                    c4_seq_lens[rows],
+                    page_table[rows],
+                    c4_sparse_page_indices[rows],
+                    indexer_metadata.c4_page_size,
+                    row_raw_indices,
+                )
+            elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
+                topk_transform_paged_v2(
+                    logits,
+                    c4_seq_lens[rows],
+                    page_table[rows],
+                    c4_sparse_page_indices[rows],
+                    indexer_metadata.c4_page_size,
+                    # The cached plan routes rows by their index in the full
+                    # range, so a chunk needs one built over its own rows.
+                    (
+                        indexer_metadata.topk_metadata
+                        if rows == all_rows or not is_hip()
+                        else plan_topk_v2(c4_seq_lens[rows])
+                    ),
+                )
+            else:
+                topk_transform_paged(
+                    logits,
+                    c4_seq_lens[rows],
+                    page_table[rows],
+                    c4_sparse_page_indices[rows],
+                    indexer_metadata.c4_page_size,
+                    row_raw_indices,
+                )
+
+        if nonpaged_plan is not None:
+            assert isinstance(q_indexer, torch.Tensor)
+            logits = self._forward_nonpaged_indexer(
+                q_indexer=q_indexer,
+                weights=weights,
+                c4_indexer=c4_indexer,
+                token_to_kv_pool=token_to_kv_pool,
+                plan=nonpaged_plan,
             )
-        elif self.dsa_topk_backend.is_flashinfer():
-            self.flashinfer_topk_transform(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
+            run_topk_transform(all_rows, logits)
+        elif use_aiter_fp4:
+            q_fp4, q_scale = q
+            is_decode = forward_batch.forward_mode.is_decode()
+            # Hoisted: these await this layer's KV transfer, which every chunk
+            # would otherwise re-await.
+            k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(
+                c4_indexer.layer_id
             )
-        elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
-            topk_transform_paged_v2(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
+            k_scale = token_to_kv_pool.get_index_k_fp4_scale_buffer(c4_indexer.layer_id)
+
+            def run_fp4_indexer(rows: slice) -> None:
+                logits = aiter_fp4_paged_mqa_logits(
+                    q_fp4=q_fp4[rows],
+                    q_scale=q_scale[rows],
+                    k_payload=k_payload,
+                    k_scale=k_scale,
+                    weights=weights[rows],
+                    page_table=page_table[rows],
+                    c4_seq_lens=c4_seq_lens[rows],
+                    weight_scale=c4_indexer.weight_scale,
+                    is_decode=is_decode,
+                    decode_workspace=metadata.fp4_decode_workspace,
+                    prefill_workspace=metadata.fp4_prefill_workspace,
+                )
+                run_topk_transform(rows, logits)
+
+            # The scores are the layer's largest transient and their width tracks
+            # context length, so prefill splits the rows into whatever fits the
+            # pooled logits block and reduces each chunk before the next one
+            # reuses it. Rows are scored and reduced independently, so this
+            # matches a single pass. Decode's rectangle is bounded by its capture
+            # shapes, so it always stays whole.
+            rows_per_chunk = (
+                query_rows if is_decode else logits_rows_per_chunk(page_table)
             )
+            if rows_per_chunk >= query_rows:
+                run_fp4_indexer(all_rows)
+            else:
+                for start in range(0, query_rows, max(1, rows_per_chunk)):
+                    run_fp4_indexer(
+                        slice(start, min(start + rows_per_chunk, query_rows))
+                    )
         else:
-            topk_transform_paged(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
+            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=c4_indexer.layer_id,
             )
+            assert c4_indexer_kv_cache.dim() == 2
+            head_dim_with_sf = 68 if use_fp4_indexer else 132
+            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
+            )
+
+            def run_paged_indexer(rows: slice, metadata: torch.Tensor) -> None:
+                row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]
+                logits = fn(
+                    row_q,
+                    c4_indexer_kv_cache,
+                    weights[rows],
+                    _c4sl[rows],
+                    page_table[rows],
+                    metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
+                run_topk_transform(rows, logits)
+
+            deep_gemm_metadata = indexer_metadata.deep_gemm_metadata
+            if isinstance(deep_gemm_metadata, list):
+                # SM120 only: DeepGEMM's metadata kernel caps the row count, so
+                # PagedIndexerMetadata split it; run indexer + topk per chunk.
+                num_rows = _c4sl.shape[0]
+                for chunk_idx, start in enumerate(
+                    range(0, num_rows, _SM120_INDEXER_M_CHUNK)
+                ):
+                    rows = slice(start, min(start + _SM120_INDEXER_M_CHUNK, num_rows))
+                    run_paged_indexer(rows, deep_gemm_metadata[chunk_idx])
+            else:
+                run_paged_indexer(all_rows, deep_gemm_metadata)
+
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[

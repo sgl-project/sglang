@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+from sglang.srt.runtime_context import get_exec
+
 try:
     from cuda.bindings import driver as cuda_drv
     from cuda.bindings import runtime as cuda_rt
@@ -259,9 +261,9 @@ class DedupedCudaGraphRegistry:
     def replay(self, graph: DedupedCudaGraph, stream: int) -> None:
         assert cuda_rt is not None
         group = graph.group
-        assert (
-            group is not None
-        ), "captured CUDA graph does not belong to this dedup state"
+        assert group is not None, (
+            "captured CUDA graph does not belong to this dedup state"
+        )
 
         raw_graph = graph.raw_graph
         graph_exec = group.graph_exec
@@ -314,7 +316,7 @@ class DedupedCudaGraphMixin:
         server_args = getattr(model_runner, "server_args", None)
         return bool(
             server_args is not None
-            and getattr(server_args, "enable_memory_saver", False)
+            and get_exec().features.enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
 
