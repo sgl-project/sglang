@@ -17,6 +17,13 @@ from sglang.srt.layers.moe.moe_runner.base import (
     RunnerInput,
     RunnerOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher import (
+    make_hidden_states_only_combine_input,
+)
+from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+    FlashinferCombineInput,
+    FlashinferDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatchOutput,
@@ -33,6 +40,35 @@ from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="stage-b-test-cpu-intel")
+
+
+@pytest.mark.parametrize(
+    ("dispatch_output_type", "combine_input_type"),
+    [
+        (StandardDispatchOutput, StandardCombineInput),
+        (FlashinferDispatchOutput, FlashinferCombineInput),
+    ],
+)
+def test_make_hidden_states_only_combine_input(
+    dispatch_output_type, combine_input_type
+) -> None:
+    hidden_states = torch.zeros(1, 2)
+    dispatch_output = dispatch_output_type(
+        hidden_states=hidden_states,
+        hidden_states_scale=None,
+        topk_output=StandardTopKOutput(
+            topk_weights=torch.ones(1, 1),
+            topk_ids=torch.zeros(1, 1, dtype=torch.int64),
+            router_logits=torch.zeros(1, 1),
+        ),
+    )
+
+    combine_input = make_hidden_states_only_combine_input(
+        dispatch_output, hidden_states
+    )
+
+    assert isinstance(combine_input, combine_input_type)
+    assert combine_input.hidden_states is hidden_states
 
 
 class _TestDispatchRunnerCore(DispatchMoeRunnerCore):

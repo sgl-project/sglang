@@ -279,6 +279,28 @@ class CombineInput(Protocol):
     def format(self) -> CombineInputFormat: ...
 
 
+def make_hidden_states_only_combine_input(
+    dispatch_output: DispatchOutput, hidden_states: torch.Tensor
+) -> CombineInput:
+    """Build a combine input when its only payload is ``hidden_states``."""
+    if dispatch_output.format.is_standard():
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardCombineInput,
+        )
+
+        return StandardCombineInput(hidden_states=hidden_states)
+    if dispatch_output.format.is_flashinfer():
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferCombineInput,
+        )
+
+        return FlashinferCombineInput(hidden_states=hidden_states)
+    raise ValueError(
+        "cannot build a hidden-states-only combine input for "
+        f"dispatch format {dispatch_output.format.value!r}"
+    )
+
+
 # ------------------------------ Base Dispatcher -------------------------------------
 
 
