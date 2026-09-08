@@ -1597,9 +1597,8 @@ class KVCacheConfigurator:
                 self.model_config.hf_config
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
-            # Tail buffers use req_pool_idx, including PD decode's extra slots
-            # in a shared target/draft request pool. The KV pool adds row 0 back.
-            max_running_requests=req_to_token_pool.req_to_token.shape[0] - 1,
+            # Match the target hybrid pool's full request-table capacity.
+            max_running_requests=req_to_token_pool.req_to_token.shape[0],
             **pool_kwargs,
         )
         return token_to_kv_pool
