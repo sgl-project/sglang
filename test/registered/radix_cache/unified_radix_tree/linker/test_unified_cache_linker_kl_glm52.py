@@ -23,7 +23,7 @@ register_cuda_ci(est_time=383, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
-    tree_core_backend = "python"
+    tree_core_backend = "rust"
     page_size = 64
     kl_threshold = 0.03
     sampling_temperature = 0
