@@ -2183,19 +2183,16 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
             )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-        elif use_per_rank_shared_slots:
-            # Shared experts appended as extra columns in topk_ids: their value
-            # would be out-of-bounds for the logical-to-physical dispatch table,
-            # so split, dispatch the routed cols, recombine.
+        elif num_fused_shared_experts > 0:
+            # Shared IDs are outside EPLB's routed-expert table for both global
+            # and per-rank layouts, so remap only routed columns.
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = _biased_grouped_topk_postprocess(
                 routed_cols, expert_location_dispatch_info, num_token_non_padded
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
-            # ExpertDistributionRecorder tracks EPLB physical routed experts.
-            # Per-rank shared-slot remap later adds shared slots to the topk ID
-            # space, so keep the routed physical ids separately for statistics.
+            # ExpertDistributionRecorder tracks only EPLB physical routed experts.
             recorder_topk_ids = routed_cols
         else:
             topk_ids = _biased_grouped_topk_postprocess(

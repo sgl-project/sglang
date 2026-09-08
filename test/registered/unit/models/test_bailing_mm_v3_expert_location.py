@@ -11,7 +11,8 @@ register_cpu_ci(est_time=2.0, suite="base-a-test-cpu")
 
 
 class TestBailingMoeV3VLExpertLocation(unittest.TestCase):
-    def test_delegates_expert_location_config_to_language_backbone(self):
+    @staticmethod
+    def _wrapper_method(name):
         model_path = (
             Path(__file__).parents[4] / "python/sglang/srt/models/bailing_mm_v3.py"
         )
@@ -22,11 +23,15 @@ class TestBailingMoeV3VLExpertLocation(unittest.TestCase):
             if isinstance(node, ast.ClassDef)
             and node.name == "BailingMoeV3VLForConditionalGeneration"
         )
-        method = next(
+        return model_path, next(
             node
             for node in wrapper.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "get_model_config_for_expert_location"
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+
+    def test_delegates_expert_location_config_to_language_backbone(self):
+        model_path, method = self._wrapper_method(
+            "get_model_config_for_expert_location"
         )
 
         delegated = object()
@@ -54,6 +59,40 @@ class TestBailingMoeV3VLExpertLocation(unittest.TestCase):
 
         result = namespace["Wrapper"].get_model_config_for_expert_location(
             SimpleNamespace(text_config=text_config)
+        )
+        self.assertIs(result, delegated)
+
+    def test_delegates_shared_expert_fusion_gate_to_language_backbone(self):
+        model_path, method = self._wrapper_method(
+            "shared_experts_fusion_disable_reason"
+        )
+        delegated = object()
+        text_config = SimpleNamespace()
+        quant_config = object()
+        test_case = self
+
+        class LanguageBackbone:
+            @classmethod
+            def shared_experts_fusion_disable_reason(cls, config, quant):
+                test_case.assertIs(config, text_config)
+                test_case.assertIs(quant, quant_config)
+                return delegated
+
+        synthetic_wrapper = ast.ClassDef(
+            name="Wrapper",
+            bases=[],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.fix_missing_locations(
+            ast.Module(body=[synthetic_wrapper], type_ignores=[])
+        )
+        namespace = {"BailingMoeV3ForCausalLM": LanguageBackbone}
+        exec(compile(module, str(model_path), "exec"), namespace)
+
+        result = namespace["Wrapper"].shared_experts_fusion_disable_reason(
+            SimpleNamespace(text_config=text_config), quant_config
         )
         self.assertIs(result, delegated)
 

@@ -62,6 +62,12 @@ _NON_TEXT_PREFIX_MAPPING = (
 class BailingMoeV3VLForConditionalGeneration(nn.Module):
     """Bailing MoE V3 language model with Qwen3 vision encoding."""
 
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        return BailingMoeV3ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config.text_config, quant_config
+        )
+
     def __init__(
         self,
         config: PretrainedConfig,
