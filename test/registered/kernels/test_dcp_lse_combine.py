@@ -272,6 +272,7 @@ class TestCPUReference(CustomTestCase):
 
         self.assertTrue(is_mla_dcp_lse_base_on_e("flashmla"))
         self.assertTrue(is_mla_dcp_lse_base_on_e("cutedsl_mla"))
+        self.assertTrue(is_mla_dcp_lse_base_on_e("ascend"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("tokenspeed_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("trtllm_mla"))

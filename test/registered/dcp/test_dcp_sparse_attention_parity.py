@@ -241,6 +241,38 @@ class TestDcpSparseAttentionParity(CustomTestCase):
         # dangerous -- not a crash, just a differently-weighted answer.
         self.assertTrue(torch.isfinite(wrong).all())
 
+    def test_ascend_is_declared_a_natural_log_backend(self):
+        """The host-side half of the test above, and the one that regresses.
+
+        The test above proves the mismatch is detectable. This one proves the
+        merge is actually told the right base on this target: the selector is
+        an allowlist, so a backend absent from it silently gets base-2. CANN
+        defines softmax_sum as sum(exp(qk - max)) and the LSE is reconstructed
+        as softmax_max + log(softmax_sum) -- natural log -- which is also what
+        the CANN family's own golden reference computes and what vLLM-Ascend's
+        DCP path forms before merging.
+
+        Lives here rather than only in
+        test/registered/kernels/test_dcp_lse_combine.py, which is CUDA CI, so
+        without this the assertion never runs on the target it is about. Same
+        skip as the test below and for the same reason: forward_mla imports
+        layers.dcp, which imports triton at module scope. That skips on a bare
+        CPU runner and *runs* on the NPU box, where triton-ascend installs as
+        `triton` -- which is the machine this assertion is about.
+        """
+        try:
+            from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+                is_mla_dcp_lse_base_on_e,
+            )
+        except ImportError as exc:  # pragma: no cover - depends on the runner
+            self.skipTest(f"forward_mla needs triton via layers.dcp: {exc}")
+
+        self.assertTrue(is_mla_dcp_lse_base_on_e("ascend"))
+        # Not a blanket opt-in: backends that really do return base-2 must stay
+        # out, or this fix trades one silent mis-weighting for another.
+        self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))
+        self.assertFalse(is_mla_dcp_lse_base_on_e(None))
+
     def test_the_inline_combine_matches_the_in_tree_one(self):
         """Keeps _combine above honest against the reference the plan names.
 
