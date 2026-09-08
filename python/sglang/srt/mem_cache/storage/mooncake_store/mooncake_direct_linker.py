@@ -95,6 +95,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
     ):
         self.page_size = params.page_size
+        self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
+        self.page_wise_load_threshold = (
+            server_args.mooncake_page_wise_load_threshold
+        )
+        if self.page_wise_load_threshold <= 0:
+            raise ValueError(
+                "--mooncake-page-wise-load-threshold must be positive, got "
+                f"{self.page_wise_load_threshold}."
+            )
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
@@ -278,7 +287,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 counter_index, pending, ready_event = task
                 try:
                     ready_event.synchronize()
-                    self.load_layer_wise(counter_index, list(pending.values()))
+                    self.load_layer_wise(counter_index, list(pending.items()))
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
@@ -288,7 +297,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.load_queue.task_done()
 
     def load_layer_wise(
-        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
+        self,
+        counter_index: int,
+        request_transfers: list[tuple[str, list[PoolTransfer]]],
     ) -> None:
         started = []
         try:
