@@ -91,6 +91,12 @@ diffusion = [
   "xatlas",
 ]
 
+ray = [
+  "ray[default]>=2.55.1",
+  # Ray registers no GPU resource on XPU without dpctl.
+  "dpctl",
+]
+
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
