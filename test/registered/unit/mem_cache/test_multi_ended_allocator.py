@@ -20,7 +20,7 @@ suite runs on CPU apart from the cases that skip themselves without CUDA.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import contextlib
 import random
@@ -44,7 +44,8 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MLASubPoolSpec,
     UnifiedKVPool,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 
 _DEV = "cpu"
 
@@ -103,6 +104,12 @@ class _RejectScalarIndexTensor:
 
 
 class TestUnifiedKVPoolViews(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_min_slot_index_and_disjoint_bytes(self):
         full = _make_mha_spec("full", "up", layer_num=4)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
@@ -173,6 +180,12 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
 
 
 class TestMultiEndedAllocator(unittest.TestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _build_pair(self, n_full_slots=64, n_mamba_slots=16):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
@@ -525,6 +538,12 @@ class _FakeUnifiedSWAKVPool:
 class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
     """The SWA composite: joint byte-budget, slot-conservation, `free_swa`
     tombstone semantics, and divergent compaction of the two sub-pools."""
+
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _build(
         self,
@@ -890,6 +909,12 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 class TestPagedMultiEndedAllocator(unittest.TestCase):
     """`MultiEndedAllocator(page_size=8)`: free-list, v2p/p2v and compaction are
     page-granular, while the external API stays in token ids as at page_size 1."""
+
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     PAGE_SIZE = 8
 
@@ -1693,6 +1718,12 @@ class TestLazyCompaction(unittest.TestCase):
     `_flush` only waits on `forward_stream` when one is passed, so these
     allocators stay CPU-only."""
 
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _make_full(self, *, lazy: bool, n_full_slots=64, n_mamba_slots=16):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
@@ -1969,6 +2000,12 @@ class TestO3FusedAllocBind(unittest.TestCase):
     """Fused take_physical_pages + bind_pages via `_alloc_bind_fast_or_slow`.
     GPU-only: the fused kernel is Triton."""
 
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():
@@ -2218,6 +2255,12 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
     `translate_kv_loc_for_kernel` / `full_v2p_page_table`, and every id must
     follow `kernel_id(t) = v2p[t // ps] * (ps * mult) + t % ps`."""
 
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     PS = 4
     FULL_L = 4
     SWA_L = 2
@@ -2328,6 +2371,12 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
     pages stress the sink-page floor, the per-layer-view tail pad and the
     page-granular alloc at once."""
 
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     PS = 64
     LAYERS = 3
 
@@ -2423,6 +2472,12 @@ class _ChainStub:
 class TestChainFrontierWalk(unittest.TestCase):
     """N-pool chain walk: 2-pool byte-identity with the single-peer formulas,
     transparent-middle skipping, and growth-side-neighbor credit routing."""
+
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _build_pair(self):
         full = _make_mha_spec("full", "up", layer_num=2)
@@ -2551,6 +2606,12 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
     """Holes-first float middle: midpoint placement, in-place hole recycling,
     larger-gap extension, boundary absorption with park-on-empty transparency,
     and the on-demand movers `make_room` and `compact_holes`."""
+
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _build_tri(self, n_state=8, n_float=32, n_full=32):
         state = _make_mamba_spec("state", "up", layer_num=2)
@@ -2844,6 +2905,12 @@ class TestDcpWidening(unittest.TestCase):
     """`dcp_size > 1`: the alloc surface speaks a widened virtual id space while
     the pool keeps storing one row per `dcp_size` logical ids."""
 
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     @contextlib.contextmanager
     def _dcp(self, dcp_size, dcp_rank=0):
         """The width comes from the parallel context, not a constructor
@@ -3031,6 +3098,83 @@ class TestDcpWidening(unittest.TestCase):
                     self.assertLess((cost - 1) * full_entry, mamba_bytes * dcp_size)
                     # The un-scaled cost -- the bug -- would not have covered it.
                     self.assertLess(base_cost * full_entry, mamba_bytes * dcp_size)
+
+
+class TestFusedWriteLocTranslate(unittest.TestCase):
+    """`write_loc_to_kernel_ids` must equal the arithmetic it stands for.
+
+    Nothing downstream can tell the two apart except by value, so the reference
+    here is the definition rather than a recorded expectation. Triton truncates
+    division toward zero where torch floors it, so the negative-loc and
+    tombstoned-page cases are the ones that matter.
+    """
+
+    def _reference(self, loc, v2p, page_size, stride, dcp_size, dcp_rank):
+        out = []
+        for raw in loc.tolist():
+            if raw < 0 or (dcp_size > 1 and raw % dcp_size != dcp_rank):
+                out.append(0)
+                continue
+            collapsed = raw // dcp_size
+            page = collapsed // page_size
+            offset = collapsed % page_size if page_size > 1 else 0
+            out.append(max(int(v2p[page]) * stride + offset, 0))
+        return out
+
+    def _check(self, *, page_size, multiplier, dcp_size, dcp_rank, device):
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+
+        span = page_size * dcp_size
+        locs = [0, 1, span - 1, span, 2 * span + 3, 5 * span + dcp_rank, -1]
+        locs += [3 * span + dcp_rank]  # lands on the tombstoned page
+        loc = torch.tensor(locs, dtype=torch.int64, device=device)
+        # Table sized past the highest page any loc can name, scrambled, with
+        # one tombstone (-1) so a missing clamp shows up.
+        num_pages = max(locs) // (page_size * dcp_size) + 2
+        v2p = torch.tensor(
+            [(5 * i + 2) % num_pages for i in range(num_pages)] + [-1],
+            dtype=torch.int64,
+            device=device,
+        )
+        v2p[min(3, num_pages - 1)] = -1
+        stride = page_size * multiplier
+
+        got = write_loc_to_kernel_ids(
+            loc=loc,
+            v2p=v2p,
+            page_size=page_size,
+            stride=stride,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+        )
+        want = self._reference(
+            loc.cpu(), v2p.cpu(), page_size, stride, dcp_size, dcp_rank
+        )
+        self.assertEqual(got.tolist(), want, f"ps={page_size} dcp={dcp_size}")
+        # `out=` must write in place and agree (the cuda-graph-stable path).
+        dst = torch.full_like(loc, -7)
+        ret = write_loc_to_kernel_ids(
+            loc=loc,
+            v2p=v2p,
+            page_size=page_size,
+            stride=stride,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            out=dst,
+        )
+        self.assertIs(ret, dst)
+        self.assertEqual(dst.tolist(), want)
+
+    def test_matches_reference_on_cpu(self):
+        for page_size in (1, 64):
+            for dcp_size, dcp_rank in ((1, 0), (2, 1), (4, 2)):
+                self._check(
+                    page_size=page_size,
+                    multiplier=7,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                    device="cpu",
+                )
 
 
 if __name__ == "__main__":
