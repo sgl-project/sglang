@@ -118,7 +118,8 @@ do
         --deepep-mode normal \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
-        --disable-cuda-graph \
+        --cuda-graph-backend-decode=disabled \
+        --cuda-graph-backend-prefill=disabled \
         --moe-dense-tp-size 1 \
         --enable-prefill-cp \
         --cp-strategy zigzag \
@@ -316,7 +317,8 @@ do
         --deepep-mode normal \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
-        --disable-cuda-graph \
+        --cuda-graph-backend-decode=disabled \
+        --cuda-graph-backend-prefill=disabled \
         --moe-dense-tp-size 1 \
         --enable-prefill-cp \
         --cp-strategy zigzag \
@@ -513,7 +515,8 @@ do
         --deepep-mode normal \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
-        --disable-cuda-graph \
+        --cuda-graph-backend-decode=disabled \
+        --cuda-graph-backend-prefill=disabled \
         --moe-dense-tp-size 1 \
         --enable-prefill-cp \
         --cp-strategy zigzag \
