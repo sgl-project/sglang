@@ -177,6 +177,11 @@ def _get_quantization_config(
             {
                 "gate_up_proj": ["gate_proj", "up_proj"],
                 "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+                # MiniMax sparse index_qkv_proj is [q|k] only when index value is
+                # disabled; index_v_proj weights are absent from the checkpoint but
+                # the model class maps three shards, which trips Quark's fused-layer
+                # ignore check (index_q/k excluded, index_v not listed -> crash).
+                "index_qkv_proj": ["index_q_proj", "index_k_proj"],
             }
         )
 

@@ -26,7 +26,13 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_gfx942_supported, is_gfx95_supported, is_npu
+
+
+def _rocm_sparse_decode_verify_supported() -> bool:
+    """MI300 (gfx942) and MI350 (gfx950): EAGLE TARGET_VERIFY uses sparse decode kernels."""
+    return is_gfx942_supported() or is_gfx95_supported()
+
 
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
@@ -295,6 +301,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
 
     @staticmethod
+    def _target_verify_q_cap(forward_batch: ForwardBatch) -> int:
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if spec_info is None:
+            raise RuntimeError(
+                "MiniMax sparse TARGET_VERIFY CUDA Graph requires spec_info."
+            )
+
+        q_cap = getattr(spec_info, "draft_token_num", None)
+        if q_cap is None or int(q_cap) <= 0:
+            q_cap = getattr(spec_info, "num_tokens_for_logprob_per_req", None)
+        if q_cap is None or int(q_cap) <= 0:
+            q_cap = getattr(spec_info, "num_tokens_per_req", None)
+        if q_cap is None or int(q_cap) <= 0:
+            raise RuntimeError(
+                "MiniMax sparse TARGET_VERIFY CUDA Graph requires a positive, "
+                "fixed per-request verify-token cap."
+            )
+        return int(q_cap)
+
+    @staticmethod
     def _choose_decode_score_max_chunks(batch_size: int) -> int:
         """Score chunk count per graph bucket.
 
@@ -335,14 +361,32 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._prefill_meta = None
             self._extend_meta = None
             self._extend_meta_key = None
-        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is not None:
-            self._max_seqlen_q = int(max(extend_lens))
+        if (
+            in_capture
+            and forward_batch.forward_mode.is_target_verify()
+            and _rocm_sparse_decode_verify_supported()
+        ):
+            # gfx942/gfx950: q bounds are CUDA Graph launch constants and must cover
+            # every verify layout admitted by this graph, not merely capture dummies.
+            self._max_seqlen_q = self._target_verify_q_cap(forward_batch)
         else:
-            self._max_seqlen_q = 1
+            extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if extend_lens is not None:
+                self._max_seqlen_q = int(max(extend_lens))
+            elif (
+                forward_batch.forward_mode.is_target_verify()
+                and _rocm_sparse_decode_verify_supported()
+            ):
+                self._max_seqlen_q = self._target_verify_q_cap(forward_batch)
+            else:
+                self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
             or (self.is_npu and forward_batch.forward_mode.is_target_verify())
+            or (
+                _rocm_sparse_decode_verify_supported()
+                and forward_batch.forward_mode.is_target_verify()
+            )
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
@@ -769,6 +813,72 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
 
         return idx_o, o
+
+    def _forward_rocm_sparse_decode_verify(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        prefix_lens: torch.Tensor,
+        layer,
+        disable_value: bool,
+    ):
+        # EAGLE TARGET_VERIFY: one decode row per draft token with causal KV len.
+        # Prefill uses per-request seq_lens and breaks verify; mirror NPU decode path.
+        bs = forward_batch.seq_lens.shape[0]
+        ndt = self._target_verify_q_cap(forward_batch)
+        prefix = prefix_lens.to(device=q.device, dtype=torch.long)
+        offsets = torch.arange(1, int(ndt) + 1, device=q.device, dtype=torch.long)
+        per_query_seq_lens = (
+            (prefix.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1).to(torch.int32)
+        )
+        per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
+            int(ndt)
+        )
+        # ``max_seqlen`` from capture-safe ``_max_seqlen_k`` (host-derived in
+        # init_forward_metadata_out_graph); no device->host sync during graph capture.
+        max_seqlen = (
+            int(self._max_seqlen_k)
+            if self._max_seqlen_k
+            else (int(per_query_seq_lens.max().item()) if ndt else 0)
+        )
+        from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+            minimax_sparse_decode,
+        )
+
+        return minimax_sparse_decode(
+            q,
+            None,
+            k_cache,
+            v_cache,
+            idx_q,
+            None,
+            idx_k_cache,
+            idx_v_cache,
+            self.req_to_token,
+            per_query_req,
+            per_query_seq_lens,
+            max_seqlen,
+            1,
+            self.block_size_k,
+            self.topk_blocks,
+            0,
+            0,
+            score_type=self.score_type,
+            disable_index_value=disable_value,
+            page_size=self.page_size,
+            use_msa=False,
+            q_scale=layer.q_scale_float,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+            idx_q_scale=layer.idx_q_scale_float,
+            idx_k_scale=layer.idx_k_scale_float,
+            idx_v_scale=layer.idx_v_scale_float,
+        )
 
     def _forward_npu_triton_verify(
         self,
@@ -1262,11 +1372,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def _resolve_extend_meta(self, forward_batch: ForwardBatch, q: torch.Tensor):
         """Return (cu_seqlens, seq_lens, prefix_lens); NPU caches per-forward casts."""
-        # NPU TARGET_VERIFY has extend_seq_lens=None (seq_lens=prefix+draft);
+        # TARGET_VERIFY has extend_seq_lens=None (seq_lens=prefix+draft);
         # reconstruct per-seq extend lengths + prefix_lens for cu_seqlens.
-        if self.is_npu and forward_batch.extend_seq_lens is None:
+        if forward_batch.extend_seq_lens is None and (
+            self.is_npu or forward_batch.forward_mode.is_target_verify()
+        ):
             _bs = forward_batch.seq_lens.shape[0]
-            _ndt = self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1))
+            if forward_batch.forward_mode.is_target_verify() and (
+                self.is_npu or _rocm_sparse_decode_verify_supported()
+            ):
+                _ndt = self._target_verify_q_cap(forward_batch)
+            else:
+                _ndt = self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1))
             forward_batch.extend_seq_lens = torch.full(
                 (_bs,),
                 int(_ndt),
@@ -1347,11 +1464,47 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
-        cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(forward_batch, q)
+        extend_seq_lens = forward_batch.extend_seq_lens
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
 
-        # DP attention pads q beyond real tokens; trim (CPU list avoids a sync).
-        if forward_batch.extend_seq_lens_cpu is not None:
-            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+        if extend_seq_lens is not None:
+            cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(
+                forward_batch, q
+            )
+        elif forward_batch.forward_mode.is_target_verify():
+            bs = int(forward_batch.seq_lens.shape[0])
+            verify_len = self._target_verify_q_cap(forward_batch)
+            expected_num_tokens = bs * verify_len
+            if bs <= 0 or q.shape[0] < expected_num_tokens:
+                raise RuntimeError(
+                    "MiniMax sparse non-ragged TARGET_VERIFY requires the fixed "
+                    "verify width from spec_info; refusing to infer a layout from "
+                    f"q.shape. Got q.shape[0]={q.shape[0]}, bs={bs}, "
+                    f"verify_cap={verify_len}, expected>={expected_num_tokens}."
+                )
+            uniform_verify_lens = torch.full(
+                (bs,),
+                verify_len,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            cu_seqlens = torch.arange(
+                0,
+                expected_num_tokens + 1,
+                verify_len,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            seq_lens = (forward_batch.seq_lens + uniform_verify_lens).to(torch.int32)
+            prefix_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens_cpu = [verify_len] * bs
+        else:
+            raise ValueError("MiniMax sparse forward_extend requires extend_seq_lens.")
+
+        # DP attention pads q beyond the real token count for collective alignment;
+        # trim to actual tokens so the sparse kernel sees consistent shapes.
+        if extend_seq_lens_cpu is not None:
+            actual_num_tokens = int(sum(extend_seq_lens_cpu))
         else:
             actual_num_tokens = int(cu_seqlens[-1].item())
         original_num_tokens = q.shape[0]
@@ -1393,43 +1546,60 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 q = _quant_q_fp8(q, layer.q_scale_float)
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
-            # GPU (CUDA/ROCm) sparse path; imported here so NPU never touches it.
-            from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
-                minimax_sparse_prefill,
-            )
+            if (
+                _rocm_sparse_decode_verify_supported()
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                # ROCm EAGLE verify: per-draft decode rows (not extend prefill).
+                idx_o, o = self._forward_rocm_sparse_decode_verify(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                    prefix_lens,
+                    layer,
+                    disable_value,
+                )
+            else:
+                from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+                    minimax_sparse_prefill,
+                )
 
-            idx_o, o = minimax_sparse_prefill(
-                q,
-                k_cache,
-                v_cache,
-                None,
-                idx_q,
-                idx_k_cache,
-                idx_v_cache,
-                None,
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                cu_seqlens,
-                seq_lens,
-                prefix_lens,
-                self._max_seqlen_q,
-                self._max_seqlen_k,
-                self.block_size_q,
-                self.block_size_k,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                score_type=self.score_type,
-                disable_index_value=disable_value,
-                use_msa=self.use_msa,
-                seqlens_cpu=forward_batch.extend_seq_lens_cpu,
-                q_scale=layer.q_scale_float,
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-                idx_q_scale=layer.idx_q_scale_float,
-                idx_k_scale=layer.idx_k_scale_float,
-                idx_v_scale=layer.idx_v_scale_float,
-            )
+                idx_o, o = minimax_sparse_prefill(
+                    q,
+                    k_cache,
+                    v_cache,
+                    None,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    None,
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    cu_seqlens,
+                    seq_lens,
+                    prefix_lens,
+                    self._max_seqlen_q,
+                    self._max_seqlen_k,
+                    self.block_size_q,
+                    self.block_size_k,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                    score_type=self.score_type,
+                    disable_index_value=disable_value,
+                    use_msa=self.use_msa,
+                    seqlens_cpu=extend_seq_lens_cpu,
+                    q_scale=layer.q_scale_float,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                    idx_q_scale=layer.idx_q_scale_float,
+                    idx_k_scale=layer.idx_k_scale_float,
+                    idx_v_scale=layer.idx_v_scale_float,
+                )
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
             o = torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
