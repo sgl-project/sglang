@@ -3,12 +3,11 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=4, suite="jit-kernel-unit-test-amd")
 
-DEVICE = get_device()
+DEVICE = "cuda"
 
 
 def reference_sigmoid_gate_mul(x, gate):

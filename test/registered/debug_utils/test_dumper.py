@@ -42,7 +42,11 @@ from sglang.srt.debug_utils.dumper import (
 from sglang.srt.distributed.parallel_state import get_default_distributed_backend
 from sglang.srt.utils import get_device, get_device_module, kill_process_tree
 from sglang.srt.utils.common import temp_set_env
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -53,6 +57,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=30, stage="nightly", runner_config="2-gpu-large")
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
+register_xpu_ci(est_time=400, suite="nightly-xpu-2-gpu", nightly=True)
 
 
 @contextmanager
