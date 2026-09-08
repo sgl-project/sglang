@@ -28,8 +28,8 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
-    accuracy: { mmmu_pro_pct: 76.01, gsm8k_pct: 97.19 },
-    notes: "4×GB300, TP=4. Measured with online dynamic FP8 (--quantization fp8 on the BF16 checkpoint), the same serving path the FP8 variant uses. Accuracy vs BF16 on the same box: MMMU-Pro 76.01% vs 77.86% (stop 99.36%), GSM8K 97.19% vs 97.35% (stop 100%). Speed (LL points, same protocol as the BF16 card): text 8192/1024 conc 1: TTFT 174.80 ms, TPOT 3.95 ms, 546 tok/s/GPU; conc 16: TTFT 981.25 ms, TPOT 7.49 ms, 4273 tok/s/GPU. Image 1024/1024 conc 1: TTFT 272.09 ms, TPOT 4.51 ms, 153 tok/s/GPU; conc 16: TTFT 1389.27 ms, TPOT 7.15 ms, 1369 tok/s/GPU. FP8 prefill (TTFT) is consistently faster than BF16 while TPOT is ~10% slower.",
+    accuracy: { mmmu_pro_pct: 77.34, gsm8k_pct: 97.19 },
+    notes: "4×GB300, TP=4 --ep 4, official FP8 checkpoint. MMMU-Pro 77.34% (stop 99.77%, truncated 0.23%, error 0) measured on this recipe; GSM8K 97.19% (stop 100%) measured with online dynamic FP8 on the same serving path. BF16 on the same box: MMMU-Pro 75.78% (TP=4), GSM8K 97.35%. Speed (LL points, online-quantized measurement, same protocol as the BF16 card): text 8192/1024 conc 1: TTFT 174.80 ms, TPOT 3.95 ms, 546 tok/s/GPU; conc 16: TTFT 981.25 ms, TPOT 7.49 ms, 4273 tok/s/GPU. Image 1024/1024 conc 1: TTFT 272.09 ms, TPOT 4.51 ms, 153 tok/s/GPU; conc 16: TTFT 1389.27 ms, TPOT 7.15 ms, 1369 tok/s/GPU. FP8 prefill (TTFT) is consistently faster than BF16 while TPOT is ~10% slower.",
   },
   { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
