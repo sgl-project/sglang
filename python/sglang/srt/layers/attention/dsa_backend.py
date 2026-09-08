@@ -2893,6 +2893,11 @@ class DeepseekSparseAttnBackend(
         live_num_tokens = q_all.shape[0]
         cache_seqlens = metadata.dsa_cache_seqlens_int32[:live_num_tokens]
         assert metadata.flashmla_metadata is not None
+        if cache_seqlens.shape[0] != live_num_tokens:
+            raise RuntimeError(
+                "FlashMLA length rows must match the live DSA query axis: "
+                f"q_tokens={live_num_tokens}, length_rows={cache_seqlens.shape[0]}"
+            )
         num_splits = metadata.flashmla_metadata.num_splits
         if num_splits.shape[0] != live_num_tokens + 1:
             raise RuntimeError(

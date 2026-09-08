@@ -163,6 +163,40 @@ class TestDSAMultiStepDecode(unittest.TestCase):
                 page_table_1=torch.zeros((1, 2), dtype=torch.int32),
             )
 
+    def test_flashmla_decode_rejects_missing_live_length_row(self):
+        flashmla = ModuleType("sgl_kernel.flash_mla")
+        flashmla.flash_mla_with_kvcache = MagicMock()
+        sgl_kernel = ModuleType("sgl_kernel")
+        sgl_kernel.flash_mla = flashmla
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.tensor([8], dtype=torch.int32),
+            flashmla_metadata=SimpleNamespace(
+                flashmla_metadata=torch.empty((1,), dtype=torch.int32),
+                num_splits=torch.empty((3,), dtype=torch.int32),
+            ),
+        )
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "sgl_kernel": sgl_kernel,
+                    "sgl_kernel.flash_mla": flashmla,
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "q_tokens=2, length_rows=1"),
+        ):
+            DeepseekSparseAttnBackend._forward_flashmla_kv(
+                SimpleNamespace(),
+                q_all=torch.empty((2, 2, 3)),
+                kv_cache=torch.empty((64, 3)),
+                v_head_dim=2,
+                sm_scale=1.0,
+                layer=SimpleNamespace(tp_q_head_num=2, head_dim=3),
+                metadata=metadata,
+                page_table_1=torch.zeros((2, 2), dtype=torch.int32),
+            )
+
     def test_draft_children_advance_visible_kv_length(self):
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         backend.speculative_num_steps = 3
