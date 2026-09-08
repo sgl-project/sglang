@@ -9310,6 +9310,43 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
         self.assertEqual(pipeline.anchor_locks, {})
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
 
+    def test_storage_cleanup_releases_buffer_prefetch_anchor(self):
+        cache = self._make_cache(live_match_len=len(self._PREFIX))
+        pipeline = self._make_pipeline(cache)
+        cache.buffer_pipeline = pipeline
+        self.assertEqual(pipeline.try_lock_anchor(self._REQ), "locked")
+        host_indices = torch.arange(4)
+        cache.ongoing_prefetch = {
+            self._REQ: _OngoingPrefetch(
+                anchor_node_id=99,
+                prefetch_key=RadixKey(array("q", range(16))),
+                host_indices=host_indices,
+                operation=mock.Mock(),
+                anchor_lock_params=None,
+                comp_xfers={},
+            )
+        }
+        cache.ongoing_backup = {}
+        cache.host_memory_mode = "buffer_only"
+        cache._prefetch_occupied_span.side_effect = lambda key, indices: (
+            UnifiedRadixCache._prefetch_occupied_span(cache, key, indices)
+        )
+        controller = cache.cache_controller
+        controller.terminate_prefetch.return_value = (4, None)
+        controller.prefetch_tokens_occupied = 12
+
+        StorageAttachment(cache)._release_pending_storage_ops()
+
+        self.assertEqual(cache.ongoing_prefetch, {})
+        self.assertEqual(pipeline.anchor_locks, {})
+        self.assertEqual(pipeline.anchor_locked_tokens_, 0)
+        self.assertNotIn(self._REQ, pipeline._prefetch_prefix_ctx)
+        cache.dec_lock_ref.assert_called_once_with(
+            99, cache.inc_lock_ref.return_value.to_dec_params.return_value
+        )
+        cache.dec_host_lock_ref.assert_not_called()
+        self.assertEqual(controller.prefetch_tokens_occupied, 8)
+
     def test_positive_hit_with_lost_anchor_is_reported_as_shrunk(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache._storage_prefetch_missed_rids = set()
