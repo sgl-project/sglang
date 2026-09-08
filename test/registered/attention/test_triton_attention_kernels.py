@@ -25,7 +25,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
-register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -152,7 +152,6 @@ def decode_attention_fwd_torch(
 
 
 class TestTritonAttention(CustomTestCase):
-
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
         random.seed(seed)

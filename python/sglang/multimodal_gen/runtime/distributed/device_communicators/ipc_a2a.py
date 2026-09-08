@@ -140,6 +140,18 @@ class IpcA2AState:
         """Drop mappings that belong to a model-parallel group being replaced."""
         self.__init__()
 
+    def drop_staging(self) -> None:
+        """Release the cached staging buffers (both ranks call this at the same point).
+
+        Staging is keyed by message size and only evicted by count, so a warmup
+        probe at the full serving shape leaves buffers sized for it behind.
+        """
+        if not self.staging:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.staging.clear()
+
     def _share(self, t, group):
         """Exchange `t` with the peer via torch IPC, re-opening the handle in
         the LOCAL device context (the mapping is only dereferenceable from the

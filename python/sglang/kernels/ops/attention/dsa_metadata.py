@@ -90,7 +90,9 @@ def _fused_dsa_decode_metadata_kernel(
     # fused decode CUDA graph drops it and consumes real_page_table alone.
     if HAS_PAGE_TABLE_1:
         tl.store(
-            page_table_1 + row * page_table_stride_0 + offs_n * page_table_stride_1,
+            page_table_1
+            + row.to(tl.int64) * page_table_stride_0
+            + offs_n * page_table_stride_1,
             vals,
             mask=mask,
         )
@@ -100,7 +102,7 @@ def _fused_dsa_decode_metadata_kernel(
         real_cols = offs_n // real_page_size
         tl.store(
             real_page_table
-            + row * real_page_table_stride_0
+            + row.to(tl.int64) * real_page_table_stride_0
             + real_cols * real_page_table_stride_1,
             vals // real_page_size,
             mask=real_mask,
@@ -320,7 +322,9 @@ def _fused_dsa_target_verify_metadata_kernel(
     # fused_dsa_decode_metadata for the optional-page_table_1 contract).
     if HAS_PAGE_TABLE_1:
         tl.store(
-            page_table_1 + out_row * page_table_stride_0 + offs_n * page_table_stride_1,
+            page_table_1
+            + out_row.to(tl.int64) * page_table_stride_0
+            + offs_n * page_table_stride_1,
             vals,
             mask=mask,
         )
@@ -330,7 +334,7 @@ def _fused_dsa_target_verify_metadata_kernel(
         real_cols = offs_n // real_page_size
         tl.store(
             real_page_table
-            + out_row * real_page_table_stride_0
+            + out_row.to(tl.int64) * real_page_table_stride_0
             + real_cols * real_page_table_stride_1,
             vals // real_page_size,
             mask=real_mask,
@@ -592,7 +596,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     if HAS_PAGE_TABLE_1:
         tl.store(
             page_table_1
-            + out_rows[:, None] * page_table_stride_0
+            + out_rows.to(tl.int64)[:, None] * page_table_stride_0
             + offs_n[None, :] * page_table_stride_1,
             vals[None, :],
             mask=mask,
@@ -603,7 +607,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
         real_cols = offs_n // real_page_size
         tl.store(
             real_page_table
-            + out_rows[:, None] * real_page_table_stride_0
+            + out_rows.to(tl.int64)[:, None] * real_page_table_stride_0
             + real_cols[None, :] * real_page_table_stride_1,
             (vals // real_page_size)[None, :],
             mask=real_mask,

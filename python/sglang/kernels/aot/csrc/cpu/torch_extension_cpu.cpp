@@ -211,6 +211,8 @@ void decode_attention_cpu(
     at::Tensor& query,
     at::Tensor& k_cache,
     at::Tensor& v_cache,
+    double k_cache_scale,
+    double v_cache_scale,
     at::Tensor& output,
     const std::optional<at::Tensor>& key,
     const std::optional<at::Tensor>& value,
@@ -233,6 +235,8 @@ void extend_attention_cpu(
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
+    double k_buf_scale,
+    double v_buf_scale,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
@@ -245,7 +249,8 @@ void extend_attention_cpu(
     int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
-    std::optional<at::Tensor> tree_mask);
+    std::optional<at::Tensor> tree_mask,
+    bool is_causal = true);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -496,6 +501,8 @@ void multimodal_rotary_embedding_cpu(
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
+// murmur_hash32
+at::Tensor murmur_hash32_cpu(const at::Tensor& seed, const at::Tensor& positions, const at::Tensor& col_indices);
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& A_log,
@@ -707,8 +714,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor? key, Tensor? "
-      "value, "
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, float k_cache_scale, float "
+      "v_cache_scale, Tensor(a!) output, Tensor? key, Tensor? value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
       "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
@@ -716,10 +723,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // extend
   m.def(
       "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
-      "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
+      "Tensor v_buffer, float k_buf_scale, float v_buf_scale, Tensor req_to_token, Tensor req_pool_indices, Tensor "
+      "seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
       "sliding_window_size, Tensor? "
-      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None) -> ()");
+      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None, bool is_causal=True) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
@@ -880,6 +888,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+
+  // murmur_hash32
+  m.def("murmur_hash32_cpu(Tensor seed, Tensor positions, Tensor col_indices) -> Tensor");
+  m.impl("murmur_hash32_cpu", torch::kCPU, &murmur_hash32_cpu);
 
   // fused_sigmoid_gating_delta_rule_update
   m.def(

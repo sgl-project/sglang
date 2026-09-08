@@ -130,18 +130,18 @@ def _assert_plans_byte_equal(
         else int(triton_verify.verify_num_valid[0].item())
     )
     n_verify_ref = int(ref_verify.verify_num_valid[0].item())
-    assert (
-        n_verify == n_verify_ref
-    ), f"verify_num_valid diverged: triton={n_verify} ref={n_verify_ref}"
+    assert n_verify == n_verify_ref, (
+        f"verify_num_valid diverged: triton={n_verify} ref={n_verify_ref}"
+    )
     # When total_verify > VERIFY_CAPACITY the offsets kernel clears verify_enable and
     # plan_entries skips its scatter — leaving verify_slot_indices/positions/prev_slot_indices
     # as whatever the (torch.empty) allocation contained. Skip the byte-equal probe in that
     # case; verify_num_valid being clamped + verify_enable=0 is the contract here.
     triton_enable = int(triton_verify.enable[0].item())
     ref_enable = int(ref_verify.enable[0].item())
-    assert (
-        triton_enable == ref_enable
-    ), f"verify_enable diverged: triton={triton_enable} ref={ref_enable}"
+    assert triton_enable == ref_enable, (
+        f"verify_enable diverged: triton={triton_enable} ref={ref_enable}"
+    )
     if n_verify > 0 and triton_enable != 0:
         assert torch.equal(
             triton_verify.verify_slot_indices[:n_verify],
@@ -166,9 +166,9 @@ def _assert_plans_byte_equal(
         else int(triton_write.write_num_valid_reqs[0].item())
     )
     n_write_ref = int(ref_write.write_num_valid_reqs[0].item())
-    assert (
-        n_write == n_write_ref
-    ), f"write_num_valid_reqs diverged: triton={n_write} ref={n_write_ref}"
+    assert n_write == n_write_ref, (
+        f"write_num_valid_reqs diverged: triton={n_write} ref={n_write_ref}"
+    )
     assert torch.equal(
         triton_write.write_offsets[: n_write + 1],
         ref_write.write_offsets[: n_write + 1],
@@ -350,7 +350,8 @@ def _yield_simpler(inputs: Any) -> Iterator[tuple[str, Any]]:
     Plan / Verify / Write fuzz failures uniformly.
     """
     fields = {
-        f: getattr(inputs, f) for f in inputs.__dataclass_fields__  # type: ignore[attr-defined]
+        f: getattr(inputs, f)
+        for f in inputs.__dataclass_fields__  # type: ignore[attr-defined]
     }
 
     def emit(label: str, **overrides: Any) -> Iterator[tuple[str, Any]]:
