@@ -710,6 +710,10 @@ def merge_timeline(series: dict) -> list:
     Backlog sums across pools (a job waits in exactly one pool) while the wait
     is a max of the per-pool p90s: averaging them would let idle pools mask the
     one pool that is actually stuck, which is the number worth alerting on.
+
+    Merging costs the answer to "which pool?" -- the deepest backlog and the
+    longest wait routinely come from different pools -- so each bucket keeps
+    the label behind both, for the card to name under the chart.
     """
     buckets: dict = {}
     for label, rows in series.get("labels", {}).items():
@@ -717,11 +721,22 @@ def merge_timeline(series: dict) -> list:
             continue
         for row in rows:
             b = buckets.setdefault(
-                row["start"], {"backlog": 0, "started": 0, "p90": 0.0}
+                row["start"],
+                {
+                    "backlog": 0,
+                    "started": 0,
+                    "p90": 0.0,
+                    "p90_pool": "-",
+                    "top_pool": "-",
+                    "top_backlog": 0,
+                },
             )
             b["backlog"] += row["backlog"]
             b["started"] += row["started"]
-            b["p90"] = max(b["p90"], row["p90_wait_min"])
+            if row["p90_wait_min"] > b["p90"]:
+                b["p90"], b["p90_pool"] = row["p90_wait_min"], label
+            if row["backlog"] > b["top_backlog"]:
+                b["top_backlog"], b["top_pool"] = row["backlog"], label
     return [dict(start=k, **v) for k, v in sorted(buckets.items())]
 
 
@@ -775,17 +790,23 @@ def render_queue_timeline(rows: list, report_url: str) -> dict:
     peak = max(rows, key=lambda r: r["backlog"])
     slowest = max(rows, key=lambda r: r["p90"])
     span = f"{fmt_local(parse_time(rows[0]['start']))} to {fmt_local(parse_time(rows[-1]['start']))}"
+    peak_hour = fmt_local_hour(parse_time(peak["start"]))
+    slowest_hour = fmt_local_hour(parse_time(slowest["start"]))
     elements = [
         md(f"{grey('Window')}  {span}  {grey('(bucket: 1h)')}"),
         kv_columns(
             [
                 ("Jobs started", str(sum(r["started"] for r in rows))),
                 ("Peak backlog", f"{peak['backlog']} jobs"),
-                ("Peak hour", fmt_local_hour(parse_time(peak["start"]))),
                 ("Worst p90 wait", fmt_duration(slowest["p90"] * 60)),
             ]
         ),
         chart(timeline_chart_spec(rows)),
+        md(
+            f"{grey('Peak backlog')}  {peak_hour}, mostly "
+            f"**{peak['top_pool']}** ({peak['top_backlog']})\n"
+            f"{grey('Worst wait')}  {slowest_hour}, **{slowest['p90_pool']}**"
+        ),
     ]
     return build_card(
         "CUDA queue over the day",

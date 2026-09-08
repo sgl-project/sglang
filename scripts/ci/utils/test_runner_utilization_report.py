@@ -156,6 +156,17 @@ class TestQueueTimeline(unittest.TestCase):
         self.assertAlmostEqual(rows[2]["p90_wait_min"], 120.0)
         self.assertEqual(rows[0]["p90_wait_min"], 0.0)
 
+    def test_partial_first_hour_is_dropped_not_reported_short(self):
+        # A window starting at 00:20 would otherwise open with a 40-minute
+        # bucket labelled the same hour as the 25th one on a 24h scan.
+        rows = rur.queue_timeline(
+            [self._waiting(1, 2)],
+            self.WINDOW_START + timedelta(minutes=20),
+            self.WINDOW_END,
+        )
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(rows[0]["start"], "2026-05-27T01:00:00Z")
+
     def test_still_queued_job_never_reports_a_wait(self):
         queued = rur.classify_job(
             _job(

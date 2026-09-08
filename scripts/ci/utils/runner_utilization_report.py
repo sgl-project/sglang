@@ -485,9 +485,13 @@ def queue_timeline(
     bucket can show a deep backlog and no p90 at all when nothing got picked up.
     """
     # Buckets start on the hour so the chart's x-axis labels mean what they
-    # say; the first one is clipped by window_start and so covers less time.
+    # say. The hour window_start falls into is only partly covered, which both
+    # under-counts it and gives a 24h window a 25th bucket repeating the first
+    # label, so that hour is dropped rather than reported short.
     bucket = timedelta(minutes=bucket_minutes)
     origin = window_start.replace(minute=0, second=0, microsecond=0)
+    if origin < window_start:
+        origin += bucket
     starts = []
     t = origin
     while t < window_end:
@@ -498,8 +502,11 @@ def queue_timeline(
     peaks = [0] * len(starts)
 
     def bucket_index(when: datetime) -> int:
+        """Bucket `when` falls in, or None when it predates the first bucket."""
+        if when < origin:
+            return None
         offset = (when - origin).total_seconds() // (bucket_minutes * 60)
-        return max(0, min(len(starts) - 1, int(offset)))
+        return min(len(starts) - 1, int(offset))
 
     events = []
     for job in jobs:
@@ -515,8 +522,9 @@ def queue_timeline(
     events.sort(key=lambda e: (e[0], e[1] == 1))
     current, prev_time = 0, window_start
     for event_time, delta in events + [(window_end, 0)]:
-        if current > 0 and event_time > prev_time:
-            for i in range(bucket_index(prev_time), bucket_index(event_time) + 1):
+        if current > 0 and event_time > prev_time and event_time >= origin:
+            first = bucket_index(max(prev_time, origin))
+            for i in range(first, bucket_index(event_time) + 1):
                 peaks[i] = max(peaks[i], current)
         current += delta
         prev_time = event_time
@@ -524,7 +532,7 @@ def queue_timeline(
     waits: list[list[float]] = [[] for _ in starts]
     for job in jobs:
         start = job.get("start")
-        if start is None or start < window_start or start > window_end:
+        if start is None or start < origin or start > window_end:
             continue
         waits[bucket_index(start)].append(job["queue_time"])
     return [
