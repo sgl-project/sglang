@@ -3818,9 +3818,6 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if adder.chunk_budget_exhausted():
-                break
-
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 

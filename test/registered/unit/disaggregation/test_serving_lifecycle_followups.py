@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.encoder.receiver import MMReceiverHTTP
-from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -15,18 +15,39 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestSchedulerLifecycle(unittest.TestCase):
-    def test_sub_page_chunk_budget_stops_admission(self):
-        adder = SimpleNamespace(page_size=64, rem_chunk_tokens=None)
-        for remaining, exhausted in (
-            (None, False),
-            (0, True),
-            (63, True),
-            (64, False),
-            (65, False),
-        ):
-            with self.subTest(remaining=remaining):
-                adder.rem_chunk_tokens = remaining
-                self.assertEqual(PrefillAdder.chunk_budget_exhausted(adder), exhausted)
+    def test_empty_prefill_only_batch_clears_flags_before_next_admission(self):
+        scheduler = MagicMock(spec=Scheduler)
+        scheduler.scheduler_stage_metrics = None
+        scheduler.enable_fpm = False
+        scheduler.dllm_config = None
+        scheduler.chunked_req = None
+        scheduler.enable_hisparse = False
+        scheduler.require_mlp_sync = False
+        scheduler._should_defer_prefill.return_value = True
+        scheduler.dp_attn_adapter = MagicMock()
+        scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = (
+            lambda batch, **kwargs: batch
+        )
+        scheduler.dp_attn_adapter.maybe_convert_decode_to_extend.side_effect = (
+            lambda batch: batch
+        )
+        scheduler.ngram_embedding_manager = MagicMock()
+        scheduler.ngram_embedding_manager.prepare_for_forward.side_effect = (
+            lambda batch, **kwargs: batch
+        )
+        finished_req = MagicMock()
+        finished_req.finished.return_value = True
+        running = ScheduleBatch(
+            reqs=[finished_req], batch_is_full=True, is_prefill_only=True
+        )
+
+        plan = Scheduler.get_next_batch_to_run(scheduler, running, None)
+
+        self.assertTrue(plan.running_batch.is_empty())
+        self.assertFalse(plan.running_batch.batch_is_full)
+        self.assertFalse(plan.running_batch.is_prefill_only)
+        self.assertIsNone(plan.batch_to_run)
+        scheduler.update_running_batch.assert_not_called()
 
     def test_all_pending_health_signals_are_returned(self):
         sender = MagicMock()
