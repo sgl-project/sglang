@@ -145,39 +145,6 @@ compact-encoder, and LoRA routes are outside that baseline and the audited
 their row says otherwise; see
 [Quantization](/docs/sglang-diffusion/quantization) for backend-wide constraints.
 
-### Singularity hybrid weights
-
-[Singularity](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity) is an
-FL/Ref fusion fine-tune, not a complete pipeline repository. Keep the official
-model ID for the encoders and VAEs, and select one exact transformer file:
-
-```bash 2×B300 hybrid checkpoint
-pip install comfy-kitchen
-
-WEIGHTS=WarmBloodAban/Minimax-h3_Singularity/Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors
-sglang serve --model-path MiniMaxAI/MiniMax-H3 \
-  --model-variant hybrid \
-  --component-weights-paths.transformer "$WEIGHTS" \
-  --num-gpus 2 --ulysses-degree 2 --performance-mode speed \
-  --port 30000
-```
-
-For the full INT8 checkpoint, replace the filename with
-`Minimax-h3_Singularity_ref2va_v1.3_int8.safetensors`. SGLang downloads the
-selected file automatically. Do not add an online quantization override.
-`hybrid` requires an explicit weight override; it does not convert the official
-Ref2VA weights into a multimode model. Request `task` and `conditions` retain
-their [usual meanings](#4-generate-video-and-audio), including `conditions: []`
-for `t2va` and keyframes for `fl2va`.
-
-Start with `quality: "lossless"` and the standard 50-point schedule. Here
-`lossless` disables additional request-time approximations; it does not undo
-INT8 quantization, pruning, or fine-tuning. The author's recommended Ref2V
-Turbo LoRA is a separate optional adapter, not an automatically inferred
-4-step schedule. Reference fidelity can differ from the official model; see
-the [author's guidance](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity/discussions/1)
-before applying the [LoRA sampling contract](#5-lora-recipes).
-
 LoRA tensors alone do not make an execution-coupled release portable. Sparse-
 attention/SLA adapters and causal-streaming adapters such as RAVEN also require
 their matching attention or streaming pipeline; they are not standard H3 LoRA
@@ -308,6 +275,39 @@ The current `torch.compile` path changes the model's numerical output, so no
 recommended lossless preset enables it implicitly. An explicit
 `--enable-torch-compile true` remains available for controlled experiments, but
 do not use it to generate consistency ground truth.
+
+### Singularity hybrid weights
+
+[Singularity](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity) is an
+FL/Ref fusion fine-tune, not a complete pipeline repository. Keep the official
+model ID for the encoders and VAEs, and select one exact transformer file:
+
+```bash 2×B300 hybrid checkpoint
+pip install comfy-kitchen
+
+WEIGHTS=WarmBloodAban/Minimax-h3_Singularity/Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors
+sglang serve --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant hybrid \
+  --component-weights-paths.transformer "$WEIGHTS" \
+  --num-gpus 2 --ulysses-degree 2 --performance-mode speed \
+  --port 30000
+```
+
+For the full INT8 checkpoint, replace the filename with
+`Minimax-h3_Singularity_ref2va_v1.3_int8.safetensors`. SGLang downloads the
+selected file automatically. Do not add an online quantization override.
+`hybrid` requires an explicit weight override; it does not convert the official
+Ref2VA weights into a multimode model. Request `task` and `conditions` retain
+their [usual meanings](#4-generate-video-and-audio), including `conditions: []`
+for `t2va` and keyframes for `fl2va`.
+
+Start with `quality: "lossless"` and the standard 50-point schedule. Here
+`lossless` disables additional request-time approximations; it does not undo
+INT8 quantization, pruning, or fine-tuning. The author's recommended Ref2V
+Turbo LoRA is a separate optional adapter, not an automatically inferred
+4-step schedule. Reference fidelity can differ from the official model; see
+the [author's guidance](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity/discussions/1)
+before applying the [LoRA sampling contract](#5-lora-recipes).
 
 ### Advanced: precomputed AdaLN cache
 
