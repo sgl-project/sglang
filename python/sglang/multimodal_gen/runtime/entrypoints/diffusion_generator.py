@@ -125,6 +125,8 @@ class DiffGenerator:
 
         Priority level: Default pipeline config < User's pipeline config < User's kwargs
         """
+        # Not shared with from_server_args: the ServerArgs built below runs
+        # Platform.apply_server_args_defaults, which hooks must precede.
         apply_plugin_hooks()
 
         # If users also provide some kwargs, it will override the ServerArgs and PipelineConfig.
@@ -137,7 +139,7 @@ class DiffGenerator:
         else:
             server_args = ServerArgs.from_kwargs(**kwargs)
 
-        return cls.from_server_args(server_args, local_mode=local_mode)
+        return cls._create(server_args, local_mode=local_mode)
 
     @classmethod
     def from_server_args(
@@ -153,6 +155,15 @@ class DiffGenerator:
             The created DiffGenerator
         """
         apply_plugin_hooks()
+        return cls._create(server_args, local_mode=local_mode)
+
+    @classmethod
+    def _create(cls, server_args: ServerArgs, *, local_mode: bool) -> "DiffGenerator":
+        """Build and connect a generator, assuming hooks are already applied.
+
+        Each public constructor owns that step itself, so this shared body must
+        not repeat it.
+        """
         globally_suppress_loggers()
         instance = cls(
             server_args=server_args,
