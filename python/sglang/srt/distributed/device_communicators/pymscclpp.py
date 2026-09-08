@@ -2,8 +2,9 @@ import importlib
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
-from typing import Any, ClassVar, Optional, Union
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, ClassVar, Optional, Union
+from itertools import product
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,7 @@ _SUPPORTED_COLLECTIVES = {"allreduce", "allgather", "reducescatter"}
 _DEFAULT_SUPPORTED_DTYPES = (torch.float, torch.float16, torch.bfloat16)
 _DEFAULT_GPU_BUFFER_SIZE = 1 << 27
 _TUNING_MESSAGE_SIZES = tuple(1 << exponent for exponent in range(9, 24))
+_ParameterAdapter = Callable[..., None]
 
 
 @dataclass(frozen=True)
@@ -39,7 +41,7 @@ class _MessageSizeRange:
         return self.minimum <= size <= self.maximum
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class _AlgorithmConfig(ABC):
     implementation: ClassVar[str]
     name: str
@@ -49,6 +51,7 @@ class _AlgorithmConfig(ABC):
     threads_per_block: tuple[int, ...]
     message_size_range: _MessageSizeRange
     reduce_op: str
+    parameter_adapter: Optional[_ParameterAdapter] = None
     supported_dtypes: tuple[torch.dtype, ...] = _DEFAULT_SUPPORTED_DTYPES
     in_place: bool = True
     requires_nvls: bool = False
@@ -94,6 +97,17 @@ class _AlgorithmConfig(ABC):
 
     def resolve_reduce_op(self, reduce_ops):
         return getattr(reduce_ops, self.reduce_op)
+
+    def adapt_to_topology(
+        self, world_size: int, nranks_per_ipc_domain: int
+    ):
+        if self.parameter_adapter is None:
+            return
+        self.parameter_adapter(
+            self,
+            world_size=world_size,
+            nranks_per_ipc_domain=nranks_per_ipc_domain,
+        )
 
     def input_buffer_size(self, message_size: int, world_size: int) -> int:
         if self.collective == "allgather":
@@ -194,12 +208,11 @@ class _AlgorithmConfig(ABC):
         )
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class _DslAlgorithmConfig(_AlgorithmConfig):
     implementation: ClassVar[str] = "dsl"
     algo_spec: Any
-    algorithm_kwargs: tuple[dict[str, Any], ...] = ()
-    name_variant: str = ""
+    algorithm_kwargs: dict[str, tuple[Any, ...]] = field(default_factory=dict)
 
     def __post_init__(self):
         super().__post_init__()
@@ -207,6 +220,8 @@ class _DslAlgorithmConfig(_AlgorithmConfig):
             raise ValueError("DSL compile thread candidates cannot be empty")
         if any(threads <= 0 for threads in self.threads_per_block):
             raise ValueError("DSL compile thread candidates must be positive")
+        if any(not values for values in self.algorithm_kwargs.values()):
+            raise ValueError("DSL algorithm kwarg candidates cannot be empty")
         if self.algorithm is None:
             if self.algo_spec.world_size != 0 or self.algo_spec.nranks_per_node != 0:
                 raise ValueError("DSL AlgoSpec templates require zero topology values")
@@ -222,6 +237,22 @@ class _DslAlgorithmConfig(_AlgorithmConfig):
     def tuning_launches(self) -> tuple[tuple[int, int], ...]:
         return ((0, 0),)
 
+    def adapt_to_topology(
+        self,
+        world_size: int,
+        nranks_per_ipc_domain: int,
+        algorithm_kwargs: Optional[dict[str, Any]] = None,
+    ):
+        if self.parameter_adapter is None:
+            return
+        self.parameter_adapter(
+            self,
+            world_size=world_size,
+            nranks_per_ipc_domain=nranks_per_ipc_domain,
+            instances=self.algo_spec.instances,
+            algorithm_kwargs=algorithm_kwargs or {},
+        )
+
     def bind(self, algorithm, algo_spec) -> "_AlgorithmConfig":
         return replace(self, algorithm=algorithm, algo_spec=algo_spec)
 
@@ -231,15 +262,11 @@ class _DslAlgorithmConfig(_AlgorithmConfig):
         threads_per_block: int,
         algorithm_kwargs: dict[str, Any],
     ) -> str:
-        variant_parts = [self.name_variant] if self.name_variant else []
-        variant_parts.extend(
-            f"{key}_{value}" for key, value in sorted(algorithm_kwargs.items())
-        )
+        variant_parts = [f"{key}_{value}" for key, value in sorted(algorithm_kwargs.items())]
         variant = f"{'_'.join(variant_parts)}_" if variant_parts else ""
         return f"{self.name}_{ipc_domain_count}node_{variant}" f"{threads_per_block}TPB"
 
-
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class _NativeAlgorithmConfig(_AlgorithmConfig):
     implementation: ClassVar[str] = "native"
     nblocks: tuple[int, ...]
@@ -276,7 +303,7 @@ class _NativeAlgorithmConfig(_AlgorithmConfig):
         return self.selected_launch_parameters
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class _CompositeAlgorithmConfig(_AlgorithmConfig):
     implementation: ClassVar[str] = "composite"
 
@@ -296,50 +323,89 @@ _NATIVE_IPC_DOMAIN_COUNTS = (1,)
 _MULTI_NODE_IPC_DOMAIN_COUNTS = (2, 4, 8)
 
 
-_NATIVE_ALGORITHM_CONFIGS = (
-    _NativeAlgorithmConfig(
-        name="default_allreduce_nvls_packet",
-        collective="allreduce",
-        world_sizes=_SUPPORTED_WORLD_SIZES,
-        ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
-        message_size_range=_MessageSizeRange(0, 512 << 10),
-        nblocks=(4, 8, 12, 16),
-        threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
-        reduce_op="SUM",
-        requires_nvls=True,
-    ),
-    _NativeAlgorithmConfig(
-        name="default_allreduce_packet",
-        collective="allreduce",
-        world_sizes=_SUPPORTED_WORLD_SIZES,
-        ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
-        message_size_range=_MessageSizeRange(0, 2 << 20),
-        nblocks=(14, 21, 28, 42, 56),
-        threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
-        reduce_op="SUM",
-    ),
-    _NativeAlgorithmConfig(
-        name="default_allreduce_rsag_zero_copy",
-        collective="allreduce",
-        world_sizes=_SUPPORTED_WORLD_SIZES,
-        ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
-        message_size_range=_MessageSizeRange(512 << 10, 4 << 30),
-        nblocks=(32, 48, 64, 128),
-        threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
-        reduce_op="SUM",
-    ),
-    _NativeAlgorithmConfig(
-        name="default_allreduce_nvls_zero_copy",
-        collective="allreduce",
-        world_sizes=_SUPPORTED_WORLD_SIZES,
-        ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
-        message_size_range=_MessageSizeRange(512 << 10, 4 << 30),
-        nblocks=(4, 8, 12, 16, 32),
-        threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
-        reduce_op="SUM",
-        requires_nvls=True,
-    ),
-)
+def _adapt_allreduce_packet(
+    config: _AlgorithmConfig,
+    *,
+    world_size: int,
+    nranks_per_ipc_domain: int,
+) -> bool:
+    if not isinstance(config, _NativeAlgorithmConfig):
+        raise TypeError("AllReduce packet adaptation requires a native config")
+    if world_size != nranks_per_ipc_domain:
+        return False
+    min_blocks = nranks_per_ipc_domain - 1
+    nblocks = tuple(nblocks for nblocks in config.nblocks if nblocks >= min_blocks)
+    if not nblocks:
+        return False
+    config.nblocks = nblocks
+    return True
+
+
+def _adapt_dsl_message_size_range(
+    config: _AlgorithmConfig,
+    *,
+    world_size: int,
+    nranks_per_ipc_domain: int,
+    algorithm_kwargs: dict[str, Any],
+    **_: Any,
+) -> bool:
+    if not isinstance(config, _DslAlgorithmConfig):
+        raise TypeError("DSL message size adaptation requires a DSL config")
+    ipc_domain_count = world_size // nranks_per_ipc_domain
+    thread_block_group_size = algorithm_kwargs.get("thread_block_group_size", 1)
+    config.message_size_range = _MessageSizeRange(
+        minimum=config.message_size_range.minimum * thread_block_group_size,
+        maximum=config.message_size_range.maximum * ipc_domain_count,
+    )
+    return True
+
+
+def _create_native_algorithm_configs() -> tuple[_NativeAlgorithmConfig, ...]:
+    return (
+        _NativeAlgorithmConfig(
+            name="default_allreduce_nvls_packet",
+            collective="allreduce",
+            world_sizes=_SUPPORTED_WORLD_SIZES,
+            ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
+            message_size_range=_MessageSizeRange(0, 512 << 10),
+            nblocks=(4, 8, 12, 16),
+            threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
+            reduce_op="SUM",
+            requires_nvls=True,
+        ),
+        _NativeAlgorithmConfig(
+            name="default_allreduce_packet",
+            collective="allreduce",
+            world_sizes=_SUPPORTED_WORLD_SIZES,
+            ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
+            message_size_range=_MessageSizeRange(0, 2 << 20),
+            nblocks=(14, 21, 28, 42, 56),
+            threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
+            reduce_op="SUM",
+            parameter_adapter=_adapt_allreduce_packet,
+        ),
+        _NativeAlgorithmConfig(
+            name="default_allreduce_rsag_zero_copy",
+            collective="allreduce",
+            world_sizes=(4, 8, 16, 32),
+            ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
+            message_size_range=_MessageSizeRange(512 << 10, 4 << 30),
+            nblocks=(32, 48, 64, 128),
+            threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
+            reduce_op="SUM",
+        ),
+        _NativeAlgorithmConfig(
+            name="default_allreduce_nvls_zero_copy",
+            collective="allreduce",
+            world_sizes=_SUPPORTED_WORLD_SIZES,
+            ipc_domain_counts=_NATIVE_IPC_DOMAIN_COUNTS,
+            message_size_range=_MessageSizeRange(512 << 10, 4 << 30),
+            nblocks=(4, 8, 12, 16, 32),
+            threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
+            reduce_op="SUM",
+            requires_nvls=True,
+        ),
+    )
 
 
 def _create_algorithm_configs(language) -> tuple[_AlgorithmConfig, ...]:
@@ -372,47 +438,50 @@ def _create_algorithm_configs(language) -> tuple[_AlgorithmConfig, ...]:
     )
     dsl_configs = (
         _DslAlgorithmConfig(
-            name="allreduce_multi_nodes",
-            collective="allreduce",
-            world_sizes=_SUPPORTED_WORLD_SIZES,
-            ipc_domain_counts=_MULTI_NODE_IPC_DOMAIN_COUNTS,
-            message_size_range=_MessageSizeRange(1 << 10, 8 << 20),
-            reduce_op="SUM",
-            algo_spec=default_spec,
-            threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
-            algorithm_kwargs=tuple(
-                {"thread_block_group_size": thread_block_group_size}
-                for thread_block_group_size in _DEFAULT_THREAD_BLOCK_GROUP_SIZES
-            ),
+                name="allreduce_multi_nodes",
+                collective="allreduce",
+                world_sizes=_SUPPORTED_WORLD_SIZES,
+                ipc_domain_counts=_MULTI_NODE_IPC_DOMAIN_COUNTS,
+                message_size_range=_MessageSizeRange(1 << 10, 1 << 20),
+                reduce_op="SUM",
+                algo_spec=default_spec,
+                threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
+                algorithm_kwargs={
+                    "thread_block_group_size": _DEFAULT_THREAD_BLOCK_GROUP_SIZES
+                },
+                parameter_adapter=_adapt_dsl_message_size_range,
         ),
         _DslAlgorithmConfig(
             name="allgather_multi_nodes",
             collective="allgather",
             world_sizes=_SUPPORTED_WORLD_SIZES,
-            ipc_domain_counts=_MULTI_NODE_IPC_DOMAIN_COUNTS,
-            message_size_range=_MessageSizeRange(1 << 10, 8 << 20),
+            ipc_domain_counts=(
+                *_NATIVE_IPC_DOMAIN_COUNTS,
+                *_MULTI_NODE_IPC_DOMAIN_COUNTS,
+            ),
+            message_size_range=_MessageSizeRange(1 << 10, 1 << 20),
             reduce_op="NOP",
             in_place=False,
             algo_spec=allgather_spec,
             threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
+            parameter_adapter=_adapt_dsl_message_size_range,
         ),
         _DslAlgorithmConfig(
             name="reducescatter_multi_nodes",
             collective="reducescatter",
             world_sizes=_SUPPORTED_WORLD_SIZES,
             ipc_domain_counts=_MULTI_NODE_IPC_DOMAIN_COUNTS,
-            message_size_range=_MessageSizeRange(1 << 10, 8 << 20),
+            message_size_range=_MessageSizeRange(1 << 10, 1 << 20),
             reduce_op="SUM",
             algo_spec=reduce_scatter_spec,
             threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
-            algorithm_kwargs=tuple(
-                {"thread_block_group_size": thread_block_group_size}
-                for thread_block_group_size in _DEFAULT_THREAD_BLOCK_GROUP_SIZES
-            ),
-            name_variant="directowner_v4_inplace_unfused",
+            algorithm_kwargs={
+                "thread_block_group_size": _DEFAULT_THREAD_BLOCK_GROUP_SIZES
+            },
+            parameter_adapter=_adapt_dsl_message_size_range,
         ),
     )
-    return (*dsl_configs, *_NATIVE_ALGORITHM_CONFIGS)
+    return (*dsl_configs, *_create_native_algorithm_configs())
 
 
 @dataclass(frozen=True)
@@ -553,8 +622,9 @@ class PyMscclppCommunicator:
             config.in_place,
         )
         algorithms = []
-        algorithm_kwargs_variants = config.algorithm_kwargs or ({},)
-        for algorithm_kwargs in algorithm_kwargs_variants:
+        algorithm_kwarg_names = tuple(config.algorithm_kwargs)
+        for values in product(*config.algorithm_kwargs.values()):
+            algorithm_kwargs = dict(zip(algorithm_kwarg_names, values))
             for threads_per_block in config.threads_per_block:
                 spec = replace(
                     config.algo_spec,
@@ -568,13 +638,19 @@ class PyMscclppCommunicator:
                     world_size=self.world_size,
                     num_threads_per_block=threads_per_block,
                 )
+                candidate = replace(config)
+                candidate.adapt_to_topology(
+                    self.world_size,
+                    self.nranks_per_ipc_domain,
+                    algorithm_kwargs,
+                )
                 algorithm = self.mscclpp.compile(
                     algorithm_builder,
                     spec,
                     self.rank,
                     **algorithm_kwargs,
                 )
-                algorithms.append(config.bind(algorithm, spec))
+                algorithms.append(candidate.bind(algorithm, spec))
         return algorithms
 
     def _create_dsl_algorithms(
@@ -608,6 +684,7 @@ class PyMscclppCommunicator:
                 continue
             message_range = config.message_size_range
             algo.set_message_size_range(message_range.minimum, message_range.maximum)
+            config.adapt_to_topology(self.world_size, self.nranks_per_ipc_domain)
             algorithms.append(config.bind(algo))
 
         return algorithms
