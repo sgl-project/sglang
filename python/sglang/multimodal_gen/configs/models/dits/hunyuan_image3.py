@@ -7,7 +7,7 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 class HunyuanImage3ArchConfig(DiTArchConfig):
     """Architecture config for HunyuanImage-3 AR transformer backbone."""
 
-    # AR transformer params (from HF config)
+    # AR transformer params
     hidden_size: int = 4096
     num_hidden_layers: int = 32
     num_attention_heads: int = 32

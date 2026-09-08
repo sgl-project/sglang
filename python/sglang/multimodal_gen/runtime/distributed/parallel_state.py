@@ -163,33 +163,39 @@ def _clear_srt_world_group() -> None:
         srt_parallel_state._WORLD = None
 
 
+def _init_srt_moe_ep_group():
+    """SRT's MOE EP group for FusedMoE layers.
+
+    multimodal_gen has no expert parallelism: every rank keeps all experts
+    and TP shards the weights inside each expert (``_MOE_TP = _TP``). The EP
+    group must therefore be single-rank (``moe_ep_size=1``); aliasing
+    ``_MOE_EP`` to ``_TP`` would partition experts across ranks and break
+    FusedMoE dispatch.
+    """
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    world_size = torch.distributed.get_world_size()
+    return srt_parallel_state.init_model_parallel_group(
+        group_ranks=[[r] for r in range(world_size)],
+        local_rank=get_world_group().local_rank,
+        backend=torch.distributed.get_backend(get_world_group().device_group),
+        use_pynccl=False,
+        use_custom_allreduce=False,
+        group_name="moe_ep",
+    )
+
+
 def _sync_srt_tp_group() -> None:
     import sglang.srt.distributed.parallel_state as srt_parallel_state
 
     if srt_parallel_state._TP is None:
         srt_parallel_state._TP = _TP
-    # Sync MOE TP group with the TP group (weights within each expert are
-    # sharded across TP ranks).
-    if srt_parallel_state._MOE_TP is None:
-        srt_parallel_state._MOE_TP = _TP
-    # Create a *single-rank* MOE EP group so that moe_ep_size = 1.
-    # In multimodal_gen there is no separate expert parallelism: every rank
-    # keeps ALL experts and TP shards the weights within each expert.
-    # NPU requires a standalone group (not aliased to _TP).
-    if srt_parallel_state._MOE_EP is None:
-        world_size = torch.distributed.get_world_size()
-        group_ranks = [[r] for r in range(world_size)]
-        backend = torch.distributed.get_backend(_TP.device_group)
-        srt_parallel_state._MOE_EP = GroupCoordinator(
-            group_ranks=group_ranks,
-            local_rank=get_world_group().local_rank,
-            torch_distributed_backend=backend,
-            use_device_communicator=False,
-            use_srt_custom_allreduce=False,
-            group_name="moe_ep_single",
-        )
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
+    if srt_parallel_state._MOE_TP is None:
+        srt_parallel_state._MOE_TP = _TP
+    if srt_parallel_state._MOE_EP is None:
+        srt_parallel_state._MOE_EP = _init_srt_moe_ep_group()
 
 
 def _clear_srt_tp_group() -> None:
@@ -201,8 +207,8 @@ def _clear_srt_tp_group() -> None:
         srt_parallel_state._TP = None
     if srt_parallel_state._MOE_TP is _TP:
         srt_parallel_state._MOE_TP = None
-    # _MOE_EP is a dedicated single-rank group, just clear it.
     if srt_parallel_state._MOE_EP is not None:
+        srt_parallel_state._MOE_EP.destroy()
         srt_parallel_state._MOE_EP = None
 
 

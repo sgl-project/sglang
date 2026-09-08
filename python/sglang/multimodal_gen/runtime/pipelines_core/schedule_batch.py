@@ -437,9 +437,9 @@ class Req:
         bot_task = getattr(self, "bot_task", None)
         system_prompt = getattr(self, "system_prompt", None)
         if bot_task is not None:
-            debug_str += f"                bot_task: {bot_task}\n"
+            debug_str += f"            bot_task: {bot_task}\n"
         if system_prompt is not None:
-            debug_str += f"           system_prompt: {system_prompt}\n"
+            debug_str += f"               system_prompt: {system_prompt}\n"
         logger.info(debug_str)
 
 

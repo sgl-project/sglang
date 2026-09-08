@@ -753,9 +753,12 @@ class HunyuanImage3TokenizerWrapper:
         image_base_size=1024, drop_think=False,
     ):
         if batchify:
+            # One prompt slot per request: _batch_gen_infer zips prompt_list
+            # against the kwargs list, and a shorter prompt_list would
+            # silently truncate the batch to its first request.
             return self._batch_gen_infer(
                 infer_fn=self._apply_general_template,
-                prompt_list=[[]],
+                prompt_list=[[]] * len(message_list),
                 infer_fn_kwargs_list=[
                     dict(
                         message_list=ml_i, max_length=max_length,
@@ -885,6 +888,11 @@ class HunyuanImage3TokenizerWrapper:
                          condition_repeat_times=1, uncondition_repeat_times=1):
         if infer_fn_kwargs_list is None:
             infer_fn_kwargs_list = [{} for _ in prompt_list]
+        if len(prompt_list) != len(infer_fn_kwargs_list):
+            raise ValueError(
+                f"prompt_list ({len(prompt_list)}) and infer_fn_kwargs_list "
+                f"({len(infer_fn_kwargs_list)}) must have the same length"
+            )
 
         cond_results_list = None
         uncond_results_list = None

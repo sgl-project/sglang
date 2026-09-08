@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
@@ -7,13 +8,24 @@ logger = init_logger(__name__)
 
 HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT = 16
 
-# Valid bot_task values for the tokenizer
-VALID_BOT_TASKS = {"auto", "image", "think", "recaption", "think_recaption", "img_ratio", "none"}
+VALID_BOT_TASKS = {
+    "auto",
+    "image",
+    "think",
+    "recaption",
+    "think_recaption",
+    "img_ratio",
+    "none",
+}
 
-# System prompt preset names (resolved by _resolve_system_prompt)
 SYSTEM_PROMPT_PRESETS = {
-    "none", "en_unified", "en_vanilla", "en_recaption",
-    "en_think_recaption", "dynamic", "auto",
+    "none",
+    "en_unified",
+    "en_vanilla",
+    "en_recaption",
+    "en_think_recaption",
+    "dynamic",
+    "auto",
 }
 
 
@@ -26,32 +38,25 @@ class HunyuanImage3SamplingParams(SamplingParams):
     guidance_scale: float = 2.5
     num_inference_steps: int = 50
 
-    # HunyuanImage-3 specific params
-    # Mode: auto, image, recaption, think, img_ratio
-    mode: str = "auto"
-
-    # Tokenizer bot_task: controls the bot response prefix in the tokenizer.
-    # Options: auto, image, think, recaption, img_ratio, none
-    # For image generation, "image" or "none" are typical choices.
-    # Default: "image" (no bot prefix added for gen_image mode)
+    # Tokenizer bot_task: controls the bot response prefix. Default "image"
+    # adds no bot prefix for gen_image mode.
     bot_task: str = "image"
 
-    # System prompt: preset name or raw custom text.
-    # Presets: none, en_unified, en_vanilla, en_recaption,
-    #          en_think_recaption, dynamic, auto
-    # Or pass any raw text string to use it directly as the system prompt.
-    # Default: "en_unified"
+    # Preset name (see SYSTEM_PROMPT_PRESETS) or raw custom text.
     system_prompt: str | None = "en_unified"
 
     # Pre-generated CoT text from AR stage (think/recaption output)
     cot_text: str | None = None
 
-    # CoT (Chain-of-Thought) related
-    enable_cot: bool = False
-    cot_mode: str = "recaption"  # recaption or think
-
-    # Image size control
-    image_size: str = "1024x1024"
+    # Output geometry is deliberately separate from the generation canvas.
+    # The AR processor chooses its own native bucket, then the decoder applies
+    # this request-scoped policy to the fully decoded pixels.
+    output_size_mode: str = "aspect_ratio"
+    output_strategy: str = "native_crop"
+    output_ratio_policy: str = "exact"
+    output_crop_anchor: tuple[float, float] = (0.5, 0.5)
+    output_max_ratio_error: float = 0.0005
+    output_pad_value: float = 0.0
 
     # Supported resolutions (height, width) - must be divisible by 16
     supported_resolutions: list[tuple[int, int]] | None = field(
@@ -65,33 +70,41 @@ class HunyuanImage3SamplingParams(SamplingParams):
     )
 
     def _adjust(self, server_args):
-        requested_width = self.width
-        requested_height = self.height
-        if self.width is not None and self.height is not None:
-            self.width, self.height = align_hunyuan_image3_resolution(
-                self.width, self.height
-            )
-            if (self.width, self.height) != (
-                requested_width,
-                requested_height,
-            ):
-                logger.warning(
-                    "HunyuanImage-3 requires dimensions divisible by %s; adjusted "
-                    "requested resolution from %sx%s to %sx%s",
-                    HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT,
-                    requested_width,
-                    requested_height,
-                    self.width,
-                    self.height,
-                )
-        # Validate bot_task
+        # The processor's get_target_size() picks the bucket by aspect ratio;
+        # pre-aligning each dimension to a 16-px grid here would distort it.
         if self.bot_task not in VALID_BOT_TASKS:
             logger.warning(
                 f"Invalid bot_task '{self.bot_task}'. Must be one of {VALID_BOT_TASKS}. "
                 f"Defaulting to 'image'."
             )
             self.bot_task = "image"
+        self._validate_output_geometry()
         super()._adjust(server_args)
+
+    def _validate_output_geometry(self) -> None:
+        if self.output_size_mode not in {"aspect_ratio", "exact_size"}:
+            raise ValueError("output_size_mode must be 'aspect_ratio' or 'exact_size'")
+        if self.output_strategy not in {"native_crop", "native_pad"}:
+            raise ValueError("output_strategy must be 'native_crop' or 'native_pad'")
+        if self.output_ratio_policy not in {"exact", "approximate"}:
+            raise ValueError("output_ratio_policy must be 'exact' or 'approximate'")
+        if len(self.output_crop_anchor) != 2 or any(
+            not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+            for value in self.output_crop_anchor
+        ):
+            raise ValueError(
+                "output_crop_anchor must contain two finite values in [0, 1]"
+            )
+        if (
+            not math.isfinite(self.output_max_ratio_error)
+            or not 0.0 <= (self.output_max_ratio_error) < 1.0
+        ):
+            raise ValueError("output_max_ratio_error must be a finite value in [0, 1)")
+        if (
+            not math.isfinite(self.output_pad_value)
+            or not 0.0 <= (self.output_pad_value) <= 1.0
+        ):
+            raise ValueError("output_pad_value must be a finite value in [0, 1]")
 
 
 def align_hunyuan_image3_dimension(value: int) -> int:

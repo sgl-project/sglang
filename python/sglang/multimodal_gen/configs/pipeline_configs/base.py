@@ -421,6 +421,10 @@ class PipelineConfig:
         """Return whether dynamic batches should run as grouped Req lists."""
         return False
 
+    def supports_batching_image_conditioning(self):
+        """Return whether image-conditioned requests may join dynamic batches."""
+        return False
+
     def supports_sequential_dit_inference(self):
         """Return whether batched AR is followed by per-request DiT inference."""
         return False

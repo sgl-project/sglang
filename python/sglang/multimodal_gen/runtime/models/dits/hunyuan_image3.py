@@ -1,34 +1,11 @@
-# coding=utf-8
-# Copyright 2024 The HunYuan team.
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""HunyuanImage-3 model for sglang multimodal_gen diffusion pipeline.
+"""HunyuanImage-3 AR backbone + diffusion I/O for multimodal_gen.
 
-This is the AR transformer backbone + diffusion I/O interface for
-HunyuanImage-3. It lives in multimodal_gen (not srt) because HunyuanImage-3
-is a diffusion model, not an LLM serving model.
-
-Ported from the official HunyuanImage-3 model repository
+Ported from the official HunyuanImage-3 repository
 (`modeling_hunyuan_image_3.py`).
-
-Uses multimodal_gen layers for TP parallelism, attention, RoPE and
-embeddings. The MoE block uses SRT FusedMoE for efficient fused expert
-computation.
 """
 
-import math
 import re
 import types
-import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -37,27 +14,26 @@ from einops import rearrange
 from torch import nn
 from transformers import PretrainedConfig
 
-logger = logging.getLogger(__name__)
-
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
-from sglang.multimodal_gen.runtime.distributed import (
-    get_tp_rank,
-    get_tp_world_size,
-    tensor_model_parallel_all_reduce,
-)
-from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import (
+from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.models.hunyuan import (
+    _get_cla_factor,
+    _is_moe,
+)
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
+
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -67,7 +43,6 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import HunyuanImag
 
 from .hunyuan_image3_utils import (
     CachedRoPE,
-    HunYuanImageAttentionMeta,
     HunYuanRotary2DEmbedder,
     ImageKVCacheManager,
     create_hunyuan_image_attention_meta,
@@ -78,41 +53,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-
-
-# Weight names belonging to the non-AR parts of the HunyuanImage-3 checkpoint
-# (VAE, ViT). These are skipped during backbone weight loading.
+# Checkpoint weight names of the non-AR parts (VAE, ViT), skipped during
+# backbone weight loading.
 UNEXPECTED_KEYWORDS = [
     "vae",
     "vision_aligner",
     "vision_model",
 ]
-
-
-def _is_moe(config: PretrainedConfig) -> bool:
-    num_experts = getattr(config, "num_experts", None)
-    if isinstance(num_experts, int):
-        return num_experts > 1
-    if isinstance(num_experts, list) and num_experts:
-        if all(isinstance(e, int) for e in num_experts):
-            return max(num_experts) > 1
-        return False
-    return False
-
-
-def _get_cla_factor(config: PretrainedConfig) -> int:
-    if not getattr(config, "use_cla", False):
-        return 1
-    return getattr(config, "cla_share_factor", 1)
-
-
-def _get_layer_value(config: PretrainedConfig, field: str, layer_id: int, default=None):
-    value = getattr(config, field, default)
-    if isinstance(value, list):
-        assert layer_id >= 0 and len(value) > layer_id, f"{field}[{layer_id}] missing"
-        return value[layer_id]
-    return value
-
 
 # =============================================================
 # Diffusion I/O helper functions and modules
@@ -299,7 +246,6 @@ class UNetDown(nn.Module):
         factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
         self.patch_size = patch_size
-        assert self.patch_size in [1, 2, 4, 8]
 
         self.model = nn.ModuleList([
             _conv_nd(2, in_channels=in_channels, out_channels=hidden_channels,
@@ -338,7 +284,6 @@ class UNetUp(nn.Module):
         factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
         self.patch_size = patch_size
-        assert self.patch_size in [1, 2, 4, 8]
         self.model = nn.ModuleList()
 
         if self.patch_size == 1:
@@ -374,6 +319,28 @@ class UNetUp(nn.Module):
             else:
                 x = module(x)
         return x
+
+
+def _make_rope(config: PretrainedConfig, head_dim: int, rope_theta, rope_scaling, max_position):
+    if rope_scaling is not None:
+        rope_scaling = dict(rope_scaling)
+        rope_scaling["rope_type"] = "default"
+    return get_rope(
+        head_dim,
+        rotary_dim=head_dim,
+        max_position=max_position,
+        base=rope_theta,
+        rope_scaling=rope_scaling,
+        is_neox_style=True,
+    )
+
+
+def _get_layer_value(config: PretrainedConfig, field: str, layer_id: int, default=None):
+    value = getattr(config, field, default)
+    if isinstance(value, list):
+        assert layer_id >= 0 and len(value) > layer_id, f"{field}[{layer_id}] missing"
+        return value[layer_id]
+    return value
 
 
 class HunYuanMLP(nn.Module):
@@ -416,252 +383,6 @@ class HunYuanMLP(nn.Module):
         return x
 
 
-def _get_head_dim(config: PretrainedConfig, hidden_size: int, num_heads: int) -> int:
-    if getattr(config, "head_dim", None):
-        return config.head_dim
-    if hasattr(config, "attention_head_dim"):
-        return config.attention_head_dim
-    return hidden_size // num_heads
-
-
-def _make_rope(config: PretrainedConfig, head_dim: int, rope_theta, rope_scaling, max_position):
-    if rope_scaling is not None:
-        rope_scaling = dict(rope_scaling)
-        rope_scaling["rope_type"] = "default"
-    return get_rope(
-        head_dim,
-        rotary_dim=head_dim,
-        max_position=max_position,
-        base=rope_theta,
-        rope_scaling=rope_scaling,
-        is_neox_style=True,
-    )
-
-
-class HunYuanAttention(nn.Module):
-    """Self-attention of a master layer."""
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        layer_id: int = 0,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[dict] = None,
-        max_position_embeddings: int = 8192,
-        quant_config: Optional[QuantizationConfig] = None,
-        bias: bool = False,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        tp_size = get_tp_world_size()
-        self.hidden_size = hidden_size
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-
-        self.head_dim = _get_head_dim(config, hidden_size, self.total_num_heads)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.use_qk_norm = getattr(config, "use_qk_norm", False)
-        self.layer_id = layer_id
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-        )
-
-        self.rotary_emb = _make_rope(
-            config, self.head_dim, rope_theta, rope_scaling, max_position_embeddings
-        )
-        self.attn = LocalAttention(
-            num_heads=self.num_heads,
-            head_size=self.head_dim,
-            num_kv_heads=self.num_kv_heads,
-            softmax_scale=self.scaling,
-            causal=True,
-        )
-
-        self.image_attn = ImageKVCacheManager(image_token_len=4097)
-        self.image_rope2d_emb = HunYuanRotary2DEmbedder(
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-        )
-
-        if self.use_qk_norm:
-            # self.weight = torch.ones(self.head_dim)
-            self.rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
-            self.query_layernorm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
-            self.key_layernorm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
-
-    def forward(
-        self,
-        positions,
-        hidden_states,
-        forward_batch,
-        kv_states=None,
-        attn_meta=None,
-        attention_mask=None,
-        custom_pos_emb=None,
-    ):
-        q_len, hidden_size = hidden_states.size()
-        hidden_states = hidden_states.reshape(-1, hidden_size)
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        if attn_meta is not None:
-            assert positions is None
-            q, k = self.image_rope2d_emb(q, k, hidden_states, custom_pos_emb, attn_meta)
-        else:
-            q, k = self.rotary_emb(positions, q, k)
-
-        ori_k = k
-
-        if self.use_qk_norm:
-            import torch_npu
-            q = torch_npu.npu_rms_norm(q.view(-1, self.num_heads, self.head_dim).contiguous(), gamma=self.query_layernorm.weight.float(), epsilon=self.rms_norm_eps)[0]
-            k = torch_npu.npu_rms_norm(k.view(-1, self.num_kv_heads, self.head_dim).contiguous(), gamma=self.key_layernorm.weight.float(), epsilon=self.rms_norm_eps)[0]
-
-        if attn_meta is not None:
-            attn_output = self.image_attn(q, k, v, attn_meta, attention_mask=attention_mask, layer_id=self.layer_id)
-        else:
-            q = q.view(-1, self.num_heads, self.head_dim)
-            k = k.view(-1, self.num_kv_heads, self.head_dim)
-            v = v.view(-1, self.num_kv_heads, self.head_dim)
-            attn_output = self.attn(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
-
-        attn_output = attn_output.view(q.shape[0], -1)
-        output, _ = self.o_proj(attn_output)
-        output = output.reshape(q_len, -1)
-        return output, (ori_k, v)
-
-
-class HunYuanCrossAttention(nn.Module):
-    """CLA follower layer: owns only q_proj, attends to master K/V."""
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        layer_id: int = 0,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[dict] = None,
-        max_position_embeddings: int = 8192,
-        quant_config: Optional[QuantizationConfig] = None,
-        bias: bool = False,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        tp_size = get_tp_world_size()
-        self.hidden_size = hidden_size
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-
-        self.head_dim = _get_head_dim(config, hidden_size, self.total_num_heads)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.use_qk_norm = getattr(config, "use_qk_norm", False)
-        self.layer_id = layer_id
-
-        self.q_proj = ColumnParallelLinear(
-            hidden_size, hidden_size, bias=bias, quant_config=quant_config,
-            prefix=f"{prefix}.q_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim, hidden_size, bias=bias,
-            quant_config=quant_config, prefix=f"{prefix}.o_proj",
-        )
-
-        self.rotary_emb = _make_rope(
-            config, self.head_dim, rope_theta, rope_scaling, max_position_embeddings
-        )
-        self.attn = LocalAttention(
-            num_heads=self.num_heads,
-            head_size=self.head_dim,
-            num_kv_heads=self.num_kv_heads,
-            softmax_scale=self.scaling,
-            causal=True,
-        )
-
-        self.image_attn = ImageKVCacheManager(image_token_len=4097)
-        self.image_rope2d_emb = HunYuanRotary2DEmbedder(
-            num_heads=self.num_heads, num_kv_heads=self.num_kv_heads, head_dim=self.head_dim,
-        )
-
-        if self.use_qk_norm:
-            rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
-            self.query_layernorm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.key_layernorm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-
-    def forward(
-        self, positions, hidden_states, forward_batch,
-        kv_states=None, attn_meta=None, attention_mask=None, custom_pos_emb=None,
-    ):
-        assert kv_states is not None
-        ori_k, v = kv_states
-        k = ori_k
-
-        q, _ = self.q_proj(hidden_states)
-
-        if attn_meta is not None:
-            assert positions is None
-            q, _ = self.image_rope2d_emb(
-                q, torch.empty_like(k), hidden_states, custom_pos_emb, attn_meta
-            )
-        else:
-            k_tmp = torch.empty_like(k)
-            q, _ = self.rotary_emb(positions, q, k_tmp)
-
-        if self.use_qk_norm:
-            q = self.query_layernorm(q.view(-1, self.num_heads, self.head_dim).contiguous())
-            k = self.key_layernorm(k.view(-1, self.num_kv_heads, self.head_dim).contiguous())
-
-        if attn_meta is not None:
-            attn_output = self.image_attn(q, k, v, attn_meta, attention_mask=attention_mask, layer_id=self.layer_id)
-        else:
-            q = q.view(-1, self.num_heads, self.head_dim)
-            k = k.view(-1, self.num_kv_heads, self.head_dim)
-            v = v.view(-1, self.num_kv_heads, self.head_dim)
-            attn_output = self.attn(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
-
-        attn_output = attn_output.view(q.shape[0], -1)
-        output, _ = self.o_proj(attn_output)
-
-        return output, (ori_k, v)
-
-
 class HunYuanSparseMoeBlock(nn.Module):
     """Sparse MoE block using SRT FusedMoE with separate TopK routing.
 
@@ -692,10 +413,8 @@ class HunYuanSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        norm_topk_prob = getattr(config, "norm_topk_prob", True)
         self.topk = TopK(
             top_k=top_k,
-            #renormalize=norm_topk_prob,
             layer_id=layer_id,
         )
 
@@ -721,8 +440,6 @@ class HunYuanSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             layer_id=layer_id,
             prefix=f"{prefix}.experts",
-            #renormalize=top_k > 1,
-            #with_bias=getattr(config, "mlp_bias", False),
         )
 
     def forward(self, hidden_states):
@@ -732,14 +449,7 @@ class HunYuanSparseMoeBlock(nn.Module):
 
         # Router logits: [num_tokens, num_experts]
         router_logits, _ = self.gate(hidden_states)
-        # from sglang.srt.layers.moe.topk import StandardTopKOutput
 
-        # topk_output = StandardTopKOutput(
-        #     topk_weights=_,
-        #     topk_ids=router_logits,
-        #     router_logits=torch.empty(0, device=hidden_states.device),
-        # )
-        
         # TopK routing: softmax + top-k selection
         topk_output = self.topk(hidden_states, router_logits)
 
@@ -759,16 +469,192 @@ class HunYuanSparseMoeBlock(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
+class HunYuanAttention(nn.Module):
+    """Self-attention; CLA followers attend to the master's K/V via ``kv_states``."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[dict] = None,
+        max_position_embeddings: int = 8192,
+        quant_config: Optional[QuantizationConfig] = None,
+        bias: bool = False,
+        prefix: str = "",
+        is_cross_attention: bool = False,
+    ) -> None:
+        super().__init__()
+        tp_size = get_tp_world_size()
+        self.hidden_size = hidden_size
+        self.is_cross_attention = is_cross_attention
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+
+        self.head_dim = hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.use_qk_norm = getattr(config, "use_qk_norm", False)
+        self.layer_id = layer_id
+
+        if is_cross_attention:
+            # CLA follower: project only Q; K/V are reused from the master layer
+            # via ``kv_states``. Matches the reference HunYuanCrossAttention and
+            # the weight loader, which skips the fused-qkv mapping for follower
+            # layers (layer_id % cla_factor != 0) and routes their ``.q_proj``
+            # weights to this standalone q_proj.
+            self.q_proj = ColumnParallelLinear(
+                hidden_size,
+                hidden_size,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_proj",
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        self.rotary_emb = _make_rope(
+            config, self.head_dim, rope_theta, rope_scaling, max_position_embeddings
+        )
+        self.attn = LocalAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            num_kv_heads=self.num_kv_heads,
+            softmax_scale=self.scaling,
+            causal=True,
+        )
+
+        self.image_attn = ImageKVCacheManager()
+        self.image_rope2d_emb = HunYuanRotary2DEmbedder(
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
+
+        if self.use_qk_norm:
+            self.rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
+            self.query_layernorm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+            self.key_layernorm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+
+    def _apply_rope(
+        self,
+        positions,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        hidden_states: torch.Tensor,
+        custom_pos_emb,
+    ):
+        """Apply the 2D image RoPE (diffusion path) or the 1D text RoPE."""
+        if custom_pos_emb is not None:
+            return self.image_rope2d_emb(q, k, hidden_states, custom_pos_emb)
+        return self.rotary_emb(positions, q, k)
+
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        kv_states=None,
+        attn_meta=None,
+        attention_mask=None,
+        custom_pos_emb=None,
+    ):
+        q_len, hidden_size = hidden_states.size()
+        hidden_states = hidden_states.reshape(-1, hidden_size)
+
+        if self.is_cross_attention:
+            # CLA follower: attend to the master layer's K/V.
+            ori_k, v = kv_states
+            k = ori_k
+            q, _ = self.q_proj(hidden_states)
+            q, _ = self._apply_rope(
+                positions, q, torch.empty_like(k), hidden_states, custom_pos_emb,
+            )
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self._apply_rope(
+                positions, q, k, hidden_states, custom_pos_emb
+            )
+            ori_k = k
+
+        if self.use_qk_norm:
+            # Master layers use NPU fused RMSNorm; followers use generic RMSNorm.
+            if self.is_cross_attention:
+                q = self.query_layernorm(
+                    q.view(-1, self.num_heads, self.head_dim).contiguous()
+                )
+                k = self.key_layernorm(
+                    k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+                )
+            else:
+                import torch_npu
+
+                q = torch_npu.npu_rms_norm(
+                    q.view(-1, self.num_heads, self.head_dim).contiguous(),
+                    gamma=self.query_layernorm.weight.float(),
+                    epsilon=self.rms_norm_eps,
+                )[0]
+                k = torch_npu.npu_rms_norm(
+                    k.view(-1, self.num_kv_heads, self.head_dim).contiguous(),
+                    gamma=self.key_layernorm.weight.float(),
+                    epsilon=self.rms_norm_eps,
+                )[0]
+
+        if attn_meta is not None:
+            attn_output = self.image_attn(q, k, v, attn_meta, attention_mask=attention_mask)
+        else:
+            q = q.view(-1, self.num_heads, self.head_dim)
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+            attn_output = self.attn(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
+
+        attn_output = attn_output.view(q.shape[0], -1)
+        output, _ = self.o_proj(attn_output)
+        output = output.reshape(q_len, -1)
+        return output, (ori_k, v)
+
+
 class HunyuanImage3DecoderLayer(nn.Module):
     def __init__(
         self, config: PretrainedConfig, layer_id: int,
         quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
     ) -> None:
         super().__init__()
-        assert layer_id >= 0
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
-        self.intermediate_size = _get_layer_value(config, "intermediate_size", layer_id, 0)
+        # intermediate_size may be a scalar or a per-layer list in the config
+        intermediate_size = getattr(config, "intermediate_size", 0)
+        if isinstance(intermediate_size, list):
+            intermediate_size = intermediate_size[layer_id]
+        self.intermediate_size = intermediate_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(config, "original_max_position_embeddings", None):
@@ -778,7 +664,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
 
         cla_factor = _get_cla_factor(config)
-        is_cross_attn = layer_id % cla_factor != 0
+        attention_type = "cross" if layer_id % cla_factor != 0 else "self"
         attn_kwargs = dict(
             config=config, hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -788,10 +674,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             quant_config=quant_config, bias=attention_bias,
             prefix=f"{prefix}.self_attn",
         )
-        if is_cross_attn:
-            self.self_attn = HunYuanCrossAttention(**attn_kwargs)
-        else:
-            self.self_attn = HunYuanAttention(**attn_kwargs)
+        self.self_attn = HunYuanAttention(**attn_kwargs, is_cross_attention=attention_type == "cross")
 
         if _is_moe(config):
             self.mlp = HunYuanSparseMoeBlock(
@@ -815,6 +698,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         if attention_mask is not None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+            
             hidden_states, ori_kv_states = self.self_attn(
                 positions=positions, hidden_states=hidden_states,
                 forward_batch=forward_batch, kv_states=kv_states,
@@ -849,7 +733,6 @@ class HunyuanImage3Model(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -893,14 +776,13 @@ class HunyuanImage3Model(nn.Module):
     def forward_block(
         self, hidden_states, attention_mask, custom_pos_emb,
         attn_meta=None, num_image_tokens=None, first_step=False,
-        residual=None,
     ):
         if attn_meta is None:
-            assert num_image_tokens is not None
             attn_meta = create_hunyuan_image_attention_meta(
                 attention_mask, num_image_tokens, first_step
             )
 
+        residual = None
         cla_factor = _get_cla_factor(self.config)
         prev_kv_states = None
         for i, layer in enumerate(self.layers):
@@ -920,7 +802,7 @@ class HunyuanImage3Model(nn.Module):
         num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         num_key_value_groups = num_attention_heads // num_kv_heads
         hidden_size = self.config.hidden_size
-        attention_head_dim = _get_head_dim(self.config, self.config.hidden_size, num_attention_heads)
+        attention_head_dim = hidden_size // num_attention_heads
 
         qkv = qkv.reshape(num_kv_heads, num_key_value_groups + 2, attention_head_dim, hidden_size)
         q, k, v = torch.split(qkv, (num_key_value_groups, 1, 1), dim=1)
@@ -937,76 +819,61 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         self, config: HunyuanImage3DitConfig, prefix: str = "", **kwargs,
     ):
         super().__init__(config=config, **kwargs)
-        self.config = config
-        # self.hf_config is the full HF config dict set by BaseDiT.__init__
-        # (from the pipeline's config_dict). It contains all fields including
-        # diffusion-specific ones (patch_size, patch_embed_hidden_dim, etc.).
-        # The arch_config dataclass only has backbone fields.
-        # Wrap the dict in a SimpleNamespace for attribute-style access.
-        raw_hf_config = self.hf_config
-        if isinstance(raw_hf_config, dict):
-            hf_config = types.SimpleNamespace(**raw_hf_config)
-            self.hf_config = hf_config
-        else:
-            hf_config = raw_hf_config
-        # For the backbone model, use the arch config (dataclass with
-        # attribute access) which has all required transformer fields.
-        backbone_config = config.arch_config
+
+        arch_config = self.config
 
         self.model = HunyuanImage3Model(
-            backbone_config, prefix=f"{prefix}.model",
+            arch_config, prefix=f"{prefix}.model",
         )
-        self.unpadded_vocab_size = backbone_config.vocab_size
+
+        self.unpadded_vocab_size = arch_config.vocab_size
         # multimodal_gen has no dedicated LM-head layer; the vocab-parallel
         # embedding shares its layout and only `.weight` is consumed downstream.
         self.lm_head = VocabParallelEmbedding(
-            self.unpadded_vocab_size, backbone_config.hidden_size,
+            self.unpadded_vocab_size, arch_config.hidden_size,
             org_num_embeddings=self.unpadded_vocab_size,
             prefix=f"{prefix}.lm_head",
         )
-        if getattr(backbone_config, "tie_word_embeddings", False):
+        if getattr(arch_config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
         # ---- Diffusion I/O modules ----
-        patch_size = getattr(hf_config, "patch_size", 1)
-        patch_embed_hidden_dim = getattr(hf_config, "patch_embed_hidden_dim", 1024)
-        img_proj_type = getattr(hf_config, "img_proj_type", "unet")
-        # latent_channels may be at top-level or nested under hf_config.vae
-        if hasattr(hf_config, "vae") and isinstance(hf_config.vae, dict):
-            latent_channels = hf_config.vae["latent_channels"]
+        patch_size = getattr(arch_config, "patch_size", 1)
+        patch_embed_hidden_dim = getattr(arch_config, "patch_embed_hidden_dim", 1024)
+        img_proj_type = getattr(arch_config, "img_proj_type", "unet")
+        # latent_channels may be top-level or nested under arch_config.vae
+        if isinstance(getattr(arch_config, "vae", None), dict):
+            latent_channels = arch_config.vae["latent_channels"]
         else:
-            latent_channels = getattr(hf_config, "latent_channels", 32)
+            latent_channels = arch_config.latent_channels
 
         if img_proj_type == "unet":
-            self.timestep_emb = TimestepEmbedder(hidden_size=hf_config.hidden_size)
+            self.timestep_emb = TimestepEmbedder(hidden_size=arch_config.hidden_size)
             self.patch_embed = UNetDown(
                 patch_size=patch_size,
-                emb_channels=hf_config.hidden_size,
+                emb_channels=arch_config.hidden_size,
                 in_channels=latent_channels,
                 hidden_channels=patch_embed_hidden_dim,
-                out_channels=hf_config.hidden_size,
+                out_channels=arch_config.hidden_size,
             )
-            self.time_embed = TimestepEmbedder(hidden_size=hf_config.hidden_size)
+            self.time_embed = TimestepEmbedder(hidden_size=arch_config.hidden_size)
             self.final_layer = UNetUp(
                 patch_size=patch_size,
-                emb_channels=hf_config.hidden_size,
-                in_channels=hf_config.hidden_size,
+                emb_channels=arch_config.hidden_size,
+                in_channels=arch_config.hidden_size,
                 hidden_channels=patch_embed_hidden_dim,
                 out_channels=latent_channels,
                 out_norm=True,
             )
-            self.time_embed_2 = TimestepEmbedder(hidden_size=hf_config.hidden_size)
+            self.time_embed_2 = TimestepEmbedder(hidden_size=arch_config.hidden_size)
         else:
             raise ValueError(f"Unknown img_proj_type: {img_proj_type}")
 
-        # Cached 2D RoPE for diffusion steps
-        head_dim = getattr(hf_config, "head_dim", None) or (
-            hf_config.hidden_size // hf_config.num_attention_heads
-        )
+        head_dim = arch_config.hidden_size // arch_config.num_attention_heads
         self.cached_rope = CachedRoPE(
-            rope_theta=getattr(hf_config, "rope_theta", 10000.0),
+            rope_theta=arch_config.rope_theta,
             head_dim=head_dim,
-            rope_type=getattr(hf_config, "rope_type", "2d"),
+            rope_type=getattr(arch_config, "rope_type", "2d"),
         )
 
     def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, **kwargs):
@@ -1015,12 +882,23 @@ class HunyuanImage3ForCausalMM(CachableDiT):
 
     def forward_block(
         self, hidden_states, attention_mask, custom_pos_emb,
-        num_image_tokens=None, first_step=False,
+        num_image_tokens=None, first_step=False, timestep=None,
     ):
-        return self.model.forward_block(
+        # TeaCache gate: skip layers on similar steps, reuse the cached
+        # residual; one decision covers the packed CFG batch.
+        if timestep is not None and self.should_skip_forward_for_cached_states(
+            timestep=timestep
+        ):
+            return self.retrieve_cached_states(hidden_states).contiguous()
+
+        output = self.model.forward_block(
             hidden_states, attention_mask, custom_pos_emb,
             num_image_tokens=num_image_tokens, first_step=first_step,
         )
+
+        if timestep is not None:
+            self.maybe_cache_states(output, hidden_states)
+        return output
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -1033,6 +911,44 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    # TeaCache — see runtime/cache/teacache.py
+
+    def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
+        ctx = self._get_teacache_context()
+        # Gate consumed by forward_block / maybe_cache_states.
+        self.enable_teacache = ctx is not None
+        if ctx is None:
+            return False
+        # Cond/uncond rows share one packed forward (same timestep), so skip
+        # boundaries are step-unit based — no CFG doubling.
+        start_skipping, end_skipping = ctx.teacache_params.get_skip_boundaries(
+            ctx.num_inference_steps, do_cfg=False
+        )
+        is_boundary_step = (
+            ctx.current_timestep < start_skipping
+            or ctx.current_timestep >= end_skipping
+        )
+        # Timestep-conditioned input for the L1 similarity decision.
+        modulated_inp = self.time_embed(kwargs["timestep"])
+        should_calc = self._compute_teacache_decision(
+            modulated_inp=modulated_inp,
+            is_boundary_step=is_boundary_step,
+            coefficients=ctx.coefficients,
+            teacache_thresh=ctx.teacache_thresh,
+        )
+        return not should_calc
+
+    def maybe_cache_states(
+        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
+    ) -> None:
+        """Cache the backbone residual for the packed [tokens, hidden] tensor."""
+        if not self.enable_teacache:
+            return
+        self.previous_residual = hidden_states - original_hidden_states
+
+    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states + self.previous_residual
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
@@ -1042,9 +958,9 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-        num_attention_heads = self.hf_config.num_attention_heads
+        num_attention_heads = self.config.num_attention_heads
         num_kv_heads = getattr(
-            self.hf_config, "num_key_value_heads", self.hf_config.num_attention_heads
+            self.config, "num_key_value_heads", self.config.num_attention_heads
         )
         split_params_mapping = [
             (".gate_up_proj", ".gate_and_up_proj", 2, [(1, 1), (0, 1)], None),
@@ -1056,22 +972,21 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             ),
         ]
 
-        cla_factor = _get_cla_factor(self.hf_config)
+        cla_factor = _get_cla_factor(self.config)
 
-        # Expert params mapping for FusedMoE weight loading (matching vllm-omni).
-        # Checkpoint stores fused gate_and_up_proj per expert.
-        # expert_weights_remapping maps model weight_name → checkpoint key substring.
+        # Expert mapping for FusedMoE loading (matching vllm-omni); remaps
+        # to fused gate_and_up_proj checkpoint keys.
         expert_weights_remapping = {
             "gate_proj": ("gate_and_up_proj", 1, 2),
             "up_proj": ("gate_and_up_proj", 0, 2),
         }
         expert_params_mapping = []
-        if _is_moe(self.hf_config):
+        if _is_moe(self.config):
             expert_params_mapping = FusedMoE.make_expert_params_mapping(
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
-                num_experts=self.hf_config.num_experts,
+                num_experts=self.config.num_experts,
             )
 
         params_dict = dict(self.named_parameters())
@@ -1096,7 +1011,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                 name = name.replace("up_proj_bias", "up_proj.bias")
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 continue
-            if getattr(self.hf_config, "tie_word_embeddings", False) and "lm_head.weight" in name:
+            if getattr(self.config, "tie_word_embeddings", False) and "lm_head.weight" in name:
                 continue
 
             if name.endswith("wte.weight"):
@@ -1156,13 +1071,12 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             if is_found:
                 continue
 
-            # Expert weights: matching vllm-omni approach exactly.
-            # Uses FusedMoE.make_expert_params_mapping + expert_weights_remapping
-            # to handle fused gate_and_up_proj checkpoint format.
+            # Expert weights: FusedMoE.make_expert_params_mapping +
+            # expert_weights_remapping handle the fused gate_and_up_proj format.
             is_expert_weight = False
             is_found = False
             found_num = 0
-            if _is_moe(self.hf_config) and "mlp.experts" in name:
+            if _is_moe(self.config) and "mlp.experts" in name:
                 if not getattr(self, "_expert_ckpt_logged", False):
                     logger.info("  expert ckpt key sample: %s", name)
                     self._expert_ckpt_logged = True
@@ -1170,7 +1084,6 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                     param_name, weight_name, expert_id, shard_id = mapping
                     offset = 0
                     den = 1
-                    # Apply remapping: convert model weight_name to checkpoint key
                     for (
                         mapped_weight_substr,
                         origin_weight_info,
@@ -1190,8 +1103,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                         continue
                     param = params_dict[name_mapped]
                     weight_loader = param.weight_loader
-            
-                    # Extract the correct shard from the loaded weight
+
                     if den > 1:
                         assert loaded_weight.shape[0] % den == 0
                         units = loaded_weight.shape[0] // den
@@ -1200,7 +1112,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                         ]
                     else:
                         loaded_weight_shard = loaded_weight
-            
+
                     weight_loader(
                         param,
                         loaded_weight_shard,
@@ -1227,11 +1139,10 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        # Log missing weights (model params not loaded from checkpoint)
+        # Log missing weights; filter out expected missing patterns
         all_param_names = set(params_dict.keys())
         missing = all_param_names - loaded_params
         if missing:
-            # Filter out expected missing patterns
             significant_missing = [
                 n for n in missing
                 if not any(k in n for k in ["rotary_emb", "lm_head"])
@@ -1256,23 +1167,90 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                 len(loaded_params), len(all_param_names),
             )
 
-        # Log weight dtypes for a few key parameters
-        key_names = [
-            "model.embed_tokens.weight",
-            "model.layers.0.self_attn.q_proj.weight",
-            "model.layers.0.mlp.gate.weight",
-            "patch_embed.proj.weight",
-            "final_layer.linear.weight",
-        ]
-        for kn in key_names:
-            if kn in params_dict:
-                p = params_dict[kn]
-                logger.info(
-                    "  weight dtype check: %s -> dtype=%s shape=%s",
-                    kn, p.dtype, tuple(p.shape),
-                )
-
         return loaded_params
+
+
+class LightProjector(nn.Module):
+    """ViT embedding → transformer dim projection."""
+
+    def __init__(self, config):
+        config = types.SimpleNamespace(**config)
+        super().__init__()
+
+        if config.projector_type == "linear":
+            self.layers = nn.Linear(config.input_dim, config.n_embed)
+        elif config.projector_type == "mlp_gelu":
+            modules = [nn.Linear(config.input_dim, config.n_embed)]
+            for _ in range(1, config.depth):
+                modules.append(nn.GELU())
+                modules.append(nn.Linear(config.n_embed, config.n_embed))
+            self.layers = nn.Sequential(*modules)
+        else:
+            raise ValueError(f"Unknown projector type: {config.projector_type}")
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class _Hi3CacheBlock(nn.Module):
+    """Pattern_3 view of one decoder layer for cache-dit.
+
+    cache-dit drives blocks as ``(hidden_states, *conds) -> hidden_states``
+    (ForwardPattern.Pattern_3); the real layer has the AR-backbone signature
+    ``(positions, hidden, forward_batch, residual, kv_states, mask, pos_emb)
+    -> (hidden, residual, kv)``. In the masked diffusion path the layer resets
+    ``residual = hidden`` internally and CLA is off, so it is a pure
+    ``hidden -> hidden`` map with the two condition tensors passed through.
+
+    The real layer is held by plain reference (object.__setattr__) so its
+    parameters stay registered only under ``HunyuanImage3Model.layers`` -- no
+    double registration in named_parameters/state_dict.
+    """
+
+    def __init__(self, layer: nn.Module):
+        super().__init__()
+        object.__setattr__(self, "_layer", layer)
+
+    def forward(self, hidden_states, attention_mask, custom_pos_emb):
+        # The restored pre-compact attention contract dispatches on attn_meta,
+        # which Model.forward_block always builds via the factory. This adapter
+        # was added after that threading was removed, so it builds the metadata
+        # itself (ImageKVCacheManager only reads query_lens from it).
+        attn_meta = create_hunyuan_image_attention_meta(attention_mask, None, False)
+        hidden_states, _, _ = self._layer(
+            None, hidden_states, None, None, None, attn_meta, attention_mask, custom_pos_emb,
+        )
+        return hidden_states
+
+
+class Hi3CacheBlockAdapter(nn.Module):
+    """cache-dit-wrappable view of the diffusion block loop.
+
+    ``forward`` matches ForwardPattern.Pattern_3 so DBCache caches the
+    hidden_states residual across steps and threads ``attention_mask`` /
+    ``custom_pos_emb`` through every block unchanged. This is the module handed
+    to ``enable_cache_on_transformer``; its spec is registered under this class
+    name by the AR stage (``_register_hi3_cache_dit_spec``).
+
+    The name deliberately does NOT start with ``HunyuanImage``: cache-dit's
+    ``BlockAdapterRegister.is_supported`` / ``get_adapter`` resolve a module by
+    ``cls_name.startswith(prefix)``, so a ``HunyuanImage3...`` name prefix-matches
+    cache-dit's built-in HunyuanImage (diffusers) adapter, which reads
+    ``transformer_blocks`` and mis-fires on this AR backbone. A non-colliding
+    name makes ``is_supported`` return False so the custom Pattern_3 spec
+    (``blocks_attr="blocks"``) is used instead.
+    """
+
+    def __init__(self, model: "HunyuanImage3Model"):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [_Hi3CacheBlock(layer) for layer in model.layers]
+        )
+
+    def forward(self, hidden_states, attention_mask, custom_pos_emb):
+        for block in self.blocks:
+            hidden_states = block(hidden_states, attention_mask, custom_pos_emb)
+        return hidden_states.contiguous()
 
 
 EntryClass = [HunyuanImage3ForCausalMM]
