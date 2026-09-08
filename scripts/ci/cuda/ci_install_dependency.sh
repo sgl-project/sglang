@@ -324,20 +324,6 @@ setup_cargo_cache() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-invalidate_torch_rust_cache() {
-    if [ "${SGLANG_BUILD_RUST_EXTS:-}" = "none" ]; then
-        mark_step_done "${FUNCNAME[0]}"
-        return
-    fi
-
-    # uv's editable build uses a temporary torch path. Rebuild these units
-    # under the lock so Cargo does not reuse that path in a later job.
-    cargo clean --release --manifest-path "${REPO_ROOT}/rust/sglang-radix-tree/Cargo.toml" \
-        -p torch-sys -p sglang-radix-tree
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 release_cargo_cache_lock() {
     if [ "${CARGO_TARGET_LOCK_HELD:-0}" = "1" ]; then
         flock --unlock 9
@@ -918,7 +904,6 @@ main() {
     install_pytorch_stack
     install_cuda12_deepep_wheel
     setup_cargo_cache
-    invalidate_torch_rust_cache
     install_sglang
     release_cargo_cache_lock
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
