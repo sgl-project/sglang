@@ -21,7 +21,7 @@ from sglang.srt.layers.mova import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 def test_router_bias_changes_selection_but_not_mixture_weights():
