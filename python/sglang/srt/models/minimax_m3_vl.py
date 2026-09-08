@@ -172,9 +172,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         if is_shared_experts_fusion_disabled():
             return
         self.num_fused_shared_experts = self.config.text_config.n_shared_experts
-        assert (
-            self.num_fused_shared_experts == 1
-        ), "Only 1 fused shared expert is supported"
+        assert self.num_fused_shared_experts == 1, (
+            "Only 1 fused shared expert is supported"
+        )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     @classmethod

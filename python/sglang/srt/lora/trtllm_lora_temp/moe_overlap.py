@@ -373,9 +373,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    assert (
-        runner_config.activation == "silu" and runner_config.is_gated
-    ), "experimental_sgl_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
+    assert runner_config.activation == "silu" and runner_config.is_gated, (
+        "experimental_sgl_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
+    )
     topk_output = dispatch_output.topk_output
     assert TopKOutputChecker.format_is_standard(topk_output)
     assert runner_config.top_k is not None
@@ -623,9 +623,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    assert (
-        runner_config.activation == "silu" and runner_config.is_gated
-    ), "experimental_sgl_trtllm BF16 LoRA currently supports the gated SwiGLU path only."
+    assert runner_config.activation == "silu" and runner_config.is_gated, (
+        "experimental_sgl_trtllm BF16 LoRA currently supports the gated SwiGLU path only."
+    )
     topk_output = dispatch_output.topk_output
     assert TopKOutputChecker.format_is_standard(topk_output)
     assert runner_config.top_k is not None

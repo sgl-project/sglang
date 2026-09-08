@@ -21,6 +21,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 from sglang.srt.utils import is_npu
 
@@ -222,8 +226,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self._msa_dec_meta = None
         if self.use_msa:
-            from sglang.srt.runtime_context import get_parallel
-
             self.num_q_heads = (
                 runner.model_config.num_attention_heads // get_parallel().attn_tp_size
             )
@@ -247,7 +249,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             Phase,
             check_cuda_graph_backend,
         )
-        from sglang.srt.runtime_context import get_spec
 
         spec = get_spec()
         self.speculative_num_draft_tokens = spec.speculative_num_draft_tokens
@@ -994,9 +995,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         per_query_prefix = prefix_lens_l.repeat_interleave(extend_lens)  # [total_q]
         per_query_within = torch.arange(
             total_q, device=device, dtype=torch.long
-        ) - cu_q[:-1].repeat_interleave(
-            extend_lens
-        )  # 0-indexed within each request
+        ) - cu_q[:-1].repeat_interleave(extend_lens)  # 0-indexed within each request
         per_query_seq_lens = (per_query_prefix + per_query_within + 1).to(torch.int32)
 
         max_seqlen = (
@@ -1615,6 +1614,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     ):
         self.dense = dense_backend
         self.sparse = sparse_backend
+        self.kv_index_translator = dense_backend.kv_index_translator
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend

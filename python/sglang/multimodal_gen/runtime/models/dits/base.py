@@ -22,9 +22,9 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 # TODO
 class BaseDiT(nn.Module, ABC):
-    # These are runtime implementation capabilities, not checkpoint metadata.
-    # Concrete DiT implementations override them when their tensor layout or
-    # execution semantics support only a subset of the available backends.
+    # These are runtime implementation settings, not checkpoint metadata.
+    # The backend set guides automatic selection; explicit backend requests are
+    # validated against platform and layer capabilities instead of this set.
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
     # Methods that drive a forward pass without going through __call__. FSDP2
@@ -40,6 +40,7 @@ class BaseDiT(nn.Module, ABC):
     _supported_attention_backends: set[AttentionBackendEnum] = {
         AttentionBackendEnum.SLIDING_TILE_ATTN,
         AttentionBackendEnum.SAGE_ATTN,
+        AttentionBackendEnum.SPARGE_ATTN,
         AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
         AttentionBackendEnum.AITER_SAGE,
@@ -107,6 +108,34 @@ class BaseDiT(nn.Module, ABC):
     ) -> dict[str, torch.Tensor]:
         """Apply model-specific LoRA transforms after names are normalized."""
         return adapter
+
+    def validate_weight_update_source(self, *, weights_path: str | None) -> None:
+        """Reject a weight update this model cannot stay coherent under.
+
+        Called before any weight is written, so a rejection leaves the served
+        model untouched. ``weights_path`` is the new on-disk source, or None
+        for in-memory (tensor RPC) updates. Default no-op; models that derive
+        served values from their weights override this.
+        """
+        return None
+
+    def validate_lora_layers(self, layer_names: list[str]) -> None:
+        """Reject LoRA layers this model cannot apply.
+
+        Called before any LoRA weight is written. Default no-op; models that
+        prune or replace layers a LoRA may target override this so the update
+        fails instead of silently skipping those layers.
+        """
+        return None
+
+    def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
+        """Invalidate caches derived from weights after a weight update.
+
+        ``weights_path`` is the new on-disk source, or None for in-memory
+        (tensor RPC) updates. Default no-op; models that precompute values
+        from their weights override this.
+        """
+        return None
 
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:

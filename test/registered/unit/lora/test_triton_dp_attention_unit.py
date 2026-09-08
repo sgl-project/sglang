@@ -12,6 +12,7 @@ from sglang.srt.lora.backend.triton_backend import (
     TritonLoRABackend,
     gather_dp_attention_lora_batch_info,
 )
+from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import LoRABatchLayout, get_forward
@@ -92,6 +93,7 @@ def test_communicator_publishes_layout_at_each_transition(
     communicator = LayerCommunicator.__new__(LayerCommunicator)
     communicator.layer_scatter_modes = SimpleNamespace(mlp_mode=mlp_mode)
     communicator._context = SimpleNamespace()
+    communicator._sp_variant = None
     communicator.post_attention_layernorm = None
     communicator.input_layernorm = lambda x: x
     communicator.qkv_latent_func = None
@@ -111,6 +113,26 @@ def test_communicator_publishes_layout_at_each_transition(
             assert get_forward().lora_batch_layout is expected
             communicator.prepare_attn(hidden, None, None)
             assert get_forward().lora_batch_layout is LoRABatchLayout.DP_LOCAL
+
+
+@pytest.mark.parametrize("can_run_decode_cuda_graph", [False, True])
+def test_manager_uses_current_dp_cuda_graph_eligibility(can_run_decode_cuda_graph):
+    manager = LoRAManager.__new__(LoRAManager)
+    manager.enable_dp_attention = True
+    manager.max_bs_in_cuda_graph = 4
+    tokens = torch.zeros(2, dtype=torch.int64)
+    forward_batch = ForwardBatch(
+        forward_mode=ForwardMode.DECODE,
+        batch_size=2,
+        input_ids=tokens,
+        req_pool_indices=tokens,
+        seq_lens=tokens,
+        out_cache_loc=tokens,
+        seq_lens_sum=0,
+        can_run_decode_cuda_graph=can_run_decode_cuda_graph,
+    )
+
+    assert manager._use_cuda_graph_batch(forward_batch) is can_run_decode_cuda_graph
 
 
 def test_dp_cuda_graph_global_routing_does_not_require_logprob_metadata(

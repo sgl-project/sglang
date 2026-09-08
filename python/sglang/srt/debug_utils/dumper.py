@@ -23,7 +23,11 @@ import torch.distributed as dist
 import zmq
 
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_server_args,
+    get_serving,
+)
 
 # -------------------------------------- config base ------------------------------------------
 
@@ -175,9 +179,9 @@ class DumperConfig(_BaseConfig):
                 f"grafter_role must be 'baseline' or 'target' when grafter_enable=True, "
                 f"got {self.grafter_role!r}"
             )
-            assert (
-                self.grafter_master_address
-            ), "grafter_master_address must be set when grafter_enable=True"
+            assert self.grafter_master_address, (
+                "grafter_master_address must be set when grafter_enable=True"
+            )
             assert self.grafter_master_port > 0, (
                 f"grafter_master_port must be a positive port when grafter_enable=True, "
                 f"got {self.grafter_master_port}"
@@ -992,9 +996,9 @@ class _Grafter:
             return
 
         cfg = self._config
-        assert (
-            dist.is_initialized()
-        ), "[Grafter] default torch.distributed must be initialized"
+        assert dist.is_initialized(), (
+            "[Grafter] default torch.distributed must be initialized"
+        )
         role = _GraftRole(cfg.grafter_role)
         local_world = dist.get_world_size()
         local_rank = dist.get_rank()
@@ -1722,8 +1726,6 @@ class _SGLangPlugin(_FrameworkPlugin):
 
         info = {}
 
-        from sglang.srt.runtime_context import get_parallel
-
         try:
             parallel = get_parallel()
             info["tp_rank"] = parallel.tp_rank
@@ -1793,8 +1795,6 @@ class _SGLangPlugin(_FrameworkPlugin):
             return None
 
         try:
-            from sglang.srt.runtime_context import get_server_args
-
             args = get_server_args()
             if args is None:
                 return None

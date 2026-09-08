@@ -493,8 +493,8 @@ def _run_spec_verify_cuda_graph_case(
         make_capture_case=lambda base, name, capture_prefix_len, bs: (
             make_case_with_prefix_lens(base, name, (capture_prefix_len,) * bs)
         ),
-        make_replay_case=lambda base, name, pad_prefix_lens: (
-            make_case_with_prefix_lens(base, name, base.prefix_lens + pad_prefix_lens)
+        make_replay_case=lambda base, name, pad_prefix_lens: make_case_with_prefix_lens(
+            base, name, base.prefix_lens + pad_prefix_lens
         ),
         make_forward_batch=make_forward_batch,
         fixture_inputs=fixture_inputs,
@@ -740,8 +740,8 @@ def run_gdn_eagle_verify_cuda_graph_case(
         make_forward_batch=_make_gdn_forward_batch,
         fixture_inputs=gdn_fixture_inputs,
         make_capture_inputs=make_gdn_random_inputs,
-        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: (
-            gdn_fixture_inputs(fixture)
+        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: gdn_fixture_inputs(
+            fixture
         ),
         prepare_batch=lambda spec_case, batch: _prepare_gdn_verify_batch(
             spec_case,
@@ -928,9 +928,9 @@ def run_dsv4_eagle_verify_cuda_graph_case(
     )
 
     num_draft_tokens = case.extend_lens[0] if case.extend_lens else 0
-    assert (
-        num_draft_tokens > 0
-    ), "DSV4 verify cases must set `extend_lens=(num_draft, ...)`."
+    assert num_draft_tokens > 0, (
+        "DSV4 verify cases must set `extend_lens=(num_draft, ...)`."
+    )
 
     def _prepare_dsv4_verify_batch(spec_case, batch):
         _prepare_target_verify_batch(batch, spec_case, device)
@@ -1080,8 +1080,8 @@ def run_kda_eagle_verify_cuda_graph_case(
         make_forward_batch=_make_kda_forward_batch,
         fixture_inputs=kda_fixture_inputs,
         make_capture_inputs=make_kda_random_inputs,
-        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: (
-            kda_fixture_inputs(fixture)
+        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: kda_fixture_inputs(
+            fixture
         ),
         prepare_batch=lambda spec_case, batch: _prepare_kda_verify_batch(
             spec_case,

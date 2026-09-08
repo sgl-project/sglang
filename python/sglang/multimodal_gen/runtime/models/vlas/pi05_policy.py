@@ -57,6 +57,11 @@ from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     VLADensePrefixCache,
     VLAPrefixCacheManager,
 )
+from sglang.multimodal_gen.runtime.vla.prompt_bucketing import (
+    bucket_prompt_tokens,
+    effective_token_length,
+    select_prompt_token_bucket,
+)
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
@@ -83,6 +88,7 @@ class Pi05ActionExpert(nn.Module):
         timestep: torch.Tensor,
         *,
         action_position_offset: int = 0,
+        denoise_layout: tuple[torch.Tensor | None, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         return self.core_model.denoise_step(
             prefix_context.prefix_pad_masks,
@@ -91,6 +97,7 @@ class Pi05ActionExpert(nn.Module):
             timestep,
             bool(prefix_context.layout.get("full_attention", False)),
             action_position_offset=action_position_offset,
+            denoise_layout=denoise_layout,
         )
 
 
@@ -163,12 +170,16 @@ class Pi05PolicyModel(nn.Module):
         if self.runtime_role != "all":
             logger.info("Pi05 split runtime role on rank: %s", self.runtime_role)
         self.action_expert = Pi05ActionExpert(config, self.core_model)
+        evict_graphs_on_miss = self._prompt_token_bucketing_enabled()
         self.prefix_graph_runner = VLAPrefixGraphRunner(
             enabled=self._prefix_cuda_graph_enabled(),
             max_entries=config.prefix_cuda_graph_max_entries,
+            evict_on_miss=evict_graphs_on_miss,
         )
         self.graph_runner = VLADenoiseGraphRunner(
-            enabled=config.enable_action_cuda_graph
+            enabled=config.action_cuda_graph_available(),
+            max_entries=config.action_cuda_graph_max_entries,
+            evict_on_miss=evict_graphs_on_miss,
         )
 
     def _should_use_prefix_tensor_parallel(self) -> bool:
@@ -184,22 +195,30 @@ class Pi05PolicyModel(nn.Module):
 
     def _prefix_cuda_graph_enabled(self) -> bool:
         if (
-            not self.config.enable_prefix_cuda_graph
+            not self.config.prefix_cuda_graph_available()
             or self.device.type != "cuda"
             or self.runtime_role not in ("all", "prefix")
             or self._prefix_tensor_parallel_enabled()
         ):
             return False
-        return not any(
-            (
-                self.config.offload_prefix_image_encoder,
-                self.config.offload_prefix_image_encoder_after_embed,
-                self.config.offload_prefix_token_embedding,
-                self.config.offload_prefix_language_layers,
-                self.config.offload_prefix_language_layers_after_prefix,
-                self.config.empty_cache_after_prefix,
-            )
+        return True
+
+    def _prompt_token_bucketing_enabled(self) -> bool:
+        graph_path_available = (
+            self._prefix_cuda_graph_enabled()
+            or self.config.action_cuda_graph_available()
         )
+        if (
+            not self.config.prompt_token_buckets
+            or not graph_path_available
+            or self.device.type != "cuda"
+            or self.runtime_role not in ("all", "prefix")
+            or self._prefix_tensor_parallel_enabled()
+        ):
+            return False
+        # Action SP currently requires a full-attention prefix, while prompt
+        # buckets introduce padding masks.
+        return get_vla_split_group() is None
 
     @staticmethod
     def _to_empty_preserve_buffers(module: nn.Module, *, device: torch.device) -> None:
@@ -785,6 +804,8 @@ class Pi05PolicyModel(nn.Module):
     def build_prefix_cache_key(
         self,
         observation: VLAObservationBatch,
+        *,
+        bucket_prompt: bool = False,
     ) -> str:
         camera_order = tuple(observation.metadata.get("camera_order", ()))
         image_hashes = {
@@ -793,7 +814,7 @@ class Pi05PolicyModel(nn.Module):
         masks = {
             name: bool(mask.item()) for name, mask in observation.image_masks.items()
         }
-        token_len = int(observation.token_masks.sum(dim=1).max().item())
+        token_len = effective_token_length(observation.token_masks)
         tokens = (
             observation.tokens[:, :token_len] if token_len > 0 else observation.tokens
         )
@@ -803,6 +824,18 @@ class Pi05PolicyModel(nn.Module):
             else observation.token_masks
         )
         model_revision = os.path.basename(os.path.normpath(self.model_path))
+        bucketing_enabled = bucket_prompt and self._prompt_token_bucketing_enabled()
+        prompt_bucket = (
+            select_prompt_token_bucket(token_len, self.config.prompt_token_buckets)
+            if bucketing_enabled
+            else None
+        )
+        if prompt_bucket is not None:
+            prompt_layout = f"bucket-{prompt_bucket}"
+        elif bucketing_enabled:
+            prompt_layout = "bucket-miss-exact"
+        else:
+            prompt_layout = "exact"
         return VLAPrefixCacheManager.make_key(
             model_revision=model_revision,
             tokenizer_id=f"{self.config.paligemma_variant}:{self.config.max_token_len}",
@@ -811,7 +844,9 @@ class Pi05PolicyModel(nn.Module):
             token_digest=tensor_fingerprint(tokens),
             token_mask_digest=tensor_fingerprint(token_masks),
             masks=masks,
-            positions_version=self.config.prefix_cache_layout_version,
+            positions_version=(
+                f"{self.config.prefix_cache_layout_version}:{prompt_layout}"
+            ),
             dtype=str(self.dtype).replace("torch.", ""),
             parallel_layout_version=self.config.parallel_layout_version,
             cache_namespace="pi05",
@@ -858,6 +893,7 @@ class Pi05PolicyModel(nn.Module):
         observation: VLAObservationBatch,
         *,
         use_cuda_graph: bool = True,
+        bucket_prompt: bool | None = None,
     ) -> PrefixContext:
         camera_order = tuple(observation.metadata.get("camera_order", ()))
         images = [
@@ -867,19 +903,42 @@ class Pi05PolicyModel(nn.Module):
         image_masks = [
             observation.image_masks[name].to(self.device) for name in camera_order
         ]
-        token_len = int(observation.token_masks.sum(dim=1).max().item())
-        tokens_trimmed = token_len > 0
-        if tokens_trimmed and token_len < observation.tokens.shape[1]:
-            tokens_cpu = observation.tokens[:, :token_len]
-            token_masks_cpu = observation.token_masks[:, :token_len]
+        if bucket_prompt is None:
+            bucket_prompt = use_cuda_graph
+        use_prompt_bucket = bucket_prompt and self._prompt_token_bucketing_enabled()
+        if use_prompt_bucket:
+            tokens_cpu, token_masks_cpu, token_len, prompt_bucket = (
+                bucket_prompt_tokens(
+                    observation.tokens,
+                    observation.token_masks,
+                    self.config.prompt_token_buckets,
+                )
+            )
         else:
-            tokens_cpu = observation.tokens
-            token_masks_cpu = observation.token_masks
+            token_len = effective_token_length(observation.token_masks)
+            prompt_bucket = None
+            if 0 < token_len < observation.tokens.shape[1]:
+                tokens_cpu = observation.tokens[:, :token_len]
+                token_masks_cpu = observation.token_masks[:, :token_len]
+            else:
+                tokens_cpu = observation.tokens
+                token_masks_cpu = observation.token_masks
+        prompt_bucket_miss = use_prompt_bucket and prompt_bucket is None
+        preserve_token_shape = token_len > 0 or prompt_bucket is not None
         tokens = tokens_cpu.to(self.device)
         token_masks = token_masks_cpu.to(self.device)
-        prefix_full_attention_hint = all(
-            bool(observation.image_masks[name].all().item()) for name in camera_order
-        ) and bool(token_masks_cpu.all().item())
+        # Use one masked control flow for every logical length in a bucket.
+        prefix_full_attention_hint = (
+            False
+            if prompt_bucket is not None
+            else (
+                all(
+                    bool(observation.image_masks[name].all().item())
+                    for name in camera_order
+                )
+                and bool(token_masks_cpu.all().item())
+            )
+        )
 
         image_count = len(images)
         graph_inputs = tuple([*images, *image_masks, tokens, token_masks])
@@ -896,7 +955,7 @@ class Pi05PolicyModel(nn.Module):
                     current_tokens,
                     current_token_masks,
                     prefix_full_attention_hint=prefix_full_attention_hint,
-                    tokens_trimmed=tokens_trimmed,
+                    tokens_trimmed=preserve_token_shape,
                 )
             )
             past_key_values = self._materialize_prefix_kv_for_action(past_key_values)
@@ -904,13 +963,18 @@ class Pi05PolicyModel(nn.Module):
                 past_key_values=past_key_values,
                 prefix_pad_masks=prefix_pad_masks,
                 prefix_len=prefix_pad_masks.shape[1],
-                layout={"full_attention": full_attention},
+                layout={
+                    "full_attention": full_attention,
+                    "prompt_token_bucket": prompt_bucket,
+                    "cuda_graph_eligible": not prompt_bucket_miss,
+                },
             )
 
         if (
             not use_cuda_graph
             or not self.prefix_graph_runner.enabled
             or observation.batch_size != 1
+            or prompt_bucket_miss
         ):
             return encode(graph_inputs)
 
@@ -923,7 +987,8 @@ class Pi05PolicyModel(nn.Module):
             static_layout=(
                 image_count,
                 prefix_full_attention_hint,
-                tokens_trimmed,
+                preserve_token_shape,
+                prompt_bucket,
             ),
             parallel_layout=self.config.parallel_layout_version,
         )
@@ -957,15 +1022,17 @@ class Pi05PolicyModel(nn.Module):
         use_cuda_graph: bool = True,
         action_position_offset: int = 0,
         action_sp_enabled: bool = False,
+        denoise_layout: tuple[torch.Tensor | None, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        if not bool(prefix_context.layout.get("full_attention", False)):
-            use_cuda_graph = False
-        if not use_cuda_graph:
+        if not use_cuda_graph or not prefix_context.layout.get(
+            "cuda_graph_eligible", True
+        ):
             return self.action_expert(
                 prefix_context,
                 x_t,
                 timestep,
                 action_position_offset=action_position_offset,
+                denoise_layout=denoise_layout,
             )
         parallel_layout = self.config.parallel_layout_version
         if action_sp_enabled:
@@ -976,6 +1043,9 @@ class Pi05PolicyModel(nn.Module):
         signature = VLADenoiseGraphSignature(
             batch_size=x_t.shape[0],
             prefix_len=prefix_context.prefix_len,
+            prefix_full_attention=bool(
+                prefix_context.layout.get("full_attention", False)
+            ),
             action_horizon=x_t.shape[1],
             action_dim=x_t.shape[2],
             dtype=str(x_t.dtype).replace("torch.", ""),
@@ -992,6 +1062,7 @@ class Pi05PolicyModel(nn.Module):
                 current_x_t,
                 current_timestep,
                 action_position_offset=action_position_offset,
+                denoise_layout=denoise_layout,
             )
 
         return self.graph_runner.capture_or_run(
@@ -1135,6 +1206,21 @@ class Pi05PolicyModel(nn.Module):
         if action_sp_enabled:
             x_t, action_position_offset = self._shard_action_sequence(x_t)
 
+        full_attention = bool(prefix_context.layout.get("full_attention", False))
+        graph_enabled = (
+            use_cuda_graph
+            and self.graph_runner.enabled
+            and prefix_context.layout.get("cuda_graph_eligible", True)
+        )
+        denoise_layout = None
+        if not graph_enabled:
+            denoise_layout = self.core_model.prepare_denoise_layout(
+                prefix_context.prefix_pad_masks,
+                x_t,
+                full_attention,
+                action_position_offset=action_position_offset,
+            )
+
         dt = -1.0 / num_steps
         timesteps = torch.linspace(
             1.0,
@@ -1152,6 +1238,7 @@ class Pi05PolicyModel(nn.Module):
                 use_cuda_graph=use_cuda_graph,
                 action_position_offset=action_position_offset,
                 action_sp_enabled=action_sp_enabled,
+                denoise_layout=denoise_layout,
             )
             x_t.add_(velocity, alpha=dt)
         if action_sp_enabled:

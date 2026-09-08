@@ -191,9 +191,9 @@ class LoRARegistry:
         This method itself is not synchronized, which is safe because it should only be called during LoRA unloading,
         which itself is guaranteed to be sequential.
         """
-        assert (
-            lora_id not in self._registry
-        ), "wait_for_unload should only be called after the LoRA adapter has been unregistered. "
+        assert lora_id not in self._registry, (
+            "wait_for_unload should only be called after the LoRA adapter has been unregistered. "
+        )
         counter = self._counters.get(lora_id)
         if counter is None:
             return
