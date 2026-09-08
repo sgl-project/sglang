@@ -116,7 +116,10 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         dcp_comm_backend = (
             "fi_a2a"
             if is_fi_a2a_supported(
-                dcp_size=cfg.dcp_size, tp_size=cfg.tp_size, nnodes=cfg.nnodes
+                dcp_size=cfg.dcp_size,
+                tp_size=cfg.tp_size,
+                pp_size=cfg.pp_size,
+                nnodes=cfg.nnodes,
             )
             else "a2a"
         )

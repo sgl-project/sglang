@@ -385,12 +385,15 @@ def all_gather_kv_cache_for_dcp(
 _FI_A2A_STATE: Optional[dict] = None
 
 
-def is_fi_a2a_supported(*, dcp_size: int, tp_size: int, nnodes: int) -> bool:
+def is_fi_a2a_supported(
+    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
+) -> bool:
     if not get_platform().is_sm100:
         return False
     if is_mnnvl_fabric_device():
         return True
-    return nnodes == 1 or (tp_size // nnodes) % dcp_size == 0
+    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
+    return tp_size_per_node % dcp_size == 0
 
 
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
@@ -430,14 +433,18 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     parallel = get_parallel()
 
     if not is_fi_a2a_supported(
-        dcp_size=cp_size, tp_size=parallel.tp_size, nnodes=parallel.nnodes
+        dcp_size=cp_size,
+        tp_size=parallel.tp_size,
+        pp_size=parallel.pp_size,
+        nnodes=parallel.nnodes,
     ):
         raise RuntimeError(
             "--dcp-comm-backend fi_a2a needs a Blackwell system whose DCP group "
             "shares one MNNVL domain: either MNNVL fabric memory (GB200/GB300) "
             f"or a DCP group inside one node (got dcp_size={cp_size}, "
-            f"tp_size={parallel.tp_size}, nnodes={parallel.nnodes}). Use "
-            "--dcp-comm-backend a2a or ag_rs otherwise."
+            f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
+            f"nnodes={parallel.nnodes}). Use --dcp-comm-backend a2a or ag_rs "
+            "otherwise."
         )
 
     mapping = Mapping(
