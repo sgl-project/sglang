@@ -17,6 +17,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
+from sglang.srt.hardware_backend.npu.dsv4.dsv41_compressor import (
+    LowRatioCompressResult,
+    compress_low_ratio_batch,
+)
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -411,10 +415,57 @@ class CompressorAscendBackendMixin:
         forward_batch: ForwardBatch,
         layer_id: int,
         compressor,
-    ) -> None:
+    ) -> Optional[LowRatioCompressResult]:
+        """C4/C128 publish cache as before; C1/C2 return a pre-RoPE result.
+
+        Low-ratio callers must consume the result via the future V4.1 NPU
+        indexer/cache path; this is not a replacement for
+        ``forward_low_ratio_sources``, which also publishes index/top-k data.
+        """
         if forward_batch.forward_mode.is_idle():
             return
+        if getattr(compressor, "compress_ratio", None) in (1, 2):
+            return self.forward_low_ratio_compressor(
+                compressor=compressor,
+                x=x,
+                positions=forward_batch.positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+            )
         compressor(x, forward_batch)
+
+    def forward_low_ratio_compressor(
+        self,
+        *,
+        compressor,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> Optional[LowRatioCompressResult]:
+        """Run C1/C2 only, returning normalized latents before RoPE/FP4.
+
+        Reuses the GPU model weights and source-owned C2 pending-pair state.
+        It does not use the C4/C128 fused-op state ABI or write those pools.
+        """
+        if forward_batch.forward_mode.is_idle():
+            return None
+        parallel = get_parallel()
+        if (
+            getattr(parallel, "attn_cp_size", 1) != 1
+            or getattr(parallel, "attn_dcp_size", 1) != 1
+        ):
+            raise NotImplementedError(
+                "NPU C1/C2 Compress does not support CP-sharded inputs"
+            )
+        return compress_low_ratio_batch(
+            compressor=compressor,
+            x=x,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            token_to_kv_pool=self.token_to_kv_pool,
+        )
 
     def forward_compress(
         self,
