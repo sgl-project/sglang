@@ -201,6 +201,12 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return BailingMoeV3ForCausalLM.get_model_config_for_expert_location(
+            config.text_config
+        )
+
     def _load_non_text_weight(
         self,
         name: str,
