@@ -16,11 +16,17 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_attn_tensor_model_parallel_rank,
-    get_attn_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
-from sglang.srt.layers.dp_attention import attn_tp_all_reduce
+from sglang.srt.layers.dp_attention import (
+    dp_gather_replicate,
+    dp_scatter,
+    get_attention_dp_size,
+    get_global_dp_buffer_len,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
@@ -298,17 +304,21 @@ class EngramHasher(nn.Module):
 
 
 class EngramEmbedding(nn.Module):
-    """One layer's fp8 hash table, sharded over rows across the attn-TP group
-    (the lm_head convention). Ranks in an attn-TP group process the same token
-    set, so the post-gather all_reduce has an identical shape on every peer --
-    including DP-attention idle ranks. Dequantized with e8m0 block scales."""
+    """One layer's fp8 hash table, sharded over rows across the FULL TP group
+    (minimizes per-rank memory). Under DP attention this follows the
+    moe_dense_tp convention: gather indices into the uniform global DP buffer
+    (identical shape on every rank, idle ranks included), look up + dequant on
+    the global shape, all_reduce the row-shard partials over the full TP group,
+    then scatter back to the local token segment. Without DP attention the
+    token count is already uniform across the TP group and a plain all_reduce
+    suffices. Dequantized with e8m0 block scales."""
 
     def __init__(self, num_embeddings: int, dim: int):
         super().__init__()
-        self.tp_size = get_attn_tensor_model_parallel_world_size()
+        self.tp_size = get_tensor_model_parallel_world_size()
         assert num_embeddings % self.tp_size == 0, (num_embeddings, self.tp_size)
         self.rows = num_embeddings // self.tp_size
-        self.row_start = get_attn_tensor_model_parallel_rank() * self.rows
+        self.row_start = get_tensor_model_parallel_rank() * self.rows
         self.weight = nn.Parameter(
             torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
             requires_grad=False,
@@ -323,15 +333,40 @@ class EngramEmbedding(nn.Module):
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight[self.row_start : self.row_start + self.rows])
 
-    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+    def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        """indices [..., n_cols] -> bf16 [.., n_cols, head_dim], zeroed on rows
+        this rank's shard does not own."""
         local = indices - self.row_start
         owned = (local >= 0) & (local < self.rows)
         local = local.masked_fill(~owned, 0)
         rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
         values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
-        values = values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
+        return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
+
+    def forward(
+        self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+    ) -> torch.Tensor:
+        if (
+            self.tp_size > 1
+            and forward_batch is not None
+            and get_attention_dp_size() > 1
+        ):
+            # moe_dense_tp style: allgather the DP domain first so the
+            # all_reduce below has the same [global_tokens, ...] shape on
+            # every rank (a bare all_reduce on the local tensor would
+            # mismatch across DP groups and deadlock HCCL).
+            global_indices = indices.new_zeros(
+                (get_global_dp_buffer_len(), *indices.shape[1:])
+            )
+            # Clone: the MAX_LEN gather may zero its local input in place.
+            dp_gather_replicate(global_indices, indices.clone(), forward_batch)
+            values = tensor_model_parallel_all_reduce(self._lookup(global_indices))
+            out = values.new_zeros((indices.shape[0], *values.shape[1:]))
+            dp_scatter(out, values, forward_batch)
+            return out
+        values = self._lookup(indices)
         if self.tp_size > 1:
-            values = attn_tp_all_reduce(values)
+            values = tensor_model_parallel_all_reduce(values)
         return values
 
 
@@ -388,9 +423,14 @@ class Engram(nn.Module):
         self.q_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
 
-    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        hash_ids: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
-        kv, _ = self.wkv(self.embed(hash_ids).flatten(-2))
+        kv, _ = self.wkv(self.embed(hash_ids, forward_batch).flatten(-2))
         return engram_gate(
             x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
         )
