@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""kitchen_int8's sgl-kernel backend: INT8 W8A8 linear on the fused ConvRot ops.
+"""convrot_int8's sgl-kernel backend: INT8 W8A8 linear on the fused ConvRot ops.
 
 One op takes a BF16 activation and performs the group-wise Hadamard rotation,
 dynamic per-row INT8 quantization, INT8 GEMM, dequantization and bias add
@@ -30,8 +30,8 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
@@ -97,7 +97,7 @@ def check_convrot_int8_capability(capability: tuple[int, int]) -> None:
     )
     supported_text = ", ".join(f"{a}.{b}" for a, b in sorted(supported))
     raise RuntimeError(
-        f"kitchen_int8 backend sgl_kernel does not support CC {major}.{minor}: "
+        f"convrot_int8 backend sgl_kernel does not support CC {major}.{minor}: "
         f"{reason}. Supported compute capabilities: {supported_text}"
     )
 
@@ -128,7 +128,7 @@ def _load_sgl_kernel() -> None:
     # Ops first: the capability table is read from the kernel itself.
     if not _ops_registered():
         raise RuntimeError(
-            "kitchen_int8 backend sgl_kernel requires an sgl_kernel build that "
+            "convrot_int8 backend sgl_kernel requires an sgl_kernel build that "
             "registers the torch.ops.sgl_kernel.convrot_int8_* ops; the installed "
             "sgl_kernel does not"
         )
@@ -143,7 +143,7 @@ def _as_rows(x: torch.Tensor) -> torch.Tensor:
         x = x.to(torch.bfloat16)
     elif x.dtype != torch.bfloat16:
         raise ValueError(
-            f"kitchen_int8 backend sgl_kernel does not support activation dtype {x.dtype}"
+            f"convrot_int8 backend sgl_kernel does not support activation dtype {x.dtype}"
         )
     return x.reshape(-1, x.shape[-1]).contiguous()
 
@@ -158,7 +158,7 @@ class ConvRotInt8SglKernelLinearMethod(LinearMethodBase):
 
     def __init__(
         self,
-        quant_config: KitchenInt8Config,
+        quant_config: ConvRotInt8Config,
         *,
         group_size: int,
         is_checkpoint_serialized: bool,
@@ -183,14 +183,14 @@ class ConvRotInt8SglKernelLinearMethod(LinearMethodBase):
         # layer splits the very dimension the rotation groups over.
         if input_size_per_partition % self.group_size:
             raise ValueError(
-                f"kitchen_int8 needs input_size_per_partition "
+                f"convrot_int8 needs input_size_per_partition "
                 f"({input_size_per_partition}) divisible by group_size "
                 f"{self.group_size}; leave the layer in BF16 with "
                 "--quantization-ignored-layers"
             )
         if sum(output_partition_sizes) % 8:
             raise ValueError(
-                f"kitchen_int8 backend sgl_kernel needs the output size per "
+                f"convrot_int8 backend sgl_kernel needs the output size per "
                 f"partition ({sum(output_partition_sizes)}) to be a multiple of 8"
             )
         # The online path initially matches UnquantizedLinearMethod so the

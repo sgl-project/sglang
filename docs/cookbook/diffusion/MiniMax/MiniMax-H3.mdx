@@ -238,12 +238,12 @@ transfer overhead. This exact recipe was validated on
 latency and memory comparison is collected in the benchmark section below.
 
 For a single 24 GB consumer card (RTX 4090), stream the DiT and text encoder
-and quantize DiT linear layers online with `kitchen_int8`. Keep `vae` out of
+and quantize DiT linear layers online with `convrot_int8`. Keep `vae` out of
 `--layerwise-offload-components`: putting the VAE decoder in layerwise
 offload re-streams about 9 GiB on each of 167 decode tiles. Default
 attention stays `fa` (exact). Approximate backends are opt-in; see
 [Attention Backends](/docs/sglang-diffusion/attention_backends#sage-then-sol-hybrid).
-On the RTX 4090 (CC 8.9) `kitchen_int8` runs on `comfy-kitchen`, so install it
+On the RTX 4090 (CC 8.9) `convrot_int8` runs on `comfy-kitchen`, so install it
 first (`pip install comfy-kitchen`); on CC 9.0, 10.0, 12.0 and 12.1 it uses the
 ConvRot ops bundled in `sgl-kernel` instead.
 
@@ -251,7 +251,7 @@ ConvRot ops bundled in `sgl-kernel` instead.
 sglang generate \
   --model-path MiniMaxAI/MiniMax-H3 \
   --model-variant fl2va \
-  --quantization kitchen_int8 \
+  --quantization convrot_int8 \
   --attention-backend fa \
   --performance-mode memory \
   --layerwise-offload-components dit,text_encoder \
@@ -1053,11 +1053,11 @@ This recipe is limited to the resident B200 and B300 topologies used for real
 H3 validation runs.
 </Warning>
 
-On a single 24 GB card, use `kitchen_int8` instead of FP8. It quantizes the
+On a single 24 GB card, use `convrot_int8` instead of FP8. It quantizes the
 four GEMMs per DiT block online from the Hub BF16 weights (data-free, no
 calibration) and runs them on `comfy_kitchen.int8_linear` on the 4090 (CC 8.9)
 or on the ConvRot ops bundled in `sgl-kernel` on CC 9.0, 10.0, 12.0 and 12.1
-(see [Quantization](/docs/sglang-diffusion/quantization#kitchen-int8)).
+(see [Quantization](/docs/sglang-diffusion/quantization#convrot-int8)).
 Quantization happens after H3's grouped `qkv` reorder, so do not load an
 externally pre-quantized INT8 checkpoint here.
 
@@ -1065,7 +1065,7 @@ externally pre-quantized INT8 checkpoint here.
 sglang generate \
   --model-path MiniMaxAI/MiniMax-H3 \
   --model-variant fl2va \
-  --quantization kitchen_int8 \
+  --quantization convrot_int8 \
   --attention-backend fa \
   --performance-mode memory \
   --layerwise-offload-components dit,text_encoder \
@@ -1080,13 +1080,13 @@ sglang generate \
 `--attention-backend sol_attn` with
 `--attention-backend-config dense_backend=sage_attn,dense_steps=10` and
 `--component-attention-backends text_encoder=torch_sdpa,transformer=sol_attn`.
-See [Quantization](/docs/sglang-diffusion/quantization#kitchen-int8)
+See [Quantization](/docs/sglang-diffusion/quantization#convrot-int8)
 and [Attention Backends](/docs/sglang-diffusion/attention_backends#sage-then-sol-hybrid).
 
 <Warning>
-`kitchen_int8` changes Linear numerics. `sol_attn` / `sage_attn` also change
+`convrot_int8` changes Linear numerics. `sol_attn` / `sage_attn` also change
 the attention algorithm. Neither is a consistency ground-truth mode. The
-BF16 path never depends on `comfy-kitchen`; `kitchen_int8` needs it only on
+BF16 path never depends on `comfy-kitchen`; `convrot_int8` needs it only on
 GPUs the `sgl-kernel` ops do not cover (any CC other than 9.0, 10.0, 12.0 and
 12.1).
 </Warning>
@@ -1218,7 +1218,7 @@ the configurations with collected measurements:
 | Ascend NPU | 8 NPUs, TP2 + SP4, Laser Attention | 4 NPUs, TP2 + SP2, Laser Attention |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
 | RTX 5090 | 2× TP2 + layerwise offload | — |
-| RTX 4090 24 GB | 1× layerwise offload + `kitchen_int8` | Approximate attention backends are opt-in |
+| RTX 4090 24 GB | 1× layerwise offload + `convrot_int8` | Approximate attention backends are opt-in |
 
 ### GB300 single-host
 
@@ -1692,15 +1692,15 @@ timed (seed 42); only the timed pass is reported. GPU peak stayed about
 | Config | Timed e2e | Denoise | vs BF16 | PSNR vs BF16 |
 | --- | ---: | ---: | ---: | ---: |
 | BF16 + FlashAttention | 405.6 s | 370.2 s | 1.00× | — |
-| `kitchen_int8` + FA | 303.3 s | 273.7 s | 1.34× | 24.81 dB |
-| `kitchen_int8` + `sol_attn` | 223.9 s | 203.9 s | 1.81× | 24.44 dB |
-| `kitchen_int8` + `sage_attn` | 174.9 s | 154.2 s | 2.32× | 23.51 dB |
-| `kitchen_int8` + Sage→Sol hybrid | 163.8 s | 143.1 s | 2.48× | 23.04 dB |
+| `convrot_int8` + FA | 303.3 s | 273.7 s | 1.34× | 24.81 dB |
+| `convrot_int8` + `sol_attn` | 223.9 s | 203.9 s | 1.81× | 24.44 dB |
+| `convrot_int8` + `sage_attn` | 174.9 s | 154.2 s | 2.32× | 23.51 dB |
+| `convrot_int8` + Sage→Sol hybrid | 163.8 s | 143.1 s | 2.48× | 23.04 dB |
 
-`kitchen_int8` + FA changes Linear numerics only. The `sol_attn` /
+`convrot_int8` + FA changes Linear numerics only. The `sol_attn` /
 `sage_attn` / hybrid rows also change the attention algorithm, so speed
 and pixel fidelity rank in opposite orders there. Default remains
-`kitchen_int8` + `fa`. Cache-DiT can share this layerwise recipe; omit
+`convrot_int8` + `fa`. Cache-DiT can share this layerwise recipe; omit
 `quality` and see the quality-level section.
 
 ### AMD Instinct task and scaling runs

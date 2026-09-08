@@ -14,8 +14,8 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     apply_unquantized_linear,
 )
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel import (
     sgl_kernel_convrot_available,
@@ -57,7 +57,7 @@ def _linear(
     bias: bool = True,
     dim: int = DIM,
     dtype: torch.dtype = torch.bfloat16,
-    quant_config: KitchenInt8Config | None = None,
+    quant_config: ConvRotInt8Config | None = None,
     prefix: str = "",
 ) -> ColumnParallelLinear:
     linear = ColumnParallelLinear(
@@ -105,7 +105,7 @@ def _attention(
     *,
     bias: bool = True,
     dtype: torch.dtype = torch.bfloat16,
-    quant_config: KitchenInt8Config | None = None,
+    quant_config: ConvRotInt8Config | None = None,
 ) -> QwenImageCrossAttention:
     dim = DIM if quant_config is None else CONVROT_DIM
     attn = object.__new__(QwenImageCrossAttention)
@@ -380,12 +380,12 @@ class TestQwenImageJointQkvBuffers(_JointQkvCase):
 
 @requires_convrot_kernel
 class TestQwenImageJointQkvBuffersConvRot(_JointQkvCase):
-    """The same forward with the six projections on kitchen_int8's sgl-kernel
+    """The same forward with the six projections on convrot_int8's sgl-kernel
     backend, which writes the joint buffers through its out= op."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.config = KitchenInt8Config(backend="sgl_kernel")
+        self.config = ConvRotInt8Config(backend="sgl_kernel")
 
     def test_forward_is_bitwise_identical_to_join_seqs_path(self):
         attn = _attention(quant_config=self.config)

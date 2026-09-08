@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""INT8 weight-only-storage linear backed by comfy_kitchen's fused ConvRot kernel.
+"""convrot_int8's comfy_kitchen backend: INT8 linear on comfy_kitchen's fused ConvRot kernel.
 
 On Ada (RTX 4090) INT8 is only worth doing with the right kernel: on MiniMax H3
 shapes `torch._int_mm` measures 0.46-0.90x of BF16 (i.e. slower) and a Triton
@@ -22,12 +22,12 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
-__all__ = ["KitchenInt8Config", "KitchenInt8LinearMethod"]
+__all__ = ["ConvRotInt8ComfyKitchenLinearMethod"]
 
 # comfy_kitchen's dtype codes for the fused op's output.
 _OUT_DTYPE_CODE = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
@@ -71,7 +71,7 @@ def _load_comfy_kitchen():
         import comfy_kitchen  # noqa: F401
     except ImportError as exc:  # pragma: no cover - depends on optional dep
         raise ImportError(
-            "kitchen_int8 quantization requires the `comfy-kitchen` package "
+            "convrot_int8 quantization requires the `comfy-kitchen` package "
             "(pip install comfy-kitchen). It is a self-contained abi3 extension "
             "and does not link against libtorch, so any torch version works."
         ) from exc
@@ -82,12 +82,12 @@ def _load_comfy_kitchen():
         )
 
 
-class KitchenInt8LinearMethod(LinearMethodBase):
+class ConvRotInt8ComfyKitchenLinearMethod(LinearMethodBase):
     """Loads or creates ConvRot INT8 weights and runs the fused kernel."""
 
     def __init__(
         self,
-        quant_config: KitchenInt8Config,
+        quant_config: ConvRotInt8Config,
         *,
         group_size: int,
         is_checkpoint_serialized: bool,
@@ -112,7 +112,7 @@ class KitchenInt8LinearMethod(LinearMethodBase):
         # dimension the rotation groups over.
         if input_size_per_partition % self.group_size:
             raise ValueError(
-                f"kitchen_int8 needs input_size_per_partition "
+                f"convrot_int8 needs input_size_per_partition "
                 f"({input_size_per_partition}) divisible by group_size "
                 f"{self.group_size}; leave the layer in BF16 with "
                 "--quantization-ignored-layers"
@@ -187,7 +187,7 @@ class KitchenInt8LinearMethod(LinearMethodBase):
         out_code = _OUT_DTYPE_CODE.get(x.dtype)
         if out_code is None:
             raise ValueError(
-                f"kitchen_int8 does not support activation dtype {x.dtype}"
+                f"convrot_int8 does not support activation dtype {x.dtype}"
             )
 
         # The kernel takes 2D activations; callers may pass [..., K].

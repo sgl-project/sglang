@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.method_names import (
+    canonical_quantization_method,
+)
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
@@ -1870,10 +1873,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
             normalized_direct_gpu_loading[component_name] = enabled
         self.component_direct_gpu_weight_loading = normalized_direct_gpu_loading
+        if self.quantization is not None:
+            self.quantization = canonical_quantization_method(self.quantization)
         normalized_quantizations: dict[str, str] = {}
         for component, quantization in self.component_quantizations.items():
             component = str(component).strip().replace("-", "_")
-            quantization = str(quantization).strip().lower()
+            quantization = canonical_quantization_method(
+                str(quantization).strip().lower()
+            )
             if not component or not quantization:
                 raise ValueError(
                     "Component quantization entries require a component and method"
@@ -2647,10 +2654,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Use this flag to override auto-detection. "
                 "Online (post-load) quantization from a BF16/FP16 checkpoint "
-                "is supported for 'fp8', 'mxfp4' and 'kitchen_int8' (ConvRot INT8 "
+                "is supported for 'fp8', 'mxfp4' and 'convrot_int8' (ConvRot INT8 "
                 "W8A8; runs on sgl-kernel's fused ops on CC 9.0, 10.0, 12.0 and "
                 "12.1, else on comfy_kitchen; see "
-                "SGLANG_DIFFUSION_KITCHEN_INT8_BACKEND). Other methods "
+                "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND; 'kitchen_int8' is a "
+                "deprecated alias). Other methods "
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
@@ -2664,7 +2672,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.quantization_ignored_layers,
             help=(
                 "Layer name patterns to keep unquantized during online quantization "
-                "(fp8/mxfp4/kitchen_int8). Each pattern is matched against the "
+                "(fp8/mxfp4/convrot_int8). Each pattern is matched against the "
                 "layer prefix. "
                 "Example: --quantization-ignored-layers img_mod txt_mod to_out"
             ),

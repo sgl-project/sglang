@@ -122,12 +122,12 @@ backend.
       <td>MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to <code>fp8</code> / <code>mxfp4</code> dynamically.</td>
     </tr>
     <tr>
-      <td><code>kitchen_int8</code> (online quantization)</td>
+      <td><code>convrot_int8</code> (online quantization; <code>kitchen_int8</code> is a deprecated alias)</td>
       <td>Unquantized BF16/FP16 checkpoint</td>
-      <td><code>--component-quantizations.&lt;component&gt; kitchen_int8</code></td>
+      <td><code>--component-quantizations.&lt;component&gt; convrot_int8</code></td>
       <td>MiniMax-H3, Qwen-Image, Qwen-Image-Edit (quality-validated); other BF16 DiTs load but are not quality-validated</td>
       <td><code>sgl-kernel</code> (bundled) or <code>comfy-kitchen</code></td>
-      <td>Data-free INT8 ConvRot W8A8 at load time, per layer on the fused <code>sgl-kernel</code> ops (CC 9.0, 10.0, 12.0, 12.1) or on <code>comfy_kitchen.int8_linear</code> (Turing+); <code>SGLANG_DIFFUSION_KITCHEN_INT8_BACKEND</code> forces one. Layers whose input dim is not divisible by the group size stay in BF16. TP, LoRA, FSDP and memory notes under Kitchen INT8 below.</td>
+      <td>Data-free INT8 ConvRot W8A8 at load time, per layer on the fused <code>sgl-kernel</code> ops (CC 9.0, 10.0, 12.0, 12.1) or on <code>comfy_kitchen.int8_linear</code> (Turing+); <code>SGLANG_DIFFUSION_CONVROT_INT8_BACKEND</code> forces one. Layers whose input dim is not divisible by the group size stay in BF16. TP, LoRA, FSDP and memory notes under ConvRot INT8 below.</td>
     </tr>
     <tr>
       <td><code>fp8</code> (offline quantization)</td>
@@ -389,9 +389,10 @@ sglang generate \
 ```
 **Note:** Requires `aiter` package with MXFP4 kernel support
 
-### Kitchen INT8
+### ConvRot INT8
 
-`kitchen_int8` is online W8A8 INT8 for DiTs and compatible native encoders:
+`convrot_int8` (formerly `kitchen_int8`, still accepted as a deprecated alias)
+is online W8A8 INT8 for DiTs and compatible native encoders:
 every linear whose input dim is divisible by the Hadamard group size (256) is
 rotated and quantized per output channel after loading a stock BF16 checkpoint
 (ConvRot, arXiv:2512.03673; no calibration data). Each forward call runs one
@@ -418,7 +419,7 @@ The default `auto` takes `sgl_kernel` wherever its ops run and `comfy_kitchen`
 otherwise; loading stops with an install hint if `comfy-kitchen` is then
 missing. A layer whose output width is not a multiple of 8 goes to
 `comfy_kitchen` when it is installed and stays BF16 otherwise.
-`SGLANG_DIFFUSION_KITCHEN_INT8_BACKEND=sgl_kernel` or `=comfy_kitchen` forces
+`SGLANG_DIFFUSION_CONVROT_INT8_BACKEND=sgl_kernel` or `=comfy_kitchen` forces
 one backend. LoRA adapters run in dynamic mode (they cannot be merged into
 rotated INT8 weights); under FSDP `auto` resolves to `comfy_kitchen` and an
 explicit `sgl_kernel` is refused. Serialized Comfy ConvRot INT8 DiTs and native
@@ -430,7 +431,7 @@ quantization), and follow the same per-layer backend choice.
 ```bash
 sglang generate \
   --model-path Qwen/Qwen-Image \
-  --quantization kitchen_int8 \
+  --quantization convrot_int8 \
   --prompt "a beautiful sunset" \
   --save-output
 ```
@@ -439,7 +440,7 @@ sglang generate \
 sglang generate \
   --model-path MiniMaxAI/MiniMax-H3 \
   --model-variant fl2va \
-  --component-quantizations.transformer kitchen_int8 \
+  --component-quantizations.transformer convrot_int8 \
   --attention-backend fa \
   --performance-mode memory \
   --layerwise-offload-components dit,text_encoder \
@@ -482,11 +483,11 @@ offload); the serialized Comfy INT8 checkpoint loads at 96 GiB resident and
 runs on `sgl_kernel` at the same speed.
 
 <Warning>
-`kitchen_int8` is approximate: same-seed outputs are not bit-exact with BF16 or
+`convrot_int8` is approximate: same-seed outputs are not bit-exact with BF16 or
 between the two backends (both stay within INT8 quantization noise of BF16), so
 it is not a consistency ground-truth mode. Quality was validated against BF16 on
 MiniMax-H3, Qwen-Image and Qwen-Image-Edit; other DiTs load but are not
-quality-validated. Without `kitchen_int8` neither backend is loaded and the BF16
+quality-validated. Without `convrot_int8` neither backend is loaded and the BF16
 path is untouched. See the
 [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#8-feature-contracts-and-advanced-recipes)
 for the 24 GB offload recipe, including why `vae` must stay out of

@@ -13,8 +13,8 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     OnlineQuantizationComponentLoader,
@@ -384,7 +384,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             )
         if (
             use_fsdp
-            and isinstance(quant_spec.quant_config, KitchenInt8Config)
+            and isinstance(quant_spec.quant_config, ConvRotInt8Config)
             and not quant_spec.quant_config.is_checkpoint_int8_serialized
         ):
             # Only the comfy_kitchen backend has run under FSDP.
@@ -488,7 +488,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 runtime_quant_config=quant_spec.runtime_quant_config,
                 quantized_cpu_load_supported=(
                     quant_spec.gguf_file is not None
-                    or quant_spec.is_serialized_kitchen_int8
+                    or quant_spec.is_serialized_convrot_int8
                     or quant_spec.is_serialized_kitchen_w4a8
                 ),
             )

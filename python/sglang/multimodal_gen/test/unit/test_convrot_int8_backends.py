@@ -1,4 +1,4 @@
-"""Unit tests for kitchen_int8's backend selection and its sgl-kernel backend."""
+"""Unit tests for convrot_int8's backend selection and its sgl-kernel backend."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,8 +13,11 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
+    ConvRotInt8ComfyKitchenLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel import (
     ConvRotInt8SglKernelLinearMethod,
@@ -25,20 +28,15 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel i
     convrot_int8_shares_input,
     sgl_kernel_convrot_available,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8 import (
-    KitchenInt8LinearMethod,
-)
 
 _CONFIG_MODULE = (
-    "sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config"
+    "sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config"
 )
 _LOAD_SGL_KERNEL = (
     "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel."
     "_load_sgl_kernel"
 )
-_LOAD_COMFY_KITCHEN = (
-    "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8._load_comfy_kitchen"
-)
+_LOAD_COMFY_KITCHEN = "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen._load_comfy_kitchen"
 
 QWEN_IMAGE_IGNORED_LAYERS = ["img_mod", "txt_mod", "txt_mlp.net.2"]
 
@@ -49,8 +47,8 @@ requires_kernel = pytest.mark.skipif(
 )
 
 
-def _sgl_config(**kwargs) -> KitchenInt8Config:
-    return KitchenInt8Config(backend="sgl_kernel", **kwargs)
+def _sgl_config(**kwargs) -> ConvRotInt8Config:
+    return ConvRotInt8Config(backend="sgl_kernel", **kwargs)
 
 
 def _method_for(config, prefix, input_size=3072):
@@ -237,7 +235,7 @@ def test_row_parallel_shard_not_divisible_by_group_is_refused(
 
     _with_tp(monkeypatch, tp_size)
     config = _sgl_config()
-    # kitchen_int8 semantics: the unsharded input divides, so the layer is
+    # convrot_int8 semantics: the unsharded input divides, so the layer is
     # selected, and a shard that does not divide is refused at construction.
     with pytest.raises(ValueError, match="divisible by group_size"):
         RowParallelLinear(
@@ -408,7 +406,7 @@ def test_auto_backend_prefers_sgl_kernel_and_falls_back_to_comfy(_sgl, _comfy):
         patch(_SGL_AVAILABLE, return_value=True),
         patch(_COMFY_AVAILABLE, return_value=True),
     ):
-        config = KitchenInt8Config()
+        config = ConvRotInt8Config()
         assert config.resolve_backend() == "sgl_kernel"
         method = config.get_quant_method(LinearBase(3072, 3072), "blocks.0.attn.to_q")
         assert isinstance(method, ConvRotInt8SglKernelLinearMethod)
@@ -417,10 +415,10 @@ def test_auto_backend_prefers_sgl_kernel_and_falls_back_to_comfy(_sgl, _comfy):
         patch(_SGL_AVAILABLE, return_value=False),
         patch(_COMFY_AVAILABLE, return_value=True),
     ):
-        config = KitchenInt8Config()
+        config = ConvRotInt8Config()
         assert config.resolve_backend() == "comfy_kitchen"
         method = config.get_quant_method(LinearBase(3072, 3072), "blocks.0.attn.to_q")
-        assert isinstance(method, KitchenInt8LinearMethod)
+        assert isinstance(method, ConvRotInt8ComfyKitchenLinearMethod)
         assert config.selected_by_backend["comfy_kitchen"] == ["blocks.0.attn.to_q"]
 
 
@@ -431,12 +429,12 @@ def test_auto_backend_serves_narrow_outputs_with_comfy_or_leaves_bf16(_sgl, _com
     to comfy_kitchen when it is installed and stays BF16 otherwise."""
     with patch(_SGL_AVAILABLE, return_value=True):
         with patch(_COMFY_AVAILABLE, return_value=True):
-            config = KitchenInt8Config()
+            config = ConvRotInt8Config()
             method = config.get_quant_method(LinearBase(4096, 4), "blocks.0.gate")
-            assert isinstance(method, KitchenInt8LinearMethod)
+            assert isinstance(method, ConvRotInt8ComfyKitchenLinearMethod)
             assert config.selected_by_backend["comfy_kitchen"] == ["blocks.0.gate"]
         with patch(_COMFY_AVAILABLE, return_value=False):
-            config = KitchenInt8Config()
+            config = ConvRotInt8Config()
             method = config.get_quant_method(LinearBase(4096, 4), "blocks.0.gate")
             assert isinstance(method, UnquantizedLinearMethod)
             assert config.skipped == ["blocks.0.gate(out=4)"]
@@ -463,14 +461,14 @@ def test_serialized_layers_pick_the_backend_per_marker_group_size(_sgl, _comfy):
         patch(_SGL_AVAILABLE, return_value=True),
         patch(_COMFY_AVAILABLE, return_value=True),
     ):
-        config = KitchenInt8Config(layer_markers=markers)
+        config = ConvRotInt8Config(layer_markers=markers)
         small = ReplicatedLinear(
             64, 16, bias=False, quant_config=config, prefix="visual.proj"
         )
         fc1 = ReplicatedLinear(
             256, 16, bias=False, quant_config=config, prefix="blocks.0.fc1"
         )
-    assert isinstance(small.quant_method, KitchenInt8LinearMethod)
+    assert isinstance(small.quant_method, ConvRotInt8ComfyKitchenLinearMethod)
     assert isinstance(fc1.quant_method, ConvRotInt8SglKernelLinearMethod)
     assert fc1.quant_method.is_checkpoint_serialized
     assert fc1.weight.dtype == torch.int8 and fc1.weight.shape == (16, 256)
@@ -481,11 +479,11 @@ def test_serialized_layers_pick_the_backend_per_marker_group_size(_sgl, _comfy):
 
 def test_explicit_backend_rejects_group_sizes_it_has_no_kernel_for():
     with pytest.raises(ValueError, match="group sizes"):
-        KitchenInt8Config(group_size=16, backend="sgl_kernel")
+        ConvRotInt8Config(group_size=16, backend="sgl_kernel")
     with pytest.raises(ValueError, match="group sizes"):
-        KitchenInt8Config(group_size=128, backend="comfy_kitchen")
+        ConvRotInt8Config(group_size=128, backend="comfy_kitchen")
     with pytest.raises(ValueError, match="backend must be one of"):
-        KitchenInt8Config(backend="triton")
+        ConvRotInt8Config(backend="triton")
 
 
 def test_require_comfy_kitchen_pins_auto_and_refuses_explicit_sgl_kernel():
@@ -493,11 +491,11 @@ def test_require_comfy_kitchen_pins_auto_and_refuses_explicit_sgl_kernel():
         patch(_SGL_AVAILABLE, return_value=True),
         patch(_COMFY_AVAILABLE, return_value=True),
     ):
-        config = KitchenInt8Config()
+        config = ConvRotInt8Config()
         config.require_comfy_kitchen("is not validated here")
         assert config.resolve_backend() == "comfy_kitchen"
         with pytest.raises(ValueError, match="sgl_kernel is not validated here"):
-            KitchenInt8Config(backend="sgl_kernel").require_comfy_kitchen(
+            ConvRotInt8Config(backend="sgl_kernel").require_comfy_kitchen(
                 "is not validated here"
             )
 
@@ -514,7 +512,7 @@ def test_serialized_layer_on_sgl_kernel_matches_online_quantization_bitwise():
             "convrot_groupsize": 256,
         }
     }
-    config = KitchenInt8Config(layer_markers=markers, backend="sgl_kernel")
+    config = ConvRotInt8Config(layer_markers=markers, backend="sgl_kernel")
     serialized = ReplicatedLinear(
         3072, 3072, params_dtype=torch.bfloat16, quant_config=config, prefix="attn.to_q"
     ).cuda()
@@ -531,15 +529,15 @@ def test_serialized_layer_on_sgl_kernel_matches_online_quantization_bitwise():
 
 
 def test_auto_logs_why_the_sgl_kernel_backend_is_unavailable(caplog):
-    """A refused GPU (CC 10.3) must still say why once the method is kitchen_int8
+    """A refused GPU (CC 10.3) must still say why once the method is convrot_int8
     with auto backend, not only when sgl_kernel is requested explicitly."""
     import logging
 
     from sglang.multimodal_gen.runtime.layers.quantization.configs import (
-        kitchen_int8_config,
+        convrot_int8_config,
     )
 
-    kitchen_int8_config._log_sgl_kernel_fallback.cache_clear()
+    convrot_int8_config._log_sgl_kernel_fallback.cache_clear()
     reason = (
         "CC 10.3 is not supported: Blackwell Ultra cuts INT8 tensor-core throughput"
     )
@@ -552,7 +550,7 @@ def test_auto_logs_why_the_sgl_kernel_backend_is_unavailable(caplog):
         patch(_COMFY_AVAILABLE, return_value=True),
         caplog.at_level(logging.INFO),
     ):
-        config = KitchenInt8Config()
+        config = ConvRotInt8Config()
         assert config.resolve_backend() == "comfy_kitchen"
         assert config.resolve_backend() == "comfy_kitchen"
     messages = [
@@ -572,7 +570,7 @@ def test_shared_input_requires_one_group_size(_sgl):
         "b": {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 64},
         "c": {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256},
     }
-    config = KitchenInt8Config(layer_markers=markers, backend="sgl_kernel")
+    config = ConvRotInt8Config(layer_markers=markers, backend="sgl_kernel")
     a, b, c = (
         ReplicatedLinear(256, 16, bias=False, quant_config=config, prefix=name)
         for name in "abc"
@@ -589,13 +587,13 @@ def test_every_no_kernel_branch_raises_instead_of_falling_back():
         patch(_COMFY_AVAILABLE, return_value=True),
     ):
         with pytest.raises(ValueError, match="no backend on this machine"):
-            KitchenInt8Config(group_size=128)
+            ConvRotInt8Config(group_size=128)
     with (
         patch(_SGL_AVAILABLE, return_value=True),
         patch(_COMFY_AVAILABLE, return_value=False),
     ):
         with pytest.raises(ValueError, match="no kernel for group size 128"):
-            KitchenInt8Config(group_size=128).require_comfy_kitchen("is pinned")
+            ConvRotInt8Config(group_size=128).require_comfy_kitchen("is pinned")
         markers = {
             "gate": {
                 "format": "int8_tensorwise",
@@ -603,7 +601,7 @@ def test_every_no_kernel_branch_raises_instead_of_falling_back():
                 "convrot_groupsize": 256,
             }
         }
-        config = KitchenInt8Config(layer_markers=markers)
+        config = ConvRotInt8Config(layer_markers=markers)
         with pytest.raises(ValueError, match="pip install comfy-kitchen"):
             config.get_quant_method(LinearBase(256, 4), "gate")
 
@@ -628,7 +626,7 @@ def test_serialized_layers_log_the_backend_split_once_loaded(_sgl, _comfy, caplo
         patch(_COMFY_AVAILABLE, return_value=True),
         caplog.at_level(logging.INFO),
     ):
-        config = KitchenInt8Config(layer_markers=markers)
+        config = ConvRotInt8Config(layer_markers=markers)
         fc1 = ReplicatedLinear(256, 16, bias=False, quant_config=config, prefix="fc1")
         small = ReplicatedLinear(
             64, 16, bias=False, quant_config=config, prefix="small"
@@ -640,5 +638,31 @@ def test_serialized_layers_log_the_backend_split_once_loaded(_sgl, _comfy, caplo
         r.getMessage() for r in caplog.records if "serialized INT8" in r.getMessage()
     ]
     assert lines == [
-        "kitchen_int8: loaded 2 serialized INT8 linear layers (sgl_kernel 1, comfy_kitchen 1)"
+        "convrot_int8: loaded 2 serialized INT8 linear layers (sgl_kernel 1, comfy_kitchen 1)"
     ]
+
+
+def test_kitchen_int8_is_a_deprecated_alias_of_convrot_int8(caplog):
+    """Existing `--quantization kitchen_int8` commands must keep working under the
+    new name, with one deprecation warning per process."""
+    import logging
+
+    from sglang.multimodal_gen.runtime.layers.quantization import (
+        get_quantization_config,
+        method_names,
+    )
+    from sglang.multimodal_gen.runtime.utils.logging_utils import _print_warning_once
+
+    _print_warning_once.cache_clear()
+    with caplog.at_level(logging.WARNING):
+        assert (
+            method_names.canonical_quantization_method("kitchen_int8") == "convrot_int8"
+        )
+        assert (
+            method_names.canonical_quantization_method("kitchen_int8") == "convrot_int8"
+        )
+        assert method_names.canonical_quantization_method("fp8") == "fp8"
+    warnings = [r for r in caplog.records if "deprecated alias" in r.getMessage()]
+    assert len(warnings) == 1
+    assert get_quantization_config("kitchen_int8") is ConvRotInt8Config
+    assert ConvRotInt8Config.get_name() == "convrot_int8"

@@ -18,8 +18,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
     ComfyNvfp4Config,
     ComfyRowwiseInt8EmbeddingMethod,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
@@ -459,11 +459,11 @@ class TestTextEncoderQuantization(unittest.TestCase):
             "/model/text_encoder",
             "/model/text_encoder",
             "text_encoder",
-            explicit_quantization="kitchen_int8",
+            explicit_quantization="convrot_int8",
             ignored_layers=["lm_head"],
         )
 
-        self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
+        self.assertIsInstance(model_config.quant_config, ConvRotInt8Config)
         self.assertFalse(model_config.quant_config.is_checkpoint_int8_serialized)
         self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
 
@@ -524,7 +524,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
                     "text_encoder",
                 )
 
-        self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
+        self.assertIsInstance(model_config.quant_config, ConvRotInt8Config)
         self.assertEqual(
             set(model_config.quant_config.layer_markers),
             {"model.visual.blocks.0.attn.qkv_proj"},
@@ -965,17 +965,17 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         ):
             _require_quantized_encoder_layers(nn.Linear(2, 2), "text_encoder")
 
-    def test_online_kitchen_int8_has_no_markers_to_consume(self):
-        """An online kitchen_int8 encoder carries no serialized markers, so the
+    def test_online_convrot_int8_has_no_markers_to_consume(self):
+        """An online convrot_int8 encoder carries no serialized markers, so the
         consumption check must pass instead of failing on the absent map."""
         _require_quantized_encoder_layers(
             _QuantizedEncoder(_RecordingQuantMethod()),
             "text_encoder",
-            quant_config=KitchenInt8Config(ignored_layers=["lm_head"]),
+            quant_config=ConvRotInt8Config(ignored_layers=["lm_head"]),
         )
 
     def test_rejects_unconsumed_comfy_marker(self):
-        config = KitchenInt8Config(
+        config = ConvRotInt8Config(
             layer_markers={
                 "visual.proj": {
                     "format": "int8_tensorwise",
