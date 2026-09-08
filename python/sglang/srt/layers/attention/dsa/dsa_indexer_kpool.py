@@ -862,6 +862,10 @@ class IndexerKPool(MultiPlatformOp):
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
     ) -> Tuple[bool, int]:
+        """
+        Detect whether we need to chunk the MQA logits computation to avoid OOM.
+        Return: (need_chunk, logits_budget_bytes)
+        """
         if num_q * num_k < 8_000_000:
             return False, 0
 
@@ -870,7 +874,11 @@ class IndexerKPool(MultiPlatformOp):
         logits_bytes = num_q * num_k * bytes_per_elem
 
         need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
-        return need_chunk, free_mem
+        # A chunk must coexist with the top-k outputs of all chunks, allocator
+        # fragmentation, and kernel-side padding/workspace, so only grant a
+        # quarter of the free memory rather than half.
+        budget_bytes = max(1, min(free_mem // 4, int(total_mem * 0.3)))
+        return need_chunk, budget_bytes
 
     def _get_topk_ragged_kpool_plan(
         self,
@@ -902,31 +910,6 @@ class IndexerKPool(MultiPlatformOp):
             f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
         )
 
-        if total_k_rows > 0:
-            k_u8 = plan.ragged_k_u8
-            k_scale = plan.ragged_k_scale
-            assert k_u8 is not None and k_scale is not None
-            pool = get_token_to_kv_pool()
-            gather_index_k_scale_prefix_into(
-                pool=pool,
-                buf=self._get_index_k_read_buffer(pool, layer_id),
-                page_indices=plan.ragged_concat_page_table,
-                seq_len=total_k_rows,
-                k_out=k_u8,
-                scale_out=k_scale,
-            )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[:n_real].contiguous(),
-                (k_fp8.contiguous(), k_scale.contiguous()),
-                weights[:n_real].contiguous(),
-                ks_per_q,
-                ke_per_q,
-                clean_logits=True,
-            )
-        else:
-            logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
-
         topk_method = metadata.topk_transform_method
         attn_metadata = metadata.attn_metadata
         page_table_all = None
@@ -939,16 +922,113 @@ class IndexerKPool(MultiPlatformOp):
             elif topk_method == TopkTransformMethod.RAGGED:
                 topk_offsets_all = attn_metadata.topk_indices_offset
 
-        return self._topk_from_kpool_logits(
-            logits,
-            pool_lens,
-            seq_lens=seq_lens_expanded,
-            page_table=page_table_all,
-            topk_offsets=topk_offsets_all,
-            row_starts=ks_per_q,
-            out_rows=total_q,
-            page_table_row_index=page_table_row_index_all,
+        if total_k_rows <= 0:
+            logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
+            return self._topk_from_kpool_logits(
+                logits,
+                pool_lens,
+                seq_lens=seq_lens_expanded,
+                page_table=page_table_all,
+                topk_offsets=topk_offsets_all,
+                row_starts=ks_per_q,
+                out_rows=total_q,
+                page_table_row_index=page_table_row_index_all,
+            )
+
+        k_u8 = plan.ragged_k_u8
+        k_scale = plan.ragged_k_scale
+        assert k_u8 is not None and k_scale is not None
+        pool = get_token_to_kv_pool()
+        gather_index_k_scale_prefix_into(
+            pool=pool,
+            buf=self._get_index_k_read_buffer(pool, layer_id),
+            page_indices=plan.ragged_concat_page_table,
+            seq_len=total_k_rows,
+            k_out=k_u8,
+            scale_out=k_scale,
         )
+        k_fp8 = k_u8.view(torch.float8_e4m3fn)
+        kv_fp8 = (k_fp8.contiguous(), k_scale.contiguous())
+
+        need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
+            n_real, total_k_rows, device
+        )
+        if not need_chunk:
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8[:n_real].contiguous(),
+                kv_fp8,
+                weights[:n_real].contiguous(),
+                ks_per_q,
+                ke_per_q,
+                clean_logits=True,
+            )
+            return self._topk_from_kpool_logits(
+                logits,
+                pool_lens,
+                seq_lens=seq_lens_expanded,
+                page_table=page_table_all,
+                topk_offsets=topk_offsets_all,
+                row_starts=ks_per_q,
+                out_rows=total_q,
+                page_table_row_index=page_table_row_index_all,
+            )
+
+        # Chunk along the query rows to bound the transient
+        # [n_real, total_k_rows] fp32 logits allocation. Logits rows are
+        # independent, so per-row inputs are simply sliced per chunk.
+        bytes_per_row = total_k_rows * 4
+        max_rows = max(1, logits_budget_bytes // max(bytes_per_row, 1))
+        max_rows = min(max_rows, n_real)
+
+        topk_chunks: List[torch.Tensor] = []
+        for start in range(0, n_real, max_rows):
+            end = min(start + max_rows, n_real)
+            logits_chunk = deep_gemm.fp8_mqa_logits(
+                q_fp8[start:end].contiguous(),
+                kv_fp8,
+                weights[start:end].contiguous(),
+                ks_per_q[start:end],
+                ke_per_q[start:end],
+                clean_logits=True,
+            )
+            topk_chunk = self._topk_from_kpool_logits(
+                logits_chunk,
+                pool_lens[start:end],
+                seq_lens=seq_lens_expanded[start:end],
+                page_table=(
+                    page_table_all[start:end] if page_table_all is not None else None
+                ),
+                topk_offsets=(
+                    topk_offsets_all[start:end]
+                    if topk_offsets_all is not None
+                    else None
+                ),
+                row_starts=ks_per_q[start:end],
+                page_table_row_index=(
+                    page_table_row_index_all[start:end]
+                    if page_table_row_index_all is not None
+                    else None
+                ),
+            )
+            # Release the chunk logits before the next iteration allocates;
+            # otherwise the old chunk stays alive until re-assignment and two
+            # chunks coexist.
+            del logits_chunk
+            topk_chunks.append(topk_chunk)
+
+        topk_result = (
+            topk_chunks[0] if len(topk_chunks) == 1 else torch.cat(topk_chunks, dim=0)
+        )
+        if total_q > n_real:
+            padded = torch.full(
+                (total_q, topk_result.shape[1]),
+                -1,
+                dtype=topk_result.dtype,
+                device=topk_result.device,
+            )
+            padded[:n_real] = topk_result
+            topk_result = padded
+        return topk_result
 
     def _get_topk_ragged_kpool(
         self,
