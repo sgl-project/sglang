@@ -8,9 +8,9 @@ from sglang.srt.utils.common import is_xpu
 
 # Put the `test/` root on sys.path so `registered.<...>` resolves regardless of
 # cwd: CI runs each file as `python3 <full_path>` (only the file's own dir is on
-# the path), and pytest inserts only the file's dir too. `test/` is two levels
-# up from this file's dir (test/registered/xpu/<this>).
-_TEST_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# the path), and pytest inserts only the file's dir too. `test/` is three levels
+# up from this file's dir (test/registered/xpu/e2e/<this>).
+_TEST_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if _TEST_ROOT not in sys.path:
     sys.path.insert(0, _TEST_ROOT)
 
