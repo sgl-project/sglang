@@ -145,8 +145,10 @@ class ComfyNvfp4LinearMethod(ComfyFullPrecisionNvfp4LinearMethod):
         x = x.reshape(-1, shape[-1])
         if self.has_pre_quant_scale:
             x = x * layer.pre_quant_scale
-        scale = (x.abs().amax().float() / (448 * 6)).clamp_min(
-            torch.finfo(torch.float32).tiny
+        scale = (
+            (x.abs().amax() / (448 * 6))
+            .float()
+            .clamp_min(torch.finfo(torch.float32).tiny)
         )
         packed, block_scale = quantize_nvfp4(x.contiguous(), scale, pad_16x=True)
         output = scaled_mm_nvfp4(

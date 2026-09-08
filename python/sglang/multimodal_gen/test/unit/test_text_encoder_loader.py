@@ -144,13 +144,15 @@ def test_comfy_embedding_checkpoint_lookup(tmp_path, backend, tensorwise, tp_siz
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_comfy_nvfp4_dynamic_matmul():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_comfy_nvfp4_dynamic_matmul(dtype):
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("requires NVFP4 tensor cores")
     ck = pytest.importorskip("comfy_kitchen")
+    layout = pytest.importorskip("comfy_kitchen.tensor.nvfp4").TensorCoreNVFP4Layout
     torch.manual_seed(42)
-    x = torch.randn(33, 256, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(33, 256, device="cuda", dtype=dtype)
+    w = torch.randn(128, 256, device="cuda", dtype=dtype)
     weight_scale = w.abs().amax().float() / (448 * 6)
     packed, scales = ck.quantize_nvfp4(w, weight_scale)
     layer = nn.Module()
@@ -161,14 +163,13 @@ def test_comfy_nvfp4_dynamic_matmul():
     config = ComfyNvfp4Config({"proj": {"format": "nvfp4"}})
     method = ComfyNvfp4LinearMethod(config, has_pre_quant_scale=False)
     actual = method.apply(layer, x)
-    x_scale = x.abs().amax().float() / (448 * 6)
-    x_packed, x_scales = ck.quantize_nvfp4(x, x_scale, pad_16x=True)
+    x_packed, x_params = layout.quantize(x)
     expected = ck.scaled_mm_nvfp4(
         x_packed,
         packed,
-        tensor_scale_a=x_scale,
+        tensor_scale_a=x_params.scale,
         tensor_scale_b=weight_scale,
-        block_scale_a=x_scales,
+        block_scale_a=x_params.block_scale,
         block_scale_b=scales,
         out_dtype=x.dtype,
     )[:33]
