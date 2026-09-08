@@ -813,6 +813,37 @@ class TestEagleConfigurator(CustomTestCase):
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
 
+    def test_eagle_dcp_replicated_draft_does_not_exceed_budget(self):
+        """The replicated EAGLE draft pool spans every DCP virtual location."""
+        available = 10_000_000
+        num_layers = 32
+        eagle_draft_num_layers = 1
+        dcp_size = 4
+
+        mr = _make_model_runner(self, num_layers=num_layers)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
+
+        # TP=8 makes the DCP topology valid; target geometry stays fixed so this
+        # isolates the draft term.
+        with (
+            mock_cpu_env(tp_size=8),
+            get_parallel().override(attn_dcp_size=dcp_size),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+
+        full_pt = _full_per_token(mr)
+        total_layers = num_layers + eagle_draft_num_layers * dcp_size
+        used = config.max_total_num_tokens * full_pt * total_layers
+        self.assertLessEqual(used, available)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,

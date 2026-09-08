@@ -241,7 +241,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                draft_num_layers = int(eagle_draft_num_layers)
+                # Under DCP the target pool is sharded but the draft pool is
+                # replicated across ranks (kv_cache_configurator.loc_space_scale),
+                # so every replica has to be priced. Same multiplier the DFLASH
+                # term below applies.
+                draft_num_layers = (
+                    int(eagle_draft_num_layers) * get_parallel().attn_dcp_size
+                )
                 if is_deepseek_dsa(kvc.model_config.hf_config):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
