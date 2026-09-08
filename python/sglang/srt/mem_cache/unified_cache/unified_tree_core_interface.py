@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import msgspec
 
@@ -152,6 +152,11 @@ class UnifiedTreeCoreInterface(ABC):
     is_write_back: bool
     has_swa_host_pool: bool
     kv_events: KVCacheEventRecorder
+    # Optional KV-age observer the Controller installs when metrics are on.
+    # Called as (event, tier, outcome, age_seconds, lifetime_seconds, reuses,
+    # num_tokens) once per node when it is matched again ("hit") or leaves a
+    # tier ("evict"). Backends that do not track ages leave it uncalled.
+    kv_age_observer: Optional[Callable[..., None]] = None
 
     # ==== Tree API ====
 

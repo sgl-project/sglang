@@ -27,12 +27,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import (
     KV_AGE_BUCKETS,
     KV_REUSE_BUCKETS,
     RadixCacheMetricsCollector,
     kv_age_bucket,
 )
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
 class _BoundRecordingMetric:
@@ -278,6 +281,106 @@ class TestRadixCacheEmitsKvAge(unittest.TestCase):
             if lab["event"] == "evict"
         ]
         self.assertEqual(evict_tokens, [len(tokens)])
+
+
+class TestUnifiedRadixCacheEmitsKvAge(unittest.TestCase):
+    """Same sequence on the default UnifiedRadixCache (Python tree core): the
+    tree core reports ages through the observer the cache installs."""
+
+    PAGE_SIZE = 1
+
+    def _build_cache(self):
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=self.PAGE_SIZE)
+        )
+        req_to_token_pool = ReqToTokenPool(
+            size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+        )
+        kv_pool = MHATokenToKVPool(
+            size=64,
+            page_size=self.PAGE_SIZE,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=8,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=64,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=kv_pool,
+            need_sort=False,
+        )
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=self.PAGE_SIZE,
+                tree_components=(ComponentType.FULL,),
+            )
+        )
+        # What UnifiedRadixCache.__init__ does when metrics are enabled.
+        cache.metrics_collector = _RecordingRadixCacheMetricsCollector(
+            labels={"cache_type": "UnifiedRadixCache"}
+        )
+        cache.tree_core.kv_age_observer = cache._observe_kv_age_event
+        return cache, allocator
+
+    def test_match_then_evict_records_hit_and_evict_ages(self):
+        cache, allocator = self._build_cache()
+        collector = cache.metrics_collector
+        tokens = array("q", [1, 2, 3, 4])
+        indices = allocator.alloc(len(tokens))
+        cache.insert(InsertParams(key=RadixKey(token_ids=tokens), value=indices))
+        self.assertEqual(collector.kv_age_seconds.observations, [])
+
+        cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=tokens)))
+        hits = [
+            (lab, v)
+            for lab, v in collector.kv_age_seconds.observations
+            if lab["event"] == "hit"
+        ]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0][0]["tier"], "device")
+        self.assertGreaterEqual(hits[0][1], 0.0)
+        self.assertEqual(
+            [
+                v
+                for lab, v in collector.kv_age_tokens.increments
+                if lab["event"] == "hit"
+            ],
+            [len(tokens)],
+        )
+
+        cache.evict(EvictParams(num_tokens=len(tokens)))
+        evicts = [
+            (lab, v)
+            for lab, v in collector.kv_age_seconds.observations
+            if lab["event"] == "evict"
+        ]
+        self.assertEqual(len(evicts), 1)
+        self.assertEqual(evicts[0][0]["tier"], "device")
+        self.assertEqual(evicts[0][0]["outcome"], "dropped")
+        want = {
+            "cache_type": "UnifiedRadixCache",
+            "tier": "device",
+            "outcome": "dropped",
+        }
+        self.assertEqual(len(collector.kv_lifetime_seconds.observations), 1)
+        self.assertEqual(collector.kv_lifetime_seconds.observations[0][0], want)
+        self.assertEqual(len(collector.kv_reuses.observations), 1)
+        self.assertEqual(collector.kv_reuses.observations[0][0], want)
+        self.assertEqual(
+            [
+                v
+                for lab, v in collector.kv_age_tokens.increments
+                if lab["event"] == "evict"
+            ],
+            [len(tokens)],
+        )
 
 
 if __name__ == "__main__":
