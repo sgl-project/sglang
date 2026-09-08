@@ -38,7 +38,10 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.managers.schedule_batch import (
+    mamba_lazy_spec_in_window,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
@@ -125,11 +128,10 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     """Draw from `probs` via the Gumbel-max trick: argmax(probs / Exp(1)).
 
     Distributionally equivalent to torch.multinomial, but avoids multinomial's
-    device-side distribution-validity assert, which the draft CUDA graph would
-    otherwise capture and replay every step. q is clamped off zero so a zero
-    draw can't yield inf/NaN scores that argmax would wrongly select; fp32
-    avoids bf16 argmax ties biasing the draw. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0
-    to fall back to torch.multinomial.
+    device-side distribution-validity assert, which the draft CUDA graph would otherwise capture
+    and replay every step. q is clamped off zero so a zero draw can't yield inf/NaN scores
+    that argmax would wrongly select. fp32 avoids bf16 argmax ties biasing the draw. Set
+    SGLANG_OPT_USE_GUMBEL_SAMPLE=0 to fall back to torch.multinomial.
     """
     if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
         sample_index = torch.multinomial(probs, num_samples=num_samples)
@@ -210,10 +212,9 @@ def draft_kv_indices_used_len(
 
 
 def record_stream_each(tensors, stream):
-    """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
-    non-tensor / non-cuda entries. Tells the caching allocator that the
-    tensors are also used on `stream`, so memory is not recycled while
-    queued work is still in flight after Python refs drop.
+    """Call record_stream(stream) on each cuda tensor in `tensors`, skipping non-tensor
+    / non-cuda entries. Tells the caching allocator that the tensors are also used
+    on `stream`, so memory is not recycled while queued work is still in flight after Python refs drop.
     """
     for t in tensors:
         if isinstance(t, torch.Tensor) and t.is_cuda:
@@ -369,11 +370,10 @@ def sample_simulated_acc_len(
         simulated_values = torch.clamp(simulated_values, min=1.0, max=max_len)
         simulate_acc_len = int(simulated_values.round().item())
     elif simulate_acc_method == "match-expected":
-        # multinomial sampling does not match the expected length
-        # we keep it for the sake of compatibility of existing tests
-        # but it's better to use "match-expected" for the cases that need to
-        # match the expected length, One caveat is that this will only sample
-        # either round down or round up of the expected length
+        # multinomial sampling does not match the expected length we keep it for the sake
+        # of compatibility of existing tests but it's better to use
+        # "match-expected" for the cases that need to match the expected length, One caveat
+        # is that this will only sample either round down or round up of the expected length
         simulate_acc_len = max(1.0, min(max_len, simulate_acc_len))
         lower = int(simulate_acc_len // 1)
         upper = lower + 1 if lower < max_len else lower
@@ -573,8 +573,8 @@ class GrammarTree:
     ) -> GrammarTree:
         tensors = (retrieve_next_token, retrieve_next_sibling, draft_token)
         host = tuple(_async_d2h(t) for t in tensors)
-        # Sources may be mixed -- an algorithm can synthesize part of the tree on
-        # the host -- so the event has to key off whichever one is on device.
+        # Sources may be mixed -- an algorithm can synthesize part of the tree on the host
+        # -- so the event has to key off whichever one is on device.
         device = next((t.device for t in tensors if t.device.type != "cpu"), None)
         if device is None:
             return cls(host, None)
@@ -621,9 +621,9 @@ def build_grammar_vocab_mask(
 ) -> Optional[GrammarMask]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 
-    Call it after the target verify launch -- every step here is host work, so it all
-    overlaps that forward. ``barrier`` advances the previous batch's FSM over its
-    committed tokens, which the traversal then reads, so it has to run first.
+    Call it after the target verify launch -- every step here is host work, so it all overlaps
+    that forward. ``barrier`` advances the previous batch's FSM over its committed tokens, which
+    the traversal then reads, so it has to run first.
     """
     if barrier is not None:
         barrier()
@@ -675,8 +675,8 @@ def load_token_map(token_map_path: str) -> List[int]:
 
 @contextmanager
 def draft_tp_context(tp_group: GroupCoordinator):
-    # Draft model doesn't use dp and has its own tp group.
-    # We disable mscclpp now because it doesn't support 2 comm groups.
+    # Draft model doesn't use dp and has its own tp group. We disable mscclpp now because
+    # it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
         yield
 
@@ -753,19 +753,72 @@ def move_accept_tokens_to_target_kvcache(
     )
 
 
+def _recover_ssm_track_unreachable(batch: ScheduleBatch) -> bool:
+    """
+    True when no request can reach a mamba track boundary during this verify,
+    so ``prepare_mamba_track_for_verify`` may skip the track plan.
+
+    A track boundary is a sequence position that is a multiple of ``mamba_track_interval``.
+    Reaching one during this step obliges the post-verify commit to write the boundary state
+    to the ping-pong track slot. Under ``--gdn-mtp-cache-mode none`` (RecoverSSM)
+    no intermediate h is cached, so producing that state costs a full re-fold of the interval
+    from h_0, for every GDN layer (see ``HybridLinearAttnBackend._no_cache_mtp_recompute``).
+    The other modes scatter the boundary state out of a cache instead, cheaply, so they always
+    keep the plan.
+
+    How far can the sequence position move during this verify?
+
+        kv_committed_len            CPU counter, refreshed after verify,
+                                    so it may not yet include
+                                    the previous verify's accepted tokens
+             |
+             |  up to max_draft_tokens: this verify's accepted tokens
+             |  up to max_draft_tokens more: the previous verify's
+             |  accepted tokens the GPU already counted into seq_lens
+             v
+        seq_lens upper bound = kv_committed_len + 2 * max_draft_tokens
+
+    A request can cross a boundary iff the two ends of that span sit in different
+    intervals, which is exactly ``mamba_lazy_spec_in_window``. Returning True means no crossing
+    is possible for any request: no checkpoint is due, and dropping the plan skips
+    the boundary re-check without losing a write. The bound must stay conservative
+    -- ``BatchResultProcessor._mamba_check_track_boundary`` computes the ping-pong advance
+    independently, and any checkpoint it treats as due must never have been dropped here.
+    """
+    if get_exec().mamba.gdn_mtp_cache_mode != "none":
+        return False
+    max_draft_tokens = max_speculative_num_draft_tokens()
+    if max_draft_tokens is None:
+        return False
+    mamba_track_interval = get_exec().mamba.mamba_track_interval
+    return not any(
+        mamba_lazy_spec_in_window(req, mamba_track_interval, max_draft_tokens)
+        for req in batch.reqs
+    )
+
+
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """Rebuild mamba track indices from reqs before a TARGET_VERIFY forward.
 
-    Spec batches skip the refresh in prepare_for_decode, and filter/merge
-    null these fields, so they must be rebuilt right before verify. Clearing
-    the mask also keeps a stale extend-time mask from triggering in-forward
-    tracking during TARGET_VERIFY; tracking is done in
-    commit_mamba_states_after_verify instead.
+    Spec batches skip the refresh in prepare_for_decode, and filter/merge null these fields,
+    so they must be rebuilt right before verify. Clearing the mask also keeps
+    a stale extend-time mask from triggering in-forward tracking during TARGET_VERIFY.
+    Tracking is done in commit_mamba_states_after_verify instead.
 
-    Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
-    inside forward isolation, so it must not mutate req/pool state.
+    Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs inside forward
+    isolation, so it must not mutate req/pool state.
+
+    RecoverSSM: leave the plan unset on steps where no crossing is reachable, which skips
+    the full per-GDN-layer boundary re-fold.
     """
     if not mamba_extra_buffer_enabled():
+        return
+    if _recover_ssm_track_unreachable(batch):
+        # Cleared explicitly: a plan built for an earlier step would otherwise survive here
+        # and re-run the boundary check against stale slots.
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.mamba_track_seqlens = None
         return
     track_positions = None
     if mamba_extra_buffer_lazy_enabled():
@@ -876,9 +929,9 @@ def commit_mamba_states_after_verify(
     req_pool = model_runner.req_to_token_pool
     mamba_pool = getattr(req_pool, "mamba_pool", None)
 
-    # Fold-every-commit: replay the accepted prefix from the ring into
-    # `temporal`; the same fold stores the interval-crossing state to the
-    # track slot, so no SSM scatter or force-flush is needed here.
+    # Fold-every-commit: replay the accepted prefix from the ring into `temporal`. The same fold
+    # stores the interval-crossing state to the track slot, so no SSM scatter
+    # or force-flush is needed here.
     if (
         mamba_pool is not None
         and getattr(mamba_pool, "replayssm_spec_fold", False)
@@ -1044,8 +1097,8 @@ def commit_mamba_states_after_verify(
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
-    """eagle/ngram share a stateless free function; dflash keeps stateful
-    prep on its draft input -- the dispatcher routes.
+    """eagle/ngram share a stateless free function; dflash keeps stateful prep on its draft input
+    -- the dispatcher routes.
     """
     if mamba_extra_buffer_lazy_enabled():
         # Scheduler phase (outside forward isolation).

@@ -2052,19 +2052,24 @@ class KVCacheConfigurator:
         )
 
         has_spec_dec = not self.spec_algorithm.is_none()
-        # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
-        # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
-        # budget goes to persistent slots (K sized like non-spec), which is how the
-        # freed ~9GB turns into higher max_running.
-        # The ring is allocated per slot but is not part of mamba_cache_per_req;
-        # the solve must charge it too or num_slots is over-provisioned.
+        # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget no longer
+        # reserves the (1 + D/ratio) intermediate factor and the whole budget goes
+        # to persistent slots (K sized like non-spec), which is how the freed ~9GB turns
+        # into higher max_running. The ring is allocated per slot but is not part
+        # of mamba_cache_per_req. The solve must charge it too or num_slots is over-provisioned.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None
             or kimi_linear_config(self.model_config) is not None
         )
+        # gdn_mtp_cache_mode=none (RecoverSSM) also allocates no intermediate_ssm pool
+        # (MambaPool gates the allocation on the same flag), so reserving it here would charge
+        # the KV budget for memory that is never built.
+        no_intermediate_ssm = replayssm_active or (
+            get_exec().mamba.gdn_mtp_cache_mode == "none"
+        )
         if replayssm_active:
-            # GDN sizes the fold window to the draft maximum; the KDA ring
-            # stays --linear-replayssm-cache-len long (mirrors MambaPool).
+            # GDN sizes the fold window to the draft maximum.
+            # the KDA ring stays --linear-replayssm-cache-len long (mirrors MambaPool).
             max_draft_tokens = max_speculative_num_draft_tokens()
             if kimi_linear_config(self.model_config) is not None:
                 record_len = get_exec().mamba.linear_replayssm_cache_len
@@ -2091,10 +2096,11 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=get_schedule().max_mamba_cache_size
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs (+1: the
-            # pool's padding slot, see memory_pool.py). Skipped under replayssm
-            # (no intermediate_ssm allocated).
-            if has_spec_dec and not replayssm_active:
+            # Reserve intermediate memory based
+            # on capped max_num_reqs (+1: the pool's padding slot, see memory_pool.py).
+            # Skipped when no intermediate_ssm
+            # is allocated (replayssm / gdn_mtp_cache_mode=none).
+            if has_spec_dec and not no_intermediate_ssm:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
@@ -2116,9 +2122,11 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=get_schedule().max_running_requests
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs (+1: the
-            # pool's padding slot). Skipped under replayssm.
-            if has_spec_dec and not replayssm_active:
+            # Reserve intermediate memory based
+            # on capped max_num_reqs (+1: the pool's padding slot).
+            # Skipped when no intermediate_ssm
+            # is allocated (replayssm / gdn_mtp_cache_mode=none).
+            if has_spec_dec and not no_intermediate_ssm:
                 intermediate_size = (
                     stage_per_req
                     * (get_schedule().max_mamba_cache_size + 1)
@@ -2130,9 +2138,9 @@ class KVCacheConfigurator:
             assert stage_per_req > 0
             per_req = stage_per_req
 
-            # Solve jointly for max_mamba_cache_size (K), including the pool's
-            # +1 padding slot on both buffers (see memory_pool.py):
-            #   (K + 1) * per_req + (K / ratio + 1) * D * per_req = mamba_budget_bytes
+            # Solve jointly for max_mamba_cache_size (K), including the pool's +1 padding slot
+            # on both buffers (see memory_pool.py). Layout: (K + 1) * per_req + (K / ratio + 1)
+            # * D * per_req = mamba_budget_bytes
             mamba_budget = (
                 total_rest_memory
                 * get_schedule().mamba_full_memory_ratio
@@ -2140,7 +2148,7 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec and not replayssm_active:
+            if has_spec_dec and not no_intermediate_ssm:
                 ratio = self._calculate_mamba_ratio()
                 D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
@@ -2151,8 +2159,8 @@ class KVCacheConfigurator:
                         // (per_req * (1 + D / ratio))
                     ),
                 )
-                # Intermediate memory is included in mamba_budget, subtract it
-                # so the return value only has main_state subtracted from total
+                # Intermediate memory is included in mamba_budget, subtract it so the return
+                # value only has main_state subtracted from total
                 capped_reqs = min(
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
@@ -2169,9 +2177,8 @@ class KVCacheConfigurator:
                 )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
-        # A non-positive value means GPU memory is insufficient for the requested
-        # configuration. Fail fast with actionable advice instead of silently
-        # producing garbled output at runtime.
+        # A non-positive value means GPU memory is insufficient for the requested configuration.
+        # Fail fast with actionable advice instead of silently producing garbled output at runtime.
         if get_schedule().max_mamba_cache_size <= 0:
             raise RuntimeError(
                 f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
