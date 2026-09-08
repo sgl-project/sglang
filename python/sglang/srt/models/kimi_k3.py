@@ -76,6 +76,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -453,14 +454,20 @@ class KimiK3MoE(nn.Module):
         # full precision (matches GateLinear in mke). codespell:ignore mke
         self.gate = MoEGate(config, quant_config=None, prefix=f"{prefix}.gate")
 
-        # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
-        # so FusedMoE's weight_loader uses the MXFP4 fast path
+        # For MXFP4 compressed-tensors on non-NPU, replace quant_config with
+        # Mxfp4Config so FusedMoE's weight_loader uses the MXFP4 fast path. On
+        # NPU the compressed-tensors config is kept so the scheme-based path
+        # selects NPUCompressedTensorsW4A8mxfp4MoE (see get_moe_scheme).
         moe_quant_config = quant_config
-        if quant_config is not None and getattr(quant_config, "quant_format", None):
-            if "mxfp4" in quant_config.quant_format:
-                from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+        if (
+            quant_config is not None
+            and getattr(quant_config, "quant_format", None)
+            and "mxfp4" in quant_config.quant_format
+            and not _is_npu
+        ):
+            from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
-                moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+            moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
 
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
@@ -1442,13 +1449,15 @@ class KimiK3DeltaAttention(nn.Module):
             quant_config, f"{prefix}.b_proj"
         )
 
-        # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
-        # Full-rank K3 also fuses mixed block-FP8 attention projections.
+        # Preserve the CUDA/ROCm fusion condition, including quantized K3.
         self.do_fuse_qkvbfg = self.attn_tp_size == self.tp_size and (
-            quant_config is None or self.use_full_rank_gate
+            quant_config is None or (self.use_full_rank_gate and not _is_npu)
         )
+        # NPU's full-rank [q, k, v, g] projection is explicitly sharded by
+        # attention TP and also supports DP attention and ModelSlim configs.
+        self.do_fuse_qkvg = self.use_full_rank_gate and (_is_npu or self.do_fuse_qkvbfg)
 
-        if self.do_fuse_qkvbfg and self.use_full_rank_gate:
+        if self.do_fuse_qkvg:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
             # (6144/rank at TP8). Folding b (12/rank) and f_a (128, replicated)
             # in as well skews the output dim to 6284 and measurably degrades
@@ -1470,8 +1479,8 @@ class KimiK3DeltaAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
-                3 * projection_size // self.tp_size,
-                projection_size // self.tp_size,
+                3 * projection_size // self.attn_tp_size,
+                projection_size // self.attn_tp_size,
             ]
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1999,7 +2008,7 @@ class KimiK3DeltaAttention(nn.Module):
         defer_f_b = (
             self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
         )
-        if self.do_fuse_qkvbfg:
+        if self.do_fuse_qkvbfg or self.do_fuse_qkvg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states, defer_f_b=defer_f_b
             )
@@ -3023,6 +3032,13 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    # ModelSlim describes quantization with the original checkpoint module
+    # names. Register the runtime fused QKVG module so it can resolve the
+    # q_proj scheme while the weight loader packs q/k/v/g into its shards.
+    packed_modules_mapping = {
+        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+    }
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -3032,6 +3048,15 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        if quant_config is not None:
+            if isinstance(quant_config, ModelSlimConfig):
+                model_mapping = {
+                    **quant_config.packed_modules_mapping.get("model", {}),
+                    **self.packed_modules_mapping,
+                }
+                quant_config.update_packed_modules_mapping({"model": model_mapping})
+            else:
+                quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -3197,7 +3222,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                     continue
 
             # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            if "weight_packed" in name:
+            # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE).
+            if "weight_packed" in name and not _is_npu:
                 name = name.replace("weight_packed", "weight")
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa
@@ -3243,7 +3269,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if not self.config.is_kda_layer(layer_id):
                         continue
                     layer = self.model.layers[layer_id].self_attn
-                    if not getattr(layer, "do_fuse_qkvbfg", False):
+                    # Match the projection selected during layer construction.
+                    if param_name == ".fused_qkvg_proj":
+                        if not getattr(layer, "do_fuse_qkvg", False):
+                            continue
+                    elif not getattr(layer, "do_fuse_qkvbfg", False):
                         continue
                 if weight_name in {".q_proj", ".k_proj", ".v_proj"}:
                     layer_id = int(name.split(".")[2])
