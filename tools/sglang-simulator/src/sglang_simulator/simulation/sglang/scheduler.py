@@ -15,10 +15,7 @@ from sglang_simulator.hook import (
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
-from sglang_simulator.simulation.sglang.session_timeline import (
-    OPEN_SALT,
-    SessionTimeline,
-)
+from sglang_simulator.simulation.sglang.session_timeline import SessionTimeline
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
     resolve_scheduler_config,
@@ -159,42 +156,20 @@ class ReqDispatcher:
 
     def _hold_session_requests(self, reqs: list) -> list:
         """Take session lifecycle requests out of `reqs`, returning the rest."""
-        open_type, close_type, _ = _session_io_structs()
+        _, close_type, _ = _session_io_structs()
         remaining = []
         for req in reqs:
-            if isinstance(req, open_type):
-                self.session_timeline.hold_open(session_id=req.session_id, req=req)
-            elif isinstance(req, close_type):
+            if isinstance(req, close_type):
                 self.session_timeline.hold_close(session_id=req.session_id, req=req)
             else:
                 remaining.append(req)
         return remaining
-
-    def _first_arrival_by_session(self) -> dict[str, float]:
-        first_arrival: dict[str, float] = {}
-        for enqueue_time, _, req in self.future_queue:
-            session_id = _session_id_of(req)
-            if session_id is None:
-                continue
-            if enqueue_time < first_arrival.get(session_id, float("inf")):
-                first_arrival[session_id] = enqueue_time
-        return first_arrival
 
     def _sessions_with_pending_turns(self) -> set[str]:
         sessions = {_session_id_of(req) for _, _, req in self.future_queue}
         sessions.discard(None)
         return sessions
 
-    def _schedule_pending_opens(self) -> None:
-        """Move held opens into the arrival queue ahead of their session's turns."""
-        if not self.session_timeline.has_pending_opens():
-            return
-        timestamped, releasable = self.session_timeline.take_opens(
-            self._first_arrival_by_session()
-        )
-        for arrival, req in timestamped:
-            heapq.heappush(self.future_queue, (arrival, OPEN_SALT, req))
-        self.immediate_release_requests.extend(releasable)
 
     def add(self, reqs: list):
         if self.mode == SimulationMode.BLOCKING:
@@ -202,7 +177,6 @@ class ReqDispatcher:
         elif self.mode == SimulationMode.OFFLINE:
             reqs = self._hold_session_requests(reqs)
             if self.offline_recv_all_requests:
-                self._schedule_pending_opens()
                 self.immediate_release_requests.extend(reqs)
                 return
 
@@ -251,7 +225,6 @@ class ReqDispatcher:
                 if len(self.future_queue) == total_request:
                     self.offline_recv_all_requests = True
                     heapq.heapify(self.future_queue)
-                    self._schedule_pending_opens()
                     logger.info("All requests received. Starting simulation now.")
                 else:
                     logger.info(

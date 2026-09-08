@@ -48,18 +48,6 @@ def test_close_is_held_while_a_dispatched_turn_is_unfinished():
     assert timeline.take_settled_closes(set()) == ["close-s1"]
 
 
-def test_opens_are_timestamped_to_their_session_first_arrival():
-    timeline = _timeline(finished=set())
-    timeline.hold_open(session_id="s1", req="open-s1")
-    timeline.hold_open(session_id="unknown", req="open-unknown")
-
-    timestamped, releasable = timeline.take_opens({"s1": 1.0})
-
-    assert timestamped == [(1.0, "open-s1")]
-    assert releasable == ["open-unknown"]
-    assert not timeline.has_pending_opens()
-
-
 # ===== ReqDispatcher integration, against real io_struct types =====
 
 
@@ -138,27 +126,17 @@ def test_close_waits_for_every_turn_to_finish():
     assert _types(dispatcher.dispatch()) == ["CloseSessionReqInput"]
 
 
-def test_open_precedes_the_first_turn_of_its_session():
+def test_open_releases_immediately_rather_than_waiting_for_its_turns():
+    """`open_session` awaits a scheduler response, so holding it would deadlock."""
     dispatcher = _fresh_dispatcher()
 
     dispatcher.add(
         [OpenSessionReqInput(rid="o1", capacity_of_str_len=0, session_id="s1")]
     )
-    dispatcher.add(
-        [
-            _generate_req("r1", "s1", created_time_ms=1000, total_request=2),
-            _generate_req("r2", "s1", created_time_ms=2000, total_request=2),
-        ]
-    )
+    dispatcher.add([_generate_req("r1", "s1", created_time_ms=1000, total_request=1)])
 
     StateManager.set_global_clock(0.0)
-    assert _types(dispatcher.dispatch()) == []
-
-    StateManager.set_global_clock(1.0)
-    assert _types(dispatcher.dispatch()) == [
-        "OpenSessionReqInput",
-        "TokenizedGenerateReqInput",
-    ]
+    assert _types(dispatcher.dispatch()) == ["OpenSessionReqInput"]
 
 
 def test_timeline_independent_control_requests_still_release_immediately():
