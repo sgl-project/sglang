@@ -413,6 +413,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
+        if self.prefill_backend_name == Backend.TC_PIECEWISE:
+            # Must happen before the compile pass below traces the model: the
+            # per-layer HiCache waits have to be gone from the graph, not just
+            # inert at replay time.
+            model_runner.token_to_kv_pool.hoist_layer_transfer_wait()
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
