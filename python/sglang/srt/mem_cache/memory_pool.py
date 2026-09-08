@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -263,6 +263,9 @@ class ReqToTokenPool:
     # 0 for a plain pool; the decode-flavored pool (DecodeReqToTokenPool) sets a
     # positive value. Declared here so callers can read it without getattr.
     pre_alloc_size: int = 0
+    # Class default: some decode pools borrow another __init__ (see
+    # DecodeReqToTokenPool) but inherit alloc_rows.
+    _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
 
     def __init__(
         self,
@@ -326,6 +329,8 @@ class ReqToTokenPool:
         select_index = self.free_slots[-need_size:]
         del self.free_slots[-need_size:]
         self.req_generation[select_index] += 1
+        if self._on_alloc_rows is not None:
+            self._on_alloc_rows(select_index)
         return select_index
 
     def free_rows(self, indices: List[int]) -> None:
@@ -350,6 +355,10 @@ class ReqToTokenPool:
     def attach_aux_cache(self, aux_cache: Any) -> None:
         assert self._aux_cache is None
         self._aux_cache = aux_cache
+
+    def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
+        assert self._on_alloc_rows is None
+        self._on_alloc_rows = hook
 
     def reset_aux_cache_allocator(self) -> None:
         if self._aux_cache is not None:
@@ -1388,6 +1397,28 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
+
+    @property
+    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
+        """The mamba virtual->physical slot table, or None when the ids this
+        pool hands out are already physical."""
+        return None
+
+    @property
+    def mamba_translate_is_fusable(self) -> bool:
+        """Whether `fused_replay_state_indices` can reproduce this pool's
+        `translate_mamba_indices` in its own launch.
+
+        The kernel expresses exactly two shapes: the identity, and one gather
+        through `mamba_v2p_table`. A subclass that replaces the translate with
+        anything else is excluded here rather than silently mis-served.
+        """
+        if self.mamba_v2p_table is not None:
+            return True
+        return (
+            type(self).translate_mamba_indices
+            is HybridReqToTokenPool.translate_mamba_indices
+        )
 
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba-slot translate. Identity for a static pool
