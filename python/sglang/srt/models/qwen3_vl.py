@@ -1029,6 +1029,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
 
+        attention_layout_key = (tuple(cu_seqlens.tolist()), None)
         cu_seqlens = cu_seqlens.to("cpu")
         return self.graph_runners.run(
             x=x,
@@ -1036,6 +1037,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             cu_seqlens=cu_seqlens,
             output_indices=None,
+            attention_layout_key=attention_layout_key,
         )
 
     def forward_with_cuda_graph(
@@ -1595,10 +1597,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip loading visual/language model weights
-                if (
-                    self.config.encoder_only or self.config.language_only
-                ) and name not in params_dict:
+                # Skip unexpected stacked names (e.g. ModelOpt quantizer buffers
+                # that were remapped gate_proj -> gate_up_proj but are not params).
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
