@@ -85,7 +85,7 @@ pub struct KvEventIndex {
     /// subscribers for the same worker don't collide.
     load_subscribers: Arc<KvEventSubscriberRegistry>,
     /// Engine-reported per-worker load, written by the pump from
-    /// `WorkerEvent::Load` and read by the cache-aware-zmq policy.
+    /// `WorkerEvent::Load` and captured at request ingress.
     engine_load: Arc<EngineLoadTable>,
     pump: Mutex<Option<JoinHandle<()>>>,
     pump_cancel: CancellationToken,
@@ -103,11 +103,11 @@ pub struct KvEventIndex {
     /// may legitimately have a fresh publisher whose sequence numbers
     /// restart from 1.
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
-    /// Worker-sourced `page_size` shared with the cache-aware-zmq policy.
+    /// Worker-sourced `page_size` shared with prefix providers.
     /// `add_worker` calls `try_set(cfg.block_size)` so the first worker
     /// establishes the value; subsequent workers that disagree are
-    /// rejected (logged + not subscribed). The policy reads it at routing
-    /// time to size its `compute_block_hashes` call.
+    /// rejected (logged + not subscribed). Prefix providers read it at routing
+    /// time to size their `compute_block_hashes` calls.
     block_size_oracle: Arc<BlockSizeOracle>,
 }
 
@@ -129,8 +129,8 @@ impl KvEventIndex {
 
     /// Constructor that lets the caller supply a pre-shared
     /// [`BlockSizeOracle`]. Production wires this from `AppContext` so
-    /// the same oracle the index seeds is the one the cache-aware-zmq
-    /// policy reads at routing time. Tests use this to pre-populate the
+    /// the same oracle the index seeds is available to prefix providers.
+    /// Tests use this to pre-populate the
     /// oracle and exercise the mismatch-rejection path.
     pub fn new_with_http_and_oracle(
         http: reqwest::Client,
@@ -186,10 +186,7 @@ impl KvEventIndex {
         })
     }
 
-    /// Shared accessor for the per-process block-size oracle. The
-    /// `CacheAwareZmqPolicy` (via [`crate::policies::factory`]) holds the
-    /// same `Arc` so the value the index seeds is the value the policy
-    /// hashes against.
+    /// Shared accessor for the per-process block-size oracle.
     pub fn block_size_oracle(&self) -> Arc<BlockSizeOracle> {
         Arc::clone(&self.block_size_oracle)
     }
@@ -201,9 +198,7 @@ impl KvEventIndex {
         self.tree.clone()
     }
 
-    /// Shared accessor for the engine-load table. The `CacheAwareZmqPolicy`
-    /// (via [`crate::policies::factory`]) holds the same `Arc` and only reads
-    /// it at selection time. Load *values* are written solely by the pump
+    /// Shared accessor for the engine-load table. Load values are written solely by the pump
     /// (from `LoadStat` events); `add_worker` / `remove_worker` here manage
     /// the expected set and per-worker eviction.
     pub fn engine_load(&self) -> Arc<EngineLoadTable> {
@@ -616,6 +611,7 @@ mod tests {
                 num_waiting_reqs: 4,
                 num_tokens: 0,
                 max_total_num_tokens: 0,
+                native_cache: None,
             },
         })
         .await
@@ -623,9 +619,10 @@ mod tests {
         drop(tx);
         pump.await.unwrap();
 
-        let fresh = engine_load.snapshot_fresh(Instant::now());
-        assert_eq!(fresh.get("http://w1").copied(), Some(12)); // 8 + 4
-                                                               // Load events must not pollute the cache tree.
+        let snapshot = engine_load.capture_snapshot(Instant::now());
+        let load = snapshot.fresh_load_for_url("http://w1").unwrap();
+        assert_eq!(load.num_running_reqs + load.num_waiting_reqs, 12);
+        // Load events must not pollute the cache tree.
         assert_eq!(tree.node_count(), 0);
     }
 
@@ -911,17 +908,23 @@ mod tests {
                 num_waiting_reqs: 1,
                 num_tokens: 0,
                 max_total_num_tokens: 0,
+                native_cache: None,
             },
             now,
         );
-        assert!(index.engine_load().snapshot_fresh(now).contains_key(url));
+        assert!(index
+            .engine_load()
+            .capture_snapshot(now)
+            .fresh_load_for_url(url)
+            .is_some());
 
         index.remove_worker(url).await;
         assert!(
-            !index
+            index
                 .engine_load()
-                .snapshot_fresh(Instant::now())
-                .contains_key(url),
+                .capture_snapshot(Instant::now())
+                .fresh_load_for_url(url)
+                .is_none(),
             "remove_worker must clear engine load"
         );
         assert_eq!(index.engine_load().expected_count(), 0);

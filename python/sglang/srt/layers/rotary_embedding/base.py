@@ -471,9 +471,17 @@ class RotaryEmbedding(BaseFusedOp):
             )
             return query, key
         else:
-            # Use fallback kernel of 'rotary_embedding'
             self._match_cos_sin_cache_dtype(query)
-            return torch.ops.sgl_kernel.rotary_embedding(
+            # Use fallback kernel of 'rotary_embedding'.
+            # The kernel requires 3D tensors (batch, num_heads, head_size);
+            # add a num_heads=1 dim for 2D tensors (e.g. DSA indexer k_rope).
+            q_2d = query.dim() == 2
+            k_2d = key.dim() == 2
+            if q_2d:
+                query = query.view(query.shape[0], -1, self.head_size)
+            if k_2d:
+                key = key.view(key.shape[0], -1, self.head_size)
+            q_out, k_out = torch.ops.sgl_kernel.rotary_embedding(
                 positions,
                 query,
                 key,
@@ -481,6 +489,11 @@ class RotaryEmbedding(BaseFusedOp):
                 self.cos_sin_cache,
                 self.is_neox_style,
             )
+            if q_2d:
+                q_out = q_out.view(q_out.shape[0], -1)
+            if k_2d:
+                k_out = k_out.view(k_out.shape[0], -1)
+            return q_out, k_out
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
