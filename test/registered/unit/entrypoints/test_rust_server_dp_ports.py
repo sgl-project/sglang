@@ -90,3 +90,7 @@ def test_scale_joiner_hosts_listener():
         ep_join_mode="scale",
     ):
         assert node_hosts_rust_server()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
