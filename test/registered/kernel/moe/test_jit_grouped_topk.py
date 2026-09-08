@@ -81,9 +81,24 @@ def _inputs(tokens, dev="cuda"):
     return hidden, bias, logits
 
 
+def _groups(request_groups: int) -> int:
+    """Skip single-group cases where the gate does not admit them.
+
+    biased_grouped_topk_gpu admits one group on ROCm only; CUDA still requires
+    num_expert_group > 1, so a groups=1 case there never reaches the router and
+    the test would assert against a path it did not exercise.
+    """
+    from sglang.srt.layers.moe import topk as topk_mod
+
+    if request_groups == 1 and not topk_mod._is_hip:
+        pytest.skip("single-group routing is admitted on ROCm only")
+    return request_groups
+
+
 @pytest.mark.parametrize("groups", [1, 8])
 @pytest.mark.parametrize("tokens", [6, 48, 256])
 def test_jit_router_selects_what_the_reference_selects(monkeypatch, tokens, groups):
+    groups = _groups(groups)
     hidden, bias, logits = _inputs(tokens)
 
     want = _reference_routed(logits, hidden, bias, groups)
@@ -103,6 +118,7 @@ def test_jit_router_selects_what_the_reference_selects(monkeypatch, tokens, grou
 
 @pytest.mark.parametrize("groups", [1, 8])
 def test_shared_expert_appears_exactly_once(monkeypatch, groups):
+    groups = _groups(groups)
     hidden, bias, logits = _inputs(48)
     ids, routed = _jit_routed(monkeypatch, logits, hidden, bias, groups)
 
@@ -149,7 +165,9 @@ def test_router_is_asked_for_the_total_width(monkeypatch, use_aiter):
             correction_bias=bias,
             topk=topk_in,
             renormalize=True,
-            num_expert_group=1,
+            # 8 groups, not 1: the arithmetic under test is the same either
+            # way, and only this value reaches the router on both platforms.
+            num_expert_group=8,
             topk_group=1,
             num_fused_shared_experts=SHARED,
             routed_scaling_factor=SCALE,
