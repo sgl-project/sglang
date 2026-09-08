@@ -203,9 +203,7 @@ def _create_scheduler_actor(
         rank0_node_ip: IP of rank-0's node, used for NCCL rendezvous.
         dist_init_addr: Distributed init address (tcp://rank0_node_ip:nccl_port).
     """
-    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-        server_args, tp_rank
-    )
+    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(tp_rank)
 
     return SchedulerActor.options(
         num_cpus=0,
@@ -242,6 +240,12 @@ class RayEngine(Engine):
         self._placement_group = kwargs.pop("placement_group", None)
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
+        # Schedulers are separate Ray actors; default to the Ray-backed
+        # collectors so enable_metrics reaches Ray's Prometheus endpoint.
+        if kwargs.get("enable_metrics") and kwargs.get("stat_loggers") is None:
+            from sglang.srt.observability.ray_wrappers import build_ray_stat_loggers
+
+            kwargs["stat_loggers"] = build_ray_stat_loggers()
         super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):
