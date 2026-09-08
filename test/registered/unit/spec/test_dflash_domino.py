@@ -5,7 +5,10 @@ import torch
 from torch import nn
 
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -64,6 +67,46 @@ def _projector_weights(model):
 
 
 class TestDFlashDominoConfig(CustomTestCase):
+    def test_draft_and_verify_widths(self):
+        for projector_type, shift_label, expected in (
+            ("domino", True, (16, 17)),
+            ("domino", False, (16, 16)),
+            (None, True, (16, 16)),
+        ):
+            with self.subTest(projector_type=projector_type, shift_label=shift_label):
+                config = parse_dflash_draft_config(
+                    draft_hf_config=_domino_config(
+                        dflash_config={
+                            "projector_type": projector_type,
+                            "shift_label": shift_label,
+                        }
+                    )
+                )
+                self.assertEqual(config.resolve_block_sizes(), expected)
+                self.assertEqual(
+                    config.resolve_block_sizes(verify_window=expected[1]), expected
+                )
+                self.assertEqual(
+                    config.resolve_block_sizes(draft_block_size=16), expected
+                )
+                with self.assertRaisesRegex(ValueError, "expected"):
+                    config.resolve_block_sizes(
+                        draft_block_size=16, verify_window=expected[1] + 1
+                    )
+                with get_context().override_server_args(
+                    speculative_dflash_block_size=16,
+                    speculative_num_draft_tokens=expected[1],
+                ):
+                    for draft, width in ((True, 16), (False, expected[1])):
+                        self.assertEqual(
+                            resolve_num_tokens_per_req(
+                                phase="target_verify",
+                                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                                is_draft_worker=draft,
+                            ),
+                            width,
+                        )
+
     def test_top_level_emb_dim_fallback(self):
         config = _domino_config()
         del config.dflash_config["emb_dim"]

@@ -117,6 +117,9 @@ def resolve_num_tokens_per_req(
     if phase == "draft_extend":
         return spec.speculative_num_draft_tokens
     if phase == "target_verify":
+        if is_draft_worker and spec_algorithm.is_dflash():
+            if spec.speculative_dflash_block_size is not None:
+                return int(spec.speculative_dflash_block_size)
         if num_draft_tokens is None:
             num_draft_tokens = spec.speculative_num_draft_tokens
         return spec_algorithm.get_num_tokens_per_req_for_target_verify(

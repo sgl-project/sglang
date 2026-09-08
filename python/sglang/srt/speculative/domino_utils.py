@@ -19,9 +19,6 @@ def _domino_gru_cell(
     )
 
 
-_DOMINO_CANDIDATE_POOL_SIZE = 2048
-
-
 def validate_domino_runtime(
     *,
     device: torch.device,
@@ -114,14 +111,14 @@ def validate_domino_runtime(
 def domino_greedy_rollout(
     *,
     draft_hidden: torch.Tensor,
-    verified_ids: torch.Tensor,
+    bonus_tokens: torch.Tensor,
     target_embedding: nn.Module,
     lm_head_weight: torch.Tensor,
     prefix_gru: nn.GRU,
     embed_proj: nn.Sequential,
     vocab_size: int,
     shift_label: bool,
-    candidate_pool_size: int = _DOMINO_CANDIDATE_POOL_SIZE,
+    candidate_pool_size: int,
 ) -> torch.Tensor:
     """Generate a Domino chain using one block-shared base-logit candidate pool."""
     if draft_hidden.ndim != 3:
@@ -129,12 +126,12 @@ def domino_greedy_rollout(
             f"draft_hidden must have shape [batch, block, hidden], got {tuple(draft_hidden.shape)}."
         )
     batch_size, block_size, hidden_size = draft_hidden.shape
-    if verified_ids.shape != (batch_size,):
+    if bonus_tokens.shape != (batch_size,):
         raise ValueError(
-            f"verified_ids must have shape ({batch_size},), got {tuple(verified_ids.shape)}."
+            f"bonus_tokens must have shape ({batch_size},), got {tuple(bonus_tokens.shape)}."
         )
 
-    num_proposals = int(block_size) - 1
+    num_proposals = int(block_size) if shift_label else int(block_size) - 1
     if num_proposals < 1:
         raise ValueError(f"Domino requires block_size > 1, got {block_size}.")
     candidate_pool_size = int(candidate_pool_size)
@@ -145,11 +142,7 @@ def domino_greedy_rollout(
         )
     candidate_pool_size = min(candidate_pool_size, int(vocab_size))
     start = 0 if shift_label else 1
-    z = draft_hidden[:, start : start + num_proposals, :]
-    if int(z.shape[1]) != num_proposals:
-        raise ValueError(
-            "Domino draft hidden states do not contain enough proposal positions."
-        )
+    z = draft_hidden[:, start:, :]
 
     weight = lm_head_weight[: int(vocab_size)]
     z_for_logits = z.to(weight.dtype) if z.dtype != weight.dtype else z
@@ -183,7 +176,7 @@ def domino_greedy_rollout(
         ).transpose(0, 1)
         candidate_weight = F.embedding(candidate_ids, embed_proj[2].weight)
 
-    prefix_ids = torch.stack((verified_ids, first_ids), dim=1)
+    prefix_ids = torch.stack((bonus_tokens, first_ids), dim=1)
     _, gru_hidden = prefix_gru(target_embedding(prefix_ids))
 
     for index in range(1, num_proposals):
