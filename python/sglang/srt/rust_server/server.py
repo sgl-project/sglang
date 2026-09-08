@@ -79,27 +79,19 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         server_args = scheduler.server_args
-        # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
-        # so the rank is not conflated with rank 0 of a one-rank group.
+        # Preserve the DP startup log; ports use node-local offsets.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
-        if dp_rank is not None:
-            if get_exec().moe.is_ep_scale_joiner:
-                # The joining TP group is entirely local to this node.
-                tp_size_per_node = scheduler.ps.tp_size
-            else:
-                nnodes_per_pp_rank = max(
-                    get_parallel().nnodes // scheduler.ps.pp_size, 1
-                )
-                tp_size_per_node = scheduler.ps.tp_size // nnodes_per_pp_rank
-            dp_group_width = scheduler.ps.attn_tp_size * scheduler.ps.attn_cp_size
-            # Count DP leaders within this node's TP range. The first leader must
-            # use the base port even when a DP group spans multiple nodes.
-            local_dp_rank = (scheduler.ps.tp_rank % tp_size_per_node) // dp_group_width
+        if get_exec().moe.is_ep_scale_joiner:
+            # The joining TP group is entirely local to this node.
+            tp_size_per_node = scheduler.ps.tp_size
         else:
-            local_dp_rank = None
-        listen_port = get_serving().port
-        if local_dp_rank is not None:
-            listen_port += local_dp_rank
+            nnodes_per_pp_rank = max(get_parallel().nnodes // scheduler.ps.pp_size, 1)
+            tp_size_per_node = scheduler.ps.tp_size // nnodes_per_pp_rank
+        dp_group_width = scheduler.ps.attn_tp_size * scheduler.ps.attn_cp_size
+        # Count DP leaders within this node's TP range. The first leader must
+        # use the base port even when a DP group spans multiple nodes.
+        local_dp_rank = (scheduler.ps.tp_rank % tp_size_per_node) // dp_group_width
+        listen_port = get_serving().port + local_dp_rank
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
         launch_cores, server_cores = _partition_cores(
