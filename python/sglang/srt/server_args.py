@@ -619,10 +619,9 @@ def _underscore_field_names() -> frozenset:
 
     The read-only guard exempts underscore names because they are the record's
     own bookkeeping (the stash, the flags, the cache keys). A *field* that
-    happens to start with an underscore is still configuration, and exempting
-    it by spelling would leave a leaf writable on a read-only record. There is
-    no such field today; the split stays on field-ness rather than spelling so
-    that adding one is not a silent hole.
+    happens to start with an underscore is still resolved configuration --
+    `_speculative_draft_quantization_explicitly_set` is one -- and exempting it
+    by spelling would leave exactly one leaf writable on a read-only record.
     """
     return frozenset(
         field.name

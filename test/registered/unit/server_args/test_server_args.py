@@ -237,18 +237,27 @@ class TestPrepareServerArgs(CustomTestCase):
             resolution_result(inherited, "speculative_draft_model_quantization"),
             "modelopt_fp4",
         )
-        # The record still says the operator typed nothing, which is how
-        # `ModelConfig.from_server_args` tells an inherited draft quantization
-        # from an explicit one. Resolution decided a value; it did not consume
-        # the evidence of what was asked for.
-        self.assertIsNone(inherited.speculative_draft_model_quantization)
+        # The provenance bit, not the public field: `from_server_args` reads
+        # `cfg._speculative_draft_quantization_explicitly_set` to tell an
+        # inherited draft quantization from one the operator asked for, and
+        # resolution decided the value without consuming that evidence.
+        self.assertFalse(
+            resolution_result(
+                inherited, "_speculative_draft_quantization_explicitly_set"
+            )
+        )
 
-        # And it survives the hop that matters: the scheduler and the draft
-        # worker rebuild the record from its fields, and `from_server_args`
-        # reads it there to tell an inherited draft quantization from one the
-        # operator asked for.
-        rebuilt = ServerArgs(**dataclasses.asdict(inherited))
-        self.assertIsNone(rebuilt.speculative_draft_model_quantization)
+        # And across the hop that matters: the scheduler and the draft worker
+        # rebuild the record from its fields and resolve again, so the bit has
+        # to survive `asdict` and come back the same the second time.
+        reconstructed = ServerArgs(**dataclasses.asdict(inherited))
+        handle_missing_default_values(reconstructed)
+
+        self.assertFalse(
+            resolution_result(
+                reconstructed, "_speculative_draft_quantization_explicitly_set"
+            )
+        )
 
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
