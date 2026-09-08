@@ -23,6 +23,10 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.mqa_logits_budget import (
+    mqa_logits_max_rows,
+    should_chunk_mqa_logits,
+)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -42,7 +46,6 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_parallel,
-    get_schedule,
 )
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -51,7 +54,6 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
-    get_device_module,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -205,17 +207,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-    _MQA_LOGITS_BYTES_PER_ELEM = 4
-    _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
-    _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
-    # aiter's fp8_mqa_logits only compiles below 2 GiB of logits (buffer_store).
-    _MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
-    _mqa_logits_budget_bytes: Dict[int, int] = {}
-
-    @staticmethod
-    def _mqa_logits_free_mem_fraction() -> float:
-        return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
-
     def __init__(
         self,
         hidden_size: int,
@@ -1020,69 +1011,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
 
-    def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
-        free_mem_fraction = self._mqa_logits_free_mem_fraction()
-        cached_budget = self._mqa_logits_budget_bytes.get(device_index)
-        if cached_budget is not None:
-            return cached_budget
-
-        total_mem = get_device_module().get_device_properties(device_index).total_memory
-
-        total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
-        mem_fraction_static = get_schedule().mem_fraction_static
-        if mem_fraction_static is None:
-            static_budget = total_mem_budget
-        else:
-            static_free_mem = int(total_mem * max(0.0, 1.0 - mem_fraction_static))
-            static_budget = min(
-                int(static_free_mem * free_mem_fraction),
-                total_mem_budget,
-            )
-        static_budget = max(1, static_budget)
-
-        # Keep the static serving-memory guard during CUDA graph capture without
-        # caching it. The first non-capture prefill path will cache the real
-        # free-memory budget below.
-        if get_is_capture_mode():
-            return static_budget
-
-        # Match the original free-memory guard: logits_bytes * 2 > free_mem.
-        # Synchronizes the host; cache the result capped by serving-memory headroom.
-        if _is_xpu:
-            # On XPU, use total_mem budget as the free-memory estimate;
-            # dynamic free-memory query is not supported the same way as CUDA.
-            # TODO Use torch.xpu.mem_get_info() when available (planned end of 2026).
-            budget_bytes = static_budget
-        else:
-            free_mem, _ = torch.cuda.mem_get_info(device_index)
-            budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
-
-        budget_bytes = max(1, budget_bytes)
-        self._mqa_logits_budget_bytes[device_index] = budget_bytes
-        return budget_bytes
-
-    def _should_chunk_mqa_logits(
-        self, num_q: int, num_k: int, device_index: int
-    ) -> Tuple[bool, int]:
-        """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM,
-        and on ROCm to stay under aiter's 2 GiB logits limit
-        Return: (need_chunk, logits_budget_bytes)
-        """
-        # Quick static check for normal batches
-        if num_q * num_k < self._MQA_LOGITS_STATIC_SKIP_ELEMS:
-            return False, 0
-
-        logits_bytes = num_q * num_k * self._MQA_LOGITS_BYTES_PER_ELEM
-        logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
-        if _is_hip:
-            logits_budget_bytes = min(
-                logits_budget_bytes, self._MQA_LOGITS_MAX_BYTES_ROCM
-            )
-
-        need_chunk = logits_bytes > logits_budget_bytes
-        return need_chunk, logits_budget_bytes
-
     def _get_topk_ragged(
         self,
         enable_dual_stream: bool,
@@ -1172,7 +1100,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
-        need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
+        need_chunk, logits_budget_bytes = should_chunk_mqa_logits(
             q_offset, k_offset, device_index
         )
 
@@ -1225,9 +1153,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
-        bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
-        max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
-        max_rows = min(max_rows, q_offset)
+        max_rows = mqa_logits_max_rows(logits_budget_bytes, k_offset, q_offset)
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
         cu_seqlens_q_full = None

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -84,6 +84,15 @@ class KPoolCpInfo:
     local_write_mask: torch.Tensor
 
 
+class RaggedGroup(NamedTuple):
+    """One request's slice of the ragged concat layout, on the host."""
+
+    q_start: int
+    q_len: int
+    k_start: int
+    k_rows: int
+
+
 @dataclass(frozen=True)
 class KPoolExtendPlan:
     writes: PoolWriteRows
@@ -98,6 +107,10 @@ class KPoolExtendPlan:
     ragged_k_scale: Optional[torch.Tensor]
     ragged_paged_page_table: Optional[torch.Tensor]
     ragged_paged_page_table_row_index: Optional[torch.Tensor]
+    # Host-side geometry of the ragged concat layout, one entry per request:
+    # q rows `[q_start, q_start + q_len)` read K rows `[k_start, k_start + k_rows)`
+    # and nothing else. Lets the indexer walk requests without a device sync.
+    ragged_groups: Tuple[RaggedGroup, ...] = ()
     cp: Optional[KPoolCpInfo] = None
 
 
@@ -421,6 +434,22 @@ def _kpool_plan_to_gpu(
         ragged_k_u8 = None
         ragged_k_scale = None
 
+    ragged_groups = tuple(
+        RaggedGroup(
+            q_start=q_start,
+            q_len=q_len,
+            k_start=page_start * slots_per_page,
+            k_rows=pool_pages * slots_per_page,
+        )
+        for q_start, q_len, page_start, pool_pages in zip(
+            cpu.cu_q_len_excl,
+            cpu.ragged_q_len,
+            cpu.cu_pages_excl,
+            cpu.ragged_pool_pages,
+            strict=True,
+        )
+    )
+
     return KPoolExtendPlan(
         writes=PoolWriteRows(
             req=pool_req_t,
@@ -446,6 +475,7 @@ def _kpool_plan_to_gpu(
         ragged_k_scale=ragged_k_scale,
         ragged_paged_page_table=ragged_paged_page_table,
         ragged_paged_page_table_row_index=ragged_paged_page_table_row_index,
+        ragged_groups=ragged_groups,
         cp=_kpool_cp_owner_rank(forward_batch, n_pool, device),
     )
 

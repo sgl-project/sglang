@@ -14,6 +14,10 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.mqa_logits_budget import (
+    mqa_logits_max_rows,
+    should_chunk_mqa_logits,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -42,6 +46,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_device
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.dsa.kpool_plan import KPoolExtendPlan
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
@@ -859,18 +864,43 @@ class IndexerKPool(MultiPlatformOp):
         )
         return topk_result
 
-    def _should_chunk_mqa_logits(
-        self, num_q: int, num_k: int, device: torch.device
-    ) -> Tuple[bool, int]:
-        if num_q * num_k < 8_000_000:
-            return False, 0
+    @staticmethod
+    def _kpool_ragged_topk_mapping(
+        plan: KPoolExtendPlan, metadata: BaseIndexerMetadata
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """(page_table, page_table_row_index, topk_offsets) for the ragged plan path."""
+        if not envs.SGLANG_DSA_FUSE_TOPK.get():
+            return None, None, None
+        if metadata.topk_transform_method == TopkTransformMethod.PAGED:
+            return (
+                plan.ragged_paged_page_table,
+                plan.ragged_paged_page_table_row_index,
+                None,
+            )
+        if metadata.topk_transform_method == TopkTransformMethod.RAGGED:
+            return None, None, metadata.attn_metadata.topk_indices_offset
+        return None, None, None
 
-        free_mem, total_mem = torch.cuda.mem_get_info(device)
-        bytes_per_elem = 4
-        logits_bytes = num_q * num_k * bytes_per_elem
+    def _gather_ragged_kpool_k(
+        self, plan: KPoolExtendPlan, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            gather_index_k_scale_prefix_into,
+        )
 
-        need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
-        return need_chunk, free_mem
+        k_u8 = plan.ragged_k_u8
+        k_scale = plan.ragged_k_scale
+        assert k_u8 is not None and k_scale is not None
+        pool = get_token_to_kv_pool()
+        gather_index_k_scale_prefix_into(
+            pool=pool,
+            buf=self._get_index_k_read_buffer(pool, layer_id),
+            page_indices=plan.ragged_concat_page_table,
+            seq_len=plan.ragged_total_k_rows,
+            k_out=k_u8,
+            scale_out=k_scale,
+        )
+        return k_u8.view(torch.float8_e4m3fn), k_scale
 
     def _get_topk_ragged_kpool_plan(
         self,
@@ -880,10 +910,6 @@ class IndexerKPool(MultiPlatformOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-            gather_index_k_scale_prefix_into,
-        )
-
         plan = metadata.attn_metadata.kpool_extend_plan
         assert plan is not None, "kpool extend plan is required"
         assert len(weights.shape) == 3
@@ -901,21 +927,34 @@ class IndexerKPool(MultiPlatformOp):
         assert n_real <= total_q, (
             f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
         )
+        assert device.index is not None, "q_fp8 must be on an indexed CUDA device"
 
-        if total_k_rows > 0:
-            k_u8 = plan.ragged_k_u8
-            k_scale = plan.ragged_k_scale
-            assert k_u8 is not None and k_scale is not None
-            pool = get_token_to_kv_pool()
-            gather_index_k_scale_prefix_into(
-                pool=pool,
-                buf=self._get_index_k_read_buffer(pool, layer_id),
-                page_indices=plan.ragged_concat_page_table,
-                seq_len=total_k_rows,
-                k_out=k_u8,
-                scale_out=k_scale,
+        page_table_all, page_table_row_index_all, topk_offsets_all = (
+            self._kpool_ragged_topk_mapping(plan, metadata)
+        )
+
+        if total_k_rows == 0:
+            return self._topk_from_kpool_logits(
+                torch.empty((n_real, 0), dtype=torch.float32, device=device),
+                pool_lens,
+                seq_lens=seq_lens_expanded,
+                page_table=page_table_all,
+                topk_offsets=topk_offsets_all,
+                row_starts=ks_per_q,
+                out_rows=total_q,
+                page_table_row_index=page_table_row_index_all,
             )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
+
+        k_fp8, k_scale = self._gather_ragged_kpool_k(plan, layer_id)
+
+        # The concat K layout makes the dense [n_real x total_k_rows] logits grow
+        # with the whole batch's context, while each q row only reads its own
+        # request's column window. Splitting per request (and then per q-row
+        # chunk) keeps the peak inside the budget. See sgl-project/sglang#37712.
+        need_chunk, logits_budget_bytes = should_chunk_mqa_logits(
+            n_real, total_k_rows, device.index
+        )
+        if not need_chunk:
             logits = deep_gemm.fp8_mqa_logits(
                 q_fp8[:n_real].contiguous(),
                 (k_fp8.contiguous(), k_scale.contiguous()),
@@ -924,31 +963,104 @@ class IndexerKPool(MultiPlatformOp):
                 ke_per_q,
                 clean_logits=True,
             )
-        else:
-            logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
+            return self._topk_from_kpool_logits(
+                logits,
+                pool_lens,
+                seq_lens=seq_lens_expanded,
+                page_table=page_table_all,
+                topk_offsets=topk_offsets_all,
+                row_starts=ks_per_q,
+                out_rows=total_q,
+                page_table_row_index=page_table_row_index_all,
+            )
 
-        topk_method = metadata.topk_transform_method
-        attn_metadata = metadata.attn_metadata
-        page_table_all = None
-        page_table_row_index_all = None
-        topk_offsets_all = None
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
-            if topk_method == TopkTransformMethod.PAGED:
-                page_table_all = plan.ragged_paged_page_table
-                page_table_row_index_all = plan.ragged_paged_page_table_row_index
-            elif topk_method == TopkTransformMethod.RAGGED:
-                topk_offsets_all = attn_metadata.topk_indices_offset
-
-        return self._topk_from_kpool_logits(
-            logits,
-            pool_lens,
-            seq_lens=seq_lens_expanded,
+        return self._topk_ragged_kpool_grouped(
+            plan=plan,
+            q_fp8=q_fp8,
+            weights=weights,
+            k_fp8=k_fp8,
+            k_scale=k_scale,
+            logits_budget_bytes=logits_budget_bytes,
+            total_q=total_q,
             page_table=page_table_all,
-            topk_offsets=topk_offsets_all,
-            row_starts=ks_per_q,
-            out_rows=total_q,
             page_table_row_index=page_table_row_index_all,
+            topk_offsets=topk_offsets_all,
         )
+
+    def _topk_ragged_kpool_grouped(
+        self,
+        *,
+        plan: KPoolExtendPlan,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        logits_budget_bytes: int,
+        total_q: int,
+        page_table: Optional[torch.Tensor],
+        page_table_row_index: Optional[torch.Tensor],
+        topk_offsets: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Per-request, per-q-row-chunk equivalent of the single fused MQA call.
+
+        `plan.ragged_groups` says which K rows each request's q rows may read, so
+        a group's logits only need that column window, and a q-row chunk of it
+        only needs `logits_budget_bytes`.
+        """
+        topk_result = torch.full(
+            (total_q, self.index_topk + self.index_kpool - 1),
+            -1,
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+
+        for group in plan.ragged_groups:
+            k_lo = group.k_start
+            k_hi = k_lo + group.k_rows
+            q_end = group.q_start + group.q_len
+            max_rows = mqa_logits_max_rows(
+                logits_budget_bytes, group.k_rows, group.q_len
+            )
+
+            for start in range(group.q_start, q_end, max_rows):
+                end = min(start + max_rows, q_end)
+                # The K window is sliced, so every column index rebases to it.
+                ks_local = plan.ragged_q_ks[start:end] - k_lo
+                if group.k_rows == 0:
+                    # seq_len < index_kpool: no pooled history, tail-select only.
+                    logits = torch.empty(
+                        (end - start, 0), dtype=torch.float32, device=q_fp8.device
+                    )
+                else:
+                    logits = deep_gemm.fp8_mqa_logits(
+                        q_fp8[start:end].contiguous(),
+                        (
+                            k_fp8[k_lo:k_hi].contiguous(),
+                            k_scale[k_lo:k_hi].contiguous(),
+                        ),
+                        weights[start:end].contiguous(),
+                        ks_local,
+                        plan.ragged_q_ke[start:end] - k_lo,
+                        clean_logits=True,
+                    )
+                topk_result[start:end] = self._topk_from_kpool_logits(
+                    logits,
+                    plan.pooled_seq_lens_expanded[start:end],
+                    seq_lens=plan.seq_lens_expanded[start:end],
+                    page_table=page_table,
+                    topk_offsets=(
+                        None if topk_offsets is None else topk_offsets[start:end]
+                    ),
+                    row_starts=ks_local,
+                    page_table_row_index=(
+                        None
+                        if page_table_row_index is None
+                        else page_table_row_index[start:end]
+                    ),
+                )
+                del logits
+
+        return topk_result
 
     def _get_topk_ragged_kpool(
         self,
