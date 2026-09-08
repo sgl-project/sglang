@@ -151,10 +151,30 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 ]
             )
 
-    def test_deprecated_flags_still_work(self):
-        """Deprecated flags set the correct dest field."""
-        sa = self._parse(["--incremental-streaming-output"])
-        self.assertTrue(sa.incremental_streaming_output)
+    def test_the_deprecated_flag_still_reaches_its_replacement(self):
+        """`--disable-cuda-graph` is the one deprecated alias left standing.
+
+        It is worth a test because it is not a rename. The flag writes
+        `disable_cuda_graph`, which is `no_cli=True` -- so this spelling is its
+        only way in -- and the cuda-graph hook is what turns that into the two
+        phase backends the replacement flag sets directly. Asserting the
+        backends, against the baseline of not passing it, covers that second
+        half; asserting the dest alone would not.
+        """
+        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        def backends(argv):
+            sa = self._parse(argv)
+            parse_cuda_graph_config(sa)
+            config = resolution_result(sa, "cuda_graph_config")
+            return sa.disable_cuda_graph, config.decode.backend, config.prefill.backend
+
+        self.assertEqual(backends([]), (False, Backend.FULL, Backend.BREAKABLE))
+        self.assertEqual(
+            backends(["--disable-cuda-graph"]),
+            (True, Backend.DISABLED, Backend.DISABLED),
+        )
 
     def test_combined_parse(self):
         """Multiple option types parsed together in one invocation."""
