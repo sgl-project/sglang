@@ -19,8 +19,8 @@ capture/replay mechanics live in the backend. This class adds:
   - NPU-specific patch_model monkey-patch for the decode-Full +
     torch.compile path.
   - Profile context override (NPU profiler emits to disk, not in-mem).
-  - Replay override that issues an async NPUGraph.update for
-    seq_lens before replay (skipped for deepseek-nsa).
+  - Replay override that updates dynamic seq_lens before NPUGraph replay
+    (skipped for deepseek-nsa).
   - Smaller cache_loc dtype (int32 instead of int64).
 """
 
