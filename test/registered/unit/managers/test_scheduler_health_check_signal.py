@@ -188,6 +188,7 @@ class TestWaitingHealthCheckAck(CustomTestCase):
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 1
         s.processed_tokens_counter = 0
         s.dllm_manager = SimpleNamespace(is_empty=lambda: True)
+        s.head_prefix_lock = None
         ranked = []
 
         def calc_priority(waiting, *args, **kwargs):
