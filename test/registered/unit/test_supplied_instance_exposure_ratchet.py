@@ -134,12 +134,29 @@ _ENV_MATRIX = (({}, {"SGLANG_IS_IN_CI": "true"}),)
 # are step-12 exposure like any other pair.
 _PASSED = frozenset({"model_path", "device", "random_seed"})
 
-# Empty. A pair belongs here when a reader has no bag to read -- it runs before
-# its process publishes -- and cannot use `resolving_view` either. The launcher's
-# pre-publish reads (`_set_envs_and_config`, the auto-parser gate) and the
-# late-resolution detection it calls all read the declarations now, so nothing
-# qualifies. A new entry needs that kind of reason next to it.
-_EXPOSED: frozenset = frozenset()
+# Two reasons put a pair here, and each entry carries its own.
+#
+# One: the reader has no bag to read -- it runs before its process publishes --
+# and cannot use `resolving_view` either. The launcher's pre-publish reads
+# (`_set_envs_and_config`, the auto-parser gate) and the late-resolution
+# detection it calls all read the declarations now, so nothing qualifies today.
+#
+# Two: the reader wants the operator's *input*, which is exactly what the
+# record answers. The write seal freezes every field the moment resolution
+# starts, so the record cannot drift from the input -- the read is correct, and
+# it is pinned here because this census cannot tell it apart from the mistake
+# it exists to catch: reading the record for a value resolution decides. The
+# read has to say so in a comment at the call site.
+_EXPOSED: frozenset = frozenset(
+    {
+        # Reason two. `ModelConfig` carries a provenance bit for the draft
+        # model, and resolution declares the target's quantization for the
+        # draft when the operator typed none -- so every decided surface
+        # answers with a value either way, and only the input separates
+        # "inherited" from "asked for".
+        ("configs/model_config.py", "speculative_draft_model_quantization"),
+    }
+)
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
 # `is_cuda()` gated): asserted on the CUDA registration, invisible to the CPU
@@ -147,23 +164,6 @@ _EXPOSED: frozenset = frozenset()
 # but this is where a GPU-only write's readers get pinned without breaking the
 # CPU-exact assertion.
 _EXPOSED_CUDA_ONLY: frozenset = frozenset()
-
-
-# Axis three: (file, field) pairs read through `input_of`, which answers with the
-# operator's *input* on purpose. These cannot go stale the way the reads above
-# can -- being unaffected by what resolution decided is the point -- so they are
-# counted separately rather than pinned into `_EXPOSED`, whose entries are for
-# readers that run before their process publishes. Pinned so that a second one
-# is a decision: asking "did anyone type this?" is right for a provenance bit
-# and wrong for anything that wants the value in effect.
-_INPUT_READS: frozenset = frozenset(
-    {
-        # ModelConfig carries a provenance bit for the draft model, and
-        # resolution writes the field it is about (draft quantization inherits
-        # the target's), so `cfg` cannot answer the question.
-        ("configs/model_config.py", "speculative_draft_model_quantization"),
-    }
-)
 
 
 # Axis two: (file, field) pairs where a supplied-instance read names a field that
@@ -694,7 +694,6 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         return written
 
     _READS_CACHE = None
-    _INPUT_CACHE = None
 
     def _supplied_instance_reads(self) -> set:
         """Three spellings of the same read: ``server_args.field`` off the
@@ -711,7 +710,6 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         if TestSuppliedInstanceExposure._READS_CACHE is not None:
             return TestSuppliedInstanceExposure._READS_CACHE
         pairs = set()
-        input_pairs = set()
         for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
             if rel.startswith(_OWNERS):
@@ -752,18 +750,6 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                         # The same read in optional clothing. Only a literal
                         # name is censusable; a computed one is not.
                         pairs.add((rel, node.args[1].value))
-                    elif (
-                        isinstance(node, ast.Call)
-                        and isinstance(node.func, ast.Name)
-                        and node.func.id == "input_of"
-                        and len(node.args) >= 2
-                        and isinstance(node.args[0], ast.Name)
-                        and node.args[0].id == "server_args"
-                        and isinstance(node.args[1], ast.Constant)
-                        and isinstance(node.args[1].value, str)
-                    ):
-                        # Axis three: a read that asks for the input by name.
-                        input_pairs.add((rel, node.args[1].value))
             for cls in ast.walk(tree):
                 if not isinstance(cls, ast.ClassDef):
                     continue
@@ -798,7 +784,6 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                         and node.value.value.id == "self"
                     ):
                         pairs.add((rel, node.attr))
-        TestSuppliedInstanceExposure._INPUT_CACHE = input_pairs
         TestSuppliedInstanceExposure._READS_CACHE = pairs
         return pairs
 
@@ -887,19 +872,6 @@ class TestSuppliedInstanceExposure(CustomTestCase):
             "the supplied-instance step-12 surface drifted.\n"
             f"  new (decide where the resolved value comes from): {new}\n"
             f"  gone (delete from _EXPOSED / _EXPOSED_CUDA_ONLY): {gone}",
-        )
-
-    def test_the_input_reads_match_the_pinned_list(self):
-        self._supplied_instance_reads()  # fills both caches in one walk
-        found = TestSuppliedInstanceExposure._INPUT_CACHE
-        new = sorted(found - _INPUT_READS)
-        gone = sorted(_INPUT_READS - found)
-        self.assertEqual(
-            ([], []),
-            (new, gone),
-            "the `input_of` surface drifted.\n"
-            f"  new (is this really a question about the input?): {new}\n"
-            f"  gone (delete from _INPUT_READS): {gone}",
         )
 
 

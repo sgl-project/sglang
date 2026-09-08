@@ -43,7 +43,6 @@ from sglang.srt.arg_groups.moe_hook import (
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
-    input_of,
     max_speculative_num_draft_tokens,
     resolution_result,
 )
@@ -245,12 +244,11 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertIsNone(inherited.speculative_draft_model_quantization)
 
         # And it survives the hop that matters: the scheduler and the draft
-        # worker rebuild the record from its fields, which carries no input
-        # snapshot, so `input_of` has to fall back to the field and still
-        # answer "nobody typed it".
+        # worker rebuild the record from its fields, and `from_server_args`
+        # reads it there to tell an inherited draft quantization from one the
+        # operator asked for.
         rebuilt = ServerArgs(**dataclasses.asdict(inherited))
         self.assertIsNone(rebuilt.speculative_draft_model_quantization)
-        self.assertIsNone(input_of(rebuilt, "speculative_draft_model_quantization"))
 
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
