@@ -1291,6 +1291,26 @@ class Scheduler(
                 "Transformers backend to avoid partial multimodal chunk mismatches."
             )
             self.chunked_prefill_size = None
+        elif (
+            self.chunked_prefill_size is not None
+            and self.chunked_prefill_size > 0
+            and self.model_config.is_encoder_decoder
+        ):
+            # Encoder-decoder models (e.g. Whisper, Llama-3.2-Vision / mllama) prepend the
+            # encoder as a single block of `num_image_tokens` tokens that
+            # ScheduleBatch.prepare_encoder_info_extend() must strip as a whole: it subtracts
+            # the full encoder_len from extend_num_tokens, and the encoder cannot be computed
+            # across separate forward passes. Chunked prefill has no encoder awareness and can
+            # truncate a request inside that encoder region (trunc_len < encoder_len), which
+            # drives extend_num_tokens negative and trips the
+            # `len(out_cache_loc) == extend_num_tokens` invariant, crashing the scheduler.
+            # Disabling chunked prefill guarantees each encoder is prefilled whole; these
+            # models have short decoder prompts, so the throughput impact is negligible.
+            logger.warning(
+                "Chunked prefill is disabled for encoder-decoder models to avoid "
+                "splitting the prepended encoder region across prefill chunks."
+            )
+            self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
