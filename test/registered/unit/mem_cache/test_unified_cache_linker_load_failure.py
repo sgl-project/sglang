@@ -309,6 +309,11 @@ class TestFailedLoadDoesNotPinTheForward(CustomTestCase):
         counter.set_consumer(index)
         counter.fail(index, RuntimeError("transport reset"))
 
+        # The type and message have to survive the copy that drops the frames.
+        first = counter._futures[index][0].exception()
+        self.assertIn("transport reset", str(first))
+        self.assertIn("RuntimeError", str(first))
+
         for layer in range(8):
             counter.wait_until(layer)
             published = counter._futures.get(index)
@@ -340,16 +345,6 @@ class TestFailedLoadDoesNotPinTheForward(CustomTestCase):
             for layer in range(4):
                 counter.wait_until(layer)
             self.assertIsNotNone(caller_error.__traceback__)
-
-    def test_the_message_survives(self):
-        counter = LayerWiseLoadCounter(2)
-        index = counter.update_producer()
-        counter.set_consumer(index)
-        counter.fail(index, ValueError("UMBP get failed for pool=swa"))
-
-        published = counter._futures[index][0].exception()
-        self.assertIn("UMBP get failed for pool=swa", str(published))
-        self.assertIn("ValueError", str(published))
 
 
 class TestUMBPLinkerCompletionChannel(CustomTestCase):
@@ -442,11 +437,6 @@ class TestInvalidateExternalLoadChain(CustomTestCase):
         self.assertTrue(core.invalidate_external_load_chain(7).is_dropped)
         self.assertEqual(core.deleted, [7])
 
-    def test_declines_when_the_node_is_gone(self):
-        core = self._core(None)
-        self.assertFalse(core.invalidate_external_load_chain(7).is_dropped)
-        self.assertEqual(core.deleted, [])
-
     def test_declines_for_a_backed_up_or_in_flight_node(self):
         for field in ("backuped", "write_through_pending_id", "load_back_pending_id"):
             node = self._node(**{field: True})
@@ -457,11 +447,11 @@ class TestInvalidateExternalLoadChain(CustomTestCase):
             )
             self.assertEqual(core.deleted, [])
 
-    def test_declines_when_the_node_is_not_a_device_leaf(self):
-        """Covers a since-adopted chain: locked, or grown a device child."""
-        core = self._core(self._node(), is_device_leaf=False)
-        self.assertFalse(core.invalidate_external_load_chain(7).is_dropped)
-        self.assertEqual(core.deleted, [])
+    def test_declines_for_a_missing_node_or_a_non_leaf(self):
+        """Non-leaf covers a since-adopted chain: locked, or grown a device child."""
+        for core in (self._core(None), self._core(self._node(), is_device_leaf=False)):
+            self.assertFalse(core.invalidate_external_load_chain(7).is_dropped)
+            self.assertEqual(core.deleted, [])
 
     def test_declines_for_any_child_not_only_a_device_bearing_one(self):
         """`_is_device_leaf` is not a child check, so it cannot be the one here.
@@ -866,18 +856,12 @@ class TestCacheFinishedReqReclaimsAfterTheUnlock(CustomTestCase):
 class TestFailedChainNeverReachesTheStore(CustomTestCase):
     """B1. A chain published by a failed load must not be offloaded.
 
-    ``load_back`` sets ``external_cache_stored = True`` on the chain because
-    those pages came *from* the store -- which is also what makes them
-    ineligible for offload. Clearing the flag on failure therefore does the
-    exact opposite of what it reads like: it schedules the *unfilled* pages to
-    be written into the store, where the corruption outlives a ``/flush_cache``
-    and reaches every node sharing the tier.
-
-    The chain is cut out of the tree instead, so no root-anchored walk can
-    name it for write-through in the first place. Both write-through paths
-    assert on that rather than testing it: one of these nodes turning up on a
-    walk means the tree is corrupt, and the write is the least of the
-    problems.
+    ``load_back`` sets ``external_cache_stored = True`` because those pages
+    came *from* the store, which is also what makes them ineligible for
+    offload -- so clearing it on failure would schedule the *unfilled* pages
+    into the store, where the corruption outlives a ``/flush_cache``. The
+    chain is cut out of the tree instead, and the write-through paths assert
+    rather than test: reaching one of these nodes means the tree is corrupt.
     """
 
     def test_offloading_a_failed_chain_fails_loudly(self):
@@ -953,35 +937,6 @@ class TestDetachedNodeIsRefusedByTheTree(CustomTestCase):
     def test_write_through_still_fires_for_an_ordinary_node(self):
         core = self._core()
         self.assertTrue(core._inc_hit_count_and_check(self._node()))
-
-
-class TestDetachCoversEveryNodeOfTheChain(CustomTestCase):
-    """B2. A load's insert can span several nodes, and all of them are bad.
-
-    ``_detach_failed_chain`` already walks ``endpoint -> anchor``; the reclaim
-    only ever received the endpoint. Deleting the endpoint does **not** cascade through
-    the rest: ``_iteratively_delete_tombstone_leaf`` stops at the first ancestor
-    that still holds a device value, and every node the load just filled has
-    one. So the intermediate nodes survived -- matchable, and offload-eligible.
-    """
-
-    def test_every_published_node_is_filed_for_the_reclaim(self):
-        wrapper = _make_wrapper([(["rid-a"], False)], chain_len=4)
-        wrapper._queue_load("rid-a", 3, ["transfer"], anchor=0)
-
-        _drain(wrapper, 1)
-
-        # Deepest first: the parent only becomes a device leaf once its child
-        # is gone, so purging root-ward would decline on every node but one.
-        self.assertEqual(wrapper.take_failed_chain("rid-a"), [3, 2, 1])
-
-    def test_a_single_node_chain_still_publishes_exactly_that_node(self):
-        wrapper = _make_wrapper([(["rid-a"], False)], chain_len=2)
-        wrapper._queue_load("rid-a", 1, ["transfer"], anchor=0)
-
-        _drain(wrapper, 1)
-
-        self.assertEqual(wrapper.take_failed_chain("rid-a"), [1])
 
 
 class TestSchedulerDefersUnmatchedRids(CustomTestCase):
@@ -1068,16 +1023,11 @@ class TestSchedulerDefersUnmatchedRids(CustomTestCase):
 class TestLinkerLoadFailureIsDistinguishable(CustomTestCase):
     """The PD-prefill drop must fire for a linker failure and nothing else.
 
-    process_batch_result_disagg_prefill has to drop an aborted request before it
-    is queued for a KV transfer, or the decode side is handed KV that never
-    arrived. Unlike a user abort -- which the decode node learns about through
-    its own AbortReq -- a linker failure is an internal prefill-node decision
-    that nothing else propagates, so the drop is the only thing standing between
-    corrupt KV and the decode node.
-
-    Gating that drop on is_aborted() alone would also change what happens to a
-    user abort racing the same forward, which is outside this PR. The verdict is
-    therefore tagged with an err_type and matched on it.
+    A user abort reaches the decode node through its own AbortReq; a linker
+    failure is an internal prefill-node decision that nothing else propagates,
+    so this drop is all that stands between corrupt KV and the decode node.
+    Gating on is_aborted() alone would change user-abort semantics too, so the
+    verdict carries an err_type and is matched on it.
     """
 
     def _req(self, to_finish=None, finished_reason=None):
@@ -1107,20 +1057,18 @@ class TestLinkerLoadFailureIsDistinguishable(CustomTestCase):
         )
         self.assertTrue(is_external_kv_load_failure(req))
 
-    def test_does_not_match_a_user_abort(self):
-        """abort_request's "method 3" sets a bare FINISH_ABORT."""
-        self.assertFalse(is_external_kv_load_failure(self._req(FINISH_ABORT())))
-
-    def test_does_not_match_a_bootstrap_failure(self):
-        req = self._req(
-            finished_reason=FINISH_ABORT(
-                "Prefill bootstrap failed", HTTPStatus.INTERNAL_SERVER_ERROR
-            )
+    def test_does_not_match_any_other_outcome(self):
+        """A bare FINISH_ABORT is abort_request's "method 3"; a bootstrap
+        failure carries no err_type; an unaborted request has neither."""
+        bootstrap = FINISH_ABORT(
+            "Prefill bootstrap failed", HTTPStatus.INTERNAL_SERVER_ERROR
         )
-        self.assertFalse(is_external_kv_load_failure(req))
-
-    def test_does_not_match_an_unaborted_request(self):
-        self.assertFalse(is_external_kv_load_failure(self._req()))
+        for req in (
+            self._req(FINISH_ABORT()),
+            self._req(finished_reason=bootstrap),
+            self._req(),
+        ):
+            self.assertFalse(is_external_kv_load_failure(req))
 
     def test_the_scheduler_tags_the_verdict_it_stages(self):
         """The mark hook must emit the err_type the PD drop matches on."""
@@ -1152,75 +1100,14 @@ class TestLinkerLoadFailureIsDistinguishable(CustomTestCase):
 
 
 class TestFailedChainIsCutOutOfTheTree(CustomTestCase):
-    """The tree side of B1, closed by detaching instead of flagging.
+    """The cut, from the wrapper and from the tree core.
 
     ``match_prefix`` consults no per-node validity flag, so a merely flagged
-    chain stayed reachable until the reclaim managed to drop it -- and the first
-    request that matched it gave the chain a device child, which is one of the
-    conditions ``invalidate_external_load_chain`` declines on. So matching the
-    chain once pinned it in the tree permanently: every later request with that
-    prefix was served KV that never arrived, at HTTP 200, and could offload its
-    own tail -- computed over that KV -- into the shared store.
-
-    Teaching ``match_prefix`` to refuse a flag cannot be done on its own (see
-    ``UnifiedTreeNode.detached``). Cutting the chain's top link does the same
-    job without touching either walk.
+    chain stayed reachable until the reclaim dropped it -- and the first
+    request to match it gave the chain a device child, one of the conditions
+    ``invalidate_external_load_chain`` declines on, pinning it for good.
+    Cutting the top link does the same job without touching either walk.
     """
-
-    def test_the_chain_is_unreachable_from_the_anchor(self):
-        wrapper = _make_wrapper([(["rid-a"], False)], chain_len=4)
-        wrapper._queue_load("rid-a", 3, ["transfer"], anchor=0)
-
-        _drain(wrapper, 1)
-
-        anchor = wrapper.cache.nodes[0]
-        reachable = set()
-        stack = [anchor]
-        while stack:
-            node = stack.pop()
-            reachable.add(node.id)
-            stack.extend(node.children.values())
-        self.assertEqual(
-            reachable,
-            {0},
-            "the failed load's chain is still walkable from the anchor, so "
-            "match_prefix and the insert walk can both still reach it",
-        )
-
-    def test_every_node_of_the_chain_is_marked_detached(self):
-        wrapper = _make_wrapper([(["rid-a"], False)], chain_len=4)
-        wrapper._queue_load("rid-a", 3, ["transfer"], anchor=0)
-
-        _drain(wrapper, 1)
-
-        for node_id in (1, 2, 3):
-            self.assertTrue(wrapper.cache.nodes[node_id].detached, node_id)
-        self.assertFalse(wrapper.cache.nodes[0].detached, "anchor must stay")
-
-    def test_the_chain_keeps_its_own_links_for_the_reclaim(self):
-        """Only the top link is cut; the reclaim still walks the chain."""
-        wrapper = _make_wrapper([(["rid-a"], False)], chain_len=4)
-        wrapper._queue_load("rid-a", 3, ["transfer"], anchor=0)
-
-        _drain(wrapper, 1)
-
-        nodes = wrapper.cache.nodes
-        self.assertEqual(set(nodes[1].children), {2})
-        self.assertEqual(set(nodes[2].children), {3})
-        self.assertIs(nodes[1].parent, nodes[0])
-
-    def test_a_successful_load_is_left_attached(self):
-        wrapper = _make_wrapper([(["rid-a"], True)], chain_len=4)
-        wrapper._queue_load("rid-a", 3, ["transfer"], anchor=0)
-
-        _drain(wrapper, 1)
-
-        self.assertEqual(set(wrapper.cache.nodes[0].children), {1})
-        self.assertFalse(wrapper.cache.nodes[1].detached)
-
-
-class TestDetachExternalLoadChain(CustomTestCase):
-    """The cut itself, against the real tree core."""
 
     def _chain(self, length):
         """anchor -> 1 -> ... -> length, registered in a bare core."""
@@ -1231,24 +1118,61 @@ class TestDetachExternalLoadChain(CustomTestCase):
             nodes[node_id] = parent
         return nodes, _bare_core(nodes)
 
-    def test_returns_the_chain_endpoint_first(self):
+    def test_the_whole_chain_is_filed_endpoint_first(self):
+        """Deleting the endpoint does not cascade past the first ancestor that
+        still holds a device value, and every node this load filled has one."""
+        wrapper = _make_wrapper([(["rid-a"], False)], chain_len=4)
+        wrapper._queue_load("rid-a", 3, ["transfer"], anchor=0)
+        _drain(wrapper, 1)
+        self.assertEqual(wrapper.take_failed_chain("rid-a"), [3, 2, 1])
+
+        single = _make_wrapper([(["rid-b"], False)], chain_len=2)
+        single._queue_load("rid-b", 1, ["transfer"], anchor=0)
+        _drain(single, 1)
+        self.assertEqual(single.take_failed_chain("rid-b"), [1])
+
+    def test_the_chain_is_unreachable_but_keeps_its_own_links(self):
+        wrapper = _make_wrapper([(["rid-a"], False)], chain_len=4)
+        wrapper._queue_load("rid-a", 3, ["transfer"], anchor=0)
+        _drain(wrapper, 1)
+
+        nodes = wrapper.cache.nodes
+        reachable = set()
+        stack = [nodes[0]]
+        while stack:
+            node = stack.pop()
+            reachable.add(node.id)
+            stack.extend(node.children.values())
+        self.assertEqual(reachable, {0}, "the chain is still walkable from the anchor")
+        # Only the top link is cut; the reclaim still walks the chain.
+        self.assertEqual(set(nodes[1].children), {2})
+        self.assertEqual(set(nodes[2].children), {3})
+        self.assertIs(nodes[1].parent, nodes[0])
+        for node_id in (1, 2, 3):
+            self.assertTrue(nodes[node_id].detached, node_id)
+        self.assertFalse(nodes[0].detached, "anchor must stay")
+
+    def test_a_successful_load_is_left_attached(self):
+        wrapper = _make_wrapper([(["rid-a"], True)], chain_len=4)
+        wrapper._queue_load("rid-a", 3, ["transfer"], anchor=0)
+        _drain(wrapper, 1)
+        self.assertEqual(set(wrapper.cache.nodes[0].children), {1})
+        self.assertFalse(wrapper.cache.nodes[1].detached)
+
+    def test_the_core_cuts_exactly_one_link(self):
         nodes, core = self._chain(3)
         self.assertEqual(core.detach_external_load_chain(3, 0), [3, 2, 1])
-
-    def test_cuts_exactly_one_link(self):
-        nodes, core = self._chain(3)
-        core.detach_external_load_chain(3, 0)
         self.assertEqual(nodes[0].children, {})
         self.assertEqual(set(nodes[1].children), {2})
 
-    def test_records_the_top_as_a_detached_root(self):
+    def test_the_top_is_recorded_as_a_detached_root(self):
         """_collect_all_nodes seeds from here, so sanity_check still sees it."""
         nodes, core = self._chain(3)
         core.detach_external_load_chain(3, 0)
         self.assertEqual(set(core._detached_roots), {1})
         self.assertIn(1, {n.id for n in core._collect_all_nodes()})
 
-    def test_leaves_the_anchors_other_children_alone(self):
+    def test_the_anchors_other_children_are_left_alone(self):
         nodes, core = self._chain(3)
         sibling = FakeNode(99, nodes[0])
         core._node_arena[99] = sibling
@@ -1258,21 +1182,12 @@ class TestDetachExternalLoadChain(CustomTestCase):
         self.assertEqual(set(nodes[0].children), {99})
         self.assertFalse(sibling.detached)
 
-    def test_a_single_node_chain(self):
-        nodes, core = self._chain(1)
-        self.assertEqual(core.detach_external_load_chain(1, 0), [1])
-        self.assertEqual(nodes[0].children, {})
-
-    def test_an_empty_chain_cuts_nothing(self):
-        """The load adopted no node: endpoint is the anchor itself."""
+    def test_an_empty_or_missing_chain_cuts_nothing(self):
+        """The load adopted no node, or its endpoint is already gone."""
         nodes, core = self._chain(2)
         self.assertEqual(core.detach_external_load_chain(0, 0), [])
-        self.assertEqual(set(nodes[0].children), {1})
-        self.assertEqual(core._detached_roots, {})
-
-    def test_an_endpoint_already_gone_is_a_no_op(self):
-        nodes, core = self._chain(2)
         self.assertEqual(core.detach_external_load_chain(404, 0), [])
+        self.assertEqual(set(nodes[0].children), {1})
         self.assertEqual(core._detached_roots, {})
 
 
@@ -1313,22 +1228,14 @@ class TestOwnershipOfADetachedChain(CustomTestCase):
 
         self.assertTrue(core.is_on_detached_chain(2))
 
-    def test_an_ordinary_node_is_not(self):
+    def test_an_ordinary_node_the_root_and_a_missing_node_are_not(self):
         root = self._node(0)
         node = self._node(1, parent=root)
         core = self._core([root, node], root)
 
         self.assertFalse(core.is_on_detached_chain(1))
-
-    def test_the_root_is_not(self):
-        root = self._node(0)
-
-        self.assertFalse(self._core([root], root).is_on_detached_chain(0))
-
-    def test_a_node_that_is_gone_is_not(self):
-        root = self._node(0)
-
-        self.assertFalse(self._core([root], root).is_on_detached_chain(99))
+        self.assertFalse(core.is_on_detached_chain(0))
+        self.assertFalse(core.is_on_detached_chain(99))
 
     def test_holds_detached_node_follows_the_arena(self):
         root = self._node(0)
@@ -1342,17 +1249,12 @@ class TestOwnershipOfADetachedChain(CustomTestCase):
 class TestTombstoneCascadeLeavesNoStaleLeaf(CustomTestCase):
     """The cascade must drop a node from *both* leaf sets when it deletes it.
 
-    ``_release_all_component_layers`` discards the device set and the host set
-    together; the cascade's own delete discarded only the host one. A node left
-    in ``evictable_device_leaves`` after its arena entry is gone is what
-    ``sanity_check`` reports as ``stale nodes in device_leaves``, and the strict
-    idle check turns that into a crash -- observed on all 8 ranks of a DSv4-Pro
-    run once the earlier failures stopped ending the process first.
-
-    The cascade reaches such a node through a failed load: it walks
-    ``deleted.parent``, and the parent of a request's own node can be a
-    detached chain node, which the ``has_device`` branch adds to the device set
-    on the way past.
+    The cascade's delete discarded only the host set. A node left in
+    ``evictable_device_leaves`` after its arena entry is gone is what
+    ``sanity_check`` reports as ``stale nodes in device_leaves``, fatal under
+    the strict idle check -- seen on all 8 ranks of a DSv4-Pro run. The
+    cascade reaches such a node by walking ``deleted.parent`` into a detached
+    chain node.
     """
 
     def _core(self, cur, parent, root):
@@ -1575,21 +1477,12 @@ class _LeafNode:
 class TestALeafSetNeverHoldsADeletedNode(unittest.TestCase):
     """A node the arena no longer holds must not be in a leaf set.
 
-    The crash this pins reads
-
-        D-leaf extra: [N]
-        1 stale nodes in device_leaves: [N]
-
-    and `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE` (default True) makes it
-    fatal. Deleting a node clears it from both sets; what put it back is
-    `_update_evictable_leaf_sets(parent)`, which several callers reach after a
-    delete -- and the parent can already be gone.
-
-    A failed load is what makes that reachable. A detached chain's endpoint
-    counts as a device leaf while a child holding no device KV still hangs off
-    it (`_is_device_leaf` only rejects children with Full KV *on device*), so
-    the endpoint is freed first, and that child's later deletion arrives here
-    naming a parent that is no longer in the tree.
+    The crash reads ``1 stale nodes in device_leaves: [N]``, made fatal by
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE. Deleting clears both sets;
+    what puts the node back is ``_update_evictable_leaf_sets(parent)``, whose
+    parent can already be gone -- a detached endpoint is a device leaf while a
+    KV-less child hangs off it, so the endpoint frees first and that child's
+    later deletion names a dead parent.
     """
 
     def _core(self):
@@ -1649,22 +1542,13 @@ class TestALeafSetNeverHoldsADeletedNode(unittest.TestCase):
 class TestTheReclaimNeverStrandsAChild(unittest.TestCase):
     """The reclaim must not delete a node that still has a child.
 
-    `invalidate_external_load_chain` says it declines for a node something else
-    still owns -- "a child, a lock, a host copy" -- but the only child check it
-    had was `_is_device_leaf`, which rejects a child holding Full KV *on
-    device* and nothing else. A child that is host-only, or holds nothing at
-    all, left the node looking free.
-
-    Deleting it then unregisters the parent while the child keeps pointing at
-    it. `_collect_all_nodes` walks from the root and the detached roots, so it
-    never reaches that child again: it is stranded in the arena, and
-    `sanity_check` cannot even see it to complain. When the child is host-only
-    it is also still in `evictable_host_leaves`, and a leaf-set member the walk
-    cannot reach *is* reported -- as `stale nodes in host_leaves`, fatal under
-    the strict idle check.
-
-    Found by enumerating operation interleavings against the real code
-    (fixwork/order_search2.py), not by reading it.
+    ``invalidate_external_load_chain``'s only child check was
+    ``_is_device_leaf``, which rejects a child holding Full KV *on device* and
+    nothing else, so a host-only or empty child left the node looking free.
+    Deleting it strands the child: ``_collect_all_nodes`` walks from the root
+    and the detached roots and never reaches it again, while a host-only child
+    stays in ``evictable_host_leaves`` -- reported as ``stale nodes in
+    host_leaves``. Found by enumerating operation interleavings, not by reading.
     """
 
     def _core(self, child_kind):

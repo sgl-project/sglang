@@ -3080,26 +3080,15 @@ class UnifiedRadixCache(BasePrefixCache):
         """Free the tree chains a failed external-linker load published.
 
         Called from cache_finished_req once the request has dropped its tree
-        lock. For the request that issued the load that is the one point where
-        its whole chain becomes reclaimable: Full is a path-unlock, so that
-        single dec_lock_ref clears lock_ref on every node of the chain at once.
-        A mid-chunk abort reaches the same function later, through
-        process_pending_chunked_abort.
+        lock -- the one point where the whole chain becomes reclaimable, since
+        Full is a path-unlock. Endpoint-first: a parent only becomes a device
+        leaf once its child is gone.
 
-        Endpoint-first, because a parent only becomes a device leaf once its
-        child is gone.
-
-        The loading request is not always the last owner. A request that
-        matched the chain in the tree while the load was still in flight holds
-        it too, and it releases on its own schedule -- so a node that declines
-        here is kept and retried on every later pass rather than abandoned.
-        Abandoning it was not safe: the chain stays in the arena holding device
-        slots that no eviction is obliged to reach, while the request still
-        pointing into it goes on to insert those same slots under a fresh node,
-        leaving one set of pages owned twice.
-
-        A node that has left the arena is dropped instead of retried: eviction
-        reached it first, so there is nothing left to free.
+        The loading request is not always the last owner; a request that
+        matched the chain while the load was in flight holds it too. A node
+        that declines here is retried rather than abandoned, or its slots
+        would be owned twice once that request re-inserts them. A node that
+        has left the arena is dropped instead: eviction reached it first.
         """
         if self.linker is None:
             return

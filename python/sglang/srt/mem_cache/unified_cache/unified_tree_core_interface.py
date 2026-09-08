@@ -296,14 +296,10 @@ class UnifiedTreeCoreInterface(ABC):
         under host pressure; declines (is_dropped=False) if any node is locked."""
         ...
 
-    # The four methods below are the external-linker load-failure surface.
-    # They are deliberately not abstract: every caller reaches them only once a
-    # linker is attached, so a backend that does not implement them is fully
-    # usable without one. Making them abstract would instead make every backend
-    # that predates the surface -- the Rust TreeCore here, and any registered
-    # out of tree via register_tree_core_backend -- impossible to construct at
-    # all. Raising here keeps that cost where it belongs: on the one
-    # configuration that actually needs the recovery path.
+    # The external-linker load-failure surface. Not abstract: every caller is
+    # behind a linker check, so a backend without it stays usable, and making
+    # it abstract would leave every other backend -- the Rust TreeCore, and any
+    # registered out of tree -- impossible to construct at all.
 
     def _no_external_load_recovery(self) -> str:
         return (

@@ -52,8 +52,7 @@ class LayerWiseLoadCounter:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures: dict[int, list[Future]] = {}
-        # Batch indices whose failure has already been logged, so a 60-layer
-        # model reports one line per failed load rather than sixty.
+        # Batch indices already logged: one line per failed load, not per layer.
         self.reported: set[int] = set()
 
     def update_producer(self) -> int:
@@ -68,12 +67,9 @@ class LayerWiseLoadCounter:
         self.futures[index][layer].set_result(None)
 
     def fail(self, index: int, error: BaseException) -> None:
-        # Publish a private, message-preserving copy rather than the caller's
-        # own exception: wait_until clears the traceback of whatever it catches
-        # (see there), and the caller still needs its exception intact for the
-        # logger.exception() that follows this call. On its own this copy fixes
-        # nothing -- a traceback is not inherited from construction, it is
-        # rebuilt by every raise -- so it only works together with that clear.
+        # A private copy, because wait_until clears the traceback of what it
+        # catches and the caller still needs its own exception for the
+        # logger.exception() that follows.
         failure = RuntimeError(f"{type(error).__name__}: {error}")
         for future in self.futures.get(index, ()):
             if not future.done():
@@ -87,12 +83,10 @@ class LayerWiseLoadCounter:
         try:
             futures[threshold].result()
         except BaseException as error:
-            # Never raise here: this runs inside the model forward, where an
-            # exception reaches no handler before the scheduler's top-level
-            # one and takes the whole engine down. The batch proceeds over
-            # unloaded pages and the linker reports the failure through
-            # pop_completed_load(), which aborts the affected requests before
-            # their output is committed.
+            # Never raise: this runs inside the model forward, where nothing
+            # catches before the scheduler's top-level handler and the whole
+            # engine goes down. The failure travels out through
+            # pop_completed_load(), which aborts the affected requests.
             if index not in self.reported:
                 self.reported.add(index)
                 logger.error(
@@ -101,17 +95,11 @@ class LayerWiseLoadCounter:
                     index,
                     error,
                 )
-            # Drop the traceback this raise just appended. One exception
-            # object is shared by every layer's future, so each layer's
-            # re-raise adds another entry to it, and every entry roots a frame
-            # chain reaching that layer's forward frame -- pinning that layer's
-            # activations. A 61-layer model then held one full activation set
-            # per layer: +31.9 GiB on a single faulted forward at
-            # --chunked-prefill-size 2048 (~133 GiB at 8192), and consecutive
-            # failures stacked until the engine OOMed inside the attention
-            # kernel. Nothing needs the traceback -- the message is logged
-            # above, and the failure verdict travels through
-            # pop_completed_load().
+            # Every layer re-raises this same exception object, and each
+            # appended traceback entry roots a frame chain that pins that
+            # layer's activations: +31.9 GiB on one faulted 61-layer forward at
+            # --chunked-prefill-size 2048, until the engine OOMed. Nothing
+            # reads the traceback.
             error.__traceback__ = None
         finally:
             if threshold == self.num_layers - 1:

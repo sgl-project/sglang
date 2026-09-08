@@ -592,25 +592,14 @@ class UnifiedCacheLinkerWrapper:
         """Cut the chain this load published out of the tree, endpoint first.
 
         ``external_cache_stored`` is left alone: the chain really did come from
-        the store, and clearing it is what makes the unfilled pages eligible
-        for write-through -- the opposite of what is wanted.
+        the store, and clearing it would make the unfilled pages eligible for
+        write-through.
 
-        Detaching, rather than only flagging, is what keeps the chain from
-        being served: match_prefix reads no such flag, so a merely flagged
-        chain stayed matchable until the purge managed to drop it, and the
-        first request that matched it gave it a device child and blocked the
-        reclaim for good.
-
-        The whole chain is filed, not just its endpoint. Deleting the endpoint
-        does not cascade: ``_iteratively_delete_tombstone_leaf`` stops at the
-        first ancestor still holding a device value, and every node this load
-        just filled has one. Endpoint-first order matters too -- a parent only
-        becomes a device leaf once its child is gone.
-
-        Filed under the rid because that request's ``cache_finished_req`` is
-        the one point where the whole chain becomes reclaimable: Full is a
-        path-unlock, so its single ``dec_lock_ref`` drops ``lock_ref`` on every
-        node of the chain at once.
+        The whole chain is filed, not just its endpoint: deleting the endpoint
+        does not cascade, because ``_iteratively_delete_tombstone_leaf`` stops
+        at the first ancestor still holding a device value and every node this
+        load filled has one. Filed under the rid, whose ``cache_finished_req``
+        path-unlocks the entire chain in one ``dec_lock_ref``.
         """
         self.failed_chains.setdefault(rid, []).extend(
             self.cache.tree_core.detach_external_load_chain(node_id, anchor)
