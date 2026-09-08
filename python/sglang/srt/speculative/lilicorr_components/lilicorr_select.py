@@ -14,15 +14,17 @@ instead of from a fixed-address buffer.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.lilicorr_components.lilicorr_candidates import (
     lilicorr_candidates,
     resolve_vocab_shard,
 )
+from sglang.srt.speculative.lilicorr_components.lilicorr_config import SAMPLING_ENABLED
 
 
 def propose_lilicorr_block(
@@ -32,12 +34,18 @@ def propose_lilicorr_block(
     lm_head,
     embed_tokens,
     anchor: Optional[torch.Tensor],
-) -> torch.Tensor:
+    sampling_info=None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Reranked draft block in place of the per-slot greedy argmax.
 
     ``draft_hidden`` is ``[bs, block_size, hidden]``, where slot 0 is the anchor
-    position and slots 1.. are the candidate positions. Returns the selected
-    tokens ``[bs, block_size - 1]``.
+    position and slots 1.. are the candidate positions. Returns ``(tokens [bs,
+    block_size - 1], candidate_tokens, q_rows)``; the latter two are ``None`` unless
+    ``LILICORR_SAMPLING`` is on, and the worker publishes them for the verify.
+
+    Unlike the folded path there are no static buffers to stage into, so the sampling
+    tensors are built per call -- which is also why this path exists: it serves the
+    steps the graph cannot.
     """
     bs, block_size, hidden_size = draft_hidden.shape
     slots = block_size - 1
@@ -70,7 +78,7 @@ def propose_lilicorr_block(
 
     # The embedding lookup happens here, outside the head, because on the target
     # model it may be a TP-sharded collective.
-    selected = head.select(
+    common = dict(
         token_embeddings=embed_tokens(candidate_tokens).detach(),
         candidate_tokens=candidate_tokens,
         candidate_log_probs=log_probs.view(bs, slots, int(head.candidate_topk)),
@@ -78,4 +86,24 @@ def propose_lilicorr_block(
         anchor_hidden=anchor_hidden,
         anchor_valid=anchor_valid,
     )
-    return selected.to(torch.long)
+    if not SAMPLING_ENABLED:
+        return head.select(**common).to(torch.long), None, None
+
+    device = draft_hidden.device
+    temperatures = (
+        torch.ones(bs, dtype=torch.float32, device=device)
+        if sampling_info is None
+        # Clamped like DSpark and the DFlash2 selector so a greedy row, whose
+        # temperature may be exactly 0, cannot divide by zero before greedy_mask
+        # discards its sampled pick anyway.
+        else sampling_info.temperatures.view(-1)[:bs].float().clamp_min(1e-5)
+    )
+    selected, q_rows = head.select_with_proposal(
+        uniforms=torch.rand(bs, slots, dtype=torch.float32, device=device),
+        temperatures=temperatures,
+        greedy_mask=resolve_greedy_mask(
+            bs=bs, sampling_info=sampling_info, device=device
+        ),
+        **common,
+    )
+    return selected.to(torch.long), candidate_tokens, q_rows

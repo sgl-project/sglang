@@ -8,12 +8,68 @@ model build.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any, Optional
 
 import msgspec
 
 from sglang.kernels.ops.speculative.lilicorr import MAX_FUSED_CANDIDATE_TOPK
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
+
+logger = logging.getLogger(__name__)
+
+# ── PROBABILISTIC DRAFT, RESOLVED ONCE AT IMPORT ───────────────────────────────
+# OFF by default, and off is byte-identical to the greedy commit that ships: the same
+# kernel, the same argmax, no proposal emitted. ON samples each slot from
+# ``softmax(psi_s / T)`` over that slot's candidates and publishes the row it drew
+# from, so verify pays ``sum_c min(p, q)`` rather than ``p(argmax)`` -- the contract
+# DSpark and the DFlash2 selector already serve under.
+#
+# Read at import, not per call, and that is load-bearing. ``LiLiCorrHead.select`` is
+# ``torch.compile``d with ``dynamic=False`` and replayed from a captured draft CUDA
+# graph, so a per-call ``os.environ`` read is a graph break in the compiled body and a
+# host-side branch inside a replay. One module constant means one compiled body per
+# process either way, and never a mixture.
+# It lives here, not on the head, because the head and the graph-folded sampler both
+# need it and this is the module they can both import without a cycle.
+# It changes nothing about the checkpoint: the same trained factors are read either
+# way, so a pair of runs differing only in this variable is a clean A/B on one set of
+# weights. It is also orthogonal to the DFlash backbone, convolutions included -- the
+# conv feeds ``pass_hidden``, which ``score`` consumes identically under both rules.
+_SAMPLING_RAW = os.environ.get("LILICORR_SAMPLING", "0").strip().lower()
+if _SAMPLING_RAW not in ("0", "1", "off", "on", "false", "true"):
+    raise ValueError(
+        f"LILICORR_SAMPLING={_SAMPLING_RAW!r} is not a boolean. Refusing rather than "
+        "defaulting: a typo here would report the greedy number under the sampled "
+        "arm's name."
+    )
+SAMPLING_ENABLED = _SAMPLING_RAW in ("1", "on", "true")
+logger.info(
+    "LiLiCorr draft commit: %s",
+    "sampled (T>0 aware)" if SAMPLING_ENABLED else "greedy",
+)
+
+# The require gate catches the operator error the raise above cannot. A typo in
+# ``LILICORR_SAMPLING`` already raises; FORGETTING it entirely is silent and serves the
+# greedy commit under a sampled arm's name -- believable numbers, wrong arm. Set
+# ``SGLANG_LILICORR_REQUIRE_SAMPLING=1`` on any cell whose name claims to be sampled and
+# that mismatch becomes a startup failure instead of a plausible row.
+# It cannot catch an absent overlay, and nothing here can: this file is part of the
+# overlay, so with the overlay absent none of this runs and ``LILICORR_SAMPLING`` is read
+# by nobody. The only proof of PRESENCE is the log line above -- assert it per cell
+# (``harvest_sampling_pair.py --log`` does exactly that).
+_REQUIRE_RAW = os.environ.get("SGLANG_LILICORR_REQUIRE_SAMPLING", "0").strip().lower()
+if _REQUIRE_RAW not in ("0", "1", "off", "on", "false", "true"):
+    raise ValueError(
+        f"SGLANG_LILICORR_REQUIRE_SAMPLING={_REQUIRE_RAW!r} is not a boolean. Refusing "
+        "rather than defaulting: a gate that silently reads as off is not a gate."
+    )
+if _REQUIRE_RAW in ("1", "on", "true") and not SAMPLING_ENABLED:
+    raise RuntimeError(
+        "SGLANG_LILICORR_REQUIRE_SAMPLING is set but LILICORR_SAMPLING is not enabled. "
+        "This process would serve the GREEDY commit under a sampled arm's name. Refusing."
+    )
 
 
 class LiLiCorrConfig(msgspec.Struct, frozen=True):

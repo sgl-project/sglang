@@ -28,7 +28,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.lilicorr import lilicorr_greedy_path
+from sglang.kernels.ops.speculative.lilicorr import (
+    lilicorr_greedy_path,
+    lilicorr_sample_path,
+)
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.lilicorr_components.lilicorr_config import (
     LiLiCorrConfig,
@@ -453,6 +456,51 @@ class LiLiCorrHead(nn.Module):
         log_start, log_pair = self.log_factors(start_scores, pair_scores)
         return lilicorr_greedy_path(
             log_start[:, 0, :], log_pair[:, 0], candidate_tokens
+        )
+
+    def select_with_proposal(
+        self,
+        *,
+        token_embeddings: torch.Tensor,
+        candidate_tokens: torch.Tensor,
+        candidate_log_probs: torch.Tensor,
+        pass_hidden: torch.Tensor,
+        anchor_hidden: torch.Tensor,
+        anchor_valid: torch.Tensor,
+        uniforms: torch.Tensor,
+        temperatures: torch.Tensor,
+        greedy_mask: torch.Tensor,
+        already_projected: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``select``, sampling the commit and returning the proposal it used.
+
+        Same arguments plus the per-row sampling state, and returns ``(tokens [bs,
+        slots], q_rows [bs, slots, topk])``. ``uniforms`` is ``[bs, slots]``, one draw
+        per slot, and ``temperatures`` / ``greedy_mask`` are ``[bs]``.
+
+        This deliberately duplicates ``select``'s four-line prologue instead of
+        sharing it.** ``select`` is the shipped path and this method is an overlay, so
+        leaving that function and its tests byte-untouched is worth ten repeated lines:
+        with ``LILICORR_SAMPLING`` off, the served code is not merely equivalent to the
+        greedy path, it is the same function. Exactly one of the two is ever compiled in
+        a process, since the mode is a module constant resolved at import.
+        """
+        start_scores, pair_scores = self.score(
+            token_embeddings=token_embeddings.unsqueeze(1),
+            candidate_log_probs=candidate_log_probs.unsqueeze(1),
+            pass_hidden=pass_hidden.unsqueeze(1),
+            anchor_hidden=anchor_hidden.unsqueeze(1),
+            anchor_valid=anchor_valid.unsqueeze(1),
+            already_projected=already_projected,
+        )
+        log_start, log_pair = self.log_factors(start_scores, pair_scores)
+        return lilicorr_sample_path(
+            log_start[:, 0, :],
+            log_pair[:, 0],
+            candidate_tokens,
+            uniforms=uniforms,
+            temperatures=temperatures,
+            greedy_mask=greedy_mask,
         )
 
     @torch.no_grad()

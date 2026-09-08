@@ -14,8 +14,10 @@ import torch
 
 from sglang.kernels.ops.speculative.lilicorr import (
     _greedy_path_torch,
+    _sample_path_torch,
     _topk_lse_torch,
     lilicorr_greedy_path,
+    lilicorr_sample_path,
     lilicorr_topk_lse,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -181,3 +183,39 @@ def test_fused_greedy_path_accepts_a_non_unit_stride_last_dim():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _sampled_inputs(bs, slots, k, *, seed=0):
+    torch.manual_seed(seed)
+    return dict(
+        log_start=torch.randn(bs, k, device="cuda"),
+        log_pair=torch.randn(bs, slots - 1, k, k, device="cuda"),
+        candidate_tokens=torch.arange(bs * slots * k, device="cuda").view(bs, slots, k),
+        uniforms=torch.rand(bs, slots, device="cuda"),
+        temperatures=torch.rand(bs, device="cuda") + 0.5,
+        greedy_mask=torch.zeros(bs, dtype=torch.bool, device="cuda"),
+    )
+
+
+def test_sampled_path_commits_the_same_ids_as_the_reference():
+    """The committed ids are integers, so there is no tolerance to hide in: the
+    Triton draw and the torch draw must consume the uniforms identically or the two
+    walk different paths from the same random numbers."""
+    a = _sampled_inputs(6, 5, 8, seed=0)
+    tokens, q = lilicorr_sample_path(**a)
+    ref_tokens, ref_q = _sample_path_torch(**{k: v.cpu() for k, v in a.items()})
+
+    assert torch.equal(tokens.cpu(), ref_tokens)
+    torch.testing.assert_close(q.cpu(), ref_q, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("k", [1, 2, 4, 16])
+def test_sampled_path_matches_the_reference_at_the_lane_group_edges(k):
+    """``k`` is the Triton lane group, so 1 and 16 are the degenerate and full cases
+    where an off-by-one in the cumulative-sum draw would show up."""
+    a = _sampled_inputs(4, 4, k, seed=k)
+    tokens, q = lilicorr_sample_path(**a)
+    ref_tokens, ref_q = _sample_path_torch(**{key: v.cpu() for key, v in a.items()})
+
+    assert torch.equal(tokens.cpu(), ref_tokens)
+    torch.testing.assert_close(q.cpu(), ref_q, atol=1e-6, rtol=1e-6)

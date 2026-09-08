@@ -7,6 +7,8 @@ materializes two more ``[n, V]`` temporaries, and that read is the single larges
 cost in the block. ``lilicorr_greedy_path`` folds the whole left-to-right commit
 into one launch, where the torch form issues roughly three kernels per slot over
 ``[bs, k]`` tensors and is pure launch overhead rather than arithmetic.
+``lilicorr_sample_path`` is that same walk with a sampled commit, emitting the
+per-slot proposal the verify needs to accept it by rejection sampling.
 
 Both dispatch to a value-identical torch implementation off CUDA, which is also
 what makes the head exercisable in a CPU unit test.
@@ -17,6 +19,7 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -335,3 +338,200 @@ def lilicorr_greedy_path(
         BLOCK_K=max(_GREEDY_MAX_K, triton.next_power_of_2(k)),
     )
     return out
+
+
+@triton.jit
+def _sample_path_kernel(
+    ls_ptr,
+    lp_ptr,
+    ids_ptr,
+    u_ptr,
+    temp_ptr,
+    greedy_ptr,
+    out_ptr,
+    q_ptr,
+    ls_sb,
+    lp_sb,
+    lp_ss,
+    lp_sp,
+    ids_sb,
+    ids_ss,
+    u_sb,
+    out_sb,
+    q_sb,
+    q_ss,
+    S: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """``_greedy_path_kernel`` plus the proposal it sampled from.
+
+    Same recurrence and the same loads; the only additions are the per-slot draw and
+    the ``q`` row the verify needs to run rejection sampling. A row with
+    ``greedy_mask`` set takes ``tl.argmax`` on the same fp32 node values as the greedy
+    kernel, so one captured graph serves greedy and sampling batches and the greedy
+    rows walk a bit-identical path.
+
+    ``q`` for a greedy row is the point mass at its pick, not the temperature softmax:
+    that row's token was chosen deterministically, and telling verify anything else
+    would make ``min(1, p/q)`` the wrong acceptance test for it.
+    """
+    b = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_K)
+    mask = offs < K
+    neg = -3.0e38
+    temperature = tl.load(temp_ptr + b)
+    greedy = tl.load(greedy_ptr + b) != 0
+
+    node = tl.load(ls_ptr + b * ls_sb + offs, mask=mask, other=neg)
+    node = tl.where(mask, node, neg)
+    if greedy:
+        cur = tl.argmax(node, axis=0).to(tl.int32)
+        probs = tl.where(offs == cur, 1.0, 0.0)
+    else:
+        scaled = node / temperature
+        expo = tl.exp(scaled - tl.max(scaled, axis=0))
+        probs = expo / tl.sum(expo, axis=0)
+        uniform = tl.load(u_ptr + b * u_sb)
+        cur = tl.sum(tl.where(uniform >= tl.cumsum(probs, axis=0), 1, 0), axis=0)
+        cur = tl.minimum(cur, K - 1).to(tl.int32)
+    tl.store(q_ptr + b * q_sb + offs, probs, mask=mask)
+    tl.store(out_ptr + b * out_sb, tl.load(ids_ptr + b * ids_sb + cur))
+
+    for s in range(1, S):
+        node = tl.load(
+            lp_ptr + b * lp_sb + (s - 1) * lp_ss + cur * lp_sp + offs,
+            mask=mask,
+            other=neg,
+        )
+        node = tl.where(mask, node, neg)
+        if greedy:
+            cur = tl.argmax(node, axis=0).to(tl.int32)
+            probs = tl.where(offs == cur, 1.0, 0.0)
+        else:
+            scaled = node / temperature
+            expo = tl.exp(scaled - tl.max(scaled, axis=0))
+            probs = expo / tl.sum(expo, axis=0)
+            uniform = tl.load(u_ptr + b * u_sb + s)
+            cur = tl.sum(tl.where(uniform >= tl.cumsum(probs, axis=0), 1, 0), axis=0)
+            cur = tl.minimum(cur, K - 1).to(tl.int32)
+        tl.store(q_ptr + b * q_sb + s * q_ss + offs, probs, mask=mask)
+        tl.store(
+            out_ptr + b * out_sb + s,
+            tl.load(ids_ptr + b * ids_sb + s * ids_ss + cur),
+        )
+
+
+def _sample_path_torch(
+    log_start: torch.Tensor,
+    log_pair: torch.Tensor,
+    candidate_tokens: torch.Tensor,
+    uniforms: torch.Tensor,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Value-identical reference for the fused walk, and the fallback off CUDA. The
+    # greedy and sampling picks are computed for every row and selected, rather than
+    # branched on, because the rows of one batch disagree.
+    num_slots = int(candidate_tokens.shape[1])
+    topk = int(log_start.shape[-1])
+    temps = temperatures.view(-1, 1).to(torch.float32)
+    greedy = greedy_mask.view(-1)
+    idx_cols, q_cols = [], []
+    node = log_start.float()
+    for slot in range(num_slots):
+        if slot > 0:
+            node = torch.gather(
+                log_pair[:, slot - 1, :, :].float(),
+                1,
+                idx_cols[-1].view(-1, 1, 1).expand(-1, 1, topk),
+            ).squeeze(1)
+        probs = torch.softmax(node / temps, dim=-1)
+        sampled = (
+            uniforms[:, slot : slot + 1]
+            .ge(probs.cumsum(dim=-1))
+            .sum(dim=-1)
+            .clamp_max(topk - 1)
+        )
+        picked = node.argmax(dim=-1)
+        index = torch.where(greedy, picked, sampled)
+        idx_cols.append(index)
+        q_cols.append(
+            torch.where(
+                greedy.unsqueeze(-1),
+                F.one_hot(index, topk).to(torch.float32),
+                probs,
+            )
+        )
+    path = torch.stack(idx_cols, dim=-1)
+    tokens = torch.gather(candidate_tokens, 2, path.unsqueeze(-1)).squeeze(-1)
+    return tokens, torch.stack(q_cols, dim=1)
+
+
+def lilicorr_sample_path(
+    log_start: torch.Tensor,
+    log_pair: torch.Tensor,
+    candidate_tokens: torch.Tensor,
+    uniforms: torch.Tensor,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``lilicorr_greedy_path`` with a sampled commit, plus the proposal it used.
+
+    Returns ``(tokens [bs, slots], q_rows [bs, slots, k] fp32)``. ``q_rows[b, s]`` is
+    the distribution slot ``s`` was drawn from, over that slot's ``k`` candidates and
+    zero everywhere else; the caller scatters it into the dense ``q`` the verify
+    kernel reads.
+
+    The proposal is ``softmax(psi_s / T)`` where ``psi_s`` is the head's own log-factor
+    row -- the start factor at slot 0 and the transition row out of the committed
+    predecessor after it. There is deliberately no other term: the shipped
+    configuration ablates the unary factor away and carries no log-prob prior, so
+    adding either here would serve a scoring function the head was not trained with.
+
+    Rows with ``greedy_mask`` set take the argmax and report a point mass, so a mixed
+    batch is one launch and the greedy rows are unchanged. As ``T -> 0`` the sampled
+    rows converge on that same argmax, which is what makes this a superset of the
+    greedy path rather than a different drafter.
+    """
+    if not (log_start.is_cuda and log_start.shape[-1] <= _GREEDY_MAX_K):
+        return _sample_path_torch(
+            log_start, log_pair, candidate_tokens, uniforms, temperatures, greedy_mask
+        )
+
+    bsz, num_slots, k = candidate_tokens.shape
+    ls = _as_fp32_unit_last(log_start)
+    lp = _as_fp32_unit_last(log_pair)
+    u = _as_fp32_unit_last(uniforms)
+    temps = temperatures.reshape(-1).to(torch.float32).contiguous()
+    greedy = greedy_mask.reshape(-1).contiguous()
+    ids = candidate_tokens
+    if ids.stride(-1) != 1:
+        ids = ids.contiguous()
+    out = torch.empty(bsz, num_slots, dtype=ids.dtype, device=ls.device)
+    q_rows = torch.empty(bsz, num_slots, k, dtype=torch.float32, device=ls.device)
+    _sample_path_kernel[(bsz,)](
+        ls,
+        lp,
+        ids,
+        u,
+        temps,
+        greedy,
+        out,
+        q_rows,
+        ls.stride(0),
+        lp.stride(0),
+        lp.stride(1),
+        lp.stride(2),
+        ids.stride(0),
+        ids.stride(1),
+        u.stride(0),
+        out.stride(0),
+        q_rows.stride(0),
+        q_rows.stride(1),
+        S=num_slots,
+        K=k,
+        BLOCK_K=max(_GREEDY_MAX_K, triton.next_power_of_2(k)),
+        num_warps=1,
+    )
+    return out, q_rows

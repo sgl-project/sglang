@@ -37,10 +37,16 @@ import torch
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.runtime_context import get_exec
+
+# Shared with the worker's own staging rather than reimplemented: "greedy" must mean
+# the same predicate on both sides or a row could be sampled here and accepted as
+# deterministic there. The worker already imports this module, so it costs nothing.
+from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.lilicorr_components.lilicorr_candidates import (
     lilicorr_candidates,
     resolve_vocab_shard,
 )
+from sglang.srt.speculative.lilicorr_components.lilicorr_config import SAMPLING_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -120,11 +126,33 @@ class LiLiCorrDraftSampler:
         self.anchor_valid = torch.zeros((self.max_bs,), dtype=torch.bool, device=device)
         self.token_table = head.build_token_table(embed_tokens)
 
+        # Sampling state. Written by the worker before each replay (temperatures,
+        # greedy_mask), drawn inside it (uniforms), read after it (q_out,
+        # candidate_out). Sized by max_bs like every other buffer here, and allocated
+        # unconditionally at ~90 KiB total so the greedy and sampled paths differ only
+        # in whether they are consumed, not in the object graph.
+        self.temperatures = torch.ones((self.max_bs,), dtype=torch.float32, device=device)
+        self.greedy_mask = torch.ones((self.max_bs,), dtype=torch.bool, device=device)
+        self.uniforms = torch.empty(
+            (self.max_bs, self.slots), dtype=torch.float32, device=device
+        )
+        self.q_out = torch.empty(
+            (self.max_bs, self.slots, self.topk), dtype=torch.float32, device=device
+        )
+        # The verify needs the ids q is indexed against, and the candidate tensor the
+        # body produces is an intermediate inside the compiled region, so it is copied
+        # to a fixed address rather than referenced.
+        self.candidate_out = torch.empty(
+            (self.max_bs, self.slots, self.topk), dtype=torch.int64, device=device
+        )
+
         self._warmed_bs: set[int] = set()
         self._prewarming = False
         _pin_inductor_to_eager_numerics()
         self._select = torch.compile(
-            head.select,
+            # Exactly one of the two is compiled per process: the mode is a module
+            # constant, so there is no bucket that could end up with the other body.
+            head.select_with_proposal if SAMPLING_ENABLED else head.select,
             # "default", not max-autotune: the head's GEMMs already go to cuBLAS
             # and the gap being closed is pointwise fusion, which default mode
             # does.
@@ -169,6 +197,31 @@ class LiLiCorrDraftSampler:
         if count < self.max_bs:
             self.anchor[count:].zero_()
             self.anchor_valid[count:].fill_(False)
+
+    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
+        """Host-side refresh of the static sampling params; must run before the draft
+        graph replay that consumes them.
+
+        Rows past ``bs`` are left alone deliberately: the graph replays at the padded
+        bucket size and those rows already score a zeroed anchor, so their drafts are
+        discarded by the worker's ``out[: bs * slots]`` slice whatever they sample.
+        """
+        if not SAMPLING_ENABLED:
+            return
+        if sampling_info is None:
+            self.temperatures[:bs].fill_(1.0)
+            self.greedy_mask[:bs].fill_(True)
+            return
+        torch.clamp(
+            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+            min=1e-5,
+            out=self.temperatures[:bs],
+        )
+        self.greedy_mask[:bs].copy_(
+            resolve_greedy_mask(
+                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+            )
+        )
 
     def _raise_if_recompile_limit_hit(self, where: str) -> None:
         if not self._watcher.hits:
@@ -275,7 +328,7 @@ class LiLiCorrDraftSampler:
             if pre_projected
             else self.embed_tokens(candidate_tokens).detach()
         )
-        selected = self._select(
+        common = dict(
             token_embeddings=token_embeddings,
             candidate_tokens=candidate_tokens,
             candidate_log_probs=log_probs.view(bs, self.slots, self.topk),
@@ -284,6 +337,20 @@ class LiLiCorrDraftSampler:
             anchor_valid=self.anchor_valid[:bs],
             already_projected=pre_projected,
         )
+        if SAMPLING_ENABLED:
+            selected, q_rows = self._select(
+                # In-graph philox draw: each replay advances the generator and redraws.
+                # Drawn here rather than inside `_select` because an RNG op in the
+                # compiled body is a graph break; passing the tensor keeps it pure.
+                uniforms=self.uniforms[:bs].uniform_(),
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+                **common,
+            )
+            self.q_out[:bs].copy_(q_rows)
+            self.candidate_out[:bs].copy_(candidate_tokens)
+        else:
+            selected = self._select(**common)
         self.out[:rows].copy_(selected.reshape(-1).to(torch.int64))
 
 
