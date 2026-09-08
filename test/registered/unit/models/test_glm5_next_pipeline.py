@@ -6,11 +6,122 @@ import pytest
 import torch
 from torch import nn
 
-from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration, Glm5NextModel
+from sglang.srt.models.glm5_next import (
+    Glm5NextDecoderLayer,
+    Glm5NextForConditionalGeneration,
+    Glm5NextModel,
+)
 from sglang.srt.models.glm5_next_nextn import Glm5NextForConditionalGenerationNextN
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+@pytest.fixture
+def pp_decoder_factory(monkeypatch):
+    from sglang.srt.layers import communicator as comm
+    from sglang.srt.models import glm5_next as model_module
+
+    class StubLayer(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(model_module, "Glm5NextLinearAttention", StubLayer)
+    monkeypatch.setattr(model_module, "Glm5NextMoE", StubLayer)
+    monkeypatch.setattr(model_module, "Glm5NextMLP", StubLayer)
+    monkeypatch.setattr(model_module, "RMSNorm", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(
+        model_module, "LayerCommunicator", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(
+        model_module, "MHCLayerCommunicator", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(
+        model_module, "get_spec", lambda: SimpleNamespace(speculative_algorithm="EAGLE")
+    )
+    monkeypatch.setattr(model_module, "enable_moe_dense_fully_dp", lambda: False)
+    monkeypatch.setattr(comm, "enable_moe_dense_fully_dp", lambda: False)
+    monkeypatch.setattr(comm, "_generic_prefill_cp_shards_tokens", lambda: False)
+    monkeypatch.setattr(comm, "is_dsa_enable_prefill_cp", lambda: False)
+    monkeypatch.setattr(comm, "is_mla_prefill_cp_enabled", lambda: False)
+    monkeypatch.setattr(
+        comm, "get_moe_a2a_backend", lambda: SimpleNamespace(is_none=lambda: False)
+    )
+
+    def make(layer_id, pp_rank, *, mhc=True, is_nextn=False):
+        monkeypatch.setattr(
+            model_module,
+            "get_pp_group",
+            lambda: SimpleNamespace(rank_in_group=pp_rank, world_size=2),
+        )
+        config = SimpleNamespace(
+            hidden_size=8,
+            rope_theta=10000,
+            rope_scaling=None,
+            max_position_embeddings=128,
+            is_kda_layer=lambda _: True,
+            q_lora_rank=1,
+            n_routed_experts=8,
+            first_k_dense_replace=3,
+            moe_layer_freq=1,
+            num_hidden_layers=45,
+            intermediate_size=16,
+            hidden_act="silu",
+            swiglu_limit=10.0,
+            rms_norm_eps=1e-6,
+            mhc=mhc,
+            hc_mult=4,
+        )
+        return Glm5NextDecoderLayer(config, layer_id, is_nextn=is_nextn)
+
+    return make
+
+
+@pytest.mark.parametrize("partition,boundary", [(None, 22), ("24,21", 24), ("2,43", 2)])
+@pytest.mark.parametrize("mhc", [True, False])
+def test_pp_boundary_layout_preserves_mhc_endpoint(
+    monkeypatch, pp_decoder_factory, partition, boundary, mhc
+):
+    from sglang.srt.layers.communicator import ScatterMode
+
+    if partition is None:
+        monkeypatch.delenv("SGLANG_PP_LAYER_PARTITION", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_PP_LAYER_PARTITION", partition)
+    sender = pp_decoder_factory(boundary - 1, 0, mhc=mhc)
+    receiver = pp_decoder_factory(boundary, 1, mhc=mhc)
+    endpoint = pp_decoder_factory(44, 1, mhc=mhc)
+    assert sender.layer_scatter_modes.layer_output_mode == ScatterMode.TP_ATTN_FULL
+    assert receiver.layer_scatter_modes.layer_input_mode == ScatterMode.TP_ATTN_FULL
+    assert sender.layer_id == boundary - 1 and receiver.layer_id == boundary
+    assert sender.layer_communicator.is_last_layer is (not mhc)
+    assert endpoint.layer_communicator.is_last_layer
+    if mhc:
+        assert not receiver.layer_communicator.is_first_layer
+        assert sender.hc_attn_fn.shape[1] == 4 * sender.hidden_size
+
+
+@pytest.mark.parametrize("layer_id", [0, 45])
+def test_nextn_layout_ignores_target_pp_partition(
+    monkeypatch, pp_decoder_factory, layer_id
+):
+    from sglang.srt.layers.communicator import ScatterMode
+
+    monkeypatch.setenv("SGLANG_PP_LAYER_PARTITION", "24,21")
+    draft = pp_decoder_factory(layer_id, 1, is_nextn=True)
+    assert draft.layer_scatter_modes.layer_input_mode == ScatterMode.TP_ATTN_FULL
+    assert draft.layer_scatter_modes.layer_output_mode == ScatterMode.TP_ATTN_FULL
+    assert draft.layer_communicator.is_last_layer
+
+
+def test_internal_moe_layer_remains_scattered(monkeypatch, pp_decoder_factory):
+    from sglang.srt.layers.communicator import ScatterMode
+
+    monkeypatch.setenv("SGLANG_PP_LAYER_PARTITION", "24,21")
+    internal = pp_decoder_factory(10, 0)
+    assert internal.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+    assert internal.layer_scatter_modes.layer_output_mode == ScatterMode.SCATTERED
+    assert not internal.layer_communicator.is_last_layer
 
 
 def test_glm5_next_pp_embed_and_head_follow_stage_ownership(monkeypatch):

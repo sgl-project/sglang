@@ -17,7 +17,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.distributed.utils import divide
+from sglang.srt.distributed.utils import divide, get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
@@ -650,9 +650,24 @@ class Glm5NextDecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
+        # PP send-allgather requires replicated attention-TP tensors at each
+        # stage boundary. Keep global layer IDs for weights and layer types,
+        # but describe communication within the stage that owns this layer.
+        if is_nextn:
+            communication_layer_id, communication_num_layers = 0, 1
+        else:
+            pp_group = get_pp_group()
+            start_layer, end_layer = get_pp_indices(
+                config.num_hidden_layers,
+                pp_group.rank_in_group,
+                pp_group.world_size,
+            )
+            communication_layer_id = layer_id - start_layer
+            communication_num_layers = end_layer - start_layer
+        is_stage_last_layer = communication_layer_id == communication_num_layers - 1
         self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
+            layer_id=communication_layer_id,
+            num_layers=communication_num_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
@@ -713,7 +728,11 @@ class Glm5NextDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(
+                # mHC contracts its widened stream only at the model endpoint.
+                # Plain layers must stop cross-layer reduction fusion at PP.
                 is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+                if config.mhc
+                else is_stage_last_layer
             ),
             qkv_latent_func=(
                 self.self_attn.prepare_qkv_latent if not self.is_linear_attn else None
