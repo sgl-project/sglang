@@ -181,10 +181,45 @@ def get_param_names_mapping(
     return mapping_fn
 
 
+def _fuse_tensors(
+    target_param_name: str,
+    tensors: list[torch.Tensor],
+    fused_tensor_factory: (
+        Callable[[str, torch.Size, torch.dtype], tuple[torch.Tensor, bool] | None]
+        | None
+    ),
+) -> torch.Tensor:
+    """Concatenate the pieces of one parameter along dim 0.
+
+    The factory, when given, provides the destination (a file mapping that
+    outlives anonymous memory) and says whether an earlier run already filled
+    it -- then the pieces are not even read.
+    """
+    if fused_tensor_factory is None or any(t.device.type != "cpu" for t in tensors):
+        return torch.cat(tensors, dim=0)
+    if (
+        len({tuple(t.shape[1:]) for t in tensors}) != 1
+        or len({t.dtype for t in tensors}) != 1
+    ):
+        return torch.cat(tensors, dim=0)
+    shape = torch.Size([sum(t.shape[0] for t in tensors), *tensors[0].shape[1:]])
+    provided = fused_tensor_factory(target_param_name, shape, tensors[0].dtype)
+    if provided is None:
+        return torch.cat(tensors, dim=0)
+    out, filled = provided
+    if not filled:
+        torch.cat(tensors, dim=0, out=out)
+    return out
+
+
 def hf_to_custom_state_dict(
     hf_param_sd: dict[str, torch.Tensor] | Iterator[tuple[str, torch.Tensor]],
     param_names_mapping: Callable[[str], tuple[str, Any, Any]],
     valid_target_names: set[str] | None = None,
+    fused_tensor_factory: (
+        Callable[[str, torch.Size, torch.dtype], tuple[torch.Tensor, bool] | None]
+        | None
+    ) = None,
     *,
     strict: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[str, Any, Any]]]:
@@ -236,7 +271,9 @@ def hf_to_custom_state_dict(
                     to_merge_params[target_param_name][i]
                     for i in range(num_params_to_merge)
                 ]
-                full_tensor = torch.cat(sorted_tensors, dim=0)
+                full_tensor = _fuse_tensors(
+                    target_param_name, sorted_tensors, fused_tensor_factory
+                )
                 del to_merge_params[target_param_name]
             else:
                 continue
@@ -365,10 +402,18 @@ def keep_checkpoint_mapped(*, weight_bytes: int, component: str) -> bool:
     choice -- its pages are resident, where a mapping's first use pays a fault.
     """
     from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+        host_copies_are_redundant,
         host_copies_would_not_fit,
         host_memory_available_bytes,
     )
 
+    if host_copies_are_redundant():
+        logger.info(
+            "%s stays on its checkpoint mapping: host and device share one "
+            "memory pool, so a copy would hold the same bytes twice.",
+            component,
+        )
+        return True
     if not host_copies_would_not_fit(weight_bytes):
         return False
     logger.info(
@@ -449,6 +494,27 @@ def _list_safetensors_files(
     return filter_duplicate_precision_variant_safetensors(found)
 
 
+def _load_safetensors_file(path: str) -> dict[str, torch.Tensor]:
+    """One safetensors file; a read-only mapping where host copies are redundant.
+
+    safetensors maps for torch through a private *writable* mapping, and on a
+    shared CPU/GPU pool a device copy from such a mapping copies every page it
+    touches into anonymous memory (the driver pins with write intent). A
+    read-only mapping copies at full speed and stays page cache.
+    """
+    from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+        host_copies_are_redundant,
+    )
+
+    if host_copies_are_redundant():
+        from sglang.multimodal_gen.runtime.loader.readonly_safetensors import (
+            load_safetensors_readonly,
+        )
+
+        return load_safetensors_readonly(path)
+    return safetensors_load_file(path)
+
+
 def load_safetensors_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     """Load one safetensors checkpoint, including an indexed sharded set."""
     index_path = _select_safetensors_index_file(model_path, _DEFAULT_SAFETENSORS_INDEX)
@@ -456,7 +522,7 @@ def load_safetensors_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     if index_path is not None:
         state_dict: dict[str, torch.Tensor] = {}
         for path in safetensors_files:
-            state_dict.update(safetensors_load_file(path))
+            state_dict.update(_load_safetensors_file(path))
         return state_dict
 
     if not safetensors_files:
@@ -466,7 +532,7 @@ def load_safetensors_state_dict(model_path: str) -> dict[str, torch.Tensor]:
             f"Found {len(safetensors_files)} safetensors files in {model_path} "
             "and no index to disambiguate them."
         )
-    return safetensors_load_file(safetensors_files[0])
+    return _load_safetensors_file(safetensors_files[0])
 
 
 BYTES_PER_GB = 1024**3

@@ -248,6 +248,17 @@ class TestHostPinBudget:
         budget = HostPinBudget(available_bytes=800 * GIB_BYTES, node_local_ranks=8)
         assert budget.reserve_bytes == 5 * GIB_BYTES
 
+    def test_shared_pool_does_not_pin_on_any_rank(self, monkeypatch):
+        monkeypatch.setattr(
+            host_memory_budget.current_platform,
+            "device_shares_host_memory",
+            lambda: True,
+        )
+        for ranks in (1, 4):
+            budget = HostPinBudget(node_local_ranks=ranks)
+            assert budget.available_bytes == 0
+            assert not budget.request(component_name="dit", weight_bytes=GIB_BYTES)
+
 
 class TestModuleWeightBytes:
     def test_parameters_and_buffers_are_counted(self):
