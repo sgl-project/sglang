@@ -1125,6 +1125,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
+            marlin_intermediate_size=(
+                self._quant_info.w2_qweight.shape[1] * 16
+                if self._lora_runner_backend.is_marlin()
+                else 0
+            ),
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
