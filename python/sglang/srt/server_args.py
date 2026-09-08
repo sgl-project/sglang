@@ -201,8 +201,9 @@ class ServerArgs:
        A few arguments cannot use the annotation style and must be
        registered manually in ``add_cli_args``:
 
-       - **Deprecated flags** that redirect to another field via
-         ``DeprecatedStoreTrueAction``.
+       - **Deprecated flags** that redirect to another field via one of the
+         ``Deprecated*Action`` classes in ``arg_groups/argparse_actions.py``
+         (that module's header says which shape fits which migration).
        - **Dynamic choices** computed at runtime (e.g. ``reasoning_parser``
          whose choices come from a plugin registry).
        - The ``--config`` meta-argument (not a dataclass field).
