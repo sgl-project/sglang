@@ -127,6 +127,18 @@ class TestDcpTopkRemap(CustomTestCase):
 
                     for r, row in enumerate(topk):
                         for pos in row.tolist():
+                            if pos < 0:
+                                # Padding is owned by nobody, so it has no
+                                # expected rank -- asserting `pos % dcp_size`
+                                # here would demand that -1 belong to the top
+                                # rank, which is the exact confusion the remap's
+                                # `>= 0` guard exists to prevent. Padding is not
+                                # merely skipped, though: a pad that slipped
+                                # through the guard would sort into the owned
+                                # group and displace a real index, which
+                                # test_padding_never_becomes_a_real_index and
+                                # test_pads_are_a_suffix_of_every_row both catch.
+                                continue
                             self.assertEqual(
                                 claimed.get((r, int(pos))),
                                 int(pos) % dcp_size,
