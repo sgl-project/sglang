@@ -102,9 +102,7 @@ class SpecProfilingSession:
                 1, max(2, vocab_size), size=self._seq_len, dtype=np.int64
             )
             req = Req(
-                rid=(
-                    f"spec_profile_s{self._num_steps}_" f"b{self._batch_size}_{index}"
-                ),
+                rid=(f"spec_profile_s{self._num_steps}_b{self._batch_size}_{index}"),
                 origin_input_text="",
                 origin_input_ids=array("q", token_ids.tolist()),
                 sampling_params=sampling_params,
