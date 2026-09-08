@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import _transfer_start_layer
@@ -139,6 +140,44 @@ class TestHybridSendUsesLayerIdPairing(CustomTestCase):
     def test_f5_of_n12(self):
         ids = _full_attention_ids(num_layers=48, interval=4)
         self._run_case(model_full_ids=ids, stage_full_ids=ids[:5], start_offset=0)
+
+
+class _RecordingAscendManager:
+    def __init__(self):
+        self.is_hybrid_mla_backend = True
+        self.pp_size = 2
+        self.kv_args = SimpleNamespace(
+            kv_data_ptrs=[101, 102, 103, 104],
+            kv_item_lens=[11, 12, 13, 14],
+            kv_layer_ids=[31, 35, 31, 35],
+        )
+        self.generic_call = None
+
+    def _validate_envelope_kv_layout(self, *args):
+        pass
+
+    def _send_kvcache_generic(self, **kwargs):
+        self.generic_call = kwargs
+        return 7
+
+
+class TestAscendHybridPpDispatch(CustomTestCase):
+    def test_hybrid_pp_uses_layer_id_pairing_path(self):
+        manager = _RecordingAscendManager()
+        dst_layer_ids = [3, 7, 31, 35, 3, 7, 31, 35]
+        rc = AscendKVManager.send_kvcache(
+            manager,
+            mooncake_session_id="session",
+            prefill_kv_indices=np.array([1], dtype=np.int32),
+            dst_kv_ptrs=list(range(8)),
+            dst_kv_indices=np.array([2], dtype=np.int32),
+            executor=None,
+            dst_layer_ids=dst_layer_ids,
+        )
+
+        self.assertEqual(rc, 7)
+        self.assertEqual(manager.generic_call["src_layer_ids"], [31, 35, 31, 35])
+        self.assertEqual(manager.generic_call["dst_layer_ids"], dst_layer_ids)
 
 
 class TestGetMhaKvPtrsWithPp(CustomTestCase):

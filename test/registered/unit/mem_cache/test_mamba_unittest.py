@@ -1,5 +1,7 @@
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -74,6 +76,28 @@ class TestMamba(unittest.TestCase):
         self.assertIn(
             "layer_id=1 not in full attention layers:", str(context.exception)
         )
+
+    def test_hybrid_linear_kv_pool_npu_layer_ids_match_buffer_groups(self):
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
+        pool.use_mla = True
+
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", False):
+            self.assertEqual(pool.get_kv_layer_ids(), [3, 7])
+
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
+            for group_count in (2, 3):
+                with self.subTest(group_count=group_count):
+                    pool.full_kv_pool = SimpleNamespace(
+                        get_contiguous_buf_infos=lambda: (
+                            list(range(2 * group_count)),
+                            [],
+                            [],
+                        )
+                    )
+                    self.assertEqual(
+                        pool.get_kv_layer_ids(), [3, 7] * group_count
+                    )
 
     def test_mamba_pool(self):
         max_num_reqs = 10
