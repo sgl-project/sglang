@@ -747,9 +747,9 @@ TWO_GPU_CASES = [
                 "--performance-mode",
                 "memory",
                 "--layerwise-offload-components",
-                "dit,text_encoder",
-                "--component-residency",
-                "vae=resident",
+                "dit,text_encoder,vae",
+                "--layerwise-resident-layers",
+                "video_vae=36",
                 "--dit-offload-prefetch-size",
                 "1",
                 "--dit-layerwise-resident-layers",
@@ -787,6 +787,7 @@ TWO_GPU_CASES = [
             },
         ),
         run_perf_check=True,
+        perf_repeat_requests=2,
         run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
@@ -853,7 +854,7 @@ TWO_GPU_CASES = [
                 "seed": 42,
             },
         ),
-        run_perf_check=False,
+        perf_repeat_requests=2,
         run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
@@ -1046,6 +1047,31 @@ TWO_GPU_CASES = [
             ],
         ),
         DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
+        run_component_accuracy_check=False,
+    ),
+    # LTX-2.5's diffusion decoder
+    DiffusionTestCase(
+        "ltx_2_5_diffusion_decoder_2gpus",
+        DiffusionServerArgs(
+            model_path="Lightricks/LTX-2.5-Diffusers",
+            modality="video",
+            ulysses_degree=2,
+            # Offload both the DiT and text encoder between stages to leave
+            # decoder headroom on 80 GB GPUs.
+            extras=[
+                "--load-diffusion-decoder",
+                "--component-residency "
+                "transformer=component-offload,text_encoder=component-offload",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="768x448",
+            num_frames=49,
+            expect_audio_output=True,
+            extras={"seed": 42, "use_diffusion_decoder": True},
+        ),
+        run_perf_check=False,
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
