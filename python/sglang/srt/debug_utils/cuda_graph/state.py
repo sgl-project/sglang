@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 _TAP_IN_GRAPH = "t1"
 _TAP_COMPILED = "t3"
+_TAP_EAGER = "eager"
 
 
 def _stream_is_capturing() -> bool:
@@ -226,6 +227,17 @@ class _CudaGraphDumpState:
         if not self.enabled:
             return
         self._record(self._registry.key_for_tag(tag), tensor, _TAP_COMPILED)
+
+    def eager_tags(self) -> dict[str, Any]:
+        """Tags for a frame `tap()` declined, so the eager channel is labelled.
+
+        Empty when the feature is off, so a default run's frames are exactly
+        what they always were.  Enabled, it is what makes the coverage claim
+        checkable: the acceptance gate asserts that the `t1`/`t3` frames plus
+        the `eager` frames equal the pure-eager module set, and "no tap tag"
+        would be indistinguishable from a baseline run's frames.
+        """
+        return {"tap": _TAP_EAGER} if self.enabled else {}
 
     # -------------------------------- scopes --------------------------------
 

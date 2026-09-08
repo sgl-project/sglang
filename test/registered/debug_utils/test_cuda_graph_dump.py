@@ -337,6 +337,18 @@ class TestTapLadder:
         assert state.registry.num_buffers == 0
 
 
+class TestEagerTags:
+    def test_disabled_adds_nothing(self):
+        # A default run's frames must be byte-for-byte what they always were.
+        assert _state(enable=False).eager_tags() == {}
+
+    def test_enabled_labels_the_eager_channel(self):
+        # Without this the acceptance gate cannot tell a declined frame from a
+        # pure-eager baseline frame, and "t1|t3 plus eager equals eager-only"
+        # is unverifiable.
+        assert _state().eager_tags() == {"tap": "eager"}
+
+
 class TestOccurrenceCounter:
     def test_repeated_names_get_distinct_occurrences(self):
         state = _state()

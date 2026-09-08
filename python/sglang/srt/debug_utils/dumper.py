@@ -770,13 +770,13 @@ class _NonIntrusiveDumper:
             if effective_key in self._core_fields:
                 if cuda_graph_dump.tap(effective_key, item):
                     continue
-                self._dumper.dump(effective_key, item)
+                self._dumper.dump(effective_key, item, **cuda_graph_dump.eager_tags())
             elif self._mode == "all":
                 parts = [p for p in (module_name, sub_name, key) if p]
                 name = self._NAME_PREFIX + ".".join(parts)
                 if cuda_graph_dump.tap(name, item):
                     continue
-                self._dumper.dump(name, item)
+                self._dumper.dump(name, item, **cuda_graph_dump.eager_tags())
 
     @staticmethod
     def _convert_value(value, *, skip_forward_batch: bool = False) -> dict[str, Any]:
