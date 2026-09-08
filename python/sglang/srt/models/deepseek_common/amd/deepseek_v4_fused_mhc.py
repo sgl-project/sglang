@@ -7,11 +7,13 @@ import triton
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 _FUSED_HC_POST_PRE_M_THRESHOLD = 64
 _FUSED_HC_POST_PRE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
@@ -26,6 +28,11 @@ _AITER_MHC_IMPORT_WARNED = False
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
+    # gfx1250: TileLang doesn't compile; the fused cross-layer path routes
+    # entirely through the Triton mhc_post_pre (try_fused_hc_post_pre).
+    # Gate only on SGLANG_OPT_FUSE_MHC_POST_PRE; TileLang switches don't apply.
+    if _is_gfx1250_supported:
+        return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
     # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
     # not read that flag and dispatches independently for both small and large
     # token batches, so the standalone pre flag must not veto the fused opt-in.
@@ -144,9 +151,11 @@ def try_fused_hc_post_pre(
 
     if (
         _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
-        or not is_gfx95_supported
+        or not (is_gfx95_supported or _is_gfx1250_supported)
         or x.shape[0] == 0
-        or x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD
+        # gfx1250 runs the fused cross-layer path for ALL sizes (prefill+decode);
+        # there is no TileLang fallback available, so don't cap by M there.
+        or (x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD and not _is_gfx1250_supported)
         or x.dim() != 2
         or residual.dim() != 3
     ):

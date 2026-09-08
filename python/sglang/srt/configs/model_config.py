@@ -66,6 +66,14 @@ def _quant_config_to_dict(quant_config):
     return quant_config
 
 
+def unwrap_modelopt_quantization_config(quant_config: dict) -> dict:
+    quantization = quant_config.get("quantization", quant_config)
+    if not isinstance(quantization, dict):
+        return {}
+    nested = quantization.get("quantization")
+    return nested if isinstance(nested, dict) else quantization
+
+
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     layout = getattr(hf_config, "attention_projection_layout", None)
     if layout is None:
@@ -130,13 +138,25 @@ def is_deepseek_dsa(config) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "GlmMoeDsaForCausalLMNextN",
+            "Glm5NextForConditionalGenerationNextN",
+            "Glm5NextForConditionalGeneration",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
             "XingChen4ForCausalLM",
             "Dots3NoteForCausalLM",
             "Dots3NoteForCausalLMNextN",
+            "HYV4ForCausalLM",
+            "HYV4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
+    )
+
+
+def is_glm_moe_dsa(config) -> bool:
+    """True for GLM-5.2, both the main arch and the NextN draft head."""
+    return _hf_arch(config) in (
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
     )
 
 
@@ -145,6 +165,31 @@ def is_kimi_k3(config) -> bool:
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
+
+
+def uses_kda_attention(config) -> bool:
+    configs = [config]
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        configs.append(get_text_config())
+    else:
+        text_config = _hf_attr(config, "text_config")
+        if text_config is not None:
+            configs.append(text_config)
+    for config in configs:
+        linear_attn_config = _hf_attr(config, "linear_attn_config")
+        if isinstance(linear_attn_config, dict) and linear_attn_config.get(
+            "kda_layers"
+        ):
+            return True
+        layer_types = _hf_attr(config, "layer_types") or []
+        if (
+            "linear_attention" in layer_types
+            and _hf_attr(config, "linear_num_heads") is not None
+            and _hf_attr(config, "linear_head_dim") is not None
+        ):
+            return True
+    return False
 
 
 def is_dspark_draft(config) -> bool:
@@ -166,6 +211,17 @@ def is_deepseek_v4(config) -> bool:
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
     )
+
+
+def resolve_spec_hidden_size(
+    hf_config, hidden_size: int, hc_mult: int
+) -> tuple[int, Optional[int]]:
+    # Only DSV4 carries the hc-flattened stream across the target→draft
+    # boundary; other hc models (hy_v4) collapse to hidden_size first.
+    if hc_mult <= 1 or not is_deepseek_v4(hf_config):
+        return hidden_size, None
+    hc_hidden_size = hidden_size * hc_mult
+    return hc_hidden_size, hc_hidden_size
 
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
@@ -227,6 +283,12 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
 
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        return (
+            0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
+        )
+
     # LongCat computes fresh top-k indices every cli_factor layers.
     cli_factor = getattr(config, "cli_factor", 1)
     if cli_factor is None:
@@ -257,6 +319,21 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads
+
+
+def get_dsa_index_kpool(config: PretrainedConfig) -> int:
+    return getattr(config, "index_kpool", 1)
+
+
+def get_dsa_mtp_topk_width(config: PretrainedConfig) -> int:
+    """MTP seeds include index_topk pooled tokens plus up to index_kpool - 1 tail tokens."""
+    index_kpool = get_dsa_index_kpool(config)
+    assert index_kpool >= 1, f"index_kpool must be positive, got {index_kpool}"
+    return config.index_topk + index_kpool - 1
+
+
+def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:
+    return getattr(config, "index_kpool_compress", False)
 
 
 REQUANTIZATION_METHODS = ["quark_mxfp4"]
@@ -354,7 +431,13 @@ class ModelConfig:
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
         )
-        self.is_lm_only = getattr(self.hf_config, "language_model_only", False)
+        # Text-only serving comes from either the checkpoint's own declaration
+        # or the --language-model-only flag; every capability flag below
+        # (is_multimodal, is_*_understandable_model) must see both sources,
+        # since /model_info advertises them and drives media warmup requests.
+        self.is_lm_only = language_model_only or getattr(
+            self.hf_config, "language_model_only", False
+        )
         self.model_is_mrope = (
             not self.is_lm_only
             and rope_scaling is not None
@@ -577,6 +660,7 @@ class ModelConfig:
         self.hf_eos_token_id = self._get_hf_eos_token_id()
         # Set by scheduler when reasoning_parser is enabled
         self.think_end_ids: Optional[List[int]] = None
+        self.request_selectable_think_end_id_sequences: Optional[List[List[int]]] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -588,7 +672,7 @@ class ModelConfig:
         # Checkpoints declare this one themselves (hf_transformers/processor.py),
         # so the flag may only turn it on: writing the default back would build a
         # vision tower with no weights to fill.
-        self.hf_config.language_model_only = language_model_only or self.is_lm_only
+        self.hf_config.language_model_only = self.is_lm_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
@@ -607,7 +691,6 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
-
         cfg = resolving_view(server_args)
         quantization = (
             cfg.speculative_draft_model_quantization
@@ -704,6 +787,15 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "Glm4MoeLiteForCausalLMNextN"
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        ):
+            self.hf_config.architectures[0] = "Glm5NextForConditionalGenerationNextN"
+            self.hf_text_config.architectures = list(self.hf_config.architectures)
+            self.hf_text_config.num_nextn_predict_layers = 1
+            self.hf_text_config.linear_attn_config = None
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "GlmOcrForConditionalGeneration",
         ]:
@@ -794,6 +886,10 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "HYV4ForCausalLM":
+            self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
+
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (
@@ -865,7 +961,7 @@ class ModelConfig:
             return getattr(
                 self.hf_text_config, "add_swa_attention_sink_bias", False
             ) or getattr(self.hf_text_config, "add_full_attention_sink_bias", False)
-        return False
+        return bool(getattr(self.hf_text_config, "learnable_sink", False))
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
@@ -937,8 +1033,12 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLMNextN" in self.hf_config.architectures
+            or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
+            or "Glm5NextForConditionalGenerationNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
+            or "HYV4ForCausalLM" in self.hf_config.architectures
+            or "HYV4ForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLMNextN" in self.hf_config.architectures
@@ -970,7 +1070,10 @@ class ModelConfig:
                 else None
             )
             # In transformers v5, rope_scaling is just rope_parameters.
-            self._init_mla_scaling(self.hf_text_config.rope_scaling)
+            rope_scaling = getattr(
+                self.hf_text_config, "rope_parameters", None
+            ) or getattr(self.hf_text_config, "rope_scaling", None)
+            self._init_mla_scaling(rope_scaling)
         elif (
             "DeepseekV4ForCausalLM" in self.hf_config.architectures
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
@@ -1050,7 +1153,10 @@ class ModelConfig:
             self.v_head_dim = self.hf_config.v_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-        elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
+        elif (
+            "SarvamMLAForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
+        ):
             self.head_dim = (
                 self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
             )
@@ -1103,32 +1209,29 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
-        # spec_hidden_size is the width of the hidden states fed to the Eagle
-        # draft model (== logits_output.hidden_states width). mHC models feed
-        # either the mHC-flattened residual (n * hidden_size) or the contracted
-        # hidden_size to the draft, depending on their architecture:
-        #  * DeepSeek-V4 exposes pre_hc_head (n * hidden_size, via
-        #    hidden_states_before_norm) to its draft  -> expanded.
-        #  * Models that merge the mHC streams back to hidden_size before the
-        #    draft (e.g. via an output_contract) declare
-        #    ``hc_contract_for_draft=True`` -> contracted (hidden_size).
-        # The default (False) preserves the DeepSeek-V4 behaviour; contracting
-        # models opt in via their config. The check stays model-agnostic: it
-        # relies on the declaring flag, not on any specific model_type, so it
-        # also works for the draft config whose architectures are remapped to
-        # DeepseekV3ForCausalLMNextN while model_type is unchanged.
-        contract_for_draft = getattr(
-            self.hf_text_config, "hc_contract_for_draft", False
+        is_glm5_next = getattr(self.hf_config, "model_type", None) == "glm5_next" or (
+            getattr(self.hf_text_config, "model_type", None) == "glm5_next_text"
         )
-        if hc_mult > 1 and not contract_for_draft:
-            self.spec_hidden_size = self.hidden_size * hc_mult
-        else:
+        if is_glm5_next and not getattr(self.hf_text_config, "mhc", False):
+            hc_mult = 1
+        if is_glm5_next:
+            # mHC-flattened hidden size; None when not running an mHC model.
+            self.hc_hidden_size = self.hidden_size * hc_mult if hc_mult > 1 else None
             self.spec_hidden_size = self.hidden_size
-        # mHC-flattened hidden size (n * hidden_size); None when not running an
-        # mHC model (e.g. non-DeepSeek-V4 configs without ``hc_mult``). This is
-        # the width of the mHC-internal residual stream (used to size the main
-        # model's activation buffers), distinct from spec_hidden_size.
-        self.hc_hidden_size = self.hidden_size * hc_mult if hc_mult > 1 else None
+        else:
+            self.spec_hidden_size, self.hc_hidden_size = resolve_spec_hidden_size(
+                self.hf_config, self.hidden_size, hc_mult
+            )
+            # Models that declare ``hc_contract_for_draft`` (e.g. XingChen4)
+            # merge the mHC streams back to hidden_size before the Eagle draft
+            # (so spec_hidden_size stays contracted, as resolved above) but
+            # still carry an mHC-internal residual stream (n * hidden_size)
+            # used to size the main model's activation buffers. Restore that
+            # width here; resolve_spec_hidden_size only sizes it for DSV4.
+            if hc_mult > 1 and getattr(
+                self.hf_text_config, "hc_contract_for_draft", False
+            ):
+                self.hc_hidden_size = self.hidden_size * hc_mult
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
@@ -1136,6 +1239,9 @@ class ModelConfig:
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
+        if "NanbeigeForCausalLM" in self.hf_config.architectures:
+            num_loops = getattr(self.hf_text_config, "num_loops", 1)
+            self.num_attention_layers = int(self.num_hidden_layers * int(num_loops))
         if "WhisperForConditionalGeneration" in self.hf_config.architectures:
             # Whisper has unique layer ID scheme:
             # - Encoder self-attention: 0 to encoder_layers-1 (no KV cache)
@@ -1380,8 +1486,20 @@ class ModelConfig:
         return quant_cfg
 
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
-        """Parse ModelOpt quantization config and return the appropriate quant_method."""
-        json_quant_configs = quant_config_dict["quantization"]
+        """Parse ModelOpt quantization config and return the appropriate quant_method.
+
+        Supports both nested LLM ``hf_quant_config.json``::
+
+            {"quantization": {"quant_algo": "FP8", ...}}
+
+        and flat formats (``config.json`` ``quantization_config``, or diffusion /
+        unified ModelOpt exports such as Cosmos3)::
+
+            {"quant_algo": "FP8", "quant_method": "modelopt", ...}
+        """
+        json_quant_configs = unwrap_modelopt_quantization_config(quant_config_dict)
+        if not json_quant_configs:
+            return None
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
@@ -1621,7 +1739,6 @@ class ModelConfig:
             # of an NVFP4/mixed checkpoint) must not be overridden back to the
             # source format
             if self.quantization not in REQUANTIZATION_METHODS:
-
                 # Detect which checkpoint is it
                 if not preserve_online_draft_quantization:
                     for _, method in QUANTIZATION_METHODS.items():
@@ -1914,6 +2031,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 multimodal_model_archs = [
     "CLIPModel",
     "Cohere2VisionForConditionalGeneration",
+    "Cosmos3EdgeForConditionalGeneration",
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -1923,6 +2041,7 @@ multimodal_model_archs = [
     "Gemma4UnifiedForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "Glm5NextForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "GlmImageForConditionalGeneration",
@@ -1990,6 +2109,7 @@ piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLMNextN",
     "DeepseekV4ForCausalLMDSpark",
     "Qwen3NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
 ]
@@ -1999,7 +2119,6 @@ piecewise_cuda_graph_disabled_model_archs = [
 # all multimodal models; archs here opt back in because their LM prefill captures
 # cleanly (vision encoder runs eagerly outside the graph via general_mm_embed_routine).
 multimodal_piecewise_cuda_graph_supported_model_archs = [
-    "Cohere2VisionForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -2012,6 +2131,7 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 # generic multimodal rule disabled prefill CG for them despite the LM prefill
 # capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
+    "Cohere2VisionForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
@@ -2144,7 +2264,6 @@ def is_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
 ):
-
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
         "DeepseekV4ForCausalLM",
@@ -2270,12 +2389,14 @@ def get_hybrid_layer_ids(
     elif "InklingForConditionalGeneration" in model_architectures:
         local_layer_ids = hf_text_config.local_layer_ids
         local_layer_id_set = set(local_layer_ids)
-        assert len(local_layer_id_set) == len(
-            local_layer_ids
-        ), f"Inkling local_layer_ids must be unique: {local_layer_ids}"
+        assert len(local_layer_id_set) == len(local_layer_ids), (
+            f"Inkling local_layer_ids must be unique: {local_layer_ids}"
+        )
         assert all(
             0 <= layer_id < num_hidden_layers for layer_id in local_layer_id_set
-        ), f"Inkling local_layer_ids must be in [0, {num_hidden_layers}): {local_layer_ids}"
+        ), (
+            f"Inkling local_layer_ids must be in [0, {num_hidden_layers}): {local_layer_ids}"
+        )
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if i in local_layer_id_set
         ]
