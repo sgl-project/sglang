@@ -121,7 +121,6 @@ def _receiver(tp_size: int = 1) -> SchedulerRequestReceiver:
         max_recv_per_poll=-1,
         stream_output=lambda *args, **kwargs: None,
         get_last_batch=lambda: None,
-        poll_timeout_aborts=lambda: [],
     )
 
 
