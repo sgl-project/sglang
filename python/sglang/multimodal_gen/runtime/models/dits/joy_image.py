@@ -70,6 +70,16 @@ def fused_add_gate(
     return torch.addcmul(residual, x, gate.unsqueeze(1))
 
 
+def _joy_complex_freqs(freqs_cis: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Complex-valued RoPE table from a hoisted cat([cos, sin], dim=-1)
+    cos_sin_cache tensor, split back in half.
+    """
+    if freqs_cis is None:
+        return None
+    cos, sin = freqs_cis.chunk(2, dim=-1)
+    return torch.complex(cos.to(torch.float32), sin.to(torch.float32))
+
+
 class ModulateWan(nn.Module):
     """Modulation layer for WanX."""
 
@@ -220,6 +230,8 @@ class MMDoubleStreamBlock(nn.Module):
         vec: torch.Tensor,
         vis_freqs_cis: Optional[torch.Tensor] = None,
         txt_freqs_cis: Optional[torch.Tensor] = None,
+        vis_complex_freqs: Optional[torch.Tensor] = None,
+        txt_complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_suffix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through multimodal double stream block."""
@@ -261,14 +273,6 @@ class MMDoubleStreamBlock(nn.Module):
             )
         img_q = img_q.contiguous()
         img_k = img_k.contiguous()
-        # is_neox=False here, so this can hit the NPU _apply_rotary_emb_complex
-        # fast path in RotaryEmbedding instead of the interleaved fallback
-        # (no fused NPU kernel for it). vis_freqs_cis is already validated
-        # 2D above; split back the halves cat([cos, sin], dim=-1) built it from.
-        vis_cos, vis_sin = vis_freqs_cis.chunk(2, dim=-1)
-        vis_complex_freqs = torch.complex(
-            vis_cos.to(torch.float32), vis_sin.to(torch.float32)
-        )
         img_q, img_k = apply_qk_norm_with_optional_rope(
             q=img_q,
             k=img_k,
@@ -297,12 +301,6 @@ class MMDoubleStreamBlock(nn.Module):
             raise ValueError("txt_freqs_cis must be a 2D cos_sin_cache tensor")
         txt_q = txt_q.contiguous()
         txt_k = txt_k.contiguous()
-        txt_complex_freqs = None
-        if txt_freqs_cis is not None:
-            txt_cos, txt_sin = txt_freqs_cis.chunk(2, dim=-1)
-            txt_complex_freqs = torch.complex(
-                txt_cos.to(torch.float32), txt_sin.to(torch.float32)
-            )
         txt_q, txt_k = apply_qk_norm_with_optional_rope(
             q=txt_q,
             k=txt_k,
@@ -571,6 +569,9 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         txt_suffix_len = txt.shape[1] if sequence_shard_enabled else 0
 
+        vis_complex_freqs = _joy_complex_freqs(vis_freqs_cis)
+        txt_complex_freqs = _joy_complex_freqs(txt_freqs_cis)
+
         # Pass through DiT blocks
         for block in self.double_blocks:
             img, txt = block(
@@ -579,6 +580,8 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 vec,
                 vis_freqs_cis,
                 txt_freqs_cis,
+                vis_complex_freqs=vis_complex_freqs,
+                txt_complex_freqs=txt_complex_freqs,
                 num_replicated_suffix=txt_suffix_len,
             )
 
