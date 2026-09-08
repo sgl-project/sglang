@@ -243,6 +243,7 @@ class TestResets(CustomTestCase):
         resets = []
         scheduler = SimpleNamespace(
             disable_radix_cache=False,
+            head_prefix_lock=None,
             tree_cache=SimpleNamespace(reset=lambda: resets.append("tree")),
             req_to_token_pool=storage.requests,
             token_to_kv_pool_allocator=storage.allocator,
