@@ -705,7 +705,7 @@ def _get_custom_mem_pool(device: str):
         logger.info(
             "Staging buffer using cudaMalloc (no custom mem pool). "
             "This works for all GPU architectures. "
-            "For NVLink/MNNVL transport, set SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
+            "For NVLink/MNNVL transport, set SGLANG_CUSTOM_MEM_POOL."
         )
     return custom_mem_pool, pool_type
 

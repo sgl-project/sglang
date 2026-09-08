@@ -365,7 +365,7 @@ sgl-eval run mmmu_pro \\
           env: [
             "NCCL_MNNVL_ENABLE=1",
             "NCCL_CUMEM_ENABLE=1",
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "SGLANG_CUSTOM_MEM_POOL=True",
             "MC_FORCE_MNNVL=1",
           ],
           envWhen: { hw: ["gb200", "gb300"] } },
