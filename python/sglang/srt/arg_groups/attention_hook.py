@@ -27,7 +27,6 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
     run_post_process_pass,
-    use_mla_backend,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -161,7 +160,7 @@ def handle_attention_backend_compatibility(server_args: Any):
         if (
             prefill_backend == "trtllm_mha"
             and not get_platform().is_sm100
-            and (cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1)
+            and cfg.attn_cp_size > 1
         ):
             raise ValueError(
                 "Prefill context parallelism with the TRTLLM MHA prefill backend "
@@ -202,12 +201,7 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
-    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
-    if use_mla_backend(server_args) and prefill_backend == "intel_xpu":
-        raise ValueError(
-            "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
-        )
-
+    # XPU platforms backends
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
 
     # Dual chunk flash attention backend
@@ -371,9 +365,9 @@ def handle_linear_attn_backend(server_args: Any):
             )
 
     # ReplaySSM spec-verify (Part B of #28511): linear-chain target verify via
-    # fold-every-commit -- the verify stores each draft step's raw inputs into
-    # the per-slot (rawv, rawk, g, beta) window and the commit replays the
-    # accepted prefix into the fp32 checkpoint. The intra-window interaction
+    # compact cached replay. Verify stores normalized keys, update vectors,
+    # and fp32 log-decays; accepted BF16 windows are materialized with
+    # compensated hi/lo accumulation. The intra-window interaction
     # uses a strictly-lower causal mask, so it is valid ONLY for a linear
     # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP);
     # EAGLE tree verify (topk > 1) must fall back to the recurrent verify.
@@ -439,8 +433,8 @@ def handle_linear_attn_backend(server_args: Any):
         if cfg.mamba_ssm_dtype is None:
             logger.info(
                 "--enable-linear-replayssm-spec: setting --mamba-ssm-dtype "
-                "float32 (the closed-loop exact fold keeps the SSM checkpoint "
-                "bit-identical to the recurrent baseline)."
+                "float32 (cached replay uses compensated checkpoint "
+                "projection and materialization)."
             )
             declare_resolution(
                 server_args,
@@ -450,10 +444,8 @@ def handle_linear_attn_backend(server_args: Any):
         elif cfg.mamba_ssm_dtype != "float32":
             logger.warning(
                 "--enable-linear-replayssm-spec with --mamba-ssm-dtype=%s: the "
-                "closed-loop fold re-quantizes the committed state each "
-                "commit/flush (fp32 keeps it bit-exact to the fp32 recurrent "
-                "baseline), so it may drift over long sequences. Validate "
-                "accuracy for your model.",
+                "compact checkpoint is materialized after each accepted "
+                "verify window; validate long-sequence accuracy and throughput.",
                 cfg.mamba_ssm_dtype,
             )
 
@@ -566,6 +558,7 @@ def handle_deterministic_inference(server_args: Any):
                     "PixtralForConditionalGeneration",
                     "GlmMoeDsaForCausalLM",
                     "Glm4MoeLiteForCausalLM",
+                    "Glm5NextForConditionalGeneration",
                 ]
             except Exception:
                 pass

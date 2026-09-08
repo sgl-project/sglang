@@ -14,10 +14,9 @@
 """FB-shared slot registry for the CUDA graph forward paths.
 
 ``CudaGraphBufferRegistry`` is the ForwardBatch → graph-resident buffer mirror
-used by capture / replay. It replaces the per-runner ``DecodeInputBuffers`` /
-``PrefillInputBuffers`` dataclasses and their hand-written
-``populate_from_forward_batch`` methods with a single ``GraphSlot``-driven
-registry.
+used by capture / replay. It replaces the hand-written per-runner buffer
+population logic with a single ``GraphSlot``-driven registry while adopting
+the storage allocated by ``DecodeInputBuffers`` / ``PrefillInputBuffers``.
 
 Backend-private buffers (kernel workspaces, derived page tables, etc.) stay
 on ``AttentionBackend.cuda_graph_*`` — the registry only owns FB-shared
@@ -522,6 +521,8 @@ def build_decode_registry(
     require_gathered_buffer: bool = False,
     enable_prefill_cp: bool = False,
     require_mlp_tp_gather: bool = False,
+    # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
+    attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
     dp_size: int = 1,
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
@@ -648,15 +649,28 @@ def build_decode_registry(
         )
 
         def _num_token_non_padded_post_fill(buf, fb, ctx):
-            # Gathered (DP) path overwrites the plain FB copy with this rank's
-            # local count; the non-gathered path keeps the copied value.
-            if require_gathered_buffer and not enable_prefill_cp:
-                buf.copy_(
-                    compute_local_num_token_non_padded(
-                        global_num_token_non_padded=fb.num_token_non_padded,
-                        num_tokens_per_dp=ctx.padded_num_tokens,
-                    )
+            # init_new batches localize from the invariant GLOBAL scalar (a
+            # replicated / CP forward keeps the full count; sharded=False is a
+            # passthrough). The dense SBD draft and TBO sub-batches bypass
+            # init_new -- they leave the GLOBAL None and set the replicated LOCAL
+            # count directly, so carry that through.
+            if fb.global_num_token_non_padded is None:
+                # DFLASH's dense draft can omit both optional counts, even
+                # when EP on the target enables this slot. Preserve the
+                # registry's skip-missing-field behavior for that path.
+                if fb.num_token_non_padded is not None:
+                    buf.copy_(fb.num_token_non_padded)
+                return
+            sharded = not enable_prefill_cp and attn_tp_sharded_fn(
+                ctx.padded_num_tokens
+            )
+            buf.copy_(
+                compute_local_num_token_non_padded(
+                    global_num_token_non_padded=fb.global_num_token_non_padded,
+                    num_tokens_per_dp=ctx.padded_num_tokens,
+                    sharded=sharded,
                 )
+            )
 
         slots.append(
             GraphSlot(
@@ -664,6 +678,7 @@ def build_decode_registry(
                 lambda _bs, _mt: (1,),
                 torch.int32,
                 axis="none",
+                copy_from_fb=False,
                 post_fill=_num_token_non_padded_post_fill,
             )
         )
@@ -811,6 +826,8 @@ def build_prefill_registry(
     enable_num_token_non_padded: bool = False,
     require_gathered_buffer: bool = False,
     enable_prefill_cp: bool = False,
+    # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
+    attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
     register_input_embeds: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
@@ -916,23 +933,25 @@ def build_prefill_registry(
         )
 
         def _prefill_num_token_non_padded_post_fill(buf, fb, ctx):
-            # The FB tensor was attn-TP-localized against the RAW length, but
-            # replay pads rows up to the capture bucket, moving the shard
-            # boundary — copying it verbatim would make the in-graph pad mask
-            # blank real tokens whenever raw < bucket. Recompute the local
-            # count against the padded bucket from the batch's un-adjusted
-            # global count, mirroring the decode registry's post_fill.
-            if require_gathered_buffer:
-                if not enable_prefill_cp:
-                    buf.fill_(
-                        compute_local_num_token_non_padded_cpu(
-                            global_num_token_non_padded=fb.num_token_non_padded_cpu,
-                            num_tokens_per_dp=ctx.padded_num_tokens,
-                        )
+            # LOCAL count for the PADDED bucket, derived from the invariant
+            # GLOBAL host int: replay pads rows up to the capture bucket, which
+            # moves the shard boundary, so the count must be recomputed against
+            # the bucket rather than copied. A replicated / CP forward keeps the
+            # full count (sharded=False is a passthrough).
+            if fb.global_num_token_non_padded_cpu is not None:
+                sharded = not enable_prefill_cp and attn_tp_sharded_fn(
+                    ctx.padded_num_tokens
+                )
+                buf.fill_(
+                    compute_local_num_token_non_padded_cpu(
+                        global_num_token_non_padded=fb.global_num_token_non_padded_cpu,
+                        num_tokens_per_dp=ctx.padded_num_tokens,
+                        sharded=sharded,
                     )
+                )
             else:
                 # Non-gathered FullCG still needs the live boundary rather
-                # than a stale/absent ForwardBatch tensor.
+                # than a stale/absent ForwardBatch value.
                 buf.fill_(ctx.raw_num_tokens)
 
         slots.append(
@@ -941,6 +960,7 @@ def build_prefill_registry(
                 lambda _bs2, _mt: (1,),
                 torch.int32,
                 axis="none",
+                copy_from_fb=False,
                 post_fill=_prefill_num_token_non_padded_post_fill,
             )
         )
