@@ -47,14 +47,17 @@ from sglang.kernels.ops.diffusion import (
     hunyuan_qkv_rope_pack,
     mark_fused_ln_modulate_site,
     mark_hunyuan_qknorm_site,
+    mark_ltx2_qknorm_split_rope_site,
     mark_ltx2_rms_norm_modulate_site,
     mark_qwen_image_added_qkv_site,
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
+    mount_ltx2_qknorm_split_rope,
     mount_ltx2_rms_norm_modulate,
     mount_qwen_image_added_qkv,
     try_flux2_token_cat_nvfp4,
     unmount_hunyuan_qknorm,
+    unmount_ltx2_qknorm_split_rope,
     unmount_ltx2_rms_norm_modulate,
     unmount_qwen_image_added_qkv,
     wan_rmsnorm_silu,
@@ -854,6 +857,16 @@ def test_longcat_qknorm_rope_is_bit_exact():
 # -------------------------------------------------------------------------
 # LTX-2 -- weightless RMSNorm + modulate (quality-gated)
 # -------------------------------------------------------------------------
+
+
+def test_ltx2_qknorm_split_rope_hopper_site_is_quality_gated():
+    attention = nn.Module()
+    mark_ltx2_qknorm_split_rope_site(attention)
+    assert not ltx2_module.ltx2_qknorm_split_rope_active(attention)
+    assert mount_ltx2_qknorm_split_rope(attention)
+    assert ltx2_module.ltx2_qknorm_split_rope_active(attention)
+    unmount_ltx2_qknorm_split_rope(attention)
+    assert not ltx2_module.ltx2_qknorm_split_rope_active(attention)
 
 
 def _ltx2_eager(rms, x, scale, shift, eps):
