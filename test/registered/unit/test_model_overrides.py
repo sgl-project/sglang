@@ -1686,6 +1686,74 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "flashinfer_trtllm_routed",
         )
 
+    def test_bailing_v3_mixed_mxfp4_selects_native_runner(self):
+        """Packed MXFP4 experts must not reach the FP8 Triton runner."""
+
+        def _args(**kw):
+            defaults = dict(
+                device="cuda",
+                moe_a2a_backend="none",
+                moe_runner_backend="auto",
+                _model_config=SimpleNamespace(quantization="fp8", is_fp4_experts=True),
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with override_platform(
+            is_sm90=False, is_sm100=True, is_sm120=False, is_hip=False
+        ):
+            for architecture in (
+                "BailingMoeV3ForCausalLM",
+                "BailingMoeV3VLForConditionalGeneration",
+            ):
+                with self.subTest(architecture=architecture):
+                    declarations = collect_model_override_declarations(
+                        architecture,
+                        _args(),
+                        SimpleNamespace(architectures=[architecture]),
+                    )
+                    self.assertEqual(
+                        declarations,
+                        [
+                            (
+                                "_bailing_moe_v3_overrides",
+                                {"moe_runner_backend": "flashinfer_mxfp4"},
+                            )
+                        ],
+                    )
+
+            from sglang.srt.arg_groups.model_overrides.bailing_moe_v3 import (
+                _bailing_moe_v3_overrides,
+            )
+
+            hf = SimpleNamespace(
+                architectures=["BailingMoeV3VLForConditionalGeneration"]
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(_args(moe_runner_backend="triton"), hf),
+                {},
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(_args(moe_a2a_backend="deepep"), hf),
+                {},
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(
+                    _args(
+                        _model_config=SimpleNamespace(
+                            quantization="fp8", is_fp4_experts=False
+                        )
+                    ),
+                    hf,
+                ),
+                {},
+            )
+
+        with override_platform(
+            is_sm90=False, is_sm100=False, is_sm120=False, is_hip=False
+        ):
+            self.assertEqual(_bailing_moe_v3_overrides(_args(), hf), {})
+
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,
