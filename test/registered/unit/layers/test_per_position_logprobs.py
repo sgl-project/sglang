@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.layers.logprob_processor import (
     LogprobStage,
+    OutputLogprobProcessor,
     get_token_ids_logprobs_chunk,
     get_token_ids_logprobs_raw,
 )
@@ -78,6 +79,20 @@ def test_sparse_and_flat_requests_share_one_batch_without_position_drift():
     assert values[1][1] == pytest.approx(logprobs[3, [8, 1]].tolist())
     assert values[2][0] == pytest.approx(logprobs[4, [4, 7]].tolist())
     assert indices[1] == [[3], [8, 1]]
+
+
+def test_mixed_decode_keeps_empty_values_as_tensors_for_host_normalization():
+    logprobs = torch.randn(3, 13).log_softmax(-1)
+    ids = [PerPositionTokenIds([[2, 5]]), None, [4, 7]]
+    result = OutputLogprobProcessor().compute_logprobs(
+        logprobs, [0, 0, 0], ids, torch.tensor([1, 2, 3])
+    )
+    # Both prefill/decode result consumers call tolist() after asynchronous D2H.
+    assert all(torch.is_tensor(value) for value in result.token_ids_logprobs_val)
+    values = [value.tolist() for value in result.token_ids_logprobs_val]
+    assert values[:2] == [[], []]
+    assert values[2] == pytest.approx(logprobs[2, [4, 7]].tolist())
+    assert result.token_ids_logprobs_idx == [[], [], [4, 7]]
 
 
 @pytest.mark.parametrize("boundaries", [(12,), (24,), (30,), (12, 24, 30)])
