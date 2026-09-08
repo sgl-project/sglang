@@ -14,7 +14,6 @@ from functools import partial
 from typing import Callable, Optional
 
 import torch
-from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME
 from safetensors import safe_open
 from torch import nn
 
@@ -38,9 +37,6 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     read_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
-from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    filter_duplicate_safetensors_files,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     ComponentResidencyError,
@@ -72,9 +68,6 @@ logger = init_logger(__name__)
 
 PostLoadHook = Callable[[nn.Module], None]
 
-_PRECISION_VARIANT_SUFFIX_RE = re.compile(
-    r"^(?P<stem>.+?)(?P<precision>\.(?:fp16|bf16|fp32))(?P<shard>-\d+-of-\d+)?(?P<ext>\.safetensors)$"
-)
 _MIXED_SAFETENSORS_RE = re.compile(r".*-mixed(?:-\d+-of-\d+)?\.safetensors$")
 
 
@@ -645,17 +638,7 @@ def resolve_transformer_checkpoint_files(
 
     safetensors_list = _list_safetensors_files(component_model_path)
     if safetensors_list:
-        # Preserve legacy cleanup for the base component. Explicit overrides
-        # are resolved above, where an index is already the final authority.
-        safetensors_list = filter_duplicate_safetensors_files(
-            safetensors_list,
-            os.path.dirname(safetensors_list[0]),
-            SAFE_WEIGHTS_INDEX_NAME,
-        )
         safetensors_list = _prefer_mixed_safetensors_files(safetensors_list)
-        safetensors_list = _filter_duplicate_precision_variant_safetensors(
-            safetensors_list
-        )
 
     if not safetensors_list:
         raise ValueError(f"no safetensors files found in {component_model_path}")
@@ -694,48 +677,6 @@ def _prefer_mixed_safetensors_files(safetensors_list: list[str]) -> list[str]:
         mixed_files,
     )
     return mixed_files
-
-
-def _filter_duplicate_precision_variant_safetensors(
-    safetensors_list: list[str],
-) -> list[str]:
-    """Drop precision-specific duplicates when a canonical file is present.
-
-    Diffusers checkpoints sometimes ship both `foo.safetensors` and
-    `foo.fp16.safetensors` (and their sharded variants) in the same directory.
-    Loading both is unsafe because duplicate parameter names race and whichever
-    tensor arrives last wins, leading to non-deterministic behavior
-
-    If a canonical unsuffixed (non bf16|fp32) file exists, prefer it and drop the precision
-    variant from the same family. Precision-only families are left untouched.
-    """
-    canonical_paths = set(safetensors_list)
-    filtered: list[str] = []
-    removed: list[str] = []
-
-    for path in safetensors_list:
-        match = _PRECISION_VARIANT_SUFFIX_RE.match(path)
-        if match is None:
-            filtered.append(path)
-            continue
-
-        canonical_path = (
-            f"{match.group('stem')}{match.group('shard') or ''}{match.group('ext')}"
-        )
-        if canonical_path in canonical_paths:
-            removed.append(path)
-            continue
-
-        filtered.append(path)
-
-    if removed:
-        logger.info(
-            "Filtered %d duplicate transformer precision variant file(s): %s",
-            len(removed),
-            removed,
-        )
-
-    return filtered
 
 
 def resolve_transformer_quant_load_spec(

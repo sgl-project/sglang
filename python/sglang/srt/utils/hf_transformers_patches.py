@@ -53,6 +53,8 @@ def apply_all():
         return
     _applied = True
 
+    _mute_diffusers_torchao_probe()
+
     # v5.4 patches
     _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
@@ -69,6 +71,23 @@ def apply_all():
     patch_is_base_mistral_in_ci()
 
     logger.debug("transformers compatibility patches applied")
+
+
+def _mute_diffusers_torchao_probe():
+    """Silence diffusers' torchao-Tensor-subclass probe warning.
+
+    diffusers lazily imports its torchao quantizer and warns when the installed
+    torchao has moved the optional Tensor subclasses it probes for. It only
+    affects loading torchao-serialized diffusers checkpoints, which no sglang
+    path does. Set here rather than in ``configure_logger`` because the import
+    can land before logging is configured, and the level sticks whenever the
+    lazy import happens.
+    """
+    import logging
+
+    logging.getLogger("diffusers.quantizers.torchao.torchao_quantizer").setLevel(
+        logging.ERROR
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -203,15 +222,22 @@ def _patch_removed_symbols():
 
         # Importing modeling_llama triggers a deep import chain:
         #   modeling_llama -> modeling_utils -> quantizers -> torchao
-        # torchao emits a noisy warning about incompatible torch versions
-        # that is irrelevant here — suppress it during this import.
-        _torchao_logger = logging.getLogger("torchao")
-        _prev_level = _torchao_logger.level
-        _torchao_logger.setLevel(logging.ERROR)
+        # torchao emits a noisy warning about incompatible torch versions, and
+        # its register_as_pytree_constant() calls on Enum types make
+        # torch.utils._pytree log a deprecation warning once per Enum and per
+        # rank. Neither is actionable here — suppress both during this import.
+        _muted = [
+            logging.getLogger("torchao"),
+            logging.getLogger("torch.utils._pytree"),
+        ]
+        _prev_levels = [lg.level for lg in _muted]
+        for lg in _muted:
+            lg.setLevel(logging.ERROR)
         try:
             from transformers.models.llama import modeling_llama
         finally:
-            _torchao_logger.setLevel(_prev_level)
+            for lg, level in zip(_muted, _prev_levels):
+                lg.setLevel(level)
 
         if not hasattr(modeling_llama, "LlamaFlashAttention2"):
             if hasattr(modeling_llama, "LlamaAttention"):

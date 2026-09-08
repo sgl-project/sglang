@@ -507,21 +507,43 @@ def get_draft_recurrent_hidden_state_spec(
     )
 
 
+_PREPARE_FOR_VERIFY_DEPS = None
+
+
 def eagle_prepare_for_verify(
     verify_input: EagleVerifyInput,
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
 ):
-    from sglang.kernels.ops.speculative.cache_locs import (
+    # Imports must stay lazy (import-cycle safety) but only need to resolve
+    # once, not on every decode cycle of this hot path.
+    global _PREPARE_FOR_VERIFY_DEPS
+    if _PREPARE_FOR_VERIFY_DEPS is None:
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_extend_cache_locs_uniform_func,
+        )
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+        )
+        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+
+        _PREPARE_FOR_VERIFY_DEPS = (
+            assign_extend_cache_locs_uniform_func,
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+            prepare_mamba_track_for_verify,
+        )
+    (
         assign_extend_cache_locs_uniform_func,
-    )
-    from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
-    )
-    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+        prepare_mamba_track_for_verify,
+    ) = _PREPARE_FOR_VERIFY_DEPS
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -663,11 +685,30 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _can_use_sparse_uno_tree_target_sampling(
+    max_top_k: Optional[int],
+    sampling_info: SamplingBatchInfo,
+) -> bool:
+    if max_top_k is None:
+        return False
+
+    from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
+
+    return bool(
+        _is_cuda
+        and max_top_k <= _SPARSE_TOP_K_LIMIT
+        and sampling_info.sampling_seed is None
+        and not sampling_info.need_min_p_sampling
+        and not get_spec().speculative_use_rejection_sampling
+    )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
+    uno_target_max_top_k: Optional[int] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -769,6 +810,42 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+    elif _can_use_sparse_uno_tree_target_sampling(
+        uno_target_max_top_k,
+        sampling_info,
+    ):
+        from sglang.srt.speculative.uno_utils import (
+            sample_uno_tree_target_tokens,
+        )
+
+        target_predict = sample_uno_tree_target_tokens(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            batch_size=bs,
+            verify_width=verify_input.draft_token_num,
+            max_top_k=uno_target_max_top_k,
+        )
+        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=num_correct_drafts,
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_sibling=verify_input.retrieve_next_sibling,
+            target_predict=target_predict,
+            topk=verify_input.tree_topk,
+        )
+
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
     else:
         from sgl_kernel import (
             top_k_renorm_prob,
