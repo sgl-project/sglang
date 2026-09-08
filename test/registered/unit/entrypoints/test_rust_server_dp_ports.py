@@ -15,11 +15,15 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestRustServerDpLocalPorts(CustomTestCase):
-    def _launch_rust_servers(self, nnodes, ranks):
+    def _launch_rust_servers(self, nnodes, ranks, *, tp_size=4, cp_size=1, pp_size=1):
         server_cls = MagicMock()
-        server_args = SimpleNamespace(nnodes=nnodes)
+        server_args = SimpleNamespace()
 
         with (
+            patch(
+                "sglang.srt.rust_server.server.get_parallel",
+                return_value=SimpleNamespace(nnodes=nnodes),
+            ),
             patch(
                 "sglang.srt.rust_extensions.load_rust_extension",
                 return_value=SimpleNamespace(Server=server_cls),
@@ -44,27 +48,53 @@ class TestRustServerDpLocalPorts(CustomTestCase):
                     server_args=server_args,
                     ps=SimpleNamespace(
                         tp_rank=tp_rank,
-                        tp_size=4,
-                        pp_size=1,
+                        tp_size=tp_size,
+                        pp_size=pp_size,
                         attn_tp_size=attn_tp_size,
-                        attn_cp_size=1,
+                        attn_cp_size=cp_size,
                         attn_dp_rank=dp_rank,
                         dp_size=dp_size,
                     ),
                     model_config=SimpleNamespace(is_multimodal=False),
                 )
-                RustServer.launch(scheduler)
+                with self.assertLogs(
+                    "sglang.srt.rust_server.server", level="INFO"
+                ) as logs:
+                    server = RustServer.launch(scheduler)
+                offset = server_cls.call_args.kwargs["port_offset"]
+                self.assertEqual(server.http_port, 30000 + (offset or 0))
+                self.assertIn(f"0.0.0.0:{server.http_port}", logs.output[-1])
+                if dp_size > 1:
+                    self.assertIn(f"DP rank {dp_rank}/{dp_size}", logs.output[-1])
+                else:
+                    self.assertNotIn("DP rank", logs.output[-1])
+                self.assertEqual(scheduler.ps.attn_dp_rank, dp_rank)
 
         return [call.kwargs["port_offset"] for call in server_cls.call_args_list]
 
-    def _launch_nonzero_node(self, *, nnodes, node_rank, tp_size, dp_size):
+    def _launch_nonzero_node(
+        self,
+        *,
+        nnodes,
+        node_rank,
+        tp_size,
+        dp_size=None,
+        pp_size=1,
+        cp_size=1,
+        rust=True,
+    ):
         server_args = ServerArgs(
             model_path="dummy",
             nnodes=nnodes,
             node_rank=node_rank,
             tp_size=tp_size,
-            dp_size=dp_size,
+            pp_size=pp_size,
+            attn_cp_size=cp_size,
             enable_dp_attention=True,
+            host="0.0.0.0",
+            port=30000,
+            enable_metrics=True,
+            **({"dp_size": dp_size} if dp_size is not None else {}),
         )
         server_args.check_server_args = MagicMock()
         self.addCleanup(reset_context)
@@ -76,7 +106,7 @@ class TestRustServerDpLocalPorts(CustomTestCase):
             engine_info_bootstrap_server=None,
         )
         with (
-            envs.SGLANG_RUST_SERVER.override(True),
+            envs.SGLANG_RUST_SERVER.override(rust),
             patch.object(engine_module, "configure_logger"),
             patch.object(engine_module, "_set_envs_and_config"),
             patch.object(engine_module, "load_plugins"),
@@ -97,7 +127,7 @@ class TestRustServerDpLocalPorts(CustomTestCase):
 
         scheduler_init_result.wait_for_ready.assert_called_once_with()
         scheduler_init_result.block_until_scheduler_exits.assert_called_once_with()
-        return launch, server_args
+        return launch
 
     def test_two_nodes_reuse_the_same_http_ports(self):
         offsets = self._launch_rust_servers(
@@ -118,21 +148,40 @@ class TestRustServerDpLocalPorts(CustomTestCase):
         )
         self.assertEqual(offsets, [0, 0])
 
-    def test_nonzero_node_does_not_start_dummy_server_for_rust_dp(self):
-        launch, _ = self._launch_nonzero_node(
-            nnodes=2, node_rank=1, tp_size=4, dp_size=4
+    def test_cp_and_pp_do_not_change_node_local_ports(self):
+        offsets = self._launch_rust_servers(
+            nnodes=4,
+            tp_size=8,
+            cp_size=2,
+            pp_size=2,
+            ranks=((0, 0, 1, 4), (2, 1, 1, 4), (4, 2, 1, 4), (6, 3, 1, 4)),
         )
+        self.assertEqual(offsets, [0, 1, 0, 1])
 
-        launch.assert_not_called()
+    def test_no_dp_keeps_port_offset_unset(self):
+        offsets = self._launch_rust_servers(nnodes=2, ranks=((0, 0, 4, 1),))
+        self.assertEqual(offsets, [None])
 
-    def test_non_server_node_starts_dummy_server_for_rust_dp(self):
-        launch, server_args = self._launch_nonzero_node(
-            nnodes=4, node_rank=1, tp_size=4, dp_size=2
+    def test_dummy_server_only_runs_without_a_rust_listener(self):
+        cases = (
+            (dict(nnodes=2, node_rank=1, tp_size=4, dp_size=4), False),
+            (dict(nnodes=4, node_rank=1, tp_size=4, dp_size=2), True),
+            (dict(nnodes=4, node_rank=2, tp_size=4, dp_size=2), False),
+            (dict(nnodes=2, node_rank=1, tp_size=4), True),
+            (dict(nnodes=2, node_rank=1, tp_size=4, dp_size=4, pp_size=2), True),
+            (
+                dict(nnodes=4, node_rank=1, tp_size=8, dp_size=4, cp_size=2, pp_size=2),
+                False,
+            ),
+            (dict(nnodes=2, node_rank=1, tp_size=4, dp_size=4, rust=False), True),
         )
-
-        launch.assert_called_once_with(
-            server_args.host, server_args.port, server_args.enable_metrics
-        )
+        for topology, needs_dummy in cases:
+            with self.subTest(**topology):
+                launch = self._launch_nonzero_node(**topology)
+                if needs_dummy:
+                    launch.assert_called_once_with("0.0.0.0", 30000, True)
+                else:
+                    launch.assert_not_called()
 
 
 if __name__ == "__main__":

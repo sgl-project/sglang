@@ -23,7 +23,7 @@ from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
-from sglang.srt.runtime_context import get_mm, get_serving
+from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
     RUST_MM_FAMILIES,
@@ -55,10 +55,12 @@ class RustServer:
     def __init__(
         self,
         server: Server,
+        http_port: int,
         mm_spec: Optional[RustMmSpec] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
+        self.http_port = http_port
         self.mm_spec = mm_spec
         self._max_per_poll = max_per_poll
 
@@ -81,7 +83,7 @@ class RustServer:
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         if dp_rank is not None:
-            nnodes_per_pp_rank = max(server_args.nnodes // scheduler.ps.pp_size, 1)
+            nnodes_per_pp_rank = max(get_parallel().nnodes // scheduler.ps.pp_size, 1)
             tp_size_per_node = scheduler.ps.tp_size // nnodes_per_pp_rank
             dp_group_width = scheduler.ps.attn_tp_size * scheduler.ps.attn_cp_size
             # Count DP leaders within this node's TP range. The first leader must
@@ -160,7 +162,7 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, mm_spec=mm_spec)
+        return cls(server, http_port=listen_port, mm_spec=mm_spec)
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -214,14 +216,13 @@ class RustServer:
                 obj.input_ids = ids
                 pos += nbytes
             if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
-                # The buffers rode the Rust sidecar, parked before the ring push;
-                # wrapping them into tensors is the only Python step of the Rust
-                # path. `None` for a text-only request on a multimodal model.
-                mm_result = self.server.take_mm_result(obj.rid)
-                if mm_result is not None:
-                    obj.mm_inputs = RustMmProcessor.build_output(
-                        self.mm_spec, mm_result
-                    )
+                # The buffers were parked in the Rust result store before the
+                # ring push; wrapping them into tensors is the only Python step
+                # of the Rust path. `None` for a text-only request on a
+                # multimodal model.
+                encoded = self.server.take_mm_result(obj.rid)
+                if encoded is not None:
+                    obj.mm_inputs = RustMmProcessor.wrap_encoded(self.mm_spec, encoded)
             out.append(obj)
         return out
 
