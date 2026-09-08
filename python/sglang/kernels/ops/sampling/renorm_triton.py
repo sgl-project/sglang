@@ -8,9 +8,15 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.sampling.renorm import top_p_pivots
+from sglang.srt.environ import envs
 
 _BLOCK_SIZE = 1024
+
+# Nucleus size beyond which the top-p prefix search cannot answer and has to fall
+# back to a sort. Real decode distributions need a handful of entries; flat ones
+# (high temperature, early generation) can need far more, so the fallback must stay
+# correct, not fast.
+_TOP_P_PREFIX = 4096
 
 
 @triton.jit
@@ -91,14 +97,83 @@ def _renorm_from_pivots(probs_fp32: torch.Tensor, pivots: torch.Tensor) -> torch
     return out
 
 
+def _top_p_pivots_sorted(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    """Exact top-p pivot for every row, from a full ascending sort.
+
+    Matches FlashInfer's threshold semantics: discard the smallest entries whose
+    cumulative mass stays below ``1 - p`` and retain all ties at the pivot. Exact for
+    any input and free of host synchronization, but it pays an ``O(V log V)`` sort over
+    a 100K+ vocabulary, and that cost grows with the number of rows.
+    """
+    vocab_size = probs.shape[1]
+    sorted_probs = torch.sort(probs, dim=-1).values
+    cdf = torch.cumsum(sorted_probs, dim=-1)
+    cutoff = torch.searchsorted(cdf, (1.0 - top_ps).unsqueeze(1), right=False).squeeze(
+        1
+    )
+    cutoff.clamp_(max=vocab_size - 1)
+    return sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1)
+
+
+def _top_p_pivots_prefix(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    """Top-p pivot from a bounded prefix, falling back to a sort for rows it misses.
+
+    Walking a descending prefix is the mirror image of walking the ascending CDF: an
+    entry is kept exactly while the mass above it still leaves at least ``1 - p``
+    behind. Budgeting against the row's own total rather than against ``1.0`` keeps
+    ``top_p=1`` a no-op instead of truncating the tail of a peaked row, whose leading
+    terms round up to one on their own.
+
+    A row whose nucleus runs past the prefix has its pivot outside the prefix, and only
+    a sort can find it. Those rows are flagged by the last prefix entry still being
+    kept, and re-resolved exactly. Reading that flag costs one device-to-host transfer,
+    which is what :func:`top_p_pivots` weighs against the sort it avoids.
+    """
+    vocab_size = probs.shape[1]
+    prefix = min(_TOP_P_PREFIX, vocab_size)
+
+    budget = probs.sum(dim=-1) - (1.0 - top_ps)
+    values = torch.topk(probs, prefix, dim=-1).values
+    within = values.cumsum(dim=-1) <= budget.unsqueeze(1)
+    position = within.sum(dim=-1).clamp(max=prefix - 1)
+    pivots = values.gather(1, position.unsqueeze(1)).squeeze(1)
+
+    overflow = within[:, -1]
+    if prefix < vocab_size and bool(overflow.any()):
+        rows = overflow.nonzero(as_tuple=True)[0]
+        pivots[rows] = _top_p_pivots_sorted(probs[rows], top_ps[rows])
+    return pivots
+
+
+def top_p_pivots(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    """Per-row top-p pivot for ``probs``, one value per row.
+
+    Both paths implement the same threshold; they differ only in cost. The prefix path
+    is worth its host synchronization once the sort it replaces is large enough to
+    outweigh a fixed queue drain, so the choice turns on the row count alone -- which
+    the host already knows, making the dispatch itself free. The crossover was measured
+    on MI355X with a ~151K vocabulary under speculative decoding, where the verify batch
+    is ``requests x draft tokens``: below it the sort wins on both throughput and TPOT,
+    above it the sort starts costing TPOT.
+
+    Descending and ascending accumulation round differently, so on a row flat enough
+    that thousands of entries sit within a few ULPs of each other the two paths can land
+    on adjacent entries. Ascending is the better-conditioned order, which is why it
+    stays the default for the batch sizes where it is affordable.
+    """
+    if probs.shape[0] >= envs.SGLANG_OPT_TOP_P_PREFIX_MIN_ROWS.get():
+        return _top_p_pivots_prefix(probs, top_ps)
+    return _top_p_pivots_sorted(probs, top_ps)
+
+
 def top_p_renorm_probs_triton(
     probs: torch.Tensor, top_p: Union[torch.Tensor, float]
 ) -> torch.Tensor:
     """Apply exact top-p thresholding and renormalize each probability row.
 
-    Pivot selection lives in :func:`~sglang.kernels.ops.sampling.renorm.top_p_pivots`,
-    which picks between a sort and a bounded prefix search by row count. Triton
-    performs the bandwidth-heavy masking, partial reduction, and normalization.
+    Pivot selection is delegated to :func:`top_p_pivots`, which picks between a sort
+    and a bounded prefix search by row count. Triton performs the bandwidth-heavy
+    masking, partial reduction, and normalization.
     """
     probs_fp32 = _prepare_probs(probs)
     batch_size, vocab_size = probs_fp32.shape
