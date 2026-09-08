@@ -708,6 +708,17 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if tree_core.evictable_device_leaves.contains(x) {
                 break Some(x);
             }
+            if tree_core.is_write_back
+                && tree_core.swa_write_back_eviction_barrier_enabled
+                && !tree_core.arena.node(x).backuped()
+            {
+                // A later Full backup cannot recover SWA data after this
+                // internal node is tombstoned. Pause on the same cursor so
+                // the Controller can preserve the dirty path first.
+                tree_core.component_state_mut(SWA).evict_device_backup_node = Some(x);
+                cursor = Some(x);
+                break None;
+            }
             // Internal nodes are tombstoned inline (no IO).
             tree_core.evict_component_and_detach_lru_(
                 x,
@@ -832,7 +843,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         _mamba_pool_idx: Option<Tensor>,
         host_indices: Option<Tensor>,
         _token_ids: Option<&[i64]>,
-        _prefetch_tokens: usize,
+        prefetch_tokens: usize,
         _last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         // unified_kv keeps SWA as a device-only ring.
@@ -919,11 +930,17 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 }])
             }
             CacheTransferPhase::Prefetch => {
-                let host_indices = host_indices.expect("SWA PREFETCH build requires host indices");
-                let sw_pages = host_indices.numel() / tree_core.page_size;
+                let sw_pages = host_indices.as_ref().map_or_else(
+                    || {
+                        self.sliding_window_size
+                            .div_ceil(tree_core.page_size)
+                            .min(prefetch_tokens / tree_core.page_size)
+                    },
+                    |indices| indices.numel() / tree_core.page_size,
+                );
                 Some(vec![PoolTransfer {
                     name: PoolName::Swa,
-                    host_indices: Some(host_indices),
+                    host_indices,
                     keys: Some(vec!["__placeholder__".to_string(); sw_pages]),
                     hit_policy: PoolHitPolicy::TrailingPages,
                     ..Default::default()

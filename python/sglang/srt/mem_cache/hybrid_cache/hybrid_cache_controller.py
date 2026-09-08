@@ -357,9 +357,10 @@ class HybridCacheController(BaseHiCacheController):
     def _uses_shared_host_domain(
         self, extra_pools: Optional[list[PoolTransfer]]
     ) -> bool:
-        domain = self.mem_pool_host.anchor_entry.host_pool.shared_allocation_domain
-        if domain is None:
+        anchor_pool = self.mem_pool_host.anchor_entry.host_pool
+        if not self._uses_shared_host_layout(anchor_pool):
             return False
+        domain = anchor_pool.shared_allocation_domain
         for transfer in extra_pools or []:
             if (
                 transfer.indices_from_pool is not None
@@ -368,9 +369,9 @@ class HybridCacheController(BaseHiCacheController):
             ):
                 continue
             entry = self.mem_pool_host.entry_map.get(transfer.name)
-            if (
-                entry is not None
-                and entry.host_pool.shared_allocation_domain is not domain
+            if entry is not None and (
+                not self._uses_shared_host_layout(entry.host_pool)
+                or entry.host_pool.shared_allocation_domain is not domain
             ):
                 return False
         return True
@@ -406,6 +407,7 @@ class HybridCacheController(BaseHiCacheController):
             entry
             for entry in self.mem_pool_host.entries
             if entry.name not in requested_names
+            and self._uses_shared_host_layout(entry.host_pool)
             and entry.host_pool.shared_allocation_domain is domain
         )
 
@@ -612,9 +614,11 @@ class HybridCacheController(BaseHiCacheController):
         self, operation: StorageOperation, need_size: int
     ) -> bool:
         anchor = self.mem_pool_host.anchor_entry
-        domain = anchor.host_pool.shared_allocation_domain
-        if self.host_memory_mode != "buffer_only" or domain is None:
+        if self.host_memory_mode != "buffer_only" or not self._uses_shared_host_layout(
+            anchor.host_pool
+        ):
             return super().can_fit_prefetch_host_buffers(operation, need_size)
+        domain = anchor.host_pool.shared_allocation_domain
         requests, _ = self._shared_prefetch_requests(operation, need_size)
         domain_requests = [
             (self.mem_pool_host.entry_map[name].host_pool.pool_label, size)
@@ -622,18 +626,26 @@ class HybridCacheController(BaseHiCacheController):
         ]
         return domain.can_fit_many_then(domain_requests, (), empty=True)
 
+    def prefetch_rate_limited(self) -> bool:
+        if self.host_memory_mode == "buffer_only" and self._uses_shared_host_layout(
+            self.mem_pool_host.anchor_entry.host_pool
+        ):
+            # Shared-arena occupancy includes the Full and SWA byte footprint.
+            return self.prefetch_tokens_occupied >= self.prefetch_capacity_limit
+        return super().prefetch_rate_limited()
+
     def alloc_prefetch_host_buffers(
         self, operation: StorageOperation, need_size: int
     ) -> Optional[torch.Tensor]:
         """Atomically allocate every prefetch slice from a shared arena."""
         anchor = self.mem_pool_host.anchor_entry
-        domain = anchor.host_pool.shared_allocation_domain
-        if domain is None:
+        if not self._uses_shared_host_layout(anchor.host_pool):
             return super().alloc_prefetch_host_buffers(operation, need_size)
 
         requests, independent_transfers = self._shared_prefetch_requests(
             operation, need_size
         )
+
         allocated = self._alloc_shared_host_requests_with_reclaim(requests)
         if allocated is None:
             return None
@@ -645,8 +657,9 @@ class HybridCacheController(BaseHiCacheController):
         self, operation: StorageOperation, host_indices: torch.Tensor
     ) -> None:
         """Roll back an unsubmitted prefetch's anchor and independent pools."""
+        pool_transfers = operation.pool_transfers or []
         self.mem_pool_host.free(host_indices)
-        for transfer in operation.pool_transfers or []:
+        for transfer in pool_transfers:
             if transfer.indices_from_pool is not None or transfer.host_indices is None:
                 continue
             entry = self.mem_pool_host.entry_map.get(transfer.name)
@@ -978,7 +991,7 @@ class HybridCacheController(BaseHiCacheController):
         with self.mem_pool_host.layout_lease():
             return self._page_transfer_with_stable_layout(operation)
 
-    def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> bool:
+    def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
         # KV pools and KV-derived pools first — determines actual completed page count
         kv_completed_pages = super()._page_transfer(operation)
 
@@ -1009,8 +1022,14 @@ class HybridCacheController(BaseHiCacheController):
                 transfers_nonkv, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(transfers_nonkv)
-            pool_hits = count_pool_hits(results)
+            try:
+                results = self.storage_backend.batch_get_v2(transfers_nonkv)
+                pool_hits = count_pool_hits(results)
+            except Exception:
+                logger.exception(
+                    "HiCache sidecar prefetch failed for request %s",
+                    operation.request_id,
+                )
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
         # to perform all_reduce.

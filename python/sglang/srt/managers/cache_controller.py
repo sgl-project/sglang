@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -79,7 +79,9 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[self.producer_index].finish_event.query(), (
+        assert self.events[
+            self.producer_index
+        ].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
         return self.producer_index
@@ -323,6 +325,7 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
@@ -707,9 +710,9 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert tp_lcm_size % self.tp_size == 0, (
-                "tp_lcm_size must be divisible by tp_size."
-            )
+            assert (
+                tp_lcm_size % self.tp_size == 0
+            ), "tp_lcm_size must be divisible by tp_size."
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
@@ -1070,13 +1073,20 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
-                hit_pages = self._page_transfer_kv_batch(
-                    operation,
-                    batch_hashes,
-                    batch_host_indices,
-                    extra_info,
-                    kv_derived_transfers,
-                )
+                try:
+                    hit_pages = self._page_transfer_kv_batch(
+                        operation,
+                        batch_hashes,
+                        batch_host_indices,
+                        extra_info,
+                        kv_derived_transfers,
+                    )
+                except Exception:
+                    logger.exception(
+                        "HiCache prefetch transfer failed for request %s",
+                        operation.request_id,
+                    )
+                    hit_pages = 0
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False
@@ -1137,10 +1147,13 @@ class HiCacheController:
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                if operation is None:
-                    continue
+            except Empty:
+                continue
+            if operation is None:
+                continue
+            try:
                 self._page_transfer(operation)
-
+            finally:
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
                         rid=operation.request_id,
@@ -1148,18 +1161,17 @@ class HiCacheController:
                         operation=operation,
                     )
                 )
-            except Empty:
-                continue
 
     def prefetch_rate_limited(self) -> bool:
         """
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
         if self.host_memory_mode == "buffer_only":
-            # Buffer mode charges hit-sized load allocations. Shared Full/SWA
-            # arenas express the exact combined byte footprint in Full-token
-            # units, without conflating fragmentation and write staging.
-            return self.prefetch_tokens_occupied >= self.prefetch_capacity_limit
+            # Gate on actual load staging, excluding the independent write budget.
+            used = self.mem_pool_host.size - self.mem_pool_host.available_size()
+            if self.host_write_staged_tokens_fn is not None:
+                used -= self.host_write_staged_tokens_fn()
+            return max(0, used) >= self.prefetch_capacity_limit
         # cancel prefetch if too much memory is occupied
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
             return True
@@ -1218,7 +1230,6 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-
                 try:
                     if operation.is_terminated():
                         hash_value, storage_hit_count = [], 0
@@ -1231,26 +1242,17 @@ class HiCacheController:
                         "HiCache storage query failed for request %s",
                         operation.request_id,
                     )
-                    operation.mark_terminate()
                     hash_value, storage_hit_count = [], 0
 
-                try:
-                    storage_hit_count_tensor = torch.tensor(
-                        storage_hit_count, dtype=torch.int
-                    )
-                    self._all_reduce(
-                        storage_hit_count_tensor,
-                        torch.distributed.ReduceOp.MIN,
-                        self.prefetch_hits_sync_groups,
-                    )
-                    storage_hit_count = storage_hit_count_tensor.item()
-                except Exception:
-                    logger.exception(
-                        "HiCache storage query synchronization failed for request %s",
-                        operation.request_id,
-                    )
-                    operation.mark_terminate()
-                    hash_value, storage_hit_count = [], 0
+                storage_hit_count_tensor = torch.tensor(
+                    storage_hit_count, dtype=torch.int
+                )
+                self._all_reduce(
+                    storage_hit_count_tensor,
+                    torch.distributed.ReduceOp.MIN,
+                    self.prefetch_hits_sync_groups,
+                )
+                storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.

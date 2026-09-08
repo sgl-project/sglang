@@ -209,11 +209,14 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
         return
+    assert cfg.pp_size == 1, (
+        "--enable-unified-memory does not support "
+        "pipeline parallelism (--pp-size > 1)."
+    )
+    assert (
+        not cfg.enable_mixed_chunk
+    ), "--enable-unified-memory does not support --enable-mixed-chunk."
     if cfg.disaggregation_mode != "null":
-        assert cfg.pp_size == 1, (
-            "--enable-unified-memory with PD disaggregation does not support "
-            "pipeline parallelism (--pp-size > 1)."
-        )
         # Constraints of the whole-envelope transfer; see the unified MHA and
         # MLA pool get_contiguous_buf_infos implementations.
         supported_backends = server_args._unified_memory_pd_transfer_backends()
@@ -292,9 +295,9 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "not translate speculative verify indices to the unified "
             "pool's kernel-facing space yet."
         )
-    assert not cfg.enable_lmcache, (
-        "--enable-unified-memory is not yet compatible with --enable-lmcache."
-    )
+    assert (
+        not cfg.enable_lmcache
+    ), "--enable-unified-memory is not yet compatible with --enable-lmcache."
     if cfg.enable_hierarchical_cache:
         model_config = model_config_of(server_args)
         assert not use_mla_backend(server_args), (

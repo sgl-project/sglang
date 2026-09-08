@@ -332,7 +332,7 @@ pub struct PoolTransferResult {
 }
 
 /// A device->host backup work item for the cache to execute.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct BackupKV {
     /// Backup these nodes device->host in order, stopping at the first failure; the
     /// caller orders them parent-before-child for write-through and child-first for
@@ -427,6 +427,9 @@ pub struct ComponentState {
     /// leaf may be freed: the leaf's parent for Full, the LRU predecessor for
     /// SWA and Mamba.
     pub(crate) evict_device_cursor: Option<NodeIdx_>,
+    /// Internal node whose component value must be backed up before the walk
+    /// can tombstone it. The Controller consumes this request between steps.
+    pub(crate) evict_device_backup_node: Option<NodeIdx_>,
     /// Token budget for the current eviction walk.
     pub(crate) evict_device_request_cnt: usize,
 }
@@ -483,6 +486,7 @@ pub struct EvictionStepResult {
     pub tracker: HashMap<ComponentType, usize>,
     pub device_frees: HashMap<ComponentType, Vec<Tensor>>,
     pub host_frees: HashMap<ComponentType, Vec<Tensor>>,
+    pub backup_kv: Option<BackupKV>,
 }
 
 /// The radix tree mechanism: owns the tree structure, per-node values, the
@@ -519,6 +523,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) enable_storage: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
+    /// Whether dirty internal SWA nodes must be backed up before eviction.
+    pub(crate) swa_write_back_eviction_barrier_enabled: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
     pub(crate) enable_kv_cache_events: bool,
     /// Queued placement events, drained by take_events.
@@ -632,6 +638,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.is_evict_device_ongoing = true;
         state.evict_device_request_cnt = request_cnt;
         state.evict_device_cursor = None;
+        state.evict_device_backup_node = None;
     }
 
     /// Finish the component's device-eviction bookkeeping; panics if no walk
@@ -644,6 +651,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         state.is_evict_device_ongoing = false;
         state.evict_device_cursor = None;
+        state.evict_device_backup_node = None;
     }
 
     /// Add newly evictable device tokens to the component's evictable size.
@@ -701,6 +709,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             enable_hicache: params.enable_hicache,
             enable_storage: false,
             has_swa_host_pool: params.has_swa_host_pool,
+            swa_write_back_eviction_barrier_enabled: false,
             enable_kv_cache_events: params.enable_kv_cache_events,
             kv_event_queue: Vec::new(),
             salted_event_hashes: HashMap::new(),
@@ -2008,6 +2017,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut result.device_frees,
                 &mut result.host_frees,
             );
+        let backup_node = self
+            .component_state_mut(component_type)
+            .evict_device_backup_node
+            .take();
+        if let Some(backup_node) = backup_node {
+            assert!(node_id.is_none());
+            result.backup_kv =
+                Some(self.build_backup_kv_action_(self.arena.node(backup_node), true));
+        }
         for (ct, total) in tracker {
             let delta = total - baseline.get(&ct).copied().unwrap_or(0);
             if delta > 0 {
@@ -2659,6 +2677,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Mark the host tier (HiCache) as wired.
     pub fn set_hicache_enabled(&mut self) {
         self.enable_hicache = true;
+    }
+
+    /// Preserve dirty internal SWA nodes before cache-mode write-back eviction.
+    pub fn enable_swa_write_back_eviction_barrier(&mut self) {
+        self.swa_write_back_eviction_barrier_enabled = true;
     }
 
     /// Whether the storage tier (L3) is wired; storage attaches after tree construction.

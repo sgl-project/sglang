@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import RebuildFullToSWAMapping
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -213,7 +214,11 @@ def validate_buffer_only_stack(
         # window), so every window-carrying intent would be dropped as
         # oversize and SWA storage coverage would silently be zero.
         window_tokens = swa.full_window_pages * swa._swa_kv_pool_host.page_size
-        shared_domain = swa._swa_kv_pool_host.shared_allocation_domain
+        shared_domain = (
+            swa._swa_kv_pool_host.shared_allocation_domain
+            if isinstance(swa._swa_kv_pool_host, HostKVCache)
+            else None
+        )
         if shared_domain is not None:
             full_host_pool = (
                 swa.cache.cache_controller.mem_pool_host.anchor_entry.host_pool
@@ -328,7 +333,10 @@ class BufferModePipeline:
         self._anchor_lock_cap_skips = 0
 
     def _shared_host_domain(self):
-        anchor = self._cache.cache_controller.mem_pool_host.anchor_entry.host_pool
+        cc = self._cache.cache_controller
+        anchor = cc.mem_pool_host.anchor_entry.host_pool
+        if not isinstance(anchor, HostKVCache):
+            return None
         return anchor.shared_allocation_domain
 
     def _transfer_tokens(self, transfer: PoolTransfer) -> int:
@@ -349,7 +357,7 @@ class BufferModePipeline:
             return 0
         cc = self._cache.cache_controller
         anchor = cc.mem_pool_host.anchor_entry.host_pool
-        if anchor.shared_allocation_domain is None:
+        if self._shared_host_domain() is None:
             return len(host_indices)
         num_bytes = len(host_indices) * anchor.size_per_token
         for transfer in aux_xfers or ():
@@ -367,7 +375,7 @@ class BufferModePipeline:
     ) -> Optional[list[tuple[str, int]]]:
         cc = self._cache.cache_controller
         anchor = cc.mem_pool_host.anchor_entry.host_pool
-        if anchor.shared_allocation_domain is None:
+        if self._shared_host_domain() is None:
             return None
         requests = [(anchor.pool_label, kv_tokens)]
         for transfer in aux_xfers or ():
@@ -386,7 +394,7 @@ class BufferModePipeline:
         """Prospective write staging in anchor-token accounting units."""
         cc = self._cache.cache_controller
         anchor = cc.mem_pool_host.anchor_entry.host_pool
-        if anchor.shared_allocation_domain is None:
+        if self._shared_host_domain() is None:
             return kv_tokens
         num_bytes = kv_tokens * anchor.size_per_token
         for transfer in aux_xfers or ():

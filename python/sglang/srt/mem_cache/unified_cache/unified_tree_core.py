@@ -403,6 +403,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
+        self.swa_write_back_eviction_barrier_enabled = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(params.eviction_policy.lower())
 
@@ -724,9 +725,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
-    def _match_prefix_helper(
-        self, key: RadixKey
-    ) -> tuple[
+    def _match_prefix_helper(self, key: RadixKey) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
         UnifiedTreeNode,
@@ -1339,15 +1338,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
         updated_tracker = defaultdict(int, tracker)
+        component = self.components_by_type[component_type]
         self._begin_tracking_unbacked_tokens()
         try:
-            result.node_id = self.components_by_type[
-                component_type
-            ].evict_device_next_node(
+            result.node_id = component.evict_device_next_node(
                 updated_tracker, result.device_frees, result.host_frees
             )
         finally:
             result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
+        backup_node_id = component.take_backup_before_device_eviction()
+        if backup_node_id is not None:
+            assert result.node_id is None
+            result.backup_kv = self._build_backup_kv_action(
+                self.node_by_id(backup_node_id), write_back=True
+            )
         for ct, n in updated_tracker.items():
             delta = n - tracker.get(ct, 0)
             if delta:
@@ -1894,6 +1898,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self.enable_hicache = True
+
+    def enable_swa_write_back_eviction_barrier(self) -> None:
+        self.swa_write_back_eviction_barrier_enabled = True
 
     def insert_host(
         self,

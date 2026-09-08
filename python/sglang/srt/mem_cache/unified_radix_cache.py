@@ -463,6 +463,10 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         # State initialization
+        if self.buffer_pipeline is not None:
+            self.cache_controller.host_write_staged_tokens_fn = (
+                lambda: self.buffer_pipeline.write_staged_tokens_
+            )
         self.write_through_threshold = (
             1 if get_memory().hicache_write_policy == "write_through" else 2
         )
@@ -471,6 +475,8 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.cache_controller.write_policy == "write_back"
         )
         # Pre-seed the logical dropped-tokens series.
+        if self.host_memory_mode == "cache" and self.tree_core.has_swa_host_pool:
+            self.tree_core.enable_swa_write_back_eviction_barrier()
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
             if self._tracks_write_through_unbacked_evictions():
@@ -673,16 +679,35 @@ class UnifiedRadixCache(BasePrefixCache):
     def _evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> tuple[Optional[NodeId], bool]:
-        """Advance the eviction walk one node, consuming its step result."""
-        result = self.tree_core.evict_device_next_node(component_type, tracker)
-        self._free_values(result.device_frees, result.host_frees)
-        if self._tracks_write_through_unbacked_evictions():
-            self._record_dropped_tokens(
-                result.unbacked_tokens,
-                reason="write_through_unbacked_eviction",
+        """Advance the walk, completing any pre-eviction backup barriers."""
+        while True:
+            result = self.tree_core.evict_device_next_node(component_type, tracker)
+            self._free_values(result.device_frees, result.host_frees)
+            if self._tracks_write_through_unbacked_evictions():
+                self._record_dropped_tokens(
+                    result.unbacked_tokens,
+                    reason="write_through_unbacked_eviction",
+                )
+            self._accumulate_tracker(tracker, result.tracker)
+            if result.backup_kv is None:
+                return result.node_id, result.made_progress
+
+            assert result.node_id is None
+            assert (
+                self.buffer_pipeline is None
+            ), "SWA write-back eviction barriers are cache-mode only"
+            written = self._execute_and_commit_kv_backup(
+                result.backup_kv, write_back=True
             )
-        self._accumulate_tracker(tracker, result.tracker)
-        return result.node_id, result.made_progress
+            if written <= 0:
+                logger.warning(
+                    "write_back: backup failed before auxiliary component "
+                    "eviction; leaving the component device-resident "
+                    "(component=%s)",
+                    component_type.name,
+                )
+                return None, False
+            self.writing_check(write_back=True)
 
     def _evict_device_leaf(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
@@ -1022,12 +1047,12 @@ class UnifiedRadixCache(BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
-            f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        )
-        assert new_prefix_len <= len(new_indices), (
-            f"{new_prefix_len=}, {len(new_indices)=}"
-        )
+        assert (
+            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        assert new_prefix_len <= len(
+            new_indices
+        ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
@@ -1231,9 +1256,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     window_indices
                 )
             )
-            assert bool((swa_indices > 0).all()), (
-                f"unmapped SWA window positions for request {req.rid}"
-            )
+            assert bool(
+                (swa_indices > 0).all()
+            ), f"unmapped SWA window positions for request {req.rid}"
             swa_indices = self._pad_retraction_indices(swa_indices, self.page_size)
             component_transfers[ComponentType.SWA] = [
                 PoolTransfer(
@@ -1270,7 +1295,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
         anchor_entry = self.host_pool_group.anchor_entry
-        if anchor_entry.host_pool.shared_allocation_domain is not None:
+        if self.cache_controller._uses_shared_host_layout(anchor_entry.host_pool):
             allocation = self.cache_controller.allocate_shared_host_transfers(
                 device_indices, extra_transfers or None
             )
@@ -2508,7 +2533,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
                     self.revoke_pending_prefetch(req_id)
                     return True
-            alloc_len = hit_tokens
+            alloc_len = operation.storage_hit_count
             if buffer_mode and not cc.can_fit_prefetch_host_buffers(
                 operation, alloc_len
             ):
@@ -2521,8 +2546,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.revoke_pending_prefetch(req_id)
                 return True
             host_indices = cc.alloc_prefetch_host_buffers(operation, alloc_len)
+            anchor = cc.mem_pool_host.anchor_entry.host_pool
             shared_domain = (
-                cc.mem_pool_host.anchor_entry.host_pool.shared_allocation_domain
+                anchor.shared_allocation_domain
+                if HybridCacheController._uses_shared_host_layout(anchor)
+                else None
             )
             if host_indices is None and shared_domain is None:
                 self.evict_host(alloc_len)
@@ -2872,9 +2900,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
-        assert count_values[-2] == -count_values[-1], (
-            "write_back duplicate-reclaim victims diverged across TP ranks"
-        )
+        assert (
+            count_values[-2] == -count_values[-1]
+        ), "write_back duplicate-reclaim victims diverged across TP ranks"
         return (
             count_values[0],
             count_values[1],
@@ -2958,9 +2986,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
-            assert sync_tensor[1].item() == -sync_tensor[2].item(), (
-                "write_back duplicate-reclaim victims diverged across TP ranks"
-            )
+            assert (
+                sync_tensor[1].item() == -sync_tensor[2].item()
+            ), "write_back duplicate-reclaim victims diverged across TP ranks"
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
