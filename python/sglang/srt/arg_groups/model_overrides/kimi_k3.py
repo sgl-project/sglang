@@ -42,11 +42,52 @@ def _require_kimi_k3_cutedsl_dcp_support() -> None:
         )
 
 
-@_register_for("KimiK3ForConditionalGeneration")
+@_register_for("KimiK3ForConditionalGeneration", "KimiK3LinearForCausalLM")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.dcp_size > 1:
         overrides = {}
+        if get_platform().is_npu:
+            if cfg.speculative_algorithm not in (None, "DSPARK"):
+                raise ValueError(
+                    "Kimi-K3 NPU DCP currently supports speculative decoding "
+                    "only with DSPARK."
+                )
+            if cfg.speculative_algorithm == "DSPARK":
+                from sglang.srt.speculative.ragged_verify import (
+                    RaggedVerifyMode,
+                    read_ragged_verify_mode,
+                )
+
+                ragged_mode = read_ragged_verify_mode()
+                if ragged_mode is not RaggedVerifyMode.STATIC:
+                    raise ValueError(
+                        "Kimi-K3 NPU DCP + DSPARK currently requires "
+                        "SGLANG_RAGGED_VERIFY_MODE=static; compact/cap-accept "
+                        f"are not validated under DCP (got {ragged_mode.value!r})."
+                    )
+                overrides["speculative_attention_mode"] = "decode"
+            if cfg.dcp_replicate_q_proj:
+                raise ValueError(
+                    "Kimi-K3 NPU DCP does not support --dcp-replicate-q-proj "
+                    "yet; the Ascend path uses an HCCL Q AllGather."
+                )
+            if cfg.enable_symm_mem:
+                logger.warning(
+                    "Kimi-K3 NPU DCP disables --enable-symm-mem; the initial "
+                    "Ascend path uses ordinary HCCL collectives."
+                )
+                overrides["enable_symm_mem"] = False
+            logger.info(
+                "Kimi-K3 NPU DCP selects the HCCL A2A communication path and "
+                "disables replicated Q projection."
+            )
+            overrides.update(
+                dcp_comm_backend="a2a",
+                dcp_replicate_q_proj=False,
+            )
+            return overrides
+
         if cfg.enable_symm_mem:
             logger.warning(
                 "Kimi-K3 DCP disables --enable-symm-mem due to decode CUDA "
