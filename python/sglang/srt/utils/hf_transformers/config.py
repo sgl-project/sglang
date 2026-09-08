@@ -16,7 +16,7 @@
 from pathlib import Path
 from typing import Optional
 
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, Qwen3Config
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs.model_config_parser_registry import (
@@ -24,6 +24,7 @@ from sglang.srt.configs.model_config_parser_registry import (
     get_model_config_parser,
     register_model_config_parser,
 )
+from sglang.srt.configs.speculators import normalize_speculators_dspark_config
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, lru_cache_frozenset
 
@@ -61,10 +62,18 @@ _LONGCAT_ARCHS = {
 }
 
 
-def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
-    config_dict, _ = PretrainedConfig.get_config_dict(
+def _try_load_custom_config(model, revision: Optional[str], **kwargs):
+    config_dict, unused_kwargs = PretrainedConfig.get_config_dict(
         model, revision=revision, **kwargs
     )
+    normalized = normalize_speculators_dspark_config(config_dict)
+    if normalized is not None:
+        # The export's auto_map is not an HF AutoConfig entry. Construct the
+        # supported decoder locally while preserving the DSpark architecture.
+        config = Qwen3Config.from_dict(normalized, **unused_kwargs)
+        config._name_or_path = str(model)
+        return config
+
     architectures = config_dict.get("architectures") or []
     if not any(arch in _LONGCAT_ARCHS for arch in architectures):
         return None
@@ -83,7 +92,7 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config = _try_load_custom_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,
