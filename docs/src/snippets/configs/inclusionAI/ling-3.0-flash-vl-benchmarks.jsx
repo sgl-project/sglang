@@ -64,14 +64,14 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
-    notes: "2×GB300, TP=2, --moe-runner-backend flashinfer_mxfp4 (auto-selected after sgl-project/sglang#38526). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split. Without the MXFP4 runner the default auto path enters Triton FP8 MoE and fails during decode graph warmup. Full accuracy suite pending.",
+    notes: "2×GB300, TP=2, flashinfer_mxfp4 MoE backend (explicit flag at measurement time; auto-selected by sglang dev image v4+). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split. Without the MXFP4 runner the default auto path enters Triton FP8 MoE and fails during decode graph warmup. Full accuracy suite pending.",
   },
   { match: { hw: "b300", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" } },
   {
     match: { hw: "dgx-spark", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
-    notes: "DGX Spark GB10, TP=1, --moe-runner-backend flashinfer_mxfp4 (SM120 path). Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop. Full accuracy suite pending.",
+    notes: "DGX Spark GB10, TP=1, flashinfer_mxfp4 MoE backend (SM120 path; explicit flag at measurement time, auto-selected by sglang dev image v4+). Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop. Full accuracy suite pending.",
   },
   {
     match: { hw: "dgx-spark", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" },
