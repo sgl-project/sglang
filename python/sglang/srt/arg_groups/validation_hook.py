@@ -426,16 +426,10 @@ def check_two_batch_overlap(server_args: Any):
     # there needs no extra opt-in env flag.
     cfg = resolving_view(server_args)
 
-    cp_tbo = (
-        get_platform().is_hip
-        and cfg.enable_dsa_prefill_context_parallel
-        and cfg.dsa_prefill_cp_mode == "round-robin-split"
-    )
     if (
         cfg.enable_two_batch_overlap
         and cfg.moe_a2a_backend == "none"
         and not cfg.enable_dp_attention
-        and not cp_tbo
     ):
         raise ValueError(
             "When enabling two batch overlap without an EP a2a backend "
