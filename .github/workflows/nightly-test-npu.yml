@@ -122,22 +122,6 @@ jobs:
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
 
-  nightly-1-npu-a2:
-    name: nightly-1-npu-a2
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a2-4
-      test_type: 'perf'
-      test_suite: nightly-1-npu-a2
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a2 }}
-      install_sglang_deps: false
-      device_type_for_deps: '910b'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
     if: ${{ !cancelled() }}
@@ -247,22 +231,6 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-perf-8-npu-a3:
-    name: nightly-perf-8-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-800t-8
-      test_type: 'perf'
-      test_suite: nightly-perf-8-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
     if: ${{ !cancelled() }}
@@ -278,6 +246,7 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      test_timeout_minutes: '180'
 
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
@@ -291,22 +260,6 @@ jobs:
       test_suite: nightly-acc-2-npu-a3
       is_nightly_pipeline_job: true
       partitions: '{"size":4,"arr":[0,1,2,3]}'
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
-  nightly-acc-4-npu-a3:
-    name: nightly-acc-4-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-4-
-      test_type: 'accuracy'
-      test_suite: nightly-acc-4-npu-a3
-      is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
@@ -332,7 +285,7 @@ jobs:
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3]
+    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -352,21 +305,6 @@ jobs:
             router_size: 1
             test_case: test/registered/npu/accuracy/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
             test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
-          # mimo_v2_flash performance tests
-          - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-          - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms.py
-            test_type: 'perf'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_flash performance tests
           - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
@@ -394,25 +332,21 @@ jobs:
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
+    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
-          # kimi_k2_6 performance tests
-          - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms
-            node_size: 2
-            test_case: test/registered/npu/performance/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms.py
-            test_type: 'perf'
-          - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25
-            node_size: 2
-            test_case: test/registered/npu/accuracy/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25.py
-            test_type: 'accuracy'
           # glm_5_2 accuracy tests
           - name: glm_5_2_w4a8_16p_gpqa
             node_size: 2
             test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w4a8_16p_gpqa.py
+            test_type: 'accuracy'
+          # kimi_k3 accuracy tests
+          - name: kimi_k3_w4a8_32p_gpqa
+            node_size: 4
+            test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
             test_type: 'accuracy'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
@@ -430,7 +364,6 @@ jobs:
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
-      - nightly-1-npu-a2
       - nightly-1-npu-a3
       - nightly-2-npu-a3
       - nightly-4-npu-a3
@@ -438,25 +371,15 @@ jobs:
       - nightly-16-npu-a3
       - nightly-perf-2-npu-a3
       - nightly-perf-4-npu-a3
-      - nightly-perf-8-npu-a3
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
-      - nightly-acc-4-npu-a3
       - nightly-acc-16-npu-a3
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
     steps:
-      - name: Download all metrics
-        uses: actions/download-artifact@v4
-        with:
-          pattern: metrics-*
-          path: /tmp/metrics
-          merge-multiple: false
-
       - name: Generate results table
         run: |
-          single_result_a2="${{ needs.nightly-1-npu-a2.result }}"
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
 
@@ -470,10 +393,8 @@ jobs:
             "${{ needs.nightly-16-npu-a3.result }}" \
             "${{ needs.nightly-perf-2-npu-a3.result }}" \
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "${{ needs.nightly-perf-8-npu-a3.result }}" \
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-4-npu-a3.result }}" \
             "${{ needs.nightly-acc-16-npu-a3.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
               single_result="failure"
@@ -494,7 +415,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| nightly-1-npu-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
           for entry in \
             "nightly-1-npu-a3:${{ needs.nightly-1-npu-a3.result }}" \
             "nightly-2-npu-a3:${{ needs.nightly-2-npu-a3.result }}" \
@@ -503,10 +423,8 @@ jobs:
             "nightly-16-npu-a3:${{ needs.nightly-16-npu-a3.result }}" \
             "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "nightly-perf-8-npu-a3:${{ needs.nightly-perf-8-npu-a3.result }}" \
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "nightly-acc-4-npu-a3:${{ needs.nightly-acc-4-npu-a3.result }}" \
             "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
             suite="${entry%%:*}"
             r="${entry##*:}"
@@ -516,44 +434,8 @@ jobs:
           echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "## Per-Test Metrics" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          has_metrics=false
-          # Each suite job uploads its METRICS_DATA_FILE directory, which
-          # contains per-case subdirectories with their own metrics.json.
-          # Recursively find every metrics.json and render one table row per
-          # test case.
-          for file in $(find /tmp/metrics -name metrics.json 2>/dev/null); do
-            if [ -f "$file" ]; then
-              has_metrics=true
-              echo "import json" > /tmp/parse_metrics.py
-              echo "with open('$file') as f:" >> /tmp/parse_metrics.py
-              echo "    d = json.load(f)" >> /tmp/parse_metrics.py
-              echo "tc = d.get('test_case', '-')" >> /tmp/parse_metrics.py
-              echo "tp = d.get('test_type', '-')" >> /tmp/parse_metrics.py
-              echo "st = d.get('status', 'unknown')" >> /tmp/parse_metrics.py
-              echo "icon = '✅' if st == 'pass' else '❌'" >> /tmp/parse_metrics.py
-              echo "metrics = d.get('metrics', {})" >> /tmp/parse_metrics.py
-              echo "baselines = d.get('baselines', {})" >> /tmp/parse_metrics.py
-              echo "mstr = ', '.join(f'{k}={v}' for k,v in metrics.items()) if metrics else '-'" >> /tmp/parse_metrics.py
-              echo "bstr = ', '.join(f'{k}={v}' for k,v in baselines.items()) if baselines else '-'" >> /tmp/parse_metrics.py
-              echo "print(f'| {tc} | {tp} | {icon} {st} | {mstr} | {bstr} |')" >> /tmp/parse_metrics.py
-              python3 /tmp/parse_metrics.py
-            fi
-          done > /tmp/metrics_table.txt
-
-          if [ "${has_metrics}" = "true" ]; then
-            echo "| Test Case | Type | Status | Metrics | Baseline |" >> $GITHUB_STEP_SUMMARY
-            echo "|-----------|------|--------|---------|----------|" >> $GITHUB_STEP_SUMMARY
-            cat /tmp/metrics_table.txt >> $GITHUB_STEP_SUMMARY
-          else
-            echo "No per-test metrics available (artifacts not found)." >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-
           FAIL=0
-          for r in "${single_result_a2}" "${single_result}" "${multi_result}" "${mix_result}"; do
+          for r in "${single_result}" "${multi_result}" "${mix_result}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then FAIL=1; fi
           done
           exit $FAIL

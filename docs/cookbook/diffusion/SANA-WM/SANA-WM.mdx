@@ -6,32 +6,19 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["video", "realtime", "world model", "camera control", "two-stage"]} />
+<DiffusionModelTags tags={["world model", "720p video", "minute-scale", "6-DoF camera control", "realtime"]} />
 
 ## 1. Model Introduction
 
-[SANA-WM](https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional) is an efficient open-source **world model** from NVLabs, trained natively for one-minute video generation. It is a **2.6B-parameter text+image-to-video (TI2V) diffusion transformer** that synthesizes **720p, minute-scale videos with precise 6-DoF camera control**, paired with an **LTX-2 refiner** for high-fidelity decoding. It builds on the [SANA](https://github.com/NVlabs/Sana) family — efficient high-resolution synthesis with a linear diffusion transformer.
+[SANA-WM](https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional) is NVLabs' 2.6B text-and-image-to-video world model for 720p, minute-scale generation with explicit per-frame 6-DoF camera control. Its hybrid recurrent/softmax attention keeps long causal histories bounded, while an LTX-2 refiner supplies the detail that the fast Stage-1 world model does not produce on its own.
 
-SANA-WM ships in two checkpoints: a **bidirectional** checkpoint (dense, one-shot) and a **streaming** checkpoint (chunk-causal, autoregressive — generated chunk-by-chunk, reusing causal DiT state across chunks for bounded memory → long, even endless, clips). From a single first frame, a text prompt, and a camera trajectory, this cookbook covers **all three serving modes** SGLang exposes:
+Choose the dense checkpoint for the best bounded-clip quality and the streaming checkpoint for long-running or interactive control. Streaming and realtime trade global bidirectional context for bounded state and lower response latency; the realtime WebSocket path is not bit-identical to offline batch streaming.
 
-- **(A) Dense bidirectional** (§4) — the `SANA-WM_bidirectional` checkpoint generated in one shot (no chunking) via **`SanaWMTwoStagePipeline`** over the standard **`/v1/videos`** HTTP API. Highest single-clip quality (full bidirectional attention + dense LTX-2 refiner); matches the NVlabs dense reference.
-- **(B) Batch streaming** (§5) — the `SANA-WM_streaming` checkpoint generated chunk-by-chunk in one request via the same **`SanaWMTwoStagePipeline`** + `--streaming` over **`/v1/videos`**. This is SGLang's offline chunk-causal streaming path: the whole clip is produced chunk-by-chunk internally, then returned.
-- **(C) Live realtime** (§6–7) — the streaming pipeline exposed as **`SanaWMRealtimePipeline`** over a **WebSocket API** at `/v1/realtime_video/generate`, so a browser/client streams camera-action events frame-by-frame and receives video chunks back in real time. Realtime uses the same streaming checkpoint, but the incremental session path is not bit-identical to offline batch streaming.
-
-All three modes share the camera action DSL (§8) and the configuration knobs (§9). Modes (B) and (C) share the streaming checkpoint and the chunk-causal pipeline.
-
-**Key features** (per the official model):
-
-- **Hybrid Linear Attention** — frame-wise Gated DeltaNet (GDN) recurrent blocks combined with softmax attention (every 4th layer, block indices {3,7,11,15,19}) for memory-efficient long-context modeling.
-- **Dual-Branch Camera Control** — independent main and camera branches (UCPE + PRoPE) for precise per-frame 6-DoF trajectory adherence.
-- **Two-Stage Pipeline** — an LTX-2 long-video refiner on top of Stage-1 latents for quality and temporal consistency.
-
-In the **streaming / realtime** configuration this becomes a low-latency, interactive pipeline:
-
-- **Stage-1 chunk-causal DiT** — the streaming path carries a **per-block KV cache** (recurrent GDN state + a softmax K/V window) across chunks; bounded memory means it scales to long / endless sequences. Stage-1 is intentionally coarse.
-- **LTX-2 streaming refiner** — refines each Stage-1 latent chunk block-by-block with a **sink + sliding-history KV cache** (required for sharp output).
-- **Causal LTX-2 VAE** — decodes latents chunk-by-chunk with a carried conv-cache for seam-free frames.
-- **Camera control** — drive the camera with a compact **WASD/IJKL** action DSL (move with WASD, look with IJKL; see §8) — supplied at request time on the `/v1/videos` paths, or pushed over the WebSocket at init / as live per-chunk events on the realtime path (see §7).
+| Serving mode | Checkpoint and API | Best fit | Tradeoff |
+| --- | --- | --- | --- |
+| Dense bidirectional | `SANA-WM_bidirectional` via `/v1/videos` | Highest single-clip quality | Bounded one-shot generation; full attention cost |
+| Batch streaming | `SANA-WM_streaming` via `/v1/videos` | Long clips returned as one job | Chunk-causal context rather than global bidirectional context |
+| Live realtime | `SANA-WM_streaming` via WebSocket | Interactive camera events and incremental output | Stateful session; not bit-identical to batch streaming |
 
 **Architecture & components**
 
@@ -44,7 +31,7 @@ In the **streaming / realtime** configuration this becomes a low-latency, intera
 | Refiner | LTX-2 Stage-2 distilled; ~41 GB |
 | Output | up to 720p (704×1280) @ 16 fps, minute-scale |
 
-For more details, see the [SANA-WM paper (arXiv)](https://arxiv.org/abs/2605.15178), the [SANA project page](https://nvlabs.github.io/Sana/), the [NVlabs/Sana GitHub](https://github.com/NVlabs/Sana), and the [SANA-WM_bidirectional model card](https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional) (Apache-2.0).
+For architecture and training details, see the [SANA-WM paper](https://arxiv.org/abs/2605.15178) and [model card](https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional) (Apache-2.0).
 
 ## 2. Installation
 

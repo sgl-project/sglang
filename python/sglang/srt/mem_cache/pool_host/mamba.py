@@ -5,13 +5,12 @@ import threading
 from typing import Optional
 
 import numpy as np
-import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.pool_host.base import (
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
+    host_memory_budget_bytes,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -96,9 +95,8 @@ class MambaPoolHost(HostKVCache):
                 device_pool.size,
             )
 
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_memory_budget_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -148,6 +146,9 @@ class MambaPoolHost(HostKVCache):
                 device=device,
                 pin_memory=pin_memory,
                 allocator=allocator,
+                registration_granularity_bytes=(
+                    int(np.prod(dims[1:])) * dtype.itemsize
+                ),
             )
 
         if self.layout in ["page_first", "page_first_direct"]:
@@ -251,9 +252,9 @@ class MambaPoolHost(HostKVCache):
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert (
-            need_size % self.page_size == 0
-        ), "The requested size should be a multiple of the page size."
+        assert need_size % self.page_size == 0, (
+            "The requested size should be a multiple of the page size."
+        )
         if need_size > self.available_size():
             return None
 

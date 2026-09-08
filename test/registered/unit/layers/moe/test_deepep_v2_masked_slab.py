@@ -1,10 +1,4 @@
-"""Unit tests for the DeepEP v2 masked-masked_x repack Triton kernels.
-
-Covers the corner cases flagged in review: empty expert, single hot expert,
-per-expert count near / over max_m (overflow -> fail-fast, not silent truncation),
-top-k weight fusion on real rows only, expanded<->masked_x round-trip layout, and the
-fp8 activation+scale path.
-"""
+"""Tests for the DeepEP v2 expanded/masked repack kernels."""
 
 import unittest
 
@@ -23,11 +17,7 @@ DEVICE = "cuda"
 
 
 def _build_layout(counts, align, hidden, dtype, with_scale=False, scale_hidden=4):
-    """Build (recv_x, recv_x_scale, psum, starts, total) for given per-expert counts.
-
-    Mirrors the DeepEP v2 expanded layout: expert e occupies rows
-    [align(psum[e-1]), psum[e]) with psum[-1] == 0.
-    """
+    """Build synthetic expanded-layout buffers for per-expert counts."""
     starts, psum = [], []
     prev_end = 0
     for c in counts:
@@ -38,9 +28,7 @@ def _build_layout(counts, align, hidden, dtype, with_scale=False, scale_hidden=4
         prev_end = end
     total = max(((prev_end + align - 1) // align) * align, 1)
 
-    # Unique value per real row (kept small so the x2 column stays inside the
-    # e4m3 range), alternating x1/x2 along hidden so a kernel that broadcast one
-    # column across the row, or mis-strided the hidden offset, is caught.
+    # Vary rows and columns to expose broadcast or stride errors.
     base = torch.zeros((total, hidden), dtype=torch.float32, device=DEVICE)
     col_gain = 1.0 + (torch.arange(hidden, device=DEVICE) % 2).float()
     for s, c in zip(starts, counts):
@@ -51,8 +39,7 @@ def _build_layout(counts, align, hidden, dtype, with_scale=False, scale_hidden=4
     scale = None
     if with_scale:
         scale = torch.zeros((total, scale_hidden), dtype=torch.float32, device=DEVICE)
-        # Distinct value per scale column: a row constant along scale_hidden
-        # cannot catch a kernel that reads column 0 for every column.
+        # Vary scale columns to expose pack-dimension stride errors.
         col = torch.arange(scale_hidden, dtype=torch.float32, device=DEVICE)
         for s, c in zip(starts, counts):
             for j in range(c):
@@ -83,11 +70,9 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
             recv_x, scale, psum, E, self.MAX_M, self.ALIGN
         )
 
-        # masked_m == real per-expert count
         self.assertEqual(masked_m.tolist(), list(counts))
         self.assertEqual(tuple(masked_x.shape), (E, self.MAX_M, self.HIDDEN))
 
-        # masked_x real rows == source expanded rows
         for e, (s, c) in enumerate(zip(starts, counts)):
             for j in range(c):
                 torch.testing.assert_close(
@@ -98,7 +83,6 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
                         masked_x_scale[e, j].float(), scale[s + j].float()
                     )
 
-        # round-trip back to expanded order
         weights = None
         if topk:
             weights = torch.zeros(total, dtype=torch.float32, device=DEVICE)
@@ -135,13 +119,11 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
         )
 
     def test_count_at_max_m_boundary(self):
-        # exactly max_m must be kept (no overflow, no truncation)
         self._check_expand_roundtrip(
             [self.MAX_M, 1, self.MAX_M], torch.bfloat16, with_scale=False
         )
 
     def test_overflow_fails_fast(self):
-        # one expert exceeds max_m -> must raise, not silently truncate
         counts = [self.MAX_M + 1, 2]
         recv_x, scale, psum, starts, total = _build_layout(
             counts, self.ALIGN, self.HIDDEN, torch.bfloat16
@@ -152,16 +134,12 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
             )
 
     def _production_packed_ue8m0_layout(self, counts):
-        """Expanded FP8 rows + scales built by the PRODUCTION quantizer with the
-        Blackwell flags (packed ue8m0, column-major): scale is int32 with
-        pack-dim stride != 1, unlike Hopper's row-major fp32."""
+        """Build expanded rows with the production packed UE8M0 quantizer."""
         from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
 
-        # 1024 = 8 quant groups of 128 -> the packed scale has ceil(8/4) = 2 int32
-        # columns. At hidden <= 512 it collapses to a single column: the pack-dim
-        # offset is always 0 and the pack-dim stride is never exercised.
+        # hidden=1024 ensures the packed scale has multiple columns.
         hidden = 1024
         raw, _, psum, starts, total = _build_layout(
             counts, self.ALIGN, hidden, torch.bfloat16
@@ -179,9 +157,6 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
         return recv_x, recv_x_scale, psum, starts, total, hidden
 
     def test_fp8_packed_ue8m0_scale_from_production_quantizer(self):
-        # The Blackwell dispatch scale is packed ue8m0 in column-major layout,
-        # so the repack must honor the scale pack-dim stride; the row-major
-        # fp32 cases above (stride(1) == 1) cannot regress it.
         counts = [3, 1, 6, 2]
         recv_x, recv_x_scale, psum, starts, _, hidden = (
             self._production_packed_ue8m0_layout(counts)
@@ -200,9 +175,7 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
                 torch.testing.assert_close(masked_x_scale[e, j], recv_x_scale[s + j])
 
     def test_expand_under_cuda_graph_capture(self):
-        # The masked repack runs inside the captured decode CUDA graph, so it
-        # must be capture-safe (no host sync) and correct after replay, with the
-        # production packed ue8m0 scale layout.
+        # Exercise replay with the production packed scale layout.
         counts = [3, 1, 6, 2]
         recv_x, recv_x_scale, psum, starts, _, _ = self._production_packed_ue8m0_layout(
             counts
@@ -230,13 +203,7 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
 
 
 class TestDeepEPv2HandleLifecycle(CustomTestCase):
-    """CPU-only guards of the dispatch/combine handle lifecycle.
-
-    The guards are ordered before any DeepEP work, so misuse is testable
-    without deep_ep installed and without a GPU. The positive dispatch ->
-    combine path needs real ElasticBuffer communication and is covered by the
-    GPU accuracy runs instead.
-    """
+    """CPU-only dispatch/combine handle guards."""
 
     @staticmethod
     def _bare_impl():

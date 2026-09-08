@@ -1,4 +1,5 @@
 import logging
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -241,7 +242,7 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
         for idx in range(topk):
             expert_id = tl.load(token_topk_ids_ptr + idx)
             if expert_id != num_local_experts:
-                dst_idx = tl.load(token_src2dst_ptr + idx)
+                dst_idx = tl.load(token_src2dst_ptr + idx).to(tl.int64)
                 tl.store(dst_ptr_offs + dst_idx * hidden_size, out_data, mask=mask)
 
 
@@ -417,16 +418,16 @@ def silu_and_mul_masked_post_quant_fwd(
 
     if output_scale.dtype == torch.int32:
         assert scale_ue8m0, "packed int32 scales are UE8M0 by definition"
-        assert (
-            num_real_tokens is not None and topk is not None
-        ), "the packed schedule sizes its grid from num_real_tokens * topk"
+        assert num_real_tokens is not None and topk is not None, (
+            "the packed schedule sizes its grid from num_real_tokens * topk"
+        )
         E, m_max, _ = input.shape
         G = size_n // quant_group_size
         assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
         BLOCK_N = quant_group_size * 4
-        assert (
-            size_n % BLOCK_N == 0
-        ), "packed UE8M0 path requires size_n % (4*group) == 0"
+        assert size_n % BLOCK_N == 0, (
+            "packed UE8M0 path requires size_n % (4*group) == 0"
+        )
         hidden_dim_split = size_n // BLOCK_N
         assert tuple(output_scale.shape) == (E, hidden_dim_split, m_max)
 
@@ -911,9 +912,7 @@ def post_reorder_deepgemm_triton_kernel(
     BLOCK_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
-    """`expert_id >= 0` includes the shared expert at num_experts (padding=-1); don't
-    switch to the cutlass `!= num_local_experts` gate. routed_scaling_factor is folded into the store.
-    """
+    """Accumulate valid permuted rows; routed_scaling_factor is folded into the store."""
     OutDtype = output_ptr.dtype.element_ty
 
     offset = BLOCK_SIZE * tl.program_id(1) + tl.arange(0, BLOCK_SIZE)
@@ -935,9 +934,8 @@ def post_reorder_deepgemm_triton_kernel(
 
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
         for idx in range(topk):
-            expert_id = tl.load(token_topk_ids_ptr + idx)
-            if expert_id >= 0:
-                dst_idx = tl.load(token_src2dst_ptr + idx).to(tl.int64)
+            dst_idx = tl.load(token_src2dst_ptr + idx).to(tl.int64)
+            if dst_idx >= 0:
                 weight_scale = tl.load(token_topk_weights_ptr + idx).to(tl.float32)
                 load_ptr_offs = down_output_ptr_offs + dst_idx * hidden_size
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
@@ -1074,6 +1072,8 @@ def _fwd_kernel_ep_scatter_2(
     output_index,
     output_index_stride0,
     output_index_stride1,
+    expert_start,
+    num_experts,
     topk_num: tl.constexpr,
     HIDDEN_SIZE: tl.constexpr,
     HIDDEN_SIZE_PAD: tl.constexpr,
@@ -1105,17 +1105,24 @@ def _fwd_kernel_ep_scatter_2(
 
         for topk_idx_int32 in tl.range(0, topk_num, 1, num_stages=4):
             topk_index = topk_idx_int32.to(tl.int64)
-            expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
-            if expert_id >= 0:
+            global_expert_id = tl.load(
+                recv_topk + token_id * recv_topk_stride0 + topk_index
+            )
+            expert_id = global_expert_id - expert_start
+            output_index_ptr = (
+                output_index + token_id * output_index_stride0 + topk_index
+            )
+            valid = (expert_id >= 0) & (expert_id < num_experts)
+            # The post-permute path uses this index as the validity sentinel.
+            # Initialize non-local/padding lanes in this same kernel.
+            tl.store(output_index_ptr, -1)
+            if valid:
                 dest_token_index_int32 = tl.atomic_add(
                     expert_start_loc + expert_id, 1, sem=ATOMIC_ADD_SEM
                 )
                 dest_token_index = dest_token_index_int32.to(tl.int64)
 
-                tl.store(
-                    output_index + token_id * output_index_stride0 + topk_index,
-                    dest_token_index_int32,
-                )
+                tl.store(output_index_ptr, dest_token_index_int32)
                 output_tensor_ptr = (
                     output_tensor + dest_token_index * output_tensor_stride0
                 )
@@ -1148,8 +1155,12 @@ def ep_scatter(
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
     quant_block_size: int = 128,
+    expert_alignment: int = 128,
+    expert_start: int = 0,
 ):
-    BLOCK_E = 128  # token num of per expert is aligned to 128
+    # tl.arange needs pow2, and the kernel's unmasked stores need BLOCK_E to
+    # divide the expert_alignment-padded segments; lowbit satisfies both.
+    BLOCK_E = expert_alignment & -expert_alignment
     BLOCK_D = quant_block_size  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
@@ -1167,9 +1178,9 @@ def ep_scatter(
 
     is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
     if is_fp8:
-        assert (
-            recv_x_scale.dtype == output_tensor_scale.dtype
-        ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+        assert recv_x_scale.dtype == output_tensor_scale.dtype, (
+            f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+        )
         assert (
             recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
         )
@@ -1208,6 +1219,8 @@ def ep_scatter(
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        expert_start,
+        num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
@@ -1240,9 +1253,7 @@ def _fwd_kernel_ep_scatter_psum_init(
 
     off_expert = tl.arange(0, BLOCK_E)
     for start_m in tl.range(0, cur_token_num, BLOCK_E, num_stages=4):
-        # cur_token_num need not be a multiple of BLOCK_E; mask the tail block so
-        # the final partial iteration does not write past this expert's region
-        # (which is packed right up against the next expert) and corrupt it.
+        # Mask the tail because this expert is packed against the next one.
         idx = cur_start + start_m + off_expert
         tl.store(m_indices + idx, cur_expert, mask=idx < cur_end)
 
@@ -1542,12 +1553,13 @@ def tma_align_input_scale(input_scale: torch.Tensor):
 
 @triton.jit
 def fused_moe_dispatch_index_triton_kernel(
-    topk_ids_ptr,  # flat (num_toks,) int32; -1 = padding (drives the `expert >= 0` gate)
+    topk_ids_ptr,  # flat (num_toks,) int32; global or already-local expert IDs
     src2dst_ptr,
     masked_m_ptr,
     m_max,
     num_toks,
     num_experts,
+    expert_start,
     BLOCK_SIZE: tl.constexpr,
     ZERO_INIT: tl.constexpr,
 ):
@@ -1565,19 +1577,23 @@ def fused_moe_dispatch_index_triton_kernel(
         tl.debug_barrier()
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_toks
-    expert = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
-    valid = mask & (expert >= 0)
+    global_expert = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
+    expert = global_expert - expert_start
+    valid = mask & (expert >= 0) & (expert < num_experts)
     # Clamp masked lanes to bin 0 so the masked atomic's pointer stays in-bounds.
     expert_safe = tl.where(valid, expert, 0)
     offset = tl.atomic_add(masked_m_ptr + expert_safe, 1, mask=valid)
     dst = expert_safe * m_max + offset
-    tl.store(src2dst_ptr + offs, dst, mask=valid)
+    # post_reorder checks src2dst, so mark padding/non-local lanes -1 here to
+    # prevent uninitialized offsets from adding bogus expert contributions.
+    tl.store(src2dst_ptr + offs, tl.where(valid, dst, -1), mask=mask)
 
 
 def fused_moe_dispatch_index(
     topk_ids: torch.Tensor,
     num_local_experts: int,
     m_max: int,
+    expert_start: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_toks = topk_ids.numel()
     src2dst = torch.empty(num_toks, device=topk_ids.device, dtype=torch.int32)
@@ -1602,6 +1618,7 @@ def fused_moe_dispatch_index(
         m_max,
         num_toks,
         num_local_experts,
+        expert_start,
         BLOCK_SIZE=BLOCK_SIZE,
         ZERO_INIT=single_block,
     )
@@ -1637,9 +1654,8 @@ def fill_gateup_input_triton_kernel(
 
     vec = tl.arange(0, BLOCK_SIZE)
     for idx in range(topk):
-        expert_id = tl.load(topk_ids_ptr + idx)
-        if expert_id >= 0:
-            dst_idx_int32 = tl.load(src2dst_ptr + idx)
+        dst_idx_int32 = tl.load(src2dst_ptr + idx)
+        if dst_idx_int32 >= 0:
             dst_idx = dst_idx_int32.to(tl.int64)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
@@ -1681,6 +1697,7 @@ def moe_ep_deepgemm_preprocess(
     block_shape,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
     use_mxfp8: bool = False,
+    expert_start: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
     m_max = (hidden_states.size(0) // 256 + 1) * 256
@@ -1700,12 +1717,16 @@ def moe_ep_deepgemm_preprocess(
         # correctness is unconditional (m_cap >= max(masked_m) by
         # construction, and the final src2dst below is built with the same
         # capped stride).
-        masked_m_probe, _ = fused_moe_dispatch_index(topk_ids, num_local_experts, m_max)
+        masked_m_probe, _ = fused_moe_dispatch_index(
+            topk_ids, num_local_experts, m_max, expert_start=expert_start
+        )
         m_cap = (int(masked_m_probe.max().item()) + 255) // 256 * 256
         m_max = min(m_max, max(m_cap, 256))
     expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
 
-    masked_m, src2dst = fused_moe_dispatch_index(topk_ids, num_local_experts, m_max)
+    masked_m, src2dst = fused_moe_dispatch_index(
+        topk_ids, num_local_experts, m_max, expert_start=expert_start
+    )
 
     gateup_input = torch.empty(
         (num_local_experts, m_max, hidden_states.size(1)),
@@ -2069,6 +2090,45 @@ def silu_and_mul_masked_post_per_tensor_quant_fwd(
 
 
 @triton.jit
+def _requant_row(
+    x_ptr,
+    x_scale_ptr,
+    x_scale_stride0,
+    x_scale_stride1,
+    output_ptr,
+    m,
+    k,
+    expert,
+    row,
+    output_scale_val_inv,
+    k_offsets,
+    scale_g_offsets,
+    g_mask,
+    HAS_G_TAIL: tl.constexpr,
+):
+    """Requantize one row; shared by both phases so they write rows identically."""
+    row_base = expert.to(tl.int64) * m + row
+    x_ptrs = x_ptr + row_base * k + k_offsets
+    output_ptrs = output_ptr + row_base * k + k_offsets
+    x_scale_ptrs = (
+        x_scale_ptr + expert * x_scale_stride0 + row * x_scale_stride1 + scale_g_offsets
+    )
+    if HAS_G_TAIL:
+        hidden = tl.load(x_ptrs, mask=g_mask[:, None], other=0.0)
+        group_scale = tl.load(x_scale_ptrs, mask=g_mask, other=0.0)
+    else:
+        hidden = tl.load(x_ptrs)
+        group_scale = tl.load(x_scale_ptrs)
+    scaled = hidden.to(tl.float32) * group_scale.to(tl.float32)[:, None]
+    scaled = scaled * output_scale_val_inv
+    quantized = scaled.to(output_ptr.dtype.element_ty)
+    if HAS_G_TAIL:
+        tl.store(output_ptrs, quantized, mask=g_mask[:, None])
+    else:
+        tl.store(output_ptrs, quantized)
+
+
+@triton.jit
 def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     x_ptr,
     x_scale_ptr,
@@ -2080,34 +2140,154 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     output_ptr,
     m,
     k,
+    num_experts,
+    row_cap,
     K_SCALE_BLOCK_SIZE: tl.constexpr,
-    K_BLOCK_SIZE: tl.constexpr,
+    G_BLOCK_SIZE: tl.constexpr,
+    HAS_G_TAIL: tl.constexpr,
+    EXPERT_BLOCK: tl.constexpr,
 ):
-    pid_k, pid_m, pid_e = (
+    pid_g, pid_m, pid_e = (
         tl.program_id(axis=0),
         tl.program_id(axis=1),
         tl.program_id(axis=2),
     )
-    pid_m_dim = tl.num_programs(1)
+    m_grid = tl.num_programs(1)
 
-    token_id = pid_m
-    last_effective_id = tl.load(masked_m_ptr + pid_e)
-
-    if token_id >= last_effective_id:
-        return
     output_scale_val_inv = 1.0 / tl.load(output_scale_ptr).to(tl.float32)
-    k_offsets = pid_k * K_BLOCK_SIZE + tl.arange(0, K_BLOCK_SIZE)
-    scale_offsets = (k_offsets // K_SCALE_BLOCK_SIZE) * x_scale_stride2
 
-    x_ptrs = x_ptr + pid_e * m * k + k_offsets
-    output_ptrs = output_ptr + pid_e * m * k + k_offsets
-    x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + scale_offsets
+    # Tile whole scale groups: one scalar scale load per group.  DeepEP scales
+    # are column-major in the last two dims, so element-axis loads would gather.
+    g_offsets = pid_g * G_BLOCK_SIZE + tl.arange(0, G_BLOCK_SIZE)
+    k_offsets = (
+        g_offsets[:, None] * K_SCALE_BLOCK_SIZE
+        + tl.arange(0, K_SCALE_BLOCK_SIZE)[None, :]
+    )
+    g_mask = g_offsets < k // K_SCALE_BLOCK_SIZE
+    scale_g_offsets = g_offsets * x_scale_stride2
 
-    for tok_idx in tl.range(token_id, last_effective_id, pid_m_dim):
-        hidden = tl.load(x_ptrs + tok_idx * k).to(tl.float32)
-        scale_fp32 = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1).to(tl.float32)
-        hidden = hidden * scale_fp32 * output_scale_val_inv
-        tl.store(output_ptrs + tok_idx * k, hidden.to(output_ptr.dtype.element_ty))
+    # Phase 1: this expert's rows below row_cap, strided over the m-grid.
+    last_effective_id = tl.load(masked_m_ptr + pid_e)
+    for row in tl.range(pid_m, min(last_effective_id, row_cap), m_grid):
+        _requant_row(
+            x_ptr,
+            x_scale_ptr,
+            x_scale_stride0,
+            x_scale_stride1,
+            output_ptr,
+            m,
+            k,
+            pid_e,
+            row,
+            output_scale_val_inv,
+            k_offsets,
+            scale_g_offsets,
+            g_mask,
+            HAS_G_TAIL,
+        )
+
+    # Phase 2: rows above row_cap are shared across the whole launch, so a hot
+    # expert cannot serialize; a batch with no overflow pays one reduction here.
+    expert_ids = tl.arange(0, EXPERT_BLOCK)
+    counts = tl.load(masked_m_ptr + expert_ids, mask=expert_ids < num_experts, other=0)
+    overflow = tl.maximum(counts - row_cap, 0)
+    total_overflow = tl.sum(overflow)
+    if total_overflow == 0:
+        return
+
+    # The inclusive prefix sum maps flat index i to (expert, row): the owner is
+    # however many experts finish at or before i; zero-overflow experts drop out.
+    overflow_before = tl.cumsum(overflow)
+    flat_id = pid_e * m_grid + pid_m
+    num_programs = m_grid * num_experts
+    for i in tl.range(flat_id, total_overflow, num_programs):
+        expert = tl.sum((overflow_before <= i).to(tl.int32))
+        started = tl.max(tl.where(overflow_before <= i, overflow_before, 0))
+        _requant_row(
+            x_ptr,
+            x_scale_ptr,
+            x_scale_stride0,
+            x_scale_stride1,
+            output_ptr,
+            m,
+            k,
+            expert,
+            row_cap + (i - started),
+            output_scale_val_inv,
+            k_offsets,
+            scale_g_offsets,
+            g_mask,
+            HAS_G_TAIL,
+        )
+
+
+# Tuned in bytes per lane, not elements: warp width differs by vendor, and
+# 16 B/lane measured best on both H200 (2048 elems) and MI350X (4096).
+# Below _REQUANT_MANY_EXPERTS the grid underfills NVIDIA parts and a half
+# tile buys k-block parallelism; that costs MI350X up to 5% there.
+_REQUANT_BYTES_PER_LANE = 16
+_REQUANT_BYTES_PER_LANE_FEW_EXPERTS = 8
+_REQUANT_MANY_EXPERTS = 32
+_REQUANT_NUM_WARPS = 4
+_REQUANT_DEFAULT_WARP_SIZE = 32
+_REQUANT_M_GRID_MAX = 32
+_REQUANT_M_GRID_MIN = 4
+# Program target on the (m-grid x expert) plane while rows are scarce; measured,
+# and deliberately not scaled to core count (8 per core was worse on MI350X).
+_REQUANT_TARGET_PROGRAMS = 1024
+# Past this many rows per expert the capped-away programs would carry real work.
+_REQUANT_ROWS_SATURATED = 64
+# Rows past slack * expected_rows go to the shared phase.  2x keeps ordinary
+# variation per-expert; measured 4% at even load and removes the skew regression.
+_REQUANT_ROW_CAP_SLACK = 2
+
+
+def _floor_pow2(value: int) -> int:
+    return 1 << (max(1, value).bit_length() - 1)
+
+
+@lru_cache(maxsize=None)
+def requant_warp_size(device: torch.device) -> int:
+    """Lanes per warp, which sets the tile width the requant launches."""
+    return torch.cuda.get_device_properties(device).warp_size
+
+
+def requant_launch_geometry(
+    num_groups: int,
+    num_experts: int,
+    group_size: int = 128,
+    expected_rows: Optional[int] = None,
+    warp_size: int = _REQUANT_DEFAULT_WARP_SIZE,
+    max_rows: int = 1 << 30,
+) -> Tuple[int, int, int]:
+    """Pick (groups per program, m-grid, row cap) for the requant.
+
+    All three are launch hints: any values produce the same bytes.  The row
+    estimate rounds down to a power of two because ``dispatch_a`` reports
+    ``(rows + num_experts) // num_experts``, one high at exact averages.
+    ``warp_size`` scales the tile to keep bytes per lane constant.
+    """
+    # The payload is fp8, so a byte per lane is an element per lane.
+    bytes_per_lane = (
+        _REQUANT_BYTES_PER_LANE
+        if num_experts >= _REQUANT_MANY_EXPERTS
+        else _REQUANT_BYTES_PER_LANE_FEW_EXPERTS
+    )
+    tile_elems = bytes_per_lane * _REQUANT_NUM_WARPS * warp_size
+    # Clamp to the payload.  Non-pow2 group counts (40, 48) leave the last tile
+    # partly masked, up to 8% behind a narrower tile on MI350X; accepted, since
+    # per-width constants only moved the loss.
+    g_block = min(_floor_pow2(tile_elems // group_size), _floor_pow2(num_groups))
+    if expected_rows is None:
+        # Nothing to place a cap against, so leave every row with its own expert.
+        return g_block, _REQUANT_M_GRID_MAX, max_rows
+    m_grid = min(_REQUANT_M_GRID_MAX, _floor_pow2(expected_rows))
+    if expected_rows < _REQUANT_ROWS_SATURATED:
+        m_grid = min(
+            m_grid, _floor_pow2(_REQUANT_TARGET_PROGRAMS // max(1, num_experts))
+        )
+    row_cap = min(max_rows, max(1, expected_rows) * _REQUANT_ROW_CAP_SLACK)
+    return g_block, max(_REQUANT_M_GRID_MIN, m_grid), row_cap
 
 
 def fp8_per_token_to_per_tensor_quant_triton(
@@ -2116,16 +2296,35 @@ def fp8_per_token_to_per_tensor_quant_triton(
     masked_m: torch.Tensor,
     output_scale: torch.Tensor,
     output: torch.Tensor,
+    expected_rows: Optional[int] = None,
 ):
+    # The 2-D tile indexes within a group via tl.arange, so the group width
+    # must be a power of two.
     K_SCALE_BLOCK_SIZE = 128
     assert len(x.shape) == 3 and x.size(2) % K_SCALE_BLOCK_SIZE == 0
     assert x.is_contiguous()
+    assert output.shape == x.shape and output.is_contiguous()
+    # Addressing flattens (expert, row) by raw strides; a shape mismatch reads
+    # out of bounds rather than failing.
+    assert masked_m.shape[0] == x.size(0)
+    assert x_scale.size(0) == x.size(0) and x_scale.size(1) == x.size(1)
     assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
+    # Under `use_ue8m0` DeepEP returns int32-packed UE8M0 scales; reinterpreting
+    # those as fp32 would quantize against garbage.
+    assert x_scale.dtype == torch.float32
     assert output_scale.numel() == 1
 
-    K_BLOCK_SIZE = 1024
-    assert x.size(2) % K_BLOCK_SIZE == 0
-    grid = (x.size(2) // K_BLOCK_SIZE, 32, x.size(0))
+    num_experts = x.size(0)
+    num_groups = x.size(2) // K_SCALE_BLOCK_SIZE
+    g_block, m_grid, row_cap = requant_launch_geometry(
+        num_groups=num_groups,
+        num_experts=num_experts,
+        group_size=K_SCALE_BLOCK_SIZE,
+        expected_rows=expected_rows,
+        warp_size=requant_warp_size(x.device),
+        max_rows=x.size(1),
+    )
+    grid = (triton.cdiv(num_groups, g_block), m_grid, num_experts)
     _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
         x,
         x_scale,
@@ -2135,30 +2334,23 @@ def fp8_per_token_to_per_tensor_quant_triton(
         output,
         x.size(1),
         x.size(2),
+        num_experts,
+        row_cap,
         K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
-        K_BLOCK_SIZE=K_BLOCK_SIZE,
-        num_warps=8,
+        G_BLOCK_SIZE=g_block,
+        HAS_G_TAIL=(num_groups % g_block != 0),
+        EXPERT_BLOCK=triton.next_power_of_2(num_experts),
+        num_warps=_REQUANT_NUM_WARPS,
     )
 
 
-# ---------------------------------------------------------------------------
-# DeepEP v2 decode masked-GEMM bridge: repack the expanded expert-packed
-# dispatch buffer into a regular [E_local, max_m, hidden] slab so DeepGEMM's
-# *masked* grouped GEMM can bound compute by per-expert real counts (masked_m)
-# instead of the dispatch capacity. All-GPU, static shapes -> cuda-graph safe.
-# Expanded psum semantics (DeepEP v2): psum[e] = align(psum[e-1], ALIGN) + count_e,
-# so expert e occupies recv rows [align(psum[e-1]) : psum[e]); count_e real tokens.
-# Non-expand (contiguous) psum semantics differ: psum[e] is the inclusive prefix
-# sum of alignment-PADDED counts, so every psum[e] is a multiple of ALIGN and
-# psum[e-1] is expert e's aligned group start (consumed by ep_scatter_from_psum).
-# ---------------------------------------------------------------------------
+# Expanded psum starts each expert at align(psum[e-1]); contiguous psum already
+# includes the alignment padding.
 
 _DEEPEP_V2_REPACK_WORKERS_PER_EXPERT = 64
 
 
-# recv_x_scale_stride1 carries the scale pack-dim stride so the repack reads
-# both row-major (Hopper fp32) and column-major packed UE8M0 (Blackwell int32)
-# dispatch-scale layouts correctly.
+# Scale strides support row-major FP32 and packed column-major UE8M0.
 @triton.jit
 def _fwd_kernel_expand_to_masked_slab(
     psum_ptr,
@@ -2182,10 +2374,7 @@ def _fwd_kernel_expand_to_masked_slab(
     CHECK_OVERFLOW: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
 ):
-    # Keep a fixed worker pool per expert and let each worker walk only real rows.
-    # This avoids launching cdiv(MAX_M, BLOCK_M) programs for a conservative
-    # max_m when decode traffic contains only a few rows per expert. The grid is
-    # still static and therefore cuda-graph safe.
+    # A fixed worker grid makes conservative max_m values graph-safe.
     e = tl.program_id(0)
     worker = tl.program_id(1)
     prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
@@ -2196,9 +2385,7 @@ def _fwd_kernel_expand_to_masked_slab(
     if worker == 0:
         tl.store(masked_m_ptr + e, count)
         if CHECK_OVERFLOW:
-            # Eager execution reports an invalid bound instead of truncating.
-            # Graph replay uses the proven cap * ep_size upper bound and omits
-            # this host-observable flag and its per-layer reset kernel.
+            # Graph capture omits this host-visible overflow flag.
             ovf = tl.arange(0, 1)
             tl.store(overflow_ptr + ovf, 1, mask=raw_count > MAX_M)
     off = tl.arange(0, HIDDEN_PAD)
@@ -2217,10 +2404,7 @@ def _fwd_kernel_expand_to_masked_slab(
                 + off_s * recv_x_scale_stride1,
                 mask=mask_s,
             )
-            # mn-major write: physical layout [E, SCALE_HIDDEN, MAX_M], element
-            # (e, s, j). Viewed as [E, MAX_M, SCALE_HIDDEN] this is the mn-major
-            # TMA-aligned layout deep_gemm wants, so the GEMM-side transpose
-            # (get_mn_major_tma_aligned_tensor) becomes a no-op.
+            # Write physical [E, SCALE_HIDDEN, MAX_M] for an mn-major view.
             tl.store(
                 output_tensor_scale_ptr + e * SCALE_HIDDEN * MAX_M + off_s * MAX_M + j,
                 vs,
@@ -2247,6 +2431,7 @@ def expand_to_masked_slab(
         (num_local_experts,), device=recv_x.device, dtype=torch.int32
     )
     check_overflow = not torch.cuda.is_current_stream_capturing()
+    # Dummy pointer under capture; CHECK_OVERFLOW compiles out every store to it.
     overflow = (
         torch.zeros((1,), device=recv_x.device, dtype=torch.int32)
         if check_overflow
@@ -2254,14 +2439,7 @@ def expand_to_masked_slab(
     )
     if is_fp8:
         sh = recv_x_scale.shape[1]
-        # mn-major scale: store physically as [E, sh, max_m] (contiguous),
-        # return a [E, max_m, sh] view with mn-major stride. This matches
-        # deep_gemm's mn-major TMA-aligned scale layout, so the per-layer
-        # get_mn_major_tma_aligned_tensor call on the GEMM side is a no-op.
-        # On Hopper that call still runs and would transpose if the layout ever
-        # failed to match. On Blackwell (DEEPGEMM_SCALE_UE8M0) it does not:
-        # _run_masked_gemm takes the packed-ue8m0 branch and consumes this scale
-        # as-is, so correctness there does depend on this write being mn-major.
+        # Store [E, sh, max_m] so the returned transpose is mn-major.
         output_tensor_scale = torch.empty(
             (num_local_experts * sh, max_m),
             device=recv_x.device,
@@ -2300,14 +2478,7 @@ def expand_to_masked_slab(
         NUM_WORKERS=num_workers,
         num_warps=4,
     )
-    # Outside cuda graph capture, fail fast on slab overflow rather than return a
-    # silently truncated result. During capture we skip the host read to keep the
-    # path graph-safe; the eager warmup forward validates representative shapes.
-    # Safety under graph replay therefore relies on the static upper bound
-    # max_m = cap * ep_group_size holding: each rank sends at most `cap` tokens
-    # (enforced by the dispatch-entry assert) and a token contributes at most once
-    # per local expert, so no expert can exceed max_m. If those invariants change,
-    # graph replay would NOT fail-fast on overflow — re-validate before relying on it.
+    # Capture relies on max_m = cap * ep_group_size; eager also checks counts.
     if check_overflow and int(overflow.item()) != 0:
         raise RuntimeError(
             f"DeepEP v2 masked slab overflow: an expert received more than max_m="
@@ -2316,7 +2487,6 @@ def expand_to_masked_slab(
         )
     output_tensor = output_tensor.view(num_local_experts, max_m, hidden)
     if is_fp8:
-        # physical [E, sh, max_m] -> [E, max_m, sh] view with mn-major stride (no copy)
         output_tensor_scale = output_tensor_scale.view(
             num_local_experts, sh, max_m
         ).transpose(1, 2)
@@ -2338,7 +2508,6 @@ def _fwd_kernel_masked_slab_to_expand(
     HAS_W: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
 ):
-    # Fixed worker pool; see _fwd_kernel_expand_to_masked_slab. cuda-graph safe.
     e = tl.program_id(0)
     worker = tl.program_id(1)
     prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
@@ -2366,13 +2535,10 @@ def masked_slab_to_expand(
     expert_alignment: int,
     topk_weights=None,
 ):
-    """[E_local, max_m, hidden] masked-GEMM output -> [total, hidden] expanded order.
+    """Convert masked-GEMM output to expanded order.
 
-    Only real rows are written; padding rows are uninitialized (the output is
-    torch.empty) and are never read -- combine consumes only real rows via handle
-    metadata. When topk_weights is given ([total_expanded], per expanded row), the
-    top-k weight is fused into the copy so the weighted-combine multiply happens
-    only on real rows (not the worst-case buffer).
+    Only real rows are written; combine ignores uninitialized padding through the
+    handle. Optional top-k weights are fused into the copy over real rows only.
     """
     num_local_experts, max_m, hidden = input_tensor.shape
     output_tensor = torch.empty(
@@ -2385,7 +2551,7 @@ def masked_slab_to_expand(
     if has_w:
         weight_arg = topk_weights.reshape(-1).to(torch.float32).contiguous()
     else:
-        weight_arg = input_tensor2d  # dummy, unused
+        weight_arg = input_tensor2d
     num_workers = min(max_m, _DEEPEP_V2_REPACK_WORKERS_PER_EXPERT)
     _fwd_kernel_masked_slab_to_expand[(num_local_experts, num_workers)](
         psum_num_recv_tokens_per_expert,
@@ -2405,22 +2571,12 @@ def masked_slab_to_expand(
     return output_tensor
 
 
-def moe_permute(
+def _moe_permute_rows(
     inputs: torch.Tensor,
     topk_ids: torch.Tensor,
-    num_experts: int,
-    use_int64_offset: bool = False,
-    is_ep: bool = False,
+    src2dst: torch.Tensor,
     outputs: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from sglang.kernels.ops.moe.moe_permute_prepare import moe_permute_prepare
-
-    expert_offsets, src2dst = moe_permute_prepare(
-        topk_ids=topk_ids,
-        num_experts=num_experts,
-        use_int64_offset=use_int64_offset,
-        is_ep=is_ep,
-    )
+) -> torch.Tensor:
     output_shape = (topk_ids.nelement(), inputs.size(-1))
     if outputs is None:
         outputs = torch.empty(output_shape, dtype=inputs.dtype, device=inputs.device)
@@ -2440,7 +2596,54 @@ def moe_permute(
         BLOCK_SIZE=512,
     )
 
+    return outputs
+
+
+def moe_permute(
+    inputs: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    use_int64_offset: bool = False,
+    is_ep: bool = False,
+    outputs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from sglang.kernels.ops.moe.moe_permute_prepare import moe_permute_prepare
+
+    expert_offsets, src2dst = moe_permute_prepare(
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        use_int64_offset=use_int64_offset,
+        is_ep=is_ep,
+    )
+    outputs = _moe_permute_rows(inputs, topk_ids, src2dst, outputs)
+
     return outputs, src2dst, expert_offsets
+
+
+def moe_permute_with_scale(
+    inputs: torch.Tensor,
+    input_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    use_int64_offset: bool = False,
+    is_ep: bool = False,
+    outputs: torch.Tensor | None = None,
+    scale_outputs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if inputs.size(0) != input_scale.size(0):
+        raise ValueError("inputs and input_scale must have the same number of rows")
+
+    outputs, src2dst, expert_offsets = moe_permute(
+        inputs=inputs,
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        use_int64_offset=use_int64_offset,
+        is_ep=is_ep,
+        outputs=outputs,
+    )
+    scale_outputs = _moe_permute_rows(input_scale, topk_ids, src2dst, scale_outputs)
+
+    return outputs, scale_outputs, src2dst, expert_offsets
 
 
 def moe_unpermute(

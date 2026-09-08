@@ -15,16 +15,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
+    get_resources,
     get_schedule,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 
 def _is_scattered_a2a_backend() -> bool:
-    """True for a2a backends whose MoE layer sees only this attn-TP rank's
-    slice of topk_ids (see the gather in capture()). DeepEP v2 shares legacy
-    DeepEP's token topology; classifying it as a TP-MoE backend would make
-    dp_rank > 0 read unwritten buffer rows."""
+    """Return whether routed tokens are scattered across attention-TP ranks."""
     backend = get_moe_a2a_backend()
     return backend.is_deepep() or backend.is_deepep_v2()
 
@@ -93,10 +91,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device_topk_size=topk_size + num_fused_shared_experts,
         )
 
-        # DeepEP-class a2a path: each attn-TP rank only sees its scattered
-        # slice of topk_ids. All-gather across attn-TP at capture time so
-        # device_cache holds the full batch and the existing _get_local_slice /
-        # D2H sync paths work unchanged. Pre-allocate the gather target.
+        # Rebuild the full token batch before routed-expert readback.
         if _is_scattered_a2a_backend():
             attn_tp_size = (
                 get_parallel().attn_tp_size if is_dp_attention_enabled() else 1
@@ -125,10 +120,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         can_run_graph: bool,
         cuda_graph_batch: Optional[int],
     ) -> torch.Tensor:
-        # Under DeepEP-class backends, capture() already attn_tp_all_gathered
-        # into the head of the per-rank buffer, so the local DP rank's data
-        # lives at [0:N_local] rather than at the global [start_pos:end_pos]
-        # offset.
+        # Gathered rows start at buffer offset zero on every DP rank.
         if is_dp_attention_enabled() and not _is_scattered_a2a_backend():
             # GPU->CPU sync would break overlap; operate on CPU directly.
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
@@ -143,15 +135,19 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
 
 
 def get_global_experts_capturer() -> Optional[RoutedExpertsCapturer]:
-    from sglang.srt.runtime_context import get_resources
 
     return get_resources().experts_capturer
 
 
 def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().experts_capturer = capturer
+
+
+def destroy_global_experts_capturer():
+    if (capturer := get_resources().experts_capturer) is not None:
+        capturer.destroy()
+    get_resources().experts_capturer = None
 
 
 def extract_routed_experts_from_meta_info(data):
