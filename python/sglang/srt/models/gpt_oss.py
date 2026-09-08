@@ -953,20 +953,22 @@ class GptOssForCausalLM(nn.Module):
             )
 
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
-        mxfp4_weights = []
         normal_weights = []
 
-        for name, weight in weights:
-            if (
-                ".experts" in name
-                and self.quant_config is not None
-                and self.quant_config.get_name() == "mxfp4"
-            ):
-                mxfp4_weights.append((name, weight))
-            else:
-                normal_weights.append((name, weight))
+        # Touching an mmap-backed checkpoint tensor COW-faults its pages into
+        # cgroup-charged anonymous memory; buffering them all costs ~61 GB per rank.
+        def _stream_mxfp4_weights():
+            for name, weight in weights:
+                if (
+                    ".experts" in name
+                    and self.quant_config is not None
+                    and self.quant_config.get_name() == "mxfp4"
+                ):
+                    yield name, weight
+                else:
+                    normal_weights.append((name, weight))
 
-        mxfp4_loaded_params = self._load_mxfp4_experts_weights(mxfp4_weights)
+        mxfp4_loaded_params = self._load_mxfp4_experts_weights(_stream_mxfp4_weights())
         self._load_normal_weights(
             normal_weights,
             is_nextn=is_nextn,
