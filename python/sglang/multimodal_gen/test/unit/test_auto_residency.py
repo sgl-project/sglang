@@ -16,6 +16,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
+    MAX_LAYERWISE_COMPONENT_TARGETS,
+    MAX_LAYERWISE_PIN_TARGETS,
     MAX_LAYERWISE_POLICY_TARGETS,
     MAX_LAYERWISE_RESIDENT_TARGETS,
     MIN_VRAM_RESERVE_BYTES,
@@ -3027,6 +3029,17 @@ class _FakeLazyLayerwiseDit(LayerwiseOffloadableModuleMixin, nn.Module):
         self.layerwise_offload_managers = [_FakeLayerwiseManager(tensors)]
 
 
+class _UnevenLazyLayerwiseDit(_FakeLazyLayerwiseDit):
+    """Lazy layerwise component whose layers differ in size."""
+
+    def __init__(self, num_layers: int = 14):
+        nn.Module.__init__(self)
+        self.layers = nn.ModuleList(
+            nn.Linear(4, 4 + index) for index in range(num_layers)
+        )
+        self.layerwise_offload_managers = []
+
+
 class _StubResidencyArgs:
     """Duck-typed stand-in for the two ServerArgs hooks adjustments use."""
 
@@ -3502,6 +3515,48 @@ class TestCollectResidencyTargets:
         } == {(0, 0)}
         assert all(
             candidate.target_layerwise_pinned_layers[0] == () for candidate in layerwise
+        )
+
+    def test_lazy_layerwise_frontier_stays_bounded_for_uneven_layers(self):
+        """Layers of unequal size each form their own HostPin group.
+
+        The frontier multiplies by one factor per group and its dominance
+        prune is quadratic in it, so without the same budget the configured
+        frontier uses this never returns: LTX-2 on two GPUs sat in this call
+        until the 20-minute startup deadline, so reaching the assertions at
+        all is most of what this checks.
+        """
+        module = _UnevenLazyLayerwiseDit(num_layers=14)
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": COMPONENT_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+        )
+
+        assert any(
+            candidate.target_mode() == LAYERWISE_OFFLOAD for candidate in candidates
+        )
+        assert len(candidates) <= MAX_LAYERWISE_COMPONENT_TARGETS
+        # The frontier is per layout, so the pin states of any single layout
+        # stay within their own budget even though the union is larger.
+        by_layout: dict[tuple, set] = {}
+        for candidate in candidates:
+            if candidate.target_mode() != LAYERWISE_OFFLOAD:
+                continue
+            key = (
+                candidate.target_layerwise_resident_layers,
+                candidate.target_layerwise_residency_policies,
+            )
+            by_layout.setdefault(key, set()).add(
+                candidate.target_layerwise_pinned_layers
+            )
+        assert by_layout
+        assert max(len(states) for states in by_layout.values()) <= (
+            MAX_LAYERWISE_PIN_TARGETS
         )
 
     def test_component_offload_frontier_can_expand_layerwise_lazily(self):

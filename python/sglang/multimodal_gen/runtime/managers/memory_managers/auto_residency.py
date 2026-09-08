@@ -2013,99 +2013,112 @@ def _unconfigured_layerwise_targets(
         else max(layer_host_store_bytes, default=0)
     )
     targets = []
-    for resident_layers in _layerwise_resident_targets(managers, layer_uses=layer_uses):
+    layouts = [
+        (resident_layers, policies)
+        for resident_layers in _layerwise_resident_targets(
+            managers, layer_uses=layer_uses
+        )
         for policies in _layerwise_policy_targets(
             managers=managers,
             resident_layers=resident_layers,
             tune_policy=tune_residency_policy,
-        ):
-            resident_bytes = sum(
-                manager.resident_weight_bytes(count, policy)
-                for manager, count, policy in zip(managers, resident_layers, policies)
-            )
-            active_managed_bytes = _layerwise_active_peak_device_bytes(
+        )
+    ]
+    # Same budget the configured frontier uses: the HostPin state set grows by
+    # a factor per distinct layer group, and its dominance prune is quadratic
+    # in that set. A component whose layers differ in size (LTX-2's DiT and
+    # VAE) has one group per size, so an unbounded frontier never returns.
+    max_pin_targets = min(
+        MAX_LAYERWISE_PIN_TARGETS,
+        max(1, MAX_LAYERWISE_COMPONENT_TARGETS // max(1, len(layouts))),
+    )
+    for resident_layers, policies in layouts:
+        resident_bytes = sum(
+            manager.resident_weight_bytes(count, policy)
+            for manager, count, policy in zip(managers, resident_layers, policies)
+        )
+        active_managed_bytes = _layerwise_active_peak_device_bytes(
+            managers=managers,
+            resident_layers=resident_layers,
+            residency_policies=policies,
+            layer_uses=layer_uses,
+        )
+        pin_targets = (
+            _layerwise_pin_targets(
                 managers=managers,
                 resident_layers=resident_layers,
                 residency_policies=policies,
+                current_pinned_layers=empty_pins,
+                uses_per_streamed_layer=uses_per_request,
+                layer_uses=layer_uses,
+                max_targets=max_pin_targets,
+            )
+            if allow_host_pin_reallocation
+            else [empty_pins]
+        )
+        for pinned_layers in pin_targets:
+            pinned_bytes = sum(
+                sum(
+                    manager.layer_host_store_bytes().get(layer_idx, 0)
+                    for layer_idx in pinned_indices
+                )
+                for manager, pinned_indices in zip(managers, pinned_layers)
+            )
+            transfer_work = _layerwise_transfer_work_bytes(
+                managers=managers,
+                resident_layers=resident_layers,
+                residency_policies=policies,
+                pinned_layers=pinned_layers,
+                uses_per_streamed_layer=uses_per_request,
                 layer_uses=layer_uses,
             )
-            pin_targets = (
-                _layerwise_pin_targets(
-                    managers=managers,
-                    resident_layers=resident_layers,
-                    residency_policies=policies,
-                    current_pinned_layers=empty_pins,
-                    uses_per_streamed_layer=uses_per_request,
-                    layer_uses=layer_uses,
+            targets.append(
+                ResidencyTarget(
+                    component_name=component_name,
+                    residency_mode=current_mode,
+                    target_residency_mode=LAYERWISE_OFFLOAD,
+                    target_resident_weight_bytes=resident_bytes,
+                    # This strategy has not run yet, so transfer bytes cannot
+                    # establish that it beats the calibrated coarse path. It may
+                    # tie that path as a memory alternative; only a subsequent
+                    # calibration may justify further layerwise tuning.
+                    h2d_bytes_per_request=min(
+                        coarse_savings,
+                        max(0, maximum_transfer_work - transfer_work),
+                    ),
+                    target_layerwise_resident_layers=resident_layers,
+                    target_layerwise_residency_policies=(
+                        policies
+                        if tune_residency_policy
+                        and _policy_affects_layerwise_layout(managers, resident_layers)
+                        else None
+                    ),
+                    target_layerwise_pinned_layers=pinned_layers,
+                    pinned_host_delta_bytes=pinned_bytes,
+                    host_pin_scratch_bytes=pinned_bytes,
+                    host_materialize_scratch_bytes=host_materialize_scratch,
+                    device_transition_delta_bytes=(
+                        unmanaged_weight_bytes - current_inactive_bytes
+                    ),
+                    active_device_delta_bytes=(
+                        unmanaged_weight_bytes
+                        + active_managed_bytes
+                        - full_weight_bytes
+                    ),
+                    present_device_delta_bytes=(
+                        unmanaged_weight_bytes
+                        + active_managed_bytes
+                        - full_weight_bytes
+                    ),
+                    inactive_device_delta_bytes=(
+                        unmanaged_weight_bytes - current_inactive_bytes
+                    ),
+                    target_device_weight_bytes=(
+                        unmanaged_weight_bytes + resident_bytes
+                    ),
+                    target_pinned_host_bytes=pinned_bytes,
                 )
-                if allow_host_pin_reallocation
-                else [empty_pins]
             )
-            for pinned_layers in pin_targets:
-                pinned_bytes = sum(
-                    sum(
-                        manager.layer_host_store_bytes().get(layer_idx, 0)
-                        for layer_idx in pinned_indices
-                    )
-                    for manager, pinned_indices in zip(managers, pinned_layers)
-                )
-                transfer_work = _layerwise_transfer_work_bytes(
-                    managers=managers,
-                    resident_layers=resident_layers,
-                    residency_policies=policies,
-                    pinned_layers=pinned_layers,
-                    uses_per_streamed_layer=uses_per_request,
-                    layer_uses=layer_uses,
-                )
-                targets.append(
-                    ResidencyTarget(
-                        component_name=component_name,
-                        residency_mode=current_mode,
-                        target_residency_mode=LAYERWISE_OFFLOAD,
-                        target_resident_weight_bytes=resident_bytes,
-                        # This strategy has not run yet, so transfer bytes cannot
-                        # establish that it beats the calibrated coarse path. It may
-                        # tie that path as a memory alternative; only a subsequent
-                        # calibration may justify further layerwise tuning.
-                        h2d_bytes_per_request=min(
-                            coarse_savings,
-                            max(0, maximum_transfer_work - transfer_work),
-                        ),
-                        target_layerwise_resident_layers=resident_layers,
-                        target_layerwise_residency_policies=(
-                            policies
-                            if tune_residency_policy
-                            and _policy_affects_layerwise_layout(
-                                managers, resident_layers
-                            )
-                            else None
-                        ),
-                        target_layerwise_pinned_layers=pinned_layers,
-                        pinned_host_delta_bytes=pinned_bytes,
-                        host_pin_scratch_bytes=pinned_bytes,
-                        host_materialize_scratch_bytes=host_materialize_scratch,
-                        device_transition_delta_bytes=(
-                            unmanaged_weight_bytes - current_inactive_bytes
-                        ),
-                        active_device_delta_bytes=(
-                            unmanaged_weight_bytes
-                            + active_managed_bytes
-                            - full_weight_bytes
-                        ),
-                        present_device_delta_bytes=(
-                            unmanaged_weight_bytes
-                            + active_managed_bytes
-                            - full_weight_bytes
-                        ),
-                        inactive_device_delta_bytes=(
-                            unmanaged_weight_bytes - current_inactive_bytes
-                        ),
-                        target_device_weight_bytes=(
-                            unmanaged_weight_bytes + resident_bytes
-                        ),
-                        target_pinned_host_bytes=pinned_bytes,
-                    )
-                )
     return targets, maximum_transfer_work
 
 
