@@ -762,8 +762,8 @@ impl PDRouter {
                 Some(prefill_fut),
             );
         }
-        let prefill_result = prefill_result
-            .expect("dispatch loop exits with prefill resolved or decode committed");
+        let prefill_result =
+            prefill_result.expect("dispatch loop exits with prefill resolved or decode committed");
 
         // Decode can't generate without prefill's KV, so any prefill failure
         // (non-2xx / transport error) dooms the paired decode request, which would
