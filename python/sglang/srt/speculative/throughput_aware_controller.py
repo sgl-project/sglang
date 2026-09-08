@@ -37,6 +37,7 @@ adaptive config); non-integer keys are throughput-specific settings::
         "max_profile_run_batch_size": null,
         "profile_run_n_warmup": 5,
         "profile_run_n_measure": 10,
+        "profile_run_seq_len": 128,
         "switch_hysteresis": 0.1,
         "1":   {"candidate_steps": [1, 3, 5, 7]},
         "8":   {"candidate_steps": [1, 3, 5]},
@@ -50,6 +51,10 @@ sizes to profile.  When ``null``, the server's ``cuda_graph_bs`` list is used
 
 ``max_profile_run_batch_size`` (optional int): upper bound on which batch
 sizes are profiled (to keep startup time reasonable).
+
+``profile_run_seq_len`` (optional int, default ``128``): synthetic context
+length used by startup profiling.  Set it to ``null`` to retain automatic
+selection based on the model context length.
 
 ``switch_hysteresis`` (optional float, default ``0.1``): fractional margin
 required before switching steps.  A challenger must satisfy
@@ -112,6 +117,7 @@ DEFAULT_THROUGHPUT_AWARE_CONFIG: dict = {
     "max_profile_run_batch_size": None,
     "profile_run_n_warmup": 5,
     "profile_run_n_measure": 10,
+    "profile_run_seq_len": 128,
     "switch_hysteresis": 0.1,
     "1": {"candidate_steps": [1, 3, 5, 7]},
 }
@@ -188,8 +194,10 @@ def _config_int(cfg: dict, name: str, default: int, *, minimum: int) -> int:
     return value
 
 
-def _config_optional_positive_int(cfg: dict, name: str) -> Optional[int]:
-    value = cfg.get(name)
+def _config_optional_positive_int(
+    cfg: dict, name: str, default: Optional[int] = None
+) -> Optional[int]:
+    value = cfg.get(name, default)
     if value is None:
         return None
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -268,7 +276,7 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
             cfg, "profile_run_n_measure", 10, minimum=1
         )
         self._profile_run_seq_len = _config_optional_positive_int(
-            cfg, "profile_run_seq_len"
+            cfg, "profile_run_seq_len", default=128
         )
         switch_hysteresis = cfg.get("switch_hysteresis", 0.1)
         if (
