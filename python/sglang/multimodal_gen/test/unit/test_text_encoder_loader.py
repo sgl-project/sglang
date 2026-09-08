@@ -965,6 +965,15 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         ):
             _require_quantized_encoder_layers(nn.Linear(2, 2), "text_encoder")
 
+    def test_online_kitchen_int8_has_no_markers_to_consume(self):
+        """An online kitchen_int8 encoder carries no serialized markers, so the
+        consumption check must pass instead of failing on the absent map."""
+        _require_quantized_encoder_layers(
+            _QuantizedEncoder(_RecordingQuantMethod()),
+            "text_encoder",
+            quant_config=KitchenInt8Config(ignored_layers=["lm_head"]),
+        )
+
     def test_rejects_unconsumed_comfy_marker(self):
         config = KitchenInt8Config(
             layer_markers={

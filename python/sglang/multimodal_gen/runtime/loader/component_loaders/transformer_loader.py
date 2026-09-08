@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     OnlineQuantizationComponentLoader,
 )
@@ -381,12 +384,12 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             )
         if (
             use_fsdp
-            and quant_spec.quant_config is not None
-            and quant_spec.quant_config.get_name() == "convrot_int8_customkernel"
+            and isinstance(quant_spec.quant_config, KitchenInt8Config)
+            and not quant_spec.quant_config.is_checkpoint_int8_serialized
         ):
-            raise ValueError(
-                "convrot_int8_customkernel (online INT8) does not support diffusion "
-                "FSDP inference; use TP and/or sequence parallelism instead"
+            # Only the comfy_kitchen backend has run under FSDP.
+            quant_spec.quant_config.require_comfy_kitchen(
+                "has not been validated with diffusion FSDP inference"
             )
 
         if quant_spec.gguf_file is not None:

@@ -403,7 +403,8 @@ def _require_quantized_encoder_layers(
             KitchenW4A8Config,
         ),
     ):
-        expected = set(quant_config.layer_markers)
+        # Online kitchen_int8 carries no markers; there is nothing to consume.
+        expected = set(quant_config.layer_markers or ())
         selected = set(quant_config.selected)
     elif isinstance(quant_config, QuantoInt8Config):
         expected = quant_config.layer_prefixes

@@ -59,6 +59,13 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+
+# kitchen_int8 picks its kernel backend from the GPU; pin comfy_kitchen so these
+# cases do not depend on the runner.
+_KITCHEN_SGL_AVAILABLE = (
+    "sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config."
+    "_sgl_kernel_available"
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
 )
@@ -943,6 +950,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
                 "_load_comfy_kitchen"
             ),
+            patch(_KITCHEN_SGL_AVAILABLE, return_value=False),
         ):
             config = resolve_minimax_h3_checkpoint_quantization(markers)
             w4a4 = ReplicatedLinear(
@@ -967,11 +975,12 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(int8.weight.shape, (3, 256))
         self.assertEqual(set(config.selected), {"w4a4", "int8"})
 
+    @patch(_KITCHEN_SGL_AVAILABLE, return_value=False)
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
         "_load_comfy_kitchen"
     )
-    def test_serialized_kitchen_constructs_int8_weight_and_row_scale(self, _load):
+    def test_serialized_kitchen_constructs_int8_weight_and_row_scale(self, _load, _sgl):
         config = KitchenInt8Config(
             layer_markers={
                 "proj": {
@@ -1668,9 +1677,12 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 ),
                 ModelOptFp4LinearMethod,
             )
-        with patch(
-            "sglang.multimodal_gen.runtime.layers.quantization."
-            "kitchen_int8._load_comfy_kitchen"
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization."
+                "kitchen_int8._load_comfy_kitchen"
+            ),
+            patch(_KITCHEN_SGL_AVAILABLE, return_value=False),
         ):
             self.assertIsInstance(
                 config.get_quant_method(

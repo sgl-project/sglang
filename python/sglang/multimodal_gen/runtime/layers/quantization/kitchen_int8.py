@@ -15,6 +15,7 @@ Comfy checkpoints instead load their INT8 weights and row scales directly.
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -53,6 +54,16 @@ def _row_split(rows: int, out_features: int) -> int | None:
     if out_features < _MIN_SPLIT_OUTPUT:
         return None
     return _MAX_ROWS_PER_CALL
+
+
+@functools.cache
+def comfy_kitchen_available() -> bool:
+    """Whether comfy_kitchen is importable and registers int8_linear."""
+    try:
+        import comfy_kitchen  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch.ops.comfy_kitchen, "int8_linear")
 
 
 def _load_comfy_kitchen():
@@ -103,7 +114,8 @@ class KitchenInt8LinearMethod(LinearMethodBase):
             raise ValueError(
                 f"kitchen_int8 needs input_size_per_partition "
                 f"({input_size_per_partition}) divisible by group_size "
-                f"{self.group_size}"
+                f"{self.group_size}; leave the layer in BF16 with "
+                "--quantization-ignored-layers"
             )
 
         # The online path initially matches UnquantizedLinearMethod so the
@@ -135,7 +147,10 @@ class KitchenInt8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
-        if self.is_checkpoint_serialized or weight.dtype == torch.int8:
+        if self.is_checkpoint_serialized:
+            self.quant_config.note_loaded()
+            return
+        if weight.dtype == torch.int8:
             return
 
         from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout

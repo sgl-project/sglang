@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_customkernel import (
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_sgl_kernel import (
     apply_convrot_int8_shared_input,
     convrot_int8_shares_input,
 )
