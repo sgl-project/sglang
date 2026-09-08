@@ -3040,6 +3040,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.update_evictable_leaf_sets_(new_node_id);
         self.update_evictable_leaf_sets_(node_id);
         result.inserted_host_node = Some(self.arena.node(new_node_id).id);
+        self.record_store_event_(new_node_id, StorageMedium::Cpu);
         Ok(result)
     }
 

@@ -1968,6 +1968,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(node)
         result.inserted_host_node = new_node.id
+        self.kv_events.record_store(new_node, medium=StorageMedium.CPU)
         return result
 
     def build_backup_spec(self, node_id: NodeId):

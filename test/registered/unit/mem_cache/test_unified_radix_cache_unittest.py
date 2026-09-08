@@ -1206,6 +1206,42 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         removed_cpu = self._removed_events(cache, StorageMedium.CPU)
         self.assertCountEqual(self._event_hashes(removed_cpu), stored_hashes)
 
+    def test_hicache_storage_prefetch_publishes_host_only_suffix(self):
+        """A storage-prefetch refill has no write-through ack to publish it."""
+        from sglang.srt.mem_cache.utils import get_hash_str, hash_str_to_int64
+
+        cache, _, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        self._init_hicache(cache)
+        cache.take_events()  # Clear reset / init events.
+
+        tokens = [1, 2, 7, 8]
+        hash_values = []
+        running_hash = None
+        for start in range(0, len(tokens), cache.page_size):
+            running_hash = get_hash_str(
+                array("q", tokens[start : start + cache.page_size]), running_hash
+            )
+            hash_values.append(running_hash)
+        result = cache.tree_core.insert_host(
+            cache.root_node_handle(),
+            RadixKey(array("q", tokens)),
+            torch.tensor([100, 101, 102, 103], dtype=torch.int64),
+            hash_values,
+        )
+        self.assertFalse(result.host_insert_dropped)
+        self.assertIsNotNone(result.inserted_host_node)
+
+        # The recorder coalesces the parent-linked pages into one event.
+        stored_cpu = self._stored_events(cache, StorageMedium.CPU)
+        self.assertEqual(len(stored_cpu), 1)
+        self.assertEqual(list(stored_cpu[0].token_ids), tokens)
+        self.assertEqual(stored_cpu[0].block_size, cache.page_size)
+        self.assertEqual(
+            self._event_hashes(stored_cpu),
+            [hash_str_to_int64(value) for value in hash_values],
+        )
+        self.assertIsNone(stored_cpu[0].parent_block_hash)
+
     def test_hicache_split_pending_write_through_publishes_fragments(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         self._init_hicache(cache)

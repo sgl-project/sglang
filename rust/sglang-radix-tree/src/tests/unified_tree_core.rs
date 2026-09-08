@@ -3163,6 +3163,38 @@ fn insert_host_attaches_a_host_only_leaf_under_the_root() {
 }
 
 #[test]
+fn insert_host_publishes_a_host_store_event() {
+    // A storage-prefetch refill has no write-through ack to publish it.
+    let mut tc = events_core(2);
+    let root = tc.arena.root();
+    let key = vec![1i64, 2, 7, 8];
+    let hashes = crate::node::get_hash_str::<Vec<i64>>(&key, None, 2);
+    let result = tc.insert_host(
+        tc.arena.node(root).id,
+        /* extra_key = */ None,
+        key.clone(),
+        Tensor::from_slice(&[100i64, 101, 102, 103]),
+        hashes.clone(),
+    );
+    assert!(!result.host_insert_dropped);
+    assert!(result.inserted_host_node.is_some());
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: hashes
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: key,
+            block_size: 2,
+            medium: StorageMedium::Cpu,
+            cache_salt: None,
+        }]
+    );
+}
+
+#[test]
 fn insert_host_allows_a_suffix_under_an_unbacked_write_back_parent() {
     let mut tc = core();
     tc.is_write_back = true;
