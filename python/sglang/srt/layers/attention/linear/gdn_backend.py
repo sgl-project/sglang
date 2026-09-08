@@ -364,13 +364,8 @@ class GDNKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        # FlashInfer verify supports a linear MTP chain. Tree-shaped drafts
-        # carry parent indices and must use Triton even when decode/prefill use
-        # FlashInfer.
-        verify_kernel = (
-            self.tree_verify_kernel
-            if kwargs.get("retrieve_parent_token") is not None
-            else self.verify_kernel
+        verify_kernel = self._get_target_verify_kernel(
+            kwargs.get("retrieve_parent_token")
         )
         return verify_kernel.target_verify(
             A_log=A_log,
@@ -384,6 +379,22 @@ class GDNKernelDispatcher:
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             **kwargs,
+        )
+
+    def target_verify_supports_strided_qkv(
+        self, retrieve_parent_token: Optional[torch.Tensor]
+    ) -> bool:
+        verify_kernel = self._get_target_verify_kernel(retrieve_parent_token)
+        return (
+            getattr(verify_kernel, "supports_strided_target_verify_qkv", False) is True
+        )
+
+    def _get_target_verify_kernel(self, retrieve_parent_token: Optional[torch.Tensor]):
+        # Tree drafts use Triton even when linear MTP verification uses FlashInfer.
+        return (
+            self.tree_verify_kernel
+            if retrieve_parent_token is not None
+            else self.verify_kernel
         )
 
 
@@ -415,9 +426,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        self._use_strided_target_verify_qkv = False
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        self._init_target_verify_qkv_routing(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self._init_target_verify_qkv_routing(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -435,6 +456,61 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 maybe_build_flashinfer_checkpoint_plan(
                     forward_batch, self.forward_metadata, self.device
                 )
+
+    def _init_target_verify_qkv_routing(self, forward_batch: ForwardBatch) -> None:
+        # CUDA-graph metadata leaves mode and draft count at their defaults.
+        if not forward_batch.forward_mode.is_target_verify():
+            self._use_strided_target_verify_qkv = False
+            return
+
+        metadata = self.forward_metadata
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        mamba_cache = mamba_pool.mamba_cache
+        is_gdn_replayssm = not getattr(mamba_pool, "replayssm_is_kda", False)
+        use_replayssm_fold = (
+            mamba_cache.replayssm_rawv is not None
+            and getattr(mamba_pool, "replayssm_spec_fold", False)
+            and is_gdn_replayssm
+        )
+        use_replayssm_spec = (
+            mamba_cache.replayssm_d is not None
+            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            and is_gdn_replayssm
+        )
+        self._use_strided_target_verify_qkv = self._target_verify_supports_strided_qkv(
+            retrieve_parent_token=metadata.retrieve_parent_token,
+            use_replayssm_fold=use_replayssm_fold,
+            use_replayssm_spec=use_replayssm_spec,
+            ssm_dtype=mamba_cache.temporal.dtype,
+            draft_token_num=forward_batch.spec_info.draft_token_num,
+        )
+
+    def _replayssm_fold_uses_cutedsl(
+        self, ssm_dtype: torch.dtype, draft_token_num: int
+    ) -> bool:
+        return (
+            self.kernel_dispatcher.verify_kernel_is_flashinfer
+            and ssm_dtype == torch.bfloat16
+            and draft_token_num >= 3
+        )
+
+    def _target_verify_supports_strided_qkv(
+        self,
+        *,
+        retrieve_parent_token: Optional[torch.Tensor],
+        use_replayssm_fold: bool,
+        use_replayssm_spec: bool,
+        ssm_dtype: torch.dtype,
+        draft_token_num: int,
+    ) -> bool:
+        # ReplaySSM Triton routes accept strides; the CuTeDSL fold does not.
+        if use_replayssm_fold:
+            return not self._replayssm_fold_uses_cutedsl(ssm_dtype, draft_token_num)
+        if use_replayssm_spec:
+            return True
+        return self.kernel_dispatcher.target_verify_supports_strided_qkv(
+            retrieve_parent_token
+        )
 
     def forward_decode(
         self,
@@ -717,6 +793,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mamba_cache_params.intermediate_conv_window[0]
             )
             intermediate_state_indices = self.verify_intermediate_state_indices
+            mamba_pool = self.req_to_token_pool.mamba_pool
+            use_replayssm_fold = (
+                mamba_cache_params.replayssm_rawv is not None
+                and getattr(mamba_pool, "replayssm_spec_fold", False)
+                and not getattr(mamba_pool, "replayssm_is_kda", False)
+            )
+            use_replayssm_spec = (
+                mamba_cache_params.replayssm_d is not None
+                and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+                and not getattr(mamba_pool, "replayssm_is_kda", False)
+            )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
@@ -793,7 +880,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        if (
+            (is_cuda() or is_hip() or is_xpu())
+            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            and not self._use_strided_target_verify_qkv
+        ):
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -817,17 +908,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
-            mamba_pool = self.req_to_token_pool.mamba_pool
-            use_replayssm_fold = (
-                mamba_cache_params.replayssm_rawv is not None
-                and getattr(mamba_pool, "replayssm_spec_fold", False)
-                and not getattr(mamba_pool, "replayssm_is_kda", False)
-            )
-            use_replayssm_spec = (
-                mamba_cache_params.replayssm_d is not None
-                and getattr(mamba_pool, "replayssm_cache_base", None) is not None
-                and not getattr(mamba_pool, "replayssm_is_kda", False)
-            )
             if use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
                     layer=layer,
@@ -953,11 +1033,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         seq_len = query.shape[1]
         batch_size = query_start_loc.shape[0] - 1
         draft_token_num = seq_len // batch_size
-        if (
-            self.kernel_dispatcher.verify_kernel_is_flashinfer
-            and ssm_states.dtype == torch.bfloat16
-            and draft_token_num >= 3
-        ):
+        if self._replayssm_fold_uses_cutedsl(ssm_states.dtype, draft_token_num):
             from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import (
                 gated_delta_rule_mtp,
             )
