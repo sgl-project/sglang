@@ -526,6 +526,43 @@ def fuse_scale_shift_kernel(
     return output
 
 
+def expand_scale_shift_cpu_param(
+    tensor: torch.Tensor,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    B, L, C = x.shape
+
+    if tensor.numel() == 1:
+        return tensor.reshape(1, 1, 1).expand(B, L, C)
+
+    if tensor.dim() == 1:
+        if tensor.shape[0] != C:
+            raise ValueError(f"1D modulation tensor must have shape [{C}]")
+        tensor = tensor.reshape(1, 1, C)
+
+    elif tensor.dim() == 2:
+        tensor = tensor[:, None, :]
+
+    elif tensor.dim() == 3:
+        pass
+
+    elif tensor.dim() == 4:
+        # [B, F, 1, C] -> [B, L, C]
+        if tensor.shape[2] != 1:
+            raise ValueError("4D modulation tensor must have shape [B, F, 1, C]")
+        num_frames = tensor.shape[1]
+        if L % num_frames != 0:
+            raise ValueError("sequence length must be divisible by num_frames")
+        frame_seqlen = L // num_frames
+        tensor = tensor.expand(
+            tensor.shape[0], num_frames, frame_seqlen, tensor.shape[-1]
+        ).reshape(tensor.shape[0], L, tensor.shape[-1])
+
+    else:
+        raise ValueError("modulation tensor must be scalar or 1D/2D/3D/4D")
+    return tensor.expand(B, L, C)
+
+
 def _fuse_scale_shift_kernel_cpu(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -538,8 +575,11 @@ def _fuse_scale_shift_kernel_cpu(
 
     del block_l, block_c
 
+    scale = expand_scale_shift_cpu_param(scale, x)
+    shift = expand_scale_shift_cpu_param(shift, x)
+
     return torch.ops.sgl_kernel.fused_scale_shift_cpu(
-        x,
+        x.contiguous(),
         scale,
         shift,
         scale_constant,

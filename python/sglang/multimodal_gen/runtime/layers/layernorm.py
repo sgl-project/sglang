@@ -17,6 +17,9 @@ from sglang.kernels.ops.diffusion import (
     fused_inplace_qknorm_rope,
     triton_one_pass_rms_norm,
 )
+from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
+    expand_scale_shift_cpu_param,
+)
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
@@ -754,19 +757,25 @@ class _ScaleResidualNormScaleShift(CustomOp):
 
         if isinstance(gate, torch.Tensor):
             gate_tensor = gate
-        elif isinstance(gate, (int, float)) and gate == 1:
+        elif gate == 1:
             gate_tensor = None
         else:
             return self.forward_native(residual, x, gate, shift, scale)
 
+        scale = expand_scale_shift_cpu_param(scale, x)
+        shift = expand_scale_shift_cpu_param(shift, x)
+
+        if gate_tensor is not None:
+            gate_tensor = expand_scale_shift_cpu_param(gate_tensor, x)
+
         return torch.ops.sgl_kernel.fused_scale_residual_norm_scale_shift_cpu(
-            _ensure_contiguous(residual),
-            _ensure_contiguous(x),
-            _ensure_contiguous(gate_tensor),
+            residual.contiguous(),
+            x.contiguous(),
+            gate_tensor,
             _ensure_contiguous(weight),
             _ensure_contiguous(bias),
-            scale.contiguous(),
-            shift.contiguous(),
+            scale,
+            shift,
             self.norm_type,
             self.eps,
         )
@@ -901,12 +910,15 @@ class _NormScaleShift(CustomOp):
         weight = getattr(self.norm, "weight", None)
         bias = getattr(self.norm, "bias", None)
 
+        scale = expand_scale_shift_cpu_param(scale, x)
+        shift = expand_scale_shift_cpu_param(shift, x)
+
         return torch.ops.sgl_kernel.fused_norm_scale_shift_cpu(
             x.contiguous(),
             _ensure_contiguous(weight),
             _ensure_contiguous(bias),
-            scale.contiguous(),
-            shift.contiguous(),
+            scale,
+            shift,
             self.norm_type,
             self.eps,
         )

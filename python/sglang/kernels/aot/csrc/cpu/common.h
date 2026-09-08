@@ -53,27 +53,6 @@ namespace {
 #define AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, __VA_ARGS__))
 
-// Dispatch FP32/BF16/FP16 while allowing the caller to specify
-// the type alias name.
-#define CPU_DISPATCH_FLOATING_TYPES(TYPE, ...)                   \
-  [&] {                                                          \
-    switch (TYPE) {                                              \
-      case at::ScalarType::Float: {                              \
-        using floating_t = float;                                \
-        return __VA_ARGS__();                                    \
-      }                                                          \
-      case at::ScalarType::BFloat16: {                           \
-        using floating_t = at::BFloat16;                         \
-        return __VA_ARGS__();                                    \
-      }                                                          \
-      case at::ScalarType::Half: {                               \
-        using floating_t = at::Half;                             \
-        return __VA_ARGS__();                                    \
-      }                                                          \
-      default:                                                   \
-        TORCH_CHECK(false, "Unsupported floating data type.\n"); \
-    }                                                            \
-  }()
 // dispatch: bfloat16, float16, int8_t, fp8_e4m3, uint8_t(mxfp4/int4)
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
   [&] {                                                          \
