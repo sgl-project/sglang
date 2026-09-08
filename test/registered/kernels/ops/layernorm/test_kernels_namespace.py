@@ -45,6 +45,27 @@ def test_unknown_op_or_backend_raises():
         K.select_kernel("gemm.fp8_scaled_mm", backend=KernelBackend.TRITON)
 
 
+@pytest.mark.parametrize(
+    "platform, eligible",
+    [
+        (_SM90, True),
+        (_SM100, True),
+        (PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=0), False),
+        (_CPU, False),
+        (_HIP, False),
+    ],
+)
+def test_qwen_qkv_registry_accepts_hopper(monkeypatch, platform, eligible):
+    monkeypatch.setattr(sel, "_platform", lambda: platform)
+    if eligible:
+        assert (
+            K.select_kernel("diffusion.qwen_qkv_epilogue").backend is KernelBackend.JIT
+        )
+    else:
+        with pytest.raises(ValueError, match="no backend usable"):
+            K.select_kernel("diffusion.qwen_qkv_epilogue")
+
+
 def test_multi_backend_requires_explicit_backend(monkeypatch):
     # Device is a hard eligibility filter, not a ranking: >1 usable backend on
     # the current device means selection must name one.

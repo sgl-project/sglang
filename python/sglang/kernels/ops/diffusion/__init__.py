@@ -38,6 +38,7 @@ from sglang.kernels.spec import (
 )
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
 
@@ -241,7 +242,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "diffusion.qwen_qkv_epilogue",
         KernelBackend.JIT,
         "rope.qwen_qkv_epilogue_jit:try_fused_qwen_qkv_epilogue",
-        _CUDA_SM100_PLUS,
+        _CUDA_SM90_PLUS,
         "Qwen-Image QK RMS-norm, RoPE, and joint QKV writes.",
     ),
     (
