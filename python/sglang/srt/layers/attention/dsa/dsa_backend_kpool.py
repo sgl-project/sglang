@@ -23,6 +23,17 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
+def _is_kpool_metadata_fusion_supported(
+    index_kpool: int, page_size: int, index_topk: int
+) -> bool:
+    return (
+        index_kpool > 1
+        and page_size == 64
+        and page_size % index_kpool == 0
+        and index_topk % index_kpool == 0
+    )
+
+
 @dataclass
 class _KPoolForwardInputs:
     full_real_page_table: Optional[torch.Tensor] = None

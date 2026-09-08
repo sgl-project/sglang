@@ -57,6 +57,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
+    _is_kpool_metadata_fusion_supported,
     _KPoolForwardInputs,
 )
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -392,6 +393,36 @@ class DeepseekSparseAttnBackend(
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
+        # The env is global, so unsupported KPool geometry or platforms must fall back.
+        _kpool_fusion_requested = (
+            envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.get()
+        )
+        _kpool_fusion_supported = _is_kpool_metadata_fusion_supported(
+            self.dsa_index_kpool,
+            self.real_page_size,
+            self.dsa_index_topk,
+        )
+        _kpool_fusion_platform_ok = is_cuda() and not _is_hip
+        self.experimental_kpool_metadata_fusion = (
+            _kpool_fusion_requested
+            and _kpool_fusion_supported
+            and _kpool_fusion_platform_ok
+        )
+        if (
+            _kpool_fusion_requested
+            and self.dsa_index_kpool > 1
+            and not _kpool_fusion_supported
+        ):
+            logger.warning(
+                "SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION is set but this "
+                "DSA backend's geometry is outside the validated envelope "
+                "(index_kpool=%s, page_size=%s, index_topk=%s; required: "
+                "page_size=64, page-aligned pool, pool-aligned topk) - keeping "
+                "the eager metadata path for this backend.",
+                self.dsa_index_kpool,
+                self.real_page_size,
+                self.dsa_index_topk,
+            )
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -1598,7 +1629,13 @@ class DeepseekSparseAttnBackend(
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
 
-            if (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1:
+            if (is_cuda() or _is_hip) and (
+                self.dsa_index_kpool <= 1
+                or (
+                    not _is_hip
+                    and getattr(self, "experimental_kpool_metadata_fusion", False)
+                )
+            ):
                 fused_dsa_decode_metadata(
                     seq_lens=seq_lens,
                     req_pool_indices=req_pool_indices,
@@ -1613,6 +1650,7 @@ class DeepseekSparseAttnBackend(
                     max_len=max_len,
                     dsa_index_topk=self.dsa_index_topk,
                     real_page_size=self.real_page_size,
+                    index_kpool=self.dsa_index_kpool,
                 )
                 cache_seqlens = metadata.cache_seqlens_int32
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32
@@ -1638,7 +1676,13 @@ class DeepseekSparseAttnBackend(
         elif forward_mode.is_target_verify():
             max_seqlen_k = self._graph_page_table_width(metadata)
 
-            if (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1:
+            if (is_cuda() or _is_hip) and (
+                self.dsa_index_kpool <= 1
+                or (
+                    not _is_hip
+                    and getattr(self, "experimental_kpool_metadata_fusion", False)
+                )
+            ):
                 paged_mqa_ctx_lens_2d = None
                 if (
                     self.speculative_num_draft_tokens >= 2
@@ -1668,6 +1712,7 @@ class DeepseekSparseAttnBackend(
                     real_page_size=self.real_page_size,
                     next_n=self.speculative_num_draft_tokens,
                     paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+                    index_kpool=self.dsa_index_kpool,
                 )
                 target_verify_ctx_lens_written = paged_mqa_ctx_lens_2d is not None
                 cache_seqlens = metadata.cache_seqlens_int32
@@ -1734,7 +1779,13 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             )
 
-            if (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1:
+            if (is_cuda() or _is_hip) and (
+                self.dsa_index_kpool <= 1
+                or (
+                    not _is_hip
+                    and getattr(self, "experimental_kpool_metadata_fusion", False)
+                )
+            ):
                 fused_dsa_draft_extend_metadata(
                     seq_lens=seq_lens,
                     extend_seq_lens=extend_seq_lens,
@@ -1755,6 +1806,7 @@ class DeepseekSparseAttnBackend(
                     max_extend_len=self.speculative_num_draft_tokens,
                     max_total_len=bs * self.speculative_num_draft_tokens,
                     static_extend_len=True,
+                    index_kpool=self.dsa_index_kpool,
                 )
                 cache_seqlens = metadata.cache_seqlens_int32
                 seqlens_expanded = metadata.dsa_seqlens_expanded[:total_extend_len]
