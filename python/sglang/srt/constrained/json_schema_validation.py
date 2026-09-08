@@ -155,6 +155,15 @@ def _string_constraint_groups(schema: dict[str, Any]) -> list[str]:
     return groups
 
 
+def _can_describe_string(schema: dict[str, Any]) -> bool:
+    schema_type = schema.get("type")
+    return (
+        schema_type is None
+        or schema_type == "string"
+        or (isinstance(schema_type, list) and "string" in schema_type)
+    )
+
+
 def validate_xgrammar_json_schema(schema: Any) -> None:
     """Reject constraints XGrammar 0.2.x accepts without fully enforcing."""
     for subschema, pointer in _iter_subschemas(schema):
@@ -166,7 +175,7 @@ def validate_xgrammar_json_schema(schema: Any) -> None:
                 f"keyword(s) {', '.join(unsupported)} would be ignored",
             )
 
-        if "format" in subschema:
+        if _can_describe_string(subschema) and "format" in subschema:
             format_name = subschema["format"]
             if (
                 not isinstance(format_name, str)
@@ -178,7 +187,11 @@ def validate_xgrammar_json_schema(schema: Any) -> None:
                     f"string format {format_name!r} is not implemented",
                 )
 
-        groups = _string_constraint_groups(subschema)
+        groups = (
+            _string_constraint_groups(subschema)
+            if _can_describe_string(subschema)
+            else []
+        )
         if len(groups) > 1:
             _raise_unsupported(
                 "xgrammar",
@@ -198,7 +211,11 @@ def validate_outlines_json_schema(schema: Any) -> None:
                 f"keyword(s) {', '.join(unsupported)} would be ignored or weakened",
             )
 
-        groups = _string_constraint_groups(subschema)
+        groups = (
+            _string_constraint_groups(subschema)
+            if _can_describe_string(subschema)
+            else []
+        )
         if len(groups) > 1:
             _raise_unsupported(
                 "outlines",

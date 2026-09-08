@@ -29,7 +29,6 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.json_schema_validation import (
-    UnsupportedJSONSchemaFeature,
     validate_outlines_json_schema,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
@@ -176,7 +175,6 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             )
         except (
             NotImplementedError,
-            UnsupportedJSONSchemaFeature,
             json.decoder.JSONDecodeError,
             ValueError,
         ) as e:
