@@ -650,6 +650,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         x: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis=None,
+        complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_prefix: int = 0,
         attn_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[Dict[str, int]] = None,
@@ -669,7 +670,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         value = value.unflatten(-1, (num_heads, -1))
         # Raw (cos, sin) tuple, or the cache prebuilt by the transformer forward.
         cos_sin_cache = _rope_cos_sin_cache(freqs_cis)
-        complex_freqs = _rope_complex_freqs(freqs_cis)
 
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (num_heads, -1))
@@ -892,6 +892,7 @@ class FluxSingleTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -920,6 +921,7 @@ class FluxSingleTransformerBlock(nn.Module):
             attn_output = self.attn(
                 x=norm_hidden_states,
                 freqs_cis=freqs_cis,
+                complex_freqs=complex_freqs,
                 num_replicated_prefix=num_replicated_prefix,
                 **joint_attention_kwargs,
             )
@@ -944,6 +946,7 @@ class FluxSingleTransformerBlock(nn.Module):
             attn_output = self.attn(
                 x=norm_hidden_states,
                 freqs_cis=freqs_cis,
+                complex_freqs=complex_freqs,
                 num_replicated_prefix=num_replicated_prefix,
                 **joint_attention_kwargs,
             )
@@ -1058,6 +1061,7 @@ class FluxTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1079,6 +1083,7 @@ class FluxTransformerBlock(nn.Module):
             x=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
+            complex_freqs=complex_freqs,
             num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
@@ -1364,8 +1369,14 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         join_seqs(sin[:t_loc], sin[t_loc:], pad, dim=0),
                     )
 
-        # Build the RoPE cos/sin cache once per step; every attention call
-        # below reuses the same tensor.
+        # Build the RoPE cos/sin cache and complex_freqs once per step; every
+        # attention call below reuses the same tensors.
+        complex_freqs = _rope_complex_freqs(freqs_cis)
+        singles_complex_freqs = (
+            complex_freqs
+            if singles_freqs_cis is freqs_cis
+            else _rope_complex_freqs(singles_freqs_cis)
+        )
         hoisted_freqs_cis = _rope_cos_sin_cache(freqs_cis)
         singles_freqs_cis = (
             hoisted_freqs_cis
@@ -1396,6 +1407,7 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     freqs_cis=freqs_cis,
+                    complex_freqs=complex_freqs,
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
@@ -1405,6 +1417,7 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     freqs_cis=singles_freqs_cis,
+                    complex_freqs=singles_complex_freqs,
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
