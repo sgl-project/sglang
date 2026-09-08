@@ -99,6 +99,18 @@ def get_allocator_from_storage(allocator_type):
             return HostTensorAllocator()
     elif allocator_type == "shm":
         return ShmHostTensorAllocator()
+    elif allocator_type == "tensorcast":
+        try:
+            from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
+                get_tensorcast_host_allocator_from_runtime,
+            )
+
+            return get_tensorcast_host_allocator_from_runtime()
+        except ImportError:
+            logger.warning(
+                "TensorCast's tensor allocator requires tensorcast >= 0.1.0. Please install TensorCast by 'pip install tensorcast' or build from source by following https://tensorcast.ai/development/build-from-source/. Fallback to use default allocator"
+            )
+            return HostTensorAllocator()
     else:
         return HostTensorAllocator()
 
