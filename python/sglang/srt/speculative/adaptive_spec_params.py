@@ -86,6 +86,11 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             "enable_pdmux=True is not supported "
             "(adaptive state swap does not update decode_attn_backend_group)"
         )
+    if cfg.speculative_adaptive_strategy == "throughput_aware" and cfg.pp_size != 1:
+        return (
+            f"pp_size={cfg.pp_size} is not supported by throughput-aware adaptive "
+            "profiling (synthetic startup batches do not traverse PP stages)"
+        )
     return None
 
 

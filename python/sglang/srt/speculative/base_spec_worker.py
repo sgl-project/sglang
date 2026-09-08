@@ -353,6 +353,8 @@ class BaseSpecWorker(ABC):
         """
         pass
 
-    def run_startup_spec_profiling(self, tree_cache) -> None:
+    def run_startup_spec_profiling(
+        self, tree_cache, *, max_running_requests: int
+    ) -> None:
         """Startup cost-table profiling hook. Default no-op."""
         pass

@@ -1,20 +1,23 @@
-"""Real-path profiling: measure one (batch_size, num_steps, seq_len) decode cost.
+"""Real-path profiling for throughput-aware speculative decoding.
 
-Prefill is untimed; only decode cycles (draft + verify + draft_extend) are timed.
-Forward isolation mirrors ``Scheduler._forward_isolation`` + carry-over (branches on ``batch.spec_algorithm.is_none()``).
+Prefill is untimed. Each measured decode cycle runs the same draft, verify,
+and draft-extend path used by online serving, including CUDA graph selection.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import logging
-from array import array as _array
-from typing import List, Protocol, runtime_checkable
+import statistics
+from array import array
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
@@ -36,7 +39,7 @@ class ProfilableSpecWorker(Protocol):
 
 
 class SpecProfilingSession:
-    """Profile one (batch_size, num_steps, seq_len) point; caller must activate STS first."""
+    """Measure one ``(batch_size, num_steps, seq_len)`` profile point."""
 
     def __init__(
         self,
@@ -56,143 +59,172 @@ class SpecProfilingSession:
         self._n_warmup = n_warmup
         self._n_measure = n_measure
         self._device_mod = torch.get_device_module(worker.device)
+        self._forward_iter = 0
 
     def measure(self) -> float:
-        """Return average decode latency (ms). Always frees resources in finally."""
-        reqs, batch = self._build_batch()
-        avg_ms = float("nan")
+        """Return median decode latency in milliseconds."""
+        reqs = self._build_reqs()
+        primary_error = None
         try:
-            self._run_prefill(batch)
+            batch = self._run_prefill(reqs)
             for _ in range(self._n_warmup):
                 self._run_decode(batch)
             self._device_mod.synchronize()
-            avg_ms = self._run_decode_timed(batch)
+            return statistics.median(self._measure_decode_steps(batch))
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            self._teardown(reqs)
-        return avg_ms
+            try:
+                self._teardown(reqs)
+            except Exception:
+                if primary_error is None:
+                    raise
+                logger.exception(
+                    "Failed to clean up profiling requests while handling an "
+                    "earlier profiling error"
+                )
 
-    def _build_batch(self) -> tuple[List[Req], ScheduleBatch]:
+    def _build_reqs(self) -> list[Req]:
         model_config = self._worker.model_config
         vocab_size = getattr(model_config, "vocab_size", 32000)
-        max_new = self._n_warmup + self._n_measure + 8
         sampling_params = SamplingParams(
-            temperature=0.0,
-            max_new_tokens=max_new,
+            temperature=1.0,
+            max_new_tokens=self._n_warmup + self._n_measure + 8,
             ignore_eos=True,
         )
         sampling_params.normalize(None)
 
-        reqs: List[Req] = []
-        for i in range(self._batch_size):
-            tok = np.random.randint(
+        reqs = []
+        rng = np.random.default_rng(0)
+        for index in range(self._batch_size):
+            token_ids = rng.integers(
                 1, max(2, vocab_size), size=self._seq_len, dtype=np.int64
             )
-            input_ids = _array("q", tok.tobytes())
             req = Req(
-                rid=f"spec_profile_s{self._num_steps}_b{self._batch_size}_{i}",
+                rid=(
+                    f"spec_profile_s{self._num_steps}_" f"b{self._batch_size}_{index}"
+                ),
                 origin_input_text="",
-                origin_input_ids=input_ids,
+                origin_input_ids=array("q", token_ids.tolist()),
                 sampling_params=sampling_params,
             )
             req.full_untruncated_fill_ids = req.origin_input_ids
-            req.fill_len = len(req.full_untruncated_fill_ids)
             req.logprob_start_len = -1
-            req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+            req.init_next_round_input(self._tree_cache)
+            req.set_extend_range(
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
             reqs.append(req)
+        return reqs
 
-        batch = ScheduleBatch.init_new(
+    def _build_batch(self, reqs: list[Req]) -> ScheduleBatch:
+        if (
+            self._worker.req_to_token_pool is None
+            or self._worker.token_to_kv_pool_allocator is None
+        ):
+            raise RuntimeError(
+                "Startup profiling requires initialized target memory pools"
+            )
+        return ScheduleBatch.init_new(
             reqs,
             self._worker.req_to_token_pool,
             self._worker.token_to_kv_pool_allocator,
             self._tree_cache,
-            model_config,
+            self._worker.model_config,
             False,
             self._worker.speculative_algorithm,
         )
-        return reqs, batch
 
-    def _run_prefill(self, batch: ScheduleBatch) -> None:
-        batch.prepare_for_extend()
-        if (
-            batch.input_ids is None
-            and getattr(batch, "prefill_input_ids_cpu", None) is not None
-        ):
-            batch.input_ids = batch.prefill_input_ids_cpu.to(
-                self._worker.device, non_blocking=True
+    def _run_prefill(self, reqs: list[Req]) -> ScheduleBatch:
+        max_prefill_tokens = int(get_schedule().max_prefill_tokens or (2**31 - 1))
+        reqs_per_batch = max_prefill_tokens // self._seq_len
+        if reqs_per_batch < 1:
+            raise ValueError(
+                "throughput-aware profile seq_len exceeds max_prefill_tokens: "
+                f"{self._seq_len} > {max_prefill_tokens}"
             )
-            batch.prefill_input_ids_cpu = None
-        self._run_forward_isolated(batch)
 
-    def _run_decode(self, batch: ScheduleBatch) -> None:
+        merged_batch = None
+        for start in range(0, len(reqs), reqs_per_batch):
+            batch = self._build_batch(reqs[start : start + reqs_per_batch])
+            batch.prepare_for_extend()
+            if (
+                batch.input_ids is None
+                and getattr(batch, "prefill_input_ids_cpu", None) is not None
+            ):
+                batch.input_ids = batch.prefill_input_ids_cpu.to(
+                    self._worker.device, non_blocking=True
+                )
+                batch.prefill_input_ids_cpu = None
+            self._run_forward_isolated(batch)
+            if merged_batch is None:
+                merged_batch = batch
+            else:
+                merged_batch.merge_batch(batch)
+
+        assert merged_batch is not None
+        return merged_batch
+
+    def _run_decode(self, batch: ScheduleBatch):
+        # The online scheduler sets this after the rank-consistent graph
+        # eligibility vote. Synthetic profile batches are identical on each TP
+        # rank, so the successful vote is represented directly here.
+        batch.can_run_decode_cuda_graph = True
         batch.prepare_for_decode()
-        self._run_forward_isolated(batch)
+        result = self._run_forward_isolated(batch)
+        if not result.can_run_cuda_graph:
+            raise RuntimeError(
+                "Throughput-aware profiling did not run on a CUDA graph: "
+                f"batch_size={self._batch_size}, num_steps={self._num_steps}"
+            )
+        return result
 
-    def _run_decode_timed(self, batch: ScheduleBatch) -> float:
-        start_evt = torch.cuda.Event(enable_timing=True)
-        end_evt = torch.cuda.Event(enable_timing=True)
-        start_evt.record()
+    def _measure_decode_steps(self, batch: ScheduleBatch) -> list[float]:
+        events = []
         for _ in range(self._n_measure):
+            start = self._device_mod.Event(enable_timing=True)
+            end = self._device_mod.Event(enable_timing=True)
+            start.record()
             self._run_decode(batch)
-        end_evt.record()
+            end.record()
+            events.append((start, end))
         self._device_mod.synchronize()
-        return start_evt.elapsed_time(end_evt) / max(1, self._n_measure)
+        return [start.elapsed_time(end) for start, end in events]
 
-    def _run_forward_isolated(self, batch: ScheduleBatch) -> None:
-        """Mirror scheduler _forward_isolation; snapshot when spec algorithm is active."""
-        is_spec = not batch.spec_algorithm.is_none()
-        snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
-            if is_spec
-            else None
-        )
+    def _run_forward_isolated(self, batch: ScheduleBatch):
+        """Mirror scheduler isolation and post-forward carry-over."""
+        self._forward_iter += 1
+        batch.forward_iter = self._forward_iter
+        snapshot = {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
         sampling_info = batch.sampling_info
         if sampling_info is not None:
             batch.sampling_info = sampling_info.copy_for_forward()
         try:
             result = self._worker.forward_batch_generation(batch)
         finally:
-            if is_spec:
-                for name, value in snapshot.items():
-                    setattr(batch, name, value)
-            else:
-                batch.sampling_info = sampling_info
+            for name, value in snapshot.items():
+                setattr(batch, name, value)
 
-        self._apply_carry_over(batch, result)
+        batch.spec_info = result.next_draft_input
+        if result.new_seq_lens is not None:
+            batch.seq_lens = result.new_seq_lens
+            batch.seq_lens_cpu = result.new_seq_lens.to("cpu")
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
+                req.kv.kv_committed_len = int(seq_len)
+        batch.input_ids = None
+        return result
 
-    def _apply_carry_over(self, batch: ScheduleBatch, result) -> None:
-        """Mirror scheduler post-forward carry-over."""
-        if not batch.spec_algorithm.is_none():
-            batch.spec_info = result.next_draft_input
-            if result.new_seq_lens is not None:
-                batch.seq_lens = result.new_seq_lens
-                if batch.seq_lens_cpu is not None:
-                    batch.seq_lens_cpu = result.new_seq_lens.to("cpu")
-                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            batch.input_ids = None
-        else:
-            if result.next_token_ids is not None:
-                batch.input_ids = result.next_token_ids.to(torch.int64)
-
-    def _teardown(self, reqs: List[Req]) -> None:
-        pool = self._worker.req_to_token_pool
-        kv_alloc = self._worker.token_to_kv_pool_allocator
-
+    def _teardown(self, reqs: list[Req]) -> None:
+        errors = []
         for req in reqs:
-            if getattr(req, "req_pool_idx", None) is None:
-                continue
             try:
-                # free_mamba_cache needs req_pool_idx; call before pool.free().
-                if getattr(req, "mamba_pool_idx", None) is not None and hasattr(
-                    pool, "free_mamba_cache"
-                ):
-                    pool.free_mamba_cache(req)
-                end = max(int(getattr(req, "kv_allocated_len", 0)), int(req.fill_len))
-                kv_indices = pool.req_to_token[req.req_pool_idx, :end]
-                kv_alloc.free(kv_indices)
-                pool.free(req)
-            except Exception as e:
-                logger.error(
-                    "Failed to free request %s during profiling teardown: %s",
-                    req.rid,
-                    e,
-                )
+                release_kv_cache(req, self._tree_cache, is_insert=False)
+            except Exception as exc:
+                errors.append(exc)
+                logger.exception("Failed to free profiling request %s", req.rid)
+        if errors:
+            raise RuntimeError(
+                f"Failed to free {len(errors)} profiling request(s)"
+            ) from errors[0]

@@ -1092,7 +1092,10 @@ class Scheduler(
     def maybe_run_spec_startup_profiling(self) -> None:
         """Run optional speculative-decoding profiling before serving."""
         if self.draft_worker is not None:
-            self.draft_worker.run_startup_spec_profiling(self.tree_cache)
+            self.draft_worker.run_startup_spec_profiling(
+                self.tree_cache,
+                max_running_requests=self.max_running_requests,
+            )
 
     def init_model_worker(self):
         # Load model weights.

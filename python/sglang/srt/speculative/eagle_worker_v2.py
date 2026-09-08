@@ -1531,9 +1531,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=state.speculative_num_draft_tokens,
         )
 
-    def run_startup_spec_profiling(self, tree_cache) -> None:
+    def run_startup_spec_profiling(
+        self, tree_cache, *, max_running_requests: int
+    ) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.run_profiling(tree_cache)
+            self.adaptive_controller.run_profiling(
+                tree_cache,
+                max_running_requests=max_running_requests,
+            )
 
     @contextlib.contextmanager
     def _override_worker_state(
