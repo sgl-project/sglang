@@ -52,6 +52,52 @@ def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     return kv_indices
 
 
+def remap_dcp_local_topk_indices(
+    topk_indices: torch.Tensor, invalid: int = -1
+) -> torch.Tensor:
+    """Global sparse top-k positions -> rank-local KV coordinates, shape preserved.
+
+    The sparse indexer selects top-k over the *replicated* index-K buffer, so it
+    returns positions in the full sequence's coordinate system. Sparse attention
+    reads the *sharded* latent KV and needs rank-local ones. This is the
+    translation between the two.
+
+    ``filter_dcp_local_kv_indices`` cannot be reused here even though the owner
+    rule is identical, because it *selects* and so returns a shorter tensor. A
+    top-k tensor is ``[..., K]`` with K fixed by ``index_topk``, and each row
+    keeps a different number of entries -- selecting would make it ragged, which
+    no kernel can take. So instead of dropping non-owned entries this marks them
+    ``invalid`` and stably compacts the survivors to the front, leaving the
+    shape untouched and the top-k order intact. Same approach as vLLM-Ascend
+    (``attention/context_parallel/sfa_cp.py:1023-1045``), which is the only
+    working reference for DCP composed with a sparse indexer.
+
+    The ``>= 0`` guard is load-bearing, not defensive: the indexer pads short
+    rows with -1, and ``-1 % dcp_size`` is ``dcp_size - 1`` under torch's
+    Python-style modulo, so on the highest rank every padding entry would
+    otherwise look owned and translate to a real row.
+    """
+    parallel = get_parallel()
+    dcp_size = parallel.attn_dcp_size
+    if dcp_size == 1:
+        return topk_indices
+
+    owned = (topk_indices >= 0) & (topk_indices % dcp_size == parallel.attn_dcp_rank)
+    local = torch.where(
+        owned,
+        topk_indices // dcp_size,
+        torch.full_like(topk_indices, invalid),
+    )
+
+    # Stable compaction without relying on a stable sort: offsetting a
+    # non-owned entry's position by K keeps every key distinct, so the
+    # permutation is unique and the ordering is exact rather than tie-broken.
+    k = topk_indices.shape[-1]
+    order = torch.arange(k, device=topk_indices.device, dtype=topk_indices.dtype)
+    keys = order + (~owned).to(topk_indices.dtype) * k
+    return torch.gather(local, -1, torch.argsort(keys, dim=-1))
+
+
 def filter_dcp_local_chunk_kv_indices(
     kv_indices: torch.Tensor,
     chunk_starts_cpu: torch.Tensor,
