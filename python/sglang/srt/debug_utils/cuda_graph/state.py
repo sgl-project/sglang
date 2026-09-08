@@ -313,9 +313,10 @@ class _CudaGraphDumpState:
     def wrap_forward_fn(self, forward_fn):
         """Reset the occurrence counters once per `forward_fn()` invocation.
 
-        `TcPiecewiseCudaGraphBackend.capture_one` calls `forward_fn()` twice, so
-        resetting per capture_one would make the second pass allocate a second
-        buffer for every name.
+        `TcPiecewiseCudaGraphBackend.capture_one` calls `forward_fn()` twice and
+        `BreakableCudaGraphBackend.capture_one` three times (two warmups plus the
+        captured pass), so resetting per capture_one would make every pass after
+        the first allocate a second buffer for every name.
         """
 
         def wrapped(*args, **kwargs):

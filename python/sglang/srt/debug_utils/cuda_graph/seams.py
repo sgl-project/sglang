@@ -138,9 +138,10 @@ def _seam_capture_one(fn: Callable) -> Callable:
 def _wrap_forward_fn(args: tuple, kwargs: dict) -> tuple[tuple, dict]:
     """Substitute `forward_fn` with the occurrence-counter-resetting version.
 
-    `breakable` and `tc_piecewise` both call `forward_fn()` twice per
-    `capture_one`; resetting per `capture_one` instead would make the second
-    pass allocate a second buffer for every name.
+    `breakable` calls `forward_fn()` three times per `capture_one` (two warmups
+    plus the captured pass) and `tc_piecewise` twice; resetting per `capture_one`
+    instead would make every pass after the first allocate a second buffer for
+    every name.
     """
     if len(args) >= 2:
         forward_fn = cuda_graph_dump.wrap_forward_fn(args[1])
