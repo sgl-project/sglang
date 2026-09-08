@@ -719,13 +719,15 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def _draft_extend_plan_for_decode(self, batch: ScheduleBatch) -> bool:
         runner = self.cuda_graph_runner_for_draft_extend
+        if runner is None:
+            return False
+        assert self.draft_extend_attn_backend_list, (
+            "Draft graphs require initialized attention backends"
+        )
         target_graph = self.target_worker.model_runner.decode_cuda_graph_runner
         if (
-            runner is None
-            or batch.forward_mode.is_idle()
-            or self.topk != 1
+            batch.forward_mode.is_idle()
             or getattr(target_graph, "in_graph_metadata_prep_done", None) is None
-            or not self.draft_extend_attn_backend_list
             or not all(
                 b.supports_draft_extend_metadata_staging
                 for b in self.draft_extend_attn_backend_list
@@ -735,6 +737,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             or (runner.disable_padding and len(batch.seq_lens) not in runner.capture_bs)
         ):
             return False
+        assert self.topk == 1, "Draft-extend metadata staging requires topk=1"
         locs, positions = self._compute_boundary_kv_locs_positions(batch)
         if locs is None:
             from sglang.kernels.ops.speculative.cache_locs import (
