@@ -51,7 +51,7 @@ def _get_tactic(m: int, n: int, k: int):
     key = (m, n, k)
     tactic = _tactic_cache.get(key)
     if tactic is None:
-        from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_splitk import (
+        from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
             SplitKTactic,
             default_tactic,
             validate_tactic,
@@ -76,7 +76,7 @@ def hc_mix(
     hc_count: int,
     hidden_size: int,
 ) -> torch.Tensor:
-    from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_splitk import (
+    from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
         run_splitk_dense_gate,
         run_splitk_dense_silu,
     )
