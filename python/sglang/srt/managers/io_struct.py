@@ -265,6 +265,10 @@ class GenerateReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # {lora_name: disk path}: where to (re)load a requested adapter from when
+    # this engine does not hold it — the request is self-sufficient, so a fresh
+    # or restarted engine can serve any published version without prior state.
+    lora_backfill_paths: Optional[Dict[str, str]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -1133,6 +1137,10 @@ class EmbeddingReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # {lora_name: disk path}: where to (re)load a requested adapter from when
+    # this engine does not hold it — the request is self-sufficient, so a fresh
+    # or restarted engine can serve any published version without prior state.
+    lora_backfill_paths: Optional[Dict[str, str]] = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     positional_embed_overrides: Any = None

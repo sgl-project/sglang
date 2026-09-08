@@ -3454,15 +3454,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         unregistered_loras = await self.lora_registry.get_unregistered_loras(
             unique_lora_paths
         )
+        backfill_paths = obj.lora_backfill_paths or {}
         for lora_path in unregistered_loras:
             if lora_path is None:
                 continue
 
             if lora_path not in self.lora_ref_cache:
-                raise ValueError(
-                    f"Got LoRA adapter that has never been loaded: {lora_path}\n"
-                    f"All loaded adapters: {self.lora_ref_cache.keys()}."
-                )
+                # A request-carried backfill path makes the request
+                # self-sufficient: a fresh or restarted engine can serve any
+                # published version without prior state.
+                if lora_path in backfill_paths:
+                    self.lora_ref_cache[lora_path] = LoRARef(
+                        lora_name=lora_path,
+                        lora_path=backfill_paths[lora_path],
+                        pinned=False,
+                    )
+                else:
+                    raise ValueError(
+                        f"Got LoRA adapter that has never been loaded: {lora_path}\n"
+                        f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                    )
 
             new_lora_ref = self.lora_ref_cache[lora_path]
             if not new_lora_ref.reloadable:
