@@ -714,17 +714,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _should_return_input_ids(self, request: ChatCompletionRequest) -> bool:
         """Whether prompt (input) token ids should be returned via sglext."""
-        return (
-            request.return_input_ids_in_sglext
-            or self.tokenizer_manager.server_args.return_input_ids
-        )
+        return request.return_input_ids_in_sglext or get_serving().return_input_ids
 
     def _should_return_output_ids(self, request: ChatCompletionRequest) -> bool:
         """Whether sampled output token ids should be returned via sglext."""
-        return (
-            request.return_output_ids_in_sglext
-            or self.tokenizer_manager.server_args.return_output_ids
-        )
+        return request.return_output_ids_in_sglext or get_serving().return_output_ids
 
     def _continuous_usage_cached_details(
         self, content: Dict[str, Any]
@@ -1768,7 +1762,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if return_output_ids:
                     chunk_output_ids = content.get("output_ids")
                     if chunk_output_ids is not None:
-                        if self.tokenizer_manager.server_args.incremental_streaming_output:
+                        if get_serving().incremental_streaming_output:
                             accumulated = output_ids.setdefault(index, [])
                             if finish_reason_type == "abort":
                                 # The abort chunk re-sends the last token plus any coalesced deltas;

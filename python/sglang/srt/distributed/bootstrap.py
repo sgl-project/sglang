@@ -39,7 +39,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
-    is_hip,
     is_host_cpu_arm64,
     is_npu,
     monkey_patch_p2p_access_check,
@@ -265,8 +264,8 @@ def _init_parallel_groups(
     moe_dp_size: int,
     dcp_size: int,
 ) -> None:
-    is_ep_joiner = server_args.is_ep_joiner
-    is_scale_joiner = server_args.is_ep_scale_joiner
+    is_ep_joiner = get_exec().moe.is_ep_joiner
+    is_scale_joiner = get_exec().moe.is_ep_scale_joiner
     rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
@@ -293,11 +292,6 @@ def _init_parallel_groups(
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
-        duplicate_attn_cp_group=(
-            is_hip()
-            and get_exec().overlap.enable_two_batch_overlap
-            and get_parallel().enable_dsa_prefill_context_parallel
-        ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,

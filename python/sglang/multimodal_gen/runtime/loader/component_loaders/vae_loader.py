@@ -4,7 +4,6 @@ import os
 
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file as safetensors_load_file
 from safetensors.torch import safe_open
 from safetensors.torch import save_file as safetensors_save_file
 
@@ -170,6 +169,22 @@ def _decode_dtype_store_path(
     )
 
 
+def _load_safetensors_file(path: str) -> dict:
+    """The VAE checkpoint itself: read-only where host copies are redundant."""
+    from sglang.multimodal_gen.runtime.loader.utils import (
+        _load_safetensors_file as _load,
+    )
+
+    return _load(path)
+
+
+def _load_store(path: str) -> dict:
+    """Map the store read-only where host copies are redundant (see loader.utils)."""
+    from sglang.multimodal_gen.runtime.loader.utils import _load_safetensors_file
+
+    return _load_safetensors_file(path)
+
+
 def _assign_matching_store(vae, mapped: dict, dtype: torch.dtype) -> bool:
     """Adopt a decode-dtype store if it matches the module, else refuse."""
     state = vae.state_dict()
@@ -199,7 +214,7 @@ def _rehome_cast_weights_to_file(
     path = _decode_dtype_store_path(component_model_path, component_name, dtype)
     try:
         if os.path.exists(path):
-            mapped = safetensors_load_file(path)
+            mapped = _load_store(path)
             if mapped and _assign_matching_store(vae, mapped, dtype):
                 return len(mapped), True
             raise ValueError("existing decode-dtype store does not match the module")
@@ -215,7 +230,7 @@ def _rehome_cast_weights_to_file(
         tmp = f"{path}.tmp.{os.getpid()}"
         safetensors_save_file({k: v.contiguous() for k, v in cast_state.items()}, tmp)
         os.replace(tmp, path)
-        mapped = safetensors_load_file(path)
+        mapped = _load_store(path)
         if set(mapped) != set(cast_state):
             raise ValueError("decode-dtype store does not match the cast weights")
         vae.load_state_dict(mapped, strict=False, assign=True)
@@ -671,7 +686,7 @@ class VAELoader(WeightOverrideComponentLoader):
 
         loaded = {}
         for sf_path in safetensors_list:
-            loaded.update(safetensors_load_file(sf_path))
+            loaded.update(_load_safetensors_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
         num_deparameterized = adopt_plain_weight_norm_state(vae, loaded)
         target_state = vae.state_dict()

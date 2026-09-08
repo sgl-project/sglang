@@ -16,6 +16,7 @@ from typing import Optional
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    Derived,
 )
 
 
@@ -160,10 +161,6 @@ class Parallel:
         bool,
         "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
     ] = False
-    enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
-    dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
-    enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
-    prefill_cp_mode: A[str, Arg(no_cli=True)] = "in-seq-split"
     enable_cp_decode_attn_tp: A[
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
@@ -275,3 +272,44 @@ class Parallel:
         Optional[int],
         "Maximum EP size the server can scale to at runtime. Pre-allocates active-rank state and backend buffers to this size. Defaults to the launch-time world size.",
     ] = None
+
+    # ---- derived: the quotients of the leaves above -------------------------
+    #
+    # Declared here, beside what they are computed from, because a namespace is
+    # one file and one class. They are not annotated, so they are not dataclass
+    # fields and `collect_input_fields` does not put them on the record -- which
+    # is right: a quotient has no operator input to preserve, and the record is
+    # what crosses a process boundary, so a width put there would be a stale
+    # copy the moment an elastic scale-up restamps one. Every input is a leaf
+    # above, so all six are fixed once the configuration is: `publish` computes
+    # them through `parallel_widths_of` and stores them as ordinary bag leaves,
+    # and `ParallelContext` answers with the stamp when a scale-up has moved
+    # one.
+    attn_tp_size = Derived(
+        fn="sglang.srt.runtime_context.attn_tp_size_of",
+        doc="Attention tensor-parallel width: `tp_size` divided by the "
+        "attention-DP and attention-CP dimensions.",
+    )
+    attn_dp_size = Derived(
+        fn="sglang.srt.runtime_context.attn_dp_size_of",
+        doc="Attention data-parallel width: `dp_size` when DP attention is "
+        "on, otherwise one.",
+    )
+    attn_dcp_size = Derived(
+        fn="sglang.srt.runtime_context.attn_dcp_size_of",
+        doc="Decode context-parallel width inside the attention TP group.",
+    )
+    moe_ep_size = Derived(
+        fn="sglang.srt.runtime_context.moe_ep_size_of",
+        doc="MoE expert-parallel width, normalised from the configured value.",
+    )
+    moe_tp_size = Derived(
+        fn="sglang.srt.runtime_context.moe_tp_size_of",
+        doc="MoE tensor-parallel width: what is left of `tp_size` after the "
+        "expert and MoE-DP dimensions.",
+    )
+    dcp_enabled = Derived(
+        fn="sglang.srt.runtime_context.dcp_enabled_of",
+        doc="Whether decode context parallelism is in play: `dcp_size` is "
+        "wider than one rank, which is exactly when the group gets built.",
+    )
