@@ -167,20 +167,27 @@ def _is_gated(layer: Module) -> bool:
     return True if is_gated is None else is_gated
 
 
-def _get_routing_for_flashinfer_routed(
-    topk_output,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Return ``(topk_ids, topk_weights)``; a ``None`` weight means packed ids."""
+FlashInferRouting = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+
+def _get_routing_for_flashinfer_routed(topk_output) -> FlashInferRouting:
+    """Return the `topk_ids` kernel argument for the trtllm routed MoEs."""
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
     if TopKOutputChecker.format_is_packed(topk_output):
-        return topk_output.packed_topk_ids, None
+        return topk_output.packed_topk_ids
 
     assert TopKOutputChecker.format_is_standard(topk_output)
     return (
         topk_output.topk_ids.contiguous(),
         topk_output.topk_weights.contiguous(),
     )
+
+
+def _routing_top_k(routing: FlashInferRouting) -> int:
+    """Both routing forms carry top_k as the last dim of their ids tensor."""
+    ids = routing[0] if isinstance(routing, tuple) else routing
+    return ids.shape[1]
 
 
 def _align_fp8_moe_weights(
@@ -803,7 +810,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert runner_config.top_k is not None, (
                 "runner_config.top_k is required for flashinfer_trtllm_routed."
             )
-            topk_ids, topk_weights = _get_routing_for_flashinfer_routed(topk_output)
+            routing = _get_routing_for_flashinfer_routed(topk_output)
+            topk_ids, topk_weights = (
+                routing if isinstance(routing, tuple) else (routing, None)
+            )
 
             trtllm_fp8_block_scale_routed_moe_out_wrapper(
                 topk_ids=topk_ids,
@@ -1065,15 +1075,12 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         from flashinfer.tllm_enums import ActivationType, RoutingMethodType
 
         if is_standard:
-            if prepared_packed_topk is not None:
-                routing = prepared_packed_topk
-                routed_top_k = prepared_packed_topk.shape[1]
-            else:
-                routed_ids, routed_weights = _get_routing_for_flashinfer_routed(
-                    topk_output
-                )
-                routing = (routed_ids, routed_weights)
-                routed_top_k = routed_ids.shape[1]
+            routing = (
+                prepared_packed_topk
+                if prepared_packed_topk is not None
+                else _get_routing_for_flashinfer_routed(topk_output)
+            )
+            routed_top_k = _routing_top_k(routing)
 
             defer_finalize = _deferred_finalize_enabled.get()
             result = trtllm_fp4_block_scale_routed_moe(
@@ -1380,9 +1387,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 )
 
     if use_routed_topk:
-        topk_ids, topk_weights = _get_routing_for_flashinfer_routed(topk_output)
+        routing = _get_routing_for_flashinfer_routed(topk_output)
         result = trtllm_fp4_block_scale_routed_moe(
-            topk_ids=topk_ids if topk_weights is None else (topk_ids, topk_weights),
+            topk_ids=routing,
             routing_bias=None,
             hidden_states=hs_fp4,
             hidden_states_scale=hs_scale,
@@ -1400,7 +1407,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             output2_scale_scalar=quant_info.g2_alphas,
             per_token_scale=per_token_scale,
             num_experts=quant_info.global_num_experts,
-            top_k=topk_ids.shape[1],
+            top_k=_routing_top_k(routing),
             n_group=0,
             topk_group=0,
             intermediate_size=quant_info.intermediate_size_per_partition,
@@ -1548,9 +1555,8 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             elif routing_method_type == RoutingMethodType.DeepSeekV3:
                 routing_method_type = RoutingMethodType.TopK
 
-            topk_ids, topk_weights = _get_routing_for_flashinfer_routed(topk_output)
             final_hidden_states = trtllm_bf16_routed_moe(
-                topk_ids=topk_ids if topk_weights is None else (topk_ids, topk_weights),
+                topk_ids=_get_routing_for_flashinfer_routed(topk_output),
                 hidden_states=hidden_states,
                 gemm1_weights=quant_info.gemm1_weights,
                 gemm2_weights=quant_info.gemm2_weights,
