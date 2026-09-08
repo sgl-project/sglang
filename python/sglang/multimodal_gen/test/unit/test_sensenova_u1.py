@@ -522,6 +522,17 @@ def test_sensenova_u1_rejects_direct_server_args_quantization():
         )
 
 
+def test_sensenova_u1_rejects_file_valued_component_paths(tmp_path):
+    config = SenseNovaU1PipelineConfig()
+
+    with pytest.raises(ValueError, match="component weight path overrides"):
+        ServerArgs(
+            model_path="sensenova/SenseNova-U1.5-8B-MoT",
+            pipeline_config=config,
+            component_paths={"model": str(tmp_path / "model.safetensors")},
+        )
+
+
 def test_sensenova_u1_vision_config_round_trips_sequence_fields(tmp_path):
     config = NEOVisionConfig(llm_hidden_size=2048, downsample_ratio=0.5)
     config.save_pretrained(tmp_path)

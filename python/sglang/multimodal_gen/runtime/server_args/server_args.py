@@ -1870,6 +1870,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         component_paths: dict[str, str] = {}
         component_weights_paths = dict(self.component_weights_paths)
+        migrated_component_weight_path = False
         for component, path in self.component_paths.items():
             if not is_explicit_weight_file_reference(path):
                 component_paths[component] = path
@@ -1881,6 +1882,11 @@ class ServerArgs(DisaggServerArgsMixin):
                     f"{existing!r} and {path!r}"
                 )
             component_weights_paths[component] = path
+            migrated_component_weight_path = True
+        if migrated_component_weight_path and self.is_arg_explicitly_set(
+            "component_paths"
+        ):
+            self._explicit_arg_names.add("component_weights_paths")
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
         self.component_precisions = _normalize_component_precisions(
