@@ -49,6 +49,7 @@ def transform_index_page_table_decode_kernel(
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
 ):
     TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
@@ -58,7 +59,7 @@ def transform_index_page_table_decode_kernel(
 
     offset = tl.arange(0, TOPK)  # topk should be 2048
     loaded_topk_indices = tl.load(topk_indices_ptr + offset)
-    mask = loaded_topk_indices >= 0
+    mask = (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_WIDTH)
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
     tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
     tl.store(result_ptr + offset, -1, mask=~mask)
@@ -77,6 +78,7 @@ def transform_index_page_table_prefill_kernel(
     result_stride_0: tl.constexpr,
     result_stride_1: tl.constexpr,
     PAGE_TABLE_IS_EXPANDED: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
@@ -100,7 +102,9 @@ def transform_index_page_table_prefill_kernel(
         mask=mask,
         other=-1,
     )
-    valid_topk_mask = mask & (loaded_topk_indices >= 0)
+    valid_topk_mask = (
+        mask & (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_WIDTH)
+    )
 
     if PAGE_TABLE_IS_EXPANDED:
         page_table_rows = token_indices
@@ -151,6 +155,7 @@ def transform_index_page_table_decode_fast(
         result,
         page_size,
         page_table_row_stride=page_table.stride(0),
+        PAGE_TABLE_WIDTH=page_table.shape[1],
     )
     return result
 
@@ -197,6 +202,7 @@ def transform_index_page_table_prefill_fast(
         result.stride(0),
         result.stride(1),
         PAGE_TABLE_IS_EXPANDED=page_table_is_expanded,
+        PAGE_TABLE_WIDTH=page_table.shape[1],
         TOPK=topk_indices.shape[1],
         BLOCK_Q=block_q,
         BLOCK_TOPK=block_topk,
@@ -216,13 +222,14 @@ def transform_index_page_table_decode_ref(
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert result.shape == topk_indices.shape
+    valid_topk_mask = (topk_indices >= 0) & (topk_indices < page_table.shape[1])
     torch.gather(
         page_table.to(result.dtype),
         dim=1,
-        index=topk_indices.clamp(min=0),
+        index=topk_indices.clamp(min=0, max=page_table.shape[1] - 1),
         out=result,
     )
-    result[topk_indices < 0] = -1
+    result[~valid_topk_mask] = -1
     return result
 
 

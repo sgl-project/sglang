@@ -6,7 +6,9 @@ import torch
 import sglang.kernels.ops.attention.dsa.transform_index as transform_index_module
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode_fast,
+    transform_index_page_table_decode_ref,
     transform_index_page_table_prefill_fast,
+    transform_index_page_table_prefill_ref,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -14,6 +16,23 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 
 TOPK = 2048
+
+
+class TestDSATransformIndexReference(unittest.TestCase):
+    def test_decode_reference_masks_both_index_bounds(self):
+        page_table = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
+        topk_indices = torch.tensor(
+            [[-2, -1, 0, 2, 3, 17], [-9, -1, 1, 2, 4, 99]],
+            dtype=torch.int64,
+        )
+
+        actual = transform_index_page_table_decode_ref(page_table, topk_indices)
+
+        expected = torch.tensor(
+            [[-1, -1, 11, 13, -1, -1], [-1, -1, 22, 23, -1, -1]],
+            dtype=torch.int32,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
@@ -78,10 +97,11 @@ class TestDSATransformIndex(CustomTestCase):
         torch.gather(
             source_rows,
             dim=1,
-            index=real_topk.clamp(min=0),
+            index=real_topk.clamp(min=0, max=page_table.shape[1] - 1),
             out=expected[:real_num_tokens],
         )
-        expected[:real_num_tokens][real_topk < 0] = -1
+        valid_topk_mask = (real_topk >= 0) & (real_topk < page_table.shape[1])
+        expected[:real_num_tokens][~valid_topk_mask] = -1
         return expected
 
     def _check_decode_case(
@@ -103,10 +123,11 @@ class TestDSATransformIndex(CustomTestCase):
         torch.gather(
             page_table,
             dim=1,
-            index=topk_indices.clamp(min=0),
+            index=topk_indices.clamp(min=0, max=context_length - 1),
             out=expected,
         )
-        expected[topk_indices < 0] = -1
+        valid_topk_mask = (topk_indices >= 0) & (topk_indices < context_length)
+        expected[~valid_topk_mask] = -1
         result = torch.empty_like(expected) if provide_result else None
 
         actual = transform_index_page_table_decode_fast(
@@ -234,6 +255,49 @@ class TestDSATransformIndex(CustomTestCase):
     def test_decode_fast_extreme_shapes(self):
         self._check_decode_case(8192, 4096)
         self._check_decode_case(2, 1_000_000)
+
+    def test_out_of_bounds_indices_are_replaced_with_minus_one(self):
+        context_length = 8192
+        extend_lens_cpu = [2, 1]
+
+        with self.subTest(path="decode"):
+            page_table = self._make_page_table(2, context_length)
+            topk_indices = self._make_topk(2, context_length)
+            topk_indices[:, 2] = context_length
+            topk_indices[:, 3] = context_length + 17
+            expected = transform_index_page_table_decode_ref(page_table, topk_indices)
+            actual = transform_index_page_table_decode_fast(page_table, topk_indices)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        for page_table_is_expanded in (False, True):
+            with self.subTest(
+                path="prefill",
+                page_table_is_expanded=page_table_is_expanded,
+            ):
+                page_table_rows = (
+                    sum(extend_lens_cpu)
+                    if page_table_is_expanded
+                    else len(extend_lens_cpu)
+                )
+                page_table = self._make_page_table(page_table_rows, context_length)
+                topk_indices = self._make_topk(sum(extend_lens_cpu), context_length)
+                topk_indices[:, 2] = context_length
+                topk_indices[:, 3] = context_length + 17
+                expected = transform_index_page_table_prefill_ref(
+                    page_table=page_table,
+                    topk_indices=topk_indices,
+                    extend_lens_cpu=extend_lens_cpu,
+                    page_table_is_expanded=page_table_is_expanded,
+                )
+                actual = transform_index_page_table_prefill_fast(
+                    page_table=page_table,
+                    topk_indices=topk_indices,
+                    extend_lens_cpu=extend_lens_cpu,
+                    page_table_is_expanded=page_table_is_expanded,
+                )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
