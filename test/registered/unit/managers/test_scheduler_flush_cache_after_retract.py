@@ -55,6 +55,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.draft_worker = None
         scheduler.metrics_reporter = MagicMock()
+        scheduler.head_prefix_lock = None
         return scheduler
 
     def test_flush_cache_succeeds_when_only_retracted_reqs_are_waiting(self):
