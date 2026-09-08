@@ -537,28 +537,16 @@ def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
 
 
 def _ensure_shared_workspace(mega: Any) -> None:
-    """Point this layer at a runtime-context-owned shared symmetric buffer.
-
-    FlashInfer's own workspace_pool shares by a key that includes
-    ``epilogue_pool_key(fc1_alpha/fc2_alpha/fc1_norm_const)`` (see
-    ``flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.backend
-    ._workspace_pool_key``), and that key is identity-keyed for tensors, not
-    value-keyed. sglang binds distinct per-layer alpha/norm-const tensor
-    objects on every FusedMoE layer, so FlashInfer's pool never actually hits
-    across layers and every layer independently pays a full CuteDSL compile
-    (removed in b07d9012a3 "fix: rely on FlashInfer MegaMoE workspace
-    pooling", which assumed FlashInfer's pooling alone was equivalent).
-
-    All layers share identical fleet/kernel geometry, and the alpha/norm-const
-    values are already re-staged into the workspace per forward via
-    ``stage_inputs()`` -- they are not baked into the compiled kernel -- so it
-    is safe to key sharing on geometry alone and skip FlashInfer's per-tensor
-    identity check entirely.
-
-    The first mega layer's first forward creates it (collective; safe because
-    warmup runs the same layer on all ranks in lockstep); later layers reuse it.
+    """Share this layer's workspace across MegaMOE layers with identical
+    fleet/kernel geometry.
+    FlashInfer's own workspace pool keys by fc1_alpha/fc2_alpha/fc1_norm_const
+    tensor identity, but sglang binds distinct tensor objects per layer, so
+    its pool never hits across layers; key on geometry instead, since those
+    values are re-staged into the workspace per forward rather than baked
+    into the compiled kernel. Creation is collective, so it must only happen
+    on a layer's first forward, under warmup's cross-rank lockstep.
     """
-    if getattr(mega, "_workspace", None) is not None:
+    if mega._workspace is not None:
         return
     fp = mega._fleet_params
     kc = mega._megakernel_config
@@ -636,27 +624,15 @@ def run_flashinfer_megamoe(
 
 
 def warmup_all_flashinfer_megamoe_layers(model: torch.nn.Module) -> None:
-    """Force every FlashInfer MegaMOE layer to fully build before CUDA graph
-    capture starts.
-
-    ``ensure_*_moe_layer_for_flashinfer_megamoe`` build lazily on the layer's
-    first forward (see "Initialize MegaMOE layer state lazily"). Nothing
-    actually guarantees that first forward happens during warmup, outside of
-    any graph capture -- if a layer's first real forward instead happens
-    while a CUDA graph is being captured (e.g. it wasn't exercised by the
-    warmup dummy batch/shape), its lazily-computed state (nvfp4's
-    ``input_norm_const``) is still ``None`` when capture reaches it, and
-    ``ensure_nvfp4_moe_layer_for_flashinfer_megamoe`` raises -- capture
-    forbids the fallback's blocking device sync, so it can't silently
-    recover the way warmup can.
-
-    Walk every FusedMoE layer once, explicitly, right before capture begins
-    (see ``ModelRunner.init_cuda_graphs``), so this always happens eagerly
-    and outside any graph, regardless of whether warmup's dummy batches
-    happened to route through every layer.
-
-    Only implements the nvfp4 path (this repro is nvfp4-only); extend the
-    dispatch below if fp4/mxfp8 MegaMOE hits the same gap.
+    """Force every FlashInfer MegaMOE layer to build before CUDA graph capture.
+    ``ensure_*_moe_layer_for_flashinfer_megamoe`` builds a layer's state
+    lazily on its first forward; if that first forward instead happens inside
+    a CUDA graph capture, the lazy build's blocking device sync isn't allowed
+    and it raises rather than silently recovering. Call this once, explicitly,
+    right before capture begins (see ``ModelRunner.init_cuda_graphs``) so
+    every layer is built eagerly outside any graph.
+    Only the nvfp4 path is wired up below; extend the dispatch if fp4/mxfp8
+    MegaMOE hits the same gap.
     """
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
