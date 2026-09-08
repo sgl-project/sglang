@@ -2,7 +2,11 @@ import math
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.model_config import ModelConfig, compute_mla_mscale_scaling
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    compute_mla_mscale_scaling,
+    resolve_spec_hidden_size,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -88,6 +92,10 @@ class TestInitMlaScaling(CustomTestCase):
     def test_ignores_default_rope_type(self):
         base, scaling = _mla_scaling({"rope_type": "default", "factor": 40})
         self.assertEqual(scaling, base)
+
+    def test_hyv4_keeps_plain_spec_size_and_expands_pp_hidden_size(self):
+        config = {"architectures": ["HYV4ForCausalLM"]}
+        self.assertEqual(resolve_spec_hidden_size(config, 6144, 4), (6144, 24576))
 
     def test_no_rope_scaling_keeps_base(self):
         base, scaling = _mla_scaling(None)

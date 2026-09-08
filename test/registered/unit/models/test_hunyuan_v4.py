@@ -12,6 +12,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
+def test_indexer_block_fp8_scales_are_not_permuted():
+    config = SimpleNamespace(
+        index_n_heads=32,
+        index_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+    tensors = {
+        "model.layers.0.self_attn.indexer.wk.weight_scale": torch.empty(1, 48),
+        "model.layers.0.self_attn.indexer.wq_b.weight_scale": torch.empty(32, 16),
+    }
+
+    for name, tensor in tensors.items():
+        result = hunyuan_v4.permute_hyv4_indexer_weight(name, tensor, config)
+        assert result is tensor
+
+
 def test_attention_gate_uses_attention_tp(monkeypatch):
     attn_tp_size = 2
     parallel = SimpleNamespace(
@@ -113,6 +129,44 @@ def test_hpc_attention_gate_is_bf16_only(monkeypatch):
         assert not supported("elementwise", torch.float32, (256, 6144), 256, 6144)
     finally:
         supported.cache_clear()
+
+
+class _PPDecoderLayer(nn.Module):
+    def __init__(self, next_hidden, next_topk):
+        super().__init__()
+        self.next_hidden = next_hidden
+        self.next_topk = next_topk
+
+    def forward(self, *args):
+        return self.next_hidden, self.next_topk
+
+
+def test_non_last_pp_stage_forwards_flattened_hidden_and_shared_topk():
+    model = hunyuan_v4.HYV4Model.__new__(hunyuan_v4.HYV4Model)
+    nn.Module.__init__(model)
+    model.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
+    model.start_layer = 1
+    model.end_layer = 2
+    model.send_topk_indices = True
+    model.topk_indices_width = 8
+
+    next_hidden = torch.randn(2, 4, 16)
+    next_topk = torch.ones(2, 8, dtype=torch.int32)
+    model.layers = nn.ModuleList(
+        [nn.Identity(), _PPDecoderLayer(next_hidden, next_topk)]
+    )
+
+    initial_hidden = torch.randn(2, 4, 16)
+    initial_topk = torch.zeros(2, 8, dtype=torch.int32)
+    proxy = hunyuan_v4.PPProxyTensors(
+        {"hidden_states": initial_hidden, "topk_indices": initial_topk}
+    )
+
+    forward_batch = SimpleNamespace(reuse_dsa_topk_indices=False, spec_info=None)
+    result = model(None, None, forward_batch, pp_proxy_tensors=proxy)
+
+    assert result["hidden_states"].shape == (2, 64)
+    assert result["topk_indices"] is next_topk
 
 
 if __name__ == "__main__":
