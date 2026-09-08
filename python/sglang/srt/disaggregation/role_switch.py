@@ -290,6 +290,8 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     """
     if scheduler.disable_radix_cache:
         return
+    if scheduler.head_prefix_lock is not None:
+        scheduler.head_prefix_lock.release(reason="role_switch")
     tree_cache = scheduler.tree_cache
     if tree_cache is not None:
         clear_storage = getattr(tree_cache, "clear_storage_backend", None)

@@ -75,6 +75,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
+        s.head_prefix_lock = None
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
         s.tp_worker = SimpleNamespace(

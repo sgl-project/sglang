@@ -670,6 +670,16 @@ class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
         s.req_to_token_pool.clear.assert_called_once_with()
         s.token_to_kv_pool_allocator.clear.assert_called_once_with()
 
+    def test_head_prefix_lock_is_released_before_the_reset(self):
+        # A lock released after the reset would decrement a tree it no longer
+        # belongs to.
+        s = _radix_scheduler(disable_radix_cache=False)
+        order = []
+        s.head_prefix_lock.release.side_effect = lambda **kw: order.append("release")
+        s.tree_cache.reset.side_effect = lambda: order.append("reset")
+        _release_prefix_cache_for_role_switch(s)
+        self.assertEqual(order, ["release", "reset"])
+
     def test_teardown_invokes_release(self):
         s = _radix_scheduler(disable_radix_cache=False)
         s.disaggregation_mode = DisaggregationMode.PREFILL
