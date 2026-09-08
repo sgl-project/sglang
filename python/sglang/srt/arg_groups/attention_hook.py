@@ -161,7 +161,7 @@ def handle_attention_backend_compatibility(server_args: Any):
         if (
             prefill_backend == "trtllm_mha"
             and not get_platform().is_sm100
-            and (cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1)
+            and cfg.attn_cp_size > 1
         ):
             raise ValueError(
                 "Prefill context parallelism with the TRTLLM MHA prefill backend "

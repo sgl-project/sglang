@@ -6,7 +6,7 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import enter_override, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -43,9 +43,11 @@ from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -196,6 +198,22 @@ class _MockTemplateManager:
 class ServingChatTestCase(unittest.TestCase):
     # ------------- common fixtures -------------
     def setUp(self):
+        # The serving layer reads its config from the bags, so the fixture has
+        # to publish one rather than hang the values off a mock manager.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                revision=None,
+                enable_cache_report=False,
+                tool_call_parser="hermes",
+                reasoning_parser=None,
+                stream_response_default_include_usage=False,
+                default_chat_template_kwargs=None,
+            ),
+            role="tokenizer",
+        )
         self.tm = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
@@ -3300,8 +3318,12 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIsNone(response.sglext)
 
     def test_non_streaming_ids_server_default_enables_flag(self):
-        self.tm.server_args.return_input_ids = True
-        self.tm.server_args.return_output_ids = True
+        enter_override(
+            self,
+            get_context().override_server_args(
+                return_input_ids=True, return_output_ids=True
+            ),
+        )
         req = ChatCompletionRequest(
             model="x", messages=[{"role": "user", "content": "Hi?"}]
         )
@@ -3353,7 +3375,12 @@ class ServingChatTestCase(unittest.TestCase):
     ):
         """Stream chunks with incremental or cumulative output_ids;
         return parsed sglext chunks, or raw SSE strings when return_raw."""
-        self.tm.server_args.incremental_streaming_output = incremental
+        enter_override(
+            self,
+            get_context().override_server_args(
+                incremental_streaming_output=incremental
+            ),
+        )
         if framed:
             self.fastapi_request.headers["x-sglext-ids-framed"] = "1"
 
@@ -3477,7 +3504,12 @@ class ServingChatTestCase(unittest.TestCase):
         self, normal_chunks, abort_output_ids, incremental, abort_completion_tokens
     ):
         """Stream normal chunks then a graceful-abort chunk; return parsed sglext chunks."""
-        self.tm.server_args.incremental_streaming_output = incremental
+        enter_override(
+            self,
+            get_context().override_server_args(
+                incremental_streaming_output=incremental
+            ),
+        )
 
         async def _mock_generate():
             generated = 0
@@ -3643,14 +3675,18 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_continuous_usage_reports_cached_tokens(self):
         """continuous_usage_stats chunks include cached tokens when cache reporting is on."""
-        self.tm.server_args.enable_cache_report = True
+        enter_override(
+            self, get_context().override_server_args(enable_cache_report=True)
+        )
         usages = self._collect_continuous_usage(cached_tokens=6)
         self.assertTrue(usages, "continuous_usage_stats attached no usage")
         self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
 
     def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
         """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
-        self.tm.server_args.enable_cache_report = False
+        enter_override(
+            self, get_context().override_server_args(enable_cache_report=False)
+        )
         usages = self._collect_continuous_usage(cached_tokens=6)
         self.assertTrue(usages, "continuous_usage_stats attached no usage")
         self.assertIsNone(usages[0].get("prompt_tokens_details"))
@@ -3666,7 +3702,9 @@ class ServingChatTestCase(unittest.TestCase):
         Regression test for https://github.com/sgl-project/sglang/issues/22510.
         """
         # Enable incremental_streaming_output on the mock
-        self.tm.server_args.incremental_streaming_output = True
+        enter_override(
+            self, get_context().override_server_args(incremental_streaming_output=True)
+        )
 
         # Simulate incremental streaming: each yield has ONLY the new text (delta),
         # NOT the full accumulated text.
@@ -4146,6 +4184,9 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""
 
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         tm = _MockTokenizerManager()
         tm.server_args.tool_call_parser = "kimi_k2"
         self.chat = OpenAIServingChat(tm, _MockTemplateManager())

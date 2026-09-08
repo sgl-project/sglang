@@ -23,9 +23,11 @@ from sglang.srt.entrypoints.openai.serving_responses import (
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -625,6 +627,9 @@ class OutputItemsTestCase(CustomTestCase):
     def setUp(self):
         # qwen3_coder is the default for this class; the one no-native-parser
         # case overrides it.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.serving = make_serving()
         self.serving.tool_call_parser = "qwen3_coder"
 
