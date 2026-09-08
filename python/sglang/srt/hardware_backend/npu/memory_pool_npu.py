@@ -573,22 +573,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for i in self.indexer_layer_ids
         )
         requested_kv_cache_dim = kv_cache_dim
-        use_c8 = (
+        self.dsa_kv_cache_store_fp8 = (
             index_head_dim is not None
             and dtype == torch.float8_e4m3fn
             and requested_kv_cache_dim is not None
         )
-        if use_c8:
+        if self.dsa_kv_cache_store_fp8:
             assert index_head_dim == 128 and kv_lora_rank % 128 == 0
             assert requested_kv_cache_dim == (
                 kv_lora_rank + kv_lora_rank // 128 * 4 + qk_rope_head_dim * 2
             )
-            if get_bool_env_var("SGLANG_USE_FIA_NZ"):
-                raise ValueError("Packed DSA FP8 KV requires PA_BSND, not FIA_NZ")
             self.store_dtype = dtype
-        self.dsa_kv_cache_store_fp8 = use_c8
-        self.kv_cache_dim = requested_kv_cache_dim if use_c8 else kv_lora_rank
-        self.kr_cache_dim = 0 if use_c8 else qk_rope_head_dim
+        self.kv_cache_dim = (
+            requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
+        )
+        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
 
@@ -615,7 +614,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     1,
                     self.kr_cache_dim,
                 ),
-                dtype=torch.bfloat16 if use_c8 else self.store_dtype,
+                dtype=(
+                    torch.bfloat16 if self.dsa_kv_cache_store_fp8 else self.store_dtype
+                ),
                 device=self.device,
             )
             self.index_k_buffer = None
@@ -631,7 +632,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-                if use_c8 and self.num_indexer_layers > 0:
+                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
