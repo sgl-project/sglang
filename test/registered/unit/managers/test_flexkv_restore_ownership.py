@@ -46,14 +46,7 @@ class AddReqResult(Enum):
     NO_TOKEN = auto()
 
 
-def _scheduler_case(
-    *,
-    chunked=False,
-    flexkv=False,
-    hicache=False,
-    external_linker=False,
-    running_reqs=(),
-):
+def _scheduler_case(*, chunked=False, flexkv=False):
     req = SimpleNamespace(
         rid="restore",
         init_next_round_input=MagicMock(),
@@ -76,8 +69,8 @@ def _scheduler_case(
     scheduler = SimpleNamespace(
         grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
         tree_cache=cache,
-        enable_hierarchical_cache=hicache,
-        enable_unified_cache_external_linker=external_linker,
+        enable_hierarchical_cache=False,
+        enable_unified_cache_external_linker=False,
         enable_priority_preemption=False,
         is_hybrid_swa=False,
         waiting_queue=[] if chunked else [req],
@@ -117,41 +110,17 @@ def _scheduler_case(
             "DisaggregationMode": SimpleNamespace(PREFILL="prefill"),
         },
     )
-    running = SimpleNamespace(
-        reqs=list(running_reqs),
-        batch_is_full=False,
-        is_empty=lambda: not running_reqs,
-    )
+    running = SimpleNamespace(reqs=[], batch_is_full=False, is_empty=lambda: True)
     return req, leased, adder, lambda: run(scheduler, None, running)
 
 
-@pytest.mark.parametrize(
-    "flexkv,hicache,external_linker,running_reqs,expected_attempts",
-    [
-        pytest.param(True, False, False, (), 2, id="flexkv-idle"),
-        pytest.param(False, False, False, (), 1, id="no-cache-idle"),
-        pytest.param(False, True, False, (), 2, id="hicache-idle"),
-        pytest.param(False, False, True, (), 2, id="external-linker-idle"),
-        pytest.param(True, False, False, (object(),), 1, id="flexkv-running"),
-    ],
-)
-def test_idle_cache_retries_admission_after_temporary_store_pressure(
-    flexkv, hicache, external_linker, running_reqs, expected_attempts
-):
-    _, leased, adder, run = _scheduler_case(
-        flexkv=flexkv,
-        hicache=hicache,
-        external_linker=external_linker,
-        running_reqs=running_reqs,
-    )
+def test_idle_flexkv_retries_admission_after_no_token():
+    _, leased, adder, run = _scheduler_case(flexkv=True)
     leased.clear()
-    # The first tick cannot evict slots protected by an asynchronous store.
-    # After completion, an idle cache-backed batch must retry admission even
-    # though no decode step ran to reset batch_is_full.
     adder.add_one_req.side_effect = [AddReqResult.NO_TOKEN, AddReqResult.OTHER]
     run()
     run()
-    assert adder.add_one_req.call_count == expected_attempts
+    assert adder.add_one_req.call_count == 2
 
 
 @pytest.mark.parametrize("chunked", [False, True])

@@ -3889,10 +3889,7 @@ class Scheduler(
                         or get_memory().enable_flexkv
                         or self.enable_unified_cache_external_linker
                     ):
-                        # Async cache stores can temporarily pin all evictable
-                        # GPU slots. An idle batch must retry admission after
-                        # check_hicache_events releases the completed stores;
-                        # no decode step will clear batch_is_full in that case.
+                        # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
                         )
