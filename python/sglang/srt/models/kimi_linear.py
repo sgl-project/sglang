@@ -142,6 +142,9 @@ class KimiMoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                # Without a prefix the quant loader only sees "gate_up_proj" /
+                # "down_proj" and no `ignore` entry of a checkpoint can match.
+                prefix=add_prefix("shared_experts", prefix),
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -595,7 +598,11 @@ class KimiDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 layer_idx=layer_idx,
-                prefix=f"{prefix}.mlp",
+                # The checkpoint names this module `block_sparse_moe`; quantization
+                # configs (compressed-tensors `ignore`) match against this prefix.
+                # Weight loading is unaffected (names are remapped in load_weights),
+                # the dense layer 0 keeps the `mlp` prefix.
+                prefix=f"{prefix}.block_sparse_moe",
                 alt_stream=self.alt_stream,
             )
             self.mlp = self.block_sparse_moe
@@ -757,6 +764,13 @@ class KimiLinearModel(nn.Module):
 
 
 class KimiLinearForCausalLM(nn.Module):
+    # Lets compressed-tensors map a checkpoint's `ignore` list (HF names
+    # gate_proj/up_proj, q/k/v_proj) onto the fused modules SGLang builds.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: KimiLinearConfig,
