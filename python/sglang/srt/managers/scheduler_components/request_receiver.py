@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     MMInputsProcessError,
@@ -80,7 +81,7 @@ class SchedulerRequestReceiver:
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
     # Emits AbortReqs for SGLANG_REQ_WAITING_TIMEOUT / _RUNNING_TIMEOUT;
     # runs on the rank that owns the waiting queue.
-    poll_timeout_aborts: Optional[Callable[[], List[Any]]] = None
+    poll_timeout_aborts: Callable[[], List[AbortReq]]
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -109,8 +110,7 @@ class SchedulerRequestReceiver:
         # drops the same requests in the same iteration.
         local_reqs = []
         if (
-            self.poll_timeout_aborts is not None
-            and self.ps.pp_rank == 0
+            self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
             and self.ps.attn_cp_rank == 0
         ):
