@@ -7,11 +7,29 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_multimodal_breakable_cuda_graph_supported,
+    is_multimodal_model,
+    is_multimodal_piecewise_cuda_graph_supported,
+    register_external_model_architectures,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def test_register_external_model_architectures():
+    architecture = "TestExternalMultimodalForConditionalGeneration"
+
+    register_external_model_architectures(
+        architecture,
+        multimodal=True,
+        multimodal_breakable_cuda_graph=True,
+    )
+
+    assert is_multimodal_model([architecture])
+    assert is_multimodal_breakable_cuda_graph_supported([architecture])
+    assert not is_multimodal_piecewise_cuda_graph_supported([architecture])
 
 
 class TestHybridLayerIds(CustomTestCase):

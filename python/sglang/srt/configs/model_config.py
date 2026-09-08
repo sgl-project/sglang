@@ -20,7 +20,7 @@ import os
 from enum import Enum, IntEnum, auto
 from functools import cached_property
 from pathlib import Path
-from typing import Any, List, Optional, Set, Union
+from typing import Any, Iterable, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -2123,8 +2123,44 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "KimiK25ForConditionalGeneration",
 ]
 
+
+def register_external_model_architectures(
+    model_architectures: str | Iterable[str],
+    *,
+    multimodal: bool = False,
+    multimodal_piecewise_cuda_graph: bool = False,
+    multimodal_breakable_cuda_graph: bool = False,
+) -> None:
+    """Register capabilities for architectures supplied by an external package."""
+    if isinstance(model_architectures, str):
+        model_architectures = (model_architectures,)
+    else:
+        model_architectures = tuple(model_architectures)
+    if not model_architectures or any(
+        not isinstance(name, str) or not name for name in model_architectures
+    ):
+        raise ValueError("external model architecture names must be non-empty")
+    capabilities = (
+        (multimodal, multimodal_model_archs),
+        (
+            multimodal_piecewise_cuda_graph,
+            multimodal_piecewise_cuda_graph_supported_model_archs,
+        ),
+        (
+            multimodal_breakable_cuda_graph,
+            multimodal_breakable_cuda_graph_supported_model_archs,
+        ),
+    )
+    if not any(enabled for enabled, _ in capabilities):
+        raise ValueError("at least one external model capability must be enabled")
+    for architecture in model_architectures:
+        for enabled, registry in capabilities:
+            if enabled and architecture not in registry:
+                registry.append(architecture)
+
+
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
-    multimodal_model_archs.append(external_mm_model_arch)
+    register_external_model_architectures(external_mm_model_arch, multimodal=True)
 
 
 def is_multimodal_model(model_architectures: List[str]):
