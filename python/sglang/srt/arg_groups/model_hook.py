@@ -372,13 +372,9 @@ def handle_model_specific_adjustments(server_args: Any):
     elif model_arch in [
         "DeepseekV4ForCausalLM",
     ]:
-        from sglang.srt.arg_groups.deepseek_v4_hook import (
-            validate_deepseek_v4_cp,
-            validate_deepseek_v4_mega_moe_token_budget,
-        )
+        from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
 
         validate_deepseek_v4_cp(server_args)
-        validate_deepseek_v4_mega_moe_token_budget(server_args)
 
         if get_platform().is_sm120:
             # SM120 lacks tcgen05/TMEM: disable features that depend on
@@ -639,6 +635,44 @@ def handle_model_specific_adjustments(server_args: Any):
 
     run_post_process_pass(server_args, _flashinfer_allreduce_fusion_auto_enable)
     run_post_process_pass(server_args, _enforce_disable_allreduce_fusion)
+
+    _validate_mega_moe_token_budget(server_args, model_config, model_arch)
+
+
+# MoE blocks that run every forward through the mega kernel (no fused-MoE
+# fallback), so the per-rank symmetric buffer must cover the prefill chunk.
+_MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
+    {
+        "DeepseekV4ForCausalLM",
+        "MellumForCausalLM",
+        "Qwen2MoeForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3NextForCausalLM",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+)
+
+
+def _validate_mega_moe_token_budget(
+    server_args: Any, model_config: Any, model_arch: str
+) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.moe_a2a_backend != "megamoe":
+        return
+    # NVFP4 experts are repacked into the mega layout at load, so no model can
+    # fall back to the fused MoE path with them.
+    quant_cfg = getattr(model_config.hf_config, "quantization_config", None) or {}
+    nvfp4_experts = cfg.quantization == "modelopt_fp4" or "FP4" in str(
+        quant_cfg.get("quant_algo", "")
+    )
+    if model_arch in _MEGA_MOE_NO_FALLBACK_ARCHS or nvfp4_experts:
+        from sglang.srt.arg_groups.mega_moe_hook import (
+            validate_mega_moe_token_budget,
+        )
+
+        validate_mega_moe_token_budget(server_args, model_arch)
 
 
 def handle_model_capability_adjustments(server_args: Any):

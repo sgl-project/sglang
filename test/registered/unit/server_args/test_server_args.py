@@ -161,6 +161,50 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
 
+    def test_megamoe_rejects_two_batch_overlap(self):
+        # The fused kernel has no dispatch/combine split for the TBO ops to call.
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                enable_two_batch_overlap=True,
+            )
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                args.resolve_once()
+
+    def test_megamoe_requires_sm90_or_sm100(self):
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=False):
+            args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "SM90"):
+                args.resolve_once()
+        with override_platform(is_cuda=False, is_sm90=False, is_sm100=False):
+            args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "CUDA"):
+                args.resolve_once()
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+            ServerArgs(model_path="dummy", moe_a2a_backend="megamoe").resolve_once()
+
+    def test_megamoe_token_budget_must_cover_chunked_prefill(self):
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                chunked_prefill_size=16384,
+            )
+            args.resolve_once()
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                8192
+            ):
+                with self.assertRaisesRegex(ValueError, "required_per_rank=16384"):
+                    validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                16384
+            ):
+                validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+
     def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",

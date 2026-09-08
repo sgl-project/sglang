@@ -2514,6 +2514,61 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+    def _build_mega_moe_weights(self, layer: torch.nn.Module) -> None:
+        # DeepGEMM nvfp4xnvfp4 layout: e2m1 weights + UE4M3 g16 scales, plus the
+        # per-local-expert alphas applied in the L1/L2 epilogues. Activations are
+        # quantized per token at dispatch, so w13_input_scale is not used.
+        import deep_gemm
+        from deep_gemm.utils.math import transform_ue4m3_sf_into_required_layout
+
+        from sglang.srt.layers.moe.mega_moe import check_mega_moe_shapes
+
+        assert layer.moe_runner_config.is_gated, "MegaMoE NVFP4 needs a gated MLP"
+        n1 = layer.w13_weight.shape[1]
+        n2 = layer.w2_weight.shape[1]
+        check_mega_moe_shapes(
+            hidden=layer.w13_weight.shape[2] * 2,
+            intermediate=n1 // 2,
+            mma_type="nvfp4xnvfp4",
+        )
+        w13_sf = transform_ue4m3_sf_into_required_layout(
+            layer.w13_weight_scale.data.view(torch.float8_e4m3fn), n1
+        )
+        w2_sf = transform_ue4m3_sf_into_required_layout(
+            layer.w2_weight_scale.data.view(torch.float8_e4m3fn), n2
+        )
+        l1_pair, l2_pair = deep_gemm.transform_weights_for_mega_moe(
+            (layer.w13_weight.data.view(torch.int8), w13_sf),
+            (layer.w2_weight.data.view(torch.int8), w2_sf),
+            mma_type="nvfp4xnvfp4",
+        )
+
+        num_local = layer.num_local_experts
+        ones = torch.ones(num_local, dtype=torch.float32, device=l1_pair[0].device)
+        g1_gate, g1_up = _compute_gemm1_alphas(layer.w13_weight_scale_2, ones, True)
+        # float2 per local expert: (gate alpha, up alpha).
+        l1_alphas = torch.stack([g1_gate, g1_up], dim=1).contiguous()
+        w2_input_scale = _input_scale_to_local_experts(
+            layer.w2_input_scale, num_local, layer.num_experts, layer.moe_ep_rank
+        )
+        l2_act_scales = (1.0 / w2_input_scale).contiguous()
+        l2_alphas = (
+            w2_input_scale * layer.w2_weight_scale_2.to(torch.float32)
+        ).contiguous()
+
+        layer.mega_l1_weights = l1_pair
+        layer.mega_l2_weights = l2_pair
+        layer.mega_l1_alphas = l1_alphas
+        layer.mega_l2_alphas = l2_alphas
+        layer.mega_l2_act_scales = l2_act_scales
+        # Repoint the params at the mega tensors so the checkpoint layout is freed.
+        layer.w13_weight.data = l1_pair[0]
+        layer.w13_weight_scale.data = l1_pair[1]
+        layer.w2_weight.data = l2_pair[0]
+        layer.w2_weight_scale.data = l2_pair[1]
+        layer._mega_moe_nvfp4 = True
+        layer._mega_moe_weights_built = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
@@ -2527,6 +2582,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale.data, up_first=up_first
             )
             layer._w13_deinterleaved = True
+
+        if get_moe_a2a_backend().is_megamoe():
+            self._build_mega_moe_weights(layer)
+            return
 
         # GEMM1 scale processing is deferred until the input scale is known;
         # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
@@ -2897,6 +2956,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         self._moe_runner_backend = moe_runner_backend
 
+        if get_moe_a2a_backend().is_megamoe():
+            # MegaMoE runs the experts through deep_gemm directly and never
+            # reaches FusedMoE.forward, so no runner / fused a2a func is needed.
+            self.runner = None
+            return
+
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
@@ -2947,6 +3012,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if getattr(layer, "_mega_moe_nvfp4", False):
+            # The experts were repacked into the DeepGEMM mega layout and the
+            # runner was never created; there is no fused-MoE fallback to run.
+            raise RuntimeError(
+                "NVFP4 MegaMoE experts cannot fall back to the fused MoE path; "
+                "the model block must route every forward through "
+                "run_mega_routed_experts (check the MegaMoE token budget)."
+            )
         # Note: dispatch_output may be a DeepEPLLDispatchOutput (no topk_output
         # attribute -- topk_ids/topk_weights live directly on the dispatch
         # tuple). Defer per-attribute access to the branches that actually
