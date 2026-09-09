@@ -1853,6 +1853,9 @@ class Req(ReqDllmMixin):
         self.kv.mamba_needs_clear = False
         self.kv.mamba_interior_ckpt_idx = None
         self.kv.mamba_interior_ckpt_seqlen = None
+        # reset_for_retract itself frees nothing; the armed interior slot must
+        # have been released by release_kv_cache/free_mamba_cache first.
+        assert self.kv.mamba_interior_ckpt_idx is None
         self.already_computed = 0
         assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0
@@ -2962,6 +2965,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         tree_cache = self.tree_cache
         if not isinstance(tree_cache, (MambaRadixCache, UnifiedRadixCache)):
+            return None
+        if tree_cache.disable:
+            # No tree to donate to; arming would only churn the allocator.
             return None
         if isinstance(tree_cache, UnifiedRadixCache) and (
             # The unified MAMBA component mirrors MambaRadixCache's insert
