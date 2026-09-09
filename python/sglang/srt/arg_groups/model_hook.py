@@ -357,12 +357,18 @@ def handle_model_specific_adjustments(server_args: Any):
                 # to follow it.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
-                declare_resolution(
-                    server_args,
-                    "_handle_model_specific_adjustments",
-                    enable_aiter_allreduce_fusion=True,
-                )
-                logger.info("Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM")
+                # TODO (Hubert): Put this back later
+                # server_args.enable_aiter_allreduce_fusion = True
+
+                if model_arch == "GlmMoeDsaForCausalLM":
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        enable_aiter_allreduce_fusion=True,
+                    )
+                    logger.info(
+                        "Enable Aiter AllReduce Fusion for GlmMoeDsaForCausalLM"
+                    )
 
             # The fp4-checkpoint draft spec-MoE resolution moved to the
             # resolution pipeline (arg_groups/overrides.py:
