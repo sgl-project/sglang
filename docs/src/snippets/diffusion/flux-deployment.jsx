@@ -64,6 +64,7 @@ sglang serve \\
   --model-path ${config.repoId} \\
   --num-gpus 4 \\
   --tp-size 4 \\
+  --component-residency dit=resident,text_encoder=layerwise-offload \\
   --dit-cpu-offload False`;
       }
 
