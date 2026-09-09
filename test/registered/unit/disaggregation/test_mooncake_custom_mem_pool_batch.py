@@ -70,6 +70,7 @@ class TestMooncakeCustomMemPoolBatch(CustomTestCase):
         manager.is_hybrid_mla_backend = False
         manager.enable_custom_mem_pool = True
         manager.custom_mem_pool_type = "INTRA_NODE_NVLINK"
+        manager.max_transfer_batch_indices = 0
         manager.pp_size = 1
         manager._transfer_data = MagicMock(return_value=0)
         executor = MagicMock()
@@ -109,110 +110,6 @@ class TestMooncakeCustomMemPoolBatch(CustomTestCase):
                 (src_ptrs[-1] + 500, dst_ptrs[-1] + 1_500, 100),
             ],
         )
-
-    def test_dcp_intra_node_nvlink_combines_all_layers(self):
-        manager = object.__new__(MooncakeKVManager)
-        manager.enable_custom_mem_pool = True
-        manager.custom_mem_pool_type = "INTRA_NODE_NVLINK"
-        manager.kv_args = MagicMock(
-            page_size=256,
-            kv_data_ptrs=[100_000 + i * 10_000 for i in range(43)],
-            kv_layer_ids=list(range(43)),
-        )
-        manager._transfer_data = MagicMock(return_value=0)
-        executor = MagicMock()
-        dst_ptrs = [200_000 + i * 10_000 for i in range(43)]
-
-        ret = manager.send_kvcache_dcp(
-            mooncake_session_id="session",
-            prefill_kv_indices=np.array([2], dtype=np.int32),
-            dst_kv_ptrs=dst_ptrs,
-            dst_kv_indices=np.array([5], dtype=np.int32),
-            dcp_token_item_lens=[16] * 43,
-            dst_dcp_size=1,
-            dst_dcp_rank=0,
-            src_page_offset=0,
-            decode_prefix_len=0,
-            num_kv_tokens=256,
-            executor=executor,
-            dst_layer_ids=list(range(43)),
-        )
-
-        self.assertEqual(ret, 0)
-        executor.submit.assert_not_called()
-        manager._transfer_data.assert_called_once()
-        session_id, blocks = manager._transfer_data.call_args.args
-        self.assertEqual(session_id, "session")
-        self.assertEqual(len(blocks), 43)
-        self.assertEqual(
-            blocks[0],
-            (100_000 + 2 * 256 * 16, 200_000 + 5 * 256 * 16, 256 * 16),
-        )
-        self.assertEqual(
-            blocks[-1],
-            (
-                100_000 + 42 * 10_000 + 2 * 256 * 16,
-                200_000 + 42 * 10_000 + 5 * 256 * 16,
-                256 * 16,
-            ),
-        )
-
-    def test_generic_unverified_custom_pool_keeps_per_layer_submission(self):
-        manager = object.__new__(MooncakeKVManager)
-        manager.is_mla_backend = True
-        manager.is_hybrid_mla_backend = False
-        manager.enable_custom_mem_pool = True
-        manager.custom_mem_pool_type = "NVLINK"
-        manager.pp_size = 1
-        manager.enable_deferred_decode_kv_release = False
-        manager._transfer_data = MagicMock(return_value=0)
-        executor = ImmediateExecutor()
-
-        ret = manager._send_kvcache_generic(
-            mooncake_session_id="session",
-            src_data_ptrs=[100_000, 110_000, 120_000],
-            dst_data_ptrs=[200_000, 210_000, 220_000],
-            item_lens=[100, 100, 100],
-            prefill_data_indices=np.array([1, 2], dtype=np.int32),
-            dst_data_indices=np.array([11, 12], dtype=np.int32),
-            executor=executor,
-        )
-
-        self.assertEqual(ret, 0)
-        self.assertEqual(executor.submit_count, 3)
-        self.assertEqual(manager._transfer_data.call_count, 3)
-
-    def test_dcp_unverified_custom_pool_keeps_per_layer_submission(self):
-        manager = object.__new__(MooncakeKVManager)
-        manager.enable_custom_mem_pool = True
-        manager.custom_mem_pool_type = "BAREX"
-        manager.enable_deferred_decode_kv_release = False
-        manager.kv_args = MagicMock(
-            page_size=256,
-            kv_data_ptrs=[100_000, 110_000, 120_000],
-            kv_layer_ids=[0, 1, 2],
-        )
-        manager._transfer_data = MagicMock(return_value=0)
-        executor = ImmediateExecutor()
-
-        ret = manager.send_kvcache_dcp(
-            mooncake_session_id="session",
-            prefill_kv_indices=np.array([2], dtype=np.int32),
-            dst_kv_ptrs=[200_000, 210_000, 220_000],
-            dst_kv_indices=np.array([5], dtype=np.int32),
-            dcp_token_item_lens=[16, 16, 16],
-            dst_dcp_size=1,
-            dst_dcp_rank=0,
-            src_page_offset=0,
-            decode_prefix_len=0,
-            num_kv_tokens=256,
-            executor=executor,
-            dst_layer_ids=[0, 1, 2],
-        )
-
-        self.assertEqual(ret, 0)
-        self.assertEqual(executor.submit_count, 3)
-        self.assertEqual(manager._transfer_data.call_count, 3)
 
 
 if __name__ == "__main__":

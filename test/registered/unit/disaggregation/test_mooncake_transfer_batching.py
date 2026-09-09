@@ -27,6 +27,7 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             is_hybrid_mla_backend=False,
             pp_size=1,
             enable_custom_mem_pool=enable_custom_mem_pool,
+            custom_mem_pool_type="NVLINK",
             enable_deferred_decode_kv_release=False,
             max_transfer_batch_indices=max_batch_indices,
             get_mla_kv_ptrs_with_pp=MagicMock(
