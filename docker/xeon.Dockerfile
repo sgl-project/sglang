@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 SHELL ["/bin/bash", "-c"]
 
 ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
@@ -8,6 +8,7 @@ RUN apt-get update && \
     apt-get full-upgrade -y && \
     DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
     ca-certificates \
+    ffmpeg \
     git \
     curl \
     wget \
@@ -16,7 +17,7 @@ RUN apt-get update && \
     g++ \
     make \
     libsqlite3-dev \
-    google-perftools \
+    libgoogle-perftools-dev \
     libtbb-dev \
     libnuma-dev \
     numactl

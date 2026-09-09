@@ -127,9 +127,9 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
     # bf16 cross-implementation noise (chunk=16 CUTLASS vs chunk=64 Triton);
     # measured cos ~0.985 output / ~0.9999 state on H20-3e and B200.
     assert _cos(ref_out, out) > 0.95, f"output cos too low: {_cos(ref_out, out):.4f}"
-    assert (
-        _cos(ref_state, st_fk[d["idx"]]) > 0.99
-    ), f"state cos too low: {_cos(ref_state, st_fk[d['idx']]):.4f}"
+    assert _cos(ref_state, st_fk[d["idx"]]) > 0.99, (
+        f"state cos too low: {_cos(ref_state, st_fk[d['idx']]):.4f}"
+    )
 
 
 def test_flashkda_falls_back_without_lower_bound():
@@ -191,9 +191,9 @@ def test_flashkda_spec_verify_falls_back():
     assert torch.isfinite(out).all()
     # Took the Triton fallback (not FlashKDA) -> matches chunk_kda closely. If
     # FlashKDA had run, the cross-impl cos would be ~0.985 and this would fail.
-    assert (
-        _cos(ref_out, out) > 0.999
-    ), f"spec-decode did not fall back: {_cos(ref_out, out):.4f}"
+    assert _cos(ref_out, out) > 0.999, (
+        f"spec-decode did not fall back: {_cos(ref_out, out):.4f}"
+    )
 
 
 if __name__ == "__main__":
