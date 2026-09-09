@@ -744,6 +744,7 @@ def run_one_case(
         if fake_prefill:
             payload["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
             payload["bootstrap_room"] = 0
+            payload["skip_cache_insert"] = True
         if lora_name:
             # SGLang /generate accepts lora_path as either a string (applied
             # to every prompt) or a list matching the batch size (per-prompt
