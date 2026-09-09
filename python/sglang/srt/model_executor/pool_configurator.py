@@ -23,7 +23,6 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
-    ModelConfig,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
@@ -46,7 +45,6 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
-    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -118,32 +116,6 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * get_parallel().attn_dcp_size
-
-
-def _resolve_draft_kv_cache_dtype(kvc: KVCacheConfigurator) -> torch.dtype:
-    """Resolve the EAGLE/STANDALONE draft KV dtype for capacity sizing."""
-    from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
-
-    spec = get_spec()
-    draft_model_config = kvc.model_config
-    if spec.speculative_draft_model_path:
-        draft_model_config = ModelConfig.from_server_args(
-            kvc.server_args,
-            model_path=spec.speculative_draft_model_path,
-            model_revision=spec.speculative_draft_model_revision,
-            is_draft_model=True,
-        )
-
-    _, draft_dtype = configure_kv_cache_dtype(
-        server_args_kv_cache_dtype=get_model().kv_cache_dtype,
-        speculative_draft_kv_cache_dtype=spec.speculative_draft_kv_cache_dtype,
-        model=None,
-        model_dtype=draft_model_config.dtype,
-        is_draft_worker=True,
-        is_dflash=False,
-        speculative_draft_attention_backend=spec.speculative_draft_attention_backend,
-    )
-    return draft_dtype
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -256,8 +228,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
-        # Assumes draft and target share the same per-layer KV size, except
-        # that NPU DSA accounts for the draft's independently configured KV dtype.
+        # Assumes draft and target share the same per-layer KV size (head_dim,
+        # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
+        # reuse the target architecture's attention config.
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
@@ -284,27 +257,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_kv_size = int(
                         target_kv_size * draft_num_layers / target_kv_num_layers
                     )
-                    draft_dtype = None
-                    if _is_npu:
-                        draft_dtype = _resolve_draft_kv_cache_dtype(kvc)
-                        if draft_dtype != kvc.kv_cache_dtype:
-                            from sglang.srt.mem_cache.kv_cache_configurator import (
-                                calculate_mla_kv_cache_dim,
-                            )
-
-                            draft_kv_size = (
-                                calculate_mla_kv_cache_dim(
-                                    model_config=kvc.model_config,
-                                    kv_cache_dtype=draft_dtype,
-                                )
-                                * torch._utils._element_size(draft_dtype)
-                                * draft_num_layers
-                            )
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
-                        kv_cache_dtype=draft_dtype,
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
@@ -460,7 +416,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kvc: KVCacheConfigurator,
         num_layers: int,
         allocate_all_layers: bool = False,
-        kv_cache_dtype: Optional[torch.dtype] = None,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = (
@@ -472,7 +427,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if _is_npu:
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
-            dtype = kvc.kv_cache_dtype if kv_cache_dtype is None else kv_cache_dtype
+            dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
