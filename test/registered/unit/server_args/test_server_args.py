@@ -1153,9 +1153,7 @@ class TestNcclEpArgs(CustomTestCase):
         server_args._handle_a2a_moe()
 
         self.assertEqual(server_args.nccl_ep_mode, "low_latency")
-        self.assertEqual(
-            server_args.nccl_ep_num_max_dispatch_tokens_per_rank, 1024
-        )
+        self.assertEqual(server_args.nccl_ep_num_max_dispatch_tokens_per_rank, 1024)
 
     def test_nccl_ep_falls_back_when_unavailable(self):
         # On CPU CI (no nccl4py / no CUDA), is_nccl_ep_available() is False and
@@ -1174,7 +1172,8 @@ class TestNcclEpArgs(CustomTestCase):
             self.assertEqual(server_args.moe_a2a_backend, "nccl_ep")
         else:
             self.assertIn(
-                server_args.moe_a2a_backend, ("none", "deepep"),
+                server_args.moe_a2a_backend,
+                ("none", "deepep"),
                 f"expected fallback to none/deepep, got {server_args.moe_a2a_backend}",
             )
 

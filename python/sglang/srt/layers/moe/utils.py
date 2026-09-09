@@ -208,7 +208,7 @@ class NcclEpMode(Enum):
     HIGH_THROUGHPUT = "high_throughput"
     AUTO = "auto"
 
-    def resolve(self, is_extend_in_batch: bool) -> "NcclEpMode":
+    def resolve(self, is_extend_in_batch: bool) -> NcclEpMode:
         if self == NcclEpMode.HIGH_THROUGHPUT:
             raise NotImplementedError(
                 "NCCL EP high-throughput (prefill) path is not implemented yet; "

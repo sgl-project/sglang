@@ -1283,6 +1283,7 @@ class DeepseekV2MoE(nn.Module):
                 post_combine_hook_handle.remove()
 
             from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+
             assert isinstance(
                 self.experts.dispatcher,
                 (MaybeTboDeepEPDispatcher, NcclEpDispatcher),
@@ -1419,10 +1420,7 @@ class DeepseekV2MoE(nn.Module):
             x = shared_output
             # aiter moe call will handle routed_scaling_factor in the function
             # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
-            if (
-                self.experts.should_fuse_routed_scaling_factor_in_topk
-                or _use_aiter
-            ):
+            if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
