@@ -928,7 +928,7 @@ class MQALayer(MqaAttentionBase):
             self.register_buffer("sin_cache", sin_cache, persistent=False)
 
         if alt_streams is not None and (
-            (_is_cuda and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
+            ((_is_cuda or _is_hip) and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
         ):
             self.alt_streams = alt_streams[:3]
@@ -1276,7 +1276,7 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """ATOM-style ROCm path: overlap compressors, keep Q/KV on main stream."""
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 1
@@ -1330,14 +1330,34 @@ class MQALayer(MqaAttentionBase):
                 else self.wkv(x_linear)[0]
             )
 
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+                is_unified_kv_triton,
+            )
             from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
-            swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
-            swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
+            unified = is_unified_kv_triton()
+            fuse_verify = (
+                envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
+                and forward_batch.forward_mode.is_target_verify()
+            )
+            if unified and fuse_verify:
+                kv = kv.contiguous()
+                swa_cache, swa_loc = None, None
+                swa_page_size, bf16_store = 1, True
+            elif unified:
+                swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
+                swa_loc = attn_backend.get_unified_swa_loc(forward_batch)
+                swa_page_size, bf16_store = 1, True
+            else:
+                swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
+                swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
+                swa_page_size, bf16_store = (
+                    token_to_kv_pool.swa_kv_pool.page_size,
+                    False,
+                )
 
             q = fused_qk_norm_rope_swa_store(
                 q=q,
@@ -1355,13 +1375,17 @@ class MQALayer(MqaAttentionBase):
                 swa_page_size=swa_page_size,
                 q_out=q_out,
                 dtype=x.dtype,
+                bf16_store=bf16_store,
             )
+            if not (unified and fuse_verify):
+                kv = None
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
             self._compute_kv_to_cache(
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
+            kv = None
 
         del qkv_a
 
@@ -1379,7 +1403,7 @@ class MQALayer(MqaAttentionBase):
         elif self.compressor is not None:
             current_stream.wait_stream(stream_compressor)
 
-        return q
+        return q, kv
 
     def _forward_prepare(
         self,
@@ -1650,10 +1674,10 @@ class MQALayer(MqaAttentionBase):
         attn_sink = self._local_attn_sink()
 
         if enable_multi_stream:
-            # Multi-stream path always fuses cache write into the K kernel,
-            # so the bf16 KV intermediate is gone.
+            # Unified target-verify defers its causally indexed cache write to
+            # the backend; other multi-stream paths write during preparation.
             if _is_hip:
-                q = self._forward_prepare_multi_stream_hip(
+                q, kv = self._forward_prepare_multi_stream_hip(
                     x,
                     positions,
                     forward_batch,
@@ -1670,6 +1694,7 @@ class MQALayer(MqaAttentionBase):
                     q_out,
                     x_quant=x_quant,
                 )
+                kv = None
             else:
                 q = self._forward_prepare_multi_stream(
                     x,
@@ -1679,7 +1704,7 @@ class MQALayer(MqaAttentionBase):
                     q_out,
                     x_quant=x_quant,
                 )
-            kv = None
+                kv = None
         else:
             q, kv = self._forward_prepare(
                 x,
