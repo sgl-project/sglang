@@ -1,11 +1,20 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+    _get_mooncake_client_http_port,
+    _get_mooncake_client_http_setup_kwargs,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _Pool:
@@ -133,3 +142,67 @@ def test_page_wise_scalar_error_is_attributed_without_escaping(caplog):
     assert "707" in caplog.text
 
 
+def test_l4_prefetch_metrics_use_actual_page_sources():
+    class _Store:
+        def __init__(self):
+            self.prefetched_tokens = []
+
+        def batch_get_session_start_with_sources(self, keys):
+            return [0] * len(keys), ["memory", "dfs", "local_disk"]
+
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            return [sum(item) for item in sizes]
+
+        def batch_get_session_end(self, keys):
+            return None
+
+        def record_prefetched_tokens(self, tokens):
+            self.prefetched_tokens.append(tokens)
+
+    class _Collector:
+        def __init__(self):
+            self.prefetches = []
+
+        def log_l4_prefetch(self, source, tokens, duration, success):
+            self.prefetches.append((source, tokens, success))
+
+    store = _Store()
+    linker = _make_linker(store, threshold=10, num_layers=1)
+    linker.page_size = 4
+    linker.storage_metrics_collector = _Collector()
+    linker.pending_load_metrics = {"rid": (12, {}, 0.0)}
+    linker.request_source_callbacks = {}
+    transfer = SimpleNamespace(
+        name=PoolName.KV,
+        keys=["memory-page", "dfs-page", "disk-page"],
+        host_indices=[0, 1, 2],
+    )
+
+    linker.load_layer_wise(6, [("rid", [transfer])])
+
+    assert sorted(linker.storage_metrics_collector.prefetches) == [
+        ("dfs", 4, True),
+        ("local_disk", 4, True),
+    ]
+    assert store.prefetched_tokens == [12]
+
+
+def test_mooncake_client_metrics_port_is_ranked_and_gated(monkeypatch):
+    monkeypatch.setenv(envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.name, "18001")
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+
+    assert _get_mooncake_client_http_port(dp_rank=1) == 18007
+    assert _get_mooncake_client_http_setup_kwargs(False, dp_rank=1) == {}
+    assert _get_mooncake_client_http_setup_kwargs(True, dp_rank=1) == {
+        "enable_client_http_server": True,
+        "client_http_port": 18007,
+    }
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

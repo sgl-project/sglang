@@ -357,7 +357,7 @@ class UnifiedCacheLinkerWrapper:
         )
 
         self._queue_load(
-            req.rid,
+            req,
             insert_result.last_device_node,
             load_transfers,
             time_stats=time_stats,
@@ -374,7 +374,7 @@ class UnifiedCacheLinkerWrapper:
 
     def _queue_load(
         self,
-        rid: str,
+        req: Req,
         node_id: NodeId,
         transfers: list[PoolTransfer],
         *,
@@ -382,6 +382,7 @@ class UnifiedCacheLinkerWrapper:
     ) -> None:
         if not transfers:
             return
+        rid = req.rid
         assert rid not in self.pending_loads
         lock_params = self.cache.inc_lock_ref(node_id).to_dec_params()
         try:
@@ -392,6 +393,18 @@ class UnifiedCacheLinkerWrapper:
         if not queued:
             self.cache.dec_lock_ref(node_id, lock_params)
             raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
+        source_callback_setter = getattr(
+            self.cache_linker, "set_request_storage_source_callback", None
+        )
+        if source_callback_setter is not None:
+
+            def set_storage_source(source: str | None, tokens: int) -> None:
+                req.storage_hit_length = tokens
+                req.cached_tokens_storage_source = (
+                    f"mooncake_{source}" if source is not None else None
+                )
+
+            source_callback_setter(rid, set_storage_source)
         if time_stats is not None:
             self.cache_linker.set_request_time_stats(rid, time_stats)
         self.pending_loads[rid] = (node_id, lock_params)

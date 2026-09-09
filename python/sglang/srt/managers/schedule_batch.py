@@ -1114,6 +1114,8 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # Direct external-linker source used by cached_tokens_total cache_source.
+        self.cached_tokens_storage_source: Optional[str] = None
         self.storage_hit_start: Optional[int] = None
         # FULL host-hit tokens actually spliced to device by init_load_back at
         # admission; less than host_hit_length when the load-back was declined

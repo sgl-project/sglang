@@ -38,6 +38,7 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    dp_rank: Optional[int] = None
 
 
 @dataclass
