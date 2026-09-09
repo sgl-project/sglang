@@ -61,7 +61,7 @@ def test_eager_private_batch_returns_mm_errors_to_worker(no_copy, pdmux):
     with (
         envs.SGLANG_EAGER_INPUT_NO_COPY.override(no_copy),
         patch(
-            "sglang.srt.model_executor.runner.eager_runner.is_cp_v2_active",
+            "sglang.srt.model_executor.runner.eager_runner.is_cp_active",
             return_value=False,
         ),
     ):

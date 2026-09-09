@@ -298,6 +298,12 @@ class Envs:
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
+    # instead of gathering DP tokens for a global-TP lookup.
+    SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
+    # and phases fall back to the original implementation.
+    SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
@@ -720,6 +726,8 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # Base token count for each MLA/DSA dedup broadcast chunk.
+    SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
@@ -1571,6 +1579,14 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+
+    # MiniMax-M3 sparse-attention toggles for ROCm.
+    # Share one index top-k across every N sparse layers; 1 disables sharing.
+    # Changes which KV blocks the skip layers attend, so it applies on ROCm only
+    # (never under two-batch overlap); elsewhere the backend pins 1.
+    # 2 is the accuracy-safe default: higher values reuse staler selections
+    # in the skip layers.
+    SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
     # with a per-query CUSTOM block_table
