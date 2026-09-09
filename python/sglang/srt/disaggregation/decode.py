@@ -2377,11 +2377,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
-            hicache_restore_status = decode_req.hicache_restore_status
-            if (
-                poll == KVPoll.Failed
-                or hicache_restore_status == HiCacheRestoreResult.FAILED
+            if self.scheduler.enable_decode_hicache and poll in (
+                KVPoll.Success,
+                KVPoll.Failed,
             ):
+                # PENDING must block even a peer's FAILED restore until H2D is done.
+                # A restore failure alone must not bypass network/scatter readiness.
+                restore_status = decode_req.hicache_restore_status
+                restore_done, restore_valid = _all_reduce_polls(
+                    [
+                        int(restore_status != HiCacheRestoreResult.PENDING),
+                        int(restore_status != HiCacheRestoreResult.FAILED),
+                    ],
+                    self.gloo_group,
+                )
+                if not restore_done:
+                    continue
+                if not restore_valid:
+                    poll = KVPoll.Failed
+
+            if poll == KVPoll.Failed:
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -2432,11 +2447,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                if (
-                    self.scheduler.enable_decode_hicache
-                    and hicache_restore_status == HiCacheRestoreResult.PENDING
-                ):
-                    continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
