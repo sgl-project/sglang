@@ -26,8 +26,8 @@ user's raw input, kept **read-only** for debug and reproduction; what
 resolution decided lives in the declarations (``resolution_result``) and, for
 business code, in the namespace bags below -- never on this object's fields. The context owns the storage:
 publishing goes through ``RuntimeContext.set_server_args`` (the legacy
-``set_global_server_args_for_scheduler`` / ``get_global_server_args`` are thin
-shims over this slot).
+``set_global_server_args_for_scheduler`` is a thin shim over this slot;
+``get_global_server_args`` is retired and raises).
 
 ``get_exec()`` / ``get_memory()`` / ``get_schedule()`` / ``get_device()`` /
 ``get_model()`` / ``get_spec()`` / ``get_lora()`` / ``get_mm()`` /
@@ -565,6 +565,10 @@ class DpFlags(_FlagGroupBase):
     # Hybrid-SSM models materialize idle ranks via the MAX_LEN fabricated-row
     # conversion (set when hf_config has hybrid_override_pattern).
     max_len_with_idle: bool = False
+    # Set while the prefill CUDA graph runner captures; latched by the DP
+    # gather/scatter helpers, whose captured geometry needs one shared bucket.
+    capturing_prefill_graph: bool = False
+    prefill_graph_has_dp_gather: bool = False
     # DP gathered-buffer allocation metadata (model hidden size / dtype /
     # device), set by initialize_dp_attention alongside the flags above.
     buffer_hidden_size: Any = None
