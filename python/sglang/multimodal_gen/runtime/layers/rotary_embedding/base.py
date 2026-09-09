@@ -144,6 +144,7 @@ class RotaryEmbedding(CustomOp):
             complex_freqs is not None
             and complex_freqs.dim() == 3
             and self._is_complex_style
+            and self._is_full_rotation
         )
         if support_complex_style:
             return (
@@ -439,7 +440,14 @@ class RotaryEmbedding(CustomOp):
                 f"got query: {tuple(query.shape)}, key: {tuple(key.shape)}"
             )
 
-        if complex_freqs is not None:
+        support_complex_style = (
+            complex_freqs is not None
+            and complex_freqs.dim() == 3
+            and self._is_complex_style
+            and self._is_full_rotation
+        )
+
+        if support_complex_style:
             return (
                 _apply_rotary_emb_complex(
                     query, complex_freqs, dtype=self._complex_dtype
@@ -478,7 +486,7 @@ class RotaryEmbedding(CustomOp):
             )
 
         raise ValueError(
-            "No valid inputs (complex_freqs, cos/sin, or cos_sin_cache) for interleaved RoPE."
+            "No valid inputs (complex_freqs, cos/sin, or cos_sin_cache) for RoPE."
         )
 
     def extra_repr(self) -> str:

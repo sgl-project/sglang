@@ -939,7 +939,7 @@ def apply_qk_norm_with_optional_rope(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK RMSNorm and optionally RoPE when a cos/sin cache is provided."""
 
-    if cos_sin_cache is None and freqs_complex is None:
+    if cos_sin_cache is None:
         return apply_qk_norm(
             q=q,
             k=k,
