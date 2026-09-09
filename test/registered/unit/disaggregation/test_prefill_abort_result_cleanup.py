@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -257,6 +258,48 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     scheduler.tree_cache.release_aborted_request.assert_called_once_with(req.rid)
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
     scheduler.send_kv_chunk.assert_not_called()
+
+
+class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
+    def __init__(self, device_module):
+        self.device_module = device_module
+        self.enable_staging = False
+        self.enable_overlap = True
+        self.forward_stream = object()
+        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=4)
+        self.send_kv_chunk = Mock()
+
+
+def test_early_send_wait_event_comes_from_the_scheduler_device_module():
+    """The early-send event is created on the scheduler's device.
+
+    forward_stream is built from that same device, and an event of one accelerator
+    cannot record against another's stream. Resolving the module from the process
+    default instead reinstates that mismatch whenever --device names something
+    other than the default accelerator.
+    """
+    recorded = []
+
+    class _Event:
+        def record(self, stream):
+            recorded.append(stream)
+
+    scheduler = _EarlySendScheduler(SimpleNamespace(Event=_Event))
+    req = SimpleNamespace(
+        pending_bootstrap=False,
+        prefix_indices=list(range(8)),
+        host_hit_length=0,
+        early_send_prefix_end=None,
+        start_send_idx=0,
+        disagg_kv_sender=SimpleNamespace(_early_send_wait_event=None),
+    )
+
+    with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):
+        scheduler.maybe_send_cached_prefix_chunk(req)
+
+    assert isinstance(req.disagg_kv_sender._early_send_wait_event, _Event)
+    assert recorded == [scheduler.forward_stream]
+    scheduler.send_kv_chunk.assert_called_once()
 
 
 if __name__ == "__main__":
