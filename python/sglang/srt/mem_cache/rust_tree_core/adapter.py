@@ -327,10 +327,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise ValueError(
                 "--enable-session-radix-cache is not supported by the Rust TreeCore"
             )
-        # TODO: Port the per-node load-back split.
+        # TODO: Port the per-node load-back split and the path LRU refresh.
         if params.hicache_serialize_load_back:
             raise ValueError(
                 "--hicache-serialize-load-back is not supported by the Rust TreeCore"
+            )
+        if params.allow_subagent_keepalive:
+            raise ValueError(
+                "--allow-subagent-keepalive is not supported by the Rust TreeCore"
             )
 
         # TODO(Jialin): Port custom component registration from #25754 and

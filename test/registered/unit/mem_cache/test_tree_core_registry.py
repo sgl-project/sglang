@@ -491,6 +491,7 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
     def test_python_only_features_use_python_with_a_warning(self):
         for field, flag in (
             ("hicache_serialize_load_back", "--hicache-serialize-load-back"),
+            ("allow_subagent_keepalive", "--allow-subagent-keepalive"),
         ):
             with self.subTest(flag=flag):
                 with self.assertLogs(tree_core_registry.logger, "WARNING") as logs:
