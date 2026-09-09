@@ -103,21 +103,13 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
     if is_hip and is_v4_hisparse:
-        # TEMPORARY GUARD: DSv4 HiSparse is not supported on the unified-KV path.
-        # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
-        # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
-        # at startup with a clear message instead. Remove once unified-KV HiSparse lands.
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        if is_unified_kv_triton():
+        # DSv4 HiSparse attaches to the paged C4 pool, which the ring layout
+        # does not build (c4_kv_pool is None); fail at startup, not in pool init.
+        if resolved_view(server_args).dsv4_kv_layout == "ring":
             raise ValueError(
-                "--enable-hisparse is not supported with the unified-KV path on ROCm"
-                "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton) for DeepSeek-V4: "
-                "HiSparse currently requires the separate packed KV layout. "
-                "Either set SGLANG_HACK_FLASHMLA_BACKEND=triton, or run without "
-                "--enable-hisparse."
+                "--enable-hisparse is not supported with --dsv4-kv-layout ring for "
+                "DeepSeek-V4: HiSparse requires the paged KV layout. Use "
+                "--dsv4-kv-layout paged or run without --enable-hisparse."
             )
         return
 

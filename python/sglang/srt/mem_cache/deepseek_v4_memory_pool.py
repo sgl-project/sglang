@@ -20,6 +20,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.dsv4_kv_layout import DSV4KVLayout, dsv4_kv_layout
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
@@ -449,11 +450,11 @@ class DeepSeekV4LayerItem(NamedTuple):
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
 
 
-# The following kv pool follows ATOM's unified_kv kernel layout.
-class DeepSeekV4UnifiedKVPool:
+# The following kv pool follows ATOM's ring_kv kernel layout.
+class DeepSeekV4RingKVPool:
     """
     Layout:
-    unified_kv[L]: ``[swa_pages + padded_compress_rows, head_dim]`` bf16
+    ring_kv[L]: ``[swa_pages + padded_compress_rows, head_dim]`` bf16
     - rows ``[0, swa_pages)``   = SWA ring (``req_pool_indices * swa_window + pos % swa_window``)
     - rows ``[swa_pages, ...)`` = compressed (``swa_pages + page_index``)
     """
@@ -505,7 +506,7 @@ class DeepSeekV4UnifiedKVPool:
                     )
         self.kv_buffer = bufs
 
-    def get_unified_kv(self, local_layer_id: int) -> torch.Tensor:
+    def get_ring_kv(self, local_layer_id: int) -> torch.Tensor:
         return self.kv_buffer[local_layer_id]
 
     def get_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
@@ -572,18 +573,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        # Resolve the unified-kv gate before any sizing so the two cannot drift.
-        self._unified_kv = is_unified_kv_triton()
+        # Resolve the layout before any sizing so the two cannot drift.
+        self.kv_layout = dsv4_kv_layout()
         c4_ring_size = self.get_ring_size(4)
-        if self._unified_kv:
-            # Unified C4 state is request-addressed: one ring per req slot,
+        if self.is_ring_kv:
+            # Ring C4 state is request-addressed: one ring per req slot,
             # so the caller-supplied, SWA-scaled size does not apply here.
             c4_state_pool_size = self.num_req_slots * c4_ring_size
-        # Non-unified (fp8) keeps the caller-supplied, SWA-addressed size.
+        # Paged (fp8) keeps the caller-supplied, SWA-addressed size.
         self.c4_state_pool_size = c4_state_pool_size
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:
@@ -639,14 +636,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
 
-        if self._unified_kv:
+        if self.is_ring_kv:
             self.swa_kv_pool = None
             self.c4_kv_pool = None
             self.c128_kv_pool = None
             swa_ring_size = get_swa_ring_size(
                 self.sliding_window, get_spec().speculative_algorithm is not None
             )
-            self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
+            self.ring_kv_pool = DeepSeekV4RingKVPool(
                 stage_ratios=stage_ratios,
                 num_slots=self.num_req_slots,
                 num_blocks=self.c128_size,
@@ -659,12 +656,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 swa_ring_size=swa_ring_size,
             )
 
-            self.unified_swa_window = self.sliding_window
-            self.unified_swa_ring_size = swa_ring_size
-            self.unified_swa_pages = self.unified_kv_pool.swa_pages
-            self.swa_req_ring_size = self.unified_swa_ring_size
+            self.swa_ring_window = self.sliding_window
+            self.swa_ring_size = swa_ring_size
+            self.swa_ring_rows = self.ring_kv_pool.swa_pages
+            self.swa_req_ring_size = self.swa_ring_size
         else:
-            self.unified_kv_pool = None
+            self.ring_kv_pool = None
+            self.swa_ring_rows = 0
             self.swa_kv_pool = self._make_kv_pool(
                 size=swa_size,
                 page_size=swa_page_size,
@@ -714,11 +712,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_paged_compress_states(enable_memory_saver)
 
-    def get_unified_kv(self, layer_id: int) -> torch.Tensor:
+    @property
+    def is_ring_kv(self) -> bool:
+        return self.kv_layout is DSV4KVLayout.RING
+
+    def get_ring_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
         # layer's transfer before attention reads it. No-op when HiCache is off.
         self.wait_layer_transfer(layer_id)
-        return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
+        return self.ring_kv_pool.get_ring_kv(layer_id - self._stage_start)
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
@@ -736,18 +738,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if self._unified_kv:
-            # Unified buffer per layer: [swa_pages + padded_compress_rows, head_dim].
+        if self.is_ring_kv:
+            # Ring KV buffer per layer: [swa_pages + padded_compress_rows, head_dim].
             # Compressed region [swa_pages:] is page-contiguous (row swa_pages +
             # loc//ratio), so reuse the page-block PD transfer by offsetting the ptr
             # past the SWA ring and setting item_len = one page of rows. The SWA ring
             # ships separately as StateType.SWA_RING. Order [c4, c4_indexer, c128]
-            # mirrors the non-unified kv_data layout (keeps PP ptr-slicing valid).
+            # mirrors the paged kv_data layout (keeps PP ptr-slicing valid).
             stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
-            swa_pages = self.unified_kv_pool.swa_pages
+            swa_pages = self.ring_kv_pool.swa_pages
 
             def _append_compressed_entry(local_layer_id: int, ratio: int) -> None:
-                buf = self.unified_kv_pool.kv_buffer[local_layer_id]
+                buf = self.ring_kv_pool.kv_buffer[local_layer_id]
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 row_bytes = buf[0].nbytes
                 rows_per_page = self.page_size // ratio
@@ -786,17 +788,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         return data_ptrs, data_lens, item_lens
 
-    def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """SWA-ring region [0, swa_pages) of every unified_kv layer, addressed
+    def get_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """SWA-ring region [0, swa_pages) of every ring_kv layer, addressed
         per-row by ring slot. Shipped as the StateType.SWA_RING PD component."""
         # TODO(billishyahao): validate PP layer-slicing for SWA_RING.
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
-        if not self._unified_kv:
+        if not self.is_ring_kv:
             return data_ptrs, data_lens, item_lens
-        swa_pages = self.unified_kv_pool.swa_pages
-        for buf in self.unified_kv_pool.kv_buffer:
+        swa_pages = self.ring_kv_pool.swa_pages
+        for buf in self.ring_kv_pool.kv_buffer:
             assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
             row_bytes = buf[0].nbytes
             data_ptrs.append(buf.data_ptr())
@@ -804,25 +806,25 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             item_lens.append(row_bytes)
         return data_ptrs, data_lens, item_lens
 
-    def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
+    def ring_kv_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
         """
-        In unified_kv, swa/c4/c128 share one buffer with one slot per row. But the
+        In ring_kv, swa/c4/c128 share one buffer with one slot per row. But the
         HiCache host pool transfers a whole page per indexed row, so we reshape the
         compressed region into the layout it expects: skip the SWA segment, reshape to
         one row per page, then cast to uint8.
         """
-        assert self._unified_kv, "unified_region_buffers requires unified_kv layout"
+        assert self.is_ring_kv, "ring_kv_region_buffers requires ring_kv layout"
         assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
 
-        swa_pages = self.unified_kv_pool.swa_pages
-        head_dim = self.unified_kv_pool.head_dim
+        swa_pages = self.ring_kv_pool.swa_pages
+        head_dim = self.ring_kv_pool.head_dim
         rows_per_page = self.page_size // ratio
         stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
         local_layer_ids = [i for i, r in enumerate(stage_ratios) if r == ratio]
 
         views: List[torch.Tensor] = []
         for local_layer_id in local_layer_ids:
-            buf = self.unified_kv_pool.kv_buffer[local_layer_id]
+            buf = self.ring_kv_pool.kv_buffer[local_layer_id]
             compress_rows = buf.shape[0] - swa_pages
             assert compress_rows % rows_per_page == 0, (
                 f"compressed rows {compress_rows} not a multiple of "
@@ -837,7 +839,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             views.append(page_view)
 
         item_bytes = (
-            rows_per_page * head_dim * self.unified_kv_pool.kv_buffer[0].element_size()
+            rows_per_page * head_dim * self.ring_kv_pool.kv_buffer[0].element_size()
         )
         return views, item_bytes
 
@@ -846,7 +848,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if not self._unified_kv:
+        if not self.is_ring_kv:
             for buf in self.swa_kv_pool.kv_buffer:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
@@ -1064,7 +1066,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.online_c128_mtp_pending_seq_lens
 
     def clear_c4_req_states(self, req_pool_indices: Sequence[int]) -> None:
-        if not self._unified_kv or not req_pool_indices:
+        if not self.is_ring_kv or not req_pool_indices:
             return
 
         pools = [
@@ -1297,7 +1299,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             page_size=self.swa_kv_pool.page_size,
         )
 
-    def set_unified_key_buffer_radix_fused_norm_rope(
+    def set_ring_kv_key_buffer_radix_fused_norm_rope(
         self,
         layer_id: int,
         swa_loc: torch.Tensor,
@@ -1307,22 +1309,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        """unified_kv counterpart of set_swa_key_buffer_radix_fused_norm_rope.
+        """ring_kv counterpart of set_swa_key_buffer_radix_fused_norm_rope.
 
-        Under unified_kv the (fp8, paged) swa_kv_pool is None -- SWA K lives in
-        the shared bf16 unified_kv ring instead. Norm+RoPE the draft KV in place
+        Under ring_kv the (fp8, paged) swa_kv_pool is None -- SWA K lives in
+        the shared bf16 ring_kv ring instead. Norm+RoPE the draft KV in place
         (the same freqs_cis path the main model uses via _compute_kv_bf16) and
-        scatter it into ``unified_kv[swa_loc]``. Rows with swa_loc < 0
+        scatter it into ``ring_kv[swa_loc]``. Rows with swa_loc < 0
         (uncommitted verify tokens) are skipped by the scatter.
         """
         from sglang.kernels.ops.attention.dsv4 import fused_norm_rope_inplace
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.attention.dsv4.ring_kv_kernels import runtime
 
         fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
-        runtime.scatter_bf16_into_unified(
+        runtime.scatter_bf16_into_ring_kv(
             kv=kv,
             loc=swa_loc,
-            unified_kv=self.get_unified_kv(layer_id),
+            ring_kv=self.get_ring_kv(layer_id),
         )
 
     def set_extra_key_buffer_fused(
@@ -1354,3 +1356,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.set_index_fp4(compress_layer_id, loc, cache_k)
+
+
+def is_dsv4_ring_pool(kvcache) -> bool:
+    return isinstance(kvcache, DeepSeekV4TokenToKVPool) and kvcache.is_ring_kv

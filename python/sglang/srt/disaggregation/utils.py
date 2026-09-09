@@ -1369,13 +1369,13 @@ def setup_state_kv_args(
                     StateType.BLOCK_SCALE_SWA,
                     *token_to_kv_pool.get_swa_kv_scale_buf_infos(),
                 )
-            # unified_kv: the SWA ring lives in the unified buffers (no separate
+            # ring_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
-            if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
-                token_to_kv_pool, "get_unified_swa_ring_buf_infos"
-            ):
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import is_dsv4_ring_pool
+
+            if is_dsv4_ring_pool(token_to_kv_pool):
                 ring_ptrs, ring_lens, ring_item_lens = (
-                    token_to_kv_pool.get_unified_swa_ring_buf_infos()
+                    token_to_kv_pool.get_swa_ring_buf_infos()
                 )
                 if ring_ptrs:
                     append_state_component(
@@ -1529,21 +1529,21 @@ def setup_state_kv_args(
             raise RuntimeError(
                 "DSV4 draft state transfer expects SWA-only NextN layers"
             )
-        if token_to_kv_pool._unified_kv != draft_token_to_kv_pool._unified_kv:
+        if token_to_kv_pool.is_ring_kv != draft_token_to_kv_pool.is_ring_kv:
             raise RuntimeError(
-                "DSV4 target and draft pools must use the same unified-KV mode"
+                "DSV4 target and draft pools must use the same ring-KV mode"
             )
 
-        if token_to_kv_pool._unified_kv:
+        if token_to_kv_pool.is_ring_kv:
             target_geometry = (
-                token_to_kv_pool.unified_swa_window,
-                token_to_kv_pool.unified_swa_ring_size,
-                token_to_kv_pool.unified_swa_pages,
+                token_to_kv_pool.swa_ring_window,
+                token_to_kv_pool.swa_ring_size,
+                token_to_kv_pool.swa_ring_rows,
             )
             draft_geometry = (
-                draft_token_to_kv_pool.unified_swa_window,
-                draft_token_to_kv_pool.unified_swa_ring_size,
-                draft_token_to_kv_pool.unified_swa_pages,
+                draft_token_to_kv_pool.swa_ring_window,
+                draft_token_to_kv_pool.swa_ring_size,
+                draft_token_to_kv_pool.swa_ring_rows,
             )
             if target_geometry != draft_geometry:
                 raise RuntimeError(
@@ -1551,7 +1551,7 @@ def setup_state_kv_args(
                     f"target={target_geometry}, draft={draft_geometry}"
                 )
             draft_ptrs, draft_lens, draft_item_lens = (
-                draft_token_to_kv_pool.get_unified_swa_ring_buf_infos()
+                draft_token_to_kv_pool.get_swa_ring_buf_infos()
             )
             draft_state_type = StateType.SWA_RING
         else:

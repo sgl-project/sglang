@@ -1402,11 +1402,9 @@ class MQALayer(MqaAttentionBase):
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
+        from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 
-        unified = is_unified_kv_triton()
+        ring_kv = is_dsv4_ring_kv()
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         # The kernel is token-indexed (q, kv and positions are all length M), so
         # a verify batch carrying several draft tokens per request is a shape it
@@ -1416,8 +1414,8 @@ class MQALayer(MqaAttentionBase):
             envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
             and forward_batch.forward_mode.is_target_verify()
         )
-        do_fused_qk_norm_rope = (unified and (is_decode or fuse_verify)) or (
-            not unified and self.use_fused_qk_norm_rope
+        do_fused_qk_norm_rope = (ring_kv and (is_decode or fuse_verify)) or (
+            not ring_kv and self.use_fused_qk_norm_rope
         )
 
         if do_fused_qk_norm_rope:
@@ -1439,10 +1437,10 @@ class MQALayer(MqaAttentionBase):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            if unified and fuse_verify:
-                # Target-verify runs through the unified_kv decode path. The
+            if ring_kv and fuse_verify:
+                # Target-verify runs through the ring_kv decode path. The
                 # backend writes the current chunk's KV into the ring *before*
-                # attention (save_kv_cache=True -> store_swa_into_unified ahead
+                # attention (save_kv_cache=True -> store_swa_into_ring_kv ahead
                 # of runtime.decode), and per-token causal index streams -- built
                 # once per step in the backend metadata -- keep each draft query
                 # attending only to positions up to itself. Causal masking among
@@ -1459,11 +1457,11 @@ class MQALayer(MqaAttentionBase):
                 kv = kv.contiguous()
                 swa_cache, swa_loc = None, None
                 swa_page_size, bf16_store = 1, True
-            elif unified:
-                swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
+            elif ring_kv:
+                swa_cache = token_to_kv_pool.get_ring_kv(self.layer_id)
                 # swa_loc is layer-independent; computed once per forward by the
                 # backend and cached on the metadata (read here by every layer).
-                swa_loc = attn_backend.get_unified_swa_loc(forward_batch)
+                swa_loc = attn_backend.get_swa_ring_loc(forward_batch)
                 swa_page_size, bf16_store = 1, True
             else:
                 swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
@@ -1500,10 +1498,10 @@ class MQALayer(MqaAttentionBase):
             # current chunk (attn_k = kv) and save_kv_cache = kv is not None lets
             # the backend do its normal causally-indexed store into the ring
             # before the decode kernel runs -- exactly as the unfused path did.
-            if not (unified and fuse_verify):
+            if not (ring_kv and fuse_verify):
                 kv = None
 
-            if not unified and use_cp:
+            if not ring_kv and use_cp:
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
@@ -1545,8 +1543,8 @@ class MQALayer(MqaAttentionBase):
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
-            if unified:
-                # unified_kv prefill: keep bf16 kv; the backend writes
+            if ring_kv:
+                # ring_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
             elif use_cp:
@@ -1698,11 +1696,9 @@ class MQALayer(MqaAttentionBase):
         # _forward_prepare* deliberately left the store off and the backend does
         # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
+        from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 
-        if is_unified_kv_triton():
+        if is_dsv4_ring_kv():
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
                 k=attn_k,

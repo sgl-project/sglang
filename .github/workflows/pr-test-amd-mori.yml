@@ -95,7 +95,6 @@ jobs:
       - name: Run Mori HiCache tests
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
-            -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -w /sglang-checkout/test \
             python3 registered/hicache/test_hicache_storage_umbp_backend.py

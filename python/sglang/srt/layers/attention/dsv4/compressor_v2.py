@@ -222,7 +222,7 @@ class CompressorBackendMixin:
             ),
         )
 
-    def forward_unified(
+    def forward_ring_kv(
         self,
         x: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -237,9 +237,7 @@ class CompressorBackendMixin:
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
         state_pool = compressor.get_state_pool(self)
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
+        from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 
         out_loc = self._get_out_loc(compressor.ratio)
         use_fp4_indexer = (
@@ -255,11 +253,11 @@ class CompressorBackendMixin:
                 kv_scale_cache = token_to_kv_pool.get_index_k_fp4_scale_buffer(layer_id)
             else:
                 kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
-        elif is_unified_kv_triton():
-            kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
+        elif is_dsv4_ring_kv():
+            kv_cache = token_to_kv_pool.get_ring_kv(layer_id)
             page_size = 1
             out_loc = getattr(
-                self.forward_metadata.core_metadata.unified,
+                self.forward_metadata.core_metadata.ring_kv,
                 f"c{compressor.ratio}_out_loc",
             )
             bf16_store = True
@@ -302,7 +300,7 @@ class CompressorBackendMixin:
                 or forward_batch.forward_mode,
             )
 
-    def _forward_unified_hip(
+    def _forward_ring_kv_hip(
         self,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         kv_score_input: torch.Tensor,
@@ -396,8 +394,8 @@ class CompressorBackendMixin:
             )
 
     # NOTE: alias for backward compatibility
-    forward_indexer_compressor = forward_unified
-    forward_core_compressor = forward_unified
+    forward_indexer_compressor = forward_ring_kv
+    forward_core_compressor = forward_ring_kv
 
 
 def is_overlap_compress(compress_ratio: int) -> bool:
@@ -441,7 +439,7 @@ def create_paged_compressor_data(
 
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
-    use_req_ring = compress_ratio == 4 and token_to_kv_pool._unified_kv
+    use_req_ring = compress_ratio == 4 and token_to_kv_pool.is_ring_kv
     # NOTE: This is actually a proxy, which encounter some bug with tvm-ffi.
     # As a workaround, we use `.detach()` to get the real tensor.
     full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()

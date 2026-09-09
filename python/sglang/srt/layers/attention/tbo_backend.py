@@ -192,7 +192,7 @@ class TboAttnBackend(AttentionBackend):
 
     def __getattr__(self, name):
         # Delegate backend-specific attributes/methods not explicitly wrapped
-        # above (e.g. DSV4's get_unified_swa_loc / get_swa_out_cache_loc, which
+        # above (e.g. DSV4's get_swa_ring_loc / get_swa_out_cache_loc, which
         # the model calls directly via get_attn_backend()) to the primary
         # full-batch backend. Inside TBO the per-child backend is resolved
         # directly from the forward context, so this path only serves the

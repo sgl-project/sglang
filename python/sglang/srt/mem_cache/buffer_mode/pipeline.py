@@ -174,7 +174,7 @@ def validate_buffer_only_stack(
     """Post-assembly buffer-mode fences.
 
     Sidecars reuse their source pool's transient slot ids, so every sidecar
-    host pool must expose the full source slot namespace.  unified_kv SWA
+    host pool must expose the full source slot namespace.  ring_kv SWA
     (device-only ring, never offloaded) still has no staging path.
     """
     entry_map = host_pool_group.entry_map
@@ -198,12 +198,12 @@ def validate_buffer_only_stack(
             )
     swa = swa_component
     if swa is not None and swa._swa_kv_pool_host is None:
-        # Only reachable on SWA models with the unified_kv layout (SWA as
+        # Only reachable on SWA models with the ring_kv layout (SWA as
         # a device-only ring): without a host pool the window can neither
         # stage for writes nor fetch for load-backs.
         raise ValueError(
             "--hicache-host-memory-mode buffer_only on SWA models "
-            "requires an SWA host staging pool; the unified_kv layout "
+            "requires an SWA host staging pool; the ring_kv layout "
             "keeps SWA as a device-only ring."
         )
     if swa is not None and swa._swa_kv_pool_host is not None:

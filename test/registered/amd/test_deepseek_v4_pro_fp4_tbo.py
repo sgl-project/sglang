@@ -44,13 +44,12 @@ DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
 )
 # Pro is 1.6T; weight load + warmup is much longer than Flash 285B.
 SERVER_LAUNCH_TIMEOUT = 5400
-FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
+DSV4_KV_LAYOUT = "ring"
 
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
     "SGLANG_USE_ROCM700A": "0",
-    "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
     "AITER_BF16_FP8_MOE_BOUND": "0",
     # DP TP-MoE collective path that non-EP DP TBO overlaps.
     "SGLANG_DP_USE_GATHERV": "1",
@@ -79,6 +78,8 @@ class TestDeepseekV4ProFp4Tbo(CustomTestCase):
 
         other_args = [
             "--trust-remote-code",
+            "--dsv4-kv-layout",
+            DSV4_KV_LAYOUT,
             "--tp",
             "8",
             # DP attention + TBO: non-EP DP TP-MoE two-batch-overlap. DP TBO is
@@ -140,7 +141,7 @@ class TestDeepseekV4ProFp4Tbo(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k_tbo (deepseek-v4-pro-fp4 DP+TBO, {FLASHMLA_BACKEND})\n"
+                f"### test_gsm8k_tbo (deepseek-v4-pro-fp4 DP+TBO, {DSV4_KV_LAYOUT})\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
         # TBO must not regress accuracy vs the non-TBO baseline (>0.91).

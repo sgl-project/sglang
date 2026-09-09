@@ -157,7 +157,7 @@ class SchedulerInvariantChecker:
             # Per-request SWA ring: there is no token pool to conserve; ring-slot
             # leaks are caught by the req_to_token check instead.
             return False, (
-                "[swa] unified ring (leak-check skipped): "
+                "[swa] per-request ring (leak-check skipped): "
                 f"available={ps.swa_available_size}, "
                 f"evictable={ps.swa_evictable_size}, "
                 f"total={self.swa_tokens_per_layer}"

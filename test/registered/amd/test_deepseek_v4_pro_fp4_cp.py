@@ -2,7 +2,7 @@
 
 Shares the launch conventions of test_deepseek_v4_pro_fp4.py (same 1.6T model,
 same env, same long launch timeout) but enables prefill CP via
-``--enable-prefill-cp --cp-strategy interleave`` over the unified_kv backend.
+``--enable-prefill-cp --cp-strategy interleave`` over the ring_kv backend.
 
 Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro suite
 """
@@ -36,13 +36,12 @@ DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 5400
 
 # Common DeepSeek-V4 env vars, aligned with test_deepseek_v4_pro_fp4.py, except
-# SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton which the prefill-CP path requires.
+# --dsv4-kv-layout ring which the prefill-CP path requires.
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
     "SGLANG_USE_ROCM700A": "0",
     "SGLANG_DP_USE_GATHERV": "1",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
     "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
@@ -56,7 +55,7 @@ FP4_ENV_VARS = {
     "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
 )
 class TestDeepseekV4ProFp4CPInterleave(CustomTestCase):
-    """DeepSeek-V4-Pro FP4 unified_kv prefill CP, interleave (round-robin-split), tp=8."""
+    """DeepSeek-V4-Pro FP4 ring_kv prefill CP, interleave (round-robin-split), tp=8."""
 
     @classmethod
     def setUpClass(cls):
@@ -69,6 +68,8 @@ class TestDeepseekV4ProFp4CPInterleave(CustomTestCase):
 
         other_args = [
             "--trust-remote-code",
+            "--dsv4-kv-layout",
+            "ring",
             "--tp",
             "8",
             "--dp",

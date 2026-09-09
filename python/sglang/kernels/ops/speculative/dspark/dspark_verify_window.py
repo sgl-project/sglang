@@ -609,7 +609,7 @@ class CommitInjectLayoutResult(msgspec.Struct):
     positions: torch.Tensor
 
 
-def build_unified_commit_inject_layout(
+def build_ring_kv_commit_inject_layout(
     *,
     req_pool_indices: torch.Tensor,
     prefix_lens: torch.Tensor,
@@ -618,10 +618,10 @@ def build_unified_commit_inject_layout(
     stride: int,
     ring_stride: int,
 ) -> CommitInjectLayoutResult:
-    """unified_kv counterpart of build_commit_inject_layout.
+    """ring_kv counterpart of build_commit_inject_layout.
 
-    Non-unified injection translates the verify tokens' full cache locs through
-    ``full_to_swa_mapping``; under unified_kv the SWA K lives in a ring addressed
+    Paged injection translates the verify tokens' full cache locs through
+    ``full_to_swa_mapping``; under ring_kv the SWA K lives in a ring addressed
     directly by ``state_slot * ring_stride + pos % ring_stride``, so compute the
     ring row here instead. Uncommitted tokens (col >= commit_len) get loc = -1 and
     are skipped by the scatter. All ops are static-shape (CUDA-graph safe).

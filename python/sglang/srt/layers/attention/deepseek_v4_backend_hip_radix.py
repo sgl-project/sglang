@@ -89,9 +89,9 @@ def _create_dummy_paged_compress_data(compress_ratio: int):
 
 
 @dataclass
-class UnifiedKvMetadata:
+class DSV4RingKvMetadata:
     """
-    unified-kv per-forward metadata
+    ring-KV per-forward metadata
     """
 
     # SWA ring write target (req_slot*ring + pos%ring)
@@ -117,12 +117,12 @@ class UnifiedKvMetadata:
     # equals req_pool_indices and is unused (the decode store reads that live).
     verify_store_state_slot: Optional[torch.Tensor] = None
 
-    # SWA-page-offset compressed-store locations (= c*_out_loc + unified_swa_pages),
+    # SWA-page-offset compressed-store locations (= c*_out_loc + swa_ring_rows),
     # precomputed once per step to drop the per-layer int add in the store path.
     c4_out_loc: Optional[torch.Tensor] = None
     c128_out_loc: Optional[torch.Tensor] = None
 
-    def copy_(self, other: UnifiedKvMetadata) -> None:
+    def copy_(self, other: DSV4RingKvMetadata) -> None:
         copy_metadata(
             src=other,
             dst=self,
@@ -178,8 +178,8 @@ class DSV4AttnMetadata:
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c128_topk_lengths_raw: Optional[torch.Tensor] = None
 
-    # unified-kv metadata
-    unified: Optional[UnifiedKvMetadata] = None
+    # ring-KV metadata
+    ring_kv: Optional[DSV4RingKvMetadata] = None
 
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -226,7 +226,7 @@ class DSV4AttnMetadata:
                 "c4_sparse_topk_lengths_raw",
                 "c4_sparse_page_indices",
                 "c4_sparse_raw_indices",
-                "unified",
+                "ring_kv",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
@@ -238,7 +238,7 @@ class DSV4AttnMetadata:
             ],
         )
 
-    def init_compression_metadata(self, unified_swa_pages: int = 0):
+    def init_compression_metadata(self, swa_ring_rows: int = 0):
         assert self.page_table.dim() == 2
         assert self.raw_out_loc.shape == self.seq_lens_casual.shape, (
             f"{self.raw_out_loc.shape=}, {self.seq_lens_casual.shape=}"
@@ -266,11 +266,11 @@ class DSV4AttnMetadata:
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
-        if unified_swa_pages:
-            if self.unified is None:
-                self.unified = UnifiedKvMetadata()
-            self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
-            self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
+        if swa_ring_rows:
+            if self.ring_kv is None:
+                self.ring_kv = DSV4RingKvMetadata()
+            self.ring_kv.c4_out_loc = self.c4_out_loc + swa_ring_rows
+            self.ring_kv.c128_out_loc = self.c128_out_loc + swa_ring_rows
 
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
@@ -580,7 +580,7 @@ class DeepseekV4HipRadixBackend(
             need_compress=need_compress,
             is_prefill=True,
         )
-        self._attach_unified_kv_prefill_meta(
+        self._attach_ring_kv_prefill_meta(
             core_attn_metadata,
             req_pool_indices,
             seq_lens,
@@ -589,11 +589,11 @@ class DeepseekV4HipRadixBackend(
             need_compress=need_compress,
         )
         if attach_decode_streams:
-            # Target-verify runs through the unified_kv DECODE kernel, so build
+            # Target-verify runs through the ring_kv DECODE kernel, so build
             # per-token decode streams here. req_pool_indices_repeated is the
             # per-token (num_draft*bs -> bs) req-slot map produced by the prefill
             # expansion above.
-            self._attach_unified_kv_decode_streams(
+            self._attach_ring_kv_decode_streams(
                 core_attn_metadata, req_pool_indices_repeated
             )
         indexer_metadata = (
@@ -793,7 +793,7 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=True,
         )
-        self._attach_unified_kv_decode_streams(core_attn_metadata, req_pool_indices)
+        self._attach_ring_kv_decode_streams(core_attn_metadata, req_pool_indices)
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
 
         create = functools.partial(
@@ -1225,7 +1225,7 @@ class DeepseekV4HipRadixBackend(
         if current_raw is not None:
             self.forward_metadata = current_raw
 
-    def _attach_unified_kv_decode_streams(
+    def _attach_ring_kv_decode_streams(
         self, core: DSV4AttnMetadata, state_slot: torch.Tensor
     ) -> None:
         """build the ragged decode index streams once per forward.
@@ -1234,26 +1234,24 @@ class DeepseekV4HipRadixBackend(
         ``req_pool_indices`` (1 token per req), target-verify passes
         ``req_pool_indices_repeated`` (the per-token num_draft*bs -> bs map) so
         the same builder produces per-draft-token decode streams."""
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
+        from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 
-        if not is_unified_kv_triton():
+        if not is_dsv4_ring_kv():
             return
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.attention.dsv4.ring_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
         N = core.positions_casual.shape[0]
         state_slot = state_slot[:N]
-        if core.unified is None:
-            core.unified = UnifiedKvMetadata()
+        if core.ring_kv is None:
+            core.ring_kv = DSV4RingKvMetadata()
         (
-            core.unified.swa_indices,
-            core.unified.swa_indptr,
-            core.unified.hca_indices,
-            core.unified.hca_indptr,
-            core.unified.csa_indices,
-            core.unified.csa_indptr,
+            core.ring_kv.swa_indices,
+            core.ring_kv.swa_indptr,
+            core.ring_kv.hca_indices,
+            core.ring_kv.hca_indptr,
+            core.ring_kv.csa_indices,
+            core.ring_kv.csa_indptr,
         ) = runtime.build_decode_streams(
             state_slot=state_slot,
             positions=core.positions_casual,
@@ -1262,22 +1260,22 @@ class DeepseekV4HipRadixBackend(
             csa_len=core.c4_sparse_topk_lengths_raw,
             hca_page_indices=core.c128_page_indices,
             csa_width=core.c4_sparse_page_indices.shape[1],
-            win=pool.unified_swa_window,
-            ring_stride=pool.unified_swa_ring_size,
-            swa_pages=pool.unified_swa_pages,
+            win=pool.swa_ring_window,
+            ring_stride=pool.swa_ring_size,
+            swa_pages=pool.swa_ring_rows,
         )
         # SWA ring write target, same value for every layer this forward.
         req_slot = state_slot.to(torch.int64)
-        core.unified.swa_loc = (
-            req_slot * pool.unified_swa_ring_size
-            + core.positions_casual.to(torch.int64) % pool.unified_swa_ring_size
+        core.ring_kv.swa_loc = (
+            req_slot * pool.swa_ring_size
+            + core.positions_casual.to(torch.int64) % pool.swa_ring_size
         ).to(torch.int32)
         # Per-token req-slot map for the SWA ring store, read directly by the
         # forward store (target-verify) instead of recomputing a repeat_interleave
         # per layer. Harmless for plain decode (its store reads req_pool_indices).
-        core.unified.verify_store_state_slot = state_slot
+        core.ring_kv.verify_store_state_slot = state_slot
 
-    def _attach_unified_kv_prefill_meta(
+    def _attach_ring_kv_prefill_meta(
         self,
         core: DSV4AttnMetadata,
         req_pool_indices: torch.Tensor,
@@ -1286,11 +1284,9 @@ class DeepseekV4HipRadixBackend(
         num_tokens: int,
         need_compress: bool = True,
     ) -> None:
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
+        from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 
-        if not is_unified_kv_triton():
+        if not is_dsv4_ring_kv():
             return
         device = req_pool_indices.device
         bs = req_pool_indices.shape[0]
@@ -1310,15 +1306,15 @@ class DeepseekV4HipRadixBackend(
                 extend_seq_lens,
                 output_size=num_tokens,
             )
-        if core.unified is None:
-            core.unified = UnifiedKvMetadata()
-        core.unified.pf_state_slot = req_pool_indices[bid]
-        core.unified.pf_chunk_start = (seq_lens - extend_seq_lens)[bid]
+        if core.ring_kv is None:
+            core.ring_kv = DSV4RingKvMetadata()
+        core.ring_kv.pf_state_slot = req_pool_indices[bid]
+        core.ring_kv.pf_chunk_start = (seq_lens - extend_seq_lens)[bid]
         cu_q_per_req = torch.cumsum(extend_seq_lens, dim=0) - extend_seq_lens
-        core.unified.pf_cu_q = cu_q_per_req[bid]
-        core.unified.pf_final_pos = (seq_lens - 1)[bid]
+        core.ring_kv.pf_cu_q = cu_q_per_req[bid]
+        core.ring_kv.pf_final_pos = (seq_lens - 1)[bid]
 
-    def _forward_unified_kv(
+    def _forward_ring_kv(
         self,
         *,
         q: torch.Tensor,
@@ -1330,15 +1326,15 @@ class DeepseekV4HipRadixBackend(
         core_attn_metadata: DSV4AttnMetadata,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
-        """unified_kv paged-attention path over the bf16 unified_kv"""
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        """ring_kv paged-attention path over the bf16 ring_kv"""
+        from sglang.kernels.ops.attention.dsv4.ring_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
         layer_id = layer.layer_id
-        unified = pool.get_unified_kv(layer_id)
-        win = pool.unified_swa_window
-        ring_stride = pool.unified_swa_ring_size
-        swa_pages = pool.unified_swa_pages
+        ring_kv = pool.get_ring_kv(layer_id)
+        win = pool.swa_ring_window
+        ring_stride = pool.swa_ring_size
+        swa_pages = pool.swa_ring_rows
 
         if q.ndim == 4:
             q = q.squeeze(1)
@@ -1350,39 +1346,39 @@ class DeepseekV4HipRadixBackend(
         c128_pi = getattr(core_attn_metadata, "c128_page_indices", None)
         c4_pi = getattr(core_attn_metadata, "c4_sparse_page_indices", None)
 
-        # Target-verify runs through the unified_kv DECODE kernel, same path as
+        # Target-verify runs through the ring_kv DECODE kernel, same path as
         # decode; its per-token decode streams were built in metadata.
         verify_as_decode = forward_batch.forward_mode.is_target_verify()
         is_decode = forward_batch.forward_mode.is_decode_or_idle() or verify_as_decode
         if is_decode:
             if verify_as_decode:
                 # Per-token (num_draft*bs -> bs) req-slot map, precomputed once
-                # per step in _attach_unified_kv_decode_streams. Writing every
+                # per step in _attach_ring_kv_decode_streams. Writing every
                 # draft token's K into the ring is safe: spec_extra room prevents
                 # clobbering the window history same-step tokens still read.
-                state_slot = core_attn_metadata.unified.verify_store_state_slot[:T]
+                state_slot = core_attn_metadata.ring_kv.verify_store_state_slot[:T]
             else:
                 state_slot = forward_batch.req_pool_indices[:T]
             if save_kv_cache:
-                runtime.store_swa_into_unified(
+                runtime.store_swa_into_ring_kv(
                     kv=kv,
                     state_slot=state_slot,
                     positions=positions,
-                    unified_kv=unified,
+                    ring_kv=ring_kv,
                     win=win,
                     ring_stride=ring_stride,
                     final_pos=positions,
                 )
-            unified_metadata = core_attn_metadata.unified
+            ring_kv_metadata = core_attn_metadata.ring_kv
             if compress_ratio == 0:
-                kv_indices = unified_metadata.swa_indices
-                kv_indptr = unified_metadata.swa_indptr
+                kv_indices = ring_kv_metadata.swa_indices
+                kv_indptr = ring_kv_metadata.swa_indptr
             elif compress_ratio == 128:
-                kv_indices = unified_metadata.hca_indices
-                kv_indptr = unified_metadata.hca_indptr
+                kv_indices = ring_kv_metadata.hca_indices
+                kv_indptr = ring_kv_metadata.hca_indptr
             elif compress_ratio == 4:
-                kv_indices = unified_metadata.csa_indices
-                kv_indptr = unified_metadata.csa_indptr
+                kv_indices = ring_kv_metadata.csa_indices
+                kv_indptr = ring_kv_metadata.csa_indptr
                 runtime.fill_compress_tail(
                     indices=kv_indices,
                     indptr=kv_indptr,
@@ -1395,7 +1391,7 @@ class DeepseekV4HipRadixBackend(
                 raise ValueError(f"bad compress_ratio {compress_ratio}")
             return runtime.decode(
                 q=q,
-                unified_kv=unified,
+                ring_kv=ring_kv,
                 kv_indices=kv_indices,
                 kv_indptr=kv_indptr,
                 attn_sink=attn_sink,
@@ -1403,12 +1399,12 @@ class DeepseekV4HipRadixBackend(
             )
 
         # prefill / extend
-        state_slot = core_attn_metadata.unified.pf_state_slot
-        chunk_start = core_attn_metadata.unified.pf_chunk_start
-        cu_q = core_attn_metadata.unified.pf_cu_q
-        final_pos = core_attn_metadata.unified.pf_final_pos
+        state_slot = core_attn_metadata.ring_kv.pf_state_slot
+        chunk_start = core_attn_metadata.ring_kv.pf_chunk_start
+        cu_q = core_attn_metadata.ring_kv.pf_cu_q
+        final_pos = core_attn_metadata.ring_kv.pf_final_pos
 
-        # DSA CP (round-robin/interleave): unified_pf_* are built over the GLOBAL
+        # DSA CP (round-robin/interleave): ring_kv pf_* are built over the GLOBAL
         # token layout, but under CP each rank owns only 1/cp_size of the queries
         # (q/positions are local) while kv was all-gathered to the full sequence.
         # Slice the per-query fields to this rank's tokens so their length matches
@@ -1470,7 +1466,7 @@ class DeepseekV4HipRadixBackend(
             kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
         o = runtime.prefill(
             q=q,
-            unified_kv=unified,
+            ring_kv=ring_kv,
             kv_indices_prefix=kpre_i,
             kv_indptr_prefix=kpre_p,
             kv_extend=kv,
@@ -1490,11 +1486,11 @@ class DeepseekV4HipRadixBackend(
             _ring_final_pos = final_pos_full if _cp_active else final_pos
             _ring_positions = positions_full if _cp_active else positions
             n_real = _ring_state_slot.shape[0]
-            runtime.store_swa_into_unified(
+            runtime.store_swa_into_ring_kv(
                 kv=kv[:n_real],
                 state_slot=_ring_state_slot,
                 positions=_ring_positions[:n_real],
-                unified_kv=unified,
+                ring_kv=ring_kv,
                 win=win,
                 ring_stride=ring_stride,
                 final_pos=_ring_final_pos,
@@ -1527,10 +1523,10 @@ class DeepseekV4HipRadixBackend(
             torch.int32
         )
 
-    def get_unified_swa_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """SWA ring write target for unified_kv, shared by all layers.
+    def get_swa_ring_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """SWA ring write target for ring_kv, shared by all layers.
 
-        Fast path: the per-forward value cached in _attach_unified_kv_decode_streams
+        Fast path: the per-forward value cached in _attach_ring_kv_decode_streams
         (recorded inside cuda graphs, so replay re-reads live buffers). Fallback:
         recompute at store time, matching the pre-cache per-layer behavior, for
         paths that never ran the decode-stream init (eager prefill/extend, idle,
@@ -1542,8 +1538,8 @@ class DeepseekV4HipRadixBackend(
         """
         positions = forward_batch.positions
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
-        unified = getattr(core, "unified", None) if core is not None else None
-        cached = unified.swa_loc if unified is not None else None
+        ring_kv = getattr(core, "ring_kv", None) if core is not None else None
+        cached = ring_kv.swa_loc if ring_kv is not None else None
         is_multistep_draft_decode = (
             forward_batch.forward_mode.is_decode_or_idle()
             and self.speculative_num_steps > 1
@@ -1556,7 +1552,7 @@ class DeepseekV4HipRadixBackend(
         ):
             result = cached
         else:
-            ring = self.token_to_kv_pool.unified_swa_ring_size
+            ring = self.token_to_kv_pool.swa_ring_size
             req_slot = forward_batch.req_pool_indices.to(torch.int64)
             if req_slot.shape[0] != positions.shape[0]:
                 req_slot = req_slot.repeat_interleave(
@@ -1601,12 +1597,10 @@ class DeepseekV4HipRadixBackend(
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
+        from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 
-        if is_unified_kv_triton():
-            return self._forward_unified_kv(
+        if is_dsv4_ring_kv():
+            return self._forward_ring_kv(
                 q=q,
                 kv=swa_k,
                 layer=layer,
@@ -1810,7 +1804,7 @@ class DeepseekV4HipRadixBackend(
 
         if need_compress:
             core_attn_metadata.init_compression_metadata(
-                unified_swa_pages=getattr(self.token_to_kv_pool, "unified_swa_pages", 0)
+                swa_ring_rows=self.token_to_kv_pool.swa_ring_rows
             )
             core_attn_metadata.init_flashmla_related()
         else:

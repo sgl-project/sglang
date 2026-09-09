@@ -982,11 +982,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
+        from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 
-        self._unified = is_unified_kv_triton()
+        self._ring_kv = is_dsv4_ring_kv()
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # swa_page_size is the model's sliding window (cfg.window_size).
         self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
@@ -1060,8 +1058,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
     def _get_bytes_per_full_token(self) -> float:
-        if self._unified:
-            # Unified_kv stores the whole latent in bf16.
+        if self._ring_kv:
+            # Ring KV stores the whole latent in bf16.
             kv_bytes = self.attn_head_dim * 2
         else:
             kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
@@ -1091,7 +1089,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # Ring mode: SWA is a fixed per-request pool (see _fixed_swa_bytes).
             (
                 0.0
-                if self._unified
+                if self._ring_kv
                 else self.swa_ratio * kv_bytes * self.num_layers_total
             )
             + c4_frac * kv_bytes * self.num_layers_ca4
@@ -1100,7 +1098,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # Ring mode: C4 state is per-request too (see _fixed_c4_state_bytes).
             + (
                 0.0
-                if self._unified
+                if self._ring_kv
                 else self.swa_ratio
                 * c4_state_ratio
                 * c4_state_bytes
@@ -1109,7 +1107,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
             + (
                 0.0
-                if self._unified
+                if self._ring_kv
                 else self.swa_ratio
                 * c4_state_ratio
                 * c4_indexer_state_bytes
@@ -1120,7 +1118,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
-        if not self._unified:
+        if not self._ring_kv:
             # Ring mode: the paged SWA pool is vestigial, so its floor does not apply.
             self.validate_swa_pool_size(swa_tokens, self.sliding_window_size, page_size)
         return _DSV4PoolSizes(
@@ -1128,10 +1126,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
-            # Unified_kv: request-scoped, finalized once concurrency is known.
+            # Ring KV: request-scoped, finalized once concurrency is known.
             c4_state_pool_size=(
                 0
-                if self._unified
+                if self._ring_kv
                 else swa_tokens // self.swa_page_size * self.c4_ring_size
             ),
             c128_state_pool_size=0,
@@ -1164,19 +1162,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_rows * state_last_dim * c128_state_dtype_size * self.num_layers_ca128
         )
 
-    def _unified_c4_state_pool_size(self, max_running_requests: int) -> int:
-        # Unified C4 state loc is req_pool_idx * c4_ring_size + pos % c4_ring_size.
+    def _ring_c4_state_pool_size(self, max_running_requests: int) -> int:
+        # Ring C4 state loc is req_pool_idx * c4_ring_size + pos % c4_ring_size.
         num_req_slots = self._get_num_req_slots(max_running_requests)
         return num_req_slots * self.c4_ring_size
 
     def _fixed_c4_state_bytes(self, max_running_requests: int) -> int:
-        if not self._unified or self.num_layers_ca4 == 0:
+        if not self._ring_kv or self.num_layers_ca4 == 0:
             return 0
 
         c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
         # Mirror CompressStatePool.__init__: it allocates `size + ring_size + 1`
         # rows, padded to the compress ratio.
-        state_rows = self._unified_c4_state_pool_size(max_running_requests)
+        state_rows = self._ring_c4_state_pool_size(max_running_requests)
         state_rows = ceil_div(state_rows + self.c4_ring_size + 1, 4) * 4
         # overlap c4: last_dim = 2 * (1 + overlap) * head_dim = 4 * head_dim.
         core_bytes = 4 * self.attn_head_dim * c4_state_dtype_size
@@ -1195,7 +1193,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return min(estimated, full_token // 2)
 
     def _fixed_swa_bytes(self, max_running_requests: int) -> int:
-        if not self._unified:
+        if not self._ring_kv:
             return 0
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_bytes = (
@@ -1237,8 +1235,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         else:
             config.c128_state_pool_size = num_req_slots * self.c128_ring_size
         # Ring mode: C4 state is request-scoped, so size it from the known concurrency.
-        if self._unified and self.num_layers_ca4 > 0:
-            config.c4_state_pool_size = self._unified_c4_state_pool_size(
+        if self._ring_kv and self.num_layers_ca4 > 0:
+            config.c4_state_pool_size = self._ring_c4_state_pool_size(
                 config.max_running_requests
             )
         return config
@@ -1272,7 +1270,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
-            f"DSV4 memory calculation: unified={self._unified}, "
+            f"DSV4 memory calculation: ring_kv={self._ring_kv}, "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "

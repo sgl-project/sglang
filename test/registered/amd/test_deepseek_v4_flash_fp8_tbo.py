@@ -41,7 +41,7 @@ DEEPSEEK_V4_FLASH_FP8_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V4_FP8_MODEL_PATH", "sgl-project/DeepSeek-V4-Flash-FP8"
 )
 SERVER_LAUNCH_TIMEOUT = 3600
-FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
+DSV4_KV_LAYOUT = "ring"
 
 # DSV4 fused-kernel optimal set (mirrors the validated dp-tbo launch config).
 # The DP + TBO forward path is sensitive to these; the non-TBO tp8 test can use a
@@ -53,7 +53,6 @@ COMMON_ENV_VARS = {
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
     "SGLANG_USE_AITER": "1",
     "SGLANG_USE_ROCM700A": "0",
-    "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
     "SGLANG_OPT_FP8_WO_A_GEMM": "false",
     "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
     "SGLANG_OPT_USE_TOPK_V2": "false",
@@ -89,6 +88,8 @@ class TestDeepseekV4FlashFp8Tbo(CustomTestCase):
 
         other_args = [
             "--trust-remote-code",
+            "--dsv4-kv-layout",
+            DSV4_KV_LAYOUT,
             "--tp",
             "8",
             # DP attention + TBO: non-EP DP TP-MoE two-batch-overlap. DP TBO is
@@ -150,7 +151,7 @@ class TestDeepseekV4FlashFp8Tbo(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k_tbo (deepseek-v4-flash-fp8 DP+TBO, {FLASHMLA_BACKEND})\n"
+                f"### test_gsm8k_tbo (deepseek-v4-flash-fp8 DP+TBO, {DSV4_KV_LAYOUT})\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
         # TBO must not regress accuracy vs the non-TBO baseline (>0.91).

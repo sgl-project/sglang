@@ -205,3 +205,18 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         f"dp_size={cfg.dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
         f"attn_cp_size={cfg.attn_cp_size}, ep_size={cfg.ep_size}, tp_size={cfg.tp_size}"
     )
+
+
+def validate_deepseek_v4_kv_layout(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if envs.SGLANG_HACK_FLASHMLA_BACKEND.get() == "unified_kv_triton":
+        raise ValueError(
+            "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton is no longer a backend "
+            "value: select the ring KV layout with --dsv4-kv-layout ring and leave "
+            "SGLANG_HACK_FLASHMLA_BACKEND to the paged-layout kernel choice."
+        )
+    if cfg.dsv4_kv_layout == "ring" and not get_platform().is_hip:
+        raise ValueError(
+            "--dsv4-kv-layout ring is served only by the ROCm DeepSeek-V4 attention "
+            "backend; use --dsv4-kv-layout paged on this platform."
+        )

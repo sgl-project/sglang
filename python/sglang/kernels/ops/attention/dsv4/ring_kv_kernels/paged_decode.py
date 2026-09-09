@@ -4,15 +4,15 @@
 # The following kernel is imported from ATOM.
 # Source: atom/model_ops/v4_kernels/paged_decode.py
 
-"""Sparse decode attention over a unified KV pool with per-token paged indices.
+"""Sparse decode attention over a ring KV pool with per-token paged indices.
 
 Designed for V4 decode + CUDAGraph: replaces the per-fwd `kv_flat_sa`
 materialization (whose shape depends on `n_committed_per_seq` → varies per
-fwd → blocks CG capture) with a single unified KV pool indexed via paged
+fwd → blocks CG capture) with a single ring KV pool indexed via paged
 indices, mirroring `aiter.mla.mla_decode_fwd`'s API style.
 
 Caller contract:
-  unified_kv:       [total_pages, D] BF16  (page_size=1)
+  ring_kv:       [total_pages, D] BF16  (page_size=1)
     Conceptually merges the SWA ring buffer and the compressor paged cache
     of a single V4 layer. Slots in `[0, swa_pages)` reference SWA entries
     (state_slot * win + ring); slots in `[swa_pages, ...)` reference
@@ -20,7 +20,7 @@ Caller contract:
   kv_indices: [total_indices] int32 — per-token slot lists, flat.
     Per-token entries live in
     `kv_indices[kv_indptr[t] : kv_indptr[t+1]]`.
-    **All entries MUST be valid slot ids in [0, unified_kv.shape[0]).**
+    **All entries MUST be valid slot ids in [0, ring_kv.shape[0]).**
     The production decode index builder (``write_v4_paged_decode_indices``)
     emits ragged-packed indices with no sentinels; CG-padded tokens get
     a zero-length slice via ``indptr[t+1] == indptr[t]``. The kernel no
@@ -73,7 +73,7 @@ _TARGET_WG_PER_CU = 1.5 if _is_hip else 2.0
 
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
 #
-# Storage: unified_kv[total_pages, D] in e4m3fnuz (gfx942 only) / e4m3fn +
+# Storage: ring_kv[total_pages, D] in e4m3fnuz (gfx942 only) / e4m3fn +
 # kv_scales[total_pages,
 # D // GROUP_SIZE] in fp32. Per-slot, D is split into NUM_GROUPS chunks of
 # GROUP_SIZE elements; each chunk shares one fp32 scale.
@@ -216,7 +216,7 @@ def _kv_splits_heuristic(
 @triton.jit
 def _paged_decode_fused_kernel(
     q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
+    ring_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
     kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
@@ -298,9 +298,7 @@ def _paged_decode_fused_kernel(
         )
 
         kv_raw = tl.load(
-            unified_kv_ptr
-            + slot[:, None] * kv_stride_n
-            + d_offs[None, :] * kv_stride_d,
+            ring_kv_ptr + slot[:, None] * kv_stride_n + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
@@ -368,7 +366,7 @@ def _paged_decode_fused_kernel(
 @triton.jit
 def _paged_decode_split_kernel(
     q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
+    ring_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
     kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
@@ -464,9 +462,7 @@ def _paged_decode_split_kernel(
         )
 
         kv_raw = tl.load(
-            unified_kv_ptr
-            + slot[:, None] * kv_stride_n
-            + d_offs[None, :] * kv_stride_d,
+            ring_kv_ptr + slot[:, None] * kv_stride_n + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
@@ -657,7 +653,7 @@ def _paged_decode_reduce_kernel(
 
 def _sparse_attn_v4_paged_decode_triton(
     q: torch.Tensor,
-    unified_kv: torch.Tensor,
+    ring_kv: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -671,7 +667,7 @@ def _sparse_attn_v4_paged_decode_triton(
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
     escape hatches for benchmarks; production callers pass neither.
 
-    When ``kv_scales`` is provided, ``unified_kv`` must be e4m3fnuz and
+    When ``kv_scales`` is provided, ``ring_kv`` must be e4m3fnuz and
     ``kv_scales`` must be ``[total_pages, D // GROUP_SIZE]`` fp32 — 1xGROUP_SIZE
     block-scale quantization. Dequant happens in-kernel; the dot still runs
     in q.dtype.
@@ -687,30 +683,30 @@ def _sparse_attn_v4_paged_decode_triton(
 
     quant_kv = kv_scales is not None
     if quant_kv:
-        if unified_kv.dtype != _FP8_DTYPE:
+        if ring_kv.dtype != _FP8_DTYPE:
             raise RuntimeError(
-                f"kv_scales supplied but unified_kv is {unified_kv.dtype}, "
+                f"kv_scales supplied but ring_kv is {ring_kv.dtype}, "
                 f"expected {_FP8_DTYPE}"
             )
         if kv_scales.dtype != torch.float32:
             raise RuntimeError(f"kv_scales must be fp32, got {kv_scales.dtype}")
-        D_check = unified_kv.shape[-1]
+        D_check = ring_kv.shape[-1]
         if D_check % _FP8_GROUP_SIZE != 0:
             raise RuntimeError(
                 f"D={D_check} must be divisible by GROUP_SIZE={_FP8_GROUP_SIZE}"
             )
         expected_g = D_check // _FP8_GROUP_SIZE
-        if kv_scales.shape != (unified_kv.shape[0], expected_g):
+        if kv_scales.shape != (ring_kv.shape[0], expected_g):
             raise RuntimeError(
                 f"kv_scales shape {tuple(kv_scales.shape)} does not match "
-                f"expected ({unified_kv.shape[0]}, {expected_g})"
+                f"expected ({ring_kv.shape[0]}, {expected_g})"
             )
         if kv_scales.stride(-1) != 1:
             kv_scales = kv_scales.contiguous()
     else:
-        if unified_kv.dtype != q.dtype:
+        if ring_kv.dtype != q.dtype:
             raise RuntimeError(
-                f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
+                f"ring_kv dtype mismatch: kv={ring_kv.dtype}, q={q.dtype}"
             )
 
     T, H, D = q.shape
@@ -759,7 +755,7 @@ def _sparse_attn_v4_paged_decode_triton(
         grid_fused = (T, n_head_blocks)
         _paged_decode_fused_kernel[grid_fused](
             q,
-            unified_kv,
+            ring_kv,
             kv_scales_arg,
             kv_indices,
             kv_indptr,
@@ -768,8 +764,8 @@ def _sparse_attn_v4_paged_decode_triton(
             q.stride(0),
             q.stride(1),
             q.stride(2),
-            unified_kv.stride(0),
-            unified_kv.stride(1),
+            ring_kv.stride(0),
+            ring_kv.stride(1),
             ks_stride_n_arg,
             out.stride(0),
             out.stride(1),
@@ -804,7 +800,7 @@ def _sparse_attn_v4_paged_decode_triton(
     grid_split = (T, n_head_blocks, kv_splits)
     _paged_decode_split_kernel[grid_split](
         q,
-        unified_kv,
+        ring_kv,
         kv_scales_arg,
         kv_indices,
         kv_indptr,
@@ -814,8 +810,8 @@ def _sparse_attn_v4_paged_decode_triton(
         q.stride(0),
         q.stride(1),
         q.stride(2),
-        unified_kv.stride(0),
-        unified_kv.stride(1),
+        ring_kv.stride(0),
+        ring_kv.stride(1),
         ks_stride_n_arg,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -894,16 +890,16 @@ def _sparse_attn_v4_paged_decode_triton(
 
 def sparse_attn_v4_paged_decode(
     q: torch.Tensor,
-    unified_kv: torch.Tensor,
+    ring_kv: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """V4 decode sparse attention over a unified KV pool with paged indices.
+    """V4 decode sparse attention over a ring KV pool with paged indices.
 
-    When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
+    When ``kv_scales`` is provided, ``ring_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
     if _is_gfx1250_supported:
@@ -913,7 +909,7 @@ def sparse_attn_v4_paged_decode(
 
         return pa_decode_sparse(
             q,
-            unified_kv,
+            ring_kv,
             kv_indices,
             kv_indptr,
             attn_sink,
@@ -924,7 +920,7 @@ def sparse_attn_v4_paged_decode(
     else:
         return _sparse_attn_v4_paged_decode_triton(
             q,
-            unified_kv,
+            ring_kv,
             kv_indices,
             kv_indptr,
             attn_sink,

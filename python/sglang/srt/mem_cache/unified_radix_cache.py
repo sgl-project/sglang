@@ -3052,24 +3052,22 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_reprefill_tail_tokens(self) -> int:
         """
-        Only unified_kv needs this: SWA lives in a per-request ring
+        Only ring_kv needs this: SWA lives in a per-request ring
         (state_slot/pos), not content-stable and never stored in the tree, so a
         reused prefix's trailing sliding window would read another request's
         stale ring slots. Re-prefilling that window rewrites this request's ring.
 
         Applies to plain radix reuse as well as HiCache -- the ring is stale
         either way. Returns 0 once SWA has a host pool to restore exact contents
-        from, and for every non-unified_kv layout, whose SWA slots are
+        from, and for every non-ring_kv layout, whose SWA slots are
         content-stable.
         """
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
+        from sglang.srt.mem_cache.dsv4_kv_layout import is_dsv4_ring_kv
 
         swa = self.components.get(ComponentType.SWA)
         if swa is None or not swa.sliding_window_size:
             return 0
-        if not is_unified_kv_triton():
+        if not is_dsv4_ring_kv():
             return 0
         if self.tree_core.has_swa_host_pool:
             return 0

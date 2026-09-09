@@ -305,7 +305,7 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
-        # unified_kv never caches the SWA ring (per-request, not content-stable),
+        # ring_kv never caches the SWA ring (per-request, not content-stable),
         # so SWA bookkeeping must not gate the match here.
         swa_device_only_hicache = (
             not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache
@@ -970,7 +970,7 @@ class SWAComponent(TreeComponent):
         *,
         prefetch_tokens: int = 0,
     ) -> PreparePrefetchResult:
-        # unified_kv keeps SWA as a device-only ring -- nothing to prefetch into.
+        # ring_kv keeps SWA as a device-only ring -- nothing to prefetch into.
         if self._swa_kv_pool_host is None:
             return PreparePrefetchResult()
         sw_pages = self.full_window_pages
@@ -1016,7 +1016,7 @@ class SWAComponent(TreeComponent):
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
-        # unified_kv keeps SWA as a device-only ring.
+        # ring_kv keeps SWA as a device-only ring.
         if not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache:
             return None
 

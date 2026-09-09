@@ -33,7 +33,7 @@ DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
 )
 # Pro is 1.6T; weight load + warmup is much longer than Flash 285B.
 SERVER_LAUNCH_TIMEOUT = 5400
-FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
+DSV4_KV_LAYOUT = "ring"
 
 GSM8K_ACCURACY_THRESHOLD = 0.92
 AVG_SPEC_ACCEPT_LENGTH_THRESHOLD = 2.8
@@ -43,7 +43,6 @@ COMMON_ENV_VARS = {
     "SGLANG_DSV4_REASONING_EFFORT": "max",
     "SGLANG_USE_ROCM700A": "0",
     "SGLANG_DP_USE_GATHERV": "1",
-    "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
     "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
@@ -64,6 +63,8 @@ class TestDeepseekV4ProFp4MTP(CustomTestCase):
 
         other_args = [
             "--trust-remote-code",
+            "--dsv4-kv-layout",
+            DSV4_KV_LAYOUT,
             "--tp",
             "8",
             "--disable-radix-cache",
@@ -131,7 +132,7 @@ class TestDeepseekV4ProFp4MTP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v4-pro-fp4 MTP, {FLASHMLA_BACKEND})\n"
+                f"### test_gsm8k (deepseek-v4-pro-fp4 MTP, {DSV4_KV_LAYOUT})\n"
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
@@ -146,7 +147,7 @@ class TestDeepseekV4ProFp4MTP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v4-pro-fp4 MTP, {FLASHMLA_BACKEND})\n"
+                f"### test_bs_1_speed (deepseek-v4-pro-fp4 MTP, {DSV4_KV_LAYOUT})\n"
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )

@@ -1044,7 +1044,7 @@ class TestSWAPoolFloor(CustomTestCase):
         )
         self.assertEqual(config.swa_max_total_num_tokens, 3072)
 
-    def _dsv4_sizes(self, max_tokens, page_size, unified=False):
+    def _dsv4_sizes(self, max_tokens, page_size, ring_kv=False):
         """Exercise the DSV4 size arithmetic without a full V4 model fixture:
         _compute_dsv4_sizes reads only these six attributes."""
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -1055,7 +1055,7 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.swa_page_size = 128
         cfg.c4_ring_size = 8
         cfg.c4_shrink_factor = 1
-        cfg._unified = unified
+        cfg._ring_kv = ring_kv
         return cfg._compute_dsv4_sizes(max_tokens, page_size)
 
     def test_dsv4_rejects_single_page_pool(self):
@@ -1069,7 +1069,7 @@ class TestSWAPoolFloor(CustomTestCase):
         sizes = self._dsv4_sizes(max_tokens=32768, page_size=256)
         self.assertEqual(sizes.full_max_total_num_tokens, 32768)
         self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
-        # Non-unified: the c4 state pool scales with the paged SWA pool.
+        # Non-ring_kv: the c4 state pool scales with the paged SWA pool.
         self.assertEqual(sizes.c4_state_pool_size, 3072 // 128 * 8)
 
     def test_dsv4_token_cap_never_grows_total_footprint(self):
@@ -1117,7 +1117,7 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.online_c128_mtp_max_draft_tokens = 0
         cfg.disaggregation_mode = None
         cfg.disaggregation_decode_extra_slots = 0
-        cfg._unified = True
+        cfg._ring_kv = True
         return cfg
 
     # Token pool plus the three request-scoped fixed pools, sized from the
@@ -1132,10 +1132,10 @@ class TestSWAPoolFloor(CustomTestCase):
             + cfg._get_c128_state_fixed_bytes(max_running_requests)
         )
 
-    def test_dsv4_unified_c4_state_not_token_scaled(self):
-        # Unified-KV sizes the c4 state ring from max_running_requests in
+    def test_dsv4_ring_c4_state_not_token_scaled(self):
+        # Ring-KV sizes the c4 state ring from max_running_requests in
         # finalize_with_max_running_requests, so it must not scale here.
-        sizes = self._dsv4_sizes(max_tokens=32768, page_size=256, unified=True)
+        sizes = self._dsv4_sizes(max_tokens=32768, page_size=256, ring_kv=True)
         self.assertEqual(sizes.full_max_total_num_tokens, 32768)
         self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
         self.assertEqual(sizes.c4_state_pool_size, 0)

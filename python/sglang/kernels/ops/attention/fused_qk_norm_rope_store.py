@@ -209,7 +209,7 @@ def _fused_qk_norm_rope_store_kernel(
     SCALE_BYTES: tl.constexpr = NUM_NOPE_TILES + 1
 
     if HAS_SWA_STORE and BF16_STORE:
-        # unified_kv unified_kv: write the whole head_dim as plain bf16 into a
+        # ring_kv: write the whole head_dim as plain bf16 into a
         # [num_slots, head_dim] bf16 cache at row=loc (no fp8 / no scale).
         loc = tl.load(swa_loc_ptr + src_id, mask=src_mask, other=0)
         row_base = loc.to(tl.int64)[:, None] * swa_cache_stride_page

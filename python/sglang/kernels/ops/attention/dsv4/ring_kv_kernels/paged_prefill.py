@@ -4,14 +4,14 @@
 # The following kernel is imported from ATOM.
 # Source: atom/model_ops/v4_kernels/paged_prefill.py
 
-"""Sparse prefill attention with two KV sources: paged `unified_kv` (history)
+"""Sparse prefill attention with two KV sources: paged `ring_kv` (history)
 and per-fwd flat `kv` (current chunk's input).
 
 Designed for V4 prefill: indexes the two KV sources directly without
 materialising a per-fwd `kv_flat_sa` packed tensor.
 
 Caller contract:
-  unified_kv:        [total_pages, D] BF16 — prefix source. Same buffer as
+  ring_kv:        [total_pages, D] BF16 — prefix source. Same buffer as
     decode kernel: SWA ring slots in `[0, swa_pages)`, compress pages in
     `[swa_pages, total_pages)`. For prefill, prefix indices select
     (a) prior-chunk SWA history, (b) CSA topk, (c) HCA all-committed.
@@ -65,7 +65,7 @@ except ImportError:
 @triton.jit
 def _sparse_attn_v4_paged_prefill_kernel(
     q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D]   — prefix source
+    ring_kv_ptr,  # [total_pages, D]   — prefix source
     kv_indices_prefix_ptr,  # [total_prefix_indices] int32
     kv_indptr_prefix_ptr,  # [N+1] int32
     kv_ptr,  # [total_tokens, D]    — extend source
@@ -76,8 +76,8 @@ def _sparse_attn_v4_paged_prefill_kernel(
     q_stride_t: tl.constexpr,
     q_stride_h: tl.constexpr,
     q_stride_d: tl.constexpr,
-    pkv_stride_n: tl.constexpr,  # unified_kv stride 0 (= D usually)
-    pkv_stride_d: tl.constexpr,  # unified_kv stride 1 (= 1 usually)
+    pkv_stride_n: tl.constexpr,  # ring_kv stride 0 (= D usually)
+    pkv_stride_d: tl.constexpr,  # ring_kv stride 1 (= 1 usually)
     ekv_stride_n: tl.constexpr,  # kv stride 0
     ekv_stride_d: tl.constexpr,  # kv stride 1
     out_stride_t: tl.constexpr,
@@ -114,7 +114,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
 
     k_offs = tl.arange(0, BLOCK_K)
 
-    # ===== Region 1: prefix from unified_kv =====
+    # ===== Region 1: prefix from ring_kv =====
     p_start = tl.load(kv_indptr_prefix_ptr + t)
     p_end = tl.load(kv_indptr_prefix_ptr + t + 1)
     p_len = p_end - p_start
@@ -131,7 +131,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
         slot_clamped = tl.maximum(slot, 0)
 
         kv = tl.load(
-            unified_kv_ptr
+            ring_kv_ptr
             + slot_clamped[:, None] * pkv_stride_n
             + d_offs[None, :] * pkv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
@@ -216,7 +216,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
 
 def _sparse_attn_v4_paged_prefill_triton(
     q: torch.Tensor,
-    unified_kv: torch.Tensor,
+    ring_kv: torch.Tensor,
     kv_indices_prefix: torch.Tensor,
     kv_indptr_prefix: torch.Tensor,
     kv: torch.Tensor,
@@ -233,15 +233,13 @@ def _sparse_attn_v4_paged_prefill_triton(
         raise RuntimeError(
             f"sparse_attn_v4_paged_prefill expects fp16/bf16 q, got {q.dtype}"
         )
-    if unified_kv.dtype != q.dtype:
-        raise RuntimeError(
-            f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
-        )
+    if ring_kv.dtype != q.dtype:
+        raise RuntimeError(f"ring_kv dtype mismatch: kv={ring_kv.dtype}, q={q.dtype}")
     if kv.dtype != q.dtype:
         raise RuntimeError(f"kv dtype mismatch: kv={kv.dtype}, q={q.dtype}")
-    if unified_kv.size(-1) != kv.size(-1):
+    if ring_kv.size(-1) != kv.size(-1):
         raise RuntimeError(
-            f"head_dim mismatch: unified_kv={unified_kv.size(-1)}, kv={kv.size(-1)}"
+            f"head_dim mismatch: ring_kv={ring_kv.size(-1)}, kv={kv.size(-1)}"
         )
 
     T, H, D = q.shape
@@ -256,7 +254,7 @@ def _sparse_attn_v4_paged_prefill_triton(
     block_k = 16 if D >= 256 else 32
     _sparse_attn_v4_paged_prefill_kernel[(T, triton.cdiv(H, block_h))](
         q,
-        unified_kv,
+        ring_kv,
         kv_indices_prefix,
         kv_indptr_prefix,
         kv,
@@ -267,8 +265,8 @@ def _sparse_attn_v4_paged_prefill_triton(
         q.stride(0),
         q.stride(1),
         q.stride(2),
-        unified_kv.stride(0),
-        unified_kv.stride(1),
+        ring_kv.stride(0),
+        ring_kv.stride(1),
         kv.stride(0),
         kv.stride(1),
         out.stride(0),
@@ -287,7 +285,7 @@ def _sparse_attn_v4_paged_prefill_triton(
 
 def sparse_attn_v4_paged_prefill(
     q: torch.Tensor,
-    unified_kv: torch.Tensor,
+    ring_kv: torch.Tensor,
     kv_indices_prefix: torch.Tensor,
     kv_indptr_prefix: torch.Tensor,
     kv: torch.Tensor,
@@ -296,14 +294,14 @@ def sparse_attn_v4_paged_prefill(
     attn_sink: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """V4 prefill sparse attention over two KV sources (paged unified_kv +
+    """V4 prefill sparse attention over two KV sources (paged ring_kv +
     flat per-fwd kv).
 
     Args:
       q:                 [T, H, D] BF16/FP16 — query.
-      unified_kv:        [total_pages, D] BF16/FP16 — prefix source (paged).
+      ring_kv:        [total_pages, D] BF16/FP16 — prefix source (paged).
       kv_indices_prefix: [total_prefix] int32 — flat per-token slot lists into
-        unified_kv. -1 sentinels skipped.
+        ring_kv. -1 sentinels skipped.
       kv_indptr_prefix:  [T+1] int32 — true prefix sum.
       kv:                [total_tokens, D] BF16/FP16 — extend source (this
         fwd's input K, NOT yet in swa_kv ring).
@@ -329,15 +327,11 @@ def sparse_attn_v4_paged_prefill(
         H = q.shape[1]
         if attn_sink.shape[0] != H:
             attn_sink = attn_sink[:H].contiguous()
-        if (
-            kv.stride(0) != unified_kv.stride(0)
-            and kv.shape[0] == 1
-            and kv.stride(1) == 1
-        ):
+        if kv.stride(0) != ring_kv.stride(0) and kv.shape[0] == 1 and kv.stride(1) == 1:
             kv = kv.as_strided(kv.shape, (kv.shape[1], 1))
         return pa_sparse_prefill_opus(
             q,
-            unified_kv,
+            ring_kv,
             kv_indices_prefix,
             kv_indptr_prefix,
             kv,
@@ -348,7 +342,7 @@ def sparse_attn_v4_paged_prefill(
         )
     return _sparse_attn_v4_paged_prefill_triton(
         q,
-        unified_kv,
+        ring_kv,
         kv_indices_prefix,
         kv_indptr_prefix,
         kv,

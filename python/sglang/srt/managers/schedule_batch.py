@@ -1490,7 +1490,7 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
-            # unified_kv SWA lives in a per-request ring that is not content-stable
+            # ring_kv SWA lives in a per-request ring that is not content-stable
             # and never cached in the radix tree, so a reused prefix carries stale
             # SWA. Cap the match by the trailing sliding window so it is re-prefilled
             # into this request's ring. No-op for other layouts (returns 0).

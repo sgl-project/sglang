@@ -34,14 +34,13 @@ DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V4_FP8_MODEL_PATH", "sgl-project/DeepSeek-V4-Flash-FP8"
 )
 SERVER_LAUNCH_TIMEOUT = 3600
-FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
+DSV4_KV_LAYOUT = "ring"
 
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
     "SGLANG_USE_ROCM700A": "0",
     "SGLANG_DP_USE_GATHERV": "1",
-    "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
     "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
@@ -63,6 +62,8 @@ class TestDeepseekV4Fp8(CustomTestCase):
 
         other_args = [
             "--trust-remote-code",
+            "--dsv4-kv-layout",
+            DSV4_KV_LAYOUT,
             "--tp",
             "8",
             "--disable-radix-cache",
@@ -113,7 +114,7 @@ class TestDeepseekV4Fp8(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v4-flash-fp8, {FLASHMLA_BACKEND})\n"
+                f"### test_gsm8k (deepseek-v4-flash-fp8, {DSV4_KV_LAYOUT})\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.91)
@@ -147,6 +148,8 @@ class TestDeepseekV4Fp8(CustomTestCase):
             f"--pydantic-result-filename={json_output}",
             "--no-append-to-github-summary",
             "--trust-remote-code",
+            "--dsv4-kv-layout",
+            DSV4_KV_LAYOUT,
         ]
         print(f"Running benchmark: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -172,7 +175,7 @@ class TestDeepseekV4Fp8(CustomTestCase):
             report_results = results_data
 
         summary_lines = [
-            f"### test_perf_8k_1k (deepseek-v4-flash-fp8, {FLASHMLA_BACKEND})",
+            f"### test_perf_8k_1k (deepseek-v4-flash-fp8, {DSV4_KV_LAYOUT})",
             "input_len=8192 output_len=1024",
             "",
             "| batch size | latency (s) | input throughput (tok/s) | output throughput (tok/s) | ITL (ms) |",

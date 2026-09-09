@@ -2,7 +2,7 @@
 accuracy test (8-GPU).
 
 Same launch conventions as test_deepseek_v4_pro_fp4_cp.py (prefill CP over the
-unified_kv backend via ``--enable-prefill-cp --cp-strategy interleave``), plus
+ring_kv backend via ``--enable-prefill-cp --cp-strategy interleave``), plus
 ``--enable-two-batch-overlap``. This exercises the CP TBO op strategy
 (``op_cp_gather`` / ``op_cp_moe`` / ``op_cp_combine`` driven by
 ``DeepseekV4Model._forward_layers_tbo_cp``), which splits each prefill batch into
@@ -48,13 +48,12 @@ DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
 # Pro is 1.6T; weight load + warmup is much longer than Flash 285B.
 SERVER_LAUNCH_TIMEOUT = 5400
 
-# Matches test_deepseek_v4_pro_fp4_cp.py; prefill CP requires unified_kv_triton.
+# Matches test_deepseek_v4_pro_fp4_cp.py; prefill CP requires ring KV layout.
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
     "SGLANG_USE_ROCM700A": "0",
     "SGLANG_DP_USE_GATHERV": "1",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
     "AITER_BF16_FP8_MOE_BOUND": "0",
     # ROCm HSA-resource stability for TBO at high concurrency.
     "GPU_MAX_HW_QUEUES": "5",
@@ -70,7 +69,7 @@ FP4_ENV_VARS = {
     "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
 )
 class TestDeepseekV4ProFp4CPInterleaveTbo(CustomTestCase):
-    """DeepSeek-V4-Pro FP4 unified_kv prefill CP (round-robin-split) + TBO, tp=8."""
+    """DeepSeek-V4-Pro FP4 ring_kv prefill CP (round-robin-split) + TBO, tp=8."""
 
     @classmethod
     def setUpClass(cls):
@@ -87,6 +86,8 @@ class TestDeepseekV4ProFp4CPInterleaveTbo(CustomTestCase):
 
         other_args = [
             "--trust-remote-code",
+            "--dsv4-kv-layout",
+            "ring",
             "--tp",
             "8",
             "--dp",

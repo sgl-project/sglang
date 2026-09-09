@@ -40,11 +40,6 @@ TP_SIZE = 8
 
 
 @unittest.skipUnless(is_hip(), "UMBP HiCache requires ROCm.")
-@unittest.skipUnless(
-    os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
-    == "unified_kv_triton",
-    "UMBP HiCache E2E only runs in the unified_kv_triton DSV4 nightly leg.",
-)
 class TestHiCacheStorageUMBPBackend(CustomTestCase):
     """DeepSeek-V4 hybrid HostPoolGroup round trip through local UMBP L3."""
 
@@ -76,6 +71,8 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
         }
         other_args = [
             "--trust-remote-code",
+            "--dsv4-kv-layout",
+            "ring",
             "--tp-size",
             str(TP_SIZE),
             "--attention-backend",
@@ -127,7 +124,6 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
                 "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
                 "SGLANG_USE_ROCM700A": "0",
                 "AITER_BF16_FP8_MOE_BOUND": "0",
                 # Correctness does not depend on pre-reserved hugepages, and

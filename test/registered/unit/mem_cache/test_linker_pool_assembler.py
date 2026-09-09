@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.dsv4_kv_layout import DSV4KVLayout
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -172,7 +173,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             )
 
         kvcache = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-        kvcache._unified_kv = False
+        kvcache.kv_layout = DSV4KVLayout.PAGED
         kvcache.start_layer = 1
         kvcache.end_layer = 4
         kvcache.swa_page_size = 2

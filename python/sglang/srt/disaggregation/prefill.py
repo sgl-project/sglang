@@ -1321,12 +1321,12 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _swa_ring_payload():
-                # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
+                # Ring KV SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
                 # for the last `window` positions, in ascending position order so
                 # decode (its own req_pool_idx) matches positionally.
                 _pool = self.token_to_kv_pool_allocator.get_kvcache()
-                ring_stride = _pool.unified_swa_ring_size
-                window_size = _pool.unified_swa_window
+                ring_stride = _pool.swa_ring_size
+                window_size = _pool.swa_ring_window
                 window_start = max(0, seq_len - window_size)
                 positions = np.arange(window_start, seq_len, dtype=np.int64)
                 state_slot = int(req.kv.req_pool_idx)

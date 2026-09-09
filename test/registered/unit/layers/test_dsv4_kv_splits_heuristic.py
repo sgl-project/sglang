@@ -14,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (  # noqa: E402
+from sglang.kernels.ops.attention.dsv4.ring_kv_kernels.paged_decode import (  # noqa: E402
     _MAX_KV_SPLITS,
     _kv_splits_heuristic,
     _prev_pow2,

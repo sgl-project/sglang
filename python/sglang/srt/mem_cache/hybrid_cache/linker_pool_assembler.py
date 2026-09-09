@@ -237,18 +237,21 @@ def _deepseek_v4_state_views(state_pools: list[Any], global_layers: list[int]):
 def _build_deepseek_v4_device_pool_group(
     kvcache: Any, page_size: int
 ) -> DevicePoolGroup:
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        HiSparseC4DevicePool,
+        is_dsv4_ring_pool,
+    )
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _dsv4_indexer_regions,
         _resolve_deepseek_v4_layer_mappings,
     )
 
     mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
-    if getattr(kvcache, "_unified_kv", False) or isinstance(
+    if is_dsv4_ring_pool(kvcache) or isinstance(
         kvcache.c4_kv_pool, HiSparseC4DevicePool
     ):
         raise ValueError(
-            "The direct external linker does not support unified-KV or HiSparse."
+            "The direct external linker does not support ring-KV or HiSparse."
         )
     if kvcache.swa_page_size != page_size:
         raise ValueError(

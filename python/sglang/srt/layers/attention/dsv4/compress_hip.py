@@ -119,7 +119,7 @@ class CompressorHip(_CompressorBase):
         token_to_kv_pool = backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         req_ring_state = self.ratio == 128 or (
-            self.ratio == 4 and token_to_kv_pool._unified_kv
+            self.ratio == 4 and token_to_kv_pool.is_ring_kv
         )
 
         state_pool = self._get_state_pool(backend)
@@ -264,7 +264,7 @@ class CompressorHip(_CompressorBase):
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         req_ring_state = self.ratio == 128 or (
-            self.ratio == 4 and token_to_kv_pool._unified_kv
+            self.ratio == 4 and token_to_kv_pool.is_ring_kv
         )
         req_pool_indices = forward_batch.req_pool_indices
         req_to_token = attn_backend.req_to_token_pool.req_to_token
