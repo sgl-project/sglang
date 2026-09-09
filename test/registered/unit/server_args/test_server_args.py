@@ -106,6 +106,36 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestFp8WoAGemmCompatibility(CustomTestCase):
+    def setUp(self):
+        self.server_args = object.__new__(ServerArgs)
+
+    @patch("sglang.srt.server_args.is_xpu", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_other_runtimes_are_left_untouched(self, _mock_is_cuda, _mock_is_xpu):
+        # Scoping guard: CPU, ROCm, NPU and MUSA kept their own settings before
+        # the XPU arm existed and must keep them now.
+        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(True):
+            with self.assertNoLogs(server_args_module.logger, level="WARNING"):
+                self.server_args._handle_fp8_wo_a_gemm_compatibility()
+
+            self.assertTrue(envs.SGLANG_OPT_FP8_WO_A_GEMM.get())
+
+    @patch("sglang.srt.server_args.get_device_sm", return_value=80)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.layers.deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0", False)
+    @patch("sglang.srt.layers.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM", False)
+    def test_cuda_path_still_disables_when_deepgemm_is_unsupported(
+        self, _mock_is_cuda, _mock_get_device_sm
+    ):
+        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(True):
+            with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+                self.server_args._handle_fp8_wo_a_gemm_compatibility()
+
+            self.assertFalse(envs.SGLANG_OPT_FP8_WO_A_GEMM.get())
+            self.assertIn("detected sm80", logs.output[0])
+
+
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):
         server_args = ServerArgs(
