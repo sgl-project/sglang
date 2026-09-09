@@ -649,6 +649,10 @@ class DeepSeekV4UnifiedKVPool:
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+    # object.__new__ stubs (disagg wire test) skip __init__; False is the env
+    # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
+    _unified_kv_fp8 = False
+
     def __init__(
         self,
         max_num_reqs: int,

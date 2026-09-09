@@ -78,6 +78,7 @@ class _Harness(deepseek_v4.MQALayer):
         self._attn_sink_local = None
         self.alt_streams = None
         self.dsa_enable_prefill_cp = False
+        self.use_npu_arch35_mxfp8_wo_a = False
         self.compressor = object()
         self.wo_a = SimpleNamespace(
             weight=torch.ones(
