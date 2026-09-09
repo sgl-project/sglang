@@ -717,7 +717,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
-            compress_gpu_plan=ragged_layout is not None,
+            compress_gpu_plan=use_prefill_cuda_graph or ragged_layout is not None,
             extend_start_loc=extend_start_loc,
             attach_decode_streams=True,
         )
