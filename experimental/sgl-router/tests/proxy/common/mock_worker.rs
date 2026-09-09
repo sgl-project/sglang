@@ -4,7 +4,7 @@
 //! Minimal axum mock of an SGLang HTTP worker for routing tests.
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -60,6 +60,12 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
             .route("/server_info", get(serve_tiny_server_info))
+            // The router's own cap is what this suite exercises, so the mock
+            // must not impose a second one: axum's 2 MiB default would 413 a
+            // forwarded multimodal body here, before the assertion could see
+            // what the router did. Only `start` needs this today; the other
+            // constructors keep the default and serve small bodies.
+            .layer(DefaultBodyLimit::disable())
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

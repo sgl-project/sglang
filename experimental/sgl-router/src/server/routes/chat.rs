@@ -107,14 +107,16 @@ fn prefill_policy_reason(
     }
 }
 
-/// Per-route body-size cap on `/v1/chat/completions`. 5 MiB accommodates a
-/// long context — a ~1 M-token context tokenized as JSON fits under this —
-/// while preventing a hostile client from forcing the router to
-/// heap-allocate hundreds of MiB before forwarding. The cap is wired in
-/// `crate::server::app::build_router` as a route-level `DefaultBodyLimit`
-/// layer; axum's `Bytes` extractor enforces it and returns 413
-/// PAYLOAD_TOO_LARGE before this handler runs.
-pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
+/// Per-route body-size cap on `/v1/chat/completions`. 100 MiB accommodates a
+/// long text context AND multimodal requests, whose base64-encoded image or
+/// audio payloads dwarf any text body — a handful of high-resolution images
+/// alone runs to several MiB. It bounds a SINGLE request's body; the tokenize
+/// path holds roughly three copies of it, and nothing here bounds how many
+/// requests buffer concurrently, so this is not an aggregate memory bound.
+/// The cap is wired in `crate::server::app::build_router` as a route-level
+/// `DefaultBodyLimit` layer; axum's `Bytes` extractor enforces it and returns
+/// 413 PAYLOAD_TOO_LARGE before this handler runs.
+pub const MAX_CHAT_BODY_BYTES: usize = 100 << 20;
 
 /// Minimal probe over the request body — we only need the `stream` field
 /// and the `model` field to decide between buffered vs SSE forwarding and
@@ -253,10 +255,13 @@ pub async fn chat_completions(
     //   * Bucket routing also needs the prompt token count.
     //
     // When none holds, `parse_probe`'s minimal probe is enough, so we keep
-    // avoiding the full `serde_json::Value` allocation over a (up to 1 MiB)
-    // body. When parsed, this single value is reused for the routing
-    // tokenization and the outgoing-body injection below (and PD bootstrap
-    // injection). `parse_probe` already validated the object shape.
+    // avoiding the full `serde_json::Value` allocation over a body that may
+    // run to `MAX_CHAT_BODY_BYTES`. That parse is ADDITIVE with the buffered
+    // body and with the re-serialized outgoing body, so this path holds
+    // roughly three copies of a large request at once. When parsed, this
+    // single value is reused for the routing tokenization and the
+    // outgoing-body injection below (and PD bootstrap injection).
+    // `parse_probe` already validated the object shape.
     let want_tokens = should_tokenize_request(
         ctx.tokenizers.has_chat_encoder(&model_str),
         policy.needs_request_tokens(),

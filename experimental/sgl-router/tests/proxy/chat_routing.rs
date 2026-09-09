@@ -590,6 +590,64 @@ async fn oversized_request_body_returns_413() {
 }
 
 #[tokio::test]
+async fn multimodal_sized_body_reaches_the_worker() {
+    // Regression: multimodal requests carry base64-encoded image/audio
+    // payloads that dwarf any text body — a 3x1080p-image benchmark request
+    // runs to ~8.5 MiB. A cap sized for text context alone rejects every one
+    // of them with 413 at the `DefaultBodyLimit` layer, before the handler
+    // runs, so the router must admit a body of that magnitude.
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    // 8 MiB of base64, standing in for a handful of high-resolution images.
+    let image_b64 = "A".repeat(8 << 20);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "tiny",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in this image?"},
+                {"type": "image_url", "image_url": {
+                    "url": format!("data:image/png;base64,{image_b64}"),
+                }},
+            ],
+        }],
+        "stream": false,
+    }))
+    .unwrap();
+    // Deliberately NOT asserting `body.len() <= MAX_CHAT_BODY_BYTES` first: at
+    // a too-small cap that fires before the request is sent, and reads as
+    // "shrink your test body" — pointing a bisecting reader at un-fixing the
+    // bug. Letting the request through makes `DefaultBodyLimit` produce the
+    // real 413 and the status assertion below report it.
+    let sent_len = body.len();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "multimodal-sized body must reach the handler; got: {}",
+        res.status(),
+    );
+    // Whole, not truncated — a cap that clips the payload is as broken as one
+    // that rejects it. Exact-length equality holds because this fixture takes
+    // the pass-through path (round-robin, no chat encoder, no buckets), so
+    // `build_outgoing_body` forwards the original bytes without re-serializing.
+    let captured = worker.captured.lock().unwrap();
+    assert_eq!(
+        captured.last_body.as_ref().map(|b| b.len()),
+        Some(sent_len),
+        "worker must receive the full multimodal body",
+    );
+}
+
+#[tokio::test]
 async fn chat_rejects_null_body_400() {
     // Regression: a JSON `null` body is syntactically valid JSON but is NOT
     // a chat-completions request shape. The router must reject it with 400
