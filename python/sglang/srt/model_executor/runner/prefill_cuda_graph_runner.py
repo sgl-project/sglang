@@ -317,8 +317,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.prefill_backend_name == Backend.TC_PIECEWISE
             and self.max_context_size is not None
         ):
-            # TODO: Plumb max_seq_len_override through TcPiecewise metadata
-            # preparation before enabling the fixed context limit here.
+            # TODO: Plumb max_seq_len_override through TcPiecewise
+            # metadata preparation before enabling the fixed context limit here.
             self._ignore_max_context_size("tc_piecewise prefill CUDA graph")
 
         # --- capture modes --------------------------------------------
@@ -442,6 +442,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
             self._capture_req_slots = max_req
+
+        server_args = model_runner.server_args
+        self.enable_cp_v2_bcg_capture = isinstance(
+            self.backend, BreakableCudaGraphBackend
+        ) and should_enable_cp_v2_bcg_capture(server_args)
+        if self.enable_cp_v2_bcg_capture and self.max_context_size is not None:
+            # TODO: Preserve max_seq_len_override through CP-v2's
+            # padded metadata preparation before enabling this limit.
+            self._ignore_max_context_size("CP-v2 breakable prefill CUDA graph")
+        if self.max_context_size is not None and not (
+            model_runner.attn_backend.supports_prefill_cuda_graph_max_context_size
+        ):
+            raise ValueError(
+                "--cuda-graph-prefill-max-context is only supported by attention "
+                "backends that implement fixed-context prefill graph metadata; "
+                f"got {type(model_runner.attn_backend).__name__}"
+            )
+
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
@@ -886,45 +904,33 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _resolve_max_context_size(
         model_runner, requested_size: Optional[int]
     ) -> Optional[int]:
-        """Page-align and validate the fixed captured context limit."""
         if requested_size is None:
             return None
         if isinstance(requested_size, bool) or not isinstance(requested_size, int):
             raise ValueError(
-                "--cuda-graph-prefill-context-bucket accepts exactly one integer"
+                "--cuda-graph-prefill-max-context accepts exactly one integer"
             )
         if requested_size <= 0:
             raise ValueError(
-                "--cuda-graph-prefill-context-bucket must be a positive integer"
+                "--cuda-graph-prefill-max-context must be a positive integer"
             )
 
-        page_size = int(model_runner.page_size)
         max_context_len = PrefillCudaGraphRunner._max_addressable_prefix_len(
             model_runner
         )
-        aligned = _ceil_div(requested_size, page_size) * page_size
-        if aligned > max_context_len:
+        if requested_size > max_context_len:
             raise ValueError(
-                "--cuda-graph-prefill-context-bucket exceeds the maximum "
+                "--cuda-graph-prefill-max-context exceeds the maximum "
                 "addressable context: "
-                f"aligned size {aligned} > {max_context_len}"
-            )
-        if requested_size != aligned:
-            logger.info(
-                "Page-aligning prefill CUDA graph max context size %d -> %d "
-                "(page_size=%d).",
-                requested_size,
-                aligned,
-                page_size,
+                f"requested size {requested_size} > {max_context_len}"
             )
         logger.info(
             "Prefill CUDA graph max context size: %d; graph keys remain token-only.",
-            aligned,
+            requested_size,
         )
-        return aligned
+        return requested_size
 
     def _ignore_max_context_size(self, execution_path: str) -> None:
-        """Drop the fixed context limit for a path that cannot use it yet."""
         if self.max_context_size is None:
             return
         logger.warning(
@@ -1298,6 +1304,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         # Non-DP local check (sole decision for tp-only).
+        max_context_len = (
+            self._max_context_len(forward_batch)
+            if self.max_context_size is not None
+            else None
+        )
         if not self.can_replay_locally(
             batch_size=forward_batch.batch_size,
             num_tokens=len(forward_batch.input_ids),
@@ -1314,7 +1325,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch
                 )
             ),
-            max_context_len=self._max_context_len(forward_batch),
+            max_context_len=max_context_len,
         ):
             return False
         if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
@@ -1648,14 +1659,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
         self.raw_num_tokens = num_tokens
 
-        raw_context_size = self._max_context_len(forward_batch)
-        if self.max_context_size is not None and (
-            raw_context_size is None or raw_context_size > self.max_context_size
-        ):
-            raise RuntimeError(
-                "Prefill CUDA graph replay was admitted without a fitting "
-                "maximum context size"
-            )
+        if self.max_context_size is not None:
+            raw_context_size = self._max_context_len(forward_batch)
+            if raw_context_size is None or raw_context_size > self.max_context_size:
+                raise RuntimeError(
+                    "Prefill CUDA graph replay was admitted without a fitting "
+                    "maximum context size"
+                )
 
         bs = forward_batch.batch_size
         self.raw_bs = bs

@@ -582,8 +582,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             return replay_metadata
 
         backend._build_forward_metadata = fake_build_forward_metadata
-        forward_batch = SimpleNamespace(name="live")
-        static_forward_batch = SimpleNamespace(name="static")
+        forward_batch = SimpleNamespace(name="live", max_seq_len_override=None)
+        static_forward_batch = SimpleNamespace(name="static", max_seq_len_override=None)
 
         backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             capture_metadata,

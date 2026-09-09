@@ -44,7 +44,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
             "+",
         )
         self.assertIs(
-            self.actions_by_option["--cuda-graph-prefill-context-bucket"].type,
+            self.actions_by_option["--cuda-graph-prefill-max-context"].type,
             human_readable_int,
         )
         self.assertIsNone(self.actions_by_option["--context-bucket"].nargs)
@@ -79,9 +79,9 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 self.assertEqual(args.dp_size, 3)
                 self.assertEqual(ServerArgs.from_cli_args(args).dp_size, 3)
 
-    def test_context_bucket_accepts_human_readable_values(self):
+    def test_prefill_max_context_accepts_human_readable_values(self):
         for option in (
-            "--cuda-graph-prefill-context-bucket",
+            "--cuda-graph-prefill-max-context",
             "--context-bucket",
         ):
             with self.subTest(option=option):

@@ -510,6 +510,7 @@ class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
+    supports_prefill_cuda_graph_max_context_size: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
 

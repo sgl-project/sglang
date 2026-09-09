@@ -479,8 +479,8 @@ class ExecGraph:
         Optional[int],
         Arg(
             help=(
-                "Maximum context length supported by the breakable/full "
-                "prefill CUDA graph. Context-shaped attention metadata and "
+                "Maximum context length supported by DeepSeek-V4 breakable/full "
+                "prefill CUDA graphs. Context-shaped attention metadata and "
                 "indexer logits are allocated at this fixed size instead of "
                 "the model maximum. Larger live contexts fall back to eager."
                 f"\n\n{human_readable_int.__doc__}"
