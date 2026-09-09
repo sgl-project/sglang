@@ -114,9 +114,9 @@ def _run_case(bs, gamma, HV, H, K, V, lens, acc, L, pad_last=False):
         base = inter[slots[j], int(acc[j]) - 1]
         fold = ckpt[slots[j]]
         rel = ((fold - base).abs().max() / base.abs().max().clamp_min(1e-6)).item()
-        assert (
-            rel < 1e-3
-        ), f"row={j} len={int(lens[j])} acc={int(acc[j])}: rel={rel:.3e}"
+        assert rel < 1e-3, (
+            f"row={j} len={int(lens[j])} acc={int(acc[j])}: rel={rel:.3e}"
+        )
 
 
 @pytest.mark.parametrize("bs,gamma,HV,H,K,V", SHAPES, ids=SHAPE_IDS)

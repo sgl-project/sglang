@@ -30,9 +30,9 @@ class TestPriorityBasic(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        assert (
-            r.status == "waiting"
-        ), f"force-retracted chunked req must be back in waiting; got {r.status}"
+        assert r.status == "waiting", (
+            f"force-retracted chunked req must be back in waiting; got {r.status}"
+        )
         assert r.kv_pages == 0, f"retract must release KV; got {r.kv_pages}"
 
         t.continue_generation()

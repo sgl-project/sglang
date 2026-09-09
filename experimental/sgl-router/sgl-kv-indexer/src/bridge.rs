@@ -150,6 +150,7 @@ fn classify_rpc(status: Status) -> BridgeError {
 enum Action {
     Report {
         tier: i32,
+        parent_block_hash: Option<i64>,
         hashes: Vec<i64>,
         masks: Vec<Option<u32>>,
         block_sizes: Vec<Option<u32>>,
@@ -171,19 +172,27 @@ impl EventActions {
     /// with an immediately-preceding store to the same tier and never across a
     /// revoke/clear, so the final per-hash state is preserved. All hashes here
     /// share the event's component mask and block size.
-    fn report(&mut self, tier: i32, hashes: Vec<i64>, mask: Option<u32>, block_size: Option<u32>) {
+    fn report(
+        &mut self,
+        tier: i32,
+        parent_block_hash: Option<i64>,
+        hashes: Vec<i64>,
+        mask: Option<u32>,
+        block_size: Option<u32>,
+    ) {
         if hashes.is_empty() {
             return;
         }
         let n = hashes.len();
         if let Some(Action::Report {
             tier: last_tier,
+            parent_block_hash: _,
             hashes: last,
             masks,
             block_sizes,
         }) = self.actions.last_mut()
         {
-            if *last_tier == tier {
+            if *last_tier == tier && parent_block_hash == last.last().copied() {
                 last.extend(hashes);
                 masks.extend(std::iter::repeat_n(mask, n));
                 block_sizes.extend(std::iter::repeat_n(block_size, n));
@@ -192,6 +201,7 @@ impl EventActions {
         }
         self.actions.push(Action::Report {
             tier,
+            parent_block_hash,
             hashes,
             masks: vec![mask; n],
             block_sizes: vec![block_size; n],
@@ -401,6 +411,7 @@ fn build_apply_request(
         match action {
             Action::Report {
                 tier,
+                parent_block_hash,
                 hashes,
                 masks,
                 block_sizes,
@@ -413,6 +424,7 @@ fn build_apply_request(
                 // the backend keeps the whole-block fast path.
                 component_masks: encode_component_masks(&masks),
                 block_sizes: encode_block_sizes(&block_sizes),
+                parent_block_hash,
             }),
             Action::Revoke { tier, hashes } => actions.push(ExternalKvAction {
                 r#type: ExternalKvActionType::ActionRevoke as i32,
@@ -420,6 +432,7 @@ fn build_apply_request(
                 hashes,
                 component_masks: Vec::new(),
                 block_sizes: Vec::new(),
+                parent_block_hash: None,
             }),
             Action::ClearAll => {
                 for tier in &config.clear_tiers {
@@ -429,6 +442,7 @@ fn build_apply_request(
                         hashes: Vec::new(),
                         component_masks: Vec::new(),
                         block_sizes: Vec::new(),
+                        parent_block_hash: None,
                     });
                 }
             }
@@ -499,6 +513,15 @@ fn split_action(action: ExternalKvAction) -> Vec<ExternalKvAction> {
                 hashes: action.hashes[start..end].to_vec(),
                 component_masks: slice_or_empty(&action.component_masks, start, end),
                 block_sizes: slice_or_empty(&action.block_sizes, start, end),
+                parent_block_hash: if action.r#type == ExternalKvActionType::ActionReport as i32 {
+                    if start == 0 {
+                        action.parent_block_hash
+                    } else {
+                        Some(action.hashes[start - 1])
+                    }
+                } else {
+                    None
+                },
             }
         })
         .collect()
@@ -571,11 +594,12 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
     match parse_event(event)? {
         DecodedEvent::BlockStored {
             hashes,
+            parent_block_hash,
             tier,
             component_mask,
             block_size,
         } => {
-            actions.report(tier, hashes, component_mask, block_size);
+            actions.report(tier, parent_block_hash, hashes, component_mask, block_size);
         }
         DecodedEvent::BlockRemoved { hashes, tier } => {
             actions.revoke(tier, hashes);
@@ -593,6 +617,7 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
 enum DecodedEvent {
     BlockStored {
         hashes: Vec<i64>,
+        parent_block_hash: Option<i64>,
         tier: i32,
         component_mask: Option<u32>,
         block_size: Option<u32>,
@@ -612,6 +637,7 @@ fn parse_event(event: &Value) -> Result<DecodedEvent, BridgeError> {
         .ok_or_else(|| BridgeError::Decode("KV event must be a map".to_string()))?;
     let mut event_type = None;
     let mut block_hashes = None;
+    let mut parent_block_hash = None;
     let mut block_size = None;
     let mut medium = None;
     let mut component_types = None;
@@ -621,6 +647,7 @@ fn parse_event(event: &Value) -> Result<DecodedEvent, BridgeError> {
         let slot = match name {
             "type" => &mut event_type,
             "block_hashes" => &mut block_hashes,
+            "parent_block_hash" => &mut parent_block_hash,
             "block_size" => &mut block_size,
             "medium" => &mut medium,
             "component_types" => &mut component_types,
@@ -662,8 +689,13 @@ fn parse_event(event: &Value) -> Result<DecodedEvent, BridgeError> {
                 })?)?),
                 None => None,
             };
+            let parent_block_hash = match parent_block_hash {
+                Some(value) => decode_optional_hash(value, "BlockStored.parent_block_hash")?,
+                None => None,
+            };
             Ok(DecodedEvent::BlockStored {
                 hashes,
+                parent_block_hash,
                 tier,
                 component_mask,
                 block_size,
@@ -690,24 +722,27 @@ fn parse_event(event: &Value) -> Result<DecodedEvent, BridgeError> {
 fn decode_hashes(value: &Value) -> Result<Vec<i64>, BridgeError> {
     expect_array(value, "block_hashes")?
         .iter()
-        .map(|value| {
-            if let Some(value) = value.as_i64() {
-                return Ok(value);
-            }
-            // SGLang folds the unsigned top 64 bits of the SHA-256 into the
-            // signed range by subtracting 2^64 (`hash_str_to_int64`), which is
-            // two's complement, so a producer that serialises the unsigned half
-            // instead is carrying identical bits. Reinterpreting recovers the
-            // hash the router queries for; refusing the value would instead skip
-            // the whole event and lose every placement it carried.
-            if let Some(value) = value.as_u64() {
-                return Ok(value as i64);
-            }
-            Err(BridgeError::Decode(
-                "block hash must be an integer".to_string(),
-            ))
-        })
+        .map(|value| decode_hash(value, "block hash"))
         .collect()
+}
+
+fn decode_hash(value: &Value, field: &str) -> Result<i64, BridgeError> {
+    if let Some(value) = value.as_i64() {
+        return Ok(value);
+    }
+    // SGLang folds the unsigned top 64 bits of the SHA-256 into the signed
+    // range by subtracting 2^64. Reinterpreting recovers the same bits.
+    if let Some(value) = value.as_u64() {
+        return Ok(value as i64);
+    }
+    Err(BridgeError::Decode(format!("{field} must be an integer")))
+}
+
+fn decode_optional_hash(value: &Value, field: &str) -> Result<Option<i64>, BridgeError> {
+    if matches!(value, Value::Nil) {
+        return Ok(None);
+    }
+    decode_hash(value, field).map(Some)
 }
 
 /// Decodes the optional `component_types` field of a `BlockStored` into a component
@@ -913,11 +948,15 @@ mod tests {
     }
 
     fn stored(hashes: &[i64], medium: &str) -> Value {
+        stored_with_parent(hashes, None, medium)
+    }
+
+    fn stored_with_parent(hashes: &[i64], parent: Option<i64>, medium: &str) -> Value {
         event(
             "BlockStored",
             vec![
                 field("block_hashes", ints(hashes)),
-                field("parent_block_hash", Value::Nil),
+                field("parent_block_hash", parent.map_or(Value::Nil, Value::from)),
                 field("token_ids", ints(&[1])),
                 field("block_size", Value::from(1_i64)),
                 field("lora_id", Value::Nil),
@@ -928,11 +967,21 @@ mod tests {
 
     /// A component-aware `BlockStored` with a named `component_types` field.
     fn stored_c(hashes: &[i64], medium: &str, block_size: i64, components: Value) -> Value {
+        stored_c_with_parent(hashes, None, medium, block_size, components)
+    }
+
+    fn stored_c_with_parent(
+        hashes: &[i64],
+        parent: Option<i64>,
+        medium: &str,
+        block_size: i64,
+        components: Value,
+    ) -> Value {
         event(
             "BlockStored",
             vec![
                 field("block_hashes", ints(hashes)),
-                field("parent_block_hash", Value::Nil),
+                field("parent_block_hash", parent.map_or(Value::Nil, Value::from)),
                 field("token_ids", ints(&[1])),
                 field("block_size", Value::from(block_size)),
                 field("lora_id", Value::Nil),
@@ -948,8 +997,13 @@ mod tests {
 
     /// Legacy (whole-block) report action expectation.
     fn rep(tier: i32, hashes: &[&str]) -> Action {
+        rep_with_parent(tier, None, hashes)
+    }
+
+    fn rep_with_parent(tier: i32, parent_block_hash: Option<i64>, hashes: &[&str]) -> Action {
         Action::Report {
             tier,
+            parent_block_hash,
             hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             masks: vec![None; hashes.len()],
             block_sizes: vec![None; hashes.len()],
@@ -1030,6 +1084,7 @@ mod tests {
             hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
+            parent_block_hash: None,
         }
     }
 
@@ -1040,6 +1095,7 @@ mod tests {
             hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
+            parent_block_hash: None,
         }
     }
 
@@ -1050,6 +1106,7 @@ mod tests {
             hashes: Vec::new(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
+            parent_block_hash: None,
         }
     }
 
@@ -1069,6 +1126,19 @@ mod tests {
     }
 
     #[test]
+    fn request_carries_parent_block_hash() {
+        let config = test_config(vec![hbm()]);
+        let request = request_of(
+            &config,
+            0,
+            vec![stored_with_parent(&[2, 3], Some(1), "GPU")],
+        );
+        assert_eq!(request.actions.len(), 1);
+        assert_eq!(request.actions[0].parent_block_hash, Some(1));
+        assert_eq!(request.actions[0].hashes, vec![2, 3]);
+    }
+
+    #[test]
     fn oversized_report_is_split_with_aligned_metadata() {
         let count = MAX_HASHES_PER_REQUEST + 1;
         let request = ApplyExternalKvBatchRequest {
@@ -1080,6 +1150,7 @@ mod tests {
                 hashes: (0..count).map(|index| index as i64).collect(),
                 component_masks: (0..count as u32).collect(),
                 block_sizes: (0..count as u32).map(|index| index + 1).collect(),
+                parent_block_hash: None,
             }],
             worker_address: "http://worker-1".into(),
             cache_spec: None,
@@ -1089,6 +1160,7 @@ mod tests {
 
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].actions[0].hashes.len(), MAX_HASHES_PER_REQUEST);
+        assert_eq!(batches[0].actions[0].parent_block_hash, None);
         assert_eq!(
             batches[1].actions[0].hashes,
             vec![MAX_HASHES_PER_REQUEST as i64]
@@ -1096,6 +1168,10 @@ mod tests {
         assert_eq!(
             batches[1].actions[0].component_masks,
             vec![MAX_HASHES_PER_REQUEST as u32]
+        );
+        assert_eq!(
+            batches[1].actions[0].parent_block_hash,
+            Some(MAX_HASHES_PER_REQUEST as i64 - 1)
         );
         assert_eq!(
             batches[1].actions[0].block_sizes,
@@ -1249,8 +1325,19 @@ mod tests {
     #[test]
     fn adjacent_same_tier_stores_coalesce() {
         assert_eq!(
-            actions_of(vec![stored(&[1], "GPU"), stored(&[2], "GPU")]),
+            actions_of(vec![
+                stored(&[1], "GPU"),
+                stored_with_parent(&[2], Some(1), "GPU")
+            ]),
             vec![rep(hbm(), &["1", "2"])]
+        );
+    }
+
+    #[test]
+    fn same_tier_stores_on_different_chains_do_not_coalesce() {
+        assert_eq!(
+            actions_of(vec![stored(&[1], "GPU"), stored(&[2], "GPU")]),
+            vec![rep(hbm(), &["1"]), rep(hbm(), &["2"])]
         );
     }
 
@@ -1281,10 +1368,14 @@ mod tests {
         let store = Value::Map(vec![
             field("medium", Value::String("GPU".into())),
             field("block_hashes", ints(&[7])),
+            field("parent_block_hash", Value::from(u64::MAX)),
             field("type", Value::String("BlockStored".into())),
         ]);
 
-        assert_eq!(actions_of(vec![store]), vec![rep(hbm(), &["7"])]);
+        assert_eq!(
+            actions_of(vec![store]),
+            vec![rep_with_parent(hbm(), Some(-1), &["7"])]
+        );
     }
 
     #[test]
@@ -1305,6 +1396,28 @@ mod tests {
     }
 
     #[test]
+    fn invalid_parent_skips_only_that_event() {
+        for parents in [
+            vec![field("parent_block_hash", Value::String("invalid".into()))],
+            vec![
+                field("parent_block_hash", Value::Nil),
+                field("parent_block_hash", Value::from(1)),
+            ],
+        ] {
+            let mut fields = vec![
+                field("block_hashes", ints(&[2])),
+                field("medium", Value::String("GPU".into())),
+            ];
+            fields.extend(parents);
+            let invalid = event("BlockStored", fields);
+            assert_eq!(
+                actions_of(vec![stored(&[1], "GPU"), invalid, removed(&[3], "DISK")]),
+                vec![rep(hbm(), &["1"]), rev(ssd(), &["3"])]
+            );
+        }
+    }
+
+    #[test]
     fn metadata_and_component_types_are_independent_extensions() {
         let mut store = stored_c(&[7], "GPU", 64, strv(&["full", "swa"]));
         let Value::Map(entries) = &mut store else {
@@ -1319,6 +1432,7 @@ mod tests {
             actions_of(vec![store]),
             vec![Action::Report {
                 tier: hbm(),
+                parent_block_hash: None,
                 hashes: vec![7],
                 masks: vec![Some(
                     crate::service::COMPONENT_FULL | crate::service::COMPONENT_SWA
@@ -1362,7 +1476,7 @@ mod tests {
         assert_eq!(
             decode_event_batch(&payload).unwrap().actions,
             vec![
-                rep(hbm(), &["1234567890123", "-987654321"]),
+                rep_with_parent(hbm(), Some(42), &["1234567890123", "-987654321"]),
                 rev(ssd(), &["100", "200"]),
                 Action::ClearAll,
             ]
@@ -1517,6 +1631,7 @@ mod tests {
             actions_of(vec![stored_c(&[1], "GPU", 64, strv(&["full", "swa"]))]),
             vec![Action::Report {
                 tier: hbm(),
+                parent_block_hash: None,
                 hashes: vec![1],
                 masks: vec![Some(
                     crate::service::COMPONENT_FULL | crate::service::COMPONENT_SWA
@@ -1544,7 +1659,7 @@ mod tests {
             0,
             vec![
                 stored_c(&[1], "GPU", 64, strv(&["full", "swa"])),
-                stored_c(&[2], "GPU", 32, strv(&["full"])),
+                stored_c_with_parent(&[2], Some(1), "GPU", 32, strv(&["full"])),
             ],
         );
         assert_eq!(request.actions.len(), 1);
