@@ -1,6 +1,9 @@
 name: Nightly Test Miles (AMD ROCm 10)
 
 on:
+  schedule:
+    # Runs after the 12:00 UTC miles image build has pushed the dated image.
+    - cron: "30 17 * * *"
   workflow_dispatch:
     inputs:
       image_tag:
