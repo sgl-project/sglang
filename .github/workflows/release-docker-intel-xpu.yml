@@ -1,0 +1,76 @@
+name: Release Docker Images (Intel XPU)
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (without v prefix, e.g., 0.5.7)'
+        required: true
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: intel-bmg
+    environment: 'prod'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Get version from tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+            IS_WORKFLOW_DISPATCH=true
+          else
+            # Extract version from the tag that triggered this workflow (e.g., v0.5.7 -> 0.5.7)
+            VERSION="${GITHUB_REF_NAME#v}"
+            IS_WORKFLOW_DISPATCH=false
+          fi
+
+          # Validate version format
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+
+          if [ "$IS_WORKFLOW_DISPATCH" = "true" ] && ! git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Version tag v${VERSION} does not exist"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push
+        run: |
+          version=${{ steps.version.outputs.version }}
+          tag=v${version}-xpu
+
+          docker build . -f docker/xpu.Dockerfile \
+            --build-arg SG_LANG_REPO=https://github.com/sgl-project/sglang.git \
+            --build-arg SG_LANG_BRANCH=v${version} \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache --progress=plain
+
+          push_with_retry() {
+            for i in 1 2 3 4 5; do
+              docker push "$1" && return 0
+              echo "push failed (attempt $i), retrying in $((i*15))s..."
+              sleep $((i*15))
+            done
+            return 1
+          }
+
+          push_with_retry lmsysorg/sglang:${tag}
