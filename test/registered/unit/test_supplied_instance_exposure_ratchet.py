@@ -619,7 +619,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
 
         `arg_groups/` is deliberately excluded: `_hook_assignment_targets`
         covers it exactly, and it resolves the pipeline's own computed
-        expansions (`capture_foreign_writes` declares a `**` dict this
+        expansions (`record_foreign_defaults` declares a `**` dict this
         collector's resolver cannot read). The keywords at the call sites are
         the written fields; an expansion this cannot resolve fails loudly like
         the override collector's, except the named dynamic sites below, whose

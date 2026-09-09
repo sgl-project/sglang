@@ -438,7 +438,7 @@ around it are spellings, not mechanisms:
 | name | what it adds |
 |---|---|
 | `run_post_process_pass` | runs a pass at its slot and validates its return; declares through `declare_resolution`. A pass returning an **empty** dict is a validation, not a declaration, and stays legal on the published instance — `Engine(server_args=sa)` after `Engine.shutdown()` re-runs `check_server_args` on the very instance the context holds |
-| `capture_foreign_writes` | not a declaration channel: it hands the record to a writer this tree does not own (an out-of-tree platform plugin, a registered speculative algorithm), lifts the write seal for that call, and declares the diff. Every in-tree implementation declares properly, so it captures nothing for them |
+| `record_foreign_defaults` | for a resolver this tree does not own (an out-of-tree platform plugin, a registered speculative algorithm), whose interface is to *assign* fields. It gets a stand-in whose reads fall through to `resolving_view`; what it assigned is declared. The record is never written, so the write seal has no exception. In-tree code does not go through it — `handle_platform_defaults` wraps the platform hook, and the in-tree speculative dispatcher is called directly, because handed the stand-in its own `declare_resolution` calls would stash on that instead |
 
 `resolution_projection` is gone; the whole-object readback is
 `ServerArgs.resolved_dict()`, which is what `/server_info` and its gRPC and
@@ -563,8 +563,10 @@ ONE thread — do not design for TBO threads that don't exist.
 
 ## Guardrails (these fail CI; what to do when they fire)
 
-1. **Strict mutation guard** (always on): bare `server_args.x = ...` after resolution
-   raises unconditionally in `ServerArgs.__setattr__` — this *is* the guarantee that
+1. **Strict mutation guard** (always on, and with no exception): bare
+   `server_args.x = ...` after resolution raises unconditionally in
+   `ServerArgs.__setattr__` — the named lift that out-of-tree plugins used to
+   ask for is gone, they assign onto a stand-in instead — this *is* the guarantee that
    no writer can desync the bags, so there is no writer ratchet any more. Change
    resolved config with `get_context().override`; hand a per-runner value to its
    runner as a constructor argument. Projected bags are sealed the same way (leaf

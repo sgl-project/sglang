@@ -17,10 +17,9 @@ Model-identity adjustments to the server configuration are DECLARED here and
 appended to the record's declaration stash (gate order, last writer wins).
 Nothing here writes back onto ``ServerArgs``: the record holds the user's raw
 input, and a decision is read through ``resolution_result`` or the published
-config bags — model code never mutates ``ServerArgs`` fields imperatively. The
-one channel that still leaves a field changed is ``capture_foreign_writes``,
-which does not perform the write: it captures one an out-of-tree plugin already
-made, and undoing it would surprise the plugin's own reads.
+config bags — model code never mutates ``ServerArgs`` fields imperatively. That
+holds without exception: a resolver this tree does not own assigns onto a
+stand-in (``record_foreign_defaults``), and what it set is declared.
 
 Two declaration forms, keyed on ``hf_config.architectures[0]``:
 
@@ -182,62 +181,65 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     stash.append((source, dict(fields)))
 
 
-def capture_foreign_writes(
+class _ForeignDefaults:
+    """The stand-in handed to a resolver this tree does not own.
+
+    Reads fall through to the resolving view, so a plugin sees what resolution
+    has decided so far rather than the raw input -- better than what it used to
+    get, which was the record's own fields. Writes are captured here and
+    declared by the caller, so the record is never written and the write seal
+    has no exception.
+    """
+
+    __slots__ = ("_cfg", "_written")
+
+    def __init__(self, server_args: Any):
+        object.__setattr__(self, "_cfg", resolving_view(server_args))
+        object.__setattr__(self, "_written", {})
+
+    def __getattr__(self, name: str) -> Any:
+        written = object.__getattribute__(self, "_written")
+        if name in written:
+            return written[name]
+        return getattr(object.__getattribute__(self, "_cfg"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__getattribute__(self, "_written")[name] = value
+
+
+def record_foreign_defaults(
     server_args: Any, source: str, resolve: Callable[[Any], Any]
 ) -> Any:
-    """Run a resolver that writes the fields directly, and declare what it moved.
+    """Run a resolver this tree does not own, and declare what it set.
 
-    Not a declaration channel -- the writer is not ours. Out-of-tree platform
-    plugins and registered speculative algorithms are handed the record and set
-    fields on it, an interface this tree does not own, so the write is observed
-    rather than requested. Every in-tree implementation declares properly and
-    this captures nothing for them.
+    Out-of-tree platform plugins and registered speculative algorithms are
+    handed a configuration and assign fields on it. That interface is not ours
+    to change, so the assignment stays the contract -- it just lands on a
+    stand-in instead of the record, and what it set is declared like any other
+    decision. Nothing writes the record, which is why there is no longer a
+    named hole in the seal.
 
     Returns whatever the resolver returned, so a provider with a return value
-    can go through the same capture.
+    goes through the same capture.
 
-    Out-of-tree platform plugins are handed the record and set fields on it.
-    Their implementations live outside this tree, so they cannot be converted
-    by editing the resolver; and the raw snapshot is taken before the pipeline
-    starts, so a plugin's default is neither declared nor raw. The write itself
-    stays: this captures it into the stash so the projection and the bags carry
-    it, but reverting the field would break the plugin's own reads of what it
-    just set. It is the only field a record still carries from resolution.
-
-    Rebinding is what the diff sees, and rebinding is all it needs to see: a
-    plugin that mutates a value in place reaches the projection anyway, because
-    the raw snapshot and the stash entries hold the same object it mutated.
+    Non-field names are dropped: a plugin scribbling on an attribute that is
+    not configuration is not a decision, and it was invisible to the previous
+    diff for the same reason.
 
     A stand-in record (tests drive the hooks with a plain namespace) has no
-    fields to diff and no projection to feed, so the resolver runs uncaptured.
+    view to read, so the resolver runs against it directly and uncaptured.
     """
     if not dataclasses.is_dataclass(server_args):
         return resolve(server_args)
-    before = {
-        field.name: getattr(server_args, field.name)
-        for field in dataclasses.fields(server_args)
+    recorder = _ForeignDefaults(server_args)
+    result = resolve(recorder)
+    written = {
+        name: value
+        for name, value in object.__getattribute__(recorder, "_written").items()
+        if name in field_names(type(server_args))
     }
-    already = len(getattr(server_args, "_resolved_overrides", None) or ())
-    # The one place the input seal comes off. The plugin writes the record;
-    # the diff below captures what it moved into the stash so the projection
-    # and the bags carry it.
-    from sglang.srt.server_args import record_writable
-
-    with record_writable(server_args):
-        result = resolve(server_args)
-    # A resolver reached this way can also declare properly -- the in-tree
-    # implementations of these hooks do. Those fields are already explained, and
-    # recording them again would attribute them to the wrapper and bury an
-    # actual direct write among the echoes.
-    stash = getattr(server_args, "_resolved_overrides", None) or ()
-    declared = {name for _source, fields in stash[already:] for name in fields}
-    changed = {
-        name: getattr(server_args, name)
-        for name, previous in before.items()
-        if name not in declared and getattr(server_args, name) is not previous
-    }
-    if changed:
-        declare_resolution(server_args, source, **changed)
+    if written:
+        declare_resolution(server_args, source, **written)
     return result
 
 

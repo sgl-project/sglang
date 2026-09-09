@@ -40,7 +40,6 @@ import functools
 import logging
 import tempfile
 import uuid
-from contextlib import contextmanager
 from typing import Any, NoReturn
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
@@ -270,9 +269,8 @@ class ServerArgs:
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
         # Sealed for the duration, not just afterwards: everything below this
-        # line reads the input and declares against it, and the one channel
-        # that still writes the record (`capture_foreign_writes`, for
-        # out-of-tree platform plugins) asks for the seal to be lifted by name.
+        # line reads the input and declares against it. No exceptions -- even a
+        # resolver from outside this tree assigns onto a stand-in, not here.
         self._input_frozen = True
         try:
             run_resolution_pipeline(self)
@@ -631,27 +629,6 @@ def get_global_server_args() -> NoReturn:
         "(sglang.srt.runtime_context). For the operator's raw input, which is a "
         "different question, `get_server_args()` still answers it."
     )
-
-
-@contextmanager
-def record_writable(server_args: Any):
-    """Lift the input seal for a resolver that genuinely writes the record.
-
-    There is exactly one: `capture_foreign_writes`, which hands the record to an
-    out-of-tree platform plugin that sets fields on it. Those implementations
-    live outside this tree and cannot be converted by editing a resolver here,
-    so the write stays and is captured into the stash afterwards. Naming the
-    exception is the point -- an in-tree resolver that reaches for this is
-    doing something it should be declaring instead.
-    """
-    frozen = getattr(server_args, "_input_frozen", False)
-    if frozen:
-        object.__setattr__(server_args, "_input_frozen", False)
-    try:
-        yield
-    finally:
-        if frozen:
-            object.__setattr__(server_args, "_input_frozen", True)
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:

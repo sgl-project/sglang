@@ -693,11 +693,13 @@ class TestResolutionDeclarations(CustomTestCase):
                 server_args.attention_backend = "triton"
                 server_args.schedule_conservativeness = 0.5
 
-        from sglang.srt.arg_groups import pipeline as pipeline_module
+        from sglang.srt import platforms as platforms_module
 
-        # The write capture runs in the dispatcher, so that is the namespace the
-        # plugin has to be installed in.
-        with unittest.mock.patch.object(pipeline_module, "current_platform", _Plugin()):
+        # `handle_platform_defaults` imports `current_platform` when it runs, so
+        # the platform module is the namespace to install the plugin in.
+        with unittest.mock.patch.object(
+            platforms_module, "current_platform", _Plugin()
+        ):
             server_args = self._resolve({})
         self.assertEqual(
             (
@@ -736,7 +738,7 @@ class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
 
         The property is about the stash, so the seam is the stash: a list that
         snapshots on append. Every declaration path -- `declare_resolution`,
-        `declare_resolution`, `capture_foreign_writes` and the passes --
+        `declare_resolution`, `record_foreign_defaults` and the passes --
         reaches it through `.append`, whatever it was imported as.
         """
         recorded = []
