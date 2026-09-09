@@ -359,6 +359,7 @@ def _fake_fp8_per_channel_scale_moe(
 
 def _fake_fp8_per_channel_scale_routed_moe(
     topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
@@ -473,7 +474,13 @@ def trtllm_fp8_per_channel_scale_moe_wrapper(
     activation_type: Optional[int] = None,
     norm_topk_prob: bool = True,
 ) -> torch.Tensor:
-    from flashinfer.fused_moe import trtllm_fp8_per_channel_scale_moe
+    try:
+        from flashinfer.fused_moe import trtllm_fp8_per_channel_scale_moe
+    except ImportError as e:
+        raise ImportError(
+            "Can't import trtllm_fp8_per_channel_scale_moe from flashinfer. "
+            "Please check flashinfer version."
+        ) from e
 
     kwargs = _fp8_per_channel_kwargs(
         routing_bias=routing_bias,
@@ -510,6 +517,7 @@ def trtllm_fp8_per_channel_scale_moe_wrapper(
 @register_custom_op(fake_impl=_fake_fp8_per_channel_scale_routed_moe)
 def trtllm_fp8_per_channel_scale_routed_moe_wrapper(
     topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
@@ -534,7 +542,23 @@ def trtllm_fp8_per_channel_scale_routed_moe_wrapper(
     tune_max_num_tokens: int = 8192,
     activation_type: Optional[int] = None,
 ) -> torch.Tensor:
-    from flashinfer.fused_moe import trtllm_fp8_per_channel_scale_routed_moe
+    try:
+        from flashinfer.fused_moe import trtllm_fp8_per_channel_scale_routed_moe
+    except ImportError as e:
+        raise ImportError(
+            "Can't import trtllm_fp8_per_channel_scale_routed_moe from flashinfer. "
+            "Please check flashinfer version."
+        ) from e
+
+    if topk_weights is not None:
+        # FlashInfer's per-channel routed entry point currently accepts only
+        # PackedScoreIdx routing, while SGLang's shared routed abstraction now
+        # preserves separate ids/weights when available.
+        from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import (
+            fused_pack_topk,
+        )
+
+        topk_ids = fused_pack_topk(topk_ids, topk_weights)
 
     kwargs = _fp8_per_channel_kwargs(
         routing_bias=routing_bias,

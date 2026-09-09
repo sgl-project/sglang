@@ -35,7 +35,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
-from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_flashinfer_available,
     next_power_of_2,
@@ -387,26 +387,6 @@ def align_fp8_per_channel_moe_weights_for_flashinfer_trtllm(
             .reshape(num_experts, gate_up_dim)
         )
 
-    min_alignment = 16 if is_gated else 128
-    padded_intermediate = round_up_to_multiple(intermediate_size, min_alignment)
-    if padded_intermediate != intermediate_size:
-        pad = padded_intermediate - intermediate_size
-        if is_gated:
-            w13_halves = w13_weight.reshape(
-                num_experts, 2, intermediate_size, hidden_size
-            )
-            scale_halves = w13_scale.reshape(num_experts, 2, intermediate_size)
-            w13_weight = torch.nn.functional.pad(w13_halves, (0, 0, 0, pad)).reshape(
-                num_experts, 2 * padded_intermediate, hidden_size
-            )
-            w13_scale = torch.nn.functional.pad(
-                scale_halves, (0, pad), value=1.0
-            ).reshape(num_experts, 2 * padded_intermediate)
-        else:
-            w13_weight = torch.nn.functional.pad(w13_weight, (0, 0, 0, pad))
-            w13_scale = torch.nn.functional.pad(w13_scale, (0, pad), value=1.0)
-        w2_weight = torch.nn.functional.pad(w2_weight, (0, pad))
-
     if is_gated:
         w13_weight = torch.stack(
             [reorder_rows_for_gated_act_gemm(weight) for weight in w13_weight]
@@ -432,14 +412,32 @@ def align_fp8_per_channel_moe_weights_for_flashinfer_trtllm(
 
     copy_or_rebind_param(layer, "w13_weight", w13_weight)
     copy_or_rebind_param(layer, "w2_weight", w2_weight)
-    copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
-    copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
 
+    # Keep the loader-owned [E, M, 1] scale Parameters in their canonical
+    # checkpoint layout. Weight reload writes into those Parameters and reruns
+    # this hook, so replacing them with the kernel's shuffled [E, M] layout
+    # would violate the loader contract. Bind the transformed scales under
+    # derived names, following the other post-load layout conversions.
+    alias_or_bind_derived_param(
+        layer,
+        "w13_weight_scale",
+        "w13_per_channel_weight_scale",
+        w13_scale,
+    )
+    alias_or_bind_derived_param(
+        layer,
+        "w2_weight_scale",
+        "w2_per_channel_weight_scale",
+        w2_scale,
+    )
+
+    # FlashInfer's reference formulation permits an arbitrary intermediate
+    # global scale c. Compressed-tensors stores direct dequantization scales, so
+    # choosing c=1 makes all three per-expert output factors unity.
     unit_scale = torch.ones(num_experts, dtype=torch.float32, device=w13_weight.device)
     copy_or_rebind_param(layer, "output1_scales_scalar", unit_scale)
     copy_or_rebind_param(layer, "output1_scales_gate_scalar", unit_scale)
     copy_or_rebind_param(layer, "output2_scales_scalar", unit_scale)
-    layer.intermediate_size_per_partition = padded_intermediate
 
 
 def _align_mxfp8_moe_weights(
@@ -942,9 +940,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         )
         if use_routed_topk:
             assert runner_config.top_k is not None
-            packed_topk_ids = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
+            routing = _get_routing_for_flashinfer_routed(topk_output)
+            topk_ids, topk_weights = (
+                routing if isinstance(routing, tuple) else (routing, None)
+            )
             output = trtllm_fp8_per_channel_scale_routed_moe_wrapper(
-                topk_ids=packed_topk_ids,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
                 top_k=runner_config.top_k,
                 n_group=None,
                 topk_group=None,

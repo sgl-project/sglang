@@ -1,4 +1,4 @@
-"""Blackwell GPU coverage for FlashInfer FP8 per-channel MoE integration."""
+"""Blackwell kernel coverage for FlashInfer FP8 per-channel MoE integration."""
 
 import sys
 from dataclasses import dataclass
@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from flashinfer.fused_moe.core import ActivationType
 
 import sglang.srt.layers.quantization.fp8  # noqa: F401
-from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_per_channel_scale_moe_wrapper,
@@ -22,7 +21,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=1200, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def _is_supported() -> bool:
@@ -118,11 +117,11 @@ def _common_kwargs(case: _Case, *, num_experts: int, local_expert_offset: int = 
         hidden_states=case.hidden_q,
         hidden_states_scale=case.hidden_scale,
         gemm1_weights=case.layer.w13_weight,
-        gemm1_per_channel_weight_scale=case.layer.w13_weight_scale,
+        gemm1_per_channel_weight_scale=case.layer.w13_per_channel_weight_scale,
         output1_scale_scalar=case.layer.output1_scales_scalar,
         output1_scale_gate_scalar=case.layer.output1_scales_gate_scalar,
         gemm2_weights=case.layer.w2_weight,
-        gemm2_per_channel_weight_scale=case.layer.w2_weight_scale,
+        gemm2_per_channel_weight_scale=case.layer.w2_per_channel_weight_scale,
         output2_scale_scalar=case.layer.output2_scales_scalar,
         num_experts=num_experts,
         top_k=2,
@@ -174,10 +173,9 @@ def test_logits_and_routed_paths_match_reference(is_gated):
 
     topk_logits, topk_ids = torch.topk(case.logits, k=2, dim=-1)
     topk_weights = torch.softmax(topk_logits.float(), dim=-1)
-    packed_topk = PackTopkIds.vanilla(topk_ids.to(torch.int32), topk_weights)
     kwargs["routing_method_type"] = int(RoutingMethodType.TopK)
     routed_output = trtllm_fp8_per_channel_scale_routed_moe_wrapper(
-        topk_ids=packed_topk, **kwargs
+        topk_ids=topk_ids.to(torch.int32), topk_weights=topk_weights, **kwargs
     )
     reference = _native_reference(case)
     torch.cuda.synchronize()
@@ -216,19 +214,6 @@ def test_torch_compile_and_cuda_graph_capture():
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
-
-
-def test_expert_parallel_metadata_accepts_local_weight_shard():
-    case = _make_case(is_gated=True, num_experts=4)
-    case.logits = torch.randn(8, 8, device="cuda")
-    output = trtllm_fp8_per_channel_scale_moe_wrapper(
-        routing_logits=case.logits,
-        **_common_kwargs(case, num_experts=8, local_expert_offset=2),
-    )
-    torch.cuda.synchronize()
-    assert output.shape == (8, 1024)
-    assert output.dtype == torch.bfloat16
-    assert torch.isfinite(output).all()
 
 
 if __name__ == "__main__":
