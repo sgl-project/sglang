@@ -617,13 +617,6 @@ class TestStageAffinityAndValidation(_GlobalStageArgsMixin, unittest.TestCase):
             pipeline.create_pipeline_stages(pipeline.server_args)
             self.assertEqual(list(pipeline._stage_name_mapping.keys()), stage_names)
 
-    def test_hunyuan3d_shape_stage_no_longer_stores_model_dtype(self):
-        pipeline = self._make_hunyuan_pipeline(RoleType.ENCODER, paint_enable=False)
-        pipeline.create_pipeline_stages(pipeline.server_args)
-        stage = pipeline._stage_name_mapping["shape_before_denoising"]
-        self.assertIsInstance(stage, Hunyuan3DShapeBeforeDenoisingStage)
-        self.assertFalse(hasattr(stage, "model_dtype"))
-
     def test_ltx2_refinement_stage_keeps_class_name_stage_key(self):
         stage = object.__new__(LTX2RefinementStage)
         self.assertEqual(

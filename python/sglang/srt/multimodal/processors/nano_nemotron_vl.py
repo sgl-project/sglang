@@ -46,6 +46,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils.common import sample_video_frames
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             hf_config, "video_maintain_aspect_ratio", True
         )
 
-        self.max_model_len = getattr(server_args, "context_length", None) or 8192
+        self.max_model_len = get_model().context_length or 8192
 
         self.PLACEHOLDER = self.tokenizer.unk_token
         assert isinstance(self.PLACEHOLDER, str)

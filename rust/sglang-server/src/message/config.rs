@@ -15,6 +15,7 @@
 //! [`PreferredSamplingParams`] — are the only Python-facing code in this file;
 //! the rest is pure Rust.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -129,6 +130,8 @@ pub struct ServerArgs {
     /// Launch-time sampling defaults merged beneath per-request values and
     /// advertised by `/get_model_info`.
     pub preferred_sampling_params: Option<PreferredSamplingParams>,
+    /// Per-modality media-count limits from `--limit-mm-data-per-request`.
+    pub limit_mm_data_per_request: BTreeMap<String, usize>,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
@@ -172,6 +175,7 @@ impl ServerArgs {
         disaggregation_mode,
         model_config,
         preferred_sampling_params,
+        limit_mm_data_per_request,
         allow_auto_truncate,
         enable_return_hidden_states,
         num_reserved_tokens,
@@ -202,6 +206,7 @@ impl ServerArgs {
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
         preferred_sampling_params: Option<PreferredSamplingParams>,
+        limit_mm_data_per_request: BTreeMap<String, usize>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
@@ -230,6 +235,7 @@ impl ServerArgs {
             disaggregation_mode,
             model_config,
             preferred_sampling_params,
+            limit_mm_data_per_request,
             allow_auto_truncate,
             enable_return_hidden_states,
             num_reserved_tokens,
@@ -266,6 +272,7 @@ impl Default for ServerArgs {
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
             preferred_sampling_params: None,
+            limit_mm_data_per_request: BTreeMap::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,

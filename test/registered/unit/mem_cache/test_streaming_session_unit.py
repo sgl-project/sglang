@@ -99,6 +99,7 @@ class _FakeReq:
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.skip_lock_node_ids = {}
+        self.swa_branching_seqlen = None
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
@@ -263,6 +264,20 @@ def test_release_session_threads_mamba_skip_ids():
     params = inner.dec_lock_ref_params[0]
     assert params is not None
     assert params.skip_lock_node_ids.get(ComponentType.MAMBA) == {42}
+
+
+def test_session_slot_does_not_restore_swa_branching_seqlen():
+    req = _FakeReq("session-a", req_pool_idx=0, committed=4, allocated=4)
+    req.swa_branching_seqlen = 8
+
+    slot = SessionSlot()
+    slot.save_from_req(req, is_first=True)
+
+    next_req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
+    slot.restore_to_req(next_req)
+
+    assert req.swa_branching_seqlen is None
+    assert next_req.swa_branching_seqlen is None
 
 
 # Shrink tests removed: streaming sessions are append-only after the
