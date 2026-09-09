@@ -2853,7 +2853,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.lora_merge_mode,
             help=(
                 "How LoRA is applied: auto keeps static merge for regular weights "
-                "and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather; "
+                "and uses dynamic LoRA for quantized or FSDP-sharded weights; "
                 "merge always merges into base weights; dynamic always applies LoRA at forward time."
             ),
         )
