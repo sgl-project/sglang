@@ -104,7 +104,9 @@ def main():
         tiny_q[0, 0, 0] = 0
         tiny_candidates = obj.candidates.clone()
         tiny_candidates[0, 1] = 0
-        runner.bind(tiny_local, tiny_q, tiny_candidates, obj.coins, obj.final_coins, obj.idx)
+        runner.bind(
+            tiny_local, tiny_q, tiny_candidates, obj.coins, obj.final_coins, obj.idx
+        )
         compare(runner.run(), runner.baseline())
         result["tests"].append("subnormal_reference_probability")
         runner.bind(
