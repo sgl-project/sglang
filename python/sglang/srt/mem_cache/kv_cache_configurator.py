@@ -1528,13 +1528,6 @@ class KVCacheConfigurator:
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
-        if is_dsa_model:
-            logger.info(
-                "NPU DSA indexer layout: %s",
-                "compact physical indexer layout"
-                if indexer_layer_ids is not None
-                else "all-layer compatibility layout",
-            )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1556,6 +1549,17 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
+        if is_dsa_model:
+            logger.info(
+                "NPU DSA indexer layout: %s (%d/%d layers)",
+                (
+                    "compact"
+                    if token_to_kv_pool.num_indexer_layers < token_to_kv_pool.layer_num
+                    else "all-layer"
+                ),
+                token_to_kv_pool.num_indexer_layers,
+                token_to_kv_pool.layer_num,
+            )
         return token_to_kv_pool
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
