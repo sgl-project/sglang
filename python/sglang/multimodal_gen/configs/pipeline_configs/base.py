@@ -6,7 +6,7 @@ import math
 import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
-from enum import Enum, auto
+from enum import Enum
 from typing import Any, ClassVar
 
 import numpy as np
@@ -25,7 +25,7 @@ from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -44,71 +44,6 @@ from sglang.multimodal_gen.utils import (
 )
 
 logger = init_logger(__name__)
-
-
-# NOTE: possible duplication with DataType
-# this may focus on the model's original ability
-class ModelTaskType(Enum):
-    # TODO: check if I2V/TI2V models can work w/wo text
-
-    I2V = auto()  # Image to Video
-    T2V = auto()  # Text to Video
-    TI2V = auto()  # Text and Image to Video
-
-    T2I = auto()  # Text to Image
-    I2I = auto()  # Image to Image
-    TI2I = auto()  # Image to Image or Text-Image to Image
-    I2M = auto()  # Image to Mesh
-    VLA_ACTION = auto()  # Vision-language-action policy output
-
-    def is_image_gen(self) -> bool:
-        return (
-            self == ModelTaskType.T2I
-            or self == ModelTaskType.I2I
-            or self == ModelTaskType.TI2I
-        )
-
-    def is_action_gen(self) -> bool:
-        return self == ModelTaskType.VLA_ACTION
-
-    def is_mesh_gen(self) -> bool:
-        return self == ModelTaskType.I2M
-
-    def is_video_gen(self) -> bool:
-        return (
-            self == ModelTaskType.I2V
-            or self == ModelTaskType.T2V
-            or self == ModelTaskType.TI2V
-        )
-
-    def is_visual_gen(self) -> bool:
-        return self.is_image_gen() or self.is_video_gen()
-
-    def requires_image_input(self) -> bool:
-        return (
-            self == ModelTaskType.I2V
-            or self == ModelTaskType.I2I
-            or self == ModelTaskType.I2M
-        )
-
-    def accepts_image_input(self) -> bool:
-        return (
-            self == ModelTaskType.I2V
-            or self == ModelTaskType.I2I
-            or self == ModelTaskType.TI2I
-            or self == ModelTaskType.TI2V
-            or self == ModelTaskType.I2M
-            or self == ModelTaskType.VLA_ACTION
-        )
-
-    def data_type(self) -> DataType:
-        if self.is_action_gen():
-            return DataType.ACTION
-        if self.is_mesh_gen():
-            return DataType.MESH
-        if self.is_image_gen():
-            return DataType.IMAGE
-        return DataType.VIDEO
 
 
 class STA_Mode(str, Enum):
@@ -199,7 +134,9 @@ class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
     native_only_components: ClassVar[tuple[str, ...]] = ()
+    # Default task; supported_task_types is a model capability, not a user knob.
     task_type: ModelTaskType = ModelTaskType.I2I
+    supported_task_types: ClassVar[tuple[ModelTaskType, ...] | None] = None
     skip_input_image_preprocess: bool = False
     # False when changing component placement after a calibration request is
     # known to alter the pipeline's numerical path.
@@ -284,6 +221,91 @@ class PipelineConfig:
         # return the model-specific config for optimal deployment setting
         return ModelDeploymentConfig()
 
+    def get_supported_task_types(self) -> tuple[ModelTaskType, ...]:
+        """Return the tasks implemented by this configured pipeline.
+
+        Existing pipelines keep their single default task. Multi-task models
+        declare a tuple, or override this method for configuration-dependent
+        capabilities. Declaration alone does not add model execution paths.
+        """
+        default = ModelTaskType.parse(self.task_type)
+        declared = self.supported_task_types
+        if declared is None:
+            return (default,)
+        tasks = tuple(ModelTaskType.parse(task) for task in declared)
+        if not tasks or len(set(tasks)) != len(tasks) or default not in tasks:
+            raise ValueError(
+                "supported_task_types must be nonempty, unique, and include "
+                f"the default task_type {default.name}"
+            )
+        return tasks
+
+    def resolve_task_type(
+        self,
+        requested: ModelTaskType | str | None = None,
+        *,
+        data_type: DataType | None = None,
+        has_image: bool = False,
+        has_video: bool = False,
+    ) -> ModelTaskType:
+        """Resolve a request without changing shared pipeline configuration.
+
+        HTTP endpoints constrain the output type. Otherwise the default task
+        wins when its input contract fits. An ambiguous alternative requires
+        an explicit task_type; declaration order never selects a task.
+        """
+        supported = self.get_supported_task_types()
+        if requested is not None:
+            task = ModelTaskType.parse(requested)
+            if task not in supported:
+                raise ValueError(
+                    f"Unsupported task_type {task.name}; this pipeline supports "
+                    f"{[task.name for task in supported]}"
+                )
+            if data_type is not None and task.data_type() != data_type:
+                raise ValueError(
+                    f"task_type {task.name} produces {task.data_type().name}, "
+                    f"but this endpoint produces {data_type.name}"
+                )
+            return task
+
+        candidates = tuple(
+            task
+            for task in supported
+            if data_type is None or task.data_type() == data_type
+        )
+        if not candidates:
+            raise ValueError(
+                f"This pipeline does not support {data_type.name} output; "
+                f"supported task types: {[task.name for task in supported]}"
+            )
+        if len(candidates) == 1:
+            return candidates[0]
+
+        compatible = tuple(
+            task
+            for task in candidates
+            if (not has_image or task.accepts_image_input())
+            and (not task.requires_image_input() or has_image)
+            and (not has_video or task.accepts_video_input())
+            and (not task.requires_video_input() or has_video)
+        )
+        default = ModelTaskType.parse(self.task_type)
+        if default in compatible:
+            return default
+        if data_type is None:
+            same_output = tuple(
+                task for task in compatible if task.data_type() == default.data_type()
+            )
+            compatible = same_output or compatible
+        if len(compatible) == 1:
+            return compatible[0]
+        raise ValueError(
+            "Specify task_type for this request; compatible tasks: "
+            f"{[task.name for task in compatible]}, "
+            f"supported tasks: {[task.name for task in candidates]}"
+        )
+
     def validate_server_args(self, server_args: Any) -> None:
         """Validate model-owned constraints after server args are normalized."""
 
@@ -292,7 +314,7 @@ class PipelineConfig:
     def supports_action_endpoint(self) -> bool:
         """Whether this pipeline exposes the generic action generation API."""
 
-        return self.task_type.is_action_gen()
+        return any(task.is_action_gen() for task in self.get_supported_task_types())
 
     def supports_openpi_endpoint(self) -> bool:
         """Whether this pipeline implements the OpenPI policy websocket."""
@@ -424,7 +446,10 @@ class PipelineConfig:
 
         The scheduler still checks each request before merging it into a batch.
         """
-        return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
+        return all(
+            task in (ModelTaskType.T2I, ModelTaskType.T2V)
+            for task in self.get_supported_task_types()
+        )
 
     def supports_disaggregation(self) -> bool:
         """Return whether multi-service disaggregated deployment is supported."""
@@ -1133,6 +1158,8 @@ class PipelineConfig:
         return pipeline_config
 
     def check_pipeline_config(self) -> None:
+        self.task_type = ModelTaskType.parse(self.task_type)
+        self.get_supported_task_types()
         if self.vae_sp and not self.vae_tiling:
             raise ValueError(
                 "Currently enabling vae_sp requires enabling vae_tiling, please set --vae-tiling to True."
@@ -1200,9 +1227,9 @@ class PipelineConfig:
                 elif isinstance(current_value, tuple) and all(
                     isinstance(v, ModelConfig) for v in current_value
                 ):
-                    assert len(current_value) == len(new_value), (
-                        "Users shouldn't delete or add text encoder config objects in your json"
-                    )
+                    assert len(current_value) == len(
+                        new_value
+                    ), "Users shouldn't delete or add text encoder config objects in your json"
                     for target_config, source_config in zip(
                         current_value, new_value, strict=True
                     ):

@@ -25,6 +25,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
@@ -279,6 +280,8 @@ async def generations(
         sampling = build_sampling_params(
             request_id,
             prompt=request.prompt,
+            task_type=request.task_type,
+            request_data_type=DataType.IMAGE,
             size=request.size,
             width=request.width,
             height=request.height,
@@ -406,6 +409,7 @@ async def edits(
     prompt: str = Form(...),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
+    task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     response_format: Optional[str] = Form(None),
     size: Optional[str] = Form(None),
@@ -467,6 +471,8 @@ async def edits(
         sampling = build_sampling_params(
             request_id,
             prompt=prompt,
+            task_type=task_type,
+            request_data_type=DataType.IMAGE,
             size=size,
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",

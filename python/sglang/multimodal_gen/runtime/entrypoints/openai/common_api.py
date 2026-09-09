@@ -41,6 +41,7 @@ class DiffusionModelCard(ModelCard):
 
     num_gpus: Optional[int] = None
     task_type: Optional[str] = None
+    supported_task_types: list[str] | None = None
     dit_precision: Optional[str] = None
     vae_precision: Optional[str] = None
     pipeline_name: Optional[str] = None
@@ -60,6 +61,9 @@ def _build_model_card(
         "root": served_model_name,
         "num_gpus": server_args.num_gpus,
         "task_type": server_args.pipeline_config.task_type.name,
+        "supported_task_types": [
+            task.name for task in server_args.pipeline_config.get_supported_task_types()
+        ],
         "dit_precision": server_args.pipeline_config.dit_precision,
         "vae_precision": server_args.pipeline_config.vae_precision,
     }

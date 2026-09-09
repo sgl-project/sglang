@@ -530,3 +530,65 @@ Common failure points:
 - [ ] Verified image or video quality against a reference output.
 - [ ] Completed the distributed and memory integration checks above.
 - [ ] Tested CFG parallelism and distributed serving paths when they apply.
+
+
+## Declare multiple task types
+
+Keep `PipelineConfig.task_type` as the default task. To let one configured
+pipeline serve several tasks, declare its capabilities as a class variable:
+
+```python
+from dataclasses import dataclass
+from typing import ClassVar
+
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
+
+
+@dataclass
+class MultiTaskPipelineConfig(PipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.T2V
+    supported_task_types: ClassVar[tuple[ModelTaskType, ...]] = (
+        ModelTaskType.T2I,
+        ModelTaskType.I2I,
+        ModelTaskType.T2V,
+        ModelTaskType.I2V,
+    )
+```
+
+The declaration must be nonempty, contain no duplicates, and include the
+configured default. Existing pipelines that omit it retain the singleton
+`(task_type,)`. Override `get_supported_task_types()` if capabilities depend
+on the loaded checkpoint or configuration, preserving these invariants.
+Capabilities describe implemented execution paths; declaring a task does not
+load additional components or implement conditioning and decoding for it.
+
+Requests carry `SamplingParams.task_type`, accepting an enum or its name
+(case-insensitive). Admission resolves it to an enum and derives the output
+`data_type`. Explicit tasks must belong to the supported set and match the
+HTTP endpoint's output type. Without an explicit task, admission filters by
+output type and conditioning inputs, prefers a compatible default, then
+selects a unique compatible alternative. Python/CLI requests also prefer the
+default's output type among alternatives. Ambiguous requests must specify
+`task_type`. No request changes the shared configuration.
+
+Use the admitted `batch.task_type` in model stages when behavior depends on
+the request. Shared stages use `get_request_task_type(batch, pipeline_config)`
+to preserve compatibility with direct callers that have no resolved task.
+Audit model-specific frame adjustment, reference loading, latent construction,
+and decoding for assumptions about the server default. Declare the union of
+components used by all supported tasks in stage residency metadata. Synthetic
+warmup uses the default task; provide the pipeline's warmup hook when that task
+needs model-specific reference inputs. Dynamic batching compares the admitted
+task along with the other sampling fields.
+
+`I2I` and `I2V` require image input; `T2I` and `T2V` reject it. Existing `TI2I`
+and `TI2V` retain optional image conditioning. `V2V` and `F2V` require video
+input; `F2V` denotes video-prefix conditioning. Models own the details of
+prefix length and temporal alignment. Pipelines with explicit capabilities
+reject video input for tasks that do not accept it; legacy singleton pipelines
+retain their model-owned video checks.
+
+See [request task selection](/docs/sglang-diffusion/api/openai_api#select-a-request-task)
+for the HTTP interface. Test task selection, invalid inputs, discovery,
+serialization, batching, and alternating tasks on one running server.

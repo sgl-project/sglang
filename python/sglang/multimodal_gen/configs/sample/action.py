@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     _sanitize_filename,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ class ActionSamplingParams:
     """Sampling parameters for policies that generate continuous actions."""
 
     data_type: DataType = DataType.ACTION
+    task_type: ModelTaskType = ModelTaskType.VLA_ACTION
     request_id: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     prompt: str | list[str] | None = field(
         default="", metadata={"batch_sig_exclude": True}
@@ -118,13 +120,15 @@ class ActionSamplingParams:
             )
 
     def _validate_with_pipeline_config(self, pipeline_config):
-        if not pipeline_config.task_type.is_action_gen():
+        task_type = pipeline_config.resolve_task_type(self.task_type)
+        if not task_type.is_action_gen():
             raise ValueError(
-                f"ActionSamplingParams requires an ACTION pipeline, got {pipeline_config.task_type.name}"
+                f"ActionSamplingParams requires an ACTION pipeline, got {task_type.name}"
             )
 
     def _adjust(self, server_args: "ServerArgs"):
         expand_path_fields(self)
+        self._validate_with_pipeline_config(server_args.pipeline_config)
         self.data_type = DataType.ACTION
         self.return_file_paths_only = False
         if self.output_path is None and server_args.output_path is not None:

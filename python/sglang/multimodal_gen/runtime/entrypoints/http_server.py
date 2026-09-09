@@ -182,6 +182,9 @@ async def get_models(request: Request):
         "model_path": server_args.model_path,
         "num_gpus": server_args.num_gpus,
         "task_type": server_args.pipeline_config.task_type.name,
+        "supported_task_types": [
+            task.name for task in server_args.pipeline_config.get_supported_task_types()
+        ],
         "dit_precision": server_args.pipeline_config.dit_precision,
         "vae_precision": server_args.pipeline_config.vae_precision,
         "vae_decode_precision": server_args.pipeline_config.vae_decode_precision,
@@ -223,6 +226,7 @@ async def model_info_endpoint(request: Request):
 
     server_args: ServerArgs = request.app.state.server_args
     task_type = server_args.pipeline_config.task_type
+    supported_tasks = server_args.pipeline_config.get_supported_task_types()
 
     try:
         registry_info = get_model_info(
@@ -243,10 +247,14 @@ async def model_info_endpoint(request: Request):
             [registry_info.pipeline_cls.__name__] if registry_info else None
         ),
         # Fields matching the LLM engine's /model_info shape
-        "has_image_understanding": task_type.accepts_image_input(),
+        "has_image_understanding": any(
+            task.accepts_image_input() for task in supported_tasks
+        ),
         "has_audio_understanding": False,
         # Diffusion-specific fields
         "task_type": task_type.name,
+        "supported_task_types": [task.name for task in supported_tasks],
+        "output_types": sorted({task.data_type().name for task in supported_tasks}),
         "is_image_gen": task_type.is_image_gen(),
     }
 
