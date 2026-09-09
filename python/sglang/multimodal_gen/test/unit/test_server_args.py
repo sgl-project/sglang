@@ -17,6 +17,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2PipelineConfig,
+    FluxPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.helios import (
     HeliosDistilledConfig,
 )
@@ -60,6 +64,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V720PConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
 from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
@@ -819,6 +824,48 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa.warmup_resolutions = None
         sa.bcg_text_buckets = None
         sa._validate_breakable_cuda_graph()  # must not raise
+
+    def test_flux_bcg_resolves_hub_and_local_checkpoint_warmup(self):
+        for model_path, model_id in (
+            ("black-forest-labs/FLUX.1-dev", None),
+            ("/models/FLUX.1-dev", None),
+            ("/cache/models--black-forest-labs--FLUX.1-dev/snapshots/revision", None),
+            ("/models/pinned-checkpoint", "black-forest-labs/FLUX.1-dev"),
+        ):
+            with self.subTest(model_path=model_path, model_id=model_id):
+                sa = ServerArgs.__new__(ServerArgs)
+                sa.model_path = model_path
+                sa.model_id = model_id
+                sa.pipeline_class_name = "FluxPipeline"
+                sa.pipeline_config = FluxPipelineConfig()
+                sa.enable_breakable_cuda_graph = True
+                # Resolve native sampling defaults without loading checkpoint
+                # metadata for the synthetic local paths in this unit test.
+                with patch(
+                    "sglang.multimodal_gen.runtime.warmup_request_builder."
+                    "get_model_sampling_defaults",
+                    return_value=FluxSamplingParams(),
+                ):
+                    sa._adjust_breakable_cuda_graph_support()
+                sa._adjust_warmup()
+
+                self.assertTrue(sa.enable_breakable_cuda_graph)
+                self.assertEqual(sa.warmup_resolutions, ["1024x1024"])
+                self.assertEqual(sa.warmup_mode, "server")
+
+    def test_flux_bcg_requires_both_supported_checkpoint_and_pipeline(self):
+        for model_path, config in (
+            ("black-forest-labs/FLUX.2-dev", Flux2PipelineConfig()),
+            ("black-forest-labs/FLUX.1-schnell", FluxPipelineConfig()),
+            ("black-forest-labs/FLUX.1-dev", Flux2PipelineConfig()),
+        ):
+            with self.subTest(model_path=model_path, config=type(config).__name__):
+                sa = ServerArgs.__new__(ServerArgs)
+                sa.model_path = model_path
+                sa.pipeline_config = config
+                sa.enable_breakable_cuda_graph = True
+                sa._adjust_breakable_cuda_graph_support()
+                self.assertFalse(sa.enable_breakable_cuda_graph)
 
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
