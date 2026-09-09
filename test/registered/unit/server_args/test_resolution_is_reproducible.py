@@ -27,12 +27,15 @@ import copy
 import dataclasses
 import json
 import os
+import pathlib
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 
 import torch
 
+from sglang.srt.arg_groups.overrides import model_config_of, resolution_result
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda
@@ -43,13 +46,13 @@ from sglang.test.ci.ci_register import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=104, suite="base-a-test-cpu")
 # Also on a GPU runner: the resolution branches that matter most (backend
 # defaults, DeepSeek handlers, capability gates) go through `is_cuda()` /
 # `is_hip()` / device capability, which inspect the actual hardware -- passing
 # device="cuda" on a CPU box does not reach them, so a leak confined to a GPU
 # handler would never fail the CPU registration alone.
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=78, stage="base-b", runner_config="1-gpu-small")
 # ROCm too: `is_hip()` gates its own set of backend and DeepSeek handlers, which
 # neither the CPU suite nor a CUDA runner reaches.
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
@@ -187,13 +190,13 @@ _STICKY_ACROSS_RESOLUTIONS = frozenset({"mm_feature_transport"})
 _NOT_COMPARABLE = frozenset({"random_seed"})
 
 
-class TestResolutionIsReproducible(CustomTestCase):
-    def _config_dir(self, config: dict = None) -> str:
-        config_dir = tempfile.mkdtemp(prefix="resolution_repro_")
-        self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
-        with open(os.path.join(config_dir, "config.json"), "w") as handle:
-            json.dump(config or _MINI_CONFIG, handle)
-        return config_dir
+class _RestoresProcessState:
+    """Resolution leaves process state behind, so a case that resolves has to
+    put it back. `_handle_multimodal_feature_transport` sets
+    `SGLANG_USE_CUDA_IPC_TRANSPORT` and the same handler reads `is_set()` on the
+    way in, so one resolution is visible to the next one in this process -- and
+    `TestMultimodalFeatureTransport` is the case that notices.
+    """
 
     def _process_state(self):
         """What a resolution may leave behind: the environment and the
@@ -236,13 +239,24 @@ class TestResolutionIsReproducible(CustomTestCase):
         # to catch, turned into a pass.
         unittest.TestCase._callTestMethod(self, method)
 
+
+class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
+    def _config_dir(self, config: dict = None) -> str:
+        config_dir = tempfile.mkdtemp(prefix="resolution_repro_")
+        self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as handle:
+            json.dump(config or _MINI_CONFIG, handle)
+        return config_dir
+
     def _resolved(self, model_path: str, **kwargs) -> ServerArgs:
         # device="cuda" keeps the golden path host-independent: an
         # accelerator-less runner resolves only the base platform, where
         # get_device() raises.
         kwargs.setdefault("device", "cuda")
         kwargs.setdefault("random_seed", 42)
-        return ServerArgs(model_path=model_path, **kwargs)
+        server_args = ServerArgs(model_path=model_path, **kwargs)
+        server_args.resolve_once()
+        return server_args
 
     def _comparable(self, server_args: ServerArgs) -> dict:
         """The dataclass fields, and only those.
@@ -256,7 +270,10 @@ class TestResolutionIsReproducible(CustomTestCase):
         for field in dataclasses.fields(server_args):
             if field.name in _NOT_COMPARABLE:
                 continue
-            value = getattr(server_args, field.name)
+            # The resolution result, not the field: a declaration-only resolver
+            # never writes the field, so comparing fields would miss exactly
+            # the decisions a leak would shift.
+            value = resolution_result(server_args, field.name)
             # Nested dataclasses (cuda_graph_config) compare structurally, and
             # everything else is deep-copied: a snapshot that stored the live
             # list/dict would follow an in-place mutation, which is exactly the
@@ -368,10 +385,13 @@ class TestResolutionIsReproducible(CustomTestCase):
                 # differs from the cpu that `default_before` resolved to.
                 expected = (
                     "cuda_ipc"
-                    if intermediate.mm_feature_transport == "cuda_ipc"
+                    if resolution_result(intermediate, "mm_feature_transport")
+                    == "cuda_ipc"
                     else "cpu"
                 )
-                self.assertEqual(after.mm_feature_transport, expected)
+                self.assertEqual(
+                    resolution_result(after, "mm_feature_transport"), expected
+                )
 
     def test_resolving_a_sibling_leaves_the_first_alone(self):
         for label, config, kwargs in _SHAPES:
@@ -384,6 +404,64 @@ class TestResolutionIsReproducible(CustomTestCase):
                     model_path, tp_size=2, chunked_prefill_size=1024, **kwargs
                 )
                 self.assertEqual(self._comparable(first), snapshot)
+
+    def test_the_gate_refuses_a_second_resolution(self):
+        """A record that has been resolved is left exactly as it was.
+
+        Every publishing process calls the gate, and in a child the record
+        arrived already resolved -- so this is the property that keeps the
+        child agreeing with the parent. The handlers are not written to survive
+        a second pass over their own output (the DP-attention step derives the
+        chunked prefill size *from* the chunked prefill size), which is why the
+        gate refuses rather than re-deriving.
+        """
+        for label, config, kwargs in _SHAPES:
+            with self.subTest(shape=label):
+                self._restore_process_state(self._pristine_state)
+                model_path = self._config_dir(config)
+                resolved = self._resolved(model_path, **kwargs)
+                snapshot = self._comparable(resolved)
+                declarations = list(getattr(resolved, "_resolved_overrides", []))
+                resolved.resolve_once()
+                self.assertEqual(self._comparable(resolved), snapshot)
+                self.assertEqual(
+                    list(getattr(resolved, "_resolved_overrides", [])), declarations
+                )
+
+    def test_the_gate_closes_on_the_dummy_path_too(self):
+        """The dummy model leaves the pipeline early, and the gate still shuts.
+
+        That exit is above the materialization the gate reads, so a dummy
+        record answered "not resolved yet" forever and every publish of one ran
+        the handlers again. Nothing about the early exit makes a second pass
+        safe -- the handlers above it declare and apply like any other -- and
+        the four that do run happening to be idempotent today is what the gate
+        exists to stop depending on. So this counts entries rather than
+        comparing values: the values agree either way.
+        """
+        self._restore_process_state(self._pristine_state)
+        record = ServerArgs(model_path="dummy")
+        record.resolve_once()
+
+        entries = []
+        from sglang.srt.arg_groups import pipeline as pipeline_module
+
+        original = pipeline_module.run_resolution_pipeline
+
+        def counted(server_args):
+            entries.append(1)
+            return original(server_args)
+
+        with unittest.mock.patch.object(
+            pipeline_module, "run_resolution_pipeline", counted
+        ):
+            record.resolve_once()
+        self.assertEqual(
+            entries,
+            [],
+            "a resolved dummy record entered the pipeline again, so every "
+            "publish of one re-runs the handlers",
+        )
 
     def test_the_declaration_provenance_is_reproducible(self):
         model_path = self._config_dir()
@@ -402,58 +480,180 @@ class TestResolutionIsReproducible(CustomTestCase):
         self.assertEqual(getattr(first, "_resolved_overrides", None), first_provenance)
 
 
-class TestTheResolutionSeamHasOneCaller(CustomTestCase):
-    """The pipeline is entered from exactly one place.
-
-    Step 12 moves the call from ``__post_init__`` to ``publish`` so the record
-    stays raw; that is a one-line move only while the seam has a single caller.
-    A second entry point would also mean resolution could run twice on one
-    instance, which the strict ``__setattr__`` guard turns into an
-    ``AttributeError`` rather than a silent re-resolve.
+class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
+    """A resolved record copied with `dataclasses.replace` loses what makes it
+    resolved, and the next publish resolves it a second time -- over values it
+    already decided. The Ray paths copy a resolved record to set
+    `dist_init_addr`, which is how they reach this.
     """
 
-    def test_only_post_init_runs_the_pipeline(self):
-        import ast
-        from pathlib import Path
+    def _resolved(self):
+        config_dir = tempfile.mkdtemp(prefix="replace_resolved_")
+        self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as handle:
+            json.dump(_MINI_CONFIG, handle)
+        # Two steps that are not repeatable on their own output.
+        server_args = ServerArgs(
+            model_path=config_dir,
+            device="cuda",
+            dp_size=2,
+            tp_size=2,
+            enable_dp_attention=True,
+            random_seed=42,
+        )
+        server_args.resolve_once()
+        return server_args
+
+    def test_a_bare_replace_resolves_again_and_lands_in_the_same_place(self):
+        """A bare copy resolves to the same place: the fields are the raw input.
+
+        `dataclasses.replace` copies the fields, so a bare copy re-runs
+        resolution over the *same input* the parent got -- the DP-attention
+        halving and the conservativeness scaling apply once. `replace_resolved`
+        buys something else: it carries the parent's declarations and its
+        `model_config`, so the copy answers without resolving at all.
+        """
+        parent = self._resolved()
+        bare = dataclasses.replace(parent, dist_init_addr="1.2.3.4:5000")
+        self.assertFalse(
+            getattr(bare, "_resolution_finished", False),
+            "a bare replace carried the flag; then this test proves nothing",
+        )
+        bare.resolve_once()
+        drifted = {
+            field.name: (
+                resolution_result(parent, field.name),
+                resolution_result(bare, field.name),
+            )
+            for field in dataclasses.fields(parent)
+            if field.name not in ("dist_init_addr", "random_seed")
+            and repr(resolution_result(parent, field.name))
+            != repr(resolution_result(bare, field.name))
+        }
+        self.assertEqual(
+            drifted,
+            {},
+            "resolving a bare copy landed somewhere else, so the pipeline is "
+            "reading its own output again",
+        )
+
+    def test_replace_resolved_keeps_the_parents_resolution(self):
+        parent = self._resolved()
+        copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
+        self.assertTrue(getattr(copy_, "_resolution_finished", False))
+        drifted = {
+            field.name: (getattr(parent, field.name), getattr(copy_, field.name))
+            for field in dataclasses.fields(parent)
+            if field.name != "dist_init_addr"
+            and getattr(parent, field.name) != getattr(copy_, field.name)
+        }
+        self.assertEqual(
+            drifted,
+            {},
+            f"the copy differs from its parent beyond the change: {drifted}",
+        )
+        self.assertEqual(copy_.dist_init_addr, "1.2.3.4:5000")
+
+    def test_the_copy_carries_what_resolution_left_on_the_record(self):
+        """Not just the stash and the flag.
+
+        `model_config_of()` memoizes on the record, and that cache is filled
+        during resolution. A copy that is marked resolved but arrives without it
+        cannot fill it -- the read-only guard refuses the cache write -- so the
+        first `model_config_of()` raises. That is what killed the Ray
+        schedulers, and it is why the carry is enumerated from the instance
+        rather than from a list of names.
+        """
+        parent = self._resolved()
+        copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
+        fields = {field.name for field in dataclasses.fields(parent)}
+        missing = sorted(
+            name
+            for name in vars(parent)
+            if name not in fields and name not in vars(copy_)
+        )
+        self.assertEqual(
+            missing,
+            [],
+            f"the copy did not carry what resolution left on the record: {missing}",
+        )
+        self.assertIsNotNone(model_config_of(copy_))
+        # Containers are copied, so the copy's declaration stays with it.
+        self.assertEqual(
+            len(parent._resolved_overrides) + 1, len(copy_._resolved_overrides)
+        )
+
+    def test_the_change_reaches_the_bags(self):
+        """The projection reads the raw snapshot plus the declarations, so a
+        change the copy only wrote to the field would publish the parent's raw
+        value."""
+        from sglang.srt.runtime_context import (
+            get_parallel,
+            get_schedule,
+            publish,
+            reset_context,
+        )
+
+        parent = self._resolved()
+        copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
+        self.addCleanup(reset_context)
+        reset_context()
+        publish(copy_, role="scheduler")
+        self.assertEqual(get_parallel().dist_init_addr, "1.2.3.4:5000")
+        self.assertEqual(
+            get_schedule().chunked_prefill_size,
+            resolution_result(parent, "chunked_prefill_size"),
+            "publishing the copy re-ran resolution; the bag disagrees with what "
+            "the parent's resolution decided",
+        )
+
+
+class TestResolutionStaysLazy(CustomTestCase):
+    """Resolving a dummy model must not load the families it never reaches.
+
+    The forwarding slots imported their hook only when the step ran, so a
+    `ServerArgs(model_path="dummy")` resolution touched four hook modules. With
+    the slots gone the imports are function-local for the same reason, and a
+    module-level one costs every caller of the dummy boundary -- which is every
+    `override_server_args` in the test suite.
+    """
+
+    def test_a_dummy_resolution_loads_only_what_it_reaches(self):
+        """The same claim measured, in an interpreter of its own.
+
+        In-process this would be vacuous: another test that resolved a real
+        model has already imported the late families, and the `sys.modules`
+        diff comes back empty.
+        """
+        import subprocess
+        import sys
 
         import sglang
 
-        package_root = Path(next(iter(sglang.__path__)))
-        callers = []
-        for path in sorted(package_root.rglob("*.py")):
-            try:
-                tree = ast.parse(path.read_text())
-            except SyntaxError:
-                continue
-            # The full (class, function, ...) scope chain, so the assertion can
-            # say "the one caller is ServerArgs.__post_init__" -- not merely
-            # that nothing outside a function named __post_init__ calls it.
-            scopes = {}
-            for node in ast.walk(tree):
-                own = scopes.get(id(node), ())
-                if isinstance(
-                    node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
-                ):
-                    own = own + (node.name,)
-                for child in ast.iter_child_nodes(node):
-                    scopes[id(child)] = own
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "_run_resolution_pipeline"
-                ):
-                    rel = path.relative_to(package_root).as_posix()
-                    callers.append((rel, ".".join(scopes.get(id(node), ()))))
-        # Every call, compared whole: a removed call, a duplicate inside
-        # __post_init__, or another class growing a same-named __post_init__
-        # all show up here.
-        self.assertEqual(
-            [("srt/server_args.py", "ServerArgs.__post_init__")],
-            callers,
-            "the resolution pipeline must be entered exactly once, from "
-            f"ServerArgs.__post_init__; found: {callers}",
+        probe = (
+            "import sys\n"
+            "from sglang.srt.server_args import ServerArgs\n"
+            "before = set(sys.modules)\n"
+            "ServerArgs(model_path='dummy').resolve_once()\n"
+            "print(','.join(sorted(m.rsplit('.', 1)[-1] for m in set(sys.modules) - before"
+            " if '.arg_groups.' in m and m.endswith('_hook'))))\n"
         )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(
+            pathlib.Path(next(iter(sglang.__path__))).resolve().parent
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        loaded = [name for name in out.stdout.strip().split(",") if name]
+        self.assertTrue(loaded, f"the probe reported nothing:\n{out.stdout}")
+        for late in ("model_hook", "cuda_graph_hook", "attention_hook", "lora_hook"):
+            self.assertNotIn(late, loaded)
 
 
 if __name__ == "__main__":

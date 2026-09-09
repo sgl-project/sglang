@@ -5,7 +5,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils import is_cpu, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -23,7 +23,11 @@ if not is_cpu():
 class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
-    supports_packed_decode: bool = not is_cpu() and not is_npu()
+    # XPU has no tvm_ffi CUDA JIT kernel for KDA packed decode; route XPU to the
+    # non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
+    # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
+    supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
+    supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,
@@ -63,7 +67,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_write_pos = kwargs.get("replayssm_write_pos")
         replayssm_force_flush = kwargs.get("replayssm_force_flush")
         if (
-            replayssm_d is not None
+            lower_bound is None
+            and replayssm_d is not None
             and replayssm_k is not None
             and replayssm_g is not None
             and replayssm_write_pos is not None
@@ -166,7 +171,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         intermediate_states_buffer: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
-        retrieve_parent_token: torch.Tensor,
+        retrieve_parent_token: Optional[torch.Tensor],
         lower_bound: Optional[float] = None,
         # fused ReplaySSM ring-write (dense verify only; off elsewhere).
         cache_ring: bool = False,
@@ -224,9 +229,10 @@ class TritonKDAKernel(LinearAttnKernelBase):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
+        beta_is_raw: bool = False,
         return_intermediate_states: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return chunk_kda(
             q=q,
             k=k,
@@ -240,5 +246,6 @@ class TritonKDAKernel(LinearAttnKernelBase):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
             output_intermediate_states=return_intermediate_states,
         )

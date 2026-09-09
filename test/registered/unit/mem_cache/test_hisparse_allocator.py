@@ -6,17 +6,25 @@ from unittest.mock import MagicMock
 import numpy as np
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
@@ -91,7 +99,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             rid="req-0",
             origin_input_ids=list(range(fill_len)),
             output_ids=[],
-            kv=None,
+            kv=ReqKvInfo(),
         )
 
         def set_extend_range(start, end):
@@ -105,7 +113,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
             def alloc(self, reqs):
                 for item in reqs:
-                    item.req_pool_idx = 0
+                    item.kv.req_pool_idx = 0
                 return torch.tensor([0], dtype=torch.int64)
 
             def write(self, indices, values):
@@ -116,6 +124,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),
+            swa_available_size=MagicMock(return_value=swa_tail_len),
             alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
             alloc_logical_only=MagicMock(return_value=kv_loc),
         )
@@ -151,14 +160,14 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
         self.assertEqual(req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
-        self.assertEqual(req.kv_committed_len, fill_len)
+        self.assertEqual(req.kv.kv_committed_len, fill_len)
         self.assertEqual(req.extend_range.length, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)
         coordinator.host_token_len.assert_called_once_with(fill_len)
         regular_host_alloc.assert_called_once_with(
             coordinator.req_to_host_pool,
             coordinator.req_to_host_pool_allocated_len,
-            req.req_pool_idx,
+            req.kv.req_pool_idx,
             0,
             len(host_indices),
         )
@@ -178,6 +187,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
         manager._transfer_data = MagicMock(return_value=0)
 
         with ThreadPoolExecutor(max_workers=1) as executor:

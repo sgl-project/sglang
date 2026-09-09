@@ -67,21 +67,32 @@ pub fn default_registry() -> ProcessorRegistry {
 }
 // --- Server (pure-Rust) request pipeline ---
 
-/// Build a family processor from the Python-side spec JSON. `Err` on an
-/// unknown family or malformed spec — the caller treats that as "no Rust
-/// pipeline".
+/// The resolved parameters of one family pipeline — the typed form of the
+/// Python-side spec, one variant per family arm. `sglang-server` builds it
+/// directly from its `MmSpec` pyclass; the JSON parity API reaches it through
+/// [`pipeline_from_spec`], where the `family` key selects the variant.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(tag = "family", rename_all = "snake_case")]
+pub enum PipelineSpec {
+    QwenVl(crate::qwen_vl::QwenVlSpec),
+}
+
+/// Build a family processor from a typed spec. `Err` when the family
+/// rejects its parameters (e.g. a zero patch size).
+pub fn build_pipeline(
+    spec: PipelineSpec,
+) -> Result<Box<dyn crate::pipeline::MmFamilyProcessor>, String> {
+    match spec {
+        PipelineSpec::QwenVl(spec) => Ok(Box::new(crate::qwen_vl::QwenVlProcessor::new(spec)?)),
+    }
+}
+
+/// Build a family processor from the Python-side spec JSON
+/// (`{"family": ..., resolved processor params}`). `Err` on an unknown family
+/// or malformed spec — the caller treats that as "no Rust pipeline".
 pub fn pipeline_from_spec(
     json: &str,
 ) -> Result<Box<dyn crate::pipeline::MmFamilyProcessor>, String> {
-    #[derive(serde::Deserialize)]
-    struct Header {
-        family: String,
-    }
-    let header: Header = serde_json::from_str(json).map_err(|e| format!("mm spec: {e}"))?;
-    match header.family.as_str() {
-        "qwen_vl" => Ok(Box::new(crate::qwen_vl::QwenVlProcessor::from_spec_json(
-            json,
-        )?)),
-        other => Err(format!("unknown mm family: {other}")),
-    }
+    let spec: PipelineSpec = serde_json::from_str(json).map_err(|e| format!("mm spec: {e}"))?;
+    build_pipeline(spec)
 }

@@ -28,7 +28,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -142,7 +142,7 @@ class TestMamba(unittest.TestCase):
         assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size
 
         # alloc req without free mamba cache
-        req.mamba_pool_idx = None
+        req.kv.mamba_pool_idx = None
         req_to_token_pool.alloc([req])
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
@@ -233,7 +233,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req1_kv_indices[: len(key)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -251,7 +251,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req2_kv_indices[: len(key)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -270,7 +270,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req3_kv_indices[: len(key)],
-                mamba_value=req3.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req3.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -288,7 +288,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key,
                 value=req4_kv_indices[: len(key)],
-                mamba_value=req4.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req4.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         prefix_len = result.prefix_len
@@ -300,17 +300,17 @@ class TestMamba(unittest.TestCase):
         full_num_tokens = 1
         print(f"evicting {full_num_tokens} full token")
         result = tree.evict(EvictParams(num_tokens=full_num_tokens))
-        assert (
-            result.num_tokens_evicted >= full_num_tokens
-        ), f"evicted {result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
+        assert result.num_tokens_evicted >= full_num_tokens, (
+            f"evicted {result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
+        )
         tree.pretty_print()
 
         mamba_num = 1
         print(f"evicting {mamba_num} mamba")
         result = tree.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-        assert (
-            result.mamba_num_evicted >= mamba_num
-        ), f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        assert result.mamba_num_evicted >= mamba_num, (
+            f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        )
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
@@ -348,9 +348,9 @@ class TestMamba(unittest.TestCase):
         mamba_num = 1
         print(f"evicting {mamba_num} mamba")
         result = tree.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-        assert (
-            result.mamba_num_evicted >= mamba_num
-        ), f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        assert result.mamba_num_evicted >= mamba_num, (
+            f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
+        )
         tree.pretty_print()
 
         req8_token_ids = [1, 2, 3, 4, 5, 60, 70]
@@ -372,13 +372,13 @@ class TestMamba(unittest.TestCase):
             )
         )
         kv_indices, last_node = result.device_indices, result.last_device_node
-        assert req9.mamba_pool_idx is not None
+        assert req9.kv.holds_mamba
         assert torch.all(
-            mamba_pool.mamba_cache.conv[0][:, req9.mamba_pool_idx]
+            mamba_pool.mamba_cache.conv[0][:, req9.kv.mamba_pool_idx]
             == mamba_pool.mamba_cache.conv[0][:, last_node.mamba_value]
         )
         assert torch.all(
-            mamba_pool.mamba_cache.temporal[:, req9.mamba_pool_idx]
+            mamba_pool.mamba_cache.temporal[:, req9.kv.mamba_pool_idx]
             == mamba_pool.mamba_cache.temporal[:, last_node.mamba_value]
         )
 
@@ -404,7 +404,7 @@ class TestMamba(unittest.TestCase):
                 InsertParams(
                     key=RadixKey(array("q", token_ids)),
                     value=kv,
-                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                    mamba_value=req.kv.mamba_pool_idx.unsqueeze(0),
                 )
             )
 
@@ -459,7 +459,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key1,
                 value=allocator.alloc(3)[: len(key1)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         events = tree.take_events()
@@ -476,7 +476,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key2,
                 value=allocator.alloc(5)[: len(key2)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         events = tree.take_events()
@@ -515,7 +515,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key1,
                 value=allocator.alloc(4)[: len(key1)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         first_insert_events = [
@@ -530,7 +530,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key2,
                 value=allocator.alloc(4)[: len(key2)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         second_insert_events = [
@@ -630,6 +630,157 @@ class TestMamba(unittest.TestCase):
             return req
 
         return tree, allocator, req_to_token_pool, make_dummy_req
+
+    # Qwen4-Exp's PLE N-gram window is 2 wide (ngram_size=3) and its "no history"
+    # sentinel is the eos id; pick a recognisable one for the tests.
+    NGRAM_CONTEXT_LEN = 2
+    NGRAM_EOS = 248044
+
+    def _setup_pool_with_ngram(self, ngram_context_len: int = NGRAM_CONTEXT_LEN):
+        server_args = ServerArgs(model_path="dummy", page_size=1)
+        server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
+        set_global_server_args_for_scheduler(server_args)
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=4096,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+            )
+            cache_params = Mamba2CacheParams(shape=shape, layers=[0])
+        return HybridReqToTokenPool(
+            size=10,
+            mamba_size=20,
+            mamba_spec_state_size=10,
+            max_context_len=128,
+            device=get_device(),
+            enable_memory_saver=False,
+            cache_params=cache_params,
+            mamba_layer_ids=[0],
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=3,
+            ngram_context_len=ngram_context_len,
+            ngram_eos_token_id=self.NGRAM_EOS,
+        )
+
+    # Slot-sibling parity: each test below pins one way a mamba slot changes owner.
+
+    def test_slot_siblings_registered(self):
+        """Enabled PLE side states register on the pool that owns the slots;
+        disabled ones stay off so the host-offload payload keeps its legacy shape."""
+        _, _, base_pool, _ = self._setup_tree_and_allocator()
+        # The default hybrid setup has no PLE config: no siblings ride along.
+        self.assertEqual(len(base_pool.mamba_pool._slot_siblings), 0)
+        pool = self._setup_pool_with_ngram()
+        self.assertEqual(len(pool.mamba_pool._slot_siblings), 1)
+
+    def test_ngram_clear_slots_resets_window(self):
+        """A recycled slot must not carry its previous owner's N-gram window;
+        the sibling reset must ride the same deferred ``clear_slots`` call."""
+        pool = self._setup_pool_with_ngram()
+        mamba_pool = pool.mamba_pool
+        ngram = pool.ngram_pool
+
+        victim = pool.mamba_allocator.alloc(1)
+        ngram.context[victim.long()] = 777  # poison, as a real request's history
+        mamba_pool.clear_slots(victim)
+        self.assertTrue(
+            torch.all(ngram.context[victim.long()] == self.NGRAM_EOS),
+            f"clear_slots left a dirty N-gram row: {ngram.context[victim.long()]}",
+        )
+
+    def test_ngram_copy_from_copies_window(self):
+        """copy_from carries the window, so radix cow gets the cached prefix's state."""
+        pool = self._setup_pool_with_ngram()
+        mamba_pool = pool.mamba_pool
+        ngram = pool.ngram_pool
+
+        src = pool.mamba_allocator.alloc(1)
+        dst = pool.mamba_allocator.alloc(1)
+        window = torch.tensor(
+            [[55, 66]], dtype=ngram.context.dtype, device=ngram.context.device
+        )
+        ngram.context[src.long()] = window
+
+        mamba_pool.copy_from(src, dst)
+        self.assertTrue(
+            torch.equal(ngram.context[dst.long()], window),
+            f"copy_from lost the N-gram window: got {ngram.context[dst.long()]}",
+        )
+
+    def test_ngram_cpu_offload_roundtrip(self):
+        """The window survives a host offload round-trip along with mamba state."""
+        pool = self._setup_pool_with_ngram()
+        mamba_pool = pool.mamba_pool
+        ngram = pool.ngram_pool
+
+        indices = pool.mamba_allocator.alloc(2)
+        window = torch.tensor(
+            [[11, 12], [13, 14]],
+            dtype=ngram.context.dtype,
+            device=ngram.context.device,
+        )
+        ngram.context[indices.long()] = window
+
+        saved = mamba_pool.get_cpu_copy(indices)
+        ngram.context[indices.long()] = self.NGRAM_EOS  # simulate slot reuse
+        mamba_pool.load_cpu_copy(saved, indices)
+
+        self.assertTrue(
+            torch.equal(ngram.context[indices.long()], window),
+            f"offload round-trip lost the window: got {ngram.context[indices.long()]}",
+        )
+
+    def test_ngram_pool_absent_keeps_legacy_offload_shape(self):
+        """Disabled pool stays inert: legacy 2-tuple offload payload, no sibling."""
+        pool = self._setup_pool_with_ngram(ngram_context_len=0)
+        self.assertIsNone(pool.ngram_pool.context)
+        self.assertEqual(len(pool.mamba_pool._slot_siblings), 0)
+
+        src = pool.mamba_allocator.alloc(1)
+        payload = pool.mamba_pool.get_cpu_copy(src)
+        self.assertEqual(len(payload), 2)
+        pool.mamba_pool.load_cpu_copy(payload, src)
+
+    def test_mamba_track_aligned_lens_math(self):
+        """Floor division must swallow the scheduler's `aligned + 1` (_force_track_h),
+        or the PLE side states snapshot one token past the mamba state."""
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        def aligned_for(chunk_size, track_seqlens, prefix_lens):
+            server_args = ServerArgs(model_path="dummy", page_size=1)
+            server_args._mamba_cache_chunk_size = chunk_size
+            set_global_server_args_for_scheduler(server_args)
+            fake = SimpleNamespace(
+                mamba_track_mask=torch.tensor([True] * len(track_seqlens)),
+                mamba_track_seqlens=torch.tensor(track_seqlens, dtype=torch.int64),
+                extend_prefix_lens=torch.tensor(prefix_lens, dtype=torch.int64),
+            )
+            return ForwardBatch.mamba_track_aligned_lens(fake).tolist()
+
+        # normal: track_seqlens = prefix + extend_input_len
+        self.assertEqual(
+            aligned_for(64, [100 + 64, 100 + 100, 100 + 127], [100, 100, 100]),
+            [64, 64, 64],
+        )
+        # _force_track_h with chunk > 64: track_seqlens = aligned + 1
+        self.assertEqual(aligned_for(128, [100 + 128 + 1], [100]), [128])
+        self.assertEqual(aligned_for(128, [100 + 256 + 1], [100]), [256])
+        # branching point inside the chunk, also handed over as +1
+        self.assertEqual(aligned_for(64, [100 + 64 + 1], [100]), [64])
+        # a masked-off row carries -1 and must come out non-positive, so the
+        # caller's clamp(min=0) routes it harmlessly
+        self.assertLessEqual(aligned_for(64, [-1], [100])[0], 0)
+
+        # restore the chunk size the rest of the suite expects
+        server_args = ServerArgs(model_path="dummy", page_size=1)
+        server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
+        set_global_server_args_for_scheduler(server_args)
 
     def test_mamba_pool_cpu_offload(self):
         """MambaPool.get_cpu_copy / load_cpu_copy round-trips conv and temporal state."""
@@ -771,7 +922,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key1,
                 value=allocator.alloc(3)[: len(key1)],
-                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req1.kv.mamba_pool_idx.unsqueeze(0),
             )
         )
         assert allocator.available_size() == initial_avail - 3
@@ -784,7 +935,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key2,
                 value=allocator.alloc(7)[: len(key2)],
-                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req2.kv.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=0,
             )
         )
@@ -802,7 +953,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key3,
                 value=allocator.alloc(8)[: len(key3)],
-                mamba_value=req3.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req3.kv.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=2,
             )
         )
@@ -819,7 +970,7 @@ class TestMamba(unittest.TestCase):
             InsertParams(
                 key=key4,
                 value=allocator.alloc(9)[: len(key4)],
-                mamba_value=req4.mamba_pool_idx.unsqueeze(0),
+                mamba_value=req4.kv.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=8,
             )
         )

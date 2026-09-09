@@ -3,33 +3,13 @@ import os
 
 import pytest
 
-print("[CONFTEST] Loading conftest.py at import time")
-
-
-def pytest_configure(config):
-    """
-    Create the perf results StashKey once and store it in config.
-    This hook runs once per test session, before module double-import issues.
-    """
-    if not hasattr(config, "_diffusion_perf_key"):
-        config._diffusion_perf_key = pytest.StashKey[list]()
-        print(f"[CONFTEST] Created perf_results_key: {config._diffusion_perf_key}")
-
-
-def add_perf_results(config, results: list):
-    """Add performance results to the shared stash."""
-    # Get the shared key from config (created once in pytest_configure)
-    key = config._diffusion_perf_key
-    existing = config.stash.get(key, [])
-    existing.extend(results)
-    config.stash[key] = existing
-    print(f"[CONFTEST] Added {len(results)} results, total now: {len(existing)}")
+_PERF_RESULTS = pytest.StashKey[list]()
 
 
 @pytest.fixture(scope="session")
-def perf_config(request):
-    """Provide access to pytest config for storing perf results."""
-    return request.config
+def perf_results(request):
+    """Share results through pytest rather than importing this conftest module."""
+    return request.config.stash.setdefault(_PERF_RESULTS, [])
 
 
 def _write_github_step_summary(content: str):
@@ -43,10 +23,28 @@ def _write_github_step_summary(content: str):
 def _write_results_json(results: list, output_path: str = "diffusion-results.json"):
     """Write performance results to JSON file for CI artifact collection."""
     try:
+        existing = []
+        if os.path.exists(output_path):
+            try:
+                with open(output_path, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    existing = loaded
+            except json.JSONDecodeError:
+                pass
+
+        merged = {
+            (
+                entry.get("class_name"),
+                entry.get("test_name"),
+                entry.get("request_index", 1),
+            ): entry
+            for entry in existing + results
+        }
         with open(output_path, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(list(merged.values()), f, indent=2)
         print(f"[CONFTEST] Wrote results to {output_path}")
-    except Exception as e:
+    except (json.JSONDecodeError, OSError) as e:
         print(f"[CONFTEST] Failed to write results JSON: {e}")
 
 
@@ -63,23 +61,31 @@ def _generate_diffusion_markdown_report(results: list) -> str:
 
     # Main performance table
     markdown = header
-    markdown += "| Test Suite | Test Name | Modality | E2E (ms) | Avg Denoise (ms) | Median Denoise (ms) |\n"
-    markdown += "| ---------- | --------- | -------- | -------- | ---------------- | ------------------- |\n"
+    markdown += "| Test Suite | Test Name | Request | Modality | E2E (ms) | Avg Denoise (ms) | Median Denoise (ms) | Load Peak VRAM (MiB) | Runtime Peak VRAM (MiB) | Load Peak Alloc (MiB) | Runtime Peak Alloc (MiB) |\n"
+    markdown += "| ---------- | --------- | ------- | -------- | -------- | ---------------- | ------------------- | -------------------- | ----------------------- | --------------------- | ------------------------ |\n"
 
     for entry in sorted(results, key=lambda x: (x["class_name"], x["test_name"])):
         modality = entry.get("modality", "image")
         markdown += (
-            f"| {entry['class_name']} | {entry['test_name']} | {modality} | "
+            f"| {entry['class_name']} | {entry['test_name']} | {entry.get('request_index', 1)} | {modality} | "
             f"{entry['e2e_ms']:.2f} | {entry['avg_denoise_ms']:.2f} | "
-            f"{entry['median_denoise_ms']:.2f} |\n"
+            f"{entry['median_denoise_ms']:.2f} | "
+            f"{entry.get('load_peak_vram_mb', 0):.0f} | "
+            f"{entry.get('runtime_peak_vram_mb', 0):.0f} | "
+            f"{entry.get('load_peak_allocated_mb', 0):.0f} | "
+            f"{entry.get('runtime_peak_allocated_mb', 0):.0f} |\n"
         )
 
     # Video-specific metrics table (if any video tests)
     video_results = [r for r in results if r.get("modality") == "video"]
     if video_results:
         markdown += "\n### Video Generation Metrics\n\n"
-        markdown += "| Test Name | FPS | Total Frames | Avg Frame Time (ms) |\n"
-        markdown += "| --------- | --- | ------------ | ------------------- |\n"
+        markdown += (
+            "| Test Name | Request | FPS | Total Frames | Avg Frame Time (ms) |\n"
+        )
+        markdown += (
+            "| --------- | ------- | --- | ------------ | ------------------- |\n"
+        )
         for entry in video_results:
             fps = entry.get("frames_per_second", "N/A")
             frames = entry.get("total_frames", "N/A")
@@ -88,7 +94,7 @@ def _generate_diffusion_markdown_report(results: list) -> str:
                 fps = f"{fps:.2f}"
             if isinstance(avg_frame, float):
                 avg_frame = f"{avg_frame:.2f}"
-            markdown += f"| {entry['test_name']} | {fps} | {frames} | {avg_frame} |\n"
+            markdown += f"| {entry['test_name']} | {entry.get('request_index', 1)} | {fps} | {frames} | {avg_frame} |\n"
 
     return markdown
 
@@ -98,44 +104,60 @@ def pytest_sessionfinish(session):
     This hook is called by pytest at the end of the entire test session.
     It prints a consolidated summary of all performance results.
     """
-    # Get results from stash using the shared key from config
-    key = session.config._diffusion_perf_key
-    results = session.config.stash.get(key, [])
-    print(f"\n[DEBUG] pytest_sessionfinish called, has {len(results)} entries")
+    results = session.config.stash.get(_PERF_RESULTS, [])
     if not results:
-        print("[DEBUG] No results collected, skipping summary output")
         return
 
-    sorted_results = sorted(results, key=lambda x: (x["class_name"], x["test_name"]))
+    sorted_results = sorted(
+        results,
+        key=lambda x: (x["class_name"], x["test_name"], x.get("request_index", 1)),
+    )
 
     # Print to stdout (existing behavior)
     print("\n\n" + "=" * 35 + " Performance Summary " + "=" * 35)
     print(
-        f"{'Test Suite':<30} | {'Test Name':<20} | {'E2E (ms)':>12} | {'Avg Denoise (ms)':>18} | {'Median Denoise (ms)':>20}"
+        f"{'Test Suite':<30} | {'Test Name':<20} | {'Request':>7} | {'E2E (ms)':>12} | {'Avg Denoise (ms)':>18} | {'Median Denoise (ms)':>20} | {'Load Peak (MiB)':>15} | {'Runtime Peak (MiB)':>18} | {'Load Alloc (MiB)':>16} | {'Runtime Alloc (MiB)':>19}"
     )
     print(
         "-" * 30
         + "-+-"
         + "-" * 20
         + "-+-"
+        + "-" * 7
+        + "-+-"
         + "-" * 12
         + "-+-"
         + "-" * 18
         + "-+-"
         + "-" * 20
+        + "-+-"
+        + "-" * 15
+        + "-+-"
+        + "-" * 18
+        + "-+-"
+        + "-" * 16
+        + "-+-"
+        + "-" * 19
     )
 
     for entry in sorted_results:
         print(
-            f"{entry['class_name']:<30} | {entry['test_name']:<20} | {entry['e2e_ms']:>12.2f} | "
-            f"{entry['avg_denoise_ms']:>18.2f} | {entry['median_denoise_ms']:>20.2f}"
+            f"{entry['class_name']:<30} | {entry['test_name']:<20} | {entry.get('request_index', 1):>7} | {entry['e2e_ms']:>12.2f} | "
+            f"{entry['avg_denoise_ms']:>18.2f} | {entry['median_denoise_ms']:>20.2f} | "
+            f"{entry.get('load_peak_vram_mb', 0):>15.0f} | "
+            f"{entry.get('runtime_peak_vram_mb', 0):>18.0f} | "
+            f"{entry.get('load_peak_allocated_mb', 0):>16.0f} | "
+            f"{entry.get('runtime_peak_allocated_mb', 0):>19.0f}"
         )
 
-    print("=" * 91)
+    print("=" * 130)
 
     print("\n\n" + "=" * 36 + " Detailed Reports " + "=" * 37)
     for entry in sorted_results:
-        print(f"\n--- Details for {entry['class_name']} / {entry['test_name']} ---")
+        print(
+            f"\n--- Details for {entry['class_name']} / {entry['test_name']} "
+            f"/ request {entry.get('request_index', 1)} ---"
+        )
         stage_report = ", ".join(
             f"{name}:{duration:.2f}ms"
             for name, duration in entry.get("stage_metrics", {}).items()

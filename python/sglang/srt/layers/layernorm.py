@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -110,8 +111,17 @@ _has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     import aiter as _aiter
     from aiter import layernorm2d_fwd as layer_norm
-    from aiter import rmsnorm2d_fwd as rms_norm
-    from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+
+    if is_gfx1250_supported():
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rms_norm,
+        )
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rmsnorm2d_fwd_with_add as fused_add_rms_norm,
+        )
+    else:
+        from aiter import rmsnorm2d_fwd as rms_norm
+        from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
     _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
@@ -303,17 +313,24 @@ def _forward_with_allreduce_fusion_quant_per_group(
     if world_size <= 1:
         return None
 
-    # TODO: When ROCm/aiter#3652 is available in our bundled aiter, plumb
-    # transpose_scale=use_bpreshuffle into the fused AR+RMSNorm+quant kernel
-    # and drop this explicit post-kernel scale materialization.
+    # ``transpose_scale=use_bpreshuffle`` asks the fused kernel to emit the
+    # per-group scale directly in the column-major layout the gfx95 bpreshuffle
+    # GEMM consumes (identical to ``materialize_bpreshuffle_fp8_scale``), so the
+    # fused-success paths below need no post-kernel transpose. The separate
+    # per-group-quant fallbacks still materialize: ``per_1x128_quant``'s own
+    # ``transpose_scale`` byte-shuffles the scale into a *different* arrangement,
+    # not the column-major layout this GEMM expects.
     if not keep_bf16:
         result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-            x, residual, weight, norm_module.variance_epsilon, group_size
+            x,
+            residual,
+            weight,
+            norm_module.variance_epsilon,
+            group_size,
+            transpose_scale=use_bpreshuffle,
         )
         if result is not None:
             fp8_out, residual_out, scale_out = result
-            if use_bpreshuffle:
-                scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
             return (fp8_out, scale_out), residual_out
 
         # Fallback: fused AR+RMSNorm then separate per-group quant.
@@ -345,11 +362,10 @@ def _forward_with_allreduce_fusion_quant_per_group(
         norm_module.variance_epsilon,
         group_size,
         emit_bf16=True,
+        transpose_scale=use_bpreshuffle,
     )
     if result is not None and len(result) == 4:
         fp8_out, residual_out, scale_out, bf16_out = result
-        if use_bpreshuffle:
-            scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
         return (bf16_out, fp8_out, scale_out), residual_out
 
     fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(

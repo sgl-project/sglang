@@ -14,7 +14,6 @@ JOIN_TIMEOUT_S: float = 10.0
 
 
 class BackgroundHttpPoster:
-
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
         self._loop = asyncio.new_event_loop()

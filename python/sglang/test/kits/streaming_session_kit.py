@@ -111,9 +111,9 @@ class StreamingSessionKitMixin:
         # No logprob
         asyncio.run(_concurrent_logprob_run(self.base_url, self.tokenizer))
         time.sleep(3)
-        assert (
-            requests.get(self.base_url + "/health").status_code == 200
-        ), "Server unhealthy after concurrent logprob sessions."
+        assert requests.get(self.base_url + "/health").status_code == 200, (
+            "Server unhealthy after concurrent logprob sessions."
+        )
 
     def test_stress_concurrent_sessions(self) -> None:
         """High concurrency streaming + non-streaming with retract pressure;
