@@ -4201,21 +4201,6 @@ class Scheduler(
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
-        if not self.enable_fpm:
-            return self._run_batch(batch, pp_proxy_tensors)
-        # Capture all instrumented target/draft segments of this invocation.
-        # Carry ownership on the result: overlap can launch the next iteration
-        # before process_batch_result consumes this one.
-        with self.metrics_reporter.forward_pass_device_timer.capture() as timing:
-            result = self._run_batch(batch, pp_proxy_tensors)
-        result.fpm_timing = timing
-        return result
-
-    def _run_batch(
-        self,
-        batch: ScheduleBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1

@@ -1,7 +1,7 @@
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, List, Optional
+from typing import Callable, Deque, Dict, List, Optional, Protocol
 
 import torch
 
@@ -17,44 +17,12 @@ def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
     return timer.wrap(metadata={"category": category})
 
 
-class DeviceTiming:
-    """Elapsed span between a group's first and last existing CUDA events.
+class TimingObserver(Protocol):
+    """Optional consumer of existing intervals; no timing or publication policy."""
 
-    Completion is driven by DeviceTimer's nonblocking event queries. The callback
-    may be registered after completion (e.g. when CPU result processing catches up).
-    No events are moved or added. Work outside these boundaries is not measured.
-    A group spanning different streams has no ordered boundary pair and reports
-    None rather than silently claiming a complete iteration duration.
-    """
+    def on_interval_start(self, interval: "_TimingInterval") -> None: ...
 
-    def __init__(self):
-        self.num_intervals = 0
-        self._pending = 0
-        self._sealed = False
-        self._elapsed = 0.0
-        self._callback = None
-        self._first_interval = None
-        self._last_interval = None
-        self._same_stream = True
-
-    def when_ready(self, callback: Callable[[Optional[float]], None]):
-        self._callback = callback
-        self._notify()
-
-    def _notify(self):
-        if self._sealed and self._pending == 0 and self._callback is not None:
-            callback, self._callback = self._callback, None
-            if self._first_interval is None:
-                callback(0.0)
-            elif not self._same_stream:
-                callback(None)
-            else:
-                callback(
-                    self._first_interval.start_event.elapsed_time(
-                        self._last_interval.end_event
-                    )
-                    / 1000.0
-                )
+    def on_interval_ready(self, interval: "_TimingInterval") -> None: ...
 
 
 class DeviceTimer:
@@ -62,20 +30,17 @@ class DeviceTimer:
         self._intervals: Deque[_TimingInterval] = deque()
         self._reporters: List[Callable] = [] if reporter is None else [reporter]
         self._in_wrap = False
-        self._capture: Optional[DeviceTiming] = None
+        self._observer: Optional[TimingObserver] = None
 
     @contextmanager
-    def capture(self):
-        """Group intervals launched in this scope without recording new events."""
-        assert self._capture is None, "DeviceTimer.capture is not re-entrant"
-        timing = DeviceTiming()
-        self._capture = timing
+    def capture(self, observer: TimingObserver):
+        """Observe intervals created in this scope, including later completion."""
+        assert self._observer is None, "DeviceTimer.capture is not re-entrant"
+        self._observer = observer
         try:
-            yield timing
+            yield
         finally:
-            self._capture = None
-            timing._sealed = True
-            timing._notify()
+            self._observer = None
 
     def add_reporter(self, reporter: Callable):
         self._reporters.append(reporter)
@@ -85,17 +50,10 @@ class DeviceTimer:
         # Not re-entrant: a nested wrap would end the wrong interval and leave
         # an un-ended one at the head of the queue for _report() to trip over.
         assert not self._in_wrap, "DeviceTimer.wrap is not re-entrant"
-        interval = _TimingInterval.create()
-        interval.capture = self._capture
-        if interval.capture is not None:
-            timing = interval.capture
-            timing.num_intervals += 1
-            timing._pending += 1
-            if timing._first_interval is None:
-                timing._first_interval = interval
-            elif interval.stream != timing._first_interval.stream:
-                timing._same_stream = False
-            timing._last_interval = interval
+        interval = _TimingInterval.create(track_stream=self._observer is not None)
+        interval.observer = self._observer
+        if interval.observer is not None:
+            interval.observer.on_interval_start(interval)
         self._intervals.append(interval)
         self._in_wrap = True
         try:
@@ -115,13 +73,10 @@ class DeviceTimer:
             elapsed = interval.elapsed_time() / 1000.0
             for reporter in self._reporters:
                 reporter(t=elapsed, **interval.metadata)
-            if interval.capture is not None:
-                timing = interval.capture
-                # Groups retain their boundary intervals; avoid an ownership cycle.
-                interval.capture = None
-                timing._elapsed += elapsed
-                timing._pending -= 1
-                timing._notify()
+            if interval.observer is not None:
+                # Observers can retain intervals; break the back-reference first.
+                observer, interval.observer = interval.observer, None
+                observer.on_interval_ready(interval)
 
 
 class GapTimer(DeviceTimer):
@@ -158,14 +113,14 @@ class _TimingInterval:
     start_event: torch.cuda.Event
     end_event: Optional[torch.cuda.Event] = None
     metadata: Optional[Dict] = None
-    capture: Optional[DeviceTiming] = None
+    observer: Optional[TimingObserver] = None
     stream: Optional[torch.cuda.Stream] = None
 
     @staticmethod
-    def create():
-        stream = torch.cuda.current_stream()
+    def create(track_stream: bool = False):
+        stream = torch.cuda.current_stream() if track_stream else None
         start_event = torch.cuda.Event(enable_timing=True)
-        start_event.record(stream)
+        start_event.record()
         return _TimingInterval(start_event=start_event, stream=stream)
 
     def end(self, metadata: Dict):
