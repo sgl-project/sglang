@@ -1,6 +1,20 @@
+from typing import TYPE_CHECKING
+
 import torch
 import triton
 import triton.language as tl
+
+from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
+from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
 
 
 def quantize_k_cache(cache_k):
@@ -187,7 +201,93 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
     return output
 
 
+@cache_once
+def _quantize_k_cache_fast_separate_cuda_module(
+    key_dtype: torch.dtype,
+    dim_nope: int,
+    dim_rope: int,
+    group_size: int,
+    use_pdl: bool,
+) -> "Module":
+    args = make_cpp_args(key_dtype, dim_nope, dim_rope, group_size, use_pdl)
+    return load_jit(
+        "quantize_k_cache_fast_separate_cuda",
+        *args,
+        cuda_files=["dsa/quantize_mla_k_cache.cuh"],
+        cuda_wrappers=[
+            (
+                "quantize_k_cache_fast_separate_cuda",
+                f"QuantizeKCacheFastSeparateCudaKernel<{args}>::run",
+            )
+        ],
+    )
+
+
+@debug_kernel_api
+def _quantize_k_cache_fast_separate_cuda(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    group_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize NoPE and copy RoPE into two separate byte tensors.
+
+    For the 512/64 layout, small workloads use one warp per NoPE group and
+    a separate RoPE CTA per token. Larger workloads use 128-thread CTAs with
+    contiguous group ranges and four groups per persistent iteration.
+    Both geometries launch the same CUDA entry; cache scatter is separate.
+    NoPE/RoPE dimensions and group size are JIT template arguments, with
+    group size determining vector width and unrolled work per warp.
+
+    The grid is capped by the input device's SM count times kernel occupancy.
+    Small ranges finish in one iteration.
+    """
+
+    num_tokens, dim_nope = k_nope.shape
+    num_tokens_, dim_rope = k_rope.shape
+    assert num_tokens == num_tokens_
+
+    k_nope = k_nope.contiguous()
+    k_rope = k_rope.contiguous()
+
+    num_tiles = dim_nope // group_size
+    nope_part_bytes = dim_nope + num_tiles * 4
+    rope_part_bytes = dim_rope * k_rope.element_size()
+
+    nope_part = torch.empty(
+        (num_tokens, nope_part_bytes),
+        dtype=torch.uint8,
+        device=k_nope.device,
+    )
+    rope_part = torch.empty(
+        (num_tokens, rope_part_bytes), dtype=torch.uint8, device=k_rope.device
+    )
+
+    # Occupancy is queried for the current device by the native launcher.
+    with torch.cuda.device(k_nope.device):
+        module = _quantize_k_cache_fast_separate_cuda_module(
+            k_nope.dtype,
+            dim_nope,
+            dim_rope,
+            group_size,
+            is_arch_support_pdl(),
+        )
+        module.quantize_k_cache_fast_separate_cuda(
+            nope_part,
+            rope_part,
+            k_nope,
+            k_rope,
+        )
+    return nope_part.unsqueeze(1), rope_part.unsqueeze(1)
+
+
 def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
+    """Use Triton by default, with an opt-in CUDA implementation."""
+    if envs.SGLANG_OPT_USE_CUDA_MLA_K_CACHE_QUANT.get():
+        return _quantize_k_cache_fast_separate_cuda(k_nope, k_rope, group_size)
+    return _quantize_k_cache_fast_separate_triton(k_nope, k_rope, group_size)
+
+
+def _quantize_k_cache_fast_separate_triton(k_nope, k_rope, group_size: int = 128):
     """
     Quantize k_nope and k_rope in a single Triton kernel, directly outputting two separate tensors.
 
