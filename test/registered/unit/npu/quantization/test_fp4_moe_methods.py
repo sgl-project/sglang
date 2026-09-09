@@ -313,6 +313,38 @@ class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self._method().process_weights_after_loading(layer)
 
+    def test_keeps_low_latency_dispatch_in_mxfp8(self):
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(
+                torch.ones(1, 2, 32, dtype=torch.uint8), requires_grad=False
+            ),
+            w13_weight_scale_inv=torch.nn.Parameter(
+                torch.ones(1, 2, 1, dtype=torch.uint8), requires_grad=False
+            ),
+            w2_weight=torch.nn.Parameter(
+                torch.ones(1, 32, 1, dtype=torch.uint8), requires_grad=False
+            ),
+            w2_weight_scale_inv=torch.nn.Parameter(
+                torch.ones(1, 32, 1, dtype=torch.uint8), requires_grad=False
+            ),
+            dispatcher=MagicMock(),
+        )
+        prepared_weight = torch.ones(1, 32, 2, dtype=torch.uint8)
+        prepared_scale = torch.ones(1, 1, 2, 2, dtype=torch.uint8)
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods.prepare_w4a8_mxfp_weight",
+            return_value=(prepared_weight, prepared_scale),
+        ):
+            self._method().process_weights_after_loading(layer)
+
+        layer.dispatcher.set_quant_config.assert_called_once_with(
+            {
+                "normal_dispatcher_output_dtype": "bf16",
+                "low_latency_dispatcher_output_dtype": "mxfp8",
+            }
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
