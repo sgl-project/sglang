@@ -147,6 +147,27 @@ impl SwaComponent {
         }
     }
 
+    /// Nodes whose SWA data needs a host backup, deepest first. Buffer mode
+    /// stages one node per FIFO backup intent; cache mode backs up every
+    /// device-only node within one sliding window of `node_id`.
+    fn collect_unbacked_swa_nodes_<K: ChildKeyType>(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Vec<NodeIdx_> {
+        if !tree_core.has_swa_host_pool {
+            return Vec::new();
+        }
+        if tree_core.is_host_memory_buffer_only {
+            return if tree_core.arena.node(node_id).has_device_value(SWA) {
+                vec![node_id]
+            } else {
+                Vec::new()
+            };
+        }
+        self.collect_unbacked_swa_nodes_in_window_(tree_core, node_id)
+    }
+
     /// Nodes within one sliding window of `node_id` whose SWA data sits on
     /// device with no host copy, deepest first. The walk stops at a node an
     /// in-flight backup already covers: that ack owns everything above it, so
@@ -156,9 +177,6 @@ impl SwaComponent {
         tree_core: &UnifiedTreeCore<K>,
         node_id: NodeIdx_,
     ) -> Vec<NodeIdx_> {
-        if !tree_core.has_swa_host_pool {
-            return Vec::new();
-        }
         let mut covered_tokens = 0;
         let mut unbacked: Vec<NodeIdx_> = Vec::new();
         let mut cur_id = node_id;
@@ -338,7 +356,7 @@ impl SwaComponent {
 impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
     fn needs_incremental_backup(&self, tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_) -> bool {
         !self
-            .collect_unbacked_swa_nodes_in_window_(tree_core, node_id)
+            .collect_unbacked_swa_nodes_(tree_core, node_id)
             .is_empty()
     }
 
@@ -909,18 +927,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         }
         Ok(match phase {
             CacheTransferPhase::BackupHost => {
-                let unbacked = if tree_core.is_host_memory_buffer_only {
-                    // Buffer mode stages one node per FIFO backup intent and sizes
-                    // its storage keys off that node alone.
-                    let node = tree_core.arena.node(node_id);
-                    if node.has_device_value(SWA) {
-                        vec![node_id]
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    self.collect_unbacked_swa_nodes_in_window_(tree_core, node_id)
-                };
+                let unbacked = self.collect_unbacked_swa_nodes_(tree_core, node_id);
                 if unbacked.is_empty() {
                     return Ok(None);
                 }

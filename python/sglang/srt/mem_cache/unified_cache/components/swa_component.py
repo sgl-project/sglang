@@ -85,10 +85,22 @@ class SWAComponent(TreeComponent):
 
     component_type = ComponentType.SWA
 
-    def _dirty_backup_window(self, node: UnifiedTreeNode) -> list[UnifiedTreeNode]:
+    def _collect_unbacked_swa_nodes(
+        self, node: UnifiedTreeNode
+    ) -> list[UnifiedTreeNode]:
+        """Nodes whose SWA data needs a host backup, deepest first.
+
+        Buffer mode stages one node per FIFO backup intent; cache mode backs
+        up every device-only node within one sliding window of ``node``.
+        """
         if not self.tree_core.has_swa_host_pool:
             return []
+        if self.tree_core.is_host_memory_buffer_only:
+            cd = node.component_data[self.component_type]
+            return [node] if cd.value is not None else []
+        return self._dirty_backup_window(node)
 
+    def _dirty_backup_window(self, node: UnifiedTreeNode) -> list[UnifiedTreeNode]:
         ct = self.component_type
         covered = 0
         dirty: list[UnifiedTreeNode] = []
@@ -110,7 +122,7 @@ class SWAComponent(TreeComponent):
         return dirty
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
-        return bool(self._dirty_backup_window(node))
+        return bool(self._collect_unbacked_swa_nodes(node))
 
     def reset_session_state(self) -> None:
         super().reset_session_state()
@@ -1020,12 +1032,7 @@ class SWAComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            if self.tree_core.is_host_memory_buffer_only:
-                # Buffer mode stages one node/hash span per FIFO backup intent.
-                cd = node.component_data[ct]
-                dirty = [node] if cd.value is not None else []
-            else:
-                dirty = self._dirty_backup_window(node)
+            dirty = self._collect_unbacked_swa_nodes(node)
             if not dirty:
                 return None
             dirty.reverse()

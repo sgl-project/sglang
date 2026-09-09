@@ -5188,6 +5188,44 @@ fn needs_incremental_backup_tracks_the_unbacked_window() {
 }
 
 #[test]
+fn buffer_mode_backup_window_is_the_target_alone_at_both_call_sites() {
+    // Cache mode walks the window: a host-only target still reaches the
+    // device-only ancestor above it. Buffer mode stages the target alone.
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b] = chain::<2>(&mut tc);
+    set_swa_device_value(&mut tc, a, 10);
+    set_swa_host(&mut tc, b);
+    let swa = swa_component(4);
+    let a_id = tc.arena.node(a).id;
+    let b_id = tc.arena.node(b).id;
+
+    assert!(TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+    assert_eq!(
+        backup_transfers(&tc, 4, b).unwrap()[0].nodes_to_load,
+        Some(vec![a_id])
+    );
+
+    tc.set_host_memory_buffer_only();
+    assert!(!TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+    assert!(backup_transfers(&tc, 4, b).is_none());
+
+    // A device-resident target is staged by itself, whatever its ancestors hold.
+    set_swa_host(&mut tc, a);
+    set_swa_device_value(&mut tc, b, 11);
+    assert!(TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+    assert_eq!(
+        backup_transfers(&tc, 4, b).unwrap()[0].nodes_to_load,
+        Some(vec![b_id])
+    );
+}
+
+#[test]
 fn write_back_reinsert_still_backs_up_an_unbacked_swa_window() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {

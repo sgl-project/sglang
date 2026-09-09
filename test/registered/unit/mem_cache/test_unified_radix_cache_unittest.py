@@ -5521,6 +5521,44 @@ class UnifiedRadixCacheSuite:
             cache.tree_core.has_swa_host_pool, swa._swa_kv_pool_host is not None
         )
 
+    def test_swa_backup_collector_is_shared_by_both_call_sites(self):
+        """needs_incremental_backup and the BACKUP_HOST transfer read one
+        collector: cache mode walks the window past a host-backed target to
+        its device-only ancestor, buffer mode stages the target alone."""
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA-only")
+        if self.cfg.sliding_window_size <= self.cfg.page_size:
+            self.skipTest("the window must reach past the leaf's own page")
+        if _selected_tree_core_test_backend() == "rust":
+            # needs_incremental_backup is a component method on Python nodes;
+            # the Rust core pins the same contract in its own unit suite.
+            self.skipTest("component-level check is Python-core only")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 2)
+        if len(chain) < 2:
+            self.skipTest("chain too short")
+        parent, leaf = chain[-2], chain[-1]
+        swa = cache.components[ComponentType.SWA]
+        leaf_node = cache.tree_core.node_by_id(leaf)
+        cache.tree_core.set_component_host_value_raw(
+            leaf,
+            ComponentType.SWA,
+            _device_value(cache, leaf, ComponentType.SWA).clone(),
+        )
+
+        self.assertTrue(swa.needs_incremental_backup(leaf_node))
+        xfer = cache.tree_core.build_hicache_transfers(
+            ComponentType.SWA, leaf, CacheTransferPhase.BACKUP_HOST
+        )[0]
+        self.assertEqual(xfer.nodes_to_load, [parent])
+
+        cache.tree_core.set_host_memory_buffer_only()
+        self.assertTrue(swa.needs_incremental_backup(leaf_node))
+        xfer = cache.tree_core.build_hicache_transfers(
+            ComponentType.SWA, leaf, CacheTransferPhase.BACKUP_HOST
+        )[0]
+        self.assertEqual(xfer.nodes_to_load, [leaf])
+
     def test_zero_match_result_carries_node_id_handles(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
