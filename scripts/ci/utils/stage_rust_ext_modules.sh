@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copy the built Rust artifacts into their package-relative paths under
+# Copy the built Rust artifacts into their repository-relative paths under
 # rust-ext-staging/. Shared by both jobs of _pr-test-rust-ext-build.yml, so the
 # archive layout and artifact checks cannot drift between them.
 #
@@ -8,13 +8,12 @@
 # compiled - on a cache hit these are the same bytes that already passed.
 set -euo pipefail
 shopt -s nullglob
-# upload-artifact strips the longest common prefix it matched, so a missing
-# module would silently shift the archive layout.
+# Require the complete native ABI set before publishing the combined archive.
 rm -rf rust-ext-staging
 built=()
 # Same suffix set across modules, or one ABI's Rust-server tests silently skip.
 expected_suffixes=""
-mkdir -p rust-ext-staging/rust_extensions
+mkdir -p rust-ext-staging/python/sglang/srt/rust_extensions
 for module in server grpc multimodal; do
     found=(python/sglang/srt/rust_extensions/_"${module}"*.so)
     if [ ${#found[@]} -eq 0 ]; then
@@ -29,12 +28,12 @@ for module in server grpc multimodal; do
         printf 'have:\n%s\nwant:\n%s\n' "${suffixes}" "${expected_suffixes}"
         exit 1
     fi
-    cp "${found[@]}" rust-ext-staging/rust_extensions/
+    cp "${found[@]}" rust-ext-staging/python/sglang/srt/rust_extensions/
     built+=("${found[@]}")
 done
 
-# CI builds the standalone renderer with Cargo and stages it beside the modules.
-renderer=python/sglang/srt/rust_extensions/sglang-renderer
+# Keep the standalone executable in Rust build output, separate from Python modules.
+renderer=rust/target/release/sglang-renderer
 if [ ! -f "${renderer}" ]; then
     echo "::error::no sglang-renderer executable found"
     exit 1
@@ -43,10 +42,11 @@ if [ ! -x "${renderer}" ]; then
     echo "::error::sglang-renderer is not executable: ${renderer}"
     exit 1
 fi
-cp "${renderer}" rust-ext-staging/rust_extensions/
+mkdir -p rust-ext-staging/rust/target/release
+cp "${renderer}" rust-ext-staging/rust/target/release/
 built+=("${renderer}")
 
-mkdir -p rust-ext-staging/mem_cache/rust_tree_core
+mkdir -p rust-ext-staging/python/sglang/srt/mem_cache/rust_tree_core
 for module in mem_cache mem_cache_inspection; do
     tree_core=(python/sglang/srt/mem_cache/rust_tree_core/"${module}".*.so)
     if [ ${#tree_core[@]} -eq 0 ]; then
@@ -59,7 +59,7 @@ for module in mem_cache mem_cache_inspection; do
         printf 'have:\n%s\nwant:\n%s\n' "${tree_core_suffixes}" "${expected_suffixes}"
         exit 1
     fi
-    cp "${tree_core[@]}" rust-ext-staging/mem_cache/rust_tree_core/
+    cp "${tree_core[@]}" rust-ext-staging/python/sglang/srt/mem_cache/rust_tree_core/
     built+=("${tree_core[@]}")
 done
 max_allowed="${MAX_GLIBC:-}"
