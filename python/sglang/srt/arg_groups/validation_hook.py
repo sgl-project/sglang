@@ -67,9 +67,9 @@ def check_server_args(server_args: Any):
                     "on prefill nodes (disaggregation-mode=prefill)"
                 )
         else:
-            assert (
-                cfg.disable_overlap_schedule
-            ), "Pipeline parallelism is not compatible with overlap schedule"
+            assert cfg.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
             pp_dspark_prefill = (
                 cfg.speculative_algorithm or ""
             ).upper() == "DSPARK" and cfg.disaggregation_mode == "prefill"
