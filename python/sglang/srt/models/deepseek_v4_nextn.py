@@ -25,12 +25,12 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,

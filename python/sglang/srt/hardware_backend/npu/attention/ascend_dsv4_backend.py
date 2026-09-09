@@ -17,11 +17,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_cache_layer_split import (
     LayerSplitDSV4NPUTokenToKVPool,
 )
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -592,23 +592,33 @@ class CompressorAscendBackendMixin:
             return
 
         if fused_fp8_indexer_write:
-            if loc is None:
-                raise RuntimeError(
-                    "DSV4 A5 fused indexer epilog needs a slot mapping, but "
-                    f"loc is None (mode={forward_batch.forward_mode}, "
-                    f"ratio={compressor.ratio}). Writing nothing here would "
-                    "leave the indexer KV cache stale."
+            ls_pool = self._layersplit_pool()
+            owned = ls_pool is None or ls_pool.is_layer_owned(compressor.layer_id)
+            if owned:
+                if loc is None:
+                    raise RuntimeError(
+                        "DSV4 A5 fused indexer epilog needs a slot mapping, but "
+                        f"loc is None (mode={forward_batch.forward_mode}, "
+                        f"ratio={compressor.ratio}). Writing nothing here would "
+                        "leave the indexer KV cache stale."
+                    )
+                torch.ops.custom.indexer_compress_epilog(
+                    indexer_compress_cache=self.token_to_kv_pool.get_compress_buffer(
+                        compressor.layer_id, True
+                    ),
+                    indexer_compress_scale=self.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                        compressor.layer_id, True
+                    ),
+                    x=kv,
+                    slot_mapping=loc.to(torch.int32),
                 )
-            torch.ops.custom.indexer_compress_epilog(
-                indexer_compress_cache=self.token_to_kv_pool.get_compress_buffer(
-                    compressor.layer_id, True
-                ),
-                indexer_compress_scale=self.token_to_kv_pool.get_compress_dequant_scale_buffer(
-                    compressor.layer_id, True
-                ),
-                x=kv,
-                slot_mapping=loc.to(torch.int32),
-            )
+            if ls_pool is not None:
+                # A non-owner must not scatter raw slot ids into its compact
+                # staging rows. Both ranks still launch the owner transfer so
+                # the attn_cp_group collectives stay paired.
+                ls_pool.refresh_remote_copies(
+                    compressor.layer_id, ("index_k", "index_scale")
+                )
             return
 
         self.token_to_kv_pool.set_compress_buffer(
@@ -625,7 +635,7 @@ class C4IndexerAscendBackendMixin:
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
 
-    def _layersplit_pool(self) -> Optional["LayerSplitDSV4NPUTokenToKVPool"]:
+    def _layersplit_pool(self) -> Optional[LayerSplitDSV4NPUTokenToKVPool]:
         """The pool under cache layer split, else None (plain pool)."""
         pool = self.token_to_kv_pool
         return pool if isinstance(pool, LayerSplitDSV4NPUTokenToKVPool) else None
@@ -939,12 +949,8 @@ class DeepseekV4AscendAttnBackend(
         "c4_topk_indices",
         "positions_cmp_padding_c4",
         "positions_cmp_padding_c128",
-        "c4_state_page_table",
-        "c128_state_page_table",
         "c4_loc",
         "c128_loc",
-        "c4_state_loc",
-        "c128_state_loc",
         "start_pos",
         "seqused",
     )
@@ -1083,20 +1089,33 @@ class DeepseekV4AscendAttnBackend(
         )
         return ori_sparse_indices
 
+    def _reset_layersplit_staging(self) -> None:
+        """Drop the previous forward's layer-split compact plan.
+
+        begin_forward_staging only runs on the CP-extend path below, so any
+        other forward reading this pool must not reuse that plan's row map.
+        """
+        pool = self._layersplit_pool()
+        if pool is not None:
+            pool.reset_forward_staging()
+
     def prepare_dsv4_cp_metadata(self, forward_batch: ForwardBatch) -> None:
         if getattr(forward_batch, "dsv4_cp_metadata_prepared", False):
             return
         if getattr(forward_batch, "attn_cp_metadata", None) is None:
             return
         if not forward_batch.forward_mode.is_context_parallel_extend():
+            self._reset_layersplit_staging()
             return
         if forward_batch.forward_mode.is_target_verify():
+            self._reset_layersplit_staging()
             return
 
         # CP-v2 only: the runner builds attn_cp_metadata and registers the
         # strategy; legacy dsa_prefill_cp_mode flows never reach here.
         strategy = get_cp_strategy()
         if strategy is None or strategy.cp_size <= 1:
+            self._reset_layersplit_staging()
             return
 
         fm = self.forward_metadata
@@ -1126,11 +1145,17 @@ class DeepseekV4AscendAttnBackend(
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
-            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-            if seq_lens_cpu is not None:
-                extend_lens = seq_lens_cpu.tolist()
+            # gpu_only batches leave *_cpu unset; the device tensor carries the
+            # authoritative per-request extend lengths.
+            extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+            if extend_seq_lens is not None:
+                extend_lens = extend_seq_lens.cpu().tolist()
             else:
-                extend_lens = [num_tokens]
+                seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                if seq_lens_cpu is not None:
+                    extend_lens = seq_lens_cpu.tolist()
+                else:
+                    extend_lens = [num_tokens]
         extend_lens = [int(x) for x in extend_lens]
         real_num_tokens = min(sum(extend_lens), num_tokens)
 
@@ -1867,6 +1892,9 @@ class DeepseekV4AscendAttnBackend(
         self.forward_metadata = ctx.fm
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        # A non-CP forward never reaches prepare_dsv4_cp_metadata, so drop the
+        # previous CP-extend's compact plan before any non-owned-layer read.
+        self._reset_layersplit_staging()
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
 

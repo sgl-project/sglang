@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 import triton
@@ -18,7 +18,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa
 from sglang.srt.utils.common import ceil_div
 
 

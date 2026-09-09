@@ -26,13 +26,13 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_layer_split_plan import (
     DSV4LayerShardPlan,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DSV4NPUTokenToKVPool,
     NPUDeepSeekV4IndexerPool,
     NPUDeepSeekV4SingleKVPool,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -98,9 +98,9 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
     """
 
     def __init__(self, *args, layer_shard_rank: int, layer_shard_size: int, **kwargs):
-        assert (
-            layer_shard_rank is not None and layer_shard_size > 1
-        ), "LayerSplitDSV4NPUTokenToKVPool requires layer_shard_size > 1"
+        assert layer_shard_rank is not None and layer_shard_size > 1, (
+            "LayerSplitDSV4NPUTokenToKVPool requires layer_shard_size > 1"
+        )
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
@@ -108,9 +108,9 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         # plan needs layer_num / ratios / stage range the base sets before it.
         self._shard_plan: Optional[DSV4LayerShardPlan] = None
         super().__init__(*args, **kwargs)
-        assert (
-            not self._unified_kv
-        ), "Layer split does not support the unified-KV layout yet"
+        assert not self._unified_kv, (
+            "Layer split does not support the unified-KV layout yet"
+        )
         self._init_remote_buffers()
         plan = self._get_shard_plan()
         # Global (absolute) layer range owned by this rank, read by the PD
@@ -230,12 +230,16 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             device = self.device
 
-            def scratch(buffers: List[torch.Tensor], size: int, page_size: int) -> torch.Tensor:
+            def scratch(
+                buffers: List[torch.Tensor], size: int, page_size: int
+            ) -> torch.Tensor:
                 # Shape/dtype mirror the sub-pool's real per-layer buffer, so
                 # A5 packed/indexer formats are picked up without special
                 # cases. A 0-row non-owned placeholder keeps the full shape.
                 buf = buffers[0]
-                return torch.zeros(
+                # empty, not zeros: every row is overwritten by the owner
+                # broadcast before it is read.
+                return torch.empty(
                     _num_pages(size, page_size),
                     buf.shape[1],
                     buf.shape[2],
@@ -273,7 +277,8 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
                 ),
             }
             self._ls_staging = {
-                family: torch.empty_like(buf) for family, buf in self._remote_buffers.items()
+                family: torch.empty_like(buf)
+                for family, buf in self._remote_buffers.items()
             }
         # Broadcast is bitwise-verified correct on hccl; the zbal interposed
         # process group falls back to chunked all-gather.
@@ -281,7 +286,7 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             torch.distributed.get_backend(group.device_group) != "zbal"
         )
         # Async reads: one in-flight launch per family on a side stream, keyed
-        # (layer_id, event, work, mode, selected); consumed before the read.
+        # (layer_id, event, work); consumed before the read.
         self._use_async = self._use_broadcast and envs.SGLANG_DSV4_LS_ASYNC_READ.get()
         self._async_slots: Dict[str, Optional[tuple]] = {
             family: None for family in _REMOTE_FAMILIES
@@ -313,21 +318,19 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         compact remote copies keep the pages in staging rows."""
         group = get_parallel().attn_cp_group
         self._row_maps = {family: None for family in _REMOTE_FAMILIES}
+        # index_k/index_scale are planned by mirroring c4, so a family absent
+        # from `tables` must not keep an older forward's selection.
+        self._staging_pages = {}
         for family, table in tables.items():
             remote = self._remote_buffers.get(family)
             if remote is None or table is None or table.numel() == 0:
-                self._staging_pages.pop(family, None)
                 continue
             flat = table.reshape(-1).to(torch.long)
             in_range = (flat >= 0) & (flat < remote.shape[0])
             mask = torch.zeros(remote.shape[0], dtype=torch.int32, device=flat.device)
-            mask.index_add_(
-                0,
-                flat[in_range],
-                torch.ones(
-                    int(in_range.sum()), dtype=torch.int32, device=flat.device
-                ),
-            )
+            # Only presence matters (nonzero() follows), so a plain index_put
+            # replaces counted index_add_ and its device->host sizing sync.
+            mask[flat[in_range]] = 1
             torch.distributed.all_reduce(mask, group=group.device_group)
             selected = torch.nonzero(mask, as_tuple=False).flatten()
             self._staging_pages[family] = selected
@@ -368,6 +371,32 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         rows = row_map[flat.clamp(0, pages - 1)].reshape(table.shape)
         in_plan = ((flat >= 0) & (flat < pages)).reshape(table.shape)
         return torch.where(in_plan, rows, table).to(table.dtype)
+
+    def is_layer_owned(self, layer_id: int) -> bool:
+        """Public ownership probe for backends writing this pool directly."""
+        return self._is_layer_owned(layer_id)
+
+    def refresh_remote_copies(self, layer_id: int, families: Tuple[str, ...]) -> None:
+        """Drop cached remote copies and pre-launch the owner transfer.
+
+        For a writer that bypasses ``set_compress_buffer`` (the A5 fused indexer
+        epilog) on a layer this rank does not own: the owner's copy is
+        authoritative, so nothing is scattered locally and the next read must
+        re-transfer.
+        """
+        self._invalidate_family(families, layer_id)
+        for family in families:
+            self._launch_async_read(family, layer_id)
+
+    def reset_forward_staging(self) -> None:
+        """Forget the previous forward's compact plan and read cache.
+
+        ``begin_forward_staging`` only runs for CP-extend forwards; any other
+        forward that reads a non-owned layer must not reuse that plan.
+        """
+        self._staging_pages = {}
+        self._row_maps = {family: None for family in _REMOTE_FAMILIES}
+        self._remote_layer_cache = {family: None for family in _REMOTE_FAMILIES}
 
     def _read_layer_buffer(self, family: str, layer_id: int) -> torch.Tensor:
         """This rank's buffer for ``family``/``layer_id``, remote layers included.
@@ -428,6 +457,9 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         if not self._use_async:
             return
         self._consume_async(family)
+        # This transfer overwrites the family's scratch, so a cached remote copy
+        # of a *different* layer no longer describes what that buffer holds.
+        self._remote_layer_cache[family] = None
         local = self._local_family_buffer(family, layer_id)
         remote = self._remote_buffers[family]
         selected = self._staging_pages.get(family)
@@ -483,7 +515,8 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         if local is not None:
             staging[:k].copy_(local.index_select(0, selected))
         torch.distributed.broadcast(
-            staging[:k], src=group.ranks[self._layer_owner_rank(layer_id)],
+            staging[:k],
+            src=group.ranks[self._layer_owner_rank(layer_id)],
             group=group.device_group,
         )
 
@@ -497,7 +530,8 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         """Owner's whole layer buffer broadcast into the receiver's scratch."""
         tensor = local if local is not None else remote
         torch.distributed.broadcast(
-            tensor, src=group.ranks[self._layer_owner_rank(layer_id)],
+            tensor,
+            src=group.ranks[self._layer_owner_rank(layer_id)],
             group=group.device_group,
         )
 
@@ -555,12 +589,21 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             chunk = dst[offset : offset + n]
             if flat_src is not None:
                 chunk.copy_(flat_src.index_select(0, sel))
+            # Stage the collective operand through _staging, as in
+            # _read_via_allgather_chunks: pool-resident multi-MB buffers are the
+            # operand class that corrupts on the zbal/VMM stack.
+            send = (
+                self._staging[: n * row_elems * elem]
+                .view(remote.dtype)
+                .view(n, row_elems)
+            )
+            send.copy_(chunk)
             gathered = torch.empty(
                 (group.world_size, n, row_elems),
                 dtype=remote.dtype,
                 device=remote.device,
             )
-            group.all_gather_into_tensor(gathered, chunk)
+            group.all_gather_into_tensor(gathered, send)
             if flat_src is None:
                 chunk.copy_(gathered[owner_slot])
             offset += n
@@ -612,9 +655,9 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
         row_map = self._row_maps[family]
         page = loc // page_size
         rows = row_map[page.clamp(0, row_map.shape[0] - 1)]
-        return torch.where(
-            rows >= 0, rows * page_size + loc % page_size, loc
-        ).to(loc.dtype)
+        return torch.where(rows >= 0, rows * page_size + loc % page_size, loc).to(
+            loc.dtype
+        )
 
     def get_compress_buffer(
         self,
@@ -745,16 +788,19 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
             [buf[0].nbytes for buf in buffers],
         )
 
-    def get_c128_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+    def get_request_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        # Owned C128 state only; item granularity mirrors the base pool (128).
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
         for idx in self._get_shard_plan().owned_stage_local_ids("c128"):
             pool = self.compress_state_pools[idx]
+            if pool is None:
+                continue
             state = pool.kv_score_buffer.kv_score
             data_ptrs.append(state.data_ptr())
             data_lens.append(state.nbytes)
-            item_lens.append(state[0].nbytes * pool.ring_size)
+            item_lens.append(state[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
 
     def _owned_bucket_buffers(
@@ -774,10 +820,11 @@ class LayerSplitDSV4NPUTokenToKVPool(DSV4NPUTokenToKVPool):
 
     def get_state_layer_ids(self) -> List[int]:
         plan = self._get_shard_plan()
-        return (
-            list(range(plan.shard_start, plan.shard_end))
-            + self._owned_global_bucket_ids("c4") * 2
-        )
+        ids = list(range(plan.shard_start, plan.shard_end))
+        if not is_npu_arch35():
+            # A5 ships C4 state as its own DSV4_C4_STATE component instead.
+            ids += self._owned_global_bucket_ids("c4") * 2
+        return ids
 
     def get_c128_layer_ids(self) -> List[int]:
         return self._owned_global_bucket_ids("c128")

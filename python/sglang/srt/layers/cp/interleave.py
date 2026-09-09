@@ -216,9 +216,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         # Equal per-rank lengths: one interleave copy restores the original
         # token order; cheaper than the index_select fallback below.
         actual = metadata.per_rank_actual_token
-        if (
-            total_tokens == self.cp_size * physical_rank_len
-            and all(int(n) == physical_rank_len for n in actual)
+        if total_tokens == self.cp_size * physical_rank_len and all(
+            int(n) == physical_rank_len for n in actual
         ):
             return (
                 gathered.view(self.cp_size, physical_rank_len, *x.shape[1:])

@@ -75,6 +75,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
             math.ceil(bytes_per_token / _NPU_ARCH35_KV_ROW_ALIGNMENT)
             * _NPU_ARCH35_KV_ROW_ALIGNMENT
         )
+
     def _num_pages_for(self, local_layer_idx: int) -> int:
         """Physical pages for this layer's buffer; layer split narrows it."""
         return (self.size + self.kernel_page_size + 1) // self.kernel_page_size
@@ -495,15 +496,15 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return self._c4_layer_ids() * 3
 
     def get_state_layer_ids(self) -> List[int]:
-        """Ids for ``get_state_buf_infos``: per-layer SWA KV, then c4
-        attention and c4 indexer states."""
-        return (
-            list(range(self._stage_start, self._stage_end))
-            + self._c4_layer_ids() * 2
-        )
+        """Ids for ``get_state_buf_infos``: per-layer SWA KV, then (pre-A5)
+        c4 attention and c4 indexer states."""
+        ids = list(range(self._stage_start, self._stage_end))
+        if not is_npu_arch35():
+            ids += self._c4_layer_ids() * 2
+        return ids
 
     def get_c128_layer_ids(self) -> List[int]:
-        """Ids for ``get_c128_kv_buf_infos`` / ``get_c128_state_buf_infos``."""
+        """Ids for ``get_c128_kv_buf_infos`` / ``get_request_state_buf_infos``."""
         return bucket_layer_ids(
             self.compression_ratios, self._stage_start, self._stage_end, 128
         )
