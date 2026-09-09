@@ -18,6 +18,9 @@ class HiSparseDemandInputs:
     seq_lens: torch.Tensor
     mtp_committed_lens: torch.Tensor
     cache_rows: int
+    source_counts: Optional[torch.Tensor] = None
+    group_slots: Optional[torch.Tensor] = None
+    group_role: int = 0  # 0 independent, 1 anchor, 2 fixed-slot follower
 
     def run(
         self,
@@ -54,7 +57,7 @@ class HiSparseDemandInputs:
         )
         assert q.shape[1] == 1
         assert indices.shape[-1] == 2048
-        assert self.cache_rows == 4096
+        assert self.cache_rows in (4096, 8192)
         assert self.cache_tags.dtype == torch.int64
         assert self.cache_tags.shape[1] == self.cache_rows
         assert self.decode_calls.dtype == torch.int32
@@ -68,28 +71,56 @@ class HiSparseDemandInputs:
         )
         assert self.mtp_committed_lens.dtype == torch.int32
         assert self.mtp_committed_lens.shape == (indices.shape[0],)
-
-        out, softmax_lse, _, _ = (
-            torch.ops.sgl_kernel.sparse_decode_hisparse_demand_fwd.default(
-                q,
-                k_cache,
-                indices,
-                topk_length,
-                attn_sink,
-                tile_scheduler_metadata,
-                num_splits,
-                head_dim_v,
-                softmax_scale,
-                self.host_kv,
-                self.host_locs,
-                self.device_locs,
-                self.cache_tags,
-                self.decode_calls,
-                self.num_real_reqs,
-                self.req_pool_indices,
-                self.seq_lens,
-                self.mtp_committed_lens,
-                self.cache_rows,
+        if self.source_counts is not None:
+            # Diagnostic-only: count the historical union of four verify rows.
+            # These extra kernels and the native counters are excluded from timing.
+            assert self.source_counts.shape == (self.cache_tags.shape[0], 8)
+            historical = (indices[:, 0] >= 0) & (
+                indices[:, 0] < self.mtp_committed_lens[:, None]
             )
+            groups = (
+                torch.where(historical, self.host_locs, -1)
+                .reshape(-1, 4 * 2048)
+                .sort(dim=1)
+                .values
+            )
+            unique = (groups[:, 0] >= 0).to(torch.int64)
+            unique += ((groups[:, 1:] >= 0) & (groups[:, 1:] != groups[:, :-1])).sum(1)
+            real = (
+                torch.arange(groups.shape[0], device=groups.device) * 4
+                < self.num_real_reqs
+            )
+            slots = torch.where(real, self.req_pool_indices[::4], 0)
+            self.source_counts[:, 6].scatter_add_(0, slots, unique * real)
+            self.source_counts[:, 7].scatter_add_(0, slots, real.to(torch.int64))
+
+        op = torch.ops.sgl_kernel.sparse_decode_hisparse_demand_fwd.default
+        tail = () if self.source_counts is None else (self.source_counts,)
+        if self.group_role:
+            assert self.group_role in (1, 2) and q.shape[2] == 64
+            assert self.group_slots is not None
+            op = torch.ops.sgl_kernel.sparse_decode_hisparse_group_fwd.default
+            tail = (self.group_slots, self.group_role, self.source_counts)
+        out, softmax_lse, _, _ = op(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            tile_scheduler_metadata,
+            num_splits,
+            head_dim_v,
+            softmax_scale,
+            self.host_kv,
+            self.host_locs,
+            self.device_locs,
+            self.cache_tags,
+            self.decode_calls,
+            self.num_real_reqs,
+            self.req_pool_indices,
+            self.seq_lens,
+            self.mtp_committed_lens,
+            self.cache_rows,
+            *tail,
         )
         return out, softmax_lse

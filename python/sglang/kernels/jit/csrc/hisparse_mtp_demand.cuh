@@ -11,6 +11,8 @@ __global__ void backup_window_mla_kernel(
     const int32_t* __restrict__ accept_index,
     int64_t num_items,
     int64_t item_size_bytes,
+    int64_t src_stride_bytes,
+    int64_t dst_stride_bytes,
     int64_t num_layers) {
   constexpr int kWarp = 32;
   const int lane = threadIdx.x & (kWarp - 1);
@@ -18,11 +20,11 @@ __global__ void backup_window_mla_kernel(
   const int64_t total = num_items * num_layers;
   if (warp >= total) return;
   const int64_t item = warp % num_items;
-  if (accept_index[item] < 0) return;
+  if (accept_index != nullptr && accept_index[item] < 0) return;
   const int64_t layer = warp / num_items;
   const int64_t chunks = item_size_bytes / static_cast<int64_t>(sizeof(uint64_t));
-  const auto* src = reinterpret_cast<const uint64_t*>(src_layers[layer]) + src_indices[item] * chunks;
-  auto* dst = reinterpret_cast<uint64_t*>(dst_layers[layer]) + dst_indices[item] * chunks;
+  const auto* src = reinterpret_cast<const uint64_t*>(src_layers[layer] + src_indices[item] * src_stride_bytes);
+  auto* dst = reinterpret_cast<uint64_t*>(dst_layers[layer] + dst_indices[item] * dst_stride_bytes);
   for (int64_t chunk = lane; chunk < chunks; chunk += kWarp) {
     uint64_t value;
     asm volatile("ld.global.nc.b64 %0, [%1];" : "=l"(value) : "l"(src + chunk) : "memory");
@@ -39,6 +41,8 @@ void backup_mtp_demand_window_mla(
     tvm::ffi::TensorView dst_indices,
     tvm::ffi::TensorView accept_index,
     int64_t item_size_bytes,
+    int64_t src_stride_bytes,
+    int64_t dst_stride_bytes,
     int64_t num_layers) {
   using namespace host;
   constexpr int kThreads = 128;
@@ -47,8 +51,13 @@ void backup_mtp_demand_window_mla(
       item_size_bytes > 0 && item_size_bytes % 8 == 0,
       "MTP Demand writeback item size must be positive and 8-byte aligned");
   RuntimeCheck(
-      src_indices.numel() == dst_indices.numel() && src_indices.numel() == accept_index.numel(),
+      src_indices.numel() == dst_indices.numel() &&
+          (accept_index.numel() == 0 || src_indices.numel() == accept_index.numel()),
       "MTP Demand writeback index shape mismatch");
+  RuntimeCheck(
+      src_stride_bytes >= item_size_bytes && dst_stride_bytes >= item_size_bytes && src_stride_bytes % 8 == 0 &&
+          dst_stride_bytes % 8 == 0,
+      "MTP Demand transfer strides must cover payload and be 8-byte aligned");
   RuntimeCheck(
       src_layers.numel() >= num_layers && dst_layers.numel() >= num_layers,
       "MTP Demand writeback layer pointer table is too small");
@@ -61,9 +70,11 @@ void backup_mtp_demand_window_mla(
       static_cast<const int64_t*>(dst_layers.data_ptr()),
       static_cast<const int64_t*>(src_indices.data_ptr()),
       static_cast<const int64_t*>(dst_indices.data_ptr()),
-      static_cast<const int32_t*>(accept_index.data_ptr()),
+      accept_index.numel() == 0 ? nullptr : static_cast<const int32_t*>(accept_index.data_ptr()),
       num_items,
       item_size_bytes,
+      src_stride_bytes,
+      dst_stride_bytes,
       num_layers);
 }
 

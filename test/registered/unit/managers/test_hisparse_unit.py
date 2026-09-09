@@ -13,7 +13,7 @@ import unittest
 from array import array
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -70,18 +70,21 @@ class TestHiSparseMTPDemandSelector(unittest.TestCase):
     def test_hisparse_config_parses_mtp_demand_buffer_as_opt_in(self):
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-        disabled = parse_hisparse_config(SimpleNamespace(hisparse_config=None))
-        enabled = parse_hisparse_config(
-            SimpleNamespace(hisparse_config='{"mtp_demand_buffer": true}')
-        )
+        def parse(value):
+            with patch(
+                "sglang.srt.mem_cache.sparsity.factory.get_memory",
+                return_value=SimpleNamespace(hisparse_config=value),
+            ):
+                return parse_hisparse_config()
+
+        disabled = parse(None)
+        enabled = parse('{"mtp_demand_buffer": true}')
 
         self.assertFalse(disabled.mtp_demand_buffer)
         self.assertTrue(enabled.mtp_demand_buffer)
 
         with self.assertRaisesRegex(ValueError, "mtp_demand_buffer must be a boolean"):
-            parse_hisparse_config(
-                SimpleNamespace(hisparse_config='{"mtp_demand_buffer": 1}')
-            )
+            parse('{"mtp_demand_buffer": 1}')
 
     def test_generic_free_clears_mapping_without_cpu_scalar_copy(self):
         from sglang.srt.mem_cache.allocator.hisparse import (
@@ -571,6 +574,7 @@ class TestHiSparseMTPDemandSelector(unittest.TestCase):
         coordinator.mtp_demand_device_locs = torch.zeros((2, 4102), dtype=torch.int64)
         coordinator.mtp_demand_decode_calls = torch.ones(2, dtype=torch.int32)
         coordinator.mtp_demand_host_kv = torch.empty((1, 32, 656), dtype=torch.uint8)
+        coordinator.demand_group_roles = None
         coordinator.mtp_demand_num_real_query_rows = torch.tensor(
             [2], dtype=torch.int32
         )
@@ -750,8 +754,8 @@ class TestHiSparseMTPDemandSelector(unittest.TestCase):
             forward_mode=SimpleNamespace(is_idle=lambda: False),
             hisparse_coordinator=coordinator,
             reqs=[
-                SimpleNamespace(kv_committed_len=128),
-                SimpleNamespace(kv_committed_len=4094),
+                SimpleNamespace(kv=ReqKvInfo(kv_committed_len=128)),
+                SimpleNamespace(kv=ReqKvInfo(kv_committed_len=4094)),
             ],
             req_pool_indices=torch.tensor([3, 7], dtype=torch.int64),
             req_pool_indices_cpu=torch.tensor([3, 7], dtype=torch.int64),
@@ -785,8 +789,8 @@ class TestHiSparseMTPDemandSelector(unittest.TestCase):
             forward_mode=SimpleNamespace(is_idle=lambda: False),
             hisparse_coordinator=coordinator,
             reqs=[
-                SimpleNamespace(kv_committed_len=124),
-                SimpleNamespace(kv_committed_len=4090),
+                SimpleNamespace(kv=ReqKvInfo(kv_committed_len=124)),
+                SimpleNamespace(kv=ReqKvInfo(kv_committed_len=4090)),
             ],
             req_pool_indices=torch.tensor([3, 7], dtype=torch.int64),
             req_pool_indices_cpu=torch.tensor([3, 7], dtype=torch.int64),
@@ -929,7 +933,7 @@ class TestHiSparseMTPDemandSelector(unittest.TestCase):
         req = SimpleNamespace(
             req_pool_idx=1,
             rid="capacity-order",
-            kv=SimpleNamespace(kv_allocated_len=128),
+            kv=ReqKvInfo(req_pool_idx=1, kv_allocated_len=128),
         )
 
         coordinator.alloc_device_buffer(req)
@@ -978,7 +982,7 @@ class TestHiSparseMTPDemandSelector(unittest.TestCase):
         req = SimpleNamespace(
             req_pool_idx=0,
             rid="padded-arange",
-            kv=SimpleNamespace(kv_allocated_len=128),
+            kv=ReqKvInfo(req_pool_idx=0, kv_allocated_len=128),
         )
 
         coordinator.alloc_device_buffer(req)
@@ -1293,8 +1297,8 @@ class TestHiSparseMTPNative(unittest.TestCase):
                 prepare_verify_slots_spec_v2=lambda **kwargs: calls.append(kwargs)
             ),
             reqs=[
-                SimpleNamespace(kv_committed_len=128),
-                SimpleNamespace(kv_committed_len=4094),
+                SimpleNamespace(kv=ReqKvInfo(kv_committed_len=128)),
+                SimpleNamespace(kv=ReqKvInfo(kv_committed_len=4094)),
             ],
             req_pool_indices=torch.tensor([3, 7], dtype=torch.int64),
             req_pool_indices_cpu=torch.tensor([3, 7], dtype=torch.int64),

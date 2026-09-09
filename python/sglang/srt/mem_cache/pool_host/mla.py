@@ -51,6 +51,19 @@ logger = logging.getLogger(__name__)
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
     mtp_draft_device_pools: tuple[MLATokenToKVPool, ...] = ()
+    host_row_stride_bytes: Optional[int] = None
+
+    @property
+    def storage_dim(self):
+        return (
+            self.kv_cache_dim
+            if self.host_row_stride_bytes is None
+            else self.host_row_stride_bytes // self.dtype.itemsize
+        )
+
+    @property
+    def has_row_padding(self):
+        return self.storage_dim != self.kv_cache_dim
 
     def __init__(
         self,
@@ -68,9 +81,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         dcp_rank: int = 0,
         *,
         pool_label: str = "kv",
+        host_row_stride_bytes: Optional[int] = None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
+        self.host_row_stride_bytes = host_row_stride_bytes
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -104,6 +119,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        if self.has_row_padding:
+            self._unmasked_accept = torch.empty(
+                0, dtype=torch.int32, device=self.device_pool.device
+            )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
             self.packed_device_data_ptrs = torch.cat(
@@ -130,7 +149,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.kv_cache_dim = self.override_kv_cache_dim or (
             self.kv_lora_rank + self.qk_rope_head_dim
         )
-        return self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+        if self.host_row_stride_bytes is not None:
+            if not (
+                self.host_row_stride_bytes == 768
+                and self.kv_cache_dim == 656
+                and self.dtype.itemsize == 1
+                and self.layout == "layer_first"
+                and self.dcp_size == 1
+                and not self.mtp_draft_device_pools
+                and not self.device_pool.layer_shard_enabled
+                and _is_cuda
+            ):
+                raise ValueError(
+                    "Padded Demand Host rows require CUDA layer-first V32 without layer/DCP sharding"
+                )
+        return self.storage_dim * self.dtype.itemsize * self.layer_num
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
@@ -141,7 +174,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self.layer_num,
                 self.size,
                 1,
-                self.kv_cache_dim,
+                self.storage_dim,
             )
         elif self.layout == "page_first":
             dims = (
@@ -196,7 +229,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return self.k_buffer
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+        self.token_stride_size = self.storage_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -245,6 +278,39 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device=self.device_pool.device,
         )
 
+    def _transfer_padded_rows(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        *,
+        to_host: bool,
+        host_layer_id=None,
+        device_layer_id=None,
+    ):
+        from sglang.kernels.ops.kvcache.hisparse import backup_mtp_demand_window_mla
+
+        if io_backend != "kernel":
+            raise ValueError("Padded Demand Host rows require the kernel IO backend")
+        host_ptrs = self.data_ptrs
+        device_ptrs = device_pool.data_ptrs
+        if host_layer_id is not None:
+            host_ptrs = host_ptrs[host_layer_id : host_layer_id + 1]
+            device_ptrs = device_ptrs[device_layer_id : device_layer_id + 1]
+        payload = self.kv_cache_dim * self.dtype.itemsize
+        backup_mtp_demand_window_mla(
+            src_layers=device_ptrs if to_host else host_ptrs,
+            dst_layers=host_ptrs if to_host else device_ptrs,
+            src_indices=device_indices if to_host else host_indices,
+            dst_indices=host_indices if to_host else device_indices,
+            accept_index=self._unmasked_accept,
+            item_size=payload,
+            num_layers=host_ptrs.numel(),
+            src_stride=payload if to_host else self.token_stride_size,
+            dst_stride=self.token_stride_size if to_host else payload,
+        )
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -263,6 +329,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
 
+        if self.has_row_padding:
+            self._transfer_padded_rows(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend,
+                to_host=False,
+                host_layer_id=host_layer_id,
+                device_layer_id=device_layer_id,
+            )
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -358,6 +435,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
 
+        if self.has_row_padding:
+            self._transfer_padded_rows(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend,
+                to_host=True,
+                host_layer_id=host_layer_id,
+                device_layer_id=device_layer_id,
+            )
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -423,6 +511,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
         device_indices = self.maybe_dcp_kernel_indices(device_indices)
+        if self.has_row_padding:
+            self._transfer_padded_rows(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend,
+                to_host=True,
+            )
+            return
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
@@ -556,7 +653,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self.layer_num,
                 self.page_size,
                 1,
-                self.kv_cache_dim,
+                self.storage_dim,
             ),
             dtype=self.dtype,
             device=self.device,
@@ -569,7 +666,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self.layer_num,
                 self.page_size,
                 1,
-                self.kv_cache_dim,
+                self.storage_dim,
             )
         elif self.layout == "page_first":
             self.kv_buffer[index : index + self.page_size, :, :, :] = data_page.reshape(
@@ -603,11 +700,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 for layer_id in range(self.layer_num):
                     k_ptr = (
                         kv_buffer_data_ptr
-                        + indices[index] * self.kv_cache_dim * self.dtype.itemsize
-                        + layer_id * self.size * self.kv_cache_dim * self.dtype.itemsize
+                        + indices[index] * self.token_stride_size
+                        + layer_id * self.size * self.token_stride_size
                     )
                     ptr_list.append(k_ptr)
-            element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
+            element_size = self.page_size * self.token_stride_size
             element_size_list = [element_size] * len(ptr_list)
         elif self.layout in ["page_first", "page_first_direct"]:
             for index in range(0, len(indices), self.page_size):

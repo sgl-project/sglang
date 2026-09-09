@@ -59,6 +59,20 @@ class HiSparseTokenStats(NamedTuple):
     host_token_usage: float
 
 
+def resolve_demand_group_roles(hf_text_config) -> List[int]:
+    """One placement owner per actual IndexShare group; zero means legacy."""
+    shared = [
+        dsa_layer_skips_topk(hf_text_config, i)
+        for i in range(hf_text_config.num_hidden_layers)
+    ]
+    if shared and shared[0]:
+        raise ValueError("Demand group cannot start with an unbound shared layer")
+    return [
+        2 if skip else (1 if i + 1 < len(shared) and shared[i + 1] else 0)
+        for i, skip in enumerate(shared)
+    ]
+
+
 def resolve_shared_index_layers(
     *,
     hf_text_config,
@@ -139,10 +153,13 @@ class HiSparseCoordinator:
         shared_index_layers: Optional[List[bool]] = None,
         mtp_num_rows: int = 0,
         enable_mtp_demand_buffer: bool = False,
+        demand_group_roles: Optional[List[int]] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
+        self.demand_group_roles = demand_group_roles
+        self.mtp_group_slots = None
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.swap_in_block_size = swap_in_block_size
@@ -188,9 +205,16 @@ class HiSparseCoordinator:
                 page_size=self.mem_pool_device.page_size,
                 layout="layer_first",
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+                host_row_stride_bytes=(
+                    envs.SGLANG_TEST_HISPARSE_DEMAND_HOST_STRIDE.get()
+                    if enable_mtp_demand_buffer
+                    and envs.SGLANG_TEST_HISPARSE_DEMAND_HOST_STRIDE.get() != 656
+                    else None
+                ),
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        self.padded_demand_host = getattr(self.mem_pool_host, "has_row_padding", False)
         self.mtp_num_rows = mtp_num_rows if not self.is_dsv4_hisparse else 0
         self.mtp_demand_buffer_enabled = bool(
             enable_mtp_demand_buffer
@@ -198,8 +222,10 @@ class HiSparseCoordinator:
             and self.top_k == 2048
             and self.device_buffer_size == 4096
             and self.page_size == 64
-            and self.item_size_bytes == 656
+            and self.item_size_bytes in (656, 768)
         )
+        if self.padded_demand_host and not self.mtp_demand_buffer_enabled:
+            raise ValueError("Padded Host rows require the direct MTP Demand layout")
         if enable_mtp_demand_buffer and not self.mtp_demand_buffer_enabled:
             logger.warning(
                 "HiSparse MTP Demand layout is unsupported; falling back to "
@@ -216,7 +242,16 @@ class HiSparseCoordinator:
         )
         if self.mtp_union_enabled:
             logger.info("HiSparse MTP union buffer enabled")
-        self.mtp_demand_cache_rows = 4096
+        self.mtp_demand_cache_rows = (
+            envs.SGLANG_TEST_HISPARSE_DEMAND_CACHE_ROWS.get()
+            if self.mtp_demand_buffer_enabled
+            else 4096
+        )
+        if self.mtp_demand_cache_rows not in (4096, 8192):
+            raise ValueError("Demand cache rows must be 4096 or 8192")
+        if self.mtp_demand_buffer_enabled:
+            logger.info("HiSparse MTP Demand cache rows=%d", self.mtp_demand_cache_rows)
+            logger.info("HiSparse MTP Demand host stride=%d", self.item_size_bytes)
         self.mtp_staging_size = (
             0
             if self.mtp_demand_buffer_enabled
@@ -279,7 +314,31 @@ class HiSparseCoordinator:
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
+        if demand_group_roles is not None:
+            if (
+                not self.mtp_demand_buffer_enabled
+                or len(demand_group_roles) != layer_num
+            ):
+                raise ValueError(
+                    "Demand group plan requires matching full-layer Demand layout"
+                )
+            self.mtp_group_slots = torch.full(
+                (max_num_req_slots * 4, self.top_k),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            logger.info(
+                "HiSparse group plan: anchors=%d followers=%d",
+                demand_group_roles.count(1),
+                demand_group_roles.count(2),
+            )
+        self.mtp_demand_source_counts = None
         if self.mtp_demand_buffer_enabled:
+            if envs.SGLANG_DEBUG_HISPARSE_DEMAND_SOURCE_COUNTS.get():
+                self.mtp_demand_source_counts = torch.zeros(
+                    (layer_num, max_num_req_slots, 8), dtype=torch.int64, device=device
+                )
             device_dtype = self.mem_pool_device.get_key_buffer(
                 self.mem_pool_device.start_layer
             ).dtype
@@ -537,6 +596,21 @@ class HiSparseCoordinator:
             seq_lens=seq_lens,
             mtp_committed_lens=self.mtp_demand_expanded_committed_lens[:rows],
             cache_rows=self.mtp_demand_cache_rows,
+            **(
+                {
+                    "group_role": self.demand_group_roles[local_layer_id],
+                    "group_slots": self.mtp_group_slots[:rows]
+                    if self.demand_group_roles[local_layer_id]
+                    else None,
+                }
+                if self.demand_group_roles is not None
+                else {}
+            ),
+            **(
+                {"source_counts": self.mtp_demand_source_counts[local_layer_id]}
+                if getattr(self, "mtp_demand_source_counts", None) is not None
+                else {}
+            ),
         )
 
     def prepare_mtp_demand_verify(
@@ -1615,6 +1689,7 @@ class HiSparseCoordinator:
                 accept_index=accept_index,
                 item_size=self.mem_pool_device.bytes_per_token,
                 num_layers=self.mem_pool_device.layer_num,
+                dst_stride=self.mem_pool_host.token_stride_size,
             )
             self._backup_done_event.record()
             if host_locs.is_cuda:
@@ -1769,6 +1844,37 @@ class HiSparseCoordinator:
         self.finish_pending_draft_extend_backup()
         self.finish_pending_mtp_demand_commit()
 
+        if getattr(self, "mtp_demand_source_counts", None) is not None:
+            device_module.synchronize()
+            slot = req.kv.req_pool_idx
+            logger.info(
+                "Demand source counts rid=%s buckets=invalid,overlay,ready,owner,filling_host,noslot_host,unique_host_sum,verify_calls "
+                "per_layer=%s occupied_per_layer=%s generations=%s",
+                req.rid,
+                self.mtp_demand_source_counts[:, slot].cpu().tolist(),
+                (self.mtp_demand_cache_tags[:, slot] != 0).sum(dim=-1).cpu().tolist(),
+                self.mtp_demand_decode_calls[slot].item(),
+            )
+            # Request-end diagnostic only; never read back in the timed path.
+            # Scratch can already describe an idle/new batch, so retain row-slot
+            # identity and label this as a scratch snapshot, not every verify.
+            real_rows = int(self.mtp_demand_num_real_query_rows.item())
+            row_slots = self.mtp_demand_expanded_req_pool_indices[:real_rows].cpu()
+            selected = row_slots == slot
+            logger.info(
+                "Demand last-layer scratch rid=%s slot=%s real_rows=%s "
+                "host_locs=%s logical_indices=%s committed_lens=%s cache_tags=%s",
+                req.rid,
+                slot,
+                real_rows,
+                self.top_k_host_locs_buffer[:real_rows].cpu()[selected].tolist(),
+                self.raw_indices_buffer[:real_rows].cpu()[selected].tolist(),
+                self.mtp_demand_expanded_committed_lens[:real_rows]
+                .cpu()[selected]
+                .tolist(),
+                self.mtp_demand_cache_tags[-1, slot].cpu().tolist(),
+            )
+            self.mtp_demand_source_counts[:, slot].zero_()
         self._reset_mtp_demand_request_state(req.kv.req_pool_idx)
         self._free_mtp_demand_buffer(req.kv.req_pool_idx)
         self._reset_mtp_union_request_state(req.kv.req_pool_idx)
@@ -1836,6 +1942,8 @@ class HiSparseCoordinator:
         record_plan (set on the anchor of a shared-index group) also records the
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
         """
+        if getattr(self, "padded_demand_host", False):
+            raise RuntimeError("Padded Demand Host supports direct target verify only")
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
 
@@ -1878,6 +1986,8 @@ class HiSparseCoordinator:
     def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
         (IO-only; the anchor's slot table stays valid -- lockstep layout)."""
+        if getattr(self, "padded_demand_host", False):
+            raise RuntimeError("Padded Demand Host supports direct target verify only")
         copy_cache_planned_mla(
             miss_src=self._miss_src[:num_reqs],
             miss_dst=self._miss_dst[:num_reqs],
@@ -1903,6 +2013,8 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        if getattr(self, "padded_demand_host", False):
+            raise RuntimeError("Padded Demand Host supports direct target verify only")
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
                 req_pool_indices, compressed_seq_lens, top_k_result, layer_id
@@ -1947,6 +2059,8 @@ class HiSparseCoordinator:
         layer_id: int,
     ) -> torch.Tensor:
         """Run the original request-major multi-step HiSparse MTP swap."""
+        if getattr(self, "padded_demand_host", False):
+            raise RuntimeError("Padded Demand Host supports direct target verify only")
         if self.is_dsv4_hisparse:
             raise NotImplementedError(
                 "native multi-step HiSparse is currently restricted to GLM MLA"

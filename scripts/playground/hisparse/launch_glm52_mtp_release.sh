@@ -8,6 +8,11 @@ source_root="${SOURCE_ROOT:-/home/local/workspace/cedar-orbit-src-release}"
 runtime_root="${RUNTIME_ROOT:-/home/local/workspace/cedar-orbit-runtime-release}"
 model_path="${MODEL_PATH:-/home/models/GLM-5.2-W4AFP8}"
 max_total_tokens="${MAX_TOTAL_TOKENS:-300000}"
+index_share="${INDEX_SHARE_FOR_MTP_ITERATION:-false}"
+case "$index_share" in
+  true|false) ;;
+  *) echo "INDEX_SHARE_FOR_MTP_ITERATION must be true or false" >&2; exit 2 ;;
+esac
 device_buffer_size=4096
 native_hisparse_config="{\"top_k\":2048,\"device_buffer_size\":${device_buffer_size},\"host_to_device_ratio\":1}"
 demand_hisparse_config="{\"top_k\":2048,\"device_buffer_size\":${device_buffer_size},\"host_to_device_ratio\":1,\"mtp_demand_buffer\":true}"
@@ -107,7 +112,7 @@ setsid env \
   "${hisparse_args[@]}" \
   --disable-radix-cache --disable-prefill-cuda-graph --cuda-graph-max-bs 2 \
   "${cuda_graph_args[@]}" \
-  --json-model-override-args '{"index_share_for_mtp_iteration":false}' \
+  --json-model-override-args "{\"index_share_for_mtp_iteration\":$index_share}" \
   --random-seed 1234 --skip-tokenizer-init --trust-remote-code --skip-server-warmup \
   --decode-log-interval 1 --watchdog-timeout 300 \
   --speculative-algorithm EAGLE --speculative-num-steps 3 \

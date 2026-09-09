@@ -301,13 +301,18 @@ def backup_mtp_demand_window_mla(
     accept_index: torch.Tensor,
     item_size: int,
     num_layers: int,
+    src_stride: int | None = None,
+    dst_stride: int | None = None,
 ) -> None:
-    """Write accepted fixed-width MTP rows with layer-parallel GPU workers."""
+    """Copy payload rows; an empty accept_index means copy every row."""
     assert src_layers.dtype == dst_layers.dtype
     assert src_layers.dtype in (torch.int64, torch.uint64)
     assert src_indices.dtype == dst_indices.dtype == torch.int64
     assert accept_index.dtype == torch.int32
-    assert src_indices.numel() == dst_indices.numel() == accept_index.numel()
+    assert src_indices.numel() == dst_indices.numel()
+    assert accept_index.numel() in (0, src_indices.numel())
+    if src_indices.numel() == 0:
+        return
     _jit_mtp_demand_writeback_module().backup_mtp_demand_window_mla(
         src_layers,
         dst_layers,
@@ -315,6 +320,8 @@ def backup_mtp_demand_window_mla(
         dst_indices,
         accept_index,
         item_size,
+        item_size if src_stride is None else src_stride,
+        item_size if dst_stride is None else dst_stride,
         num_layers,
     )
 

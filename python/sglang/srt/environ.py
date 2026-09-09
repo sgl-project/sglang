@@ -486,6 +486,10 @@ class Envs:
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    SGLANG_DEBUG_HISPARSE_DEMAND_SOURCE_COUNTS = EnvBool(False)
+    SGLANG_TEST_HISPARSE_DEMAND_CACHE_ROWS = EnvInt(4096)
+    SGLANG_TEST_HISPARSE_DEMAND_HOST_STRIDE = EnvInt(656)
+    SGLANG_TEST_HISPARSE_GROUP_PLAN = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.

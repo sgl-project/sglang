@@ -1,7 +1,7 @@
 diff -ruN base/csrc/api/hisparse_demand.h final/csrc/api/hisparse_demand.h
 --- base/csrc/api/hisparse_demand.h	1970-01-01 08:00:00
 +++ final/csrc/api/hisparse_demand.h	2026-08-23 21:59:33
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,174 @@
 +#pragma once
 +
 +#include <optional>
@@ -19,6 +19,9 @@ diff -ruN base/csrc/api/hisparse_demand.h final/csrc/api/hisparse_demand.h
 +    std::optional<at::Tensor> seq_lens;
 +    std::optional<at::Tensor> mtp_committed_lens;
 +    int64_t cache_rows = 0;
++    std::optional<at::Tensor> source_counts;
++    std::optional<at::Tensor> group_slots;
++    int group_role = 0;
 +
 +    bool enabled() const {
 +        return host_kv.has_value();
@@ -90,7 +93,7 @@ diff -ruN base/csrc/api/hisparse_demand.h final/csrc/api/hisparse_demand.h
 +        TORCH_CHECK(head_dim == 576, "HiSparse Demand only supports V32 KV rows");
 +        TORCH_CHECK(query_length == 1, "HiSparse Demand requires s_q == 1");
 +        TORCH_CHECK(topk == 2048, "HiSparse Demand requires topk == 2048");
-+        TORCH_CHECK(cache_rows == 4096, "HiSparse Demand requires cache_rows == 4096");
++        TORCH_CHECK(cache_rows == 4096 || cache_rows == 8192, "HiSparse Demand requires cache_rows in {4096, 8192}");
 +        TORCH_CHECK(!have_extra_kcache, "HiSparse Demand does not support extra KV");
 +        TORCH_CHECK(!have_topk_length, "HiSparse Demand does not support topk_length");
 +        TORCH_CHECK(!have_attn_sink, "HiSparse Demand does not support attn_sink");
@@ -102,8 +105,8 @@ diff -ruN base/csrc/api/hisparse_demand.h final/csrc/api/hisparse_demand.h
 +            "HiSparse Demand host KV dtype must match device KV"
 +        );
 +        TORCH_CHECK(
-+            host_kv->element_size() == 1 && host_kv->size(-1) == 656,
-+            "HiSparse Demand host KV must contain contiguous 656-byte rows"
++            host_kv->element_size() == 1 && (host_kv->size(-1) == 656 || host_kv->size(-1) == 768),
++            "HiSparse Demand host KV must contain contiguous 656- or 768-byte rows"
 +        );
 +        TORCH_CHECK(
 +            host_locs->dim() == 2 && host_locs->size(0) == batch_size &&
@@ -130,6 +133,20 @@ diff -ruN base/csrc/api/hisparse_demand.h final/csrc/api/hisparse_demand.h
 +        KU_CHECK_SHAPE(req_pool_indices, batch_size);
 +        KU_CHECK_SHAPE(seq_lens, batch_size);
 +        KU_CHECK_SHAPE(mtp_committed_lens, batch_size);
++        TORCH_CHECK(group_role >= 0 && group_role <= 2, "invalid group role");
++        TORCH_CHECK(group_slots.has_value() == (group_role != 0), "group plan and role must match");
++        if (group_slots.has_value()) {
++            KU_CHECK_DEVICE(group_slots);
++            KU_CHECK_DTYPE(group_slots, torch::kInt32);
++            KU_CHECK_CONTIGUOUS(group_slots);
++            KU_CHECK_SHAPE(group_slots, batch_size, topk);
++        }
++        if (source_counts.has_value()) {
++            KU_CHECK_DEVICE(source_counts);
++            KU_CHECK_DTYPE(source_counts, torch::kInt64);
++            KU_CHECK_CONTIGUOUS(source_counts);
++            KU_CHECK_SHAPE(source_counts, device_locs->size(0), 8);
++        }
 +    }
 +
 +    sm90::decode::sparse_fp8::hisparse_demand::Params kernel_params() const {
@@ -150,6 +167,12 @@ diff -ruN base/csrc/api/hisparse_demand.h final/csrc/api/hisparse_demand.h
 +            static_cast<int>(host_locs->size(1)),
 +            int64_stride_to_int(cache_tags->stride(0)),
 +            int64_stride_to_int(cache_tags->stride(1)),
++            source_counts.has_value()
++                ? reinterpret_cast<unsigned long long*>(source_counts->data_ptr<int64_t>())
++                : nullptr,
++            host_kv->size(-1),
++            group_slots.has_value() ? group_slots->data_ptr<int32_t>() : nullptr,
++            group_role,
 +        };
 +    }
 +};
@@ -227,7 +250,7 @@ diff -ruN base/csrc/params.h final/csrc/params.h
 diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_params.h final/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_params.h
 --- base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_params.h	1970-01-01 08:00:00
 +++ final/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_params.h	2026-08-23 22:08:19
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,30 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -250,6 +273,10 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_params.h f
 +    int token_capacity = 0;
 +    int cache_tags_req_stride = 0;
 +    int cache_tags_slot_stride = 0;
++    unsigned long long* source_counts = nullptr;
++    int64_t host_row_stride = 656;
++    int32_t* group_slots = nullptr;
++    int group_role = 0;
 +
 +};
 +
@@ -257,7 +284,7 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_params.h f
 diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h final/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
 --- base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h	1970-01-01 08:00:00
 +++ final/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h	2026-08-23 22:08:19
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,479 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -320,6 +347,18 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
 +        (source::observe_ready(tag, generation, row));
 +}
 +
++static __forceinline__ __device__ uint32_t extra_slot(
++    uint32_t row, uint32_t salt, uint32_t mask
++) {
++    row ^= salt;
++    row ^= row >> 16;
++    row *= 0x7feb352du;
++    row ^= row >> 15;
++    row *= 0x846ca68bu;
++    row ^= row >> 16;
++    return row & mask;
++}
++
 +static __forceinline__ __device__ Resolution resolve(
 +    int logical_token,
 +    int host_row,
@@ -355,23 +394,40 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
 +    ) & source::GENERATION_MASK;
 +    const uint64_t row = static_cast<uint32_t>(host_row);
 +    const uint32_t mask = static_cast<uint32_t>(cache_rows - 1);
-+    uint32_t slots[2] = {
++    constexpr int NUM_SLOTS = 2;
++    uint32_t slots[NUM_SLOTS] = {
 +        primary_slot(static_cast<uint32_t>(row), mask), 0
 +    };
 +    slots[1] = secondary_slot(
 +        static_cast<uint32_t>(row), slots[0], mask
 +    );
++    #pragma unroll
++    for (int i = 2; i < NUM_SLOTS; ++i) {
++        uint32_t candidate = extra_slot(
++            static_cast<uint32_t>(row), 0x9e3779b9u * (i - 1), mask
++        );
++        #pragma unroll
++        for (int attempt = 0; attempt < NUM_SLOTS; ++attempt) {
++            bool duplicate = false;
++            #pragma unroll
++            for (int j = 0; j < NUM_SLOTS; ++j) {
++                duplicate |= j < i && candidate == slots[j];
++            }
++            if (!duplicate) break;
++            candidate = (candidate + 1) & mask;
++        }
++        slots[i] = candidate;
++    }
 +    const int64_t tag_base = request_slot * tag_request_stride;
-+    uint64_t* tags[2] = {
-+        cache_tags + tag_base + slots[0],
-+        cache_tags + tag_base + slots[1]
-+    };
-+    uint64_t observed[2];
++    int target = -1;
++    uint64_t target_observed = 0;
++    uint32_t oldest_age = 0;
 +
 +    #pragma unroll
-+    for (int i = 0; i < 2; ++i) {
-+        observed[i] = source::load_acquire(tags[i]);
-+        if (promote_ready(tags[i], observed[i], generation, row)) {
++    for (int i = 0; i < NUM_SLOTS; ++i) {
++        uint64_t* tag = cache_tags + tag_base + slots[i];
++        uint64_t observed = source::load_acquire(tag);
++        if (promote_ready(tag, observed, generation, row)) {
 +            result.kind = Kind::DEVICE;
 +            result.cache_slot = static_cast<int>(slots[i]);
 +            result.physical_row = static_cast<int>(__ldg(
@@ -379,9 +435,9 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
 +            ));
 +            return result;
 +        }
-+        observed[i] = source::load_acquire(tags[i]);
-+        if (source::is_filling_row(observed[i], generation, row)) {
-+            result.kind = source::observe_ready(tags[i], generation, row)
++        observed = source::load_acquire(tag);
++        if (source::is_filling_row(observed, generation, row)) {
++            result.kind = source::observe_ready(tag, generation, row)
 +                ? Kind::DEVICE
 +                : Kind::HOST;
 +            result.cache_slot = static_cast<int>(slots[i]);
@@ -392,43 +448,41 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
 +            }
 +            return result;
 +        }
-+    }
-+
-+    int target = -1;
-+    #pragma unroll
-+    for (int i = 0; i < 2; ++i) {
-+        if (observed[i] == 0 && target < 0) target = i;
-+    }
-+    if (target < 0) {
-+        uint32_t oldest_age = 0;
-+        #pragma unroll
-+        for (int i = 0; i < 2; ++i) {
-+            if (!source::is_replaceable(observed[i], generation)) continue;
++        // Preserve first-empty/oldest-replaceable policy with scalar state.
++        // Avoid dynamically indexing tag/value arrays at the eventual CAS.
++        if (observed == 0) {
++            if (target < 0 || target_observed != 0) {
++                target = static_cast<int>(slots[i]);
++                target_observed = 0;
++            }
++        } else if (source::is_replaceable(observed, generation)) {
 +            const uint32_t age =
-+                (generation - source::tag_generation(observed[i])) &
++                (generation - source::tag_generation(observed)) &
 +                source::GENERATION_MASK;
-+            if (target < 0 || age > oldest_age) {
-+                target = i;
++            if (target < 0 || (target_observed != 0 && age > oldest_age)) {
++                target = static_cast<int>(slots[i]);
++                target_observed = observed;
 +                oldest_age = age;
 +            }
 +        }
 +    }
 +
 +    if (target >= 0) {
++        uint64_t* tag = cache_tags + tag_base + target;
 +        const uint64_t filling = source::pack_tag(
 +            generation, source::State::FILLING, row
 +        );
 +        const uint64_t old = source::compare_exchange_acq_rel(
-+            tags[target], observed[target], filling
++            tag, target_observed, filling
 +        );
-+        if (old == observed[target]) {
++        if (old == target_observed) {
 +            result.kind = Kind::FILL;
-+            result.cache_slot = static_cast<int>(slots[target]);
++            result.cache_slot = target;
 +            result.physical_row = static_cast<int>(__ldg(
 +                device_locs + request_slot * device_request_stride +
-+                slots[target]
++                target
 +            ));
-+            result.fill_tag = tags[target];
++            result.fill_tag = tag;
 +            result.fill_ready_tag = source::pack_tag(
 +                generation, source::State::READY, row
 +            );
@@ -437,16 +491,20 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
 +    }
 +
 +    #pragma unroll
-+    for (int i = 0; i < 2; ++i) {
-+        observed[i] = source::load_acquire(tags[i]);
-+        if (promote_ready(tags[i], observed[i], generation, row) ||
-+            source::observe_ready(tags[i], generation, row)) {
++    for (int i = 0; i < NUM_SLOTS; ++i) {
++        uint64_t* tag = cache_tags + tag_base + slots[i];
++        const uint64_t observed = source::load_acquire(tag);
++        if (promote_ready(tag, observed, generation, row) ||
++            source::observe_ready(tag, generation, row)) {
 +            result.kind = Kind::DEVICE;
 +            result.cache_slot = static_cast<int>(slots[i]);
 +            result.physical_row = static_cast<int>(__ldg(
 +                device_locs + request_slot * device_request_stride + slots[i]
 +            ));
 +            return result;
++        }
++        if (result.cache_slot < 0 && source::is_filling_row(observed, generation, row)) {
++            result.cache_slot = static_cast<int>(slots[i]);
 +        }
 +    }
 +    result.kind = Kind::HOST;
@@ -469,7 +527,57 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
 +    return logical_token < committed_len && host_row >= 0;
 +}
 +
-+template <typename Params, typename FP8>
++// Fixed-slot follower: placement belongs to the completed anchor, not this layer.
++static __forceinline__ __device__ Resolution resolve_planned(
++    int logical_token, int host_row, int seq_len, int committed_len,
++    int64_t request_slot, uint64_t* cache_tags, int64_t tag_request_stride,
++    int cache_rows, const int64_t* device_locs, int64_t device_request_stride,
++    const int32_t* decode_calls, int slot
++) {
++    Resolution result;
++    if (logical_token < 0 || logical_token >= seq_len) return result;
++    if (logical_token >= committed_len && logical_token < committed_len + 4) {
++        result.kind = Kind::DEVICE;
++        result.physical_row = static_cast<int>(__ldg(device_locs +
++            request_slot * device_request_stride + cache_rows + 2 + logical_token - committed_len));
++        return result;
++    }
++    if (logical_token >= committed_len || host_row < 0) return result;
++    result.kind = Kind::HOST;
++    // An unassigned entry must never invoke the independent allocator.
++    if (slot < 0 || slot >= cache_rows) return result;
++    result.cache_slot = slot;
++    const uint64_t row = static_cast<uint32_t>(host_row);
++    uint64_t* tag = cache_tags + request_slot * tag_request_stride + slot;
++    uint64_t observed = source::load_acquire(tag);
++    if (source::is_ready_row(observed, row)) {
++        result.kind = Kind::DEVICE;
++    } else if (source::tag_state(observed) != source::State::FILLING) {
++        // A READY row of any age may be replaced: the anchor fixed this slot's
++        // identity for the entire call, and prior follower execution completed.
++        const int calls = __ldg(decode_calls + request_slot);
++        const uint32_t generation = static_cast<uint32_t>(calls > 0 ? calls - 1 : 0)
++            & source::GENERATION_MASK;
++        const uint64_t filling = source::pack_tag(generation, source::State::FILLING, row);
++        const uint64_t old = source::compare_exchange_acq_rel(tag, observed, filling);
++        if (old == observed) {
++            result.kind = Kind::FILL;
++            result.fill_tag = tag;
++            result.fill_ready_tag = source::pack_tag(generation, source::State::READY, row);
++        } else if (source::is_ready_row(source::load_acquire(tag), row)) {
++            result.kind = Kind::DEVICE;
++        }
++    }
++    // FILLING, including an impossible wrong-row FILLING, is non-writing Host
++    // fallback. Debug plan validation detects contradictory slot assignments.
++    if (result.kind == Kind::DEVICE || result.kind == Kind::FILL) {
++        result.physical_row = static_cast<int>(__ldg(
++            device_locs + request_slot * device_request_stride + slot));
++    }
++    return result;
++}
++
++template <int GROUP_ROLE, typename Params, typename FP8>
 +static __forceinline__ __device__ ThreadState<FP8> resolve_source(
 +    const Params& params,
 +    int batch_idx,
@@ -495,6 +603,7 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
 +    int source_kind = static_cast<int>(Kind::INVALID);
 +    int host_row = -1;
 +    int physical_row = -1;
++    int planned_slot = -1;
 +    if (
 +        lane_idx < 8 && topk_ordinal >= 0 &&
 +        topk_ordinal < demand.token_capacity &&
@@ -507,24 +616,63 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
 +        const int64_t request_slot = __ldg(
 +            demand.req_pool_indices + batch_idx
 +        );
-+        const auto resolution = resolve(
-+            token_index,
-+            host_row,
-+            __ldg(demand.seq_lens + batch_idx),
-+            __ldg(demand.mtp_committed_lens + batch_idx),
-+            request_slot,
-+            demand.cache_tags,
-+            demand.cache_tags_req_stride,
-+            demand.cache_rows,
-+            demand.device_locs,
-+            demand.device_locs_req_stride,
-+            demand.decode_calls
-+        );
++        const auto resolution = [&]() {
++            if constexpr (GROUP_ROLE == 2) {
++                return resolve_planned(
++                    token_index,
++                    host_row,
++                    __ldg(demand.seq_lens + batch_idx),
++                    __ldg(demand.mtp_committed_lens + batch_idx),
++                    request_slot,
++                    demand.cache_tags,
++                    demand.cache_tags_req_stride,
++                    demand.cache_rows,
++                    demand.device_locs,
++                    demand.device_locs_req_stride,
++                    demand.decode_calls,
++            __ldg(demand.group_slots + batch_idx * demand.token_capacity + topk_ordinal)
++                );
++            } else {
++                return resolve(
++                    token_index,
++                    host_row,
++                    __ldg(demand.seq_lens + batch_idx),
++                    __ldg(demand.mtp_committed_lens + batch_idx),
++                    request_slot,
++                    demand.cache_tags,
++                    demand.cache_tags_req_stride,
++                    demand.cache_rows,
++                    demand.device_locs,
++                    demand.device_locs_req_stride,
++                    demand.decode_calls
++                );
++            }
++        }();
++        if constexpr (GROUP_ROLE == 1) planned_slot = resolution.cache_slot;
 +        source_kind = static_cast<int>(resolution.kind);
++        if (demand.source_counts != nullptr) {
++            // invalid, overlay, READY, owner, FILLING fallback, no-slot fallback.
++            const int bucket = resolution.kind == Kind::INVALID ? 0 :
++                resolution.kind == Kind::DEVICE ? (resolution.cache_slot < 0 ? 1 : 2) :
++                resolution.kind == Kind::FILL ? 3 :
++                resolution.cache_slot >= 0 ? 4 : 5;
++            const unsigned peers = __match_any_sync(
++                __activemask(), static_cast<int>(request_slot * 8 + bucket)
++            );
++            if ((lane_idx & 31) == __ffs(peers) - 1) {
++                atomicAdd(demand.source_counts + request_slot * 8 + bucket,
++                          static_cast<unsigned long long>(__popc(peers)));
++            }
++        }
 +        physical_row = resolution.physical_row;
 +        if (resolution.kind == Kind::FILL) {
 +            state.fill_tag = resolution.fill_tag;
 +            state.fill_ready_tag = resolution.fill_ready_tag;
++        }
++    }
++    if constexpr (GROUP_ROLE == 1) {
++        if (lane_idx < 8 && topk_ordinal >= 0 && topk_ordinal < demand.token_capacity) {
++            demand.group_slots[batch_idx * demand.token_capacity + topk_ordinal] = planned_slot;
 +        }
 +    }
 +    source_kind = __shfl_sync(
@@ -555,7 +703,7 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_producer.h
 +    } else if (kind == Kind::HOST || kind == Kind::FILL) {
 +        state.source_row = reinterpret_cast<FP8*>(
 +            const_cast<uint8_t*>(
-+                demand.host_kv + host_row * source::ROW_BYTES
++                demand.host_kv + static_cast<int64_t>(host_row) * demand.host_row_stride
 +            )
 +        );
 +        if (kind == Kind::FILL) {
@@ -738,8 +886,8 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/components/hisparse_demand_source.h f
 +
 +}  // namespace sm90::decode::sparse_fp8::hisparse_demand_source
 diff -ruN base/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh final/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh
---- base/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-06-24 14:52:45
-+++ final/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-08-23 21:58:23
+--- base/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh
++++ final/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh
 @@ -14,6 +14,7 @@
  #include "flashmla_utils.h"
  #include "components/dequant.h"
@@ -748,6 +896,18 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh final/csrc/sm90/decod
  #include "config.h"
  using namespace cute;
 
+@@ -83,9 +84,9 @@
+         *(float2*)(sScale + 2*(idx_in_warpgroup/4)) = *(float2*)(scale_for_olds);
+ }
+
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
++template<ModelType MODEL_TYPE, int NUM_HEADS, int GROUP_ROLE>
+ template<typename TMAParams>
+-__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
++__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, GROUP_ROLE>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
+     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
+     const int s_q_idx = blockIdx.y;
 @@ -537,14 +538,44 @@
 
                      int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
@@ -765,7 +925,7 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh final/csrc/sm90/decod
 -                        gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*k_row_stride;
 +                        static_assert(TOPK_BLOCK_SIZE == 64);
 +                        const auto demand =
-+                            hisparse_demand_producer::resolve_source(
++                            hisparse_demand_producer::resolve_source<GROUP_ROLE>(
 +                                params,
 +                                batch_idx,
 +                                topk_ordinal,
@@ -850,3 +1010,49 @@ diff -ruN base/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh final/csrc/sm90/decod
                          } else {
                              return index != -1 && rel_block_idx*TOPK_BLOCK_SIZE + lane_idx*2 + offset_within_thread < topk_length;
                          }
+@@ -683,8 +740,8 @@
+     Kernel::devfunc(params, tma_params);
+ }
+
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
+-void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &params) {
++template<ModelType MODEL_TYPE, int NUM_HEADS, int GROUP_ROLE>
++void KernelTemplate<MODEL_TYPE, NUM_HEADS, GROUP_ROLE>::run(const SparseAttnDecodeParams &params) {
+     KU_ASSERT(params.h_kv == 1);
+     KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
+     KU_ASSERT(params.d_qk == HEAD_DIM_K);
+@@ -748,7 +805,7 @@
+         shape_Q, tma_Q,
+         tensor_map_o
+     };
+-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params)>;
++    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS, GROUP_ROLE>, decltype(tma_params)>;
+
+     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+     KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+@@ -781,7 +838,13 @@
+
+ template<ModelType MODEL_TYPE, int NUM_HEADS>
+ void run_flash_splitkv_mla_fp8_sparse_kernel(const SparseAttnDecodeParams &params) {
+-    KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(params);
++    if constexpr (MODEL_TYPE == ModelType::V32 && NUM_HEADS == 64) {
++        if (params.hisparse_demand.group_role == 1)
++            return KernelTemplate<MODEL_TYPE, NUM_HEADS, 1>::run(params);
++        if (params.hisparse_demand.group_role == 2)
++            return KernelTemplate<MODEL_TYPE, NUM_HEADS, 2>::run(params);
++    }
++    KernelTemplate<MODEL_TYPE, NUM_HEADS, 0>::run(params);
+ }
+
+ }
+diff -ruN base/csrc/sm90/decode/sparse_fp8/config.h final/csrc/sm90/decode/sparse_fp8/config.h
+--- base/csrc/sm90/decode/sparse_fp8/config.h
++++ final/csrc/sm90/decode/sparse_fp8/config.h
+@@ -12,7 +12,7 @@
+
+ namespace sm90::decode::sparse_fp8 {
+
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
++template<ModelType MODEL_TYPE, int NUM_HEADS, int GROUP_ROLE = 0>
+ class KernelTemplate {
+ public:

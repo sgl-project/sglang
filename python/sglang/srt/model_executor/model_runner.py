@@ -999,11 +999,22 @@ class ModelRunner:
             return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
+            resolve_demand_group_roles,
             resolve_shared_index_layers,
         )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config()
+        group_roles = None
+        if envs.SGLANG_TEST_HISPARSE_GROUP_PLAN.get():
+            if (
+                not _supports_glm52_hisparse_mtp(self.server_args)
+                or self.server_args.enable_two_batch_overlap
+            ):
+                raise ValueError(
+                    "Demand group plan requires the validated GLM MTP path without TBO"
+                )
+            group_roles = resolve_demand_group_roles(self.model_config.hf_text_config)
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
@@ -1020,6 +1031,7 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            demand_group_roles=group_roles,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=self.ps.pp_size,
