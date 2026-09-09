@@ -147,9 +147,14 @@ jobs:
 
       - name: Run tests
         # Old stage-a (30) + stage-b (120) = 150; +20% headroom for --enable-retry.
+        # Wall-clock drops once SGLANG_XPU_MAX_CONCURRENCY is raised above 1.
         timeout-minutes: 180
+        env:
+          # Serial rollout: matches today's behavior. Ramp once host RAM/CPU
+          # capacity on the intel-bmg runner has been measured.
+          SGLANG_XPU_MAX_CONCURRENCY: 1
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --enable-retry"
+          docker exec -e SGLANG_XPU_MAX_CONCURRENCY ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout && bash scripts/ci/xpu/run_card_sharded.sh stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu"
 
       - name: Cleanup container
         if: always()
