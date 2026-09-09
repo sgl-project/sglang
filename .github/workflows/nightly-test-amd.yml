@@ -1,4 +1,4 @@
-name: Nightly Test (AMD)
+name: Nightly Test (AMD ROCm 7.2)
 
 on:
   schedule:
@@ -11,12 +11,15 @@ on:
   workflow_dispatch:
     inputs:
       rocm_version:
-        description: 'ROCm image version'
+        description: 'ROCm image version ("all" runs rocm10, rocm724, and rocm720)'
         required: false
         type: choice
-        default: rocm10
+        default: 'all'
         options:
+          - 'all'
           - rocm10
+          - rocm724
+          - rocm720
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
         required: false
@@ -35,71 +38,71 @@ on:
         options:
           - 'all'
           # 1-GPU Unit Tests (MI30x + MI35x)
-          - nightly-test-1-gpu-unit
-          - nightly-test-1-gpu-kernel
-          - nightly-test-1-gpu-mi35x
+          - nightly-test-1-gpu-unit-rocm720
+          - nightly-test-1-gpu-kernel-rocm720
+          - nightly-test-1-gpu-mi35x-rocm720
           # 2-GPU and 4-GPU Tests (MI30x + MI35x)
-          - nightly-accuracy-2-gpu
-          - nightly-accuracy-2-gpu-vlm
-          - nightly-perf-2-gpu-text
-          - nightly-perf-2-gpu-vlm
-          - nightly-4-gpu
+          - nightly-accuracy-2-gpu-rocm720
+          - nightly-accuracy-2-gpu-vlm-rocm720
+          - nightly-perf-2-gpu-text-rocm720
+          - nightly-perf-2-gpu-vlm-rocm720
+          - nightly-4-gpu-rocm720
           # 2-GPU GLM-5.1-MXFP4 (MI35x only)
-          - nightly-2-gpu-mi35x-glm51-mxfp4
+          - nightly-2-gpu-mi35x-glm51-mxfp4-rocm720
           # 2-GPU DeepSeek-R1-MXFP4 TP2 (MI35x only)
-          - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2
+          - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720
           # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
-          - nightly-accuracy-8-gpu
-          - nightly-accuracy-8-gpu-mi35x
+          - nightly-accuracy-8-gpu-rocm720
+          - nightly-accuracy-8-gpu-mi35x-rocm720
           # 8-GPU Grok1-INT4 (MI30x + MI35x)
-          - nightly-8-gpu-grok1-int4
-          - nightly-8-gpu-mi35x-grok1-int4
+          - nightly-8-gpu-grok1-int4-rocm720
+          - nightly-8-gpu-mi35x-grok1-int4-rocm720
           # 8-GPU Grok2 (MI30x + MI35x)
-          - nightly-8-gpu-grok2
-          - nightly-8-gpu-mi35x-grok2
+          - nightly-8-gpu-grok2-rocm720
+          - nightly-8-gpu-mi35x-grok2-rocm720
           # 8-GPU DeepSeek-V3.2 (MI30x)
-          - nightly-8-gpu-deepseek-v32
-          - nightly-8-gpu-deepseek-v32-mtp
+          - nightly-8-gpu-deepseek-v32-rocm720
+          - nightly-8-gpu-deepseek-v32-mtp-rocm720
           # 8-GPU DeepSeek-V3.2 (MI35x)
-          - nightly-8-gpu-mi35x-deepseek-v32
-          - nightly-8-gpu-mi35x-deepseek-v32-mtp
+          - nightly-8-gpu-mi35x-deepseek-v32-rocm720
+          - nightly-8-gpu-mi35x-deepseek-v32-mtp-rocm720
           # 8-GPU DeepSeek-R1 (MI35x only)
-          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4
-          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8
-          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion
-          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4
-          - nightly-8-gpu-mi35x-deepseek-r1-hicache
+          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-rocm720
+          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8-rocm720
+          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion-rocm720
+          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720
+          - nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720
           # 8-GPU DeepSeek-V4-Flash (MI30x)
-          - nightly-8-gpu-deepseek-v4-flash
+          - nightly-8-gpu-deepseek-v4-flash-rocm720
           # 8-GPU DeepSeek-V4 (MI35x)
-          - nightly-8-gpu-mi35x-deepseek-v4-flash
-          - nightly-8-gpu-mi35x-deepseek-v4-pro
-          - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp
-          - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark
+          - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
+          - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
+          - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
+          - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720
           # 8-GPU Kimi-K2.6 (MI30x)
-          - nightly-8-gpu-kimi-k26
+          - nightly-8-gpu-kimi-k26-rocm720
           # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
-          - nightly-8-gpu-mi35x-kimi-k3
+          - nightly-8-gpu-mi35x-kimi-k3-rocm720
           # 8-GPU Qwen3.8-MXFP4 (MI35x only - MXFP4 needs gfx95x)
-          - nightly-8-gpu-mi35x-qwen38-mxfp4
+          - nightly-8-gpu-mi35x-qwen38-mxfp4-rocm720
           # 8-GPU Qwen 3.5 (MI30x + MI35x)
-          - nightly-8-gpu-qwen35
-          - nightly-8-gpu-mi35x-qwen35
-          - nightly-8-gpu-mi35x-qwen35-triton-dcp
+          - nightly-8-gpu-qwen35-rocm720
+          - nightly-8-gpu-mi35x-qwen35-rocm720
+          - nightly-8-gpu-mi35x-qwen35-triton-dcp-rocm720
           # 8-GPU GLM-5.1 (MI30x)
-          - nightly-8-gpu-glm51
+          - nightly-8-gpu-glm51-rocm720
           # 8-GPU GLM-5.2-FP8 (MI35x accuracy + performance)
-          - nightly-8-gpu-mi35x-glm52-fp8
+          - nightly-8-gpu-mi35x-glm52-fp8-rocm720
           # 8-GPU GLM-5-MXFP4 (MI35x only)
-          - nightly-8-gpu-mi35x-glm5-mxfp4
+          - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
           # 4-GPU MiniMax-M2.5 (MI35x)
-          - nightly-4-gpu-mi35x-minimax-m25
+          - nightly-4-gpu-mi35x-minimax-m25-rocm720
           # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
-          - nightly-4-gpu-mi35x-minimax-m3
+          - nightly-4-gpu-mi35x-minimax-m3-rocm720
           # 8-GPU MiniMax-M2.7 (MI30x only)
-          - nightly-8-gpu-minimax-m27
+          - nightly-8-gpu-minimax-m27-rocm720
           # Diffusion (MI30x)
-          - nightly-1-gpu-zimage-turbo
+          - nightly-1-gpu-zimage-turbo-rocm720
       job_filter:
         description: 'Or type comma-separated job names (overrides dropdown if non-empty)'
         required: false
@@ -108,9 +111,11 @@ on:
   workflow_call:
     inputs:
       rocm_version:
-        description: 'ROCm image version'
+        description: 'ROCm image version ("all" runs rocm10, rocm724, and rocm720)'
         required: false
         type: string
+        # A single flavor, unlike the schedule and the dispatch form: a caller
+        # that says nothing should not silently get multi-version GPU cost.
         default: rocm10
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
@@ -143,25 +148,25 @@ concurrency:
   # collisions with direct schedule/push triggers. We use inputs.ref (not github.event_name)
   # to detect this, because github.event_name inherits from the caller in workflow_call.
   # Manual dispatch and scheduled runs also get unique groups so a version bump
-  # or the next daily run cannot cancel an in-progress nightly.
-  group: nightly-test-amd-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.event_name == 'schedule' && format('scheduled-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
-  cancel-in-progress: ${{ inputs.ref == '' && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' && github.event_name != 'schedule' }}
+  # or the next daily run cannot cancel an in-progress three-version nightly.
+  group: nightly-test-amd-rocm720-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.event_name == 'schedule' && format('scheduled-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' && github.event_name != 'schedule' }}
 
 jobs:
-  # ============================================== MI30x ROCm Unit Tests ==============================================
-  # 1-GPU Unit Tests - LoRA, debug utils, scheduler, etc. (MI30x ROCm)
+  # ============================================== MI30x ROCm 7.2 Unit Tests ==============================================
+  # 1-GPU Unit Tests - LoRA, debug utils, scheduler, etc. (MI30x ROCm 7.2)
 
   # ==============================================================================
   # 1-GPU Unit Tests (MI30x + MI35x)
   # ==============================================================================
 
-  nightly-test-1-gpu-unit:
+  nightly-test-1-gpu-unit-rocm720:
     name: ${{ format('nightly-test-1-gpu-unit ({0}, linux-mi300-1gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-unit,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-unit-rocm720,'))
     runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
@@ -181,7 +186,7 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-      - name: Nightly Unit Test ROCm (1-GPU)
+      - name: Nightly Unit Test ROCm 7.2 (1-GPU)
         timeout-minutes: 90
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -190,13 +195,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-test-1-gpu-kernel:
+  nightly-test-1-gpu-kernel-rocm720:
     name: ${{ format('nightly-test-1-gpu-kernel ({0}, linux-mi300-1gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-kernel,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-kernel-rocm720,'))
     runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
@@ -216,7 +221,7 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-      - name: Nightly Kernel Benchmark ROCm (1-GPU)
+      - name: Nightly Kernel Benchmark ROCm 7.2 (1-GPU)
         timeout-minutes: 60
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -225,13 +230,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-test-1-gpu-mi35x:
+  nightly-test-1-gpu-mi35x-rocm720:
     name: ${{ format('nightly-test-1-gpu-mi35x ({0}, linux-mi35x-gpu-1)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-mi35x,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-mi35x-rocm720,'))
     runs-on: linux-mi35x-gpu-1
     steps:
       - name: Checkout code
@@ -252,7 +257,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
-      - name: Nightly Test MI35x ROCm (1-GPU)
+      - name: Nightly Test MI35x ROCm 7.2 (1-GPU)
         timeout-minutes: 90
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -265,13 +270,13 @@ jobs:
   # 2-GPU and 4-GPU Tests (MI30x + MI35x)
   # ==============================================================================
 
-  nightly-accuracy-2-gpu:
+  nightly-accuracy-2-gpu-rocm720:
     name: ${{ format('nightly-accuracy-2-gpu ({0}, linux-mi300-2gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu-rocm720,'))
     runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
@@ -291,7 +296,7 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-      - name: Nightly Test ROCm (2-GPU)
+      - name: Nightly Test ROCm 7.2 (2-GPU)
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -301,13 +306,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-2-gpu-mi35x-glm51-mxfp4:
+  nightly-2-gpu-mi35x-glm51-mxfp4-rocm720:
     name: ${{ format('nightly-2-gpu-mi35x-glm51-mxfp4 ({0}, linux-mi35x-gpu-2)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-glm51-mxfp4,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-glm51-mxfp4-rocm720,'))
     runs-on: linux-mi35x-gpu-2
     steps:
       - name: Checkout code
@@ -330,7 +335,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (2-GPU GLM-5.1-MXFP4 GSM8K)
+      - name: Accuracy Test MI35x ROCm 7.2 (2-GPU GLM-5.1-MXFP4 GSM8K)
         timeout-minutes: 120
         run: |
           > github_summary.md
@@ -341,13 +346,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2:
+  nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720:
     name: ${{ format('nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2 ({0}, linux-mi35x-gpu-2)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720,'))
     runs-on: linux-mi35x-gpu-2
     steps:
       - name: Checkout code
@@ -371,7 +376,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (2-GPU DeepSeek-R1-MXFP4 TP2)
+      - name: Accuracy Test MI35x ROCm 7.2 (2-GPU DeepSeek-R1-MXFP4 TP2)
         timeout-minutes: 180
         run: |
           > github_summary.md
@@ -382,13 +387,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-accuracy-2-gpu-vlm:
+  nightly-accuracy-2-gpu-vlm-rocm720:
     name: ${{ format('nightly-accuracy-2-gpu-vlm ({0}, linux-mi300-2gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu-vlm,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu-vlm-rocm720,'))
     runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
@@ -408,7 +413,7 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-      - name: Nightly Accuracy Test ROCm (2-GPU VLM MMMU)
+      - name: Nightly Accuracy Test ROCm 7.2 (2-GPU VLM MMMU)
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
@@ -419,13 +424,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-perf-2-gpu-text:
+  nightly-perf-2-gpu-text-rocm720:
     name: ${{ format('nightly-perf-2-gpu-text ({0}, linux-mi300-2gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-2-gpu-text,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-2-gpu-text-rocm720,'))
     runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
@@ -457,13 +462,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-perf-2-gpu-vlm:
+  nightly-perf-2-gpu-vlm-rocm720:
     name: ${{ format('nightly-perf-2-gpu-vlm ({0}, linux-mi300-2gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-2-gpu-vlm,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-2-gpu-vlm-rocm720,'))
     runs-on: linux-mi300-2gpu-sglang
     steps:
       - name: Checkout code
@@ -483,7 +488,7 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-      - name: Performance Test ROCm (2-GPU VLM Models)
+      - name: Performance Test ROCm 7.2 (2-GPU VLM Models)
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
@@ -495,13 +500,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-4-gpu:
+  nightly-4-gpu-rocm720:
     name: ${{ format('nightly-4-gpu ({0}, linux-mi300-4gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-rocm720,'))
     runs-on: linux-mi300-4gpu-sglang
     steps:
       - name: Checkout code
@@ -522,7 +527,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
-      - name: Nightly Test ROCm (4-GPU)
+      - name: Nightly Test ROCm 7.2 (4-GPU)
         timeout-minutes: 120
         run: |
           > github_summary.md
@@ -536,13 +541,13 @@ jobs:
   # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
   # ==============================================================================
 
-  nightly-accuracy-8-gpu:
+  nightly-accuracy-8-gpu-rocm720:
     name: ${{ format('nightly-accuracy-8-gpu ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
@@ -563,7 +568,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test ROCm (8-GPU GPT-OSS)
+      - name: Accuracy Test ROCm 7.2 (8-GPU GPT-OSS)
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
@@ -577,7 +582,7 @@ jobs:
       # Shares this job with the accuracy step above: it already serves the same
       # two models, and an MI30x job spends ~49 min pulling the image and
       # installing dependencies before it runs anything.
-      - name: Performance Test ROCm (8-GPU GPT-OSS)
+      - name: Performance Test ROCm 7.2 (8-GPU GPT-OSS)
         if: ${{ !cancelled() }}
         timeout-minutes: 120
         run: |
@@ -589,13 +594,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-accuracy-8-gpu-mi35x:
+  nightly-accuracy-8-gpu-mi35x-rocm720:
     name: ${{ format('nightly-accuracy-8-gpu-mi35x ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-mi35x,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-mi35x-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -619,7 +624,7 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU GPT-OSS)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GPT-OSS)
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
@@ -632,7 +637,7 @@ jobs:
 
       # Shares this job with the accuracy step above rather than taking its own,
       # so the container setup and the GPT-OSS weight cache are paid for once.
-      - name: Performance Test MI35x ROCm (8-GPU GPT-OSS)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU GPT-OSS)
         if: ${{ !cancelled() }}
         timeout-minutes: 120
         run: |
@@ -648,13 +653,13 @@ jobs:
   # 8-GPU Grok1-INT4 (MI30x + MI35x)
   # ==============================================================================
 
-  nightly-8-gpu-grok1-int4:
+  nightly-8-gpu-grok1-int4-rocm720:
     name: ${{ format('nightly-8-gpu-grok1-int4 ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-grok1-int4,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-grok1-int4-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
@@ -675,7 +680,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test ROCm (8-GPU Grok1-INT4)
+      - name: Accuracy Test ROCm 7.2 (8-GPU Grok1-INT4)
         timeout-minutes: 60
         run: |
           > github_summary.md  # Clear summary file
@@ -686,7 +691,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test ROCm (8-GPU Grok1-INT4)
+      - name: Performance Test ROCm 7.2 (8-GPU Grok1-INT4)
         timeout-minutes: 60
         continue-on-error: true
         run: |
@@ -698,13 +703,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-mi35x-grok1-int4:
+  nightly-8-gpu-mi35x-grok1-int4-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-grok1-int4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-grok1-int4,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-grok1-int4-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -728,7 +733,7 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU Grok1-INT4)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Grok1-INT4)
         timeout-minutes: 60
         run: |
           > github_summary.md  # Clear summary file
@@ -739,7 +744,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm (8-GPU Grok1-INT4)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU Grok1-INT4)
         timeout-minutes: 60
         continue-on-error: true
         run: |
@@ -755,13 +760,13 @@ jobs:
   # 8-GPU Grok2 (MI30x + MI35x)
   # ==============================================================================
 
-  nightly-8-gpu-grok2:
+  nightly-8-gpu-grok2-rocm720:
     name: ${{ format('nightly-8-gpu-grok2 ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-grok2,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-grok2-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
@@ -782,7 +787,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test ROCm (8-GPU Grok2)
+      - name: Accuracy Test ROCm 7.2 (8-GPU Grok2)
         timeout-minutes: 60
         run: |
           > github_summary.md  # Clear summary file
@@ -793,7 +798,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test ROCm (8-GPU Grok2)
+      - name: Performance Test ROCm 7.2 (8-GPU Grok2)
         timeout-minutes: 60
         continue-on-error: true
         run: |
@@ -805,13 +810,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-mi35x-grok2:
+  nightly-8-gpu-mi35x-grok2-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-grok2 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-grok2,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-grok2-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -835,7 +840,7 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU Grok2)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Grok2)
         timeout-minutes: 60
         run: |
           > github_summary.md  # Clear summary file
@@ -846,7 +851,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm (8-GPU Grok2)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU Grok2)
         timeout-minutes: 60
         continue-on-error: true
         run: |
@@ -866,13 +871,13 @@ jobs:
   # checkpoint, and DeepSeek-R1/V4 carry the MI35x side.
   # ==============================================================================
 
-  nightly-8-gpu-deepseek-v32:
+  nightly-8-gpu-deepseek-v32-rocm720:
     name: ${{ format('nightly-8-gpu-deepseek-v32 ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v32,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v32-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
@@ -894,7 +899,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test ROCm (8-GPU DeepSeek-V3.2 Basic)
+      - name: Accuracy Test ROCm 7.2 (8-GPU DeepSeek-V3.2 Basic)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -904,7 +909,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test ROCm (8-GPU DeepSeek-V3.2 Basic)
+      - name: Performance Test ROCm 7.2 (8-GPU DeepSeek-V3.2 Basic)
         timeout-minutes: 150
         continue-on-error: true
         run: |
@@ -915,13 +920,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-deepseek-v32-mtp:
+  nightly-8-gpu-deepseek-v32-mtp-rocm720:
     name: ${{ format('nightly-8-gpu-deepseek-v32-mtp ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v32-mtp,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v32-mtp-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
@@ -943,7 +948,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test ROCm (8-GPU DeepSeek-V3.2 MTP)
+      - name: Accuracy Test ROCm 7.2 (8-GPU DeepSeek-V3.2 MTP)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -953,7 +958,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test ROCm (8-GPU DeepSeek-V3.2 MTP)
+      - name: Performance Test ROCm 7.2 (8-GPU DeepSeek-V3.2 MTP)
         timeout-minutes: 180
         continue-on-error: true
         run: |
@@ -972,13 +977,13 @@ jobs:
   # a second container setup and a second cold weight load for nothing.
   # ==============================================================================
 
-  nightly-8-gpu-mi35x-deepseek-v32:
+  nightly-8-gpu-mi35x-deepseek-v32-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-v32 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v32,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v32-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1003,7 +1008,7 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU DeepSeek-V3.2)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-V3.2)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -1026,13 +1031,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-mi35x-deepseek-v32-mtp:
+  nightly-8-gpu-mi35x-deepseek-v32-mtp-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-v32-mtp ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v32-mtp,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v32-mtp-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1057,7 +1062,7 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU DeepSeek-V3.2 TP+MTP)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-V3.2 TP+MTP)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -1067,7 +1072,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm (8-GPU DeepSeek-V3.2 MTP)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V3.2 MTP)
         timeout-minutes: 180
         continue-on-error: true
         run: |
@@ -1082,13 +1087,13 @@ jobs:
   # 8-GPU DeepSeek-R1 (MI35x only)
   # ==============================================================================
 
-  nightly-8-gpu-mi35x-deepseek-r1-mxfp4:
+  nightly-8-gpu-mi35x-deepseek-r1-mxfp4-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1113,7 +1118,7 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-R1-MXFP4)
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
@@ -1124,7 +1129,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-R1-MXFP4)
         timeout-minutes: 300
         continue-on-error: true
         run: |
@@ -1136,13 +1141,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4:
+  nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1166,7 +1171,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (DeepSeek-R1-MXFP4 TP4)
+      - name: Accuracy Test MI35x ROCm 7.2 (DeepSeek-R1-MXFP4 TP4)
         timeout-minutes: 180
         run: |
           > github_summary.md
@@ -1177,7 +1182,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Accuracy Test MI35x ROCm (DeepSeek-R1-MXFP4 TP4 MTP)
+      - name: Accuracy Test MI35x ROCm 7.2 (DeepSeek-R1-MXFP4 TP4 MTP)
         if: ${{ !cancelled() }}
         timeout-minutes: 180
         run: |
@@ -1189,13 +1194,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8:
+  nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1220,7 +1225,7 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4 KV FP8)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-R1-MXFP4 KV FP8)
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
@@ -1231,7 +1236,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4 KV FP8)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-R1-MXFP4 KV FP8)
         timeout-minutes: 300
         continue-on-error: true
         run: |
@@ -1243,13 +1248,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion:
+  nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1274,7 +1279,7 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4 AllReduce Fusion)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-R1-MXFP4 AllReduce Fusion)
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
@@ -1285,7 +1290,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4 AllReduce Fusion)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-R1-MXFP4 AllReduce Fusion)
         timeout-minutes: 300
         continue-on-error: true
         run: |
@@ -1297,13 +1302,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-mi35x-deepseek-r1-hicache:
+  nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-hicache ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-hicache,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1326,7 +1331,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU DeepSeek-R1 HiCache)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU DeepSeek-R1 HiCache)
         timeout-minutes: 180
         run: |
           > github_summary.md
@@ -1344,13 +1349,13 @@ jobs:
   # MI300X Flash FP8 low-latency cell, so it also covers MLA + KV-FP8 on gfx942.
   # ==============================================================================
 
-  nightly-8-gpu-deepseek-v4-flash:
+  nightly-8-gpu-deepseek-v4-flash-rocm720:
     name: ${{ format('nightly-8-gpu-deepseek-v4-flash ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v4-flash,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v4-flash-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
@@ -1372,7 +1377,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test ROCm (8-GPU DeepSeek-V4-Flash FP8)
+      - name: Accuracy Test ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8)
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
@@ -1387,13 +1392,13 @@ jobs:
   # 8-GPU DeepSeek-V4 (MI35x)
   # ==============================================================================
 
-  nightly-8-gpu-mi35x-deepseek-v4-flash:
+  nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-flash ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-flash,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1418,7 +1423,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy + Performance Test MI35x ROCm (8-GPU DeepSeek-V4-Flash FP8 + FP4, unified_kv_triton)
+      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4, unified_kv_triton)
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
@@ -1430,7 +1435,7 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
-      - name: Accuracy + Performance Test MI35x ROCm (8-GPU DeepSeek-V4-Flash FP8 + FP4, triton)
+      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4, triton)
         if: ${{ !cancelled() }}
         timeout-minutes: 300
         run: |
@@ -1443,13 +1448,13 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
-  nightly-8-gpu-mi35x-deepseek-v4-pro:
+  nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-pro ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1474,7 +1479,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy + Performance Test MI35x ROCm (8-GPU DeepSeek-V4-Pro FP8 + FP4, unified_kv_triton)
+      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 + FP4, unified_kv_triton)
         timeout-minutes: 480
         run: |
           > github_summary.md  # Clear summary file
@@ -1486,7 +1491,7 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
-      - name: Accuracy + Performance Test MI35x ROCm (8-GPU DeepSeek-V4-Pro FP8 + FP4, triton)
+      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 + FP4, triton)
         if: ${{ !cancelled() }}
         timeout-minutes: 480
         run: |
@@ -1499,13 +1504,13 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
-  nightly-8-gpu-mi35x-deepseek-v4-pro-mtp:
+  nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-pro-mtp ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-mtp,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1530,7 +1535,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy + MTP Accept Length Test MI35x ROCm (8-GPU DeepSeek-V4-Pro FP8 MTP, unified_kv_triton)
+      - name: Accuracy + MTP Accept Length Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 MTP, unified_kv_triton)
         timeout-minutes: 240
         run: |
           > github_summary.md  # Clear summary file
@@ -1542,7 +1547,7 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
-      - name: Accuracy + MTP Accept Length Test MI35x ROCm (8-GPU DeepSeek-V4-Pro FP8 MTP, triton)
+      - name: Accuracy + MTP Accept Length Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 MTP, triton)
         if: ${{ !cancelled() }}
         timeout-minutes: 240
         run: |
@@ -1555,13 +1560,13 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-mtp --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
-  nightly-8-gpu-mi35x-deepseek-v4-pro-dspark:
+  nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-v4-pro-dspark ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-dspark,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1586,7 +1591,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy + DSpark Accept Length Test MI35x ROCm (8-GPU DeepSeek-V4-Pro-DSpark FP4, unified_kv_triton)
+      - name: Accuracy + DSpark Accept Length Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro-DSpark FP4, unified_kv_triton)
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
@@ -1605,13 +1610,13 @@ jobs:
   # cannot take over here the way it does on MI35x.
   # ==============================================================================
 
-  nightly-8-gpu-kimi-k26:
+  nightly-8-gpu-kimi-k26-rocm720:
     name: ${{ format('nightly-8-gpu-kimi-k26 ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-kimi-k26,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-kimi-k26-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
@@ -1633,7 +1638,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test ROCm (8-GPU Kimi-K2.6)
+      - name: Accuracy Test ROCm 7.2 (8-GPU Kimi-K2.6)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -1648,13 +1653,13 @@ jobs:
   # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
   # ==============================================================================
 
-  nightly-8-gpu-mi35x-kimi-k3:
+  nightly-8-gpu-mi35x-kimi-k3-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-kimi-k3 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k3,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k3-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1681,7 +1686,7 @@ jobs:
 
       # The 2.8T MXFP4 checkpoint is ~1.56 TB, so weight download and load
       # dominate wall time well before the eval itself starts.
-      - name: Accuracy Test MI35x ROCm (8-GPU Kimi-K3)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Kimi-K3)
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
@@ -1698,7 +1703,7 @@ jobs:
       # throughput is never measured on a build that got the tokens wrong.
       # continue-on-error matches every other combined accuracy + perf job here,
       # so a perf hiccup cannot turn the accuracy result red.
-      - name: Performance Test MI35x ROCm (8-GPU Kimi-K3)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU Kimi-K3)
         timeout-minutes: 300
         continue-on-error: true
         run: |
@@ -1714,13 +1719,13 @@ jobs:
   # 8-GPU Qwen 3.5 (MI30x + MI35x)
   # ==============================================================================
 
-  nightly-8-gpu-qwen35:
+  nightly-8-gpu-qwen35-rocm720:
     name: ${{ format('nightly-8-gpu-qwen35 ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-qwen35,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-qwen35-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
@@ -1744,7 +1749,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
 
-      - name: Accuracy Test ROCm (8-GPU Qwen 3.5)
+      - name: Accuracy Test ROCm 7.2 (8-GPU Qwen 3.5)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -1755,7 +1760,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test ROCm (8-GPU Qwen 3.5 FP8)
+      - name: Performance Test ROCm 7.2 (8-GPU Qwen 3.5 FP8)
         timeout-minutes: 120
         continue-on-error: true
         run: |
@@ -1768,13 +1773,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-mi35x-qwen35:
+  nightly-8-gpu-mi35x-qwen35-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-qwen35 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1798,7 +1803,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
           bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
 
-      - name: Accuracy Test MI35x ROCm (8-GPU Qwen 3.5)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Qwen 3.5)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -1809,7 +1814,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm (8-GPU Qwen 3.5 FP8)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU Qwen 3.5 FP8)
         timeout-minutes: 120
         continue-on-error: true
         run: |
@@ -1822,13 +1827,13 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-mi35x-qwen35-triton-dcp:
+  nightly-8-gpu-mi35x-qwen35-triton-dcp-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-qwen35-triton-dcp ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35-triton-dcp,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35-triton-dcp-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1851,7 +1856,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU Qwen 3.5 Triton DCP)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Qwen 3.5 Triton DCP)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -1866,13 +1871,13 @@ jobs:
   # 8-GPU Qwen3.8-MXFP4 (MI35x only - MXFP4 needs gfx95x)
   # ==============================================================================
 
-  nightly-8-gpu-mi35x-qwen38-mxfp4:
+  nightly-8-gpu-mi35x-qwen38-mxfp4-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-qwen38-mxfp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen38-mxfp4,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen38-mxfp4-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1910,7 +1915,7 @@ jobs:
       # same suite so they launch from one server config. The 2.4T MXFP4
       # checkpoint is ~1.2 TB and is loaded once per phase, which dominates
       # wall time well before either the eval or the benchmark starts.
-      - name: Accuracy Test + Performance Test MI35x ROCm (8-GPU Qwen3.8-MXFP4)
+      - name: Accuracy Test + Performance Test MI35x ROCm 7.2 (8-GPU Qwen3.8-MXFP4)
         timeout-minutes: 420
         run: |
           > github_summary.md  # Clear summary file
@@ -1925,13 +1930,13 @@ jobs:
   # 8-GPU GLM-5.1 (MI30x + MI35x)
   # ==============================================================================
 
-  nightly-8-gpu-glm51:
+  nightly-8-gpu-glm51-rocm720:
     name: ${{ format('nightly-8-gpu-glm51 ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-glm51,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-glm51-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
@@ -1953,7 +1958,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test ROCm (8-GPU GLM-5.1 DSA)
+      - name: Accuracy Test ROCm 7.2 (8-GPU GLM-5.1 DSA)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -1964,7 +1969,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test ROCm (8-GPU GLM-5.1)
+      - name: Performance Test ROCm 7.2 (8-GPU GLM-5.1)
         timeout-minutes: 120
         continue-on-error: true
         run: |
@@ -1981,13 +1986,13 @@ jobs:
   # 8-GPU GLM-5.2-FP8 (MI35x accuracy + performance)
   # ==============================================================================
 
-  nightly-8-gpu-mi35x-glm52-fp8:
+  nightly-8-gpu-mi35x-glm52-fp8-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-glm52-fp8 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm52-fp8,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm52-fp8-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -2013,7 +2018,7 @@ jobs:
 
       # The ~700 GB FP8 checkpoint means weight download and load dominate wall
       # time well before the eval itself starts.
-      - name: Accuracy Test MI35x ROCm (8-GPU GLM-5.2-FP8 DSA)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GLM-5.2-FP8 DSA)
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
@@ -2026,7 +2031,7 @@ jobs:
 
       # Run perf only after correctness passes. Keeping both steps in this job
       # reuses the cached ~700 GB checkpoint and one scarce 8-GPU MI35x slot.
-      - name: Performance Test MI35x ROCm (8-GPU GLM-5.2-FP8)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU GLM-5.2-FP8)
         timeout-minutes: 120
         continue-on-error: true
         run: |
@@ -2042,13 +2047,13 @@ jobs:
   # 8-GPU GLM-5-MXFP4 (MI35x only)
   # ==============================================================================
 
-  nightly-8-gpu-mi35x-glm5-mxfp4:
+  nightly-8-gpu-mi35x-glm5-mxfp4-rocm720:
     name: ${{ format('nightly-8-gpu-mi35x-glm5-mxfp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm5-mxfp4,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm5-mxfp4-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -2071,7 +2076,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm (8-GPU GLM-5-MXFP4)
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GLM-5-MXFP4)
         timeout-minutes: 180
         run: |
           > github_summary.md
@@ -2083,7 +2088,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm (8-GPU GLM-5-MXFP4)
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU GLM-5-MXFP4)
         timeout-minutes: 300
         continue-on-error: true
         run: |
@@ -2100,13 +2105,13 @@ jobs:
   # 4-GPU MiniMax-M2.5 (MI35x)
   # ==============================================================================
 
-  nightly-4-gpu-mi35x-minimax-m25:
+  nightly-4-gpu-mi35x-minimax-m25-rocm720:
     name: ${{ format('nightly-4-gpu-mi35x-minimax-m25 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m25,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m25-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -2128,7 +2133,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test MI35x ROCm (4-GPU MiniMax-M2.5)
+      - name: Accuracy Test MI35x ROCm 7.2 (4-GPU MiniMax-M2.5)
         timeout-minutes: 120
         run: |
           > github_summary.md
@@ -2144,13 +2149,13 @@ jobs:
   # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
   # ==============================================================================
 
-  nightly-4-gpu-mi35x-minimax-m3:
+  nightly-4-gpu-mi35x-minimax-m3-rocm720:
     name: ${{ format('nightly-4-gpu-mi35x-minimax-m3 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m3,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m3-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -2172,7 +2177,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test MI35x ROCm (4-GPU MiniMax-M3 MXFP8)
+      - name: Accuracy Test MI35x ROCm 7.2 (4-GPU MiniMax-M3 MXFP8)
         timeout-minutes: 120
         run: |
           > github_summary.md
@@ -2186,7 +2191,7 @@ jobs:
 
       # Run perf only after correctness passes. Keeping both steps in this job
       # reuses the cached checkpoint and one scarce MI35x slot.
-      - name: Performance Test MI35x ROCm (4-GPU MiniMax-M3 MXFP8)
+      - name: Performance Test MI35x ROCm 7.2 (4-GPU MiniMax-M3 MXFP8)
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         run: |
@@ -2203,13 +2208,13 @@ jobs:
   # 8-GPU MiniMax-M2.7 (MI30x only)
   # ==============================================================================
 
-  nightly-8-gpu-minimax-m27:
+  nightly-8-gpu-minimax-m27-rocm720:
     name: ${{ format('nightly-8-gpu-minimax-m27 ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-minimax-m27,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-minimax-m27-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
       - name: Checkout code
@@ -2231,7 +2236,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test ROCm (8-GPU MiniMax-M2.7)
+      - name: Accuracy Test ROCm 7.2 (8-GPU MiniMax-M2.7)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -2243,7 +2248,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test ROCm (8-GPU MiniMax-M2.7)
+      - name: Performance Test ROCm 7.2 (8-GPU MiniMax-M2.7)
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         run: |
@@ -2260,13 +2265,13 @@ jobs:
   # Diffusion (MI30x)
   # ==============================================================================
 
-  nightly-1-gpu-zimage-turbo:
+  nightly-1-gpu-zimage-turbo-rocm720:
     name: ${{ format('nightly-1-gpu-zimage-turbo ({0}, linux-mi300-1gpu-sglang)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-1-gpu-zimage-turbo,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-1-gpu-zimage-turbo-rocm720,'))
     runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
@@ -2287,7 +2292,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
-      - name: Z-Image-Turbo Diffusion Test ROCm (1-GPU)
+      - name: Z-Image-Turbo Diffusion Test ROCm 7.2 (1-GPU)
         timeout-minutes: 45
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
@@ -2310,78 +2315,78 @@ jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     needs:
       # 1-GPU Unit Tests (MI30x + MI35x)
-      - nightly-test-1-gpu-unit
-      - nightly-test-1-gpu-mi35x
+      - nightly-test-1-gpu-unit-rocm720
+      - nightly-test-1-gpu-mi35x-rocm720
       # 2-GPU and 4-GPU Tests (MI30x + MI35x)
-      - nightly-accuracy-2-gpu
-      - nightly-accuracy-2-gpu-vlm
-      - nightly-perf-2-gpu-text
-      - nightly-perf-2-gpu-vlm
-      - nightly-4-gpu
-      - nightly-2-gpu-mi35x-glm51-mxfp4
-      - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2
+      - nightly-accuracy-2-gpu-rocm720
+      - nightly-accuracy-2-gpu-vlm-rocm720
+      - nightly-perf-2-gpu-text-rocm720
+      - nightly-perf-2-gpu-vlm-rocm720
+      - nightly-4-gpu-rocm720
+      - nightly-2-gpu-mi35x-glm51-mxfp4-rocm720
+      - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720
       # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
-      - nightly-accuracy-8-gpu
-      - nightly-accuracy-8-gpu-mi35x
+      - nightly-accuracy-8-gpu-rocm720
+      - nightly-accuracy-8-gpu-mi35x-rocm720
       # 8-GPU Grok1-INT4 (MI30x + MI35x)
-      - nightly-8-gpu-grok1-int4
-      - nightly-8-gpu-mi35x-grok1-int4
+      - nightly-8-gpu-grok1-int4-rocm720
+      - nightly-8-gpu-mi35x-grok1-int4-rocm720
       # 8-GPU Grok2 (MI30x + MI35x)
-      - nightly-8-gpu-grok2
-      - nightly-8-gpu-mi35x-grok2
+      - nightly-8-gpu-grok2-rocm720
+      - nightly-8-gpu-mi35x-grok2-rocm720
       # 8-GPU DeepSeek-V3.2 (MI30x)
-      - nightly-8-gpu-deepseek-v32
-      - nightly-8-gpu-deepseek-v32-mtp
+      - nightly-8-gpu-deepseek-v32-rocm720
+      - nightly-8-gpu-deepseek-v32-mtp-rocm720
       # 8-GPU DeepSeek-V3.2 (MI35x)
-      - nightly-8-gpu-mi35x-deepseek-v32
-      - nightly-8-gpu-mi35x-deepseek-v32-mtp
+      - nightly-8-gpu-mi35x-deepseek-v32-rocm720
+      - nightly-8-gpu-mi35x-deepseek-v32-mtp-rocm720
       # 8-GPU DeepSeek-R1 (MI35x only)
-      - nightly-8-gpu-mi35x-deepseek-r1-mxfp4
-      - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8
-      - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion
-      - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4
-      - nightly-8-gpu-mi35x-deepseek-r1-hicache
+      - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-rocm720
+      - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8-rocm720
+      - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion-rocm720
+      - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720
+      - nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720
       # 8-GPU DeepSeek-V4-Flash (MI30x)
-      - nightly-8-gpu-deepseek-v4-flash
+      - nightly-8-gpu-deepseek-v4-flash-rocm720
       # 8-GPU DeepSeek-V4 (MI35x)
-      - nightly-8-gpu-mi35x-deepseek-v4-flash
-      - nightly-8-gpu-mi35x-deepseek-v4-pro
-      - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp
-      - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark
+      - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
+      - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
+      - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
+      - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720
       # 8-GPU Kimi-K2.6 (MI30x)
-      - nightly-8-gpu-kimi-k26
+      - nightly-8-gpu-kimi-k26-rocm720
       # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
-      - nightly-8-gpu-mi35x-kimi-k3
+      - nightly-8-gpu-mi35x-kimi-k3-rocm720
       # 8-GPU Qwen3.8-MXFP4 (MI35x only - MXFP4 needs gfx95x)
-      - nightly-8-gpu-mi35x-qwen38-mxfp4
+      - nightly-8-gpu-mi35x-qwen38-mxfp4-rocm720
       # 8-GPU Qwen 3.5 (MI30x + MI35x)
-      - nightly-8-gpu-qwen35
-      - nightly-8-gpu-mi35x-qwen35
-      - nightly-8-gpu-mi35x-qwen35-triton-dcp
+      - nightly-8-gpu-qwen35-rocm720
+      - nightly-8-gpu-mi35x-qwen35-rocm720
+      - nightly-8-gpu-mi35x-qwen35-triton-dcp-rocm720
       # 8-GPU GLM-5.1 (MI30x)
-      - nightly-8-gpu-glm51
+      - nightly-8-gpu-glm51-rocm720
       # 8-GPU GLM-5.2-FP8 (MI35x accuracy + performance)
-      - nightly-8-gpu-mi35x-glm52-fp8
+      - nightly-8-gpu-mi35x-glm52-fp8-rocm720
       # 8-GPU GLM-5-MXFP4 (MI35x only)
-      - nightly-8-gpu-mi35x-glm5-mxfp4
+      - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
       # 4-GPU MiniMax-M2.5 (MI35x)
-      - nightly-4-gpu-mi35x-minimax-m25
+      - nightly-4-gpu-mi35x-minimax-m25-rocm720
       # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
-      - nightly-4-gpu-mi35x-minimax-m3
+      - nightly-4-gpu-mi35x-minimax-m3-rocm720
       # 8-GPU MiniMax-M2.7 (MI30x only)
-      - nightly-8-gpu-minimax-m27
+      - nightly-8-gpu-minimax-m27-rocm720
       # Diffusion (MI30x)
-      - nightly-1-gpu-zimage-turbo
+      - nightly-1-gpu-zimage-turbo-rocm720
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed
         run: |
           if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
-            echo "One or more ROCm nightly test jobs failed"
+            echo "One or more ROCm 7.2 nightly test jobs failed"
             exit 1
           fi
           if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more ROCm nightly test jobs were cancelled"
+            echo "One or more ROCm 7.2 nightly test jobs were cancelled"
             exit 1
           fi
-          echo "All ROCm nightly test jobs passed"
+          echo "All ROCm 7.2 nightly test jobs passed"

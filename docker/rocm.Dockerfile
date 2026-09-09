@@ -51,7 +51,7 @@ ARG BASE_IMAGE_1250_ROCM1000="rocm1000-base"
 ARG BASE_IMAGE_ROCM1000="ubuntu:24.04"
 
 # This is necessary for scope purpose
-ARG GPU_ARCH=gfx950-rocm1000
+ARG GPU_ARCH=gfx950
 
 # ===============================
 # Base image 942 with rocm700 and args
@@ -337,7 +337,7 @@ COPY . /src
 FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
-ARG GPU_ARCH=gfx950-rocm1000
+ARG GPU_ARCH=gfx950
 RUN echo GPU_ARCH="${GPU_ARCH}" \
     && echo "GPU_ARCH_LIST=${GPU_ARCH%%-*}" >> /etc/environment \
     && echo "export GPU_ARCH_LIST=${GPU_ARCH%%-*}" >> /etc/bash.bashrc

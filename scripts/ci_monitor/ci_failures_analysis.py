@@ -32,7 +32,8 @@ def _filter_legacy_amd_job_rows(job_data: Dict[str, Dict]) -> Dict[str, Dict]:
 
     filtered = {}
     for full_name, data in job_data.items():
-        # This caller was renamed by the AMD job-name cutover.
+        # This caller was renamed by the AMD job-name cutover. Other outer
+        # callers, including AITER's *-rocm720 callers, are still current.
         name_parts = full_name.split(" / ")
         if "call-pr-test-amd-extra-rocm720" in name_parts[:-1]:
             continue
@@ -59,14 +60,11 @@ def _filter_legacy_amd_job_rows(job_data: Dict[str, Dict]) -> Dict[str, Dict]:
         if separator and version.isdigit():
             continue
 
-        # Intermediate nightly schemas showed either only the ROCm flavor or a
-        # retired ROCm 7 flavor plus runner. Current names use ROCm 10 plus the
-        # runner inside parentheses.
+        # An intermediate nightly schema showed only the ROCm flavor. Current
+        # names always include both the flavor and runner inside parentheses.
         if leaf_name.endswith(")") and " (" in leaf_name:
             details = leaf_name.rsplit(" (", 1)[1][:-1]
             if details.startswith("rocm") and details[4:].isdigit():
-                continue
-            if details.split(",", 1)[0] in {"rocm700", "rocm720", "rocm724"}:
                 continue
 
         filtered[full_name] = data
@@ -94,7 +92,7 @@ class SGLangFailuresAnalyzer:
             "check-changes",
             "pr-test-finish",  # Nvidia workflow teardown
             "pr-test-amd-finish",  # AMD workflow teardown
-            "pr-test-amd-rocm720-finish",  # Legacy AMD teardown
+            "pr-test-amd-rocm720-finish",  # Default AMD ROCm 7.2 teardown
             "call-gate",
             "pr-gate",
             "check-all-jobs",
