@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     MIN_HOST_RESERVE_BYTES,
     HostPinBudget,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
+    MemoryOccupationController,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
     capture_weight_snapshot,
     restore_weight_snapshot,
@@ -136,6 +139,33 @@ def test_live_headroom_prevents_pin_copy(monkeypatch):
     capture_weight_snapshot(module, pin_budget=budget)
     assert module.weight.data_ptr() == pointer
     assert not module.weight.is_pinned()
+    assert budget.committed_bytes == 0
+    restore_weight_snapshot(module)
+
+
+def test_sleep_keeps_the_pin_lease_and_existing_pins_are_reused():
+    module = torch.nn.Linear(4, 4, bias=False)
+    budget = HostPinBudget(available_bytes=MIN_HOST_RESERVE_BYTES + 64)
+    capture_weight_snapshot(module, pin_budget=budget)
+    pointer = module.weight.data_ptr()
+    module.cuda()
+    pipeline = SimpleNamespace(modules={"transformer": module})
+    controller = MemoryOccupationController(pipeline, rank=0, use_fsdp_inference=False)
+    controller._move_modules(["transformer"], "cpu")
+    assert module.weight.data_ptr() == pointer
+    assert budget.committed_bytes == 64
+    capture_weight_snapshot(module, pin_budget=budget)
+    assert budget.committed_bytes == 64
+    restore_weight_snapshot(module)
+    del module, pipeline, controller
+    gc.collect()
+    assert budget.committed_bytes == 0
+
+    module = torch.nn.Linear(4, 4, bias=False)
+    module.weight.data = module.weight.detach().pin_memory()
+    pointer = module.weight.data_ptr()
+    capture_weight_snapshot(module, pin_budget=budget)
+    assert module.weight.data_ptr() == pointer
     assert budget.committed_bytes == 0
     restore_weight_snapshot(module)
 
