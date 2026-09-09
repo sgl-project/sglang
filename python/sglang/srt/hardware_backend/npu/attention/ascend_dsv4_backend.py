@@ -81,30 +81,30 @@ def _sparse_attn_kv_quant_kwargs() -> dict:
 def _npu_rope_tail(
     x: torch.Tensor, freqs_cis: torch.Tensor, positions: torch.Tensor, rope_dim: int
 ) -> torch.Tensor:
-    """NPU-safe interleaved RoPE: rotate the last rope_dim features of x.
+    """NPU-safe interleaved RoPE: rotate the last rope_dim features of x in-place
+    via the custom partial-rotary kernel.
 
     GPU code uses complex64 (view_as_complex + complex multiply), which NPU
-    does not support (aclnnIndex rejects DT_COMPLEX64). This version reads
-    the real cos/sin tables built by Dsv4NpuRoPE and does the rotation with
-    plain real arithmetic:
-        x'_2i   = x_2i * cos_i - x_2i+1 * sin_i
-        x'_2i+1 = x_2i * sin_i + x_2i+1 * cos_i
+    does not support (aclnnIndex rejects DT_COMPLEX64). The custom kernel
+    ``inplace_partial_rotary_mul`` does the same interleave rotation with fp32
+    accumulation internally, which is both faster and more precise than the
+    previous pure-torch even/odd split.
     """
     rope = Dsv4NpuRoPE.for_freqs(freqs_cis)
-    cos, sin = rope.get_cos_sin(positions.to(torch.int64), torch.float32)
-    cos_i = cos[..., ::2]
-    sin_i = sin[..., ::2]
-    cos_i = cos_i.view(cos_i.shape[0], *([1] * (x.ndim - 2)), cos_i.shape[-1])
-    sin_i = sin_i.view(sin_i.shape[0], *([1] * (x.ndim - 2)), sin_i.shape[-1])
-
-    head = x[..., :-rope_dim]
-    tail = x[..., -rope_dim:].float()
-    even = tail[..., ::2]
-    odd = tail[..., 1::2]
-    rot_even = even * cos_i - odd * sin_i
-    rot_odd = even * sin_i + odd * cos_i
-    rotated = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
-    return torch.cat([head, rotated.to(x.dtype)], dim=-1)
+    cos, sin = rope.get_cos_sin(
+        positions.to(torch.int64), torch.float32, view_4d=True
+    )
+    qk_nope_dim = x.shape[-1] - rope_dim
+    # apply_rotary_mul_inplace expects [T, n_heads, head_dim]; unsqueeze 2-D
+    # inputs (latent, index_k) so the kernel sees a head axis.
+    squeezed = False
+    if x.ndim == 2:
+        x = x.unsqueeze(-2)
+        squeezed = True
+    Dsv4NpuRoPE.apply_rotary_mul_inplace(x, None, cos, sin, qk_nope_dim=qk_nope_dim)
+    if squeezed:
+        x = x.squeeze(-2)
+    return x
 
 
 def _npu_rope_fq4(
@@ -115,8 +115,8 @@ def _npu_rope_fq4(
     The GPU _rope_fq4 either calls a Triton fused kernel (rope_tail_fake_quant_fp4,
     which uses libdevice.rint unavailable on Ascend) or falls back to rope_tail
     (which uses complex64). Neither works on NPU, so we compose the same math
-    from NPU-supported ops: _npu_rope_tail (real cos/sin) + fake_quant_fp4
-    (pure torch).
+    from NPU-supported ops: _npu_rope_tail (custom partial-rotary kernel) +
+    fake_quant_fp4 (pure torch).
     """
     return fake_quant_fp4(_npu_rope_tail(x, freqs_cis, positions, rope_dim))
 
