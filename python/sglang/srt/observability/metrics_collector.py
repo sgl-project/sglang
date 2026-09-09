@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_CATEGORIES,
+)
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.runtime_context import (
     exports_expert_balancedness_to_prometheus,
@@ -916,6 +919,31 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=list(labels.keys()) + ["category"],
         )
+        self.scheduler_idle_seconds_total = Counter(
+            name="sglang:scheduler_idle_seconds_total",
+            documentation=(
+                "Total wall time while the scheduler has no runnable or queued work."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.scheduler_process_cpu_seconds_total = Counter(
+            name="sglang:scheduler_process_cpu_seconds_total",
+            documentation=(
+                "Total CPU time consumed by the scheduler process across all threads."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.scheduler_stage_seconds_total = Counter(
+            name="sglang:scheduler_stage_seconds_total",
+            documentation=(
+                "Total scheduler-loop wall time exclusively attributed to each stage."
+            ),
+            labelnames=list(labels.keys()) + ["category"],
+        )
+        self.scheduler_idle_seconds_total.labels(**labels)
+        self.scheduler_process_cpu_seconds_total.labels(**labels)
+        for category in SCHEDULER_STAGE_CATEGORIES:
+            self.scheduler_stage_seconds_total.labels(**labels, category=category)
         self.estimated_flops_per_gpu_total = Counter(
             name="sglang:estimated_flops_per_gpu_total",
             documentation=(
@@ -1301,6 +1329,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 category=category,
                 **dp_cooperation_info.to_labels(),
             ).inc(t)
+
+    def increment_scheduler_idle_seconds(self, t: float) -> None:
+        self.scheduler_idle_seconds_total.labels(**self.labels).inc(t)
+
+    def increment_scheduler_process_cpu_seconds(self, t: float) -> None:
+        self.scheduler_process_cpu_seconds_total.labels(**self.labels).inc(t)
+
+    def increment_scheduler_stage_seconds(self, stage: str, seconds: float) -> None:
+        self.scheduler_stage_seconds_total.labels(**self.labels, category=stage).inc(
+            seconds
+        )
 
     def increment_estimated_perf(
         self,
@@ -1808,6 +1847,10 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         ).observe(value)
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
+        # Injected backends (e.g. Ray) route metrics out of process and can't
+        # introspect prometheus_client buckets here.
+        if self._histogram_cls is not None:
+            return False
         his = self.histogram_time_to_first_token.labels(
             **self.labels, is_streaming="true"
         )
@@ -1826,10 +1869,17 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self, labels: Dict[str, str], internval: float, num_new_tokens: int
     ):
         adjusted_interval = internval / num_new_tokens
+        his = self.histogram_inter_token_latency.labels(**labels)
+
+        if self._histogram_cls is not None:
+            # Injected backend (e.g. Ray): the bucket internals below don't
+            # exist, so use the public observe() API.
+            for _ in range(num_new_tokens):
+                his.observe(adjusted_interval)
+            return
 
         # A faster version of the Histogram::observe which observes multiple values at the same time.
         # reference: https://github.com/prometheus/client_python/blob/v0.21.1/prometheus_client/metrics.py#L639
-        his = self.histogram_inter_token_latency.labels(**labels)
         his._sum.inc(internval)
 
         for i, bound in enumerate(his._upper_bounds):

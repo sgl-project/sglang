@@ -436,6 +436,16 @@ class Platform:
         return True
 
     @classmethod
+    def device_shares_host_memory(cls) -> bool:
+        """Whether the accelerator draws from the same physical pool as the host.
+
+        On such a part (DGX Spark's GB10, Jetson) a device allocation is host
+        memory the kernel no longer has, and a host copy of a mapped weight is
+        a second copy of bytes the page cache already holds.
+        """
+        return False
+
+    @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Apply platform-specific optimizations to VAE after loading."""
         return vae
