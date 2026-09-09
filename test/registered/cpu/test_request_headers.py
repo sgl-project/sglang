@@ -4,7 +4,10 @@ from types import SimpleNamespace
 from fastapi import HTTPException
 from starlette.datastructures import Headers
 
-from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.request_headers import (
+    apply_header_overrides,
+    extract_routed_dp_rank,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -108,3 +111,25 @@ class TestApplyRoutingHeaders(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExtractRoutedDpRank(CustomTestCase):
+    def test_no_header_keeps_body_value(self):
+        self.assertIsNone(extract_routed_dp_rank(Headers({}), None))
+        self.assertEqual(extract_routed_dp_rank(Headers({}), 2), 2)
+        self.assertEqual(extract_routed_dp_rank(None, 2), 2)
+
+    def test_header_is_read_case_insensitively(self):
+        self.assertEqual(
+            extract_routed_dp_rank(Headers({"X-Data-Parallel-Rank": "3"}), None), 3
+        )
+
+    def test_header_overrides_body(self):
+        self.assertEqual(
+            extract_routed_dp_rank(Headers({"x-data-parallel-rank": "3"}), 1), 3
+        )
+
+    def test_non_integer_header_is_rejected(self):
+        with self.assertRaises(HTTPException) as ctx:
+            extract_routed_dp_rank(Headers({"x-data-parallel-rank": "abc"}), None)
+        self.assertEqual(ctx.exception.status_code, 400)

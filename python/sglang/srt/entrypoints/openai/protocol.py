@@ -1651,6 +1651,11 @@ class ResponsesRequest(BaseModel):
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
     )
+    # The data-parallel rank to route this request to (--dp-size > 1). The
+    # X-Data-Parallel-Rank header takes precedence, as on the other routes.
+    routed_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
+    data_parallel_rank: Optional[int] = None
 
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
@@ -1668,6 +1673,11 @@ class ResponsesRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod

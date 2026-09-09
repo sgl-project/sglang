@@ -1038,3 +1038,80 @@ class StreamingLogprobsRejectionTestCase(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoutedDpRankForwardingTestCase(unittest.TestCase):
+    """The rank pin must reach the GenerateReqInput, or a DP-aware gateway's
+    pin degrades silently to the engine's own load balancing."""
+
+    def _run(self, request, headers):
+        serving = make_serving()
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+            reasoning_end_token_ids=[41, 42],
+        )
+        captured = {}
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["adapted_request"] = adapted_request
+            context.append_output(
+                {
+                    "text": "done",
+                    "meta_info": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        raw_request = Mock()
+        raw_request.headers = headers
+        with (
+            patch.object(
+                serving, "_apply_conversation_template", return_value=rendered
+            ),
+            patch(
+                "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+            ) as parser_cls,
+        ):
+            parser_cls.return_value.parse_non_stream.return_value = (None, "done")
+            response = asyncio.run(
+                serving.create_responses(request, raw_request=raw_request)
+            )
+        self.assertEqual(response.status, "completed")
+        return captured["adapted_request"]
+
+    def test_body_routed_dp_rank_reaches_engine_request(self):
+        request = ResponsesRequest(
+            model="x", input="hi", request_id="resp_dp", store=False, routed_dp_rank=2
+        )
+        self.assertEqual(self._run(request, {}).routed_dp_rank, 2)
+
+    def test_header_overrides_body(self):
+        request = ResponsesRequest(
+            model="x", input="hi", request_id="resp_dp", store=False, routed_dp_rank=2
+        )
+        adapted = self._run(request, {"x-data-parallel-rank": "3"})
+        self.assertEqual(adapted.routed_dp_rank, 3)
+
+    def test_unpinned_request_stays_unpinned(self):
+        request = ResponsesRequest(
+            model="x", input="hi", request_id="resp_dp", store=False
+        )
+        self.assertIsNone(self._run(request, {}).routed_dp_rank)
