@@ -1527,6 +1527,10 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Caps the width the fused indexer's workspace is sized for; 0 means no
+    # cap. Any cap below max_position_embeddings makes ensure_workspace refuse
+    # on every call, since the decode graph's page table is sized to the model.
+    SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX = EnvInt(0)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)

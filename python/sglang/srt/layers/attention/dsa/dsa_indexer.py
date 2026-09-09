@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -28,6 +29,9 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
+    assert_hadamard_preserved,
+    gfx950_fused_indexer_runtime_ok,
+    gfx950_model_shape_supported,
     is_dsa_enable_prefill_cp,
     is_graph_dsa_split_op_surface,
 )
@@ -64,6 +68,21 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+
+# Every per-call decline in _gfx950_fused_decode falls through to the standard
+# path, which is silent by construction. Without a trace, a config that turns
+# the feature off -- rows past the row cap is the easy one to hit -- looks
+# identical to one where it is on, and an A/B measures two identical arms.
+_FUSED_DECLINE_LOGGED: set = set()
+
+
+def _decline_fused(reason: str) -> None:
+    """Log the first occurrence of each distinct decline reason, then stay quiet."""
+    if reason not in _FUSED_DECLINE_LOGGED:
+        _FUSED_DECLINE_LOGGED.add(reason)
+        logger.info("gfx950 fused DSA indexer declined this call: %s", reason)
+
+
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
@@ -216,6 +235,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _mqa_logits_free_mem_fraction() -> float:
         return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
 
+    @classmethod
+    def invalidate_mqa_logits_budget(cls) -> None:
+        """Drop the cached MQA-logits budget so the next prefill re-reads the real
+        figure. True once after an allocation, then False."""
+        Indexer._mqa_logits_budget_bytes.clear()
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _layer_split_pool_cls():
+        """The KV-pool class that splits index-K cache from the main KV cache, which
+        is what the fused kernels address directly."""
+        try:
+            from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                LayerSplitDSATokenToKVPool,
+            )
+
+            return LayerSplitDSATokenToKVPool
+        except ImportError:
+            logger.warning(
+                "gfx950 fused DSA indexer: cannot resolve the layer-split KV pool "
+                "class, so layer ownership cannot be checked; disabling the path"
+            )
+            return None
+
     def __init__(
         self,
         hidden_size: int,
@@ -324,6 +367,108 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
 
+        # gfx950 fused decode indexer. All three conditions below must hold; the
+        # runtime half is dsa/utils.gfx950_fused_indexer_runtime_ok.
+        gfx950_shape_ok = gfx950_model_shape_supported(
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+            n_heads=self.n_heads,
+            index_topk=self.index_topk,
+            q_lora_rank=self.q_lora_rank,
+            hidden_size=self.hidden_size,
+            quant_block=self.block_size,
+            scale_fmt=self.scale_fmt,
+            is_neox_style=is_neox_style,
+            k_norm=self.k_norm,
+            num_init_tokens=self.num_init_tokens,
+            num_local_tokens=self.num_local_tokens,
+        )
+        # The fused GEMV pre-merges [wk ; weights_proj] into one bf16 weight,
+        # so both must be bf16; a checkpoint that quantises one of them cannot
+        # take this path. Resolve every module defensively: use_dsa_indexer_fusion
+        # builds wk_weights_proj and leaves wk/weights_proj undefined, and a
+        # quantised checkpoint names its parameter something other than `weight`,
+        # so neither the modules nor their `.weight` can be assumed to exist.
+        wk_w = getattr(getattr(self, "wk", None), "weight", None)
+        wp_w = getattr(getattr(self, "weights_proj", None), "weight", None)
+        wq_b_w = getattr(getattr(self, "wq_b", None), "weight", None)
+        gfx950_weights_ok = (
+            wk_w is not None
+            and wp_w is not None
+            and wq_b_w is not None
+            and wk_w.dtype == torch.bfloat16
+            and wp_w.dtype == torch.bfloat16
+            and wq_b_w.dtype == torch.bfloat16
+        )
+        if gfx950_shape_ok and not gfx950_weights_ok:
+            logger.info(
+                "gfx950 fused DSA indexer disabled: needs bf16 wk/weights_proj/"
+                "wq_b, got %s/%s/%s",
+                getattr(wk_w, "dtype", None),
+                getattr(wp_w, "dtype", None),
+                getattr(wq_b_w, "dtype", None),
+            )
+        # Order matters: gfx950_fused_indexer_runtime_ok() ends by JIT-building
+        # four HIP extensions, so it goes last. Evaluated first it would compile
+        # them on every gfx950 server -- minutes, serialised across TP ranks on
+        # torch's build lock -- for models the shape gate then rejects anyway.
+        self.use_gfx950_fused_indexer = (
+            not self.use_dsa_indexer_fusion
+            and gfx950_shape_ok
+            and gfx950_weights_ok
+            and gfx950_fused_indexer_runtime_ok()
+        )
+        self._gfx950_fused = None
+        if (
+            # Only when asked for by name: unset, this path is a default.
+            get_exec().kernel.enable_dsa_fused_indexer is True
+            and not self.use_gfx950_fused_indexer
+        ):
+            logger.info(
+                "gfx950 fused DSA indexer not used on this layer: "
+                "dsa_indexer_fusion=%s shape_supported=%s weights_bf16=%s",
+                self.use_dsa_indexer_fusion,
+                gfx950_shape_ok,
+                gfx950_weights_ok,
+            )
+        if self.use_gfx950_fused_indexer:
+            assert_hadamard_preserved(self)
+            from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+                Gfx950FusedIndexer,
+                consume_fresh_allocation,
+                prealloc_workspace,
+            )
+
+            self._gfx950_fused = Gfx950FusedIndexer(self)
+            # Bound once: this runs per layer per decode step.
+            self._consume_fresh_allocation = consume_fresh_allocation
+
+            # Take the workspace here, while weights load, so calculate_pool_sizes still
+            # sees the real free memory. Deferring it left the pools sized against memory
+            # that was about to be taken.
+            _PAGE_SLACK = 4  # pages of headroom over the derived width
+            max_ctx = getattr(config, "max_position_embeddings", 0) or 0
+            extra = 4
+            try:
+                from sglang.srt.runtime_context import get_spec
+
+                if get_spec().speculative_num_draft_tokens is not None:
+                    extra += int(get_spec().speculative_num_draft_tokens)
+            except Exception:  # spec config not available: the +4 still applies
+                pass
+            if max_ctx:
+                pages = -(-(max_ctx + extra) // 64) + _PAGE_SLACK
+                max_ctx = pages * 64
+            cap = envs.SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX.get()
+            if cap:
+                max_ctx = min(max_ctx, cap)
+            if max_ctx:
+                prealloc_workspace(
+                    device=torch.device("cuda", torch.cuda.current_device()),
+                    max_cols=max_ctx,
+                    fp8_dtype=fp8_dtype,
+                )
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -396,6 +541,146 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Fusion drops the (logit-preserving) Hadamard rotation; without it the
         # index-K cache here matches the fused path that decode reads back.
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
+
+    def _gfx950_fused_decode(
+        self,
+        x,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        metadata: Optional[BaseIndexerMetadata],
+        in_graph: bool,
+    ) -> Optional[torch.Tensor]:
+        """Per-call half of the gate plus the four launches. Returns the (rows,
+        index_topk) physical-slot tensor, or None to mean this call is not served
+        here -- forward_cuda then continues into the standard path unchanged."""
+        from sglang.kernels.ops.attention.dsa.hip_gfx950 import MAX_ROWS, PAGE_SIZE
+
+        if not self.use_gfx950_fused_indexer or metadata is None or in_graph:
+            return None
+        # draft-extend-v2 rows are an extend chunk, not one query per row.
+        if not (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            return None
+        # These kernels emit physical page_size=1 slots, which is what the caller
+        # wants only while the fused top-k transform is in play. When the topk is
+        # forced unfused -- SGLANG_DSA_FUSE_TOPK=0, hisparse on decode, or a PD
+        # seed without local-slot remap -- the attention backend transforms the
+        # indexer's output itself and therefore expects logical positions, so
+        # handing it slots would index the page table with slot ids and corrupt
+        # the gather with no error anywhere.
+        if metadata.force_unfused_topk:
+            _decline_fused("the top-k transform is forced unfused")
+            return None
+        # CP gathers K outside the kernel, which this path writes itself.
+        if forward_batch.attn_cp_metadata is not None or self.dsa_enable_prefill_cp:
+            _decline_fused("context parallelism gathers K outside the kernel")
+            return None
+        # The fused GEMV takes bf16 hidden states, not the quantised tuple.
+        if isinstance(x, tuple) or x.dtype != torch.bfloat16:
+            _decline_fused("hidden states are not plain bf16")
+            return None
+        # LoRA owns base+delta; the weights this path consumes are base only --
+        # wk/weights_proj pre-merged into one bf16 tensor and wq_b taken straight
+        # from the module. All three are LoRA-targetable (lora/utils.py maps
+        # indexer.wq_b alongside indexer.wk and indexer.weights_proj), so an
+        # adapter on any of them has to fall through to the standard path.
+        if any(
+            getattr(getattr(self, name, None), "set_lora", False)
+            for name in ("weights_proj", "wk", "wq_b")
+        ):
+            _decline_fused("a LoRA adapter owns wk / weights_proj / wq_b")
+            return None
+
+        pool = get_token_to_kv_pool()
+        if pool.page_size != PAGE_SIZE:
+            _decline_fused(f"pool page_size is {pool.page_size}, not {PAGE_SIZE}")
+            return None
+        # DSA cache layer split: the standard path stores index-K per layer, and the
+        # fused path addresses the same buffer directly.
+        split_cls = self._layer_split_pool_cls()
+        if split_cls is None:
+            return None
+        if isinstance(pool, split_cls):
+            # Ordering, not ownership, is what rules this out. The read buffer is
+            # materialised before state.run() writes this step's K, and for a
+            # split pool materialising it *is* the owner broadcast (invalidate()
+            # clears remote_layer_id, so get_broadcastable_buffer copies straight
+            # away). The current token would therefore be missing from the very
+            # logits that rank it. The standard path stores first and reads
+            # after; matching that here means splitting run() in two, so decline
+            # instead -- this combination is untested for this path anyway.
+            _decline_fused("the DSA cache layer-split pool needs store-then-read")
+            return None
+
+        rows = x.shape[0]
+        if not (1 <= rows <= MAX_ROWS):
+            _decline_fused(f"row count is outside [1, {MAX_ROWS}]")
+            return None
+        # Per-token lengths; decode aliases this to the per-request tensor.
+        seqlens = metadata.get_seqlens_expanded()
+        page_table_64 = metadata.get_page_table_64()
+        if seqlens.shape[0] != rows:
+            return None
+        if page_table_64 is None or page_table_64.shape[0] == 0:
+            return None
+        if not page_table_64.is_contiguous() or page_table_64.dtype != torch.int32:
+            return None
+        out_cache_loc = forward_batch.out_cache_loc
+        if (
+            out_cache_loc.dtype != torch.int64
+            or positions.dtype != torch.int64
+            or out_cache_loc.shape[0] < rows
+            or positions.shape[0] < rows
+            or not out_cache_loc.is_contiguous()
+            or not positions.is_contiguous()
+        ):
+            return None
+
+        state = self._gfx950_fused
+        if not state.ensure_workspace(
+            device=x.device,
+            max_cols=page_table_64.shape[1] * PAGE_SIZE,
+            fp8_dtype=fp8_dtype,
+        ):
+            return None
+        if self._consume_fresh_allocation():
+            # The workspace is device memory taken after the pools were sized, so the
+            # cached MQA-logits budget is stale until the next prefill re-reads it.
+            Indexer.invalidate_mqa_logits_budget()
+
+        # Draft rows share their request's table; broadcast into the
+        # preallocated buffer, since no allocation is legal under capture.
+        n_pt, blocks = page_table_64.shape
+        if n_pt < rows:
+            if rows % n_pt or rows * blocks > state.workspace.page_table.numel():
+                return None
+            dst = state.workspace.page_table[: rows * blocks].view(rows, blocks)
+            dst.view(n_pt, rows // n_pt, blocks).copy_(page_table_64.unsqueeze(1))
+            page_table_64 = dst
+        else:
+            page_table_64 = page_table_64[:rows]
+
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        # The owned/read buffer split the standard path uses.
+        kv_write = pool.get_index_k_with_scale_buffer(layer_id=layer_id).view(fp8_dtype)
+        kv_read = self._get_index_k_read_buffer(pool, layer_id).view(fp8_dtype)
+        return state.run(
+            x=x,
+            q_lora=q_lora,
+            positions=positions[:rows],
+            out_cache_loc=out_cache_loc[:rows],
+            kv_cache=kv_write.view(-1, PAGE_SIZE, 132),
+            kv_cache_read=kv_read,
+            seqlens_int32=seqlens,
+            row_ends_int32=seqlens,
+            page_table_64=page_table_64,
+            rows=rows,
+        )
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         # When kv_len <= index_topk the top-k selects ALL valid positions, so the
@@ -1561,6 +1846,25 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
+
+        # gfx950 fused decode indexer (4 kernels). Returns None -- and touches
+        # nothing -- whenever any part of its gate is false, so the standard path
+        # below is reached completely unchanged.
+        if self.use_gfx950_fused_indexer:
+            fused_topk = self._gfx950_fused_decode(
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                layer_id,
+                metadata,
+                in_piecewise_or_breakable_cuda_graph,
+            )
+            if fused_topk is not None:
+                fused_topk = _broadcast_indexer_topk_from_rank0(
+                    fused_topk if return_indices else None
+                )
+                return maybe_capture_indexer_topk(layer_id, fused_topk)
 
         # When weights_proj is LoRA-wrapped, use an eager module call so the
         # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
