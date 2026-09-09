@@ -151,6 +151,7 @@ CI_MULTI_LORA_MODELS = [
                 rouge_l_tolerance=0.9,
             ),
         ],
+        rouge_l_tolerance=0.9,
         max_loras_per_batch=2,
         max_loaded_loras=4,
     ),
