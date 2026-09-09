@@ -236,6 +236,28 @@ def reg_all_to_all_single(
     group._all_to_all_single(output, input)
 
 
+#: The fused all-reduce + RMSNorm paths fall back when the communicator cannot express an
+#: operand's layout, and the exception they catch is the diagnostic: it names which operand
+#: and which layout. Discarding it makes a run that is permanently on the unfused path
+#: indistinguishable from one where the fusion was never requested, so someone measuring
+#: the fusion's benefit can measure zero and conclude it does not help. Warned once per
+#: process, because these sit on the per-layer forward path.
+_fused_ar_rms_fallback_warned = False
+
+
+def _warn_fused_ar_rms_fallback(api: str, err: Exception) -> None:
+    global _fused_ar_rms_fallback_warned
+    if _fused_ar_rms_fallback_warned:
+        return
+    logger.warning(
+        "Fused all-reduce + RMSNorm via %s is unavailable (%s); falling back. "
+        "Reported once per process.",
+        api,
+        err,
+    )
+    _fused_ar_rms_fallback_warned = True
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -791,9 +813,9 @@ class GroupCoordinator:
                 return ca_comm.fused_allreduce_rmsnorm(
                     input_, residual_inp_, weight_, eps
                 )
-            except Exception:
-                # Fall back to custom_fused_ar_rms path below.
-                pass
+            except Exception as e:
+                # Fall back to custom_fused_ar_rms path below, saying why.
+                _warn_fused_ar_rms_fallback("fused_allreduce_rmsnorm", e)
 
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
@@ -908,7 +930,8 @@ class GroupCoordinator:
                 emit_bf16=emit_bf16,
                 transpose_scale=transpose_scale,
             )
-        except Exception:
+        except Exception as e:
+            _warn_fused_ar_rms_fallback("custom_fused_ar_rms_per_group_quant", e)
             return None
 
     def _resolve_outplace_all_reduce_method(
