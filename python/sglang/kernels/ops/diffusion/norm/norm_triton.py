@@ -649,11 +649,11 @@ def norm_infer(
 
 norm_infer = select_impl(
     norm_infer,
-    mps=lazy_fallback("mps", "norm_infer_native"),
+    mps=lazy_fallback("torch", "norm_infer_native"),
     cpu=lazy_fallback("torch", "norm_infer_native"),
 )
 rms_norm_fn = select_impl(
     rms_norm_fn,
-    mps=lazy_fallback("mps", "rms_norm_fn_native"),
+    mps=lazy_fallback("torch", "rms_norm_fn_native"),
     cpu=lazy_fallback("torch", "rms_norm_fn_native"),
 )

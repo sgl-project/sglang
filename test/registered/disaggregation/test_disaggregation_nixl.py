@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=700, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=506, stage="base-c", runner_config="8-gpu-h20")
 # base-c 8-GPU runner is required for TP4 prefill + TP4 decode.
 
 NIXL_PREFILL_TP_SIZE = 4
@@ -126,7 +126,6 @@ def _clear_disagg_failure_env():
     # Failure injection is scoped to the failure test; clear inherited env so
     # Basic/Accuracy cannot run with injected transfer failures.
     os.environ.pop("SGLANG_TEST_DISAGG_FAILURE_PROB", None)
-    os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB", None)
 
 
 _HAS_CONFIGURED_NIXL_BACKEND = is_in_ci() or _has_configured_nixl_backend()

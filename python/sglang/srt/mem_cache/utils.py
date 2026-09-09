@@ -23,6 +23,9 @@ from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_triton as get_mla_kv_buffer_triton,
 )
 from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_dcp_sharded_triton as set_mla_kv_buffer_dcp_sharded_triton,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_fp8_quant_kernel as set_mla_kv_buffer_fp8_quant_kernel,
 )
 from sglang.kernels.ops.kvcache.mla_buffer import (
@@ -67,10 +70,9 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[..., EvictionStrategy]] = {
 
 
 def get_eviction_strategy(
-    eviction_policy: str,
-    tlru_threshold: int = 0,
-    tlru_next_prompt_estimate: int = 0,
+    eviction_policy: str, config: Optional[dict[str, Any]] = None
 ) -> EvictionStrategy:
+    """Build the eviction strategy; ``config`` is passed to it as keyword arguments."""
     policy = eviction_policy.lower()
     try:
         factory = _EVICTION_POLICY_FACTORIES[policy]
@@ -79,11 +81,7 @@ def get_eviction_strategy(
         raise ValueError(
             f"Unknown eviction policy: {policy}. Supported policies: '{supported}'."
         ) from None
-    if policy == "tlru":
-        return factory(
-            threshold=tlru_threshold, next_prompt_estimate=tlru_next_prompt_estimate
-        )
-    return factory()
+    return factory(**config) if config else factory()
 
 
 def maybe_init_custom_mem_pool(

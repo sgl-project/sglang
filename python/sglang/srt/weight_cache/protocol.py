@@ -15,16 +15,10 @@ from typing import Any, Dict, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
-
-# Socket path template for weight cache daemons (keyed by global rank
-# = tp_size * pp_rank + tp_rank, so multi-node / multi-PP don't collide)
-WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.sock"
-
-# Ready file template — daemon writes this after loading completes
-WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.ready"
 
 
 class CacheConfig(msgspec.Struct):
@@ -42,6 +36,14 @@ class CacheConfig(msgspec.Struct):
     pp_rank: int
     dp_size: int
     ep_size: int
+    moe_dp_size: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+    enable_dp_attention: bool
+    enable_dp_lm_head: bool
+    attn_cp_size: int
+    moe_dense_tp_size: Optional[int]
+    moe_a2a_backend: str
     quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
     quant_config_hash: str  # SHA-256 hash of quantization config
     dtype: str  # e.g. "torch.float16"
@@ -267,12 +269,7 @@ def compute_env_stamp() -> Dict[str, str]:
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
-    """Single source of truth for the daemon rank formula.
-
-    global_rank = tp_size * pp_rank + tp_rank, so each daemon gets a unique
-    socket/ready path even across PP stages and nodes. Every call site (engine,
-    loader, model_runner, daemon) must go through this so the copies can't drift.
-    """
+    """Global rank for ``init_distributed_environment`` (tp_size * pp_rank + tp_rank)."""
     return tp_size * pp_rank + tp_rank
 
 
@@ -300,20 +297,32 @@ def compute_local_gpu_id(
     )
 
 
-def get_socket_path(global_rank: int) -> str:
-    """Get the Unix socket path for a weight cache daemon.
+def _format_daemon_path(env_field, device_uuid: str) -> str:
+    """Fill in a daemon path template, rejecting one that drops the GPU identity.
 
-    global_rank = tp_size * pp_rank + tp_rank
+    The template is user-overridable, and ``str.format`` silently ignores a
+    missing placeholder. Every physical GPU would then derive the same path,
+    letting one job's client discover another job's daemon, so refuse up
+    front rather than serve wrong weights.
     """
-    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(global_rank=global_rank)
+    template = env_field.get()
+    if "{device_uuid}" not in template:
+        raise ValueError(
+            f"{env_field.name}={template!r} must contain '{{device_uuid}}': "
+            f"each physical GPU needs its own path, and a GPU-independent one "
+            f"would point every caller at a single daemon."
+        )
+    return template.format(device_uuid=device_uuid)
 
 
-def get_ready_path(global_rank: int) -> str:
-    """Get the ready-file path for a weight cache daemon.
+def get_socket_path(device_uuid: str) -> str:
+    """Get the Unix socket path for a weight cache daemon's physical GPU."""
+    return _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE, device_uuid)
 
-    global_rank = tp_size * pp_rank + tp_rank
-    """
-    return WEIGHT_CACHE_READY_TEMPLATE.format(global_rank=global_rank)
+
+def get_ready_path(device_uuid: str) -> str:
+    """Get the ready-file path for a weight cache daemon's physical GPU."""
+    return _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_READY_TEMPLATE, device_uuid)
 
 
 def _read_ready_pid(ready_path: str) -> Optional[int]:
@@ -339,8 +348,8 @@ def _is_pid_alive(pid: int) -> bool:
         return True
 
 
-def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None:
-    """Validate and clean up .ready/.sock files for a daemon rank.
+def cleanup_stale_daemon_files(device_uuid: str, *, force: bool = False) -> None:
+    """Validate and clean up .ready/.sock files for a daemon's physical GPU.
 
     If the .ready file exists and the recorded PID is still alive, the daemon
     is still running — raise RuntimeError so the caller doesn't clobber it,
@@ -349,8 +358,8 @@ def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None
     If the PID is dead (or unreadable), the files are stale leftovers from a
     crashed/killed daemon and are safe to remove.
     """
-    ready_path = get_ready_path(global_rank)
-    socket_path = get_socket_path(global_rank)
+    ready_path = get_ready_path(device_uuid)
+    socket_path = get_socket_path(device_uuid)
 
     if not os.path.exists(ready_path) and not os.path.exists(socket_path):
         return
@@ -360,14 +369,14 @@ def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None
     if pid is not None and _is_pid_alive(pid):
         if not force:
             raise RuntimeError(
-                f"Weight cache daemon for rank {global_rank} is already running "
+                f"Weight cache daemon for GPU {device_uuid} is already running "
                 f"(pid={pid}, ready={ready_path}). Stop the existing daemon before "
                 f"launching a new one, or pass force=True (--force) to kill it and "
                 f"take over."
             )
         logger.warning(
             f"[weight_cache] force takeover: killing existing daemon pid={pid} "
-            f"for rank {global_rank} and reclaiming its socket/ready files."
+            f"for GPU {device_uuid} and reclaiming its socket/ready files."
         )
         try:
             os.kill(pid, signal.SIGKILL)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -27,10 +27,9 @@ class CacheInitParams:
     attn_tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     pp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
-    # Tail-Optimized LRU parameters, in tokens. Only read when eviction_policy is
-    # "tlru"; see TLRUStrategy for the meaning.
-    tlru_threshold: int = 0
-    tlru_next_prompt_estimate: int = 0
+    # Keyword arguments for the eviction policy's constructor; see the strategy
+    # classes in evict_policy.py for what each policy accepts.
+    eviction_policy_config: Optional[dict[str, Any]] = None
     disable_finished_insert: bool = False
 
     enable_metrics: bool = False

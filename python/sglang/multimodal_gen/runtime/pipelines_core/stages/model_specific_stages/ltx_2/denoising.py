@@ -39,6 +39,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     is_ltx2_two_stage_pipeline_name,
@@ -178,6 +181,8 @@ class LTX2DenoisingStage(DenoisingStage):
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
         )
         self.sampler_name = sampler_name
+        # set per request by _prepare_denoising_loop before the cache-dit hook
+        self._disable_cache_dit_for_request = False
 
     def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
         return self.prepare_extra_func_kwargs(
@@ -444,14 +449,12 @@ class LTX2DenoisingStage(DenoisingStage):
             )
         return latents[:, :orig_s, :].contiguous()
 
-    def _maybe_enable_cache_dit(self, num_inference_steps: int, batch: Req) -> None:
-        """Disable cache-dit for TI2V-style requests to avoid stale activations.
-
-        NOTE: base denoising stage calls this hook with (num_inference_steps, batch).
-        """
-        if getattr(self, "_disable_cache_dit_for_request", False):
-            return
-        return super()._maybe_enable_cache_dit(num_inference_steps, batch)
+    def _cache_dit_requested_for_batch(self, batch: Req) -> bool:
+        """TI2V requests must not cache stale activations; reporting "not
+        requested" lets the base stage unmount hooks a prior request left."""
+        if self._disable_cache_dit_for_request:
+            return False
+        return super()._cache_dit_requested_for_batch(batch)
 
     def _get_ltx2_stage1_guider_params(
         self, batch: Req, server_args: ServerArgs, stage: str
@@ -563,7 +566,11 @@ class LTX2DenoisingStage(DenoisingStage):
         noise = torch.randn(
             reference_tensor.shape,
             generator=generator,
-            dtype=torch.float64,
+            dtype=(
+                torch.float32
+                if not current_platform.is_float64_supported()
+                else torch.float64
+            ),
             device=reference_tensor.device,
         )
         noise = (noise - noise.mean()) / noise.std()
@@ -2719,8 +2726,8 @@ class LTX2DenoisingStage(DenoisingStage):
 
     def _get_negative_prompt_embeds_validator(self, batch: Req):
         """Allow either tensor or list negative prompt embeddings for LTX-2 CFG."""
-        return (
-            lambda x: (not batch.do_classifier_free_guidance)
+        return lambda x: (
+            (not batch.do_classifier_free_guidance)
             or V.is_tensor(x)
             or V.list_not_empty(x)
         )

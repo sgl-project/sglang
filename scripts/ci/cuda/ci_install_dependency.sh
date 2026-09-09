@@ -8,6 +8,9 @@ set -euxo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
+# shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
+source "${SCRIPT_DIR}/../utils/git_clone_with_retry.sh"
+
 # ---------------------------------------------------------------------------
 # Timing helper
 # ---------------------------------------------------------------------------
@@ -133,6 +136,18 @@ cleanup_stale_shm() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+is_apt_package_installed() {
+    local name
+    # Ubuntu 24.04 renamed time64 libraries (librdmacm1 -> librdmacm1t64);
+    # apt-get follows the Provides alias, dpkg -l does not.
+    for name in "$1" "${1}t64"; do
+        if dpkg -l "$name" 2>/dev/null | grep -q "^ii"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 install_apt_packages() {
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
@@ -149,7 +164,7 @@ install_apt_packages() {
     local pkg
     local -a MISSING_APT_PACKAGES=()
     for pkg in "${CI_APT_PACKAGES[@]}"; do
-        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || MISSING_APT_PACKAGES+=("$pkg")
+        is_apt_package_installed "$pkg" || MISSING_APT_PACKAGES+=("$pkg")
     done
 
     if [ ${#MISSING_APT_PACKAGES[@]} -eq 0 ]; then
@@ -207,9 +222,7 @@ install_gdrcopy() {
         done
     }
 
-    rm -rf "${gdrcopy_root}"
-    git clone --branch "v${gdrcopy_version}" --depth 1 \
-        https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}"
+    git_clone_with_retry https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}" "--branch v${gdrcopy_version}"
     (
         cd "${gdrcopy_root}/packages"
         CUDA=/usr/local/cuda ./build-deb-packages.sh
@@ -277,11 +290,24 @@ clean_site_packages() {
 }
 
 setup_cargo_cache() {
+    if [ "${SGLANG_BUILD_RUST_EXTS:-}" = "none" ]; then
+        echo "Using prebuilt Rust extensions; skipping Cargo target setup"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
     # actions/checkout's `git clean -ffdx` deletes the gitignored in-repo
     # rust/target, so every job recompiles the whole dependency graph. Move the
     # target dir out of the tree: setuptools-rust has no target-dir option of its
     # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
     export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+    local cargo_target_lock="${HOME}/.cache/sglang-cargo-target.lock"
+    mkdir -p "${HOME}/.cache"
+    exec 9>"${cargo_target_lock}"
+    echo "Waiting for exclusive cargo target lock: ${cargo_target_lock}"
+    flock --exclusive 9
+    CARGO_TARGET_LOCK_HELD=1
+    echo "Acquired cargo target lock"
     mkdir -p "${CARGO_TARGET_DIR}"
 
     # Same disk-pressure guard as the uv cache in ci_cleanup_venv.sh (which
@@ -296,6 +322,15 @@ setup_cargo_cache() {
     fi
 
     mark_step_done "${FUNCNAME[0]}"
+}
+
+release_cargo_cache_lock() {
+    if [ "${CARGO_TARGET_LOCK_HELD:-0}" = "1" ]; then
+        flock --unlock 9
+        exec 9>&-
+        CARGO_TARGET_LOCK_HELD=0
+        echo "Released cargo target lock"
+    fi
 }
 
 setup_pip_toolchain() {
@@ -473,10 +508,19 @@ require_prebuilt_rust_exts() {
     for module in server grpc multimodal; do
         [ -f "python/sglang/srt/rust_extensions/_${module}${suffix}" ] || missing+=("${module}")
     done
+    [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache${suffix}" ] \
+        || missing+=("mem_cache")
+    [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache_inspection${suffix}" ] \
+        || missing+=("mem_cache_inspection")
     if [ ${#missing[@]} -gt 0 ]; then
         echo "::warning::no prebuilt Rust extension ${suffix} for: ${missing[*]}; building from source"
         ls -l python/sglang/srt/rust_extensions/_*.so 2>/dev/null || echo "(no extension modules at all)"
+        ls -l python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so 2>/dev/null || true
         export SGLANG_BUILD_RUST_EXTS=
+        export SGLANG_RUST_BUILD_MODE=auto
+        if [ -n "${GITHUB_ENV:-}" ]; then
+            echo "SGLANG_RUST_BUILD_MODE=auto" >> "${GITHUB_ENV}"
+        fi
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
@@ -501,6 +545,19 @@ install_sglang() {
        && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
         echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
         $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_nccl() {
+    if [ "$CU_MAJOR" = "13" ]; then
+        # PyTorch pins 2.29.7, so this override must run after every command
+        # that resolves Python dependencies (including lmms-eval).
+        $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+            --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    else
+        echo "CUDA ${CU_MAJOR} does not require the NCCL Gin wheel"
     fi
 
     mark_step_done "${FUNCNAME[0]}"
@@ -680,10 +737,8 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.12.post1"
+    MOONCAKE_VERSION="0.3.13"
     NIXL_VERSION="1.3.0"
-    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
-    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -719,12 +774,9 @@ install_extra_deps() {
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
-    $PIP_CMD install "$SGL_EVAL_SPEC" $PIP_INSTALL_SUFFIX
-
     if [ "$IS_BLACKWELL" != "1" ]; then
-        git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-        $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
-        # lmms-eval v0.5 pulls antlr4-python3-runtime==4.7.2, clobbering the
+        $PIP_CMD install "lmms_eval==0.5.0" $PIP_INSTALL_SUFFIX
+        # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
         $PIP_CMD install "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
@@ -741,14 +793,6 @@ install_test_tools() {
     [ -e "${HOME}/.cache/sglang" ] && [ ! -d "${HOME}/.cache/sglang" ] && rm -f "${HOME}/.cache/sglang"
     mkdir -p "${HOME}/.cache/sglang/"
     mv python/kernels.lock "${HOME}/.cache/sglang/" || true
-
-    # Install human-eval (subshell keeps cd local)
-    $PIP_CMD install "setuptools==70.0.0" $PIP_INSTALL_SUFFIX
-    [ -d human-eval ] || git clone https://github.com/merrymercy/human-eval.git
-    (
-        cd human-eval
-        $PIP_CMD install -e . --no-build-isolation $PIP_INSTALL_SUFFIX
-    )
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -785,6 +829,24 @@ verify_imports() {
     # One process; torch/cutlass do not import sglang, so the find_spec check
     # still runs ahead of any sglang import.
     SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+import ctypes
+import importlib.metadata
+import os
+import sys
+
+if sys.argv[1] == "13":
+    if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
+        raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
+    nccl = ctypes.CDLL("libnccl.so.2")
+    nccl_version = ctypes.c_int()
+    status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
+    if status != 0 or nccl_version.value != 23007:
+        raise SystemExit(
+            f"expected NCCL runtime 2.30.7, got status={status}, "
+            f"raw_version={nccl_version.value}"
+        )
+    print("NCCL package and runtime versions are 2.30.7")
+
 import torch
 print(torch.version.cuda)
 import deep_ep
@@ -795,7 +857,7 @@ import cutlass.cute
 # A shadowed sglang still imports, so without this the failure only surfaces
 # as a missing submodule during the test step. find_spec, not import: the
 # finders alone answer this without importing sglang.
-import importlib.util, os
+import importlib.util
 want = os.environ["SGLANG_EXPECTED_INIT"]
 spec = importlib.util.find_spec("sglang")
 if spec is None:
@@ -818,7 +880,7 @@ for mod in ("server", "grpc", "multimodal"):
     except Exception as exc:
         raise SystemExit(f"{name} is present but does not load: {exc!r}")
     print(f"{name} loads")
-'
+' "$CU_MAJOR"
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -835,14 +897,15 @@ main() {
     install_apt_packages
     install_gdrcopy
     clean_site_packages
-    setup_cargo_cache
     require_prebuilt_rust_exts
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
     install_pytorch_stack
     install_cuda12_deepep_wheel
+    setup_cargo_cache
     install_sglang
+    release_cargo_cache_lock
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
     if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
@@ -855,6 +918,7 @@ main() {
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools
+    install_nccl
     prepare_runner
     setup_ld_library_path
     verify_imports
