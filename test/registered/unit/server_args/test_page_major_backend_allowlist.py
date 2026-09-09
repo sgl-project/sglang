@@ -19,13 +19,15 @@ MHA/SWA arm, and no page-major arm at all without the unified pool. `fa3` is
 the resolved default on pre-Blackwell hosts, so its absence from an arm makes
 `--enable-unified-memory` fail to boot under its own default configuration.
 
-The same handler screens the pool itself: asymmetric K/V rows are not admitted
-yet (the token-major views can hold them, but the backends' read and write
-paths are not audited for them), so an asymmetric-K/V model (MiMoV2: head_dim
-192 != v_head_dim 128) is rejected on EVERY backend, Triton included. MLA
-models are exempt -- their sub-pool keeps one latent row per layer, and real
-MLA configs (Kimi-Linear: head_dim 72, v_head_dim 128) report asymmetric dims
-while running the unified pool today.
+The same handler narrows the MHA arm for asymmetric K/V rows (MiMoV2:
+head_dim 192 != v_head_dim 128) to `ASYMMETRIC_KV_BACKENDS`, the backends
+that carry v_head_dim through to the kernel; flashinfer's `paged_kv_t`
+compiles one head_dim for both K and V, and trtllm_mha refuses unequal QK/V
+dims outright. `fa4` is the resolved default for such a model on SM100, so
+that arm keeps it for the same reason. MLA models are exempt -- their
+sub-pool keeps one latent row per layer, and real MLA configs (Kimi-Linear:
+head_dim 72, v_head_dim 128) report asymmetric dims while running the
+unified pool today.
 """
 
 import unittest
@@ -33,7 +35,10 @@ from types import SimpleNamespace
 
 import msgspec
 
-from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
+from sglang.srt.arg_groups.kv_cache_hook import (
+    ASYMMETRIC_KV_BACKENDS,
+    handle_page_major_kv_layout,
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -108,9 +113,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
         the MLA nor the MHA arm can narrow away."""
         for use_mla in (True, False):
             self.assertTrue(_accepts("triton", use_mla=use_mla))
-        # The asymmetric-K/V screen is a property of the model, not of the
-        # backend, so it rejects even Triton.
-        self.assertFalse(_accepts("triton", use_mla=False, has_asymmetric_kv=True))
+        self.assertTrue(_accepts("triton", use_mla=False, has_asymmetric_kv=True))
 
     def test_per_layer_view_mla_backends_allowed_under_unified_mla(self):
         for backend in self.PER_LAYER_VIEW_MLA_BACKENDS:
@@ -133,14 +136,27 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 f"{backend} is an MLA kernel and must stay out of the MHA arm",
             )
 
-    def test_asymmetric_kv_mha_model_cannot_use_unified_memory(self):
-        """The rejection is the POOL's, not a backend's, so it must fire on
-        every backend -- Triton included."""
-        for backend in ("triton",) + self.PER_LAYER_VIEW_MHA_BACKENDS:
+    def test_asymmetric_kv_mha_model_narrows_to_v_head_dim_backends(self):
+        """head_dim != v_head_dim (MiMoV2): the token-major entry holds the
+        two row widths at different offsets, so admission is per backend --
+        exactly the ones that carry v_head_dim through to the kernel.
+
+        `fa4` must stay admitted: it is the resolved default for an
+        asymmetric-K/V model on SM100, so dropping it makes such a model
+        unbootable under its own default configuration."""
+        for backend in ASYMMETRIC_KV_BACKENDS:
+            self.assertTrue(
+                _accepts(backend, use_mla=False, has_asymmetric_kv=True),
+                f"{backend} carries v_head_dim through and must admit an "
+                "asymmetric-K/V model",
+            )
+        one_head_dim = set(self.PER_LAYER_VIEW_MHA_BACKENDS) - ASYMMETRIC_KV_BACKENDS
+        self.assertEqual(one_head_dim, {"flashinfer", "trtllm_mha"})
+        for backend in one_head_dim:
             self.assertFalse(
                 _accepts(backend, use_mla=False, has_asymmetric_kv=True),
-                f"--enable-unified-memory + {backend} must be rejected for an "
-                "asymmetric-K/V model",
+                f"{backend} reads V at K's head_dim (or refuses unequal dims) "
+                "and must stay rejected for an asymmetric-K/V model",
             )
 
     def test_asymmetric_dims_do_not_screen_out_mla(self):
