@@ -36,13 +36,7 @@ def extract_routed_dp_rank(
     headers, body_routed_dp_rank: Optional[int] = None
 ) -> Optional[int]:
     """The DP rank a request is pinned to: the ``X-Data-Parallel-Rank`` header
-    when present (case-insensitive), else ``body_routed_dp_rank``.
-
-    The header wins over the body so a gateway that routes on rank can pin a
-    request without parsing and re-serializing its payload. A header that is
-    not an integer is a 400: silently ignoring it would let a mistyped pin
-    degrade to the engine's own load balancing with no error anywhere.
-    """
+    when present, else ``body_routed_dp_rank``; a non-integer header is a 400."""
     if headers is None:
         return body_routed_dp_rank
 

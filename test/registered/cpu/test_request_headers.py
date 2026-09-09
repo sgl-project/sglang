@@ -1,17 +1,21 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import HTTPException
 from starlette.datastructures import Headers
 
+from sglang.srt.entrypoints.http_server import generate_request
 from sglang.srt.entrypoints.request_headers import (
     apply_header_overrides,
     extract_routed_dp_rank,
 )
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=4, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="stage-a-test-cpu-intel")
 
 
 def _obj():
@@ -133,3 +137,33 @@ class TestExtractRoutedDpRank(CustomTestCase):
         with self.assertRaises(HTTPException) as ctx:
             extract_routed_dp_rank(Headers({"x-data-parallel-rank": "abc"}), None)
         self.assertEqual(ctx.exception.status_code, 400)
+
+
+class TestGenerateReadsRoutedDpRankHeader(CustomTestCase):
+    """A header pin on /generate is a 200 whether or not it is honoured; only
+    the routed_dp_rank handed to the tokenizer manager shows the difference."""
+
+    def _generate(self, obj, headers):
+        captured = {}
+
+        async def fake_generate_request(req, raw_request):
+            captured["obj"] = req
+            yield {"text": "ok", "meta_info": {}}
+
+        state = SimpleNamespace(
+            tokenizer_manager=SimpleNamespace(generate_request=fake_generate_request)
+        )
+        request = SimpleNamespace(headers=Headers(headers))
+        with patch("sglang.srt.entrypoints.http_server._global_state", state):
+            asyncio.run(generate_request(obj, request))
+        return captured["obj"]
+
+    def test_header_pins_the_rank(self):
+        obj = GenerateReqInput(text="hi", routed_dp_rank=0)
+        self.assertEqual(
+            self._generate(obj, {"x-data-parallel-rank": "3"}).routed_dp_rank, 3
+        )
+
+    def test_no_header_keeps_body_rank(self):
+        obj = GenerateReqInput(text="hi", routed_dp_rank=1)
+        self.assertEqual(self._generate(obj, {}).routed_dp_rank, 1)
