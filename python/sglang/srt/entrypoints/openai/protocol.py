@@ -396,6 +396,8 @@ class CompletionRequest(BaseModel):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # Read existing prefixes but never insert this request's KV into the prefix cache
+    skip_cache_insert: Optional[Union[List[bool], bool]] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -954,6 +956,8 @@ class ChatCompletionRequest(BaseModel):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # Read existing prefixes but never insert this request's KV into the prefix cache
+    skip_cache_insert: Optional[Union[List[bool], bool]] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -1650,6 +1654,10 @@ class ResponsesRequest(BaseModel):
     )
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
+    )
+    skip_cache_insert: Optional[bool] = Field(
+        default=None,
+        description="Read existing prefixes but never insert this request's KV into the prefix cache",
     )
 
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
