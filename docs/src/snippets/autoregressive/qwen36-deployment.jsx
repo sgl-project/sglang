@@ -10,6 +10,17 @@ export const Qwen36Deployment = () => {
         { id: 'b200', label: 'B200', default: false },
         { id: 'b300', label: 'B300', default: false },
         { id: 'xeon', label: 'XEON', default: false },
+        { id: 'a3', label: 'A3 (NPU)', default: false },
+      ],
+    },
+    // Atlas 800I A3: 1 card = 2 dies, so --tp-size is twice the card count.
+    npuCards: {
+      name: 'npuCards',
+      title: 'Ascend Cards',
+      condition: (values) => values.hardware === 'a3',
+      items: [
+        { id: '1', label: '1 Card (2 dies)', default: true },
+        { id: '2', label: '2 Cards (4 dies)', default: false },
       ],
     },
     modelSize: {
@@ -24,7 +35,16 @@ export const Qwen36Deployment = () => {
       name: 'quantization',
       title: 'Quantization',
       // NVFP4 checkpoints are available for both model sizes on Blackwell (B200/B300).
+      // On Ascend NPU the verified options are BF16 for both sizes and W8A8
+      // (modelslim) for the 27B dense variant.
       getDynamicItems: (values) => {
+        if (values.hardware === 'a3') {
+          const items = [{ id: 'bf16', label: 'BF16', default: true }];
+          if (values.modelSize === '27b') {
+            items.push({ id: 'w8a8', label: 'W8A8', default: false });
+          }
+          return items;
+        }
         const items = [
           { id: 'fp8', label: 'FP8', default: true },
           { id: 'bf16', label: 'BF16', default: false },
@@ -65,12 +85,17 @@ export const Qwen36Deployment = () => {
             disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : '' },
         ];
       },
-      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null,
+      commandRule: (value, values) => {
+        if (value !== 'enabled') return null;
+        // Ascend NPU uses the built-in MTP weights via the NEXTN algorithm.
+        const algo = values.hardware === 'a3' ? 'NEXTN' : 'EAGLE';
+        return `--speculative-algorithm ${algo} \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4`;
+      },
     },
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => values.hardware !== 'xeon',
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'a3',
       getDynamicItems: (values) => {
         const mtpEnabled = values.speculative === 'enabled';
         if (mtpEnabled) {
@@ -164,6 +189,35 @@ export const Qwen36Deployment = () => {
   const generateCommand = () => {
     const { hardware, modelSize, quantization, speculative } = values;
     const sizeConfig = modelConfigs[modelSize];
+
+    // Atlas 800I A3 (Ascend NPU): PD-mixed single-node serving. Follows the
+    // verified recipes in the Ascend NPU best practices — ascend attention
+    // backend, bfloat16 mamba state, NEXTN speculative decoding on the built-in
+    // MTP weights, and modelslim W8A8 checkpoints for the 27B dense variant.
+    if (hardware === 'a3') {
+      const cards = Number(values.npuCards) || 1;
+      const modelName = quantization === 'w8a8'
+        ? `Eco-Tech/Qwen3.6-${sizeConfig.baseName}-w8a8`
+        : `Qwen/Qwen3.6-${sizeConfig.baseName}`;
+      let cmd = `sglang serve --model-path ${modelName}`;
+      cmd += ` \\\n  --tp-size ${cards * 2} --nnodes 1`;
+      cmd += ` \\\n  --attention-backend ascend --device npu`;
+      if (quantization === 'w8a8') {
+        cmd += ` \\\n  --quantization modelslim`;
+      }
+      const reasoningRule = options.reasoning.commandRule(values.reasoning, values);
+      if (reasoningRule) cmd += ` \\\n  ${reasoningRule}`;
+      const toolcallRule = options.toolcall.commandRule(values.toolcall, values);
+      if (toolcallRule) cmd += ` \\\n  ${toolcallRule}`;
+      if (speculative === 'enabled') {
+        cmd += ` \\\n  --speculative-algorithm NEXTN --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`;
+      }
+      cmd += ` \\\n  --mamba-ssm-dtype bfloat16`;
+      cmd += ` \\\n  --mem-fraction-static 0.7`;
+      cmd += ` \\\n  --host 0.0.0.0 --port 30000`;
+      return cmd;
+    }
+
     const hwConfig = sizeConfig?.[hardware]?.[quantization];
     if (!hwConfig) {
       return '# Please select a valid hardware and quantization combination';
@@ -210,7 +264,7 @@ export const Qwen36Deployment = () => {
       if (key === 'quantization' || key === 'hardware' || key === 'modelSize') continue;
       if (option.condition && !option.condition(values)) continue;
       if (!option.commandRule) continue;
-      const rule = option.commandRule(adjustedValues[key]);
+      const rule = option.commandRule(adjustedValues[key], values);
       if (rule) {
         cmd += ` \\\n  ${rule}`;
       }
