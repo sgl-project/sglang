@@ -479,7 +479,17 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def get_interval(self):
         return time.perf_counter() - self.last_time
 
-    def get_first_token_latency(self):
+    def get_first_token_latency(
+        self, scheduler_time_stats: Optional[SchedulerReqTimeStats] = None
+    ):
+        # The scheduler timestamp travels in existing output messages, which
+        # may be delayed for non-streaming requests. Arrival time remains the
+        # reference for ITL and response handling.
+        ready_time = getattr(scheduler_time_stats, "first_token_ready_time", 0.0)
+        if self.created_time <= ready_time <= self.first_token_time and ready_time:
+            return ready_time - self.created_time
+        # Older senders, metrics-disabled senders and empty/aborted outputs
+        # may not supply readiness. Reject out-of-range converted timestamps.
         return self.first_token_time - self.created_time
 
     def get_e2e_latency(self):
@@ -613,6 +623,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     wait_queue_entry_time: float = 0.0
     forward_entry_time: float = 0.0
     prefill_finished_time: float = 0.0
+    # Scheduler-local output readiness, independent of output message batching.
+    first_token_ready_time: float = 0.0
     completion_time: float = 0.0
 
     # prefill node, get by time.perf_counter()
@@ -660,6 +672,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
+        # Do not serialize the zero sentinel: cross-process clock conversion
+        # would turn it into a nonzero timestamp when clock offsets differ.
+        if self.first_token_ready_time:
+            state["first_token_ready_time"] = self.first_token_ready_time
         return state
 
     def set_scheduler_recv_time(self, ts=None):
