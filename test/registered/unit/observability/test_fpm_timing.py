@@ -64,8 +64,9 @@ class TestDeviceTimerCapture(unittest.TestCase):
             return result
 
         wrapped = wrap_forward_with_fpm(forward, timer)
-        self.assertIs(wrapped("batch", pp_proxy_tensors="proxy"), result)
-        self.assertEqual(calls, [("batch", "proxy")])
+        batch = SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: False))
+        self.assertIs(wrapped(batch, pp_proxy_tensors="proxy"), result)
+        self.assertEqual(calls, [(batch, "proxy")])
         self.assertIs(wrapped.__wrapped__, forward)
         self.assertEqual(result.fpm_timing.num_intervals, 0)
         self.assertIsNone(timer._observer)
