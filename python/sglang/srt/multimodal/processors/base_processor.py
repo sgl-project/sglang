@@ -233,6 +233,11 @@ class BaseMultimodalProcessor(ABC):
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
+    # Safety net against OOM from oversized image batches: each 4K image can
+    # cost ~1 GiB of GPU memory in the fast image processor. Processors that
+    # support more images override this; an explicit
+    # --limit-mm-data-per-request takes priority over this default.
+    IMAGE_NUM_LIMITATION = 5
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -1191,6 +1196,42 @@ class BaseMultimodalProcessor(ABC):
         BaseMultimodalProcessor._validate_one_modality(Modality.VIDEO, video_data)
         BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
 
+    def _get_image_limit(self) -> Optional[int]:
+        """The effective per-request image count limit, or None for no limit.
+
+        An explicit ``--limit-mm-data-per-request`` image entry wins over this
+        processor's ``IMAGE_NUM_LIMITATION`` default, mirroring the priority
+        order documented on the constant.
+        """
+        cli_limit = (get_mm().limit_mm_data_per_request or {}).get("image")
+        if cli_limit is not None:
+            return int(cli_limit)
+        return self.IMAGE_NUM_LIMITATION
+
+    def validate_image_num_limitation(self, image_data: Optional[list]) -> None:
+        """Reject requests with more images than the effective limit.
+
+        Runs before any image is fetched or decoded, so an oversized request
+        never reaches the ~1 GiB-per-4K-image preprocessing path.
+        Preprocessed single-item inputs (processor_output /
+        precomputed_embedding) are exempt: they carry no decode cost.
+        """
+        if not image_data:
+            return
+        if self._is_preprocessed_input(image_data[0] if len(image_data) == 1 else None):
+            return
+        limit = self._get_image_limit()
+        if limit is None or limit <= 0:
+            return
+        count = len(image_data)
+        if count > limit:
+            raise ValueError(
+                f"This model accepts at most {limit} image(s) per request, "
+                f"but {count} were provided. Raise the limit with "
+                "--limit-mm-data-per-request '{\"image\": N}' if your "
+                "use case needs more."
+            )
+
     def _process_loaded_mm_data(self, modality, raw_data, result):
         images, videos, audios = [], [], []
 
@@ -1223,6 +1264,7 @@ class BaseMultimodalProcessor(ABC):
         audio_sample_rate: Optional[int] = None,
     ) -> BaseMultiModalProcessorOutput:
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
+        self.validate_image_num_limitation(image_data)
 
         input_ids = prompt if isinstance(prompt, list) else None
         if input_ids is not None and self._all_mm_data_is_preprocessed(
