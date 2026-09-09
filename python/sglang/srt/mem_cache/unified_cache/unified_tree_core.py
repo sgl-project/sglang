@@ -27,6 +27,7 @@ import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -1490,11 +1491,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if absent. Under
-        write_back, FULL pressure reclaims redundant Full host copies first."""
+        write_back, FULL pressure reclaims redundant Full host copies first
+        (skipped if SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM=1)."""
         result = DriveHostEvictionResult()
         comp = self.components_by_type.get(component_type)
         if comp is not None:
-            if self.is_write_back and component_type == BASE_COMPONENT_TYPE:
+            if (
+                not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+                and self.is_write_back
+                and component_type == BASE_COMPONENT_TYPE
+            ):
                 self._reclaim_full_host_duplicates(
                     num_tokens,
                     result.tracker,
