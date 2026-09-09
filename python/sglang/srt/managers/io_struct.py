@@ -265,6 +265,8 @@ class GenerateReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # {lora_name: disk path}: backfill source when this engine does not hold the adapter
+    lora_backfill_paths: Optional[Dict[str, str]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -1133,6 +1135,8 @@ class EmbeddingReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # {lora_name: disk path}: backfill source when this engine does not hold the adapter
+    lora_backfill_paths: Optional[Dict[str, str]] = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     positional_embed_overrides: Any = None
@@ -2049,6 +2053,8 @@ class EndWeightUpdateReqInput(BaseReq, kw_only=True):
     # {lora_name: {hf_key: sha256}}; when set, each stashed adapter is verified
     # (set equality + per-tensor checksum) before it is applied.
     expected_lora_checksums: Optional[Dict[str, Dict[str, str]]] = None
+    # discard the streamed LoRA stash and deferred publications; in-place base writes are not rolled back
+    abort: bool = False
 
 
 class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2373,13 +2379,19 @@ class RegisterLoRAAdapterReqInput(BaseReq, kw_only=True):
     # and pinning every slot would trip the anti-starvation check.
     pinned: bool = False
     lora_id: Optional[str] = None
+    # Disk artifact holding the same adapter (PEFT dir). With a path the
+    # adapter is reloadable: it may be LRU-evicted and refilled from disk.
+    lora_path: Optional[str] = None
+    # keep the name unservable until end_weight_update commits its session; fresh names only
+    defer_publish: bool = False
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
             lora_id=self.lora_id,
             lora_name=self.lora_name,
-            lora_path="__stream__",
+            lora_path=self.lora_path or "__stream__",
             pinned=self.pinned,
+            reloadable=self.lora_path is not None,
         )
 
 
@@ -2387,6 +2399,8 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
+    # acks a defer_publish registration; the trainer fails closed without it
+    pending: bool = False
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = RegisterLoRAAdapterReqOutput = (

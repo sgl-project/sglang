@@ -333,7 +333,7 @@ class SchedulerWeightUpdaterManager:
             else:
                 base_tensors, lora_tensors = _split_lora_named_tensors(named_tensors)
                 named_tensors = base_tensors
-            self._stash_lora_tensors(lora_tensors)
+            self._stash_lora_tensors(lora_tensors, copy_tensors=True)
             success, message = True, "Success"
             if base_tensors:
                 assert (
@@ -423,9 +423,13 @@ class SchedulerWeightUpdaterManager:
             run_post_load = not self._weight_update_loaded
             for _, runner in self.get_model_runners(self._weight_update_selector):
                 runner.end_weight_update(run_post_load=run_post_load)
-        success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
+        if recv_req.abort:
+            self._lora_stash = {}
+            success, message = True, "Aborted: streamed adapters discarded"
+        else:
+            success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
         self._weight_update_in_progress = False
-        if success:
+        if success and not recv_req.abort:
             self.record_weight_version_after_update(self._weight_update_pending_version)
         self._weight_update_pending_version = None
         torch.distributed.barrier(group=self.tp_cpu_group)
@@ -436,7 +440,8 @@ class SchedulerWeightUpdaterManager:
         is a new adapter identity and may stream a different tensor set."""
         self._lora_applied_names.pop(lora_name, None)
 
-    def _stash_lora_tensors(self, lora_tensors) -> None:
+    def _stash_lora_tensors(self, lora_tensors, *, copy_tensors: bool = False) -> None:
+        copied_devices = set()
         for prefixed_name, tensor in lora_tensors:
             lora_name, hf_key = prefixed_name.split(":", 1)
             if isinstance(tensor, LocalSerializedTensor):
@@ -444,7 +449,14 @@ class SchedulerWeightUpdaterManager:
             assert isinstance(
                 tensor, torch.Tensor
             ), f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
+            if copy_tensors:
+                # the stash outlives this RPC, but an IPC sender may reuse the bucket once it replies
+                tensor = tensor.clone()
+                if tensor.is_cuda:
+                    copied_devices.add(tensor.device)
             self._lora_stash.setdefault(lora_name, {})[hf_key] = tensor
+        for device in copied_devices:
+            torch.cuda.current_stream(device).synchronize()
 
     def _apply_lora_stash(
         self, expected_checksums: Optional[Dict[str, Dict[str, str]]]

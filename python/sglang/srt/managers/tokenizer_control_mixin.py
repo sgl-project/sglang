@@ -8,6 +8,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
+import msgspec
 
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
@@ -457,31 +458,47 @@ class TokenizerControlMixin:
         return FanOutCommunicator.merge_results(results)
 
     async def _weight_update_session_call(
-        self: TokenizerManager, communicator, obj
+        self: TokenizerManager, communicator, obj, staged: bool = False
     ) -> Tuple[bool, str]:
-        """Run one weight-update session RPC under the same pause-aware locking as
-        update_weights_from_distributed: while the engine is paused the writer lock
-        is already held by whoever paused it, so taking it again would deadlock."""
+        """Run one weight-update RPC with pause-aware locking (a paused engine
+        already holds the writer lock). A staged session takes the reader lock
+        and runs alongside generation: deferred names are not servable and base
+        tensors are rejected; other sessions keep the writer lock."""
         self.auto_create_handle_loop()
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
                 results = await communicator(obj)
         if not is_paused:
-            async with self.model_update_lock.writer_lock:
+            lock = (
+                self.model_update_lock.reader_lock
+                if staged
+                else self.model_update_lock.writer_lock
+            )
+            async with lock:
                 results = await communicator(obj)
         return FanOutCommunicator.merge_results(results)
+
+    def _staged_serving_state_error(self: TokenizerManager, obj) -> Optional[str]:
+        # the reader lock gave up exclusivity; serving-state mutations need the writer lock
+        if self._weight_update_staged_session and (
+            obj.flush_cache or obj.abort_all_requests or obj.weight_version is not None
+        ):
+            return "a staged adapter session cannot change serving state"
+        return None
 
     async def begin_weight_update(
         self: TokenizerManager,
         obj: BeginWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        staged = not obj.sync_base and bool(self._pending_lora_publications)
         success, message = await self._weight_update_session_call(
-            self.begin_weight_update_communicator, obj
+            self.begin_weight_update_communicator, obj, staged=staged
         )
         if success:
             self._weight_update_session_open = True
+            self._weight_update_staged_session = staged
             self._weight_update_pending_version = None
         return success, message
 
@@ -490,14 +507,61 @@ class TokenizerControlMixin:
         obj: EndWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
+        pending = dict(self._pending_lora_publications)
+        # fail closed: without a full manifest a lost bucket would publish an incomplete adapter
+        missing = set() if obj.abort else set(pending) - set(obj.expected_lora_checksums or {})
+        obj.abort = obj.abort or bool(missing)
         success, message = await self._weight_update_session_call(
-            self.end_weight_update_communicator, obj
+            self.end_weight_update_communicator,
+            obj,
+            staged=self._weight_update_staged_session,
         )
         self._weight_update_session_open = False
-        if success:
+        self._weight_update_staged_session = False
+        if success and not obj.abort:
             self._update_weight_version_if_provided(self._weight_update_pending_version)
         self._weight_update_pending_version = None
+        if obj.abort or not success:
+            await self._discard_pending_publications()
+        elif pending:
+            await self._publish_pending_adapters()
+        if missing:
+            return False, f"deferred adapters {sorted(missing)} have no checksum manifest; session aborted"
         return success, message
+
+    async def _discard_pending_publications(self: TokenizerManager) -> None:
+        """Drop deferred publications after an aborted or failed session: the
+        backends must forget the zeroed identities the names never served."""
+        pending, self._pending_lora_publications = self._pending_lora_publications, {}
+        async with self.lora_update_lock:
+            for ref in pending.values():
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(
+                        UnloadLoRAAdapterReqInput(
+                            lora_name=ref.lora_name, lora_id=ref.lora_id
+                        )
+                    )
+                )
+                if not result.success:
+                    logger.warning(
+                        "Failed to discard unpublished LoRA adapter %r: %s",
+                        ref.lora_name,
+                        result.error_message,
+                    )
+
+    async def _publish_pending_adapters(self: TokenizerManager) -> None:
+        """Commit deferred publications: the names become servable atomically."""
+        pending, self._pending_lora_publications = self._pending_lora_publications, {}
+        async with self.lora_update_lock:
+            for name, ref in pending.items():
+                await self.lora_registry.register(ref)
+                self.lora_ref_cache[name] = ref
+            try:
+                await self._evict_lru_over_cap()
+            except ValueError:
+                # The publish is already committed; an unevictable over-cap
+                # pool is a capacity problem, not a publication failure.
+                logger.exception("LRU eviction after LoRA publication failed")
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
@@ -509,20 +573,16 @@ class TokenizerControlMixin:
             get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
+        if error := self._staged_serving_state_error(obj):
+            return False, error
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Hold is_pause_cond while updating to prevent unpause from racing.
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
+        success, message = await self._weight_update_session_call(
+            self.update_weights_from_distributed_communicator,
+            obj,
+            staged=self._weight_update_staged_session,
+        )
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
@@ -569,6 +629,8 @@ class TokenizerControlMixin:
             get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
+        if error := self._staged_serving_state_error(obj):
+            return False, error
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -576,16 +638,11 @@ class TokenizerControlMixin:
             obj.serialized_named_tensors
         )
 
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
+        success, message = await self._weight_update_session_call(
+            self.update_weights_from_tensor_communicator,
+            obj,
+            staged=self._weight_update_staged_session,
+        )
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
@@ -694,35 +751,8 @@ class TokenizerControlMixin:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
 
-                if self.server_args.max_loaded_loras is not None:
-                    while (
-                        self.lora_registry.num_registered_loras
-                        > self.server_args.max_loaded_loras
-                    ):
-                        lru_lora_name = await self.lora_registry.lru_lora_name(
-                            exclude_pinned=True
-                        )
-                        if lru_lora_name is None:
-                            raise ValueError(
-                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
-                                f"LoRA registry is: {self.lora_registry._registry}"
-                            )
-
-                        logger.info(
-                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
-                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {self.server_args.max_loaded_loras})"
-                        )
-
-                        unload_result = await self._unload_lora_adapter_locked(
-                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
-                        )
-                        if not unload_result.success:
-                            raise ValueError(
-                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
-                                f"{unload_result.error_message}"
-                            )
-                        del result.loaded_adapters[lru_lora_name]
+                for evicted in await self._evict_lru_over_cap():
+                    del result.loaded_adapters[evicted]
 
                 return result
         except ValueError as e:
@@ -730,6 +760,40 @@ class TokenizerControlMixin:
                 success=False,
                 error_message=str(e),
             )
+
+    async def _evict_lru_over_cap(self: TokenizerManager) -> list:
+        """Unload LRU adapters until the registry is back under
+        --max-loaded-loras; returns the evicted names. Caller must hold
+        lora_update_lock."""
+        evicted = []
+        if self.server_args.max_loaded_loras is None:
+            return evicted
+        while (
+            self.lora_registry.num_registered_loras > self.server_args.max_loaded_loras
+        ):
+            lru_lora_name = await self.lora_registry.lru_lora_name(exclude_pinned=True)
+            if lru_lora_name is None:
+                raise ValueError(
+                    "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
+                    f"LoRA registry is: {self.lora_registry._registry}"
+                )
+
+            logger.info(
+                f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
+                f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
+                f"max allowed: {self.server_args.max_loaded_loras})"
+            )
+
+            unload_result = await self._unload_lora_adapter_locked(
+                UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
+            )
+            if not unload_result.success:
+                raise ValueError(
+                    f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
+                    f"{unload_result.error_message}"
+                )
+            evicted.append(lru_lora_name)
+        return evicted
 
     def _validate_lora_upsert_supported(self: TokenizerManager) -> None:
         """Upsert resolves lora_name -> lora_id through this process's registry.
@@ -770,19 +834,35 @@ class TokenizerControlMixin:
                 )
             async with self.lora_update_lock:
                 self._validate_lora_upsert_supported()
-                new_adapter, reused = await self.lora_registry.register_or_reuse(
-                    LoRARef(
-                        lora_name=obj.lora_name,
-                        lora_path="__stream__",
-                        pinned=obj.pinned,
-                        reloadable=False,
-                    ),
-                    upsert=True,
+                ref = LoRARef(
+                    lora_name=obj.lora_name,
+                    lora_path=obj.lora_path or "__stream__",
+                    pinned=obj.pinned,
+                    reloadable=obj.lora_path is not None,
                 )
+                if obj.lora_name in self._pending_lora_publications:
+                    raise ValueError(
+                        f"LoRA adapter '{obj.lora_name}' is awaiting publication; "
+                        "commit or abort its session before registering it again."
+                    )
+                if obj.defer_publish:
+                    if await self.lora_registry.get_lora_id(obj.lora_name) is not None:
+                        raise ValueError(
+                            f"defer_publish requires a fresh adapter name, but "
+                            f"'{obj.lora_name}' is already registered: a published "
+                            "name has readers and must not be staged over."
+                        )
+                    new_adapter, reused = ref, False
+                else:
+                    new_adapter, reused = await self.lora_registry.register_or_reuse(
+                        ref, upsert=True
+                    )
                 # No path to reload a streamed adapter from: eviction would lose the
-                # only engine-side copy, so the cap rejects new names instead.
+                # only engine-side copy, so the cap rejects new non-reloadable names
+                # instead. Reloadable names resolve over-cap by LRU eviction.
                 if (
                     not reused
+                    and not new_adapter.reloadable
                     and self.server_args.max_loaded_loras is not None
                     and self.lora_registry.num_registered_loras
                     >= self.server_args.max_loaded_loras
@@ -800,11 +880,16 @@ class TokenizerControlMixin:
                 )
 
                 if result.success:
-                    if reused:
-                        await self.lora_registry.refresh(new_adapter)
+                    if obj.defer_publish:
+                        self._pending_lora_publications[obj.lora_name] = new_adapter
+                        result = msgspec.structs.replace(result, pending=True)
                     else:
-                        await self.lora_registry.register(new_adapter)
-                    self.lora_ref_cache[obj.lora_name] = new_adapter
+                        if reused:
+                            await self.lora_registry.refresh(new_adapter)
+                        else:
+                            await self.lora_registry.register(new_adapter)
+                        self.lora_ref_cache[obj.lora_name] = new_adapter
+                        await self._evict_lru_over_cap()
                 return result
         except ValueError as e:
             return RegisterLoRAAdapterReqOutput(
@@ -836,6 +921,11 @@ class TokenizerControlMixin:
                 "Start unload Lora adapter. Lora name=%s",
                 obj.lora_name,
             )
+            if obj.lora_name in self._pending_lora_publications:
+                raise ValueError(
+                    f"LoRA adapter '{obj.lora_name}' is awaiting publication; "
+                    "abort its weight-update session instead of unloading it."
+                )
 
             async with self.lora_update_lock:
                 result = await self._unload_lora_adapter_locked(obj)

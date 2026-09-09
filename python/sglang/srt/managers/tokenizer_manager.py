@@ -656,6 +656,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
         self._weight_update_session_open = False
+        # A staged session (adapter-only, deferred publications pending) runs
+        # under the reader lock, concurrent with generation.
+        self._weight_update_staged_session = False
         self._weight_update_pending_version: Optional[str] = None
 
     def init_lora(self):
@@ -676,6 +679,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if get_lora().lora_paths is not None:
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
+        # defer_publish registrations: zeroed identities on the backends, names
+        # unservable until end_weight_update commits their session
+        self._pending_lora_publications: Dict[str, LoRARef] = {}
 
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
@@ -3450,15 +3456,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         unregistered_loras = await self.lora_registry.get_unregistered_loras(
             unique_lora_paths
         )
+        backfill_paths = obj.lora_backfill_paths or {}
         for lora_path in unregistered_loras:
             if lora_path is None:
                 continue
 
-            if lora_path not in self.lora_ref_cache:
+            if lora_path in self._pending_lora_publications:
+                # a staged session is streaming this name; a disk load now would give it two identities
                 raise ValueError(
-                    f"Got LoRA adapter that has never been loaded: {lora_path}\n"
-                    f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                    f"LoRA adapter '{lora_path}' is awaiting publication and "
+                    "cannot be served or backfilled yet."
                 )
+            if lora_path not in self.lora_ref_cache:
+                # a request-carried path lets a fresh or restarted engine serve any published version
+                if lora_path in backfill_paths:
+                    self.lora_ref_cache[lora_path] = LoRARef(
+                        lora_name=lora_path,
+                        lora_path=backfill_paths[lora_path],
+                        pinned=False,
+                    )
+                else:
+                    raise ValueError(
+                        f"Got LoRA adapter that has never been loaded: {lora_path}\n"
+                        f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                    )
 
             new_lora_ref = self.lora_ref_cache[lora_path]
             if not new_lora_ref.reloadable:
