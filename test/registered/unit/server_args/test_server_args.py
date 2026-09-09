@@ -195,6 +195,23 @@ class TestPrepareServerArgs(CustomTestCase):
                 ["--model-path", "dummy", "--sampling-mask-max-tokens", "0"]
             ).resolve_once()
 
+    def test_legacy_sampling_mask_env_requires_migration(self):
+        """Legacy configuration must not silently disable PD sampling masks."""
+        for value in ("0", "128", "invalid", ""):
+            for enabled in (False, True):
+                with (
+                    self.subTest(value=value, enabled=enabled),
+                    envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.override(value),
+                    envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(enabled),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.*"
+                        "Unset it.*SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1.*"
+                        "--sampling-mask-max-tokens.*prefill and decode",
+                    ),
+                ):
+                    ServerArgs(model_path="dummy").resolve_once()
+
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)

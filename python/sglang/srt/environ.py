@@ -668,6 +668,8 @@ class Envs:
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
+    # Retained only to reject the removed setting during startup.
+    SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(None)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
