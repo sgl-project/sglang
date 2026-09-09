@@ -60,7 +60,7 @@ class MoEGate(nn.Module):
             torch.empty((config.moe_num_experts, config.hidden_size))
         )
         self.e_score_correction_bias = nn.Parameter(
-            torch.empty((1, config.moe_num_experts))
+            torch.empty((1, config.moe_num_experts), dtype=torch.float32)
         )
 
     def forward(self, hidden_states):
