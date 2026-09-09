@@ -36,6 +36,17 @@ _NPU_ARCH35_KV_QUANT_GROUP_SIZE = 64
 _NPU_ARCH35_KV_ROW_ALIGNMENT = 128
 
 
+def bucket_layer_ids(
+    compression_ratios: List[int], stage_start: int, stage_end: int, ratio: int
+) -> List[int]:
+    """Global ids of the stage layers compressed at ``ratio``, in buffer order."""
+    return [
+        layer_id
+        for layer_id in range(stage_start, stage_end)
+        if compression_ratios[layer_id] == ratio
+    ]
+
+
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     """NPU PA_ND variant of the full / SWA / c4 / c128 single-KV pool.
 
@@ -64,6 +75,18 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
             math.ceil(bytes_per_token / _NPU_ARCH35_KV_ROW_ALIGNMENT)
             * _NPU_ARCH35_KV_ROW_ALIGNMENT
         )
+    def _num_pages_for(self, local_layer_idx: int) -> int:
+        """Physical pages for this layer's buffer; layer split narrows it."""
+        return (self.size + self.kernel_page_size + 1) // self.kernel_page_size
+
+    def _create_buffers(self):
+        # NPU page counts follow kernel_page_size, so pass them per layer
+        # instead of the base's page_size-derived count.
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.kv_buffer = [
+                self.create_buffer(num_pages=self._num_pages_for(i))
+                for i in range(self.layer_num)
+            ]
 
     def create_buffer(self, *, num_pages: int):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
@@ -78,9 +101,8 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         self.kv_cache_total_dim = kv_dim
         # Writes are flat-indexed by loc; kernel_page_size controls the physical
         # page layout exposed to the NPU operators.
-        npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
         return torch.zeros(
-            npu_num_pages,
+            num_pages,
             self.kernel_page_size,
             1,
             kv_dim,
@@ -181,38 +203,51 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         self._kernel_page_size = kernel_page_size
         super().__init__(*args, **kwargs)
 
-    def _create_buffer(self):
-        # Base allocates the packed CUDA index_k_with_scale_buffer (kept for
-        # get_contiguous_buf_infos / NSA compat); then add the NPU buffers.
-        super()._create_buffer()
+    def _num_pages_for(self, local_layer_idx: int) -> int:
+        """Physical pages for this layer's buffers; layer split narrows it."""
         kp = self._kernel_page_size
-        npu_num_pages = (self.size + kp + 1) // kp
+        return (self.size + kp + 1) // kp
+
+    def _create_buffer(self):
+        # Packed CUDA index_k_with_scale_buffer (kept for get_contiguous_buf_infos
+        # / NSA compat) plus the dedicated NPU int8 K / fp16 scale buffers.
+        page_bytes = self.page_size * self.get_bytes_per_token()
+        kp = self._kernel_page_size
         if is_npu_arch35():
             index_k_dtype, index_scale_dtype = torch.float8_e4m3fn, torch.float32
         else:
             index_k_dtype, index_scale_dtype = torch.int8, torch.float16
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.index_k_with_scale_buffer = [
+                torch.zeros(
+                    self._num_pages_for(i),
+                    page_bytes,
+                    dtype=self.index_k_with_scale_buffer_dtype,
+                    device=self.device,
+                )
+                for i in range(self.layer_num)
+            ]
             self.index_k_buffer = [
                 torch.zeros(
-                    npu_num_pages,
+                    self._num_pages_for(i),
                     kp,
                     1,
                     self.index_head_dim,
                     dtype=index_k_dtype,
                     device=self.device,
                 )
-                for _ in range(self.layer_num)
+                for i in range(self.layer_num)
             ]
             self.index_scale_buffer = [
                 torch.zeros(
-                    npu_num_pages,
+                    self._num_pages_for(i),
                     kp,
                     1,
                     1,
                     dtype=index_scale_dtype,
                     device=self.device,
                 )
-                for _ in range(self.layer_num)
+                for i in range(self.layer_num)
             ]
 
     @property
@@ -448,6 +483,34 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             [buf.data_ptr() for buf in buffers],
             [buf.nbytes for buf in buffers],
             [buf[0].nbytes for buf in buffers],
+        )
+
+    # ---- PD transfer layer ids ---------------------------------------------
+    # One global layer id per entry of the matching buf-infos list, so the
+    # transfer layer pairs prefill/decode by id instead of positional slicing.
+
+    def get_kv_layer_ids(self) -> List[int]:
+        """Ids for ``get_contiguous_buf_infos``: three same-length sections
+        (c4 KV, index K, index scale), so each c4 id appears once per section."""
+        return self._c4_layer_ids() * 3
+
+    def get_state_layer_ids(self) -> List[int]:
+        """Ids for ``get_state_buf_infos``: per-layer SWA KV, then c4
+        attention and c4 indexer states."""
+        return (
+            list(range(self._stage_start, self._stage_end))
+            + self._c4_layer_ids() * 2
+        )
+
+    def get_c128_layer_ids(self) -> List[int]:
+        """Ids for ``get_c128_kv_buf_infos`` / ``get_c128_state_buf_infos``."""
+        return bucket_layer_ids(
+            self.compression_ratios, self._stage_start, self._stage_end, 128
+        )
+
+    def _c4_layer_ids(self) -> List[int]:
+        return bucket_layer_ids(
+            self.compression_ratios, self._stage_start, self._stage_end, 4
         )
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:

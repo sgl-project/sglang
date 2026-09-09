@@ -33,6 +33,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import get_layer_shard_range
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
@@ -1003,6 +1004,29 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # swa_page_size is the model's sliding window (cfg.window_size).
         self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
         self._spec_infl = 1.0
+        # Layer split (prefill CP) stores only the owned layer slice per rank,
+        # so the KV/indexer terms shrink and token capacity grows. All CP
+        # ranks must derive the SAME capacity: take the min over ranks' owned
+        # slices. Compress state pools are not sharded (full-layer counts).
+        self.layer_shard_size = 1
+        if (
+            not kvc.is_draft_worker
+            and get_parallel().enable_dsa_cache_layer_split
+            and get_parallel().attn_cp_size > 1
+            and is_deepseek_v4(cfg.hf_config)
+        ):
+            self.layer_shard_size = get_parallel().attn_cp_size
+        owned_slices = [self.compression_ratios]
+        if self.layer_shard_size > 1:
+            owned_slices = [
+                self.compression_ratios[s:e]
+                for s, e in (
+                    get_layer_shard_range(
+                        rank, self.layer_shard_size, self.num_layers_total
+                    )
+                    for rank in range(self.layer_shard_size)
+                )
+            ]
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
@@ -1010,14 +1034,33 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 max_speculative_num_draft_tokens() or 0
             )
 
-        self.bytes_per_full_token = self._get_bytes_per_full_token()
+        per_rank_bytes = [
+            self._get_bytes_per_full_token(
+                slice_, scratch_layers=int(self.layer_shard_size > 1)
+            )
+            for slice_ in owned_slices
+        ]
+        self._owned_ratio_slice = owned_slices[per_rank_bytes.index(min(per_rank_bytes))]
+        self.bytes_per_full_token = min(per_rank_bytes)
+        if self.layer_shard_size > 1:
+            logger.info(
+                "DSV4 layer-split capacity: shard_size=%d owned_layers=%d/%d "
+                "bytes_per_full_token=%.1f (unsharded=%.1f)",
+                self.layer_shard_size,
+                len(self._owned_ratio_slice),
+                self.num_layers_total,
+                self.bytes_per_full_token,
+                self._get_bytes_per_full_token(),
+            )
         if self.is_speculative:
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
-            # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
+            # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T). The
+            # 1-layer draft pool is not layer-split sharded, so the target
+            # count is the owned slice.
             draft_layers = 1
-            target_layers = self.num_layers_total
+            target_layers = len(self._owned_ratio_slice)
             self._spec_infl = (target_layers + draft_layers) / target_layers
             self.bytes_per_full_token *= self._spec_infl
 
@@ -1071,7 +1114,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"get_compress_state_ring_size()."
             )
 
-    def _get_bytes_per_full_token(self) -> float:
+    def _get_bytes_per_full_token(self, ratios=None, scratch_layers: int = 0) -> float:
+        # ``ratios`` is the layer-split owned slice (default: the full PP
+        # slice). Only the KV/indexer pools are sharded; the compress state
+        # terms keep full-layer counts (states run unsharded on every rank).
+        # ``scratch_layers`` (layer split only) amortizes the per-family remote
+        # read scratch buffers, mirroring the GPU's owned+1 layer estimate.
+        ratios = self.compression_ratios if ratios is None else ratios
+        layers_total = len(ratios) + scratch_layers
+        layers_ca4 = sum(1 for r in ratios if r == 4) + scratch_layers
+        layers_ca128 = sum(1 for r in ratios if r == 128) + scratch_layers
+
         if self._unified:
             # Unified_kv stores the whole latent in bf16.
             kv_bytes = self.attn_head_dim * 2
@@ -1104,12 +1157,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             (
                 0.0
                 if self._unified
-                else self.swa_ratio * kv_bytes * self.num_layers_total
+                else self.swa_ratio * kv_bytes * layers_total
             )
-            + c4_frac * kv_bytes * self.num_layers_ca4
-            + 1 / 128 * kv_bytes * self.num_layers_ca128
-            + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
+            + c4_frac * kv_bytes * layers_ca4
+            + 1 / 128 * kv_bytes * layers_ca128
+            + 1 / 4 * self.indexer_bytes_per_token * layers_ca4
             # Ring mode: C4 state is per-request too (see _fixed_c4_state_bytes).
+            # State pools are not sharded, so this term keeps the full count.
             + (
                 0.0
                 if self._unified

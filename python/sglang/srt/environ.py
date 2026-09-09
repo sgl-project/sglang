@@ -477,6 +477,12 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # DSV4 layer-split: owner reads broadcast the selected active pages when
+    # the process group backend is not zbal (whose broadcast is unproven).
+    SGLANG_DSV4_LS_CHUNK_BYTES = EnvInt(1024 * 1024)
+    # DSV4 layer-split: launch each layer's broadcast on a comm stream right
+    # after its owner-side write; the consumer waits the recorded event.
+    SGLANG_DSV4_LS_ASYNC_READ = EnvBool(True)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
