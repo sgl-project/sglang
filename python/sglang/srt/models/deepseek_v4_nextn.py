@@ -43,14 +43,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v4 import (
-    (
     DeepseekV4DecoderLayer,
-   
+    _is_npu,
     DeepseekV4ForCausalLM,
     wo_a_fp8_gemm_enabled,
-),
-    _is_npu,
 )
+
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
