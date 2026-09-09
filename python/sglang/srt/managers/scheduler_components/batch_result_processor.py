@@ -1240,14 +1240,17 @@ class SchedulerBatchResultProcessor:
         """Release a request whose sampled token must not be committed."""
         if req.multimodal_inputs is not None and req.session is None:
             req.multimodal_inputs.release_features()
-        if get_memory().enable_hisparse:
-            self.hisparse_coordinator.request_finished(req)
-        prepare_release = getattr(
-            self.model_worker, "prepare_for_kv_cache_release", None
-        )
-        if callable(prepare_release):
-            prepare_release(req)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if get_disagg().disaggregation_decode_enable_offload_kvcache:
+            self.decode_offload_manager.finalize_release_on_finish(req)
+        else:
+            if get_memory().enable_hisparse:
+                self.hisparse_coordinator.request_finished(req)
+            prepare_release = getattr(
+                self.model_worker, "prepare_for_kv_cache_release", None
+            )
+            if callable(prepare_release):
+                prepare_release(req)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(

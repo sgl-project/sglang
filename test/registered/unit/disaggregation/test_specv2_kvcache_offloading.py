@@ -9,7 +9,8 @@ Requires: torch, sglang (run in an environment with sglang installed)
 
 import gc
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
@@ -20,9 +21,14 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -438,6 +444,59 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         self.assertEqual(len(manager.offloaded_state), 0)
         self.assertEqual(len(manager.offload_inflight), 0)
+
+
+class TestSamplingMaskAbortOffload(CustomTestCase):
+    def test_abort_waits_for_existing_offload_before_reusing_slots(self):
+        """An abort must not recycle slots while a previous D2H copy reads them."""
+        for inflight in (False, True):
+            with self.subTest(inflight=inflight):
+                manager, freed = _make_manager(pool_size=32)
+                req = _make_mock_req(0, 20, 20)
+                req.multimodal_inputs = None
+                req.finished.return_value = True
+                manager.req_to_token_pool.free.side_effect = lambda req: setattr(
+                    req.kv, "req_pool_idx", None
+                )
+                processor = SimpleNamespace(
+                    decode_offload_manager=manager,
+                    tree_cache=manager.tree_cache,
+                    model_worker=MagicMock(),
+                )
+                if inflight:
+                    manager.offload_inflight[req] = 1
+                    manager.ongoing_offload[1] = (req, torch.arange(4), [1], 0.0)
+                    manager.cache_controller = MagicMock()
+                    manager.cache_controller.ack_write_queue = [
+                        HiCacheAck(None, _FinishedEvent(), [1])
+                    ]
+                    manager._trigger_backup = MagicMock(return_value="hash")
+
+                with (
+                    get_context().override_server_args(
+                        disaggregation_decode_enable_offload_kvcache=True,
+                        enable_hisparse=False,
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache",
+                        side_effect=lambda req, *args, **kwargs: manager._release_finished_req(
+                            req
+                        ),
+                    ),
+                ):
+                    SchedulerBatchResultProcessor._handle_sampling_mask_abort(
+                        processor, req
+                    )
+
+                if inflight:
+                    self.assertEqual(freed, [])
+                    self.assertEqual(req.kv.req_pool_idx, 0)
+                    manager._check_offload_progress(1)
+                self.assertEqual(len(freed), 1)
+                self.assertTrue(torch.equal(freed[0], torch.arange(20)))
+                self.assertIsNone(req.kv.req_pool_idx)
+                manager.finalize_release_on_finish(req)
+                self.assertEqual(len(freed), 1)
 
 
 if __name__ == "__main__":
