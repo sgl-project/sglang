@@ -2224,8 +2224,7 @@ class OpenAIServingChat(OpenAIServingBase):
     def _process_logprobs_tokens(
         self, logprobs: LogProbs
     ) -> List[ChatCompletionTokenLogprob]:
-        """Common helper to process logprobs tokens for both streaming and non-streaming
-        """
+        """Common helper to process logprobs tokens for both streaming and non-streaming"""
         token_logprobs = []
 
         for token_idx, (token, logprob) in enumerate(
