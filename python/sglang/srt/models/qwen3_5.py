@@ -363,46 +363,49 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
         # projection of the input hidden states
-        self.qkvz_width = (2 * self.key_dim + 2 * self.value_dim) // self.attn_tp_size
-        self.ba_width = (2 * self.num_v_heads) // self.attn_tp_size
-        self.in_proj_qkvz = None
-        self.in_proj_ba = None
-        self.in_proj_qkvzba = self.create_qkvzba_proj(
-            hidden_size=self.hidden_size,
-            key_dim=self.key_dim,
-            value_dim=self.value_dim,
-            num_v_heads=self.num_v_heads,
-            quant_config=quant_config,
-            prefix=add_prefix(gdn_in_proj_merge.MERGED_PARAM, prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-        )
-        if self.in_proj_qkvzba is None:
-            self.in_proj_qkvz = self.create_qkvz_proj(
+        self.in_proj_qkvzba = None
+        if gdn_in_proj_merge.ENABLED:
+            self.in_proj_qkvzba = gdn_in_proj_merge.build(
                 hidden_size=self.hidden_size,
                 key_dim=self.key_dim,
                 value_dim=self.value_dim,
-                quant_config=quant_config,
-                prefix=add_prefix("in_proj_qkvz", prefix),
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
-            )
-
-            self.in_proj_ba = self.create_ba_proj(
-                hidden_size=self.hidden_size,
                 num_v_heads=self.num_v_heads,
                 quant_config=quant_config,
-                prefix=add_prefix("in_proj_ba", prefix),
+                prefix=add_prefix(gdn_in_proj_merge.MERGED_PARAM, prefix),
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
             )
+            if self.in_proj_qkvzba is not None:
+                self.qkvz_width = (2 * self.key_dim + 2 * self.value_dim) // self.attn_tp_size
+                self.ba_width = (2 * self.num_v_heads) // self.attn_tp_size
+
+        self.in_proj_qkvz = self.create_qkvz_proj(
+            hidden_size=self.hidden_size,
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("in_proj_qkvz", prefix),
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+        ) if self.in_proj_qkvzba is None else None
+
+        self.in_proj_ba = self.create_ba_proj(
+            hidden_size=self.hidden_size,
+            num_v_heads=self.num_v_heads,
+            quant_config=quant_config,
+            prefix=add_prefix("in_proj_ba", prefix),
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+        ) if self.in_proj_qkvzba is None else None
 
         # Override weight loaders for packed checkpoint format.
         # Important: for FP8, this must cover not only `.weight` but also
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
-        for proj in (self.in_proj_qkvzba, self.in_proj_qkvz, self.in_proj_ba):
-            if proj is not None:
-                self._bind_packed_weight_loaders(proj)
+        if self.in_proj_qkvzba is not None:
+            self._bind_packed_weight_loaders(self.in_proj_qkvzba)
+        else:
+            self._bind_packed_weight_loaders(self.in_proj_qkvz)
+            self._bind_packed_weight_loaders(self.in_proj_ba)
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
@@ -641,28 +644,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=tp_size,
         )
 
-    def create_qkvzba_proj(
-        self,
-        hidden_size: int,
-        key_dim: int,
-        value_dim: int,
-        num_v_heads: int,
-        quant_config: QuantizationConfig | None,
-        prefix: str,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
-    ) -> Optional[MergedColumnParallelLinear]:
-        return gdn_in_proj_merge.build(
-            hidden_size,
-            key_dim,
-            value_dim,
-            num_v_heads,
-            quant_config,
-            prefix,
-            tp_rank,
-            tp_size,
-        )
-
     @property
     def qkvz_proj(self) -> nn.Module:
         return (
@@ -694,7 +675,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if self.in_proj_qkvzba is not None:
+        if gdn_in_proj_merge.ENABLED and self.in_proj_qkvzba is not None:
             hs = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvzba)
             projected_states, _ = self.in_proj_qkvzba(hs)
             return gdn_in_proj_merge.split_output(
