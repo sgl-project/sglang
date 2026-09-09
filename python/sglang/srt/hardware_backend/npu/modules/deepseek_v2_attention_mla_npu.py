@@ -598,24 +598,13 @@ def npu_mla_preprocess(
             m.v_head_dim,
             m.quant_config,
         )
-    _is_arch35_dsa = (
-        m.mla_preprocess.is_npu_arch35
-        and get_token_to_kv_pool().index_head_dim is not None
-    )
-    quant_method = m.mla_preprocess.qkv_a_proj.quant_method
-    _is_w8a8 = (
-        hasattr(quant_method, "quantization_config")
-        and quant_method.quantization_config.get_name() == "modelslim"
-    )
-    _is_mlaprolog = _is_arch35_dsa or (
-        not _is_w8a8
-        and hasattr(m.mla_preprocess.quant_config, "ignore")
-        and any(
-            re.fullmatch(r".*kv_b_proj", pattern)
-            for pattern in m.mla_preprocess.quant_config.ignore
-        )
-    )
     # mlaprolog does not require additional calculation of q_lora
+    _is_mlaprolog = (
+        _is_npu_arch35 and get_token_to_kv_pool().index_head_dim is not None
+    ) or (
+        hasattr(m.quant_config, "ignore")
+        and any(re.fullmatch(r".*kv_b_proj", l) for l in m.quant_config.ignore)
+    )
     if _is_mlaprolog:
         (
             q_pe,
