@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -143,6 +144,55 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
         "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
         f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
     )
+
+
+class PoolRole(Enum):
+    """Whether a pricing-table row belongs to the target model or a draft worker."""
+
+    TARGET = "target"
+    DRAFT = "draft"
+
+
+@dataclass
+class PoolPriceEntry:
+    """One row of a pool pricing table: the per-token price of one pool.
+
+    ``cell_ratio`` applies only when summing the unified-budget coefficient
+    (cell size) -- e.g. SWA rows are priced at ``swa_full_tokens_ratio`` of a
+    full token in hybrid mode. Draft-pool byte sums always use the raw price.
+    Flat additive prices (a DFLASH draft pool with its own geometry) use
+    ``num_layers=1``.
+
+    Step 1 of table-driven pool pricing: rows replace hand-written per-class
+    formulas. Per-request fixed rows (the Mamba/GDN state pool) arrive with
+    MambaPoolConfigurator in step 2.
+    """
+
+    name: str
+    role: PoolRole
+    bytes_per_token: int
+    num_layers: int = 1
+    cell_ratio: float = 1.0
+
+
+def _sum_price_table(entries: list[PoolPriceEntry], *, for_coeff: bool) -> float:
+    """Reduce pricing-table rows to a single bytes-per-token figure.
+
+    Rows sharing a price and ratio are grouped (layer counts summed) and terms
+    are emitted in declaration order, so the arithmetic reproduces the previous
+    hand-written formulas bit-for-bit; golden tests freeze the values.
+    """
+    grouped: dict[tuple[int, float], int] = {}
+    for entry in entries:
+        key = (entry.bytes_per_token, entry.cell_ratio if for_coeff else 1.0)
+        grouped[key] = grouped.get(key, 0) + entry.num_layers
+    total = 0
+    for (price, ratio), num_layers in grouped.items():
+        if for_coeff and ratio != 1.0:
+            total = total + ratio * price * num_layers
+        else:
+            total = total + price * num_layers
+    return total
 
 
 class MemoryPoolConfigurator:
@@ -655,43 +705,64 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 
-        self._recompute_cell_size()
-
-    def _recompute_cell_size(self) -> None:
-        # Bytes per token of max_total_num_tokens.
+        # Pricing table: one row per (pool, role).
         #
-        # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
-        # for both pools: F*nf + r*S*ns (where swa_tokens = full_tokens * r).
+        # Hybrid (full_layers > 0): max_total = full_tokens, so the coefficient
+        # accounts for both pools: F*nf + r*S*ns (swa_tokens = full_tokens * r),
+        # i.e. SWA rows carry swa_full_tokens_ratio as their cell_ratio.
         #
         # All-SWA (full_layers == 0): max_total = swa_tokens directly. The ratio
         # is meaningless here -- there is no full pool to relate to, and every
-        # token beyond the sliding window can be evicted. So cell_size = S*ns,
-        # with no ratio factor applied.
-        if self._full_layers_num == 0:
-            self._cell_size = (
-                self._swa_per_token * self._swa_layers_num
-                + self._full_per_token * self._draft_full_layers_num
-                + self._swa_per_token * self._draft_swa_layers_num
-                + self._swa_per_token * self._draft_swa_full_layers_num
-                + self._draft_cell_size
-            )
-        else:
-            self._cell_size = (
-                self._full_per_token
-                * (self._full_layers_num + self._draft_full_layers_num)
-                + self._swa_per_token * self._draft_swa_full_layers_num
-                + self._swa_full_tokens_ratio
-                * self._swa_per_token
-                * (self._swa_layers_num + self._draft_swa_layers_num)
-                + self._draft_cell_size
-            )
+        # token beyond the sliding window can be evicted -- so SWA rows price
+        # flat (cell_ratio = 1.0).
+        swa_cell_ratio = (
+            self._swa_full_tokens_ratio if self._full_layers_num > 0 else 1.0
+        )
+        self._price_table = [
+            PoolPriceEntry(
+                "full", PoolRole.TARGET, self._full_per_token, self._full_layers_num
+            ),
+            PoolPriceEntry(
+                "full",
+                PoolRole.DRAFT,
+                self._full_per_token,
+                self._draft_full_layers_num,
+            ),
+            PoolPriceEntry(
+                "swa_full_capacity",
+                PoolRole.DRAFT,
+                self._swa_per_token,
+                self._draft_swa_full_layers_num,
+            ),
+            PoolPriceEntry(
+                "swa",
+                PoolRole.TARGET,
+                self._swa_per_token,
+                self._swa_layers_num,
+                cell_ratio=swa_cell_ratio,
+            ),
+            PoolPriceEntry(
+                "swa",
+                PoolRole.DRAFT,
+                self._swa_per_token,
+                self._draft_swa_layers_num,
+                cell_ratio=swa_cell_ratio,
+            ),
+            PoolPriceEntry("dflash_draft", PoolRole.DRAFT, self._draft_cell_size),
+        ]
+        self._recompute_cell_size()
+
+    def _recompute_cell_size(self) -> None:
+        # Bytes per token of max_total_num_tokens, reduced from the pricing
+        # table; declaration order preserves the previous formula's arithmetic.
+        self._cell_size = _sum_price_table(self._price_table, for_coeff=True)
 
     def _draft_pool_bytes_per_token(self) -> int:
         return int(
-            self._full_per_token * self._draft_full_layers_num
-            + self._swa_per_token
-            * (self._draft_swa_layers_num + self._draft_swa_full_layers_num)
-            + self._draft_cell_size
+            _sum_price_table(
+                [e for e in self._price_table if e.role is PoolRole.DRAFT],
+                for_coeff=False,
+            )
         )
 
     def _max_unified_full_tokens(

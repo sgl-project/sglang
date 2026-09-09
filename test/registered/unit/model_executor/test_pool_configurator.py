@@ -1141,5 +1141,93 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(sizes.c4_state_pool_size, 0)
 
 
+class TestHybridSWAPriceTable(CustomTestCase):
+    """Golden values: the pricing table reproduces the closed-form sizing."""
+
+    def _build(self, mr):
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            return create_memory_pool_configurator(mr)
+
+    @staticmethod
+    def _swa_target_row(cfg):
+        from sglang.srt.model_executor.pool_configurator import PoolRole
+
+        return next(
+            e for e in cfg._price_table if e.name == "swa" and e.role is PoolRole.TARGET
+        )
+
+    def test_hybrid_no_draft(self):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+        )
+        cfg = self._build(mr)
+        # full = swa = 4*(64+64)*2 = 1024 bytes/token/layer.
+        # cell = F*1 + 0.5*S*1 = 1536; no draft rows contribute.
+        self.assertEqual(cfg._cell_size, 1536)
+        self.assertEqual(cfg._draft_pool_bytes_per_token(), 0)
+        self.assertEqual(len(cfg._price_table), 6)
+        self.assertEqual(self._swa_target_row(cfg).cell_ratio, 0.5)
+
+    def test_all_swa_prices_flat(self):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[],
+            swa_attention_layer_ids=[0, 1],
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+        )
+        cfg = self._build(mr)
+        # All-SWA: the ratio is meaningless; cell = S*2 = 2048, int arithmetic.
+        self.assertEqual(cfg._cell_size, 2048)
+        self.assertIsInstance(cfg._cell_size, int)
+        self.assertEqual(self._swa_target_row(cfg).cell_ratio, 1.0)
+
+    def test_eagle_draft_rows(self):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 2
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 1
+        cfg = self._build(mr)
+        # draft_full = 1, draft_swa = 1:
+        # cell = F*(1+1) + 0.5*S*(1+1) = 3072; draft pool = F*1 + S*1 = 2048.
+        self.assertEqual(cfg._cell_size, 3072)
+        self.assertEqual(cfg._draft_pool_bytes_per_token(), 2048)
+
+    def test_dflash_flat_row(self):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+        )
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_cell_size_per_token = 100
+        cfg = self._build(mr)
+        # cell = F*1 + 0.5*S*1 + 100 = 1636; draft pool = 100.
+        self.assertEqual(cfg._cell_size, 1636)
+        self.assertEqual(cfg._draft_pool_bytes_per_token(), 100)
+
+
 if __name__ == "__main__":
     unittest.main()
