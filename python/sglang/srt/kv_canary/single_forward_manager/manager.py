@@ -132,7 +132,7 @@ class SingleForwardManager:
         if bs > self._write_req_capacity:
             raise RuntimeError(
                 f"kv-canary: forward_batch.batch_size={bs} exceeds pre-allocated "
-                f"write_req_capacity={self._write_req_capacity}; raise --cuda-graph-max-bs "
+                f"write_req_capacity={self._write_req_capacity}; raise --cuda-graph-max-bs-decode "
                 f"or check CanaryLaunchCapacities.from_args"
             )
         if num_tokens > self._write_entry_capacity:
