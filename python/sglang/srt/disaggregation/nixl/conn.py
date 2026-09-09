@@ -1504,6 +1504,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         bypass_prepped: bool = False,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_item_lens: Optional[List[int]] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1573,6 +1574,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     len(dst_data_ptrs),
                     allow_positional_fallback=self.pp_size == 1,
                 )
+                # The source item length is used as the destination stride, so
+                # the paired entries must have identical layouts.
+                if dst_item_lens is not None:
+                    for i, j in pairs:
+                        if item_lens[i] != dst_item_lens[j]:
+                            raise RuntimeError(
+                                f"{state_type} item length mismatch for paired "
+                                f"entries src[{i}]={item_lens[i]} "
+                                f"dst[{j}]={dst_item_lens[j]}"
+                            )
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
                 ]
@@ -2517,6 +2528,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     force_flat=st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
                     src_layer_ids=src_lids,
                     dst_layer_ids=dst_lids,
+                    dst_item_lens=dst_lens,
                 )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer

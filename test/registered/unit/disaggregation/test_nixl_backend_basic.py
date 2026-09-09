@@ -367,6 +367,31 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
         self.assertEqual(mgr.agent.get_xfer_descs_calls, [])
         self.assertEqual(mgr.agent.initialize_xfer_calls, [])
 
+    def test_paired_state_entries_reject_item_length_mismatch(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = StagingFakeAgent()
+        mgr.is_mla_backend = False
+        mgr.pp_size = 1
+        mgr.kv_args = SimpleNamespace(prefill_start_layer=0, kv_data_ptrs=[1])
+
+        with self.assertRaisesRegex(RuntimeError, "item length mismatch"):
+            mgr._send_kvcache_generic(
+                peer_name="decode",
+                src_data_ptrs=[10],
+                dst_data_ptrs=[20],
+                item_lens=[32],
+                prefill_data_indices=np.array([3], dtype=np.int32),
+                dst_data_indices=np.array([5], dtype=np.int32),
+                dst_gpu_id=0,
+                notif="qsa-mismatch",
+                state_type=StateType.QSA_PENDING,
+                force_flat=True,
+                src_layer_ids=[24],
+                dst_layer_ids=[24],
+                dst_item_lens=[48],
+            )
+        self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+
 
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
