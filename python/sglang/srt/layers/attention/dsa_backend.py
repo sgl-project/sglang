@@ -420,6 +420,9 @@ class DeepseekSparseAttnBackend(
             self.aiter_dsa_metadata_q_dtype = None
             self.aiter_dsa_metadata_kv_dtype = None
             self.aiter_dsa_kv_last_page_lens = None
+            self.aiter_dsa_logits_buf = None
+            self.aiter_dsa_attn_lse_buf = None
+            self._in_cuda_graph_capture = False
             self.aiter_dsa_work_metadata = None
 
             if (
@@ -428,7 +431,7 @@ class DeepseekSparseAttnBackend(
                 self._ensure_aiter_dsa_decode_metadata_buffer(
                     max_seqlen_q=1,
                     batch_size=max_bs,
-                    q_dtype=torch.bfloat16,
+                    q_dtype=fp8_dtype,
                     kv_dtype=fp8_dtype,
                 )
 
@@ -640,6 +643,15 @@ class DeepseekSparseAttnBackend(
         self.aiter_dsa_kv_last_page_lens = torch.ones(
             (batch_size,), dtype=torch.int32, device=self.device
         )
+        max_partials = self.aiter_dsa_reduce_partial_map.shape[0] * max_seqlen_q
+        self.aiter_dsa_logits_buf = torch.empty(
+            (max_partials, 1, self.num_head_padded, 512),
+            dtype=torch.float32, device=self.device,
+        )
+        self.aiter_dsa_attn_lse_buf = torch.empty(
+            (max_partials, 1, self.num_head_padded, 1),
+            dtype=torch.float32, device=self.device,
+        )
         self.aiter_dsa_metadata_capacity = batch_size
         self.aiter_dsa_metadata_max_seqlen_q = max_seqlen_q
         self.aiter_dsa_metadata_q_dtype = q_dtype
@@ -698,6 +710,8 @@ class DeepseekSparseAttnBackend(
             "reduce_partial_map": self.aiter_dsa_reduce_partial_map,
             "intra_batch_mode": True,
             "num_kv_splits": self.aiter_dsa_max_split_per_batch,
+            "logits_buf": self.aiter_dsa_logits_buf,
+            "attn_lse_buf": self.aiter_dsa_attn_lse_buf,
         }
 
     def _pad_trtllm_sparse_page_table(
@@ -1238,6 +1252,7 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        self._in_cuda_graph_capture = True
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -1806,6 +1821,7 @@ class DeepseekSparseAttnBackend(
         forward_mode: ForwardMode,
     ):
         """Fast path: copy precomputed metadata to this backend's metadata.
+        self._in_cuda_graph_capture = False
 
         This function only performs copy operations, no computation.
 
@@ -3242,22 +3258,27 @@ class DeepseekSparseAttnBackend(
         bs: int,
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        num_rows = page_table_1.shape[0]
 
+        o_dtype = torch.bfloat16
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = torch.empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                            dtype=o_dtype, device=q.device)
         else:
-            o = torch.empty_like(q)
+            o = torch.empty((q.shape[0], layer.tp_q_head_num * layer.head_dim),
+                            dtype=o_dtype, device=q.device)
 
         if self.need_pad_heads:
             q_kernel = q.view(
                 -1, layer.tp_q_head_num, layer.head_dim
             ).repeat_interleave(self.head_repeat_factor, dim=1)
-            o_kernel = q.new_empty(
+            o_kernel = torch.empty(
                 (
                     q.shape[0],
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=o_dtype, device=q.device,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -3267,28 +3288,42 @@ class DeepseekSparseAttnBackend(
         kv_scale = None
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
+            q_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
             kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         kv_indptr = self.kv_indptr
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
-        kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
+        kv_indptr[1 : num_rows + 1] = torch.cumsum(non_minus1_counts, dim=0)
 
         kv_indices = self.kv_indices
-        get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
+        get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, num_rows)
 
-        kv_last_page_lens = metadata.cu_seqlens_q
-        if kv_cache.dtype == fp8_dtype:
+        kv_last_page_lens = torch.ones(
+            (num_rows,), dtype=torch.int32, device=q_kernel.device
+        )
+        _has_bufs = (
+            hasattr(self, 'aiter_dsa_work_metadata') and
+            self.aiter_dsa_work_metadata is not None and
+            hasattr(self, 'aiter_dsa_logits_buf') and
+            self.aiter_dsa_logits_buf is not None
+        )
+        if kv_cache.dtype == fp8_dtype and _has_bufs and not self._in_cuda_graph_capture:
             aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
                 metadata.cu_seqlens_q,
                 kv_indptr,
-                bs,
+                num_rows,
                 metadata.max_seq_len_q,
                 q_kernel.dtype,
                 kv_cache.dtype,
             )
             kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
+
+        if not aiter_persistent_kwargs:
+            if hasattr(self, 'aiter_dsa_logits_buf') and self.aiter_dsa_logits_buf is not None:
+                aiter_persistent_kwargs['logits_buf'] = self.aiter_dsa_logits_buf
+                aiter_persistent_kwargs['attn_lse_buf'] = self.aiter_dsa_attn_lse_buf
 
         mla_decode_fwd(
             q_kernel,
@@ -3321,21 +3356,25 @@ class DeepseekSparseAttnBackend(
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
+        o_dtype = torch.bfloat16
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
+            o = torch.empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim),
+                            dtype=o_dtype, device=q.device)
         else:
-            o = torch.empty_like(q)
+            o = torch.empty((num_tokens, layer.tp_q_head_num * layer.head_dim),
+                            dtype=o_dtype, device=q.device)
 
         if self.need_pad_heads:
             q_kernel = q.view(
                 -1, layer.tp_q_head_num, layer.head_dim
             ).repeat_interleave(self.head_repeat_factor, dim=1)
-            o_kernel = q.new_empty(
+            o_kernel = torch.empty(
                 (
                     num_tokens,
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=o_dtype, device=q.device,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -3345,6 +3384,7 @@ class DeepseekSparseAttnBackend(
         kv_scale = None
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
+            q_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
             kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         non_minus1_mask = page_table_1 != -1
@@ -3368,15 +3408,10 @@ class DeepseekSparseAttnBackend(
         )
         kv_last_page_lens = cu_seqlens_q
         if kv_cache.dtype == fp8_dtype:
-            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
-                cu_seqlens_q,
-                kv_indptr,
-                num_tokens,
-                1,
-                q_kernel.dtype,
-                kv_cache.dtype,
+            pass
+            kv_last_page_lens = torch.ones(
+                (num_tokens,), dtype=torch.int32, device=self.device
             )
-            kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
         # TODO support more forward_mode
         mla_decode_fwd(
