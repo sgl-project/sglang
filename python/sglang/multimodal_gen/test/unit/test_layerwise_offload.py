@@ -544,6 +544,38 @@ def test_layerwise_pin_lease_includes_alignment_and_survives_host_aliases():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("stride,allocation_bytes", [(1, 16), (3, 40)])
+def test_layerwise_budget_uses_view_allocation_not_the_backing_storage(
+    stride, allocation_bytes
+):
+    model = torch.nn.Module()
+    block = torch.nn.Module()
+    source = torch.arange(32, dtype=torch.float32)[1 : 1 + 4 * stride : stride]
+    expected = source.clone()
+    block.weight = torch.nn.Parameter(source)
+    model.blocks = torch.nn.ModuleList([block])
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + allocation_bytes
+    )
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    assert budget.committed_bytes == allocation_bytes
+    manager.load_all_layers()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(block.weight.cpu(), expected, rtol=0, atol=0)
+    manager.remove_forward_hooks()
+    manager.enabled = False
+    manager.release_host_stores()
+    assert budget.committed_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_failed_layerwise_allocation_refunds_only_unallocated_allowance(monkeypatch):
     budget = host_memory_budget.HostPinBudget(
         available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + 1024
