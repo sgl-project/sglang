@@ -2668,7 +2668,6 @@ class DeepseekV4AscendAttnBackend(
                 os.environ.get("SGLANG_COMPRESSOR_PREFILL_USE_TRITON", "0") == "1"
             )
             if use_triton:
-                print(f"[prefill] 111111111111111111")
                 pooled, compacted_out_loc, compacted_group_pos = (
                     low_ratio_compress_triton(
                         kv,
@@ -2787,7 +2786,6 @@ class DeepseekV4AscendAttnBackend(
                 pair_kv_state = pool.c2_pair_kv_state[layer.layer_id]
                 pair_score_state = pool.c2_pair_score_state[layer.layer_id]
                 pad_row = pool.c2_pair_pad_row
-            print(f"[decode] 111111111111111111")
             latent, group_pos, slots = low_ratio_compress_decode(
                 kv,
                 score,
