@@ -9,11 +9,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+class FakeEvent:
+    def __init__(self, timestamp):
+        self.timestamp = timestamp
+
+    def elapsed_time(self, end):
+        return end.timestamp - self.timestamp
+
+
 class FakeInterval:
-    def __init__(self, milliseconds, ready=False):
+    def __init__(self, milliseconds, ready=False, start=0, stream=0):
         self.milliseconds = milliseconds
         self.ready = ready
         self.end_event = self
+        self.start_event = FakeEvent(start)
+        self.timestamp = start + milliseconds
+        self.stream = stream
         self.capture = None
         self.metadata = None
 
@@ -33,9 +44,9 @@ class TestDeviceTimerCapture(unittest.TestCase):
         timer = DeviceTimer(reporter)
         intervals = [
             FakeInterval(2),
-            FakeInterval(5),
-            FakeInterval(3),
-            FakeInterval(20),
+            FakeInterval(5, start=4),
+            FakeInterval(3, start=12),
+            FakeInterval(20, start=20),
         ]
         with patch.object(_TimingInterval, "create", side_effect=intervals) as create:
             with timer.capture() as first:
@@ -59,7 +70,7 @@ class TestDeviceTimerCapture(unittest.TestCase):
         # FPM attaches its CPU snapshot only after both groups have been drained.
         first.when_ready(first_result)
         second.when_ready(second_result)
-        first_result.assert_called_once_with(0.010)
+        first_result.assert_called_once_with(0.015)
         second_result.assert_called_once_with(0.020)
         self.assertEqual(reporter.call_count, 4)
         timer._report()
@@ -68,7 +79,7 @@ class TestDeviceTimerCapture(unittest.TestCase):
 
     def test_partial_completion_waits_for_entire_closed_group(self):
         timer = DeviceTimer()
-        intervals = [FakeInterval(2, ready=True), FakeInterval(5)]
+        intervals = [FakeInterval(2, ready=True), FakeInterval(5, start=4)]
         result = Mock()
         with patch.object(_TimingInterval, "create", side_effect=intervals):
             with timer.capture() as timing:
@@ -81,7 +92,20 @@ class TestDeviceTimerCapture(unittest.TestCase):
         result.assert_not_called()
         intervals[1].ready = True
         timer._report()
-        result.assert_called_once_with(0.007)
+        result.assert_called_once_with(0.009)
+
+    def test_different_streams_do_not_claim_an_ordered_span(self):
+        timer = DeviceTimer()
+        intervals = [FakeInterval(2, True, stream=1), FakeInterval(5, True, stream=2)]
+        with patch.object(_TimingInterval, "create", side_effect=intervals):
+            with timer.capture() as timing:
+                with timer.wrap({}):
+                    pass
+                with timer.wrap({}):
+                    pass
+        result = Mock()
+        timing.when_ready(result)
+        result.assert_called_once_with(None)
 
     def test_completed_time_survives_later_unscoped_work(self):
         timer = DeviceTimer()

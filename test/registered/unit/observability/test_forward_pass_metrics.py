@@ -202,6 +202,8 @@ class TestForwardPassMetrics(unittest.TestCase):
         timer = self.reporter.forward_pass_device_timer = DeviceTimer()
         interval = types.SimpleNamespace(
             capture=None,
+            stream=0,
+            start_event=types.SimpleNamespace(elapsed_time=lambda _: 42.0),
             end=lambda **_: None,
             end_event=types.SimpleNamespace(query=lambda: True),
             elapsed_time=lambda: 42.0,
@@ -241,6 +243,8 @@ class TestForwardPassMetrics(unittest.TestCase):
         ready = [False]
         interval = types.SimpleNamespace(
             capture=None,
+            stream=0,
+            start_event=types.SimpleNamespace(elapsed_time=lambda _: 7.0),
             end=lambda **_: None,
             end_event=types.SimpleNamespace(query=lambda: ready[0]),
             elapsed_time=lambda: 7.0,
