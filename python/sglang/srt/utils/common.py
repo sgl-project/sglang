@@ -90,7 +90,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -317,6 +317,12 @@ is_sm90_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
     )
 )
+
+
+# RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
+@lru_cache(maxsize=1)
+def is_sm120() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 0)
 
 
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
@@ -1813,6 +1819,7 @@ def smart_to_rgb(
     if not isinstance(image, Image.Image):
         return image
 
+    image = ImageOps.exif_transpose(image)
     if image.mode in ("RGBA", "LA") or "transparency" in image.info:
         image = image.convert("RGBA")
         width, height = image.size
@@ -1954,6 +1961,8 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
+    if image_size is not None and isinstance(image, Image.Image):
+        image_size = (image.width, image.height)
     return image, image_size
 
 

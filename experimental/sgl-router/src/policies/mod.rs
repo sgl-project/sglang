@@ -3,13 +3,15 @@
 
 pub mod active_load;
 pub mod admission;
+pub mod buckets;
 pub mod cache_aware;
-pub mod cache_aware_zmq;
+pub mod decode;
 pub mod engine_load;
 pub mod factory;
 pub mod kv_events;
 pub mod load_based;
 pub mod power_of_two;
+pub mod prefix_provider;
 pub mod random;
 pub mod registry;
 pub mod round_robin;
@@ -18,6 +20,7 @@ pub mod session_aware;
 pub mod sticky;
 
 use crate::discovery::ModelId;
+use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
@@ -154,6 +157,7 @@ pub struct SelectionContext<'a> {
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
     load_snapshot: Option<&'a EngineLoadSnapshot>,
+    prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
     affinity_assignment_enabled: bool,
 }
@@ -170,6 +174,7 @@ impl<'a> SelectionContext<'a> {
             request_tokens: None,
             external_prefix: None,
             load_snapshot: None,
+            prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
             affinity_assignment_enabled: true,
         }
@@ -190,6 +195,7 @@ impl<'a> SelectionContext<'a> {
             request_tokens: None,
             external_prefix: None,
             load_snapshot: None,
+            prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
             affinity_assignment_enabled: true,
         }
@@ -201,19 +207,19 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// Attaches the Session-Aware session ID.
+    /// Attaches a Session-Aware session ID.
     pub fn with_session_id(mut self, session_id: Option<&'a str>) -> Self {
         self.session_id = session_id;
         self
     }
 
-    /// Attaches this policy evaluation's candidate range ID.
+    /// Identifies the candidate domain for this policy call.
     pub fn with_candidate_range_id(mut self, candidate_range_id: &'a str) -> Self {
         self.candidate_range_id = candidate_range_id;
         self
     }
 
-    /// Attaches the request input-token count.
+    /// Attaches the request input token count.
     pub fn with_input_tokens(mut self, input_tokens: u64) -> Self {
         self.input_tokens = Some(input_tokens);
         self
@@ -227,9 +233,20 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// Attaches the Engine Load snapshot captured at request start.
+    /// Attaches the engine load snapshot captured at request ingress.
     pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
+        self
+    }
+
+    /// Cache-Aware uses this binding before Top-K truncation so an
+    /// incompatible cache holder cannot displace a lower-ranked usable one.
+    pub fn with_prefill_cache_bucket(
+        mut self,
+        selector: &'a BucketSelector,
+        request: BucketRequest,
+    ) -> Self {
+        self.prefill_cache_bucket = Some((selector, request));
         self
     }
 
@@ -240,7 +257,7 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// Keeps affinity lookup but disables assignment writes.
+    /// Enables affinity lookup without recording new assignments.
     pub fn without_affinity_assignment(mut self) -> Self {
         self.affinity_assignment_enabled = false;
         self
@@ -282,6 +299,10 @@ impl<'a> SelectionContext<'a> {
         self.load_snapshot
     }
 
+    pub fn prefill_cache_bucket(&self) -> Option<(&BucketSelector, BucketRequest)> {
+        self.prefill_cache_bucket
+    }
+
     pub fn affinity_lookup_enabled(&self) -> bool {
         self.affinity_lookup_enabled
     }
@@ -291,36 +312,43 @@ impl<'a> SelectionContext<'a> {
     }
 }
 
-/// A policy's primary/backup proposal.
+/// Primary and backup workers proposed by a policy.
 #[derive(Clone)]
 pub struct SelectionProposal {
     pub primary: Arc<Worker>,
     pub backup: Option<Arc<Worker>>,
     pub kind: ProposalKind,
-    /// Workers still eligible for fallback after filtering.
+    /// Optional pressure guard settings for this pair.
+    /// Applied only when both workers have complete, fresh native monitor data.
+    pub guard_hints: GuardHints,
+    /// Workers available for fallback after eligibility filtering.
     pub eligible_workers: Option<Vec<Arc<Worker>>>,
 }
 
-/// A Cache-Aware Prefill candidate with `E = L - H`.
+/// Cache-Aware prefill candidate where `E = L - H`.
 #[derive(Clone)]
 pub struct CacheCandidate {
     pub worker: Arc<Worker>,
     pub matched_prefix_tokens: u64,
     pub uncached_tokens: u64,
-    /// Candidate domain.
+    /// Domain containing this candidate.
     pub candidate_range_id: String,
-    /// Optional pending-Prefill limit checked with `E`.
+    /// Optional pending prefill limit checked against `E`.
     pub max_pending_prefill_tokens: Option<u64>,
 }
 
-/// A bounded Cache-Aware candidate set.
-#[derive(Clone)]
+/// Bounded set of Cache-Aware candidates.
+#[derive(Clone, Default)]
 pub struct CacheCandidateProposal {
     pub candidates: Vec<CacheCandidate>,
     pub cache_switch_margin_tokens: u64,
+    pub enable_pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
+    pub pressure_rel_threshold: f64,
 }
 
-/// A Prefill policy result: a pair or Cache-Aware candidates.
+/// Prefill proposal returned as either a pair or a Cache-Aware candidate set.
 #[derive(Clone)]
 pub enum PrefillProposal {
     Pair(SelectionProposal),
@@ -328,7 +356,7 @@ pub enum PrefillProposal {
 }
 
 impl PrefillProposal {
-    /// Applies EligibilityFilter results to either proposal form.
+    /// Applies eligibility filtering to either proposal form.
     pub fn with_eligible_workers(self, workers: Vec<Arc<Worker>>) -> Self {
         match self {
             Self::Pair(proposal) => Self::Pair(proposal.with_eligible_workers(workers)),
@@ -351,6 +379,7 @@ impl SelectionProposal {
             primary,
             backup: None,
             kind: ProposalKind::Generic,
+            guard_hints: GuardHints::default(),
             eligible_workers: None,
         }
     }
@@ -361,6 +390,7 @@ impl SelectionProposal {
             primary,
             backup: Some(backup),
             kind: ProposalKind::PowerOfTwo,
+            guard_hints: GuardHints::default(),
             eligible_workers: None,
         }
     }
@@ -370,13 +400,18 @@ impl SelectionProposal {
         self
     }
 
+    pub fn with_guard_hints(mut self, guard_hints: GuardHints) -> Self {
+        self.guard_hints = guard_hints;
+        self
+    }
+
     pub fn with_eligible_workers(mut self, workers: Vec<Arc<Worker>>) -> Self {
         self.eligible_workers = Some(workers);
         self
     }
 }
 
-/// The source of a primary/backup proposal.
+/// Source of a primary/backup proposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProposalKind {
     Generic,
@@ -384,6 +419,26 @@ pub enum ProposalKind {
     SessionAffinity,
     CacheAffinity,
     Score,
+}
+
+/// Optional guard settings for a pair proposal.
+#[derive(Debug, Clone)]
+pub struct GuardHints {
+    pub enable_pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
+    pub pressure_rel_threshold: f64,
+}
+
+impl Default for GuardHints {
+    fn default() -> Self {
+        Self {
+            enable_pressure_guard: false,
+            pressure_abs_threshold_tokens: 0,
+            pressure_abs_threshold_ms: None,
+            pressure_rel_threshold: 1.0,
+        }
+    }
 }
 
 pub trait Policy: Send + Sync + std::fmt::Debug {
@@ -426,7 +481,12 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
         self.uses_shared_prefill_admission()
     }
 
-    /// Whether this policy resolves an affinity primary within the candidate range.
+    /// Whether in-flight requests must be timestamped for load correction.
+    fn needs_dispatch_timestamps(&self) -> bool {
+        false
+    }
+
+    /// Whether this policy resolves an affinity primary within its candidate range.
     fn is_bucket_affinity_policy(&self) -> bool {
         false
     }
@@ -499,20 +559,23 @@ mod tests {
         resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
-    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
     use std::collections::HashMap;
     use std::time::Instant;
 
-    /// Aggregated `LoadStat` values used only by policy tests.
+    /// #34608 `LoadStat` aggregate used by policy tests.
     #[derive(Clone, Default)]
     struct TestEngineLoad {
         num_running_reqs: u64,
         num_waiting_reqs: u64,
         num_tokens: u64,
         max_total_num_tokens: u64,
+        num_waiting_uncached_tokens: Option<u64>,
+        num_total_tokens: Option<u64>,
+        max_running_requests: Option<u64>,
     }
 
     fn worker(id: &str) -> Arc<Worker> {
@@ -601,6 +664,7 @@ mod tests {
                 max_pending_prefill_tokens: None,
             }],
             cache_switch_margin_tokens: 8,
+            ..Default::default()
         };
 
         assert_eq!(proposal.candidates[0].worker.id, hot.id);
@@ -1118,18 +1182,27 @@ mod tests {
     }
 
     fn snapshot(entries: &[(&Arc<Worker>, TestEngineLoad)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_workers(
+        EngineLoadSnapshot::from_native_cache_workers(
             1,
             entries
                 .iter()
                 .map(|(worker, aggregate)| {
                     (
                         worker.url.clone(),
-                        EngineWorkerLoad {
+                        NativeCacheWorkerLoad {
                             num_running_reqs: aggregate.num_running_reqs,
                             num_waiting_reqs: aggregate.num_waiting_reqs,
-                            num_tokens: aggregate.num_tokens,
+                            num_waiting_uncached_tokens: aggregate
+                                .num_waiting_uncached_tokens
+                                .unwrap_or(aggregate.num_waiting_reqs),
+                            num_used_tokens: aggregate.num_tokens,
+                            num_total_tokens: aggregate
+                                .num_total_tokens
+                                .unwrap_or(aggregate.num_tokens),
                             max_total_num_tokens: aggregate.max_total_num_tokens,
+                            max_running_requests: aggregate.max_running_requests.unwrap_or(64),
+                            prefill_throughput_tokens_per_s: None,
+                            estimated_prefill_queue_ms: None,
                             captured_at: Instant::now(),
                         },
                     )
@@ -1202,6 +1275,7 @@ mod tests {
                 cache_candidate(&winner, 70, 30, None),
             ],
             cache_switch_margin_tokens: 16,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1223,6 +1297,7 @@ mod tests {
         ]);
 
         let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
             .expect("a later admitted cache match must survive");
 
         assert_eq!(decision.selected.id, winner.id);
@@ -1243,6 +1318,7 @@ mod tests {
                 cache_candidate(&final_winner, 80, 20, None),
             ],
             cache_switch_margin_tokens: 0,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1269,6 +1345,7 @@ mod tests {
         ]);
 
         let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
             .expect("all admitted candidates must participate in the tournament");
 
         assert_eq!(decision.selected.id, final_winner.id);
@@ -1282,6 +1359,7 @@ mod tests {
         let proposal = CacheCandidateProposal {
             candidates: vec![cache_candidate(&candidate, 80, 20, Some(30))],
             cache_switch_margin_tokens: 16,
+            ..Default::default()
         };
         let pending_allows = snapshot(&[(
             &candidate,
@@ -1292,7 +1370,9 @@ mod tests {
             },
         )]);
         assert!(
-            resolve_cache_candidates(&proposal, 100, &pending_allows).is_some(),
+            resolve_cache_candidates(&proposal, 100, &pending_allows)
+                .decision
+                .is_some(),
             "pending admission must project E=20, not L=100"
         );
 
@@ -1306,7 +1386,9 @@ mod tests {
             },
         )]);
         assert!(
-            resolve_cache_candidates(&proposal, 100, &kv_rejects).is_none(),
+            resolve_cache_candidates(&proposal, 100, &kv_rejects)
+                .decision
+                .is_none(),
             "KV safety must conservatively project the complete input L=100"
         );
     }
@@ -1321,6 +1403,7 @@ mod tests {
                 cache_candidate(&idle, 80, 20, None),
             ],
             cache_switch_margin_tokens: 32,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1341,7 +1424,9 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
+            .unwrap();
         assert_eq!(decision.selected.id, congested.id);
     }
 
@@ -1355,6 +1440,7 @@ mod tests {
                 cache_candidate(&idle, 20, 80, None),
             ],
             cache_switch_margin_tokens: 32,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1375,7 +1461,9 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
+            .unwrap();
         assert_eq!(
             decision.selected.id, hot.id,
             "pressure may break a near tie, but must not erase a material cache-work gain"
@@ -1397,6 +1485,7 @@ mod tests {
                 cache_candidate(&beyond_margin, 60, 40, None),
             ],
             cache_switch_margin_tokens: 32,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1425,7 +1514,9 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
+            .unwrap();
         assert_eq!(
             decision.selected.id, best_work.id,
             "without a unit-compatible token-pressure signal, cache work remains authoritative"

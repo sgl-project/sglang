@@ -102,7 +102,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=50, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
 
 # A dedicated test entry point overrides this without changing the process-wide
@@ -7860,13 +7860,15 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             indices, start_pos=0
         )
 
-    def test_apply_component_action_device_kv_swa_uses_free_swa(self):
+    def test_apply_component_action_device_kv_swa_uses_free_swa_segment(self):
         cache = mock.MagicMock()
         indices = torch.tensor([4, 5])
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.SWA)
         )
-        cache.token_to_kv_pool_allocator.free_swa.assert_called_once_with(indices)
+        cache.token_to_kv_pool_allocator.free_swa_segment.assert_called_once_with(
+            indices, start_pos=0
+        )
 
     def test_apply_component_action_device_kv_mamba_uses_mamba_allocator(self):
         cache = mock.MagicMock()
@@ -8061,6 +8063,61 @@ class _InsertWalkSuite(CustomTestCase):
     _skip_unsupported_hicache_test = (
         UnifiedRadixCacheSuite._skip_unsupported_hicache_test
     )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestUnifiedTreeCoreSWAPrefetchBackends(_InsertWalkSuite):
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=4
+    )
+
+    def test_mid_tree_shortened_swa_prefetch_is_released(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        prefix = [1, 2]
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        anchor = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefix)))
+        ).last_device_node
+
+        cache.tree_core.is_write_back = True
+        suffix = [3, 4]
+        insert_result = cache.tree_core.insert_host(
+            anchor,
+            RadixKey(array("q", suffix)),
+            torch.tensor([100, 101], dtype=torch.int64),
+            ["h3", "h4"],
+        )
+        self.assertIsNotNone(insert_result.inserted_host_node)
+
+        swa_host_indices = torch.tensor([30, 31], dtype=torch.int64)
+        actions = []
+        cache.tree_core.commit_hicache_transfers(
+            anchor,
+            CacheTransferPhase.PREFETCH,
+            {
+                ComponentType.SWA: [
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        host_indices=swa_host_indices,
+                    )
+                ]
+            },
+            cache_actions=actions,
+            insert_result=insert_result,
+            pool_storage_result=PoolTransferResult(
+                kv_hit_pages=len(suffix),
+                extra_pool_hit_pages={PoolName.SWA: len(suffix)},
+            ),
+        )
+
+        self.assertIsNone(
+            _host_value(cache, insert_result.inserted_host_node, ComponentType.SWA)
+        )
+        self.assertEqual(len(actions), 1)
+        self.assertIsInstance(actions[0], FreeComponentHostSlot)
+        self.assertEqual(actions[0].component_type, ComponentType.SWA)
+        self.assertEqual(len(actions[0].host_indices), 1)
+        self.assertTrue(torch.equal(actions[0].host_indices[0], swa_host_indices))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
