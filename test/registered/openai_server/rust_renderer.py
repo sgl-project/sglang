@@ -31,7 +31,9 @@ def launch_rust_renderer(model, base_url, *, timeout, engine_args=(), renderer_a
             model,
             engine_url,
             timeout=timeout,
-            other_args=list(engine_args),
+            # Python's default warmup sends text to the token-ID-only engine.
+            # popen_launch_server waits for its pre-tokenized health probe instead.
+            other_args=["--skip-server-warmup", *engine_args],
             env={"SGLANG_RUST_SERVER": "1"},
         )
         stack.callback(kill_process_tree, engine.pid)

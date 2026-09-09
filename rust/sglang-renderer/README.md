@@ -19,8 +19,13 @@ Start the engine in one terminal, using its normal Python launcher.
 ```sh
 SGLANG_RUST_SERVER=1 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
-  --host 127.0.0.1 --port 30001
+  --host 127.0.0.1 --port 30001 --skip-server-warmup
 ```
+
+Python's automatic server warmup sends text to `/generate`, which the native
+engine now rejects. Skip that warmup and warm the service through the renderer's
+OpenAI endpoints. Keep scheduler tokenizer initialization enabled for stop and
+minimum-token handling. The engine's `/health_generate` uses a token-ID probe.
 
 Start the renderer in another terminal. Match the engine's model revision,
 tokenizer, context limit, and sampling defaults. Set tool and reasoning parsers

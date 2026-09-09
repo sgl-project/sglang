@@ -75,7 +75,7 @@ class TestStandaloneRustRenderer(unittest.TestCase):
             "model",
             "http://127.0.0.1:31000",
             timeout=1,
-            other_args=["--tp", "2"],
+            other_args=["--skip-server-warmup", "--tp", "2"],
             env={"SGLANG_RUST_SERVER": "1"},
         )
         self.launch_renderer.assert_called_once_with(
