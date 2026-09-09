@@ -79,11 +79,23 @@ export const benchmarks = [
   {
     match: { hw: "dgx-spark", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
-    notes: "DGX Spark GB10, TP=1, flashinfer_mxfp4 MoE backend (SM120 path; explicit flag at measurement time, auto-selected by sglang dev image v4+). Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop. Full accuracy suite pending.",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 8 },
+        ttft_ms: 2538.64, tpot_ms: 30.18, tokens_per_sec_per_gpu: 272.44 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 32 },
+        ttft_ms: 23622.31, tpot_ms: 111.61, tokens_per_sec_per_gpu: 1069.73 },
+    ],
+    notes: "DGX Spark GB10, TP=1, flashinfer_mxfp4 MoE backend (SM120 CUTLASS W4A8 path). The explicit --moe-runner-backend flashinfer_mxfp4 in this cell is required on the current arm64 dev image — without it the auto path enters Triton FP8 MoE and fails during decode graph warmup. Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop and reasoning split. Speed: bench_serving --flush-cache, temperature 0, TTFT/TPOT are P50; tok/s = total (input + output) token throughput on one GPU. Image workload (one 720p JPEG per request, 883 vision tokens, in/out=1024/1024): conc 1 (8 prompts): TTFT 318.70 ms, TPOT 30.70 ms, 96.26 tok/s; conc 16 (32 prompts): TTFT 9476.07 ms, TPOT 82.39 ms, 510.44 tok/s. Full accuracy suite pending.",
   },
   {
     match: { hw: "dgx-spark", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
-    notes: "DGX Spark GB10, TP=1, auto-detected compressed-tensors int4. Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop and reasoning split. Full accuracy suite pending.",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 8 },
+        ttft_ms: 2885.34, tpot_ms: 44.18, tokens_per_sec_per_gpu: 191.87 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 32 },
+        ttft_ms: 173008.14, tpot_ms: 66.22, tokens_per_sec_per_gpu: 549.63 },
+    ],
+    notes: "DGX Spark GB10, TP=1, auto-detected compressed-tensors int4. Serving smoke verified on the 128GB unified-memory node with positive headroom: text and image requests complete with finish_reason=stop and reasoning split. Speed: bench_serving --flush-cache, temperature 0, TTFT/TPOT are P50; tok/s = total (input + output) token throughput on one GPU. Image workload (one 720p JPEG per request, 883 vision tokens, in/out=1024/1024): conc 1 (8 prompts): TTFT 1137.64 ms, TPOT 43.92 ms, 65.14 tok/s; conc 16 (32 prompts): TTFT 137419.53 ms, TPOT 60.71 ms, 214.28 tok/s. conc-16 TTFT is queue-dominated (two waves of 16; GB10 prefill runs at ~2.8k tok/s). Full accuracy suite pending.",
   },
 ];
