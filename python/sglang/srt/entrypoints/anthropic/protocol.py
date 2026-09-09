@@ -19,6 +19,8 @@ from pydantic import (
     model_validator,
 )
 
+from sglang.srt.entrypoints.openai.protocol import _migrate_deprecated_dp_rank
+
 
 class AnthropicError(BaseModel):
     """Error structure for Anthropic API."""
@@ -377,6 +379,16 @@ class AnthropicMessagesRequest(BaseModel):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+    # SGLang extension: the data-parallel rank to route to (--dp-size > 1),
+    # same fields and precedence as the OpenAI routes.
+    routed_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
+    data_parallel_rank: Optional[int] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @field_validator("model")
     @classmethod
