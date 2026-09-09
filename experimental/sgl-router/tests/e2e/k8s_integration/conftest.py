@@ -172,14 +172,20 @@ def _port_forward_start(
     service: str,
     local_port: int,
     remote_port: int,
+    resource: str = "svc",
 ) -> subprocess.Popen:
-    """Start kubectl port-forward and wait until the port is reachable."""
+    """Start kubectl port-forward and wait until the port is reachable.
+
+    `resource="pod"` binds one specific pod instead of the Service. A draining
+    pod is removed from the Service's ready endpoints, so a test that needs to
+    keep talking to it through the drain must address the pod directly.
+    """
     cmd = [
         "kubectl",
         "--context",
         KUBECTL_CONTEXT,
         "port-forward",
-        f"svc/{service}",
+        f"{resource}/{service}",
         f"{local_port}:{remote_port}",
         "-n",
         namespace,
@@ -213,6 +219,47 @@ def _cleanup_port_forward(name: str, pf: subprocess.Popen) -> None:
         logger.warning("Port-forward %s exited rc=%s%s", name, rc, suffix)
     else:
         logger.debug("Port-forward %s exited cleanly (rc=%s)", name, rc)
+
+
+def _pod_json(pod: str, namespace: str = NAMESPACE) -> dict:
+    """One pod's full object. The `or "{}"` mirrors
+    `_wait_for_replacement_pod_ready`: kubectl can hand back empty stdout, and a
+    JSONDecodeError there says nothing about what went wrong."""
+    result = _kubectl("get", "pod", pod, "-n", namespace, "-o", "json")
+    return json.loads(result.stdout or "{}")
+
+
+def _pod_names(selector: str, namespace: str = NAMESPACE) -> list[str]:
+    """Names of pods matching `selector`, excluding any already terminating."""
+    result = _kubectl("get", "pods", "-n", namespace, "-l", selector, "-o", "json")
+    pods = json.loads(result.stdout or "{}").get("items", [])
+    return [
+        p["metadata"]["name"]
+        for p in pods
+        if not p["metadata"].get("deletionTimestamp")
+    ]
+
+
+def _container_restart_count(
+    pod: str,
+    container: str,
+    namespace: str = NAMESPACE,
+) -> int:
+    """`restartCount` for one container — how a test observes that the process
+    exited and kubelet restarted it in place (no new pod, same name)."""
+    statuses = _pod_json(pod, namespace).get("status", {}).get("containerStatuses", [])
+    for status in statuses:
+        if status["name"] == container:
+            return int(status["restartCount"])
+    raise AssertionError(f"container {container!r} not found on pod {pod!r}")
+
+
+def _pod_ready_condition(pod: str, namespace: str = NAMESPACE) -> str:
+    """The pod's `Ready` condition as k8s currently sees it ("True"/"False")."""
+    for cond in _pod_json(pod, namespace).get("status", {}).get("conditions", []):
+        if cond["type"] == "Ready":
+            return cond["status"]
+    return "Unknown"
 
 
 def _poll_until(

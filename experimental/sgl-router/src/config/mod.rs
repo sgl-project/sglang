@@ -5,6 +5,29 @@ pub use types::*;
 
 use anyhow::{anyhow, Result};
 
+/// The k8s default `terminationGracePeriodSeconds`. A `shutdown_drain_secs` at
+/// or above this leaves no time for the in-flight drain, so the pod is
+/// SIGKILLed before it finishes, unless the operator has raised the grace
+/// period — the opposite of what the drain is for.
+const K8S_DEFAULT_GRACE_SECS: u64 = 30;
+
+/// Advisory (not a hard error: the router can't read the pod's actual
+/// `terminationGracePeriodSeconds`) for a `shutdown_drain_secs` that leaves no
+/// room under the grace period for the in-flight drain that follows the pause.
+/// The bound is `>=`, not `>`: a drain of exactly the grace period already
+/// consumes all of it. Returns `Some(message)` to warn, `None` if safe.
+pub fn shutdown_drain_advisory(shutdown_drain_secs: u64) -> Option<String> {
+    (shutdown_drain_secs >= K8S_DEFAULT_GRACE_SECS).then(|| {
+        format!(
+            "shutdown_drain_secs={shutdown_drain_secs} leaves no room under the k8s default \
+             terminationGracePeriodSeconds ({K8S_DEFAULT_GRACE_SECS}s); under k8s the pod \
+             will be SIGKILLed during the in-flight drain unless \
+             terminationGracePeriodSeconds is raised to at least the drain plus in-flight \
+             request time"
+        )
+    })
+}
+
 impl Config {
     /// Check invariants the type system and `clap` don't already enforce.
     /// Called by [`cli::Cli::into_config`] after assembling the `Config`
@@ -206,10 +229,7 @@ mod tests {
     /// the `cli` module tests; the k8s selector grammar in `types`.
     fn cfg(model_id: &str, urls: &[&str]) -> Config {
         Config {
-            server: ServerConfig {
-                host: "127.0.0.1".into(),
-                port: 30000,
-            },
+            server: ServerConfig::default(),
             observability: ObservabilityConfig::default(),
             model: ModelConfig {
                 id: model_id.into(),
@@ -478,5 +498,30 @@ mod tests {
             .expect_err("a misspelled capacity profile must fail startup")
             .to_string();
         assert!(error.contains("ttft_p95_at_capcity_ms"), "got: {error}");
+    }
+
+    #[test]
+    fn shutdown_drain_advisory_is_silent_below_the_k8s_default_grace() {
+        // The default drain (5 s) and anything strictly under the k8s default
+        // terminationGracePeriodSeconds (30 s) still leaves room for the
+        // in-flight drain, so it is safe without operator action.
+        assert!(shutdown_drain_advisory(default_shutdown_drain_secs()).is_none());
+        assert!(shutdown_drain_advisory(29).is_none());
+        assert!(shutdown_drain_advisory(0).is_none());
+    }
+
+    #[test]
+    fn shutdown_drain_advisory_warns_once_the_drain_consumes_the_whole_grace() {
+        // A drain of exactly the 30 s k8s default leaves zero seconds for the
+        // in-flight drain, so the pod is SIGKILLed mid-drain — the boundary
+        // itself must warn, not just values past it.
+        for drain in [K8S_DEFAULT_GRACE_SECS, 120] {
+            let msg =
+                shutdown_drain_advisory(drain).unwrap_or_else(|| panic!("{drain} s must warn"));
+            assert!(
+                msg.contains("terminationGracePeriodSeconds"),
+                "advisory must name the k8s knob to raise: {msg}"
+            );
+        }
     }
 }

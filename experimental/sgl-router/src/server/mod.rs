@@ -7,3 +7,4 @@ pub mod error;
 pub mod header_utils;
 pub mod metrics;
 pub mod routes;
+pub mod shutdown;

@@ -102,6 +102,21 @@ impl AppContext {
         self.ready.store(true, Ordering::Relaxed);
     }
 
+    /// Inverse of [`mark_ready`](Self::mark_ready): flip `/readyz` to 503.
+    /// Called at the start of the SIGTERM drain so probes and any probe-driven
+    /// load balancer see this pod as not-ready while the endpoint removal
+    /// (triggered by the pod's `deletionTimestamp`, not by this flip)
+    /// propagates. See [`crate::server::shutdown::drain_for_termination`] for
+    /// which mechanism the pause is sized for.
+    pub fn mark_not_ready(&self) {
+        self.ready.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether bootstrap finished — only ONE term of the `/readyz` predicate,
+    /// which also requires a non-empty worker registry (see
+    /// `server::routes::health::readyz`). Expected to be monotonic once
+    /// [`mark_not_ready`](Self::mark_not_ready) has run: nothing re-readies a
+    /// pod that has begun draining.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
@@ -113,6 +128,7 @@ impl AppContext {
                 server: crate::config::ServerConfig {
                     host: "x".into(),
                     port: 0,
+                    ..Default::default()
                 },
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
@@ -149,5 +165,25 @@ impl AppContext {
             engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mark_not_ready_flips_readiness_back_off() {
+        let ctx = AppContext::stub();
+        // stub starts not-ready; mark_ready is the readiness on-switch.
+        ctx.mark_ready();
+        assert!(ctx.is_ready(), "mark_ready must report ready");
+        // The SIGTERM drain path needs the inverse so /readyz can flip to 503
+        // before the server stops accepting.
+        ctx.mark_not_ready();
+        assert!(
+            !ctx.is_ready(),
+            "mark_not_ready must flip readiness back off",
+        );
     }
 }
