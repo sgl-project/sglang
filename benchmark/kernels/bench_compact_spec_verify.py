@@ -10,12 +10,12 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from sglang.srt.speculative.compact_verify.core import Verify
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     MultimemAllGatherer,
 )
 from sglang.srt.distributed.parallel_state import cleanup_dist_env_and_memory
+from sglang.srt.speculative.compact_verify.core import Verify
 from sglang.srt.speculative.compact_verify.engine import (
     ServingVerifier,
     runtime_supported,
