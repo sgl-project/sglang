@@ -456,6 +456,10 @@ def causal_conv1d_fn(
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
     _, width = weight.shape
+    if width < 2 or width > 4:
+        raise ValueError(
+            f"causal_conv1d only supports width between 2 and 4, got {width}"
+        )
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
@@ -642,6 +646,7 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    IS_CIRCULAR_BUFFER: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
@@ -691,6 +696,12 @@ def _causal_conv1d_update_kernel(
     else:
         conv_state_token_offset = 0
 
+    if IS_CIRCULAR_BUFFER:
+        cache_seqlen = tl.load(cache_seqlens_ptr + idx_seq).to(tl.int64)
+        cache_seqlen = cache_seqlen % state_len
+    else:
+        cache_seqlen = 0
+
     # STEP 1: READ init_state data
     conv_states_base = (
         conv_state_ptr
@@ -699,69 +710,113 @@ def _causal_conv1d_update_kernel(
     )
     mask_w = idx_feats < dim
 
-    prior_tokens = conv_states_base + conv_state_token_offset * stride_conv_state_tok
-    if KERNEL_WIDTH >= 2:
-        conv_states_ptrs = prior_tokens  # [BLOCK_N]
-        col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
-    if KERNEL_WIDTH >= 3:
-        conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
-        col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
-    if KERNEL_WIDTH >= 4:
-        conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
-        col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
-    if KERNEL_WIDTH == 5:
-        conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
-        col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
+    if IS_SPEC_DECODING:
+        # Speculative decoding uses an offset into the extended state window.
+        prior_tokens = (
+            conv_states_base + conv_state_token_offset * stride_conv_state_tok
+        )
+    elif not IS_CIRCULAR_BUFFER:
+        # A cache can be longer than the convolution window. Its logical
+        # history is tail-aligned, so the first tap comes from the last
+        # ``KERNEL_WIDTH - 1`` entries rather than cache entry zero.
+        prior_tokens = conv_states_base + (
+            state_len - (KERNEL_WIDTH - 1)
+        ) * stride_conv_state_tok
+    if IS_CIRCULAR_BUFFER:
+        # Normalize every tap independently; the base offset can wrap when the
+        # ring cursor is near zero (especially when state_len == width - 1).
+        prior_offset = cache_seqlen - (KERNEL_WIDTH - 1) + state_len
+        prior_offset = tl.where(
+            prior_offset >= state_len, prior_offset - state_len, prior_offset
+        )
+        if KERNEL_WIDTH >= 2:
+            col0 = tl.load(
+                conv_states_base + prior_offset * stride_conv_state_tok,
+                mask_w,
+                0.0,
+            )
+        if KERNEL_WIDTH >= 3:
+            tap1 = tl.where(
+                prior_offset + 1 >= state_len,
+                prior_offset + 1 - state_len,
+                prior_offset + 1,
+            )
+            col1 = tl.load(
+                conv_states_base + tap1 * stride_conv_state_tok,
+                mask_w,
+                0.0,
+            )
+        if KERNEL_WIDTH >= 4:
+            tap2 = tl.where(
+                prior_offset + 2 >= state_len,
+                prior_offset + 2 - state_len,
+                prior_offset + 2,
+            )
+            col2 = tl.load(
+                conv_states_base + tap2 * stride_conv_state_tok,
+                mask_w,
+                0.0,
+            )
+    else:
+        if KERNEL_WIDTH >= 2:
+            conv_states_ptrs = prior_tokens  # [BLOCK_N]
+            col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        if KERNEL_WIDTH >= 3:
+            conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
+            col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        if KERNEL_WIDTH >= 4:
+            conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
+            col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
-    # STEP 2: assume state_len > seqlen
+    # STEP 2: update the linear tail-aligned state. Circular buffers are
+    # written token-by-token below instead of being shifted here.
     idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
-    # The conv_state updates works in a sliding window manner,
-    # at each forward pass, the tokens are shift by 1, so we
-    # load since idx_tokens + 1.
-    conv_state_ptrs_source = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
-            :, None
-        ]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (
-        (conv_state_batch_coord < num_cache_lines)
-        & ((idx_tokens + seqlen) < state_len)[:, None]
-        & (idx_feats < dim)[None, :]
-    )
-    conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
-
-    VAL = state_len - seqlen
     x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
+    if not IS_CIRCULAR_BUFFER:
+        # The conv_state update works in a sliding-window manner: load the
+        # retained suffix, then append the current input at the tail.
+        conv_state_ptrs_source = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + conv_state_token_offset * stride_conv_state_tok
+            + (idx_feats * stride_conv_state_dim)[None, :]
+            + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
+                :, None
+            ]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (
+            (conv_state_batch_coord < num_cache_lines)
+            & ((idx_tokens + seqlen) < state_len)[:, None]
+            & (idx_feats < dim)[None, :]
+        )
+        conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
-    x_ptrs = (
-        x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
+        VAL = state_len - seqlen
+        x_ptrs = (
+            x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
 
-    mask_x = (
-        (idx_tokens - VAL >= 0)[:, None]
-        & (idx_tokens - VAL < seqlen)[:, None]
-        & (idx_feats < dim)[None, :]
-    )  # token-index  # token-index  # feature-index
-    loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-    tl.debug_barrier()
+        mask_x = (
+            (idx_tokens - VAL >= 0)[:, None]
+            & (idx_tokens - VAL < seqlen)[:, None]
+            & (idx_feats < dim)[None, :]
+        )  # token-index  # token-index  # feature-index
+        loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+        tl.debug_barrier()
 
-    new_conv_state = tl.where(mask, conv_state, loaded_x)
+        new_conv_state = tl.where(mask, conv_state, loaded_x)
 
-    conv_state_base = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + (idx_feats * stride_conv_state_dim)
-    )  # [BLOCK_N,]
-    conv_state_ptrs_target = (
-        conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+        conv_state_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )  # [BLOCK_N,]
+        conv_state_ptrs_target = (
+            conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
     if HAS_BIAS:
@@ -986,6 +1041,20 @@ def _causal_conv1d_update_kernel(
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 
+        if IS_CIRCULAR_BUFFER:
+            # `matrix_x` is the current input token in the dense path. Reload
+            # explicitly for tree-shaped verification, where the convolution
+            # walks parent links and leaves `matrix_x` on a parent token.
+            current_x = tl.load(
+                x_base_1d + idx_token * stride_x_token, mask=mask_x_1d
+            )
+            update_idx = (cache_seqlen + idx_token) % state_len
+            tl.store(
+                conv_states_base + update_idx * stride_conv_state_tok,
+                current_x,
+                mask=mask_w,
+            )
+
         # fuse: store calculated retrieve_parent_token to tensor
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             tl.store(
@@ -1040,7 +1109,6 @@ def causal_conv1d_update(
     out: (batch, dim) or (batch, dim, seqlen)
     """
     if validate_data:
-        assert cache_seqlens is None  # not implemented yet - ok for vLLM
         assert pad_slot_id is not None
         assert x.stride(1) == 1
     if isinstance(activation, bool):
@@ -1053,6 +1121,14 @@ def causal_conv1d_update(
         x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
     _, width = weight.shape
+    if validate_data and cache_seqlens is not None:
+        assert cache_seqlens.dim() == 1
+        assert cache_seqlens.shape == (batch,)
+        assert cache_seqlens.dtype == torch.int32
+    if width < 2 or width > 4:
+        raise ValueError(
+            f"causal_conv1d only supports width between 2 and 4, got {width}"
+        )
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
 
@@ -1073,7 +1149,6 @@ def causal_conv1d_update(
 
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
-        assert cache_seqlens is None  # not needed for vLLM - circular buffer
 
     # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
     out = torch.empty_like(x)
@@ -1092,9 +1167,11 @@ def causal_conv1d_update(
         else 0
     )
     if num_accept_tokens is not None:
+        # Speculative decoding addresses the accepted-token window inside the
+        # extended state.  In the regular decode path, retain the actual cache
+        # length so tail-aligned histories longer than ``width - 1`` are not
+        # truncated in the kernel launch metadata.
         state_len = width - 1 + (seqlen - 1)  # effective state_len needed
-    else:
-        state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
     np2_seqlen = triton.next_power_of_2(seqlen)
 
@@ -1203,6 +1280,7 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        IS_CIRCULAR_BUFFER=cache_seqlens is not None,
         **pdl_kwargs,
     )
     if unsqueeze:

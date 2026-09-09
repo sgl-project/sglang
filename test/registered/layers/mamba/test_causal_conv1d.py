@@ -434,6 +434,61 @@ def test_causal_conv1d_varlen_mixed_input_and_state_dtype():
     torch.testing.assert_close(conv_states, conv_states_ref, rtol=1e-2, atol=5e-2)
 
 
+def test_causal_conv1d_update_uses_tail_of_oversized_state():
+    """An oversized state cache must use its trailing convolution window."""
+    device = get_device()
+    torch.manual_seed(0)
+    batch, dim, seqlen, width, state_len = 2, 7, 3, 2, 8
+    x = torch.randn(batch, dim, seqlen, device=device)
+    conv_state = torch.randn(batch, dim, state_len, device=device)
+    weight = torch.randn(dim, width, device=device)
+    bias = torch.randn(dim, device=device)
+
+    conv_state_ref = conv_state.clone()
+    out = causal_conv1d_update(
+        x.clone(), conv_state, weight, bias, activation="silu"
+    )
+    out_ref = causal_conv1d_update_ref(
+        x.clone(), conv_state_ref, weight, bias, activation="silu"
+    )
+
+    torch.testing.assert_close(out, out_ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(conv_state, conv_state_ref, rtol=0, atol=0)
+
+
+def test_causal_conv1d_update_supports_circular_state():
+    """Circular state reads and writes must follow cache_seqlens."""
+    device = get_device()
+    torch.manual_seed(1)
+    batch, dim, seqlen, width, state_len = 2, 7, 2, 3, 4
+    x = torch.randn(batch, dim, seqlen, device=device)
+    conv_state = torch.randn(batch, dim, state_len, device=device)
+    cache_seqlens = torch.tensor([0, 3], dtype=torch.int32, device=device)
+    weight = torch.randn(dim, width, device=device)
+    bias = torch.randn(dim, device=device)
+
+    conv_state_ref = conv_state.clone()
+    out = causal_conv1d_update(
+        x.clone(),
+        conv_state,
+        weight,
+        bias,
+        activation="silu",
+        cache_seqlens=cache_seqlens,
+    )
+    out_ref = causal_conv1d_update_ref(
+        x.clone(),
+        conv_state_ref,
+        weight,
+        bias,
+        activation="silu",
+        cache_seqlens=cache_seqlens,
+    )
+
+    torch.testing.assert_close(out, out_ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(conv_state, conv_state_ref, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     import sys
 
