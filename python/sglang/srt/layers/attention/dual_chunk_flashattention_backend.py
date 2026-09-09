@@ -112,10 +112,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         self.device = model_runner.device
         self.max_context_len = model_runner.model_config.context_len
         self.num_heads = model_runner.model_config.get_num_attention_heads(
-            model_runner.server_args.tp_size
+            get_parallel().tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.server_args.tp_size
+            get_parallel().tp_size
         )
         self.head_size = model_runner.model_config.head_dim
 

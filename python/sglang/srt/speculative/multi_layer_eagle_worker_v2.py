@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
 )
+from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_backend_context,
@@ -159,12 +160,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # Load draft model weights only.
-        with empty_context(), speculative_moe_backend_context(), draft_model_build_scope():
+        with (
+            empty_context(),
+            speculative_moe_backend_context(),
+            draft_model_build_scope(),
+        ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 is_multi_layer_eagle=True,
@@ -185,9 +190,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             "InklingForConditionalGenerationMTP",
         ]
         self.draft_tp_context = (
-            draft_tp_context
-            if get_parallel().config.enable_dp_attention
-            else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
@@ -366,6 +369,17 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner_list[i].model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
+        from sglang.srt.speculative.eagle_worker_v2 import (
+            _qsa_index_share_requested,
+        )
+
+        hf_config = self.draft_runner_list[0].model_config.hf_config
+        if _qsa_index_share_requested(hf_config):
+            logger.warning(
+                "index_share_for_mtp_iteration is not supported with "
+                "multi-layer EAGLE; the draft indexer runs every step"
+            )
+        qsa_profile = parse_qsa_profile(hf_config)
         # Create attn backends
         self.draft_extend_attn_backend_list = []
         for step in range(self.speculative_num_steps):
@@ -373,14 +387,15 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner_list[step],
                 self.topk,
                 self.speculative_num_steps,
+                qsa_profile=qsa_profile,
             )
             self.draft_extend_attn_backend_list.append(
                 draft_backend_factory.create_draft_extend_backend()
             )
             if self.draft_extend_attn_backend_list[-1] is not None:
-                self.draft_runner_list[step].attn_backend = (
-                    self.draft_extend_attn_backend_list[-1]
-                )
+                self.draft_runner_list[
+                    step
+                ].attn_backend = self.draft_extend_attn_backend_list[-1]
 
     def _capture_cuda_graphs(self):
         self.cuda_graph_runner = None
@@ -846,7 +861,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     self.cuda_graph_runner_for_draft_extend.prune_draft_extend_logits
                 )
             else:
-                prune_logits = not require_gathered_buffer(self.server_args)
+                prune_logits = not require_gathered_buffer()
             if prune_logits:
                 forward_batch.spec_info.select_index = select_index
             # Left unmarked on every platform: each de-tied runner has its own
@@ -964,8 +979,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
     @property
     def last_shared_read_runner(self):
-        # Multi-layer eagle has no draft forward, only draft extend.
-        return self._draft_worker.draft_runner
+        return self._draft_worker.draft_runner_list[-1]
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
