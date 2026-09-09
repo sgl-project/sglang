@@ -1249,7 +1249,7 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
 # take in FP8 deployments. The `flashmla_kv` decode kernel and *both*
 # flashmla prefill kernels are the production-relevant FP8 paths.
 DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_sparse", "flashmla_kv", "flashmla_auto"}
+    {"aiter", "flashmla_sparse", "flashmla_kv", "flashmla_auto"}
 )
 DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
     {"flashmla_kv", "flashmla_auto"}
@@ -1396,8 +1396,8 @@ def run_dsa_sparse_fp8_prefill_case(
     if dsa_prefill_backend not in DSA_FP8_COMPATIBLE_PREFILL_IMPLS:
         testcase.skipTest(
             f"DSA prefill impl `{dsa_prefill_backend}` does not support FP8 KV "
-            f"cache (only `flashmla_sparse`, `flashmla_kv`, and `flashmla_auto` "
-            f"read FP8 K directly; others require BF16 K)."
+            f"cache (only `aiter`, `flashmla_sparse`, `flashmla_kv`, and "
+            f"`flashmla_auto` read FP8 K directly; others require BF16 K)."
         )
     if not case.forward_mode.is_extend_without_speculative():
         raise ValueError("run_dsa_sparse_fp8_prefill_case expects an EXTEND case.")
