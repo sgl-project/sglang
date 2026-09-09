@@ -33,16 +33,11 @@ for module in server grpc multimodal; do
     built+=("${found[@]}")
 done
 
-# RustBin writes executables to build/scripts-*. Keep one beside the modules so
-# the cache and artifact use the same layout.
+# CI builds the standalone renderer with Cargo and stages it beside the modules.
 renderer=python/sglang/srt/rust_extensions/sglang-renderer
 if [ ! -f "${renderer}" ]; then
-    renderers=(python/build/scripts-*/sglang-renderer)
-    if [ ${#renderers[@]} -eq 0 ]; then
-        echo "::error::no sglang-renderer executable found"
-        exit 1
-    fi
-    cp "${renderers[0]}" "${renderer}"
+    echo "::error::no sglang-renderer executable found"
+    exit 1
 fi
 if [ ! -x "${renderer}" ]; then
     echo "::error::sglang-renderer is not executable: ${renderer}"

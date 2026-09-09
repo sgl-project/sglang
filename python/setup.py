@@ -12,9 +12,6 @@ Cargo.toml declares
 is built as a PyO3 extension module at that import path. Adding a new extension
 crate therefore needs no pyproject changes — declare the metadata in the crate.
 
-Crates may instead declare ``python-bin`` to install a Cargo executable in the
-wheel. The optional ``debug`` and ``features`` metadata has the same meaning.
-
 Two filters can narrow the discovered set:
 
 - [tool.sglang] rust-extensions in the active pyproject.toml: a list of
@@ -39,7 +36,7 @@ from pathlib import Path
 from setuptools import setup
 
 try:
-    from setuptools_rust import Binding, RustBin, RustExtension, build_rust
+    from setuptools_rust import Binding, RustExtension, build_rust
 except ModuleNotFoundError as exc:
     if exc.name != "setuptools_rust":
         raise
@@ -132,23 +129,12 @@ def _match_by_substring(declared, tokens, source):
 
 
 def _discovered_rust_extensions():
-    """Rust extensions and executables declared by workspace crates."""
+    """One RustExtension per workspace crate declaring a python-module."""
     extensions = []
     for package in sorted(
         _cargo_workspace_metadata()["packages"], key=lambda p: p["name"]
     ):
         sglang_meta = (package["metadata"] or {}).get("sglang", {})
-        if "python-bin" in sglang_meta:
-            binary = RustBin(
-                target=sglang_meta["python-bin"],
-                path=package["manifest_path"],
-                debug=sglang_meta.get("debug"),
-                features=sglang_meta.get("features"),
-                cargo_manifest_args=["--locked"],
-            )
-            binary._sglang_metadata = sglang_meta
-            binary._sglang_manifest_path = package["manifest_path"]
-            extensions.append(binary)
         if "python-module" not in sglang_meta:
             continue
         extension = RustExtension(
@@ -170,7 +156,7 @@ def _discovered_rust_extensions():
     if not extensions:
         raise RuntimeError(
             f"no crate under {_RUST_WORKSPACE_DIR} declares "
-            "[package.metadata.sglang] python-module or python-bin; set "
+            "[package.metadata.sglang] python-module; set "
             f"{_BUILD_RUST_EXTS_ENV}=none to build without Rust extensions"
         )
     return extensions

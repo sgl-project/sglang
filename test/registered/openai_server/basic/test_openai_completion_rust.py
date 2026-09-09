@@ -1,7 +1,16 @@
 import math
+import sys
 import unittest
+from contextlib import ExitStack
+from pathlib import Path
 
 import requests
+
+_TEST_ROOT = Path(__file__).resolve().parents[3]
+if str(_TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TEST_ROOT))
+
+from registered.openai_server.rust_renderer import launch_rust_renderer
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -27,23 +36,32 @@ class TestOpenAICompletionRustParity(CustomTestCase):
 
     def _get_logprobs(self, *, rust_frontend):
         # compare identical prefill shapes, without graph padding or warmup cache hits
-        process = popen_launch_server(
-            self.model,
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=self.api_key,
-            env={
-                "SGLANG_RUST_SERVER": "1" if rust_frontend else "0",
-                "SGLANG_RUST_RENDERER": "1" if rust_frontend else "0",
-            },
-            other_args=[
-                "--random-seed",
-                "42",
-                "--disable-prefill-cuda-graph",
-                "--disable-radix-cache",
-            ],
-        )
-        try:
+        engine_args = [
+            "--random-seed",
+            "42",
+            "--disable-prefill-cuda-graph",
+            "--disable-radix-cache",
+        ]
+        with ExitStack() as stack:
+            if rust_frontend:
+                stack.enter_context(
+                    launch_rust_renderer(
+                        self.model,
+                        DEFAULT_URL_FOR_TEST,
+                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                        engine_args=engine_args,
+                    )
+                )
+            else:
+                process = popen_launch_server(
+                    self.model,
+                    DEFAULT_URL_FOR_TEST,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    api_key=self.api_key,
+                    env={"SGLANG_RUST_SERVER": "0"},
+                    other_args=engine_args,
+                )
+                stack.callback(kill_process_tree, process.pid)
             response = requests.post(
                 DEFAULT_URL_FOR_TEST + "/v1/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
@@ -58,8 +76,6 @@ class TestOpenAICompletionRustParity(CustomTestCase):
             )
             response.raise_for_status()
             return response.json()["choices"][0]["logprobs"]
-        finally:
-            kill_process_tree(process.pid)
 
     @staticmethod
     def _kl_divergence(reference, candidate):

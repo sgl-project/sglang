@@ -1,7 +1,16 @@
 import json
+import sys
 import unittest
+from contextlib import ExitStack
+from pathlib import Path
 
 import openai
+
+_TEST_ROOT = Path(__file__).resolve().parents[3]
+if str(_TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TEST_ROOT))
+
+from registered.openai_server.rust_renderer import launch_rust_renderer
 
 from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -946,16 +955,23 @@ class TestOpenAIFunctionCallingWithRust(TestOpenAIServerFunctionCalling):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=["--tool-call-parser", "llama3"],
-            env={"SGLANG_RUST_SERVER": "1", "SGLANG_RUST_RENDERER": "1"},
+        stack = ExitStack()
+        cls.addClassCleanup(stack.close)
+        stack.enter_context(
+            launch_rust_renderer(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                renderer_args=["--tool-call-parser", "llama3"],
+            )
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        # Class cleanup owns both processes, including failed setUpClass calls.
+        pass
 
 
 @unittest.skipUnless(
@@ -971,16 +987,23 @@ class TestOpenAIPythonicFunctionCallingWithRust(TestOpenAIPythonicFunctionCallin
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=["--tool-call-parser", "pythonic"],
-            env={"SGLANG_RUST_SERVER": "1", "SGLANG_RUST_RENDERER": "1"},
+        stack = ExitStack()
+        cls.addClassCleanup(stack.close)
+        stack.enter_context(
+            launch_rust_renderer(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                renderer_args=["--tool-call-parser", "pythonic"],
+            )
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        # Class cleanup owns both processes, including failed setUpClass calls.
+        pass
 
 
 # Skip for ci test

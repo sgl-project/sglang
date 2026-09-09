@@ -5,11 +5,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[package.metadata.sglang]
-python-bin = "sglang-renderer"
-features = ["http"]
-debug = false
-
 [features]
 default = []
 http = [

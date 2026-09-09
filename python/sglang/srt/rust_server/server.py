@@ -18,12 +18,9 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
-from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
-    compute_num_reserved_tokens,
     msgpack_decode_explained,
 )
 from sglang.srt.runtime_context import get_mm, get_serving
@@ -42,7 +39,6 @@ from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
-    from sglang.srt.managers.rust_renderer import RustRendererSidecar
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
 
@@ -61,13 +57,11 @@ class RustServer:
         server: Server,
         http_port: int,
         mm_spec: Optional[RustMmSpec] = None,
-        renderer_sidecar: Optional[RustRendererSidecar] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
         self.http_port = http_port
         self.mm_spec = mm_spec
-        self.renderer_sidecar = renderer_sidecar
         self._max_per_poll = max_per_poll
 
     @classmethod
@@ -89,31 +83,7 @@ class RustServer:
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         listen_port = get_serving().port + (dp_rank or 0)
-        public_addr = NetworkAddress(get_serving().host, listen_port)
-        renderer_sidecar = None
-        if envs.SGLANG_RUST_RENDERER.get():
-            from sglang.srt.managers.rust_renderer import RustRendererSidecar
-
-            renderer_sidecar = RustRendererSidecar(
-                resolving_view(server_args),
-                scheduler.model_config,
-                public_addr,
-                compute_num_reserved_tokens(),
-            )
-
-        if renderer_sidecar is None:
-            rust_server_args = _build_server_args(scheduler)
-            port_offset = dp_rank
-            listen_addr = public_addr.to_host_port_str()
-        else:
-            internal_addr = renderer_sidecar.internal_server_addr
-            rust_server_args = _build_server_args(
-                scheduler,
-                host=internal_addr.host,
-                port=internal_addr.port,
-            )
-            port_offset = None
-            listen_addr = internal_addr.to_host_port_str()
+        listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
         launch_cores, server_cores = _partition_cores(
             mm_workers=(
@@ -124,10 +94,10 @@ class RustServer:
         )
 
         server = Server(
-            rust_server_args,
+            _build_server_args(scheduler),
             # None -> run unpinned; the list carries the pinning decision.
             cores=server_cores,
-            port_offset=port_offset,
+            port_offset=dp_rank,
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python
@@ -164,13 +134,6 @@ class RustServer:
                 )
             server.start_mm_workers(cls._build_mm_spec(mm_spec), mm_host.mm_workers)
 
-        if renderer_sidecar is not None:
-            try:
-                renderer_sidecar.start(server_cores)
-            except BaseException:
-                server.shutdown()
-                raise
-
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
             try:
@@ -190,12 +153,7 @@ class RustServer:
             dp_note,
         )
 
-        return cls(
-            server,
-            http_port=listen_port,
-            mm_spec=mm_spec,
-            renderer_sidecar=renderer_sidecar,
-        )
+        return cls(server, http_port=listen_port, mm_spec=mm_spec)
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -258,14 +216,6 @@ class RustServer:
                     obj.mm_inputs = RustMmProcessor.wrap_encoded(self.mm_spec, encoded)
             out.append(obj)
         return out
-
-    def close(self) -> None:
-        """Stop the public renderer, then the internal Rust server."""
-        try:
-            if self.renderer_sidecar is not None:
-                self.renderer_sidecar.stop()
-        finally:
-            self.server.shutdown()
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting

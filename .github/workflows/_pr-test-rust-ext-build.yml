@@ -228,6 +228,13 @@ jobs:
           cargo clean --release --manifest-path rust/sglang-radix-tree/Cargo.toml \
               -p torch-sys -p sglang-radix-tree 2>/dev/null || true
           (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
+          # The standalone executable is independent of the Python ABI.
+          if [ "${{ matrix.python-version }}" = "3.12" ]; then
+              cargo build --manifest-path rust/Cargo.toml -p sglang-renderer \
+                  --release --features http --locked
+              renderer_release="${CARGO_TARGET_DIR}${CARGO_BUILD_TARGET:+/${CARGO_BUILD_TARGET}}/release"
+              cp "${renderer_release}/sglang-renderer" python/sglang/srt/rust_extensions/
+          fi
           python - <<'PY'
           import importlib.util
           import os
@@ -298,7 +305,7 @@ jobs:
           )
           PY
 
-      # Both globs sit under python/sglang/srt/, which upload-artifact strips as the
+      # All artifacts sit under python/sglang/srt/, which upload-artifact strips as the
       # common prefix, so the collect job restores them by unpacking back into it.
       - name: Upload this interpreter's modules
         uses: actions/upload-artifact@v4
@@ -306,6 +313,7 @@ jobs:
           name: ${{ inputs.artifact_name }}-build-py${{ matrix.python-version }}
           path: |
             python/sglang/srt/rust_extensions/_*.so
+            python/sglang/srt/rust_extensions/sglang-renderer
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
           if-no-files-found: error
           retention-days: 1
@@ -349,7 +357,9 @@ jobs:
       - name: Verify modules and stage for upload
         env:
           MAX_GLIBC: ${{ inputs.max_glibc }}
-        run: bash scripts/ci/utils/stage_rust_ext_modules.sh
+        run: |
+          chmod +x python/sglang/srt/rust_extensions/sglang-renderer
+          bash scripts/ci/utils/stage_rust_ext_modules.sh
 
       # Without it the entry saved below lands under a version no reader with zstd
       # can find. This runner's image ships without it.

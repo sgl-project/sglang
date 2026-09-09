@@ -8,12 +8,21 @@ python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test
 import json
 import random
 import re
+import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from pathlib import Path
 from typing import Optional
 
 import openai
 import requests
+
+_TEST_ROOT = Path(__file__).resolve().parents[3]
+if str(_TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TEST_ROOT))
+
+from registered.openai_server.rust_renderer import launch_rust_renderer
 
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
@@ -558,19 +567,15 @@ class TestOpenAICompletionWithRust(CustomTestCase):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            env={"SGLANG_RUST_SERVER": "1", "SGLANG_RUST_RENDERER": "1"},
+        stack = ExitStack()
+        cls.addClassCleanup(stack.close)
+        stack.enter_context(
+            launch_rust_renderer(
+                cls.model, cls.base_url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            )
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
 
     # Reuse the reference test methods directly so Python and Rust coverage
     # cannot drift into separate matrices.

@@ -64,7 +64,7 @@ runs:
       id: decide
       shell: bash
       run: |
-        set -uo pipefail
+        set -euo pipefail
         if [ "${{ steps.artifact.outcome }}" = "success" ] \
            || [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
             renderer="${GITHUB_WORKSPACE}/python/sglang/srt/rust_extensions/sglang-renderer"
