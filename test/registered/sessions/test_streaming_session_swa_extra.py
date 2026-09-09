@@ -15,6 +15,7 @@ from sglang.test.server_fixtures.streaming_session_fixture import (
 
 register_cuda_ci(est_time=145, stage="extra-a", runner_config="1-gpu-large")
 register_cpu_ci(est_time=449, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=529, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestStreamingSessionSWARetractMixedChunk(

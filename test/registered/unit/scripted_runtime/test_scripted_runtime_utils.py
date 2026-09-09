@@ -10,6 +10,7 @@ from sglang.test.scripted_runtime.utils import ensure_script_importable, resolve
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestResolveFn(CustomTestCase):

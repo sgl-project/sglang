@@ -13,6 +13,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=16, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=39, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestPatchTokenizerEndToEndTest(unittest.TestCase):

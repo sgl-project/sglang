@@ -13,9 +13,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 
 register_amd_ci(est_time=10, suite="stage-a-test-1-gpu-small-amd")
+register_cpu_ci(est_time=8, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _make_proj(weight_dtype, weight_scale_shape=None):

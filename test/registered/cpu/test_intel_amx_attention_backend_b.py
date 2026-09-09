@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=47, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=241, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestIntelAMXAttnBackendQuant(CustomTestCase):

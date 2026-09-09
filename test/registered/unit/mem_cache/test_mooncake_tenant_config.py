@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _fake_mooncake_modules(fake_store_cls):

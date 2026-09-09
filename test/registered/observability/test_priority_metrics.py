@@ -25,6 +25,7 @@ register_cuda_ci(
     runner_config="1-gpu-small",
 )
 register_cpu_ci(est_time=49, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=181, suite="nightly-intel-cpu-gnr", nightly=True)
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 

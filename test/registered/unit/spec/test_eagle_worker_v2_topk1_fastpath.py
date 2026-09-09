@@ -25,6 +25,7 @@ register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

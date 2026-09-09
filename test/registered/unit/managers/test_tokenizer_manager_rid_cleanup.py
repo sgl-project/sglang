@@ -39,6 +39,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet

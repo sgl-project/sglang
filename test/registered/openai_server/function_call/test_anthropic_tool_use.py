@@ -30,6 +30,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=50, stage="base-b", runner_config="1-gpu-large")
 register_cpu_ci(est_time=54, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=196, suite="nightly-intel-cpu-gnr", nightly=True)
 
 # System message to guide Llama3.2 to produce proper tool call format
 SYSTEM_MESSAGE = (

@@ -37,6 +37,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=92, stage="base-b", runner_config="1-gpu-large")
 register_cpu_ci(est_time=123, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=494, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _data_uri():

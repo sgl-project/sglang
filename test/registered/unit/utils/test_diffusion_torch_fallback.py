@@ -17,6 +17,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu-intel")
 register_cpu_ci(est_time=1, suite="base-b-test-cpu-arm64")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
+register_cpu_ci(est_time=7, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestDiffusionTorchFallback(unittest.TestCase):

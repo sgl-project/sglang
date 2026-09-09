@@ -20,6 +20,7 @@ from sglang.srt.lora.trtllm_lora_temp import environ as trtllm_lora_environ
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="nightly-intel-cpu-gnr", nightly=True)
 
 _SGLANG_ROOT = Path(sglang.__file__).resolve().parent
 

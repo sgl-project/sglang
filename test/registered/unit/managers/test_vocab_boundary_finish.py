@@ -10,6 +10,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR, Req
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 VOCAB_SIZE = 1000
 

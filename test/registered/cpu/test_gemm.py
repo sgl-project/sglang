@@ -19,6 +19,7 @@ from sglang.test.cpu_test_utils import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=10, suite="nightly-intel-cpu-gnr", nightly=True)
 
 torch.manual_seed(1234)
 

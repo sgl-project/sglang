@@ -12,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=34, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=32, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=143, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestExternalModels(CustomTestCase):

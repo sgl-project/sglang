@@ -15,6 +15,7 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _runner_input():

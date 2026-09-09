@@ -26,6 +26,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=357, stage="weekly", runner_config="cpu")
+register_cpu_ci(est_time=347, suite="nightly-intel-cpu-gnr", nightly=True)
 
 # ==================== Non-E2E Tests ====================
 

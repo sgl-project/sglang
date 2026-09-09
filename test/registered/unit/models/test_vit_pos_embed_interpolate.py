@@ -25,6 +25,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_amd_ci(est_time=20, stage="stage-a", runner_config="1-gpu-small-amd")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 NUM_POS = 2304  # Qwen3-VL num_position_embeddings -> 48x48 grid
 HIDDEN = 64  # small hidden dim keeps the unit test fast

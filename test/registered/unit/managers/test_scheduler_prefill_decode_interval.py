@@ -11,6 +11,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _make_scheduler(*, interval: int, require_mlp_sync: bool) -> Scheduler:

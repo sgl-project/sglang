@@ -12,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
+register_cpu_ci(est_time=7, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestAdaptiveStepSlot(CustomTestCase):

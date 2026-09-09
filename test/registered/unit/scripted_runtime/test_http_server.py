@@ -17,6 +17,7 @@ from sglang.test.scripted_runtime.io_struct import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def _sample_script(ctx, *args):

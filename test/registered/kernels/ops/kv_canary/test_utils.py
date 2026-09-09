@@ -9,6 +9,7 @@ from sglang.kernels.jit.benchmark.kv_canary.utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, stage="base-a", runner_config="cpu")
+register_cpu_ci(est_time=7, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def test_fast_matrix_cases_include_e2e_decode_and_chunked_prefill_scenarios() -> None:

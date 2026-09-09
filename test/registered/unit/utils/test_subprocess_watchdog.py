@@ -26,6 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=10, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 def healthy_worker():

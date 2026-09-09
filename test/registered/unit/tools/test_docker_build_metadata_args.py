@@ -20,6 +20,7 @@ def _load_module(name, path):
 
 register_cpu_ci = _load_module("ci_register", CI_REGISTER_PATH).register_cpu_ci
 register_cpu_ci(est_time=0, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestDockerBuildMetadataArgs(unittest.TestCase):

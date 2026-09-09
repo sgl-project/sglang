@@ -21,6 +21,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=148, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=405, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=603, suite="nightly-intel-cpu-gnr", nightly=True)
 
 
 class TestRadixCacheFCFS(CustomTestCase):
