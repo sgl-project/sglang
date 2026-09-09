@@ -21,6 +21,8 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -45,6 +47,12 @@ def _vec2d(val: float = 1.0) -> torch.Tensor:
 
 
 class TestPositionalEmbeds(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_from_list_of_1d_tensors(self):
         pe = PositionalEmbeds(embeds=[_vec(1), _vec(2)], positions=[0, 5])
         self.assertEqual(pe.embeds.shape, (2, HIDDEN_DIM))
@@ -75,6 +83,12 @@ class TestPositionalEmbeds(CustomTestCase):
 
 
 class TestConvertEmbedsToTensors(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_none_returns_none(self):
         self.assertIsNone(convert_embeds_to_tensors(None))
 
@@ -110,6 +124,12 @@ class TestConvertEmbedsToTensors(CustomTestCase):
 
 
 class TestResolveEmbedOverrides(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_basic_resolution(self):
         embeds = [_vec(1), _vec(2)]
         pe = TokenizerManager._resolve_embed_overrides(
@@ -144,6 +164,12 @@ class TestResolveEmbedOverrides(CustomTestCase):
 
 
 class TestGenerateReqInputEmbedOverride(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_single_override_in_getitem(self):
         """Single PositionalEmbeds is shared across all items in __getitem__."""
         pe = PositionalEmbeds(embeds=[_vec()], positions=[0])
@@ -176,6 +202,12 @@ class TestGenerateReqInputEmbedOverride(CustomTestCase):
 
 
 class TestEmbeddingReqInputEmbedOverride(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_override_fields_in_getitem(self):
         """embed_override_token_id, embed_overrides, and positional_embed_overrides
         are correctly sliced in __getitem__."""
@@ -220,6 +252,9 @@ class _FakeMixin(TokenizerManagerScoreMixin):
 
 class TestResolveOverridesForSequence(CustomTestCase):
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.mixin = _FakeMixin()
 
     def test_none_embeds_returns_empty(self):
@@ -276,6 +311,9 @@ class TestResolveOverridesForSequence(CustomTestCase):
 
 class TestResolveEmbedOverridesForRequest(CustomTestCase):
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.mixin = _FakeMixin()
 
     def test_no_overrides_returns_none(self):
@@ -339,6 +377,9 @@ DELIM_TOKEN = MIS_DELIMITER_TOKEN_ID
 
 class TestBuildTokenIdInputs(CustomTestCase):
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.mixin = _FakeMixin(enable_mis=True)
 
     # --- single-item mode, no embeds ---
@@ -505,6 +546,9 @@ class TestScoreRequestValidation(CustomTestCase):
     """Test validation guards in score_request without running full pipeline."""
 
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.mixin = _FakeMixin()
 
     def _call(self, **kwargs):

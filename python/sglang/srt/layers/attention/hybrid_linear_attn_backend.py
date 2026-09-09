@@ -11,6 +11,7 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
+    fused_mamba_state_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
@@ -32,12 +33,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_memory,
-    get_spec,
-    mamba_cache_chunk_size,
-)
+from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -64,21 +60,17 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.enable_unified_memory = model_runner.server_args.enable_unified_memory
+        self.enable_unified_memory = get_memory().enable_unified_memory
         # model_config must not be touched here: backend selection reads the
         # linear_attn_backends stamp first, and that guard test constructs
         # backends on runners without a real model_config.
         self._model_runner = model_runner
         self._mamba_chunk_size: Optional[int] = None
-        # Fused replay-prep state-indices fast path (fused_replay_state_indices):
-        # requires the static hybrid pool whose v2p translate is the identity —
-        # the unified pool overrides translate_mamba_indices with an allocator
-        # lookup that is not a flat table gather.
+        pool = self.req_to_token_pool
         self._fused_state_indices_ok = (
-            str(self.device).startswith("cuda")
-            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
-            and type(self.req_to_token_pool).translate_mamba_indices
-            is HybridReqToTokenPool.translate_mamba_indices
+            torch.device(self.device).type == "cuda"
+            and isinstance(pool, HybridReqToTokenPool)
+            and pool.mamba_translate_is_fusable
         )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
@@ -343,11 +335,13 @@ class MambaAttnBackendBase(AttentionBackend):
         the last complete chunk boundary, mamba_track_mask rows only)."""
         conv_state_len = self.conv_states_shape[-1]
 
-        lens_to_track = (
-            forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
+        # Shared with the Qwen4-Exp PLE side states so the boundary can never
+        # drift between them.
+        aligned_len = forward_batch.mamba_track_aligned_lens()
+        assert aligned_len is not None, (
+            "conv-state tracking requires mamba_track_seqlens and extend_prefix_lens; "
+            "this path should only run when the track mask is set on an extend batch"
         )
-        chunk_size = mamba_cache_chunk_size()
-        aligned_len = (lens_to_track // chunk_size) * chunk_size
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
         start_indices = start_indices[forward_batch.mamba_track_mask]
 
@@ -643,6 +637,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 out_state_indices=self.state_indices_list[bs - 1],
                 valid_bs=bs - int(num_padding),
                 total_bs=bs,
+                v2p=self.req_to_token_pool.mamba_v2p_table,
             )
         else:
             # Make sure forward metadata is correctly handled for padding reqs
@@ -929,14 +924,12 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
 
-        if model_runner.server_args.enable_mamba_extra_buffer():
+        if get_exec().mamba.enable_mamba_extra_buffer:
             assert self.conv_states_shape[-1] < self.mamba_chunk_size, (
                 f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
             )
-            assert (
-                model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
-            ), (
-                f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
+            assert get_exec().mamba.mamba_track_interval >= self.mamba_chunk_size, (
+                f"mamba_track_interval ({get_exec().mamba.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
             )
 
     def init_forward_metadata_out_graph(
@@ -1113,6 +1106,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        if layer_id in self.full_attn_layers:
+            return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
+        return None
 
     def on_after_cuda_graph_warmup(self):
         for attn_backend in self.attn_backend_list:
@@ -1386,6 +1384,98 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_track_indices,
             mamba_steps_to_track,
         )
+
+        self._update_ple_state_after_mtp_verify(
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+
+    @staticmethod
+    def _scatter_speculative_state_with_mask(
+        dst: torch.Tensor,
+        src: torch.Tensor,
+        dst_indices_raw: torch.Tensor,
+        step_indices_raw: torch.Tensor,
+    ):
+        if dst is None or src is None or step_indices_raw.numel() == 0:
+            return
+        if dst.is_cuda and src.is_cuda:
+            fused_mamba_state_scatter_with_mask(
+                dst, src, dst_indices_raw, step_indices_raw
+            )
+            return
+
+        device = dst.device
+        dst_indices = dst_indices_raw.to(device=device, dtype=torch.long)
+        steps = step_indices_raw.to(device=device, dtype=torch.long)
+        src_indices = torch.arange(steps.shape[0], device=device, dtype=torch.long)
+        valid = (
+            (steps >= 0)
+            & (steps < src.shape[2])
+            & (dst_indices >= 0)
+            & (dst_indices < dst.shape[1])
+            & (src_indices < src.shape[1])
+        )
+        valid_indices = valid.nonzero(as_tuple=True)[0]
+        if valid_indices.numel() == 0:
+            return
+        dst[:, dst_indices[valid_indices]] = src[
+            :, src_indices[valid_indices], steps[valid_indices]
+        ]
+
+    def _update_ple_state_after_mtp_verify(
+        self,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ):
+        """Roll the accepted per-step PLE side states into their main slots."""
+        req_to_token_pool = self.linear_attn_backend.req_to_token_pool
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+
+        state_pairs = []
+        short_conv_pool = req_to_token_pool.short_conv_pool
+        if (
+            short_conv_pool.conv_state is not None
+            and short_conv_pool.intermediate_conv_state is not None
+        ):
+            state_pairs.append(
+                (
+                    short_conv_pool.conv_state,
+                    short_conv_pool.intermediate_conv_state,
+                )
+            )
+
+        ngram_pool = req_to_token_pool.ngram_pool
+        if (
+            ngram_pool.context is not None
+            and ngram_pool.intermediate_context is not None
+        ):
+            state_pairs.append(
+                (
+                    ngram_pool.context.unsqueeze(0),
+                    ngram_pool.intermediate_context.unsqueeze(0),
+                )
+            )
+
+        for state, intermediate_state in state_pairs:
+            self._scatter_speculative_state_with_mask(
+                state,
+                intermediate_state,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+            if mamba_track_indices is not None:
+                self._scatter_speculative_state_with_mask(
+                    state,
+                    intermediate_state,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
