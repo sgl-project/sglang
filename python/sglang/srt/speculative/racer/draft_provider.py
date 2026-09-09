@@ -5,7 +5,7 @@ from typing import Sequence
 
 import numpy as np
 
-from sglang.srt.speculative.racer.refill_automaton import BinaryRefillRacerAutomaton
+from sglang.srt.speculative.racer.automaton import RacerAutomaton
 from sglang.srt.speculative.racer.stats import InstrumentedRacerAutomaton
 
 
@@ -26,16 +26,16 @@ class RacerDraftProvider:
         self.topk = int(topk)
         self.max_nodes = int(max_nodes)
         self.stats_enabled = bool(stats_enabled)
-        self._states: dict[object, BinaryRefillRacerAutomaton] = {}
+        self._states: dict[object, RacerAutomaton] = {}
         self._last_batch_stats: list[dict[str, int | float]] = []
 
-    def _state(self, req_id: object) -> BinaryRefillRacerAutomaton:
+    def _state(self, req_id: object) -> RacerAutomaton:
         state = self._states.get(req_id)
         if state is None:
             cls = (
                 InstrumentedRacerAutomaton
                 if self.stats_enabled
-                else BinaryRefillRacerAutomaton
+                else RacerAutomaton
             )
             state = cls(
                 ngram=self.ngram,
@@ -186,8 +186,14 @@ class RacerDraftProvider:
         draft_tokens = np.asarray(draft_tokens).reshape(bs, k)
         topk_ids = np.asarray(topk_ids).reshape(bs, k, -1)
         for b, rid in enumerate(req_ids):
-            self._state(rid).update_logits(
-                draft_tokens[b].tolist(), topk_ids[b].tolist()
+            state = self._state(rid)
+            # Dummy token-0 padding is not a copy-logit observation.
+            n = min(k, int(getattr(state, "_last_real_count", k)))
+            if n <= 0:
+                continue
+            state.update_logits(
+                draft_tokens[b, :n].tolist(),
+                topk_ids[b, :n].tolist(),
             )
 
     def load_external_corpus_named(self, *args, **kwargs):

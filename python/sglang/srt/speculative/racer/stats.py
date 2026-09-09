@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from sglang.srt.speculative.racer.refill_automaton import BinaryRefillRacerAutomaton
+from sglang.srt.speculative.racer.automaton import RacerAutomaton
 
 
 @dataclass
@@ -10,15 +10,7 @@ class RacerProposalStats:
     borders: int = 0
     retrieval_selected: int = 0
     retrieval_unique_nodes: int = 0
-    merge_holes: int = 0
-    tokenbin_budget: int = 0
-    tokenbin_paths: int = 0
-    nodes_after_original_tokenbin: int = 0
-    refill_used: int = 0
-    refill_budget: int = 0
-    refill_probes: int = 0
-    nodes_after_refill: int = 0
-    refill_unique_added: int = 0
+    logits_fill_nodes: int = 0
     nodes_before_padding: int = 0
     padding_nodes: int = 0
     proposal_ms: float = 0.0
@@ -27,8 +19,8 @@ class RacerProposalStats:
         return asdict(self)
 
 
-class InstrumentedRacerAutomaton(BinaryRefillRacerAutomaton):
-    """Binary-refill RACER automaton with proposal-shape instrumentation."""
+class InstrumentedRacerAutomaton(RacerAutomaton):
+    """RACER automaton with proposal-shape instrumentation."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

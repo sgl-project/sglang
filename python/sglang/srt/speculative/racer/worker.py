@@ -65,8 +65,8 @@ class RACERWorker(NGRAMWorker):
         self._stats_requests = 0
         self._stats_borders = 0
         self._stats_retrieval_selected = 0
-        self._stats_tokenbin_budget = 0
-        self._stats_tokenbin_paths = 0
+        self._stats_retrieval_unique_nodes = 0
+        self._stats_logits_fill_nodes = 0
         self._stats_nodes_before_padding = 0
         self._stats_padding_nodes = 0
         self._stats_padding_rounds = 0
@@ -83,8 +83,8 @@ class RACERWorker(NGRAMWorker):
         self._stats_requests = 0
         self._stats_borders = 0
         self._stats_retrieval_selected = 0
-        self._stats_tokenbin_budget = 0
-        self._stats_tokenbin_paths = 0
+        self._stats_retrieval_unique_nodes = 0
+        self._stats_logits_fill_nodes = 0
         self._stats_nodes_before_padding = 0
         self._stats_padding_nodes = 0
         self._stats_padding_rounds = 0
@@ -101,8 +101,8 @@ class RACERWorker(NGRAMWorker):
             self._stats_requests += 1
             self._stats_borders += int(stats["borders"])
             self._stats_retrieval_selected += int(stats["retrieval_selected"])
-            self._stats_tokenbin_budget += int(stats["tokenbin_budget"])
-            self._stats_tokenbin_paths += int(stats["tokenbin_paths"])
+            self._stats_retrieval_unique_nodes += int(stats["retrieval_unique_nodes"])
+            self._stats_logits_fill_nodes += int(stats["logits_fill_nodes"])
             self._stats_nodes_before_padding += int(stats["nodes_before_padding"])
             padding_nodes = int(stats["padding_nodes"])
             self._stats_padding_nodes += padding_nodes
@@ -125,7 +125,7 @@ class RACERWorker(NGRAMWorker):
         logger.info(
             "[RACER_STATS] rounds=%d reqs=%d K=%d avg_accept_len=%.3f "
             "avg_borders=%.2f avg_retrieval_selected=%.2f "
-            "avg_tokenbin_budget=%.2f avg_tokenbin_paths=%.2f "
+            "avg_retrieval_unique=%.2f avg_logits_fill_nodes=%.2f "
             "avg_nodes_before_padding=%.2f padding_rounds=%d/%d(%.1f%%) "
             "avg_padding_nodes=%.2f proposal_ms/req=%.3f "
             "copy_topk_gpu_ms/round=%.3f copy_d2h_ms/round=%.3f "
@@ -136,8 +136,8 @@ class RACERWorker(NGRAMWorker):
             avg_accept_len,
             self._stats_borders / requests,
             self._stats_retrieval_selected / requests,
-            self._stats_tokenbin_budget / requests,
-            self._stats_tokenbin_paths / requests,
+            self._stats_retrieval_unique_nodes / requests,
+            self._stats_logits_fill_nodes / requests,
             self._stats_nodes_before_padding / requests,
             self._stats_padding_rounds,
             requests,

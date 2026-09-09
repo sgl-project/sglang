@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-import logging
 from typing import Dict, Sequence
 
-logger = logging.getLogger(__name__)
+import numpy as np
 
 
 @dataclass(eq=False)
@@ -18,71 +17,69 @@ class _TrieNode:
     parent: "_TrieNode | None" = None
 
 
-class _CandidateTrie:
-    """Small merge trie used only for one RACER proposal tree."""
+class _DraftTree:
+    """Fixed-K proposal tree grown in place like NGRAM_LOGITS padding fill."""
 
-    def __init__(self):
-        self.root = _TrieNode()
-        self.node_count = 0
+    def __init__(self, budget: int):
+        self.budget = int(budget)
+        self.tokens = np.zeros(self.budget, dtype=np.int64)
+        self.mask = np.zeros((self.budget, self.budget), dtype=np.bool_)
+        self.children: dict[tuple[int, int], int] = {}
+        self.root_indices: dict[int, int] = {}
+        self.active = 0
 
-    def insert(self, path: Sequence[int], budget: int) -> None:
-        node = self.root
-        for token in path:
-            token = int(token)
-            nxt = node.children.get(token)
-            if nxt is None:
-                if self.node_count >= budget:
-                    return
-                nxt = _TrieNode(
-                    token=token,
-                    depth=node.depth + 1,
-                    parent=node,
-                )
-                node.children[token] = nxt
-                self.node_count += 1
-            node = nxt
+    def add(self, parent: int, token: int) -> int | None:
+        """Insert ``token`` under ``parent``, reusing an existing edge for free."""
 
-    def flatten(self, budget: int) -> tuple[list[int], list[list[bool]]]:
-        """Flatten the merged draft trie and build RACER's tree-attention mask.
+        token = int(token)
+        if parent < 0:
+            idx = self.root_indices.get(token)
+            if idx is not None:
+                return idx
+            if self.active >= self.budget:
+                return None
+            idx = self.active
+            self.tokens[idx] = token
+            self.mask[idx, idx] = True
+            self.root_indices[token] = idx
+            self.active += 1
+            return idx
 
-        Paper correspondence:
-          - Sec. 3.3: Retrieval Tree and Logits Tree are merged by trie union.
-          - Eq. (2): each draft node attends only to itself and its ancestors.
+        key = (parent, token)
+        idx = self.children.get(key)
+        if idx is not None:
+            return idx
+        if self.active >= self.budget:
+            return None
+        idx = self.active
+        self.tokens[idx] = token
+        self.mask[idx, :] = self.mask[parent, :]
+        self.mask[idx, idx] = True
+        self.children[key] = idx
+        self.active += 1
+        return idx
 
-        The returned ``tokens`` are in BFS order. ``parents[i]`` records the
-        flattened parent of node i, and walking that chain marks exactly the
-        self-plus-ancestor entries required by the tree-attention mask.
-        """
+    def pad_with_zeros(self) -> None:
+        """Fill leftover slots with dummy token-0 children of the draft root."""
 
-        tokens: list[int] = []
-        parents: list[int] = []
-        q = deque((child, -1) for child in self.root.children.values())
-        while q and len(tokens) < budget:
-            node, parent_idx = q.popleft()
-            idx = len(tokens)
-            tokens.append(node.token)
-            parents.append(parent_idx)
-            for child in node.children.values():
-                q.append((child, idx))
-
-        n = len(tokens)
-        mask = [[False] * n for _ in range(n)]
-        for i in range(n):
-            cur = i
-            while cur >= 0:
-                mask[i][cur] = True
-                cur = parents[cur]
-        return tokens, mask
+        while self.active < self.budget:
+            idx = self.active
+            self.tokens[idx] = 0
+            self.mask[idx, :] = False
+            self.mask[idx, 0] = True
+            self.mask[idx, idx] = True
+            self.active += 1
 
 
 class RacerAutomaton:
-    """Pure-Python port of the original RACER C++ Automaton/TokenBin semantics.
+    """Per-request RACER Automaton with NGRAM_LOGITS-style Logits Tree fill.
 
-    The serving worker keeps one instance per request.  The implementation is
-    intentionally fidelity-first: retrieval-tree selection, AC fail transitions,
-    TokenBin breadth propagation, and the split of the K-node budget match the
-    original C++ implementation.  A final padding path is only a defensive guard
-    for SGLang's fixed-K verify ABI and should not be used in the normal path.
+    Retrieval Tree selection and AC fail transitions keep the original RACER
+    semantics. After retrieval occupies the draft trie, leftover fixed-K
+    slots are filled in place from copy-logit TokenBin successors. Existing
+    retrieval edges are reused for free. A node with no TokenBin outgoing
+    edge grows one token-0 placeholder; any residual capacity becomes dummy
+    token-0 root-children so TARGET_VERIFY always sees exactly K nodes.
     """
 
     def __init__(
@@ -103,7 +100,7 @@ class RacerAutomaton:
         self._history: list[int] = []
         self._token_bin: dict[int, list[int]] = {}
         self._cur_state = self.root
-        self._warned_padding = False
+        self._last_real_count = 0
 
     def reset(self) -> None:
         self.root = _TrieNode()
@@ -112,7 +109,7 @@ class RacerAutomaton:
         self._history.clear()
         self._token_bin.clear()
         self._cur_state = self.root
-        self._warned_padding = False
+        self._last_real_count = 0
 
     def _new_child(self, parent: _TrieNode, token: int) -> _TrieNode | None:
         if self._node_count >= self.max_nodes:
@@ -229,77 +226,52 @@ class RacerAutomaton:
         """
 
         for token, row in zip(tokens, topk_ids):
-            values = [int(x) for x in row[: self.topk]]
-            if len(values) < self.topk:
-                values.extend([0] * (self.topk - len(values)))
-            self._token_bin[int(token)] = values
+            self._token_bin[int(token)] = [int(x) for x in row[: self.topk]]
 
     def _token_bin_row(self, token: int) -> list[int]:
-        # C++ TokenBin preallocates the whole matrix with zeros.  Missing entries
-        # therefore behave as a top-k row of zero token ids.
         return self._token_bin.get(int(token), [0] * self.topk)
 
-    def _token_bin_retrieve(
-        self, next_token: int, max_num_draft: int, is_chain: bool = False
-    ) -> list[list[int]]:
-        """Construct the Logits Tree by breadth-first expansion.
+    def _token_bin_successors(self, token: int, breadth: int) -> Sequence[int]:
+        row = self._token_bin.get(int(token))
+        if not row:
+            # No copy-logit adjacency: grow one token-0 placeholder so the
+            # leftover budget still materializes unique nodes instead of
+            # stalling before K.
+            return (0,)
+        return row[: max(1, min(int(breadth), len(row)))]
 
-        Paper correspondence: Sec. 3.1 Eq. (3) and Appendix E.1 Algorithm 1.
-        The root preserves its breadth for its highest-ranked child; non-root
-        nodes halve it before assigning child breadths. Thus the highest-ranked
-        branch for the paper default k=8 follows 8 -> 8 -> 4 -> 2 -> 1.
+    def _fill_logits_tree(self, tree: _DraftTree, root_idx: int, root_token: int) -> None:
+        """Expand leftover slots from TokenBin with RACER Sec. 3.1 Eq. (3).
+
+        The root keeps its breadth for the highest-ranked child; deeper nodes
+        start at half their parent's breadth; later siblings keep halving,
+        clamped to one. An existing retrieval edge is reused and does not
+        consume a slot.
         """
 
-        if max_num_draft <= 0:
-            return []
+        queue = deque([(root_idx, int(root_token), int(self.topk), 0)])
+        expanded: set[int] = set()
 
-        # (token, parent_position, breadth, depth)
-        q: list[tuple[int, int, int, int]] = [
-            (int(next_token), -1, 1 if is_chain else self.topk, 0)
-        ]
-        remaining = int(max_num_draft) - 1
-        head = 0
-        candidates: list[list[int]] = []
+        while queue and tree.active < tree.budget:
+            node_idx, token, breadth, depth = queue.popleft()
+            if node_idx in expanded:
+                continue
+            expanded.add(node_idx)
 
-        while head < len(q):
-            token, pos_parent, breadth, depth = q[head]
-            pos_u = head
-            head += 1
+            successors = self._token_bin_successors(token, breadth)
+            if not successors:
+                continue
 
-            if remaining > 0 and breadth > 0:
-                row = self._token_bin_row(token)
-                # Eq. (3) / Algorithm 1: only the root is exempt from the
-                # initial halving; sibling breadth then halves after each child.
-                next_breadth = breadth if depth == 0 else (breadth >> 1)
-                next_depth = depth + 1
-                added = 0
-                for i in range(min(breadth, self.topk)):
-                    if remaining <= 0:
-                        break
-                    child = int(row[i])
-                    q.append(
-                        (
-                            child,
-                            pos_u,
-                            max(1, next_breadth),
-                            next_depth,
-                        )
-                    )
-                    next_breadth >>= 1
-                    remaining -= 1
-                    added += 1
-                if added:
-                    continue
-
-            # Leaf: recover root -> leaf candidate from parent indices.
-            candidate: list[int] = []
-            cur = pos_u
-            while cur >= 0:
-                candidate.append(q[cur][0])
-                cur = q[cur][1]
-            candidates.append(list(reversed(candidate)))
-
-        return candidates
+            next_breadth = breadth if depth == 0 else max(1, breadth >> 1)
+            for child_token in successors:
+                child_breadth = max(1, next_breadth)
+                next_breadth = max(1, next_breadth >> 1)
+                child_idx = tree.add(node_idx, int(child_token))
+                if child_idx is None:
+                    break
+                queue.append(
+                    (child_idx, int(child_token), child_breadth, depth + 1)
+                )
 
     def _collect_borders(self, next_token: int) -> list[_TrieNode]:
         """Collect AC border states used by the Retrieval Tree (Sec. 3.2)."""
@@ -339,7 +311,7 @@ class RacerAutomaton:
 
         This corresponds to Sec. 3.2: continuations from all matched border
         sub-tries are pooled, ranked by empirical frequency, and the strongest
-        states are retained before allocating the remaining draft capacity to
+        states are retained. Leftover fixed-K slots are filled afterwards by
         the Logits Tree.
         """
 
@@ -384,54 +356,20 @@ class RacerAutomaton:
 
         return paths
 
-    def _defensive_pad(self, trie: _CandidateTrie, budget: int, root_token: int) -> None:
-        if trie.node_count >= budget:
-            return
-        if not self._warned_padding:
-            logger.warning(
-                "RACER proposal produced %d/%d nodes; applying defensive fixed-K padding. "
-                "Normal RetrievalTree+TokenBin generation should already fill the budget.",
-                trie.node_count,
-                budget,
-            )
-            self._warned_padding = True
-
-        # Follow the TokenBin top-1 continuation so padding remains a valid token
-        # path. This is a last-resort ABI guard, not part of normal RACER proposal.
-        path = [int(root_token)]
-        token = int(root_token)
-        guard = 0
-        while trie.node_count < budget and guard < budget * 4:
-            row = self._token_bin_row(token)
-            token = int(row[0])
-            path.append(token)
-            before = trie.node_count
-            trie.insert(path, budget)
-            if trie.node_count == before:
-                # Duplicate path: extend it once more on the same continuation.
-                guard += 1
-                continue
-            guard += 1
-
-        # Extremely defensive fallback for a pathological self-looping TokenBin.
-        # Valid token 0 mirrors an uninitialized C++ TokenBin row.
-        while trie.node_count < budget:
-            path.append(0)
-            trie.insert(path, budget)
+    def _record_proposal_shape(self, **kwargs) -> None:
+        return None
 
     def retrieve(
         self, root_token: int, max_num_draft: int
     ) -> tuple[list[int], list[list[bool]]]:
-        """Build RACER's unified proposal tree under a fixed draft capacity.
+        """Build a fixed-K proposal: Retrieval Tree first, then Logits Tree fill.
 
-        Paper correspondence: Sec. 3.3 first selects Retrieval Tree candidates,
-        assigns the remaining capacity to Logits Tree BFS expansion, and merges
-        both sources by trie union.
-
-        SGLang adaptation: trie union can collapse token-identical paths, while
-        the reused NGRAM TARGET_VERIFY ABI requires exactly ``max_num_draft``
-        unique nodes. The refill/padding below restores that fixed-K invariant;
-        it is an integration detail rather than part of the RACER paper.
+        Retrieval nodes are materialized first and never replaced. Logits Tree
+        BFS then walks from the current token, reusing any retrieval edge that
+        TokenBin also wants, and only consuming leftover slots for new nodes.
+        A node with no TokenBin outgoing edge grows one token-0 placeholder
+        child. Residual capacity, if any, is dummy token-0 children of the
+        draft root so TARGET_VERIFY always sees exactly K nodes.
         """
 
         budget = int(max_num_draft)
@@ -442,34 +380,40 @@ class RacerAutomaton:
         borders = self._collect_borders(root_token)
         selected = self._select_retrieval_nodes(borders, budget)
 
-        candidate_trie = _CandidateTrie()
+        tree = _DraftTree(budget)
         for path in self._selected_paths(selected):
-            candidate_trie.insert(path, budget)
+            parent = -1
+            for token in path:
+                idx = tree.add(parent, token)
+                if idx is None:
+                    break
+                parent = idx
 
-        retrieval_unique_nodes = candidate_trie.node_count
-        merge_holes = max(0, len(selected) - retrieval_unique_nodes)
+        retrieval_unique_nodes = tree.active
+        if tree.active == 0 or root_token not in tree.root_indices:
+            tree.add(-1, root_token)
 
-        # Sec. 3.3 budget split: retrieval is allocated first, then the
-        # remaining speculative capacity is assigned to the Logits Tree.
-        original_tokenbin_budget = budget - len(selected)
-        original_tokenbin_paths = self._token_bin_retrieve(
-            root_token, original_tokenbin_budget, is_chain=False
+        root_idx = tree.root_indices.get(root_token)
+        if root_idx is None:
+            raise RuntimeError("RACER draft tree is missing the current root token")
+
+        after_seed = tree.active
+        self._fill_logits_tree(tree, root_idx, root_token)
+        nodes_before_padding = tree.active
+        tree.pad_with_zeros()
+        self._last_real_count = nodes_before_padding
+
+        self._record_proposal_shape(
+            borders=len(borders),
+            retrieval_selected=len(selected),
+            retrieval_unique_nodes=retrieval_unique_nodes,
+            logits_fill_nodes=max(0, nodes_before_padding - after_seed),
+            nodes_before_padding=nodes_before_padding,
+            padding_nodes=max(0, budget - nodes_before_padding),
         )
-        for path in original_tokenbin_paths:
-            candidate_trie.insert(path, budget)
 
-        # Original fallback when only the implicit trie root exists.
-        if candidate_trie.node_count == 0:
-            candidate_trie.insert([root_token], budget)
-
-        # SGLang's current NGRAM verify ABI requires exactly K flattened nodes.
-        # This should be unreachable in the normal RACER path, but keep a guard
-        # for duplicate merging / capacity edge cases instead of crashing serving.
-        self._defensive_pad(candidate_trie, budget, root_token)
-
-        tokens, mask = candidate_trie.flatten(budget)
-        if len(tokens) != budget:
+        if tree.active != budget:
             raise RuntimeError(
-                f"RACER fixed-K proposal invariant failed: {len(tokens)=}, {budget=}"
+                f"RACER fixed-K proposal invariant failed: {tree.active=}, {budget=}"
             )
-        return tokens, mask
+        return tree.tokens.tolist(), tree.mask.tolist()
