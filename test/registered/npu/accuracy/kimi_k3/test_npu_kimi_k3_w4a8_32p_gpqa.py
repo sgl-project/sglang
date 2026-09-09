@@ -70,7 +70,7 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     0.72,
     "--chunked-prefill-size",
     8192,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     4,
     16,
