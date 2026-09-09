@@ -27,6 +27,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
@@ -55,8 +56,10 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
         cfg.enable_prefill_cp
         and cfg.pp_size == 1
         and resolved.attn_cp_size == cfg.tp_size
-        and cfg.cp_strategy == "zigzag"
-        and prefill_attention_backend == "trtllm_mha"
+        and (
+            (cfg.cp_strategy == "zigzag" and prefill_attention_backend == "trtllm_mha")
+            or (cfg.cp_strategy == "interleave" and prefill_attention_backend == "dsv4")
+        )
     )
 
 
@@ -68,8 +71,10 @@ def enable_cp_v2_bcg_capture(server_args: ServerArgs) -> bool:
 def filter_prefill_cp_bcg_capture_num_tokens(
     capture_num_tokens: list[int], server_args: ServerArgs
 ) -> list[int]:
-    """Keep only token buckets where the zigzag CP strategy can run."""
-    min_num_tokens = resolved_view(server_args).attn_cp_size * 2
+    """Keep only token buckets where the selected CP strategy can run."""
+    min_num_tokens = resolved_view(server_args).attn_cp_size
+    if resolving_view(server_args).cp_strategy == "zigzag":
+        min_num_tokens *= 2
     filtered = [size for size in capture_num_tokens if size >= min_num_tokens]
     if not filtered:
         raise ValueError(
@@ -118,24 +123,30 @@ class PrefillCPBCGInput:
             )
 
     def required_local_tokens(self, extend_seq_lens: Any) -> Optional[int]:
-        """Return the aligned CP-local rows required by a live zigzag layout."""
+        """Return the largest aligned local shard, uniformly across CP ranks."""
         strategy = get_cp_strategy()
-        if not isinstance(strategy, ZigzagCPStrategy) or extend_seq_lens is None:
+        if extend_seq_lens is None:
             return None
-
-        cp_segment_num = strategy.cp_size * 2
-        per_rank_logical_tokens = [0] * strategy.cp_size
-        for raw_length in extend_seq_lens:
-            base, remainder = divmod(int(raw_length), cp_segment_num)
-            for rank in range(strategy.cp_size):
-                opposite_rank = cp_segment_num - 1 - rank
-                per_rank_logical_tokens[rank] += (
-                    base * 2 + int(rank < remainder) + int(opposite_rank < remainder)
-                )
+        if isinstance(strategy, InterleaveCPStrategy):
+            num_tokens = sum(int(length) for length in extend_seq_lens)
+            max_local_tokens = (num_tokens + strategy.cp_size - 1) // strategy.cp_size
+        elif isinstance(strategy, ZigzagCPStrategy):
+            cp_segment_num = strategy.cp_size * 2
+            per_rank_logical_tokens = [0] * strategy.cp_size
+            for raw_length in extend_seq_lens:
+                base, remainder = divmod(int(raw_length), cp_segment_num)
+                for rank in range(strategy.cp_size):
+                    opposite_rank = cp_segment_num - 1 - rank
+                    per_rank_logical_tokens[rank] += (
+                        base * 2
+                        + int(rank < remainder)
+                        + int(opposite_rank < remainder)
+                    )
+            max_local_tokens = max(per_rank_logical_tokens)
+        else:
+            return None
         align_size = get_cp_padding_align_size()
-        return (
-            (max(per_rank_logical_tokens) + align_size - 1) // align_size * align_size
-        )
+        return (max_local_tokens + align_size - 1) // align_size * align_size
 
     def select_replay_bucket(
         self,
@@ -190,6 +201,7 @@ class PrefillCPBCGInput:
         # Replay batches may reuse a ForwardBatch object whose metadata was
         # built for a different request layout. Always rebuild before sharding.
         forward_batch.attn_cp_metadata = None
+        out_cache_loc = forward_batch.out_cache_loc
         prepare_cp_forward(forward_batch)
 
         captured_local_tokens = None
@@ -258,6 +270,22 @@ class PrefillCPBCGInput:
         forward_batch.positions = positions
         self.live_local_tokens = live_local_tokens
 
+        if isinstance(get_cp_strategy(), InterleaveCPStrategy):
+            # DSV4's layer-internal KV/compressor gathers are captured too. Their
+            # global output rows and cache-write buffers must retain the bucket
+            # shape even when the live batch is smaller. Shard using the real
+            # lengths above, then expose the fixed geometry to the model body.
+            # Sequence/extend lengths stay live for causal and compressor plans;
+            # the registry zeroes the unused cache locations (the dummy slot).
+            metadata = forward_batch.attn_cp_metadata
+            cp_size = len(metadata.per_rank_actual_token)
+            base, remainder = divmod(static_num_tokens, cp_size)
+            metadata.total_seq_lens = static_num_tokens
+            metadata.per_rank_logical_token = [
+                base + int(rank < remainder) for rank in range(cp_size)
+            ]
+            forward_batch.out_cache_loc = out_cache_loc
+
 
 def execute_prefill_cp_bcg(
     runner: PrefillCudaGraphRunner,
@@ -308,10 +336,34 @@ def execute_prefill_cp_bcg(
             static_forward_batch,
             torch.cuda.current_stream(),
         )
+        hidden_states = _slice_output_rows(hidden_states, raw_num_tokens)
+        if aux_hidden_states is not None:
+
+            def gather_aux(aux):
+                return _slice_output_rows(
+                    cp_gather_after_forward(
+                        aux, static_forward_batch, torch.cuda.current_stream()
+                    ),
+                    raw_num_tokens,
+                )
+
+            if torch.is_tensor(aux_hidden_states):
+                aux_hidden_states = gather_aux(aux_hidden_states)
+            else:
+                aux_hidden_states = [gather_aux(aux) for aux in aux_hidden_states]
+
+        # Mirror the DSV4 outer forward and the eager CP runner: the body
+        # returns (normalized hidden states, pre-mHC-head hidden states).
+        logits_kwargs = {}
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_before_norm = hidden_states
+            if aux_hidden_states is None:
+                logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
             aux_hidden_states,
+            **logits_kwargs,
         )

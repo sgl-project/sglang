@@ -520,6 +520,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+            logger.info(
+                "Prefill CP breakable CUDA graph enabled: strategy=%s, cp_size=%d",
+                get_parallel().cp_strategy,
+                get_parallel().attn_cp_size,
+            )
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
@@ -1231,9 +1236,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         ):
             return False
-        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
-            forward_batch
-        ):
+        if getattr(self, "enable_cp_v2_bcg_capture", False):
+            # These graphs contain a CP-local body. Tiny/non-CP batches must
+            # execute eagerly rather than entering CP preparation at replay.
+            if not is_cp_v2_active(forward_batch):
+                return False
             assert self.prefill_cp_bcg_input is not None
             if (
                 self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
