@@ -471,6 +471,15 @@ class PrefillBootstrapQueue:
             if poll is None:
                 continue
 
+            if is_aborted(req):
+                if poll == KVPoll.Bootstrapping:
+                    # Keep the bounded bootstrap wait to learn decode destinations,
+                    # but never admit the rejected request to optimistic prefill.
+                    continue
+                assert req.disagg_kv_sender is not None
+                req.disagg_kv_sender.abort_before_send()
+                poll = KVPoll.Failed
+
             if poll == KVPoll.Failed:
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
@@ -1111,8 +1120,14 @@ class SchedulerDisaggregationPrefillMixin:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-        self.output_streamer.stream_output([req], req.return_logprob)
+        if is_aborted(req):
+            req.update_finish_state()
+        else:
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+        if not req.finished_output:
+            self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         if self.enable_hicache_storage:

@@ -193,6 +193,10 @@ class BaseKVSender(ABC):
         """
         pass
 
+    def abort_before_send(self) -> None:
+        """Abort a bootstrap request that has never submitted a send."""
+        self.abort()
+
 
 class BaseKVReceiver(ABC):
     @abstractmethod

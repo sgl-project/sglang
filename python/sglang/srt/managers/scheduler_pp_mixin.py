@@ -9,13 +9,16 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    is_aborted,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -623,7 +626,7 @@ class SchedulerPPMixin:
         aborted_rids = {
             req.rid
             for req in self.disagg_prefill_bootstrap_queue.queue
-            if isinstance(req.finished_reason, FINISH_ABORT)
+            if is_aborted(req)
         }
         good_bootstrapped_rids, bad_bootstrapped_rids = self._route_aborts_to_bad(
             good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
@@ -1186,7 +1189,7 @@ class SchedulerPPMixin:
         aborted_rids = {
             decode_req.req.rid
             for decode_req in self.disagg_decode_prealloc_queue.queue
-            if isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+            if is_aborted(decode_req.req)
         }
         good_prealloc_rids, bad_prealloc_rids = self._route_aborts_to_bad(
             good_prealloc_rids, bad_prealloc_rids, aborted_rids

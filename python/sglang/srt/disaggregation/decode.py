@@ -57,6 +57,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -638,6 +639,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        if is_aborted(req):
+            if self.pp_size > 1:
+                self._create_receiver_and_enqueue(req, is_rebootstrap=is_rebootstrap)
+            else:
+                req.update_finish_state()
+                if not req.finished_output:
+                    self.scheduler.output_streamer.stream_output(
+                        [req], req.return_logprob
+                    )
+            return
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -900,6 +911,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
+            if is_aborted(decode_req.req):
+                poll = KVPoll.Failed
             if poll == KVPoll.Bootstrapping:
                 pass
             elif poll == KVPoll.WaitingForInput:
@@ -918,11 +931,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     logger.debug(error_message)
                 else:
                     logger.error(error_message)
-                prepare_abort(
-                    decode_req.req,
-                    error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
+                if not is_aborted(decode_req.req):
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
@@ -981,6 +995,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
+            if is_aborted(decode_req.req):
+                continue
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
 
@@ -1022,7 +1038,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Group pending requests by bootstrap_addr
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
+        aborted_reqs = []
         for decode_req in self.pending_reqs:
+            if is_aborted(decode_req.req):
+                aborted_reqs.append(decode_req)
+                continue
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
 
@@ -1075,7 +1095,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefetched is not None:
                     prefetched[1].cancel()
 
-        self.pending_reqs = remaining
+        self.pending_reqs = remaining + aborted_reqs
 
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
@@ -1093,10 +1113,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
 
-        self._resolve_pending_reqs()
-        self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
+
+        for decode_req in self.queue:
+            req = decode_req.req
+            if rids_to_check is not None and req.rid not in rids_to_check:
+                continue
+            if isinstance(req.to_finish, FINISH_ABORT):
+                req.update_finish_state()
+                # Preallocation has not published destination pages yet.
+                decode_req.kv_receiver.abort()
+
+        self._resolve_pending_reqs()
+        self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
 
         failed_reqs = []
         preallocated_reqs = []

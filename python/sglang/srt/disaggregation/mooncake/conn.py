@@ -1756,6 +1756,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
+    def notify_bootstrap_failure(self, bootstrap_room: int) -> None:
+        for info in list(self.transfer_infos.get(bootstrap_room, {}).values()):
+            if info.is_dummy:
+                continue
+            try:
+                self.sync_status_to_decode_endpoint(
+                    info.endpoint,
+                    info.dst_port,
+                    bootstrap_room,
+                    KVPoll.Failed,
+                    self._prefill_unique_rank(),
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to notify decode of bootstrap rejection for room %s",
+                    bootstrap_room,
+                    exc_info=True,
+                )
+
     def transfer_worker(
         self,
         queue: FastQueue,
