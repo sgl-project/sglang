@@ -33,7 +33,7 @@ on:
         description: 'The a3 running docker image of the test task with cann 9.1.0.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-20260909'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-nightly'
       image_a5:
         description: 'The a5 running docker image of the test task.'
         required: false
@@ -126,7 +126,7 @@ jobs:
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a3_cann910 }}" ]; then
-            echo "image_a3_cann910=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-20260909" >> $GITHUB_OUTPUT
+            echo "image_a3_cann910=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-nightly" >> $GITHUB_OUTPUT
           else
             echo "image_a3_cann910=${{ inputs.image_a3_cann910 }}" >> $GITHUB_OUTPUT
           fi
@@ -342,7 +342,6 @@ jobs:
   # Suites suffixed with `-cann910` run against the CANN 9.1.0 image.
   nightly-perf-16-npu-a3-cann910:
     name: nightly-perf-16-npu-a3-cann910
-    # Disabled: temporarily run only the cann910 w8a8 8p GPQA accuracy case.
     if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
@@ -360,8 +359,7 @@ jobs:
 
   nightly-acc-16-npu-a3-cann910:
     name: nightly-acc-16-npu-a3-cann910
-    # Enabled: run only the cann910 w8a8 8p GPQA accuracy case (the only
-    # test registered to this suite).
+    if: ${{ false }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -493,8 +491,6 @@ jobs:
 
   nightly-poc-multi-node-mix-tests-cann910:
     name: multi-node-mix-poc-cann910
-    # Disabled: temporarily run only the cann910 w8a8 8p GPQA accuracy case.
-    if: ${{ false }}
     needs: [set-image-config, nightly-poc-multi-node-tests-cann910]
     strategy:
       fail-fast: false
