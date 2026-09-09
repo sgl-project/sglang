@@ -46,7 +46,7 @@ class AddReqResult(Enum):
     NO_TOKEN = auto()
 
 
-def _scheduler_case(*, chunked=False):
+def _scheduler_case(*, chunked=False, flexkv=False):
     req = SimpleNamespace(
         rid="restore",
         init_next_round_input=MagicMock(),
@@ -55,7 +55,12 @@ def _scheduler_case(*, chunked=False):
         kv=SimpleNamespace(holds_mamba=False),
     )
     leased = {req.rid}
-    cache = SimpleNamespace(has_uncommitted_restore=lambda r: r.rid in leased)
+    cache = SimpleNamespace(
+        has_uncommitted_restore=lambda r: r.rid in leased,
+        check_hicache_events=MagicMock(),
+        check_prefetch_progress=MagicMock(return_value=True),
+        pop_prefetch_loaded_span=MagicMock(return_value=(0, None)),
+    )
     adder = SimpleNamespace(
         can_run_list=[],
         add_one_req=MagicMock(return_value=AddReqResult.OTHER),
@@ -88,7 +93,7 @@ def _scheduler_case(*, chunked=False):
         enable_lora=False,
         req_to_token_pool=SimpleNamespace(mamba_allocator=None),
         enable_hicache_storage=False,
-        enable_flexkv=False,
+        enable_flexkv=flexkv,
         disaggregation_mode=None,
         truncation_align_size=None,
     )
@@ -98,15 +103,24 @@ def _scheduler_case(*, chunked=False):
         "_get_new_batch_prefill_raw",
         {
             "PrefillAdder": lambda *_args, **_kwargs: adder,
-            "get_memory": lambda: SimpleNamespace(enable_flexkv=False),
+            "get_memory": lambda: SimpleNamespace(enable_flexkv=flexkv),
             "get_schedule": lambda: SimpleNamespace(prefill_max_requests=None),
             "TEST_RETRACT": False,
             "AddReqResult": AddReqResult,
             "DisaggregationMode": SimpleNamespace(PREFILL="prefill"),
         },
     )
-    running = SimpleNamespace(reqs=[], batch_is_full=False)
+    running = SimpleNamespace(reqs=[], batch_is_full=False, is_empty=lambda: True)
     return req, leased, adder, lambda: run(scheduler, None, running)
+
+
+def test_idle_flexkv_retries_admission_after_no_token():
+    _, leased, adder, run = _scheduler_case(flexkv=True)
+    leased.clear()
+    adder.add_one_req.side_effect = [AddReqResult.NO_TOKEN, AddReqResult.OTHER]
+    run()
+    run()
+    assert adder.add_one_req.call_count == 2
 
 
 @pytest.mark.parametrize("chunked", [False, True])
