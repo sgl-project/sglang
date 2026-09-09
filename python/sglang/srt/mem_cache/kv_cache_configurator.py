@@ -1549,17 +1549,6 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
-        if is_dsa_model:
-            logger.info(
-                "NPU DSA indexer layout: %s (%d/%d layers)",
-                (
-                    "compact"
-                    if token_to_kv_pool.num_indexer_layers < token_to_kv_pool.layer_num
-                    else "all-layer"
-                ),
-                token_to_kv_pool.num_indexer_layers,
-                token_to_kv_pool.layer_num,
-            )
         return token_to_kv_pool
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
