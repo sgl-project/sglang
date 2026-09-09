@@ -2924,6 +2924,28 @@ class Scheduler(
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+        if (
+            req.sampling_params.trace_decode_token_ids is not None
+            and not self.spec_algorithm.is_none()
+        ):
+            error_msg = (
+                "trace_decode_token_ids is not supported with speculative decoding."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            req.sampling_params.trace_decode_token_ids is not None
+            and req.return_sampling_mask
+        ):
+            error_msg = (
+                "trace_decode_token_ids is not supported with return_sampling_mask."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
             return
 
         if self.spec_algorithm.is_dflash_family():
