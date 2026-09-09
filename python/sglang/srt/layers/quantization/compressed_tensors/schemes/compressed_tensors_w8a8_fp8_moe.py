@@ -52,7 +52,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
-        self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
+        moe_runner_backend = get_moe_runner_backend()
+        self.use_flashinfer_trtllm = moe_runner_backend.is_flashinfer_trtllm()
+        self.use_flashinfer_trtllm_per_channel = (
+            self.use_flashinfer_trtllm
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
+        )
 
         per_tensor = (
             self.weight_quant.strategy == QuantizationStrategy.TENSOR
@@ -69,6 +74,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         else:
             self.weight_block_size = None
         self.block_quant = self.weight_block_size is not None
+
+        if moe_runner_backend.is_flashinfer_trtllm_routed() and not per_channel:
+            raise ValueError(
+                "The flashinfer_trtllm_routed backend supports compressed-tensors "
+                "FP8 only with per-channel weights and dynamic per-token activations."
+            )
 
         self.static_input_scales = not self.input_quant.dynamic
         if self.static_input_scales and per_channel:
@@ -338,6 +349,15 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 swap_w13_to_w31(layer.w13_weight_scale.data),
                 requires_grad=False,
             )
+        elif (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and self.use_flashinfer_trtllm_per_channel
+        ):
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                align_fp8_per_channel_moe_weights_for_flashinfer_trtllm,
+            )
+
+            align_fp8_per_channel_moe_weights_for_flashinfer_trtllm(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -428,6 +448,45 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     a2_scale=layer.w2_input_scale,
                     block_shape=self.weight_block_size,
                 )
+            return self.runner.run(dispatch_output, quant_info)
+        elif (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and self.use_flashinfer_trtllm_per_channel
+        ):
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                get_activation_type,
+            )
+            from sglang.srt.layers.moe.utils import RoutingMethodType
+
+            routing_method_type = layer.routing_method_type
+            if routing_method_type is None:
+                raise ValueError(
+                    "FlashInfer TRT-LLM per-channel FP8 MoE requires an explicit "
+                    "routing_method_type."
+                )
+            quant_info = FlashInferTrtllmFp8MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                global_num_experts=layer.num_experts,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=layer.num_local_experts,
+                intermediate_size=layer.w2_weight.shape[2],
+                routing_method_type=int(routing_method_type),
+                block_quant=False,
+                per_channel_quant=True,
+                w13_per_channel_weight_scale=layer.w13_per_channel_weight_scale,
+                w2_per_channel_weight_scale=layer.w2_per_channel_weight_scale,
+                output1_scales_scalar=layer.output1_scales_scalar,
+                output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
+                output2_scales_scalar=layer.output2_scales_scalar,
+                use_routing_scales_on_input=(
+                    routing_method_type == RoutingMethodType.Llama4
+                ),
+                activation_type=get_activation_type(
+                    moe_runner_config.activation,
+                    is_gated=moe_runner_config.is_gated,
+                ),
+            )
             return self.runner.run(dispatch_output, quant_info)
         else:
             quant_info = TritonMoeQuantInfo(
