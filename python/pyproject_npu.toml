@@ -65,7 +65,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xxhash",
-  "xgrammar==0.2.1",
+  "xgrammar==0.2.6",
   "memfabric-hybrid==1.1.4",
   "memfabric-zbal==1.2.0",
 ]
