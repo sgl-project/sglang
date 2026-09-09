@@ -11,6 +11,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_world_group
 from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.runner_utils.pool import graph_pool_borrow_enabled
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -84,6 +85,13 @@ def compute_post_capture_kv_resize(
                 get_device_memory_capacity(model_runner.device)
             )
             / 1024,
+        )
+    if not graph_pool_borrow_enabled():
+        # Borrowing serves the sampling temporaries out of idle graph storage;
+        # without it they need real headroom the KV pool must not claim.
+        headroom_gb = max(
+            headroom_gb,
+            model_runner.sampling_prewarm_result.sampling_headroom_bytes / (1 << 30),
         )
     mm_reservation_gb = mm_runtime_reservation_gb(
         is_multimodal=model_runner.model_config.is_multimodal,

@@ -55,7 +55,6 @@ def _init_npu_conv_state(
 
 
 class NPUMHATokenToKVPool(MHATokenToKVPool):
-
     def __init__(
         self,
         size: int,
@@ -356,7 +355,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
     # NPUMHATokenToKVPool stores buffers as
     #   (num_pages, page_size, head_num, head_dim)            # use_fia=False
     #   (num_pages*page_size, 1, head_num, head_dim)          # use_fia=True
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.npu.synchronize()
         buf_of_layers = []
         for local_layer_id in range(self.layer_num):
@@ -371,7 +370,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         torch.npu.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
@@ -523,7 +524,6 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
-
     def __init__(
         self,
         size: int,
@@ -552,33 +552,42 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self.enable_sparsity_driven_kv_offload = (
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+        )
+        if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
+            raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
 
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.kv_lora_rank,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.v_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.qk_rope_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
+            if self.enable_sparsity_driven_kv_offload:
+                self.k_buffer = None
+                self.v_buffer = None
+            else:
+                self.k_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.kv_lora_rank,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self.v_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.qk_rope_head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
@@ -596,22 +605,34 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
-        assert hasattr(self, "k_buffer")
-        assert hasattr(self, "v_buffer")
         kv_size_bytes = 0
-        for k_cache in self.k_buffer:
-            kv_size_bytes += get_tensor_size_bytes(k_cache)
-        for v_cache in self.v_buffer:
-            kv_size_bytes += get_tensor_size_bytes(v_cache)
-        if self.index_head_dim is not None:
-            assert hasattr(self, "index_k_buffer")
+
+        if getattr(self, "k_buffer", None) is not None:
+            for k_cache in self.k_buffer:
+                kv_size_bytes += get_tensor_size_bytes(k_cache)
+        if getattr(self, "v_buffer", None) is not None:
+            for v_cache in self.v_buffer:
+                kv_size_bytes += get_tensor_size_bytes(v_cache)
+        if getattr(self, "index_k_buffer", None) is not None:
             for index_k_cache in self.index_k_buffer:
                 kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
 
+    def _raise_if_native_kv_cache_disabled(self):
+        if (
+            getattr(self, "k_buffer", None) is None
+            or getattr(self, "v_buffer", None) is None
+        ):
+            raise RuntimeError(
+                "Native NPU MLA device KV cache is disabled; "
+                "k_buffer/v_buffer are not available. Use the sparse KV manager "
+                "path, or re-enable native device KV cache for this code path."
+            )
+
     def get_kv_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        self._raise_if_native_kv_cache_disabled()
         return (
             self.k_buffer[layer_id - self.start_layer],
             self.v_buffer[layer_id - self.start_layer],
@@ -628,6 +649,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        self._raise_if_native_kv_cache_disabled()
 
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
@@ -636,6 +658,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        self._raise_if_native_kv_cache_disabled()
 
         if self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
@@ -644,6 +667,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_index_k_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if getattr(self, "index_k_buffer", None) is None:
+            raise RuntimeError("NPU MLA index KV cache is not allocated.")
 
         if self.store_dtype != self.dtype:
             return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
@@ -651,6 +676,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     # for disagg
     def get_contiguous_buf_infos(self):
+        self._raise_if_native_kv_cache_disabled()
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
         kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
             self.v_buffer[i].data_ptr() for i in range(self.layer_num)
@@ -681,6 +707,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
+        self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
@@ -745,7 +772,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             out.append(layer_chunks)
         return out
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.npu.synchronize()
         buf_of_layers = []
         has_ik = self.index_head_dim is not None
@@ -763,7 +790,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         torch.npu.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         has_ik = self.index_head_dim is not None
