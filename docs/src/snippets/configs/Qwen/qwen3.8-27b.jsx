@@ -28,10 +28,11 @@ export const config = {
   ],
 
   // Every cell pins `--kv-cache-dtype fp8_e4m3` at the maintainers' direction
-  // (sign-off recorded in the PR description). NVFP4: a no-op made visible
-  // (the checkpoint's `kv_cache_quant_algo: FP8` already resolved `auto` to
-  // fp8_e4m3). BF16/FP8: a real quality/capacity trade — halves
-  // kv_bytes_per_token but those checkpoints carry no fp8 KV calibration.
+  // (sign-off recorded in the PR description). The two RadixArk NVFP4 exports:
+  // a no-op made visible (their `kv_cache_quant_algo: FP8` already resolved
+  // `auto` to fp8_e4m3). BF16/FP8 and the NVIDIA NVFP4 export: a real
+  // quality/capacity trade — halves kv_bytes_per_token, and those checkpoints
+  // declare no KV scheme at all, so `auto` would leave the pool in bf16.
   //
   // Speculative decoding and GDN state precision are orthogonal knobs, so
   // they are overlay rows, not match dims (3 x 2 would turn 12 cells into
@@ -51,6 +52,15 @@ export const config = {
       // BF16-head recipes verbatim.
       { id: "nvfp4-bf16-head", label: "NVFP4-BF16-Head" },
       { id: "nvfp4-fp4-head",  label: "NVFP4-FP4-Head"  },
+      // NVIDIA's own ModelOpt export of the same W4A4 body: identical
+      // quantized-layer map (401 layers, FP8 attention projections + NVFP4
+      // MLPs), identical tensor set, identical 21.9GB on disk, and the same
+      // FP4-packed lm_head as RadixArk/Qwen3.8-27B-NVFP4 — so every cell
+      // reuses that checkpoint's recipe verbatim. The one difference is that
+      // it declares no `kv_cache_scheme`, so `--kv-cache-dtype auto` resolves
+      // to bf16 here rather than fp8_e4m3; the cells pin fp8_e4m3 explicitly,
+      // which makes the launch command and the KV pool identical either way.
+      { id: "nvfp4-nvidia",    label: "NVFP4-NVIDIA"    },
     ] },
     { id: "nodes", title: "Nodes", options: [
       { id: "single", label: "Single Node" },
@@ -235,7 +245,8 @@ export const config = {
           //     clears prefill CUDA-graph capture, for either draft model.
           //     Measured across 0.86-0.96 at both chunk sizes, plus balanced-
           //     ratio overrides to 20.
-          //   FP4 head  — the packed head frees that headroom back: DSpark
+          //   FP4 head  — either FP4-head export (RadixArk or NVIDIA; same
+          //     packed head, same footprint) frees that headroom back: DSpark
           //     serves at 0.89 on the balanced ratio and DFlash2 High-Throughput
           //     at 0.895 with the ratio overridden to 10. Only DFlash2
           //     Low-Latency stays out of reach: S=5 fp32 slots plus a full
@@ -268,6 +279,7 @@ export const config = {
     "default|fp8":   "Qwen/Qwen3.8-27B-FP8",
     "default|nvfp4-bf16-head": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
     "default|nvfp4-fp4-head":  "RadixArk/Qwen3.8-27B-NVFP4",
+    "default|nvfp4-nvidia":    "nvidia/Qwen3.8-27B-NVFP4",
   },
 
   placeholders: {
@@ -462,9 +474,10 @@ export const config = {
       // is the H200-validated setting: SM90 prefill is fast enough that a big
       // chunk stalls decode far less than on SM120, and the SM90 FlashInfer GDN
       // prefill default engages under it (fp32 state pool, chunk <= 32768).
-      // No NVFP4 cell on this card: SM90 has no FP4 tensor cores, so the W4A4
-      // checkpoint's MLP would fall back to the Marlin W4A16 weight-only path —
-      // runnable, but not a recipe this page ships.
+      // No NVFP4 cell on this card, for any of the three exports: SM90 has no
+      // FP4 tensor cores, so a W4A4 checkpoint's MLP would fall back to the
+      // Marlin W4A16 weight-only path — runnable, but not a recipe this page
+      // ships.
       match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
       // DFLASH2 has not been exercised on this platform; every other overlay
@@ -535,6 +548,27 @@ export const config = {
       // ~16.5GB of weights, fp8 KV auto-enabled by the checkpoint.
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4-fp4-head", nodes: "single" },
       verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
+        "--mem-fraction-static 0.85",
+        "--attention-backend flashinfer",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // NVIDIA's ModelOpt export of the same W4A4 body and FP4 lm_head as the
+      // RadixArk FP4-head checkpoint above, so it reuses that recipe verbatim.
+      // The SM120 grid has not been re-run against it, hence the badge.
+      match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -653,6 +687,38 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
+    {
+      // NVIDIA's ModelOpt export: same body, same FP4 lm_head, same 21.9GB of
+      // weights as the RadixArk FP4-head checkpoint, so the 32GB fit and every
+      // mem-fraction pin the overlay rows apply carry over unchanged. Those
+      // pins were measured on the RadixArk export, not this one, hence the badge.
+      match: { hw: "rtx5090", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      // Rendered with the cell so nobody ships the bs=1 pins into a
+      // multi-user deployment unaware.
+      warn:
+        "This recipe serves ONE request at a time: --max-running-requests 1 " +
+        "and --cuda-graph-max-bs-decode 1 pin it to the validated single-stream " +
+        "envelope. To handle more concurrent requests, raise both flags " +
+        "together and re-derive --mamba-full-memory-ratio (and mem-fraction) " +
+        "with the [Mamba ratio calculator](#mamba-ratio-calculator) — on this " +
+        "32GB card the GDN state pool, not KV, is what runs out first.",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
+        "--mem-fraction-static 0.9",
+        "--attention-backend flashinfer",
+        "--max-running-requests 1",
+        "--cuda-graph-max-bs-decode 1",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     // DGX Spark (GB10, SM121): single node, 128GB coherent unified memory
     // shared with the CPU — every checkpoint fits, so all three quants get a
     // cell. These cells reuse the RTX PRO 6000 recipe at one lower
@@ -706,6 +772,27 @@ export const config = {
       // included — its selector folded into the draft CUDA graph in all four
       // of its cells here.
       verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
+        "--mem-fraction-static 0.80",
+        "--attention-backend flashinfer",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // NVIDIA's ModelOpt export of the same W4A4 body as the RadixArk FP4-head
+      // checkpoint, on that cell's recipe. It was not part of the 1cf2b8c GB10
+      // sweep, so it does not inherit that platform's boot-and-serve coverage.
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -788,6 +875,28 @@ export const config = {
       // Same recipe as the BF16-head cell above: the FP4 head is smaller,
       // so anything that fits the bf16 head fits here with room to spare.
       match: { hw: "gb300", variant: "default", quant: "nvfp4-fp4-head", nodes: "single" },
+      verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // NVIDIA's ModelOpt export of the same W4A4 body and FP4 lm_head as the
+      // RadixArk FP4-head checkpoint above, on that cell's recipe.
+      match: { hw: "gb300", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
       verified: true,
       // DFLASH2 has not been exercised on this platform; every other overlay
       // pick keeps this cell's original validation.

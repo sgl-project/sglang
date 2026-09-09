@@ -176,18 +176,34 @@ context from earlier messages.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Same body, `lm_head` left dense in BF16</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead">RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead</a></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.8-27B-NVFP4 (NVIDIA)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA's ModelOpt export of the same W4A4 body, `lm_head` packed to FP4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4">nvidia/Qwen3.8-27B-NVFP4</a></td>
+    </tr>
   </tbody>
 </table>
 
-The two NVFP4 exports differ only in the `lm_head`: one packs it to FP4, the
-other leaves it dense in BF16. The dense head is ~1.7 GB larger on disk and
-~3.2 GB larger at runtime, so it is the harder of the two to fit — every
+The two RadixArk NVFP4 exports differ only in the `lm_head`: one packs it to
+FP4, the other leaves it dense in BF16. The dense head is ~1.7 GB larger on disk
+and ~3.2 GB larger at runtime, so it is the harder of the two to fit — every
 recipe on this page was measured against it, and the FP4-head cells reuse
 those pins unchanged.
 
-Both NVFP4 checkpoints declare `kv_cache_quant_algo: FP8`; SGLang's default
-`--kv-cache-dtype auto` honors it, so the KV pool runs in `fp8_e4m3` with the
-checkpoint's calibration scales automatically.
+NVIDIA's own export is that same W4A4 body with that same FP4 head: identical
+quantized-layer map (FP8 attention and GDN projections, NVFP4 MLPs), identical
+tensor set, identical 21.9 GB on disk. Its cells therefore reuse the FP4-head
+pins unchanged too. It has been verified on GB300; the RTX PRO 6000, RTX 5090
+and DGX Spark cells have not been re-run against it and carry the
+**Final Verification In Progress** badge.
+
+The two RadixArk checkpoints declare `kv_cache_quant_algo: FP8`, so SGLang's
+default `--kv-cache-dtype auto` already puts their KV pool in `fp8_e4m3`. The
+NVIDIA export ships no `kv_cache_scheme`, so `auto` would leave its pool in
+BF16 instead. Every recipe on this page pins `--kv-cache-dtype fp8_e4m3`
+explicitly, so all three run the same `fp8_e4m3` pool regardless; the
+difference only shows up if you switch the Playground's **KV Cache Precision**
+row back to Auto.
 
 ## 2. Configuration Tips
 
@@ -216,13 +232,13 @@ checkpoint's calibration scales automatically.
   in `/proc/meminfo` instead; and the BF16 checkpoint takes ~6.5 minutes just
   to load its 18 shards from NVMe, so budget ~10 minutes to READY before
   calling a boot hung.
-- **H200 (SM90)**: BF16 and FP8 only — the card has no FP4 tensor cores, so the
-  NVFP4 checkpoint's MLP would fall back to the Marlin W4A16 weight-only path
-  and its cell is greyed out. The H200 recipes use 32768-token prefill chunks
-  (SM90 prefill is fast enough that a big chunk barely stalls decode, unlike
-  the SM120 guidance below), and the FlashInfer GDN prefill backend engages by
-  default under them. `--attention-backend fa3` is a valid alternative,
-  measured slightly faster at bs=1.
+- **H200 (SM90)**: BF16 and FP8 only — the card has no FP4 tensor cores, so an
+  NVFP4 checkpoint's MLP would fall back to the Marlin W4A16 weight-only path,
+  and all three NVFP4 cells are greyed out. The H200 recipes use 32768-token
+  prefill chunks (SM90 prefill is fast enough that a big chunk barely stalls
+  decode, unlike the SM120 guidance below), and the FlashInfer GDN prefill
+  backend engages by default under them. `--attention-backend fa3` is a valid
+  alternative, measured slightly faster at bs=1.
 - **MTP**: `--speculative-algorithm EAGLE --speculative-num-steps 3
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` uses the
   in-checkpoint MTP head. (This recipe was originally documented with `NEXTN`,
