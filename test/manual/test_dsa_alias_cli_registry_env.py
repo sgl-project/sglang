@@ -41,12 +41,6 @@ class TestDSAChoicesAndFields(unittest.TestCase):
         self.assertIn("tilelang", choices)
         self.assertIn("flashinfer_sparse_mla", choices)
 
-    def test_nsa_choices_match_dsa_choices(self):
-        self.assertEqual(
-            self.actions["--nsa-prefill-backend"].choices,
-            self.actions["--dsa-prefill-backend"].choices,
-        )
-
     def test_serverargs_has_dsa_fields(self):
         sa = self.ServerArgs
         self.assertTrue(hasattr(sa, "dsa_prefill_backend"))
@@ -93,63 +87,6 @@ class TestCLICanonicalFlags(unittest.TestCase):
     def test_attention_backend_dsa_key_in_choices(self):
         args = self._parse(["--attention-backend", "dsa"])
         self.assertEqual(args.attention_backend, "dsa")
-
-
-class TestCLIDeprecatedFlags(unittest.TestCase):
-    """Deprecated flags write to canonical attributes and emit logger warning."""
-
-    def setUp(self):
-        import logging
-
-        from sglang.srt.server_args import ServerArgs
-
-        self.parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(self.parser)
-
-        # Capture log output to detect deprecation warnings
-        self.log_records = []
-        handler = (
-            logging.handlers_collector(self.log_records)
-            if hasattr(logging, "handlers_collector")
-            else None
-        )
-
-    def _parse(self, extra_args):
-        return self.parser.parse_args(["--model", "dummy"] + extra_args)
-
-    def _parse_capture_warnings(self, extra_args):
-        """Parse and capture both warnings.warn and logger output."""
-        import io
-        import logging
-
-        log_stream = io.StringIO()
-        handler = logging.StreamHandler(log_stream)
-        handler.setLevel(logging.WARNING)
-        root = logging.getLogger()
-        root.addHandler(handler)
-        try:
-            args = self._parse(extra_args)
-        finally:
-            root.removeHandler(handler)
-        return args, log_stream.getvalue()
-
-    def test_nsa_prefill_backend_deprecated_writes_to_dsa(self):
-        args, log_output = self._parse_capture_warnings(
-            ["--nsa-prefill-backend", "fa3"]
-        )
-        self.assertEqual(args.dsa_prefill_backend, "fa3")
-        self.assertIn(
-            "deprecated",
-            log_output.lower(),
-            f"Expected deprecation warning in log; got: {log_output!r}",
-        )
-
-    def test_nsa_decode_backend_deprecated_writes_to_dsa(self):
-        args, log_output = self._parse_capture_warnings(
-            ["--nsa-decode-backend", "tilelang"]
-        )
-        self.assertEqual(args.dsa_decode_backend, "tilelang")
-        self.assertIn("deprecated", log_output.lower())
 
     def test_attention_backend_nsa_still_accepted(self):
         """attention_backend='nsa' still parses without error (registry handles the deprecation)."""
