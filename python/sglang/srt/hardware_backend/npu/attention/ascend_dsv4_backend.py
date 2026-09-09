@@ -2981,24 +2981,10 @@ class DeepseekV4AscendAttnBackend(
             slots_j = (
                 self.req_to_token[r, j * ratio].to(torch.int64) // ratio
             )
-            # NPU stores indexer K in PA_ND buffer (bf16 or fp8 on A5).
-            # NPU does not support indexing on FP8, so view as uint8 first.
-            compress_ratio = layer.compress_ratio
-            indexer_pool = pool._indexer_pool(compress_ratio)
-            if hasattr(indexer_pool, "index_k_buffer"):
-                source = pool.latent_source_layer(layer.layer_id)
-                source_slot = pool.low_ratio_sources[compress_ratio].index(source)
-                buf = indexer_pool.get_index_k(source_slot)
-                d = buf.shape[-1]
-                if buf.dtype == torch.float8_e4m3fn:
-                    gathered = buf.view(torch.uint8).reshape(-1, d)[slots_j]
-                    index_k = gathered.view(torch.float8_e4m3fn).to(torch.bfloat16)
-                else:
-                    index_k = buf.reshape(-1, d)[slots_j].to(torch.bfloat16)
-            else:
-                index_k = pool.get_low_ratio_index_k_dequant(
-                    layer.layer_id, slots_j
-                )
+            # Dequantize indexer K (handles FP8+scale on A5, int8+scale on older NPUs).
+            index_k = pool.get_low_ratio_index_k_dequant(
+                layer.layer_id, slots_j
+            )
             k = min(topk, lc)
             idx, reach, masks = topk_from_scores(
                 indexer.scores(q[tok], index_k, weights[tok]),

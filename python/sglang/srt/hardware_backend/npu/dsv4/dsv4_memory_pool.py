@@ -260,7 +260,10 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         if slots is None:
             slots = torch.arange(total_slots, device=k_buf.device)
         slots = slots.to(torch.int64)
-        k_vals = k_buf.reshape(-1, k_buf.shape[-1])[slots]
+        if k_buf.dtype == torch.float8_e4m3fn:
+            k_vals = k_buf.view(torch.uint8).reshape(-1, k_buf.shape[-1])[slots].view(torch.float8_e4m3fn)
+        else:
+            k_vals = k_buf.reshape(-1, k_buf.shape[-1])[slots]
         scale_vals = scale_buf.reshape(-1)[slots]
         return (k_vals.to(torch.float32) * scale_vals.unsqueeze(-1)).to(
             torch.bfloat16
