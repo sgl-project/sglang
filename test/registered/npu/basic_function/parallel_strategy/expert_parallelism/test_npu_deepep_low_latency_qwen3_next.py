@@ -41,7 +41,7 @@ class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "--watchdog-timeout",
         9000,
         "--disable-radix-cache",
-        "--cuda-graph-bs",
+        "--cuda-graph-bs-decode",
         2,
         4,
         6,

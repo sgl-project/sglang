@@ -123,7 +123,7 @@ do
         --dp-size 32 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 1 \
+        --cuda-graph-bs-decode 1 \
         --disable-radix-cache \
         --speculative-algorithm EAGLE3 \
         --speculative-draft-model-path $DRAFT_MODEL_PATH \
@@ -305,7 +305,7 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 1 2 4 6 8 16 \
+        --cuda-graph-bs-decode 1 2 4 6 8 16 \
         --speculative-algorithm EAGLE3 \
         --speculative-draft-model-path $DRAFT_MODEL_PATH \
         --speculative-num-steps 3 \
@@ -504,7 +504,7 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 1 2 4 6 8 16 \
+        --cuda-graph-bs-decode 1 2 4 6 8 16 \
         --speculative-algorithm EAGLE3 \
         --speculative-draft-model-path $DRAFT_MODEL_PATH \
         --speculative-num-steps 3 \
@@ -702,7 +702,7 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 16 \
+        --cuda-graph-bs-decode 16 \
         --reasoning-parser kimi_k2 \
         --tool-call-parser kimi_k2 \
         --speculative-algorithm EAGLE3 \
@@ -896,7 +896,7 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 1 2 4 6 8 \
+        --cuda-graph-bs-decode 1 2 4 6 8 \
         --reasoning-parser kimi_k2 \
         --tool-call-parser kimi_k2 \
         --speculative-algorithm EAGLE3 \
