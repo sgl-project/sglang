@@ -473,6 +473,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
             dtype = kvc.kv_cache_dtype if kv_cache_dtype is None else kv_cache_dtype
+            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
