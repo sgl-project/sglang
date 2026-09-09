@@ -1984,6 +1984,22 @@ def override_platform(**facts: Any) -> _PlatformOverride:
 # config it derives from (always the process's, i.e. the target's).
 
 
+def linear_attn_tp_size() -> int:
+    """Linear-attention head width, including CP when prefill CP is enabled."""
+    parallel = get_parallel()
+    if not parallel.enable_linear_attn_cp:
+        return parallel.attn_tp_size
+    return parallel.attn_tp_size * parallel.attn_cp_size
+
+
+def linear_attn_tp_rank() -> int:
+    """Head-shard rank in CP-major, attention-TP-minor weight-loader order."""
+    parallel = get_parallel()
+    if not parallel.enable_linear_attn_cp:
+        return parallel.attn_tp_rank
+    return parallel.attn_cp_rank * parallel.attn_tp_size + parallel.attn_tp_rank
+
+
 def mamba_cache_chunk_size() -> int:
     """The caching point granularity for mamba state: ``max(the model's mamba
     chunk size, page_size)``. Cached on the config after the first call."""
