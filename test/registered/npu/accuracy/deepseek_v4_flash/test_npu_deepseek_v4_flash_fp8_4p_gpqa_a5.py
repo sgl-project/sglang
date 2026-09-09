@@ -75,7 +75,7 @@ DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     131072,
     "--max-prefill-tokens",
     131072,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,
