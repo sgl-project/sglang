@@ -79,7 +79,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--kv-cache-dtype",
     "bfloat16",
     "--skip-server-warmup",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,
