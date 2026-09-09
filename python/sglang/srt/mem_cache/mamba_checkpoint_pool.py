@@ -403,8 +403,6 @@ def maybe_init_int8_mamba_checkpoint_pool(
             if i != dim:
                 others *= int(s)
         ple_extra += (ckpt_size + 1) * others * t.element_size()
-    kwargs["ple_side_states"] = list(ple_side_states or [])
-
     est = MambaCheckpointPool.estimate_mem_usage_bytes(
         **kwargs, ple_extra_bytes=ple_extra
     )
@@ -429,7 +427,9 @@ def maybe_init_int8_mamba_checkpoint_pool(
             f"(currently {ckpt_size}) or --mem-fraction-static."
         )
 
-    pool = MambaCheckpointPool(device=device, **kwargs)
+    pool = MambaCheckpointPool(
+        device=device, ple_side_states=list(ple_side_states or []), **kwargs
+    )
     # NOTE: this pool's HBM is NOT subtracted from the KV-cache budget
     # (max_total_num_tokens); it is allocated from --mem-fraction-static headroom.
     # The estimate check above guards against an oversized pool; accounting it in
