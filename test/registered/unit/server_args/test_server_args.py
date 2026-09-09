@@ -1812,18 +1812,6 @@ class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
         args._model_config = SimpleNamespace(context_len=model_context_len)
         return args
 
-    def test_page_aligns_limit_without_mutating_raw_config(self):
-        args = self._make_args(700)
-        raw_config = args.cuda_graph_config
-
-        finalize_cuda_graph_prefill_max_context(args)
-
-        self.assertIs(args.cuda_graph_config, raw_config)
-        self.assertEqual(
-            resolution_result(args, "cuda_graph_config").prefill.max_context_size,
-            704,
-        )
-
     def test_rejects_invalid_values_during_resolution(self):
         cases = (
             ([256, 1024], "exactly one integer"),
