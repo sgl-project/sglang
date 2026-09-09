@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <torch/extension.h>
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/utils.cuh>
+
+#include <dlpack/dlpack.h>
+#include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <tuple>
+#include <utility>
+
+namespace sglang {
 
 namespace {
 
@@ -343,223 +349,398 @@ __global__ void mxfp4_marlin_repack_scale_kernel(
   output[static_cast<int64_t>(target_slots[batch]) * output_stride + index] = value;
 }
 
-void mxfp4_marlin_repack(
-    torch::Tensor raw,
-    torch::Tensor source_slots,
-    torch::Tensor target_slots,
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Host layer
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// \brief What `verify_matvec_inputs` learned about a validated operand set.
+struct MatvecOperands {
+  int64_t records;
+  int64_t cache_bytes;
+  DLDataType dtype;
+  DLDevice device;
+  bool is_bf16;
+};
+
+/**
+ * \brief Validate the operands shared by both matvec entry points.
+ *
+ * The check order is deliberate: `input_size` is the value every later
+ * computation is derived from, so its divisibility is reported before the
+ * role-byte arithmetic that a bad `input_size` would also make wrong.
+ *
+ * \return The record count, per-slot cache width, dtype, device, and which of
+ *         the two supported element types was passed.
+ */
+auto verify_matvec_inputs(
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView cache,
+    tvm::ffi::TensorView slot_ids,
     int64_t role_bytes,
-    int64_t hidden_size,
-    int64_t intermediate_size,
-    torch::Tensor w13,
-    torch::Tensor w2,
-    torch::Tensor w13_scale,
-    torch::Tensor w2_scale) {
-  TORCH_CHECK(raw.is_cuda() && source_slots.is_cuda() && target_slots.is_cuda(), "repack inputs must be CUDA tensors");
-  TORCH_CHECK(raw.scalar_type() == at::kByte && raw.dim() == 2, "raw cache must be a uint8 matrix");
-  TORCH_CHECK(
-      source_slots.scalar_type() == at::kInt && target_slots.scalar_type() == at::kInt, "slot ids must be int32");
-  TORCH_CHECK(source_slots.numel() == target_slots.numel(), "slot id size mismatch");
-  TORCH_CHECK(w13.scalar_type() == at::kInt && w2.scalar_type() == at::kInt, "Marlin weights must be int32");
-  TORCH_CHECK(
-      w13_scale.scalar_type() == at::kByte && w2_scale.scalar_type() == at::kByte,
-      "Marlin scales must be uint8 storage");
-  TORCH_CHECK(hidden_size % 32 == 0 && intermediate_size % 32 == 0, "MXFP4 dimensions must be divisible by 32");
-  const int batch = static_cast<int>(source_slots.numel());
-  if (batch == 0) return;
-  const int threads = 256;
-  const auto stream = at::cuda::getCurrentCUDAStream();
-  const int w13_n = static_cast<int>(2 * intermediate_size);
-  const int w2_n = static_cast<int>(hidden_size);
-  const int w13_k = static_cast<int>(hidden_size);
-  const int w2_k = static_cast<int>(intermediate_size);
-  const int64_t w13_words = static_cast<int64_t>(w13_k / kMarlinTileK) * w13_n * 2;
-  const int64_t w2_words = static_cast<int64_t>(w2_k / kMarlinTileK) * w2_n * 2;
-  const int64_t w13_scales = static_cast<int64_t>(w13_k / kQuantBlock) * w13_n;
-  const int64_t w2_scales = static_cast<int64_t>(w2_k / kQuantBlock) * w2_n;
-  mxfp4_marlin_repack_weight_kernel<<<dim3((w13_words + threads - 1) / threads, batch), threads, 0, stream>>>(
-      raw.data_ptr<uint8_t>(),
-      raw.stride(0),
-      source_slots.data_ptr<int32_t>(),
-      target_slots.data_ptr<int32_t>(),
-      role_bytes,
-      w13_k,
-      w13_n,
-      true,
-      w13.data_ptr<int32_t>(),
-      w13.stride(0));
-  mxfp4_marlin_repack_weight_kernel<<<dim3((w2_words + threads - 1) / threads, batch), threads, 0, stream>>>(
-      raw.data_ptr<uint8_t>(),
-      raw.stride(0),
-      source_slots.data_ptr<int32_t>(),
-      target_slots.data_ptr<int32_t>(),
-      role_bytes,
-      w2_k,
-      w2_n,
-      false,
-      w2.data_ptr<int32_t>(),
-      w2.stride(0));
-  mxfp4_marlin_repack_scale_kernel<<<dim3((w13_scales + threads - 1) / threads, batch), threads, 0, stream>>>(
-      raw.data_ptr<uint8_t>(),
-      raw.stride(0),
-      source_slots.data_ptr<int32_t>(),
-      target_slots.data_ptr<int32_t>(),
-      role_bytes,
-      w13_k,
-      w13_n,
-      true,
-      w13_scale.data_ptr<uint8_t>(),
-      w13_scale.stride(0));
-  mxfp4_marlin_repack_scale_kernel<<<dim3((w2_scales + threads - 1) / threads, batch), threads, 0, stream>>>(
-      raw.data_ptr<uint8_t>(),
-      raw.stride(0),
-      source_slots.data_ptr<int32_t>(),
-      target_slots.data_ptr<int32_t>(),
-      role_bytes,
-      w2_k,
-      w2_n,
-      false,
-      w2_scale.data_ptr<uint8_t>(),
-      w2_scale.stride(0));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+    int64_t input_size,
+    int64_t output_size,
+    int64_t records_per_input) -> MatvecOperands {
+  using namespace host;
+
+  auto rows = SymbolicSize{"input_rows"};
+  auto records = SymbolicSize{"records"};
+  auto slots = SymbolicSize{"cache_slots"};
+  auto cache_bytes = SymbolicSize{"cache_bytes_per_slot"};
+  auto dtype = SymbolicDType{};
+  auto device = SymbolicDevice{};
+
+  TensorMatcher({rows, input_size})  //
+      .with_dtype<fp16_t, bf16_t>(dtype)
+      .with_device<kDLCUDA>(device)
+      .verify(input);
+
+  CHECK_HOST(input_size > 0 && input_size % kQuantBlock == 0)
+      << "input_size must be divisible by 32, got " << input_size;
+  CHECK_HOST(records_per_input > 0) << "records_per_input must be positive, got " << records_per_input;
+
+  TensorMatcher({slots, cache_bytes})  //
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(cache);
+  TensorMatcher({records})  //
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(slot_ids);
+
+  CHECK_HOST(records.unwrap() == rows.unwrap() * records_per_input)
+      << "slot count does not match input rows and records_per_input: " << records.unwrap() << " != " << rows.unwrap()
+      << " * " << records_per_input;
+
+  const int64_t expected_role_bytes = output_size * (input_size / kQuantBlock) * kBlockBytes;
+  CHECK_HOST(role_bytes == expected_role_bytes)
+      << "role byte count does not match matrix dimensions: " << role_bytes << " != " << expected_role_bytes;
+
+  return MatvecOperands{
+      records.unwrap(), cache_bytes.unwrap(), dtype.unwrap(), device.unwrap(), dtype.is_type<bf16_t>()};
 }
 
-torch::Tensor mxfp4_matvec(
-    torch::Tensor input,
-    torch::Tensor cache,
-    torch::Tensor slot_ids,
+/// \brief Check that one role's byte range lies inside every cache slot.
+void verify_role_range(int64_t role_offset, int64_t role_bytes, int64_t cache_bytes, const char* name) {
+  CHECK_HOST(role_offset >= 0 && role_offset + role_bytes <= cache_bytes)
+      << name << " role range is outside each cache slot: [" << role_offset << ", " << role_offset + role_bytes
+      << ") not within [0, " << cache_bytes << ")";
+}
+
+/// \brief The launch geometry both matvec kernels use: one warp group per row tile, one block row per record.
+auto matvec_launch_shape(int64_t output_size, int64_t records) -> std::pair<dim3, dim3> {
+  constexpr uint32_t kRowsPerBlock = kWarpsPerBlock * kRowsPerWarp;
+  const dim3 grid(host::div_ceil(static_cast<uint32_t>(output_size), kRowsPerBlock), static_cast<uint32_t>(records));
+  const dim3 block(kWarpsPerBlock * device::kWarpThreads);
+  return {grid, block};
+}
+
+/// \brief Verify an output tensor against the shape, dtype, and device of its inputs.
+void verify_matvec_output(tvm::ffi::TensorView out, const MatvecOperands& operands, int64_t output_size) {
+  using namespace host;
+  TensorMatcher({operands.records, output_size})  //
+      .with_dtype(operands.dtype)
+      .with_device(operands.device)
+      .verify(out);
+}
+
+template <typename scalar_t>
+void launch_matvec(
+    const MatvecOperands& operands,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView cache,
+    tvm::ffi::TensorView slot_ids,
+    int64_t role_offset,
+    int64_t input_size,
+    int64_t output_size,
+    int64_t records_per_input) {
+  const auto [grid, block] = matvec_launch_shape(output_size, operands.records);
+  host::LaunchKernel(grid, block, operands.device)(
+      mxfp4_matvec_kernel<scalar_t>,
+      static_cast<const scalar_t*>(input.data_ptr()),
+      static_cast<const uint8_t*>(cache.data_ptr()),
+      cache.stride(0),
+      static_cast<const int32_t*>(slot_ids.data_ptr()),
+      role_offset,
+      static_cast<int>(input_size),
+      static_cast<int>(output_size),
+      static_cast<int>(operands.records),
+      static_cast<int>(records_per_input),
+      static_cast<scalar_t*>(out.data_ptr()));
+}
+
+template <typename scalar_t>
+void launch_matvec_dual(
+    const MatvecOperands& operands,
+    tvm::ffi::TensorView out_a,
+    tvm::ffi::TensorView out_b,
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView cache,
+    tvm::ffi::TensorView slot_ids,
+    int64_t role_offset_a,
+    int64_t role_offset_b,
+    int64_t input_size,
+    int64_t output_size,
+    int64_t records_per_input) {
+  const auto [grid, block] = matvec_launch_shape(output_size, operands.records);
+  host::LaunchKernel(grid, block, operands.device)(
+      mxfp4_matvec_dual_kernel<scalar_t>,
+      static_cast<const scalar_t*>(input.data_ptr()),
+      static_cast<const uint8_t*>(cache.data_ptr()),
+      cache.stride(0),
+      static_cast<const int32_t*>(slot_ids.data_ptr()),
+      role_offset_a,
+      role_offset_b,
+      static_cast<int>(input_size),
+      static_cast<int>(output_size),
+      static_cast<int>(operands.records),
+      static_cast<int>(records_per_input),
+      static_cast<scalar_t*>(out_a.data_ptr()),
+      static_cast<scalar_t*>(out_b.data_ptr()));
+}
+
+}  // namespace
+
+/**
+ * \brief Multiply selected raw GGUF MXFP4 matrices by BF16/FP16 rows.
+ *
+ * \param out               Output, `[records, output_size]`, same dtype as `input`.
+ * \param input             Hidden states, `[rows, input_size]`, FP16 or BF16.
+ * \param cache             Raw MXFP4 slot bank, `[slots, bytes_per_slot]` uint8.
+ * \param slot_ids          One slot per record, `[records]` int32.
+ * \param role_offset       Byte offset of the matrix within each cache slot.
+ * \param role_bytes        Byte size of one matrix; must match the dimensions.
+ * \param input_size        Columns of `input`; must be divisible by 32.
+ * \param output_size       Rows of the MXFP4 matrix.
+ * \param records_per_input How many records share one row of `input`.
+ */
+inline void mxfp4_matvec(
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView cache,
+    tvm::ffi::TensorView slot_ids,
     int64_t role_offset,
     int64_t role_bytes,
     int64_t input_size,
     int64_t output_size,
     int64_t records_per_input) {
-  TORCH_CHECK(
-      input.is_cuda() && cache.is_cuda() && slot_ids.is_cuda(), "input, cache, and slot_ids must be CUDA tensors");
-  TORCH_CHECK(
-      input.is_contiguous() && cache.is_contiguous() && slot_ids.is_contiguous(),
-      "input, cache, and slot_ids must be contiguous");
-  TORCH_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf, "input must be BF16 or FP16");
-  TORCH_CHECK(cache.scalar_type() == at::kByte && cache.dim() == 2, "cache must be a two-dimensional uint8 tensor");
-  TORCH_CHECK(
-      slot_ids.scalar_type() == at::kInt && slot_ids.dim() == 1, "slot_ids must be a one-dimensional int32 tensor");
-  TORCH_CHECK(input.dim() == 2 && input.size(1) == input_size, "input shape does not match input_size");
-  TORCH_CHECK(input_size > 0 && input_size % kQuantBlock == 0, "input_size must be divisible by 32");
-  TORCH_CHECK(records_per_input > 0, "records_per_input must be positive");
-  TORCH_CHECK(
-      slot_ids.numel() == input.size(0) * records_per_input,
-      "slot count does not match input rows and records_per_input");
-  const int64_t expected_role_bytes = output_size * (input_size / kQuantBlock) * kBlockBytes;
-  TORCH_CHECK(role_bytes == expected_role_bytes, "role byte count does not match matrix dimensions");
-  TORCH_CHECK(role_offset >= 0 && role_offset + role_bytes <= cache.size(1), "role range is outside each cache slot");
+  const auto operands =
+      verify_matvec_inputs(input, cache, slot_ids, role_bytes, input_size, output_size, records_per_input);
+  verify_role_range(role_offset, role_bytes, operands.cache_bytes, "matrix");
+  verify_matvec_output(out, operands, output_size);
 
-  const auto records = slot_ids.numel();
-  auto output = torch::empty({records, output_size}, input.options());
-  const dim3 block(kWarpsPerBlock * 32);
-  const dim3 grid((output_size + kWarpsPerBlock * kRowsPerWarp - 1) / (kWarpsPerBlock * kRowsPerWarp), records);
-  const auto stream = at::cuda::getCurrentCUDAStream();
-  if (input.scalar_type() == at::kBFloat16) {
-    mxfp4_matvec_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-        cache.data_ptr<uint8_t>(),
-        cache.stride(0),
-        slot_ids.data_ptr<int32_t>(),
-        role_offset,
-        input_size,
-        output_size,
-        records,
-        records_per_input,
-        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()));
+  // An empty batch has nothing to compute, and `records` is a grid dimension.
+  if (operands.records == 0) return;
+
+  if (operands.is_bf16) {
+    launch_matvec<bf16_t>(
+        operands, out, input, cache, slot_ids, role_offset, input_size, output_size, records_per_input);
   } else {
-    mxfp4_matvec_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const half*>(input.data_ptr()),
-        cache.data_ptr<uint8_t>(),
-        cache.stride(0),
-        slot_ids.data_ptr<int32_t>(),
-        role_offset,
-        input_size,
-        output_size,
-        records,
-        records_per_input,
-        reinterpret_cast<half*>(output.data_ptr()));
+    launch_matvec<fp16_t>(
+        operands, out, input, cache, slot_ids, role_offset, input_size, output_size, records_per_input);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return output;
 }
 
-std::tuple<torch::Tensor, torch::Tensor> mxfp4_matvec_dual(
-    torch::Tensor input,
-    torch::Tensor cache,
-    torch::Tensor slot_ids,
+/**
+ * \brief Compute gate and up projections while loading each input row once.
+ *
+ * Same contract as `mxfp4_matvec`, with two roles read per record and two
+ * outputs written. Both roles must have the same dimensions.
+ *
+ * \param out_a            Gate output, `[records, output_size]`.
+ * \param out_b            Up output, `[records, output_size]`.
+ * \param role_offset_a    Byte offset of the gate matrix within each slot.
+ * \param role_offset_b    Byte offset of the up matrix within each slot.
+ */
+inline void mxfp4_matvec_dual(
+    tvm::ffi::TensorView out_a,
+    tvm::ffi::TensorView out_b,
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView cache,
+    tvm::ffi::TensorView slot_ids,
     int64_t role_offset_a,
     int64_t role_offset_b,
     int64_t role_bytes,
     int64_t input_size,
     int64_t output_size,
     int64_t records_per_input) {
-  TORCH_CHECK(
-      input.is_cuda() && cache.is_cuda() && slot_ids.is_cuda(), "input, cache, and slot_ids must be CUDA tensors");
-  TORCH_CHECK(
-      input.is_contiguous() && cache.is_contiguous() && slot_ids.is_contiguous(),
-      "input, cache, and slot_ids must be contiguous");
-  TORCH_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf, "input must be BF16 or FP16");
-  TORCH_CHECK(cache.scalar_type() == at::kByte && cache.dim() == 2, "cache must be a two-dimensional uint8 tensor");
-  TORCH_CHECK(
-      slot_ids.scalar_type() == at::kInt && slot_ids.dim() == 1, "slot_ids must be a one-dimensional int32 tensor");
-  TORCH_CHECK(input.dim() == 2 && input.size(1) == input_size, "input shape does not match input_size");
-  TORCH_CHECK(input_size > 0 && input_size % kQuantBlock == 0, "input_size must be divisible by 32");
-  TORCH_CHECK(records_per_input > 0, "records_per_input must be positive");
-  TORCH_CHECK(
-      slot_ids.numel() == input.size(0) * records_per_input,
-      "slot count does not match input rows and records_per_input");
-  const int64_t expected_role_bytes = output_size * (input_size / kQuantBlock) * kBlockBytes;
-  TORCH_CHECK(role_bytes == expected_role_bytes, "role byte count does not match matrix dimensions");
-  TORCH_CHECK(
-      role_offset_a >= 0 && role_offset_a + role_bytes <= cache.size(1), "gate role range is outside each cache slot");
-  TORCH_CHECK(
-      role_offset_b >= 0 && role_offset_b + role_bytes <= cache.size(1), "up role range is outside each cache slot");
+  const auto operands =
+      verify_matvec_inputs(input, cache, slot_ids, role_bytes, input_size, output_size, records_per_input);
+  verify_role_range(role_offset_a, role_bytes, operands.cache_bytes, "gate");
+  verify_role_range(role_offset_b, role_bytes, operands.cache_bytes, "up");
+  verify_matvec_output(out_a, operands, output_size);
+  verify_matvec_output(out_b, operands, output_size);
 
-  const auto records = slot_ids.numel();
-  auto output_a = torch::empty({records, output_size}, input.options());
-  auto output_b = torch::empty({records, output_size}, input.options());
-  const dim3 block(kWarpsPerBlock * 32);
-  const dim3 grid((output_size + kWarpsPerBlock * kRowsPerWarp - 1) / (kWarpsPerBlock * kRowsPerWarp), records);
-  const auto stream = at::cuda::getCurrentCUDAStream();
-  if (input.scalar_type() == at::kBFloat16) {
-    mxfp4_matvec_dual_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-        cache.data_ptr<uint8_t>(),
-        cache.stride(0),
-        slot_ids.data_ptr<int32_t>(),
+  // An empty batch has nothing to compute, and `records` is a grid dimension.
+  if (operands.records == 0) return;
+
+  if (operands.is_bf16) {
+    launch_matvec_dual<bf16_t>(
+        operands,
+        out_a,
+        out_b,
+        input,
+        cache,
+        slot_ids,
         role_offset_a,
         role_offset_b,
         input_size,
         output_size,
-        records,
-        records_per_input,
-        reinterpret_cast<__nv_bfloat16*>(output_a.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(output_b.data_ptr()));
+        records_per_input);
   } else {
-    mxfp4_matvec_dual_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const half*>(input.data_ptr()),
-        cache.data_ptr<uint8_t>(),
-        cache.stride(0),
-        slot_ids.data_ptr<int32_t>(),
+    launch_matvec_dual<fp16_t>(
+        operands,
+        out_a,
+        out_b,
+        input,
+        cache,
+        slot_ids,
         role_offset_a,
         role_offset_b,
         input_size,
         output_size,
-        records,
-        records_per_input,
-        reinterpret_cast<half*>(output_a.data_ptr()),
-        reinterpret_cast<half*>(output_b.data_ptr()));
+        records_per_input);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return std::make_tuple(output_a, output_b);
 }
 
-}  // namespace
+/**
+ * \brief Repack raw GGUF MXFP4 objects into contiguous Marlin SoA cache tensors.
+ *
+ * One entry of `source_slots` / `target_slots` per object to move: the raw
+ * matrices at `source_slots[i]` are read and the Marlin-layout weights and
+ * scales for `target_slots[i]` are written. Slots absent from `target_slots`
+ * are left untouched.
+ *
+ * \param raw               Raw MXFP4 slot bank, `[source_slots, 3 * role_bytes]` uint8.
+ * \param source_slots      Row of `raw` to read per object, int32.
+ * \param target_slots      Row of the Marlin tensors to write per object, int32.
+ * \param role_bytes        Byte size of one role (gate, up, or down) per slot.
+ * \param hidden_size       Model hidden size; must be divisible by 32.
+ * \param intermediate_size Expert intermediate size; must be divisible by 32.
+ * \param w13               Marlin gate/up weights, int32.
+ * \param w2                Marlin down weights, int32.
+ * \param w13_scale         Marlin gate/up scales, uint8.
+ * \param w2_scale          Marlin down scales, uint8.
+ */
+inline void mxfp4_marlin_repack(
+    tvm::ffi::TensorView raw,
+    tvm::ffi::TensorView source_slots,
+    tvm::ffi::TensorView target_slots,
+    int64_t role_bytes,
+    int64_t hidden_size,
+    int64_t intermediate_size,
+    tvm::ffi::TensorView w13,
+    tvm::ffi::TensorView w2,
+    tvm::ffi::TensorView w13_scale,
+    tvm::ffi::TensorView w2_scale) {
+  using namespace host;
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
-  module.def("mxfp4_matvec", &mxfp4_matvec, "GGUF MXFP4 matrix-vector multiply");
-  module.def("mxfp4_matvec_dual", &mxfp4_matvec_dual, "GGUF MXFP4 gate/up matrix-vector multiply");
-  module.def("mxfp4_marlin_repack", &mxfp4_marlin_repack, "Repack raw GGUF MXFP4 objects to Marlin layout");
+  CHECK_HOST(hidden_size > 0 && hidden_size % kQuantBlock == 0)
+      << "MXFP4 dimensions must be divisible by 32, got hidden_size=" << hidden_size;
+  CHECK_HOST(intermediate_size > 0 && intermediate_size % kQuantBlock == 0)
+      << "MXFP4 dimensions must be divisible by 32, got intermediate_size=" << intermediate_size;
+
+  const int64_t w13_n = 2 * intermediate_size;
+  const int64_t w2_n = hidden_size;
+  const int64_t w13_k = hidden_size;
+  const int64_t w2_k = intermediate_size;
+  const int64_t w13_words = (w13_k / kMarlinTileK) * w13_n * 2;
+  const int64_t w2_words = (w2_k / kMarlinTileK) * w2_n * 2;
+  const int64_t w13_scales = (w13_k / kQuantBlock) * w13_n;
+  const int64_t w2_scales = (w2_k / kQuantBlock) * w2_n;
+
+  auto batch = SymbolicSize{"objects"};
+  auto source_capacity = SymbolicSize{"raw_slots"};
+  auto target_capacity = SymbolicSize{"marlin_slots"};
+  auto device = SymbolicDevice{};
+
+  TensorMatcher({source_capacity, 3 * role_bytes})  //
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(raw);
+  TensorMatcher({batch})  //
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(source_slots)
+      .verify(target_slots);
+  TensorMatcher({target_capacity, w13_words})  //
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(w13);
+  TensorMatcher({target_capacity, w2_words})  //
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(w2);
+  TensorMatcher({target_capacity, w13_scales})  //
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(w13_scale);
+  TensorMatcher({target_capacity, w2_scales})  //
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(w2_scale);
+
+  const uint32_t objects = static_cast<uint32_t>(batch.unwrap());
+  if (objects == 0) return;
+
+  constexpr uint32_t kThreads = 256;
+  const DLDevice dev = device.unwrap();
+  const auto* raw_ptr = static_cast<const uint8_t*>(raw.data_ptr());
+  const auto* source_ptr = static_cast<const int32_t*>(source_slots.data_ptr());
+  const auto* target_ptr = static_cast<const int32_t*>(target_slots.data_ptr());
+
+  LaunchKernel(dim3(div_ceil(static_cast<uint32_t>(w13_words), kThreads), objects), kThreads, dev)(
+      mxfp4_marlin_repack_weight_kernel,
+      raw_ptr,
+      raw.stride(0),
+      source_ptr,
+      target_ptr,
+      role_bytes,
+      static_cast<int>(w13_k),
+      static_cast<int>(w13_n),
+      true,
+      static_cast<int32_t*>(w13.data_ptr()),
+      w13.stride(0));
+  LaunchKernel(dim3(div_ceil(static_cast<uint32_t>(w2_words), kThreads), objects), kThreads, dev)(
+      mxfp4_marlin_repack_weight_kernel,
+      raw_ptr,
+      raw.stride(0),
+      source_ptr,
+      target_ptr,
+      role_bytes,
+      static_cast<int>(w2_k),
+      static_cast<int>(w2_n),
+      false,
+      static_cast<int32_t*>(w2.data_ptr()),
+      w2.stride(0));
+  LaunchKernel(dim3(div_ceil(static_cast<uint32_t>(w13_scales), kThreads), objects), kThreads, dev)(
+      mxfp4_marlin_repack_scale_kernel,
+      raw_ptr,
+      raw.stride(0),
+      source_ptr,
+      target_ptr,
+      role_bytes,
+      static_cast<int>(w13_k),
+      static_cast<int>(w13_n),
+      true,
+      static_cast<uint8_t*>(w13_scale.data_ptr()),
+      w13_scale.stride(0));
+  LaunchKernel(dim3(div_ceil(static_cast<uint32_t>(w2_scales), kThreads), objects), kThreads, dev)(
+      mxfp4_marlin_repack_scale_kernel,
+      raw_ptr,
+      raw.stride(0),
+      source_ptr,
+      target_ptr,
+      role_bytes,
+      static_cast<int>(w2_k),
+      static_cast<int>(w2_n),
+      false,
+      static_cast<uint8_t*>(w2_scale.data_ptr()),
+      w2_scale.stride(0));
 }
+
+}  // namespace sglang
