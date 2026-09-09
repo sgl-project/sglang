@@ -238,6 +238,7 @@ class TritonAttnBackend(AttentionBackend):
             and model_runner.spec_algorithm.is_dspark()
         )
         if self.is_hip_dspark_draft:
+            # Drafts never join the dcp group so we ignore it
             self.dcp_size = 1
             self.dcp_rank = 0
         else:
