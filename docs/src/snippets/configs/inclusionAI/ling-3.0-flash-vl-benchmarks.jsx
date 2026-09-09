@@ -50,7 +50,11 @@ export const benchmarks = [
   { match: { hw: "h100", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+    sglang_version: "dev @ bf254483a1",
+    notes: "2×H200, TP=2, E4M3 block-[128,128] kernels engaged (measured: 126.2 GB checkpoint, ~59 GB weights per GPU, healthy in 581 s including download and first-time DeepGEMM compile). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split. Full accuracy suite pending.",
+  },
   { match: { hw: "h100", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
   {
     match: { hw: "gb300", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" },
@@ -59,7 +63,11 @@ export const benchmarks = [
   },
   { match: { hw: "b300", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "h200", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" } },
+  {
+    match: { hw: "h200", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" },
+    sglang_version: "dev @ bf254483a1",
+    notes: "1×H200 (141 GB), TP=1, auto-detected compressed-tensors int4 (W4A16 Marlin MoE; 121 GB GPU memory in use incl. KV pool). Serving smoke verified: text and image requests complete with finish_reason=stop and reasoning split. Full accuracy suite pending.",
+  },
   { match: { hw: "h100", variant: "default", quant: "int4", strategy: "balanced", nodes: "single" } },
   {
     match: { hw: "gb300", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
