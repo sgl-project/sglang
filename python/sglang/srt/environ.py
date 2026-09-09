@@ -1107,6 +1107,9 @@ class Envs:
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
+    # Experimental SM120 in_proj_ba (N=48, K=5120, M=2..8). Opt-in only;
+    # deterministic/batch-invariant and explicit BF16 backends keep their path.
+    SGLANG_ENABLE_SM120_BA_GEMM = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
