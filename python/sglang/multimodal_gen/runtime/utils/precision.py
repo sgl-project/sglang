@@ -185,67 +185,28 @@ def align_tensor_to_module_dtype(
     return tensor.to(device=device, dtype=dtype)
 
 
-def _module_requires_fp32_cast(module) -> bool:
-    """Return whether this module contains floating state that must be temporarily cast to fp32.
-
-    This is the guard used by the temporary fp32 helpers: if the module is already fully
-    fp32, the context manager exits without mutating any tensors. Mixed-dtype modules are
-    converted in-place for the duration of the scope and then restored exactly.
-    """
-    for param in module.parameters(recurse=True):
-        if param.is_floating_point() and param.dtype != torch.float32:
-            return True
-    for buffer in module.buffers(recurse=True):
-        if buffer.is_floating_point() and buffer.dtype != torch.float32:
-            return True
-    return False
-
-
-def _capture_module_value_state(module):
-    param_state = {
-        name: param.detach().clone()
-        for name, param in module.named_parameters(recurse=True)
-    }
-    buffer_state = {
-        name: buffer.detach().clone()
-        for name, buffer in module.named_buffers(recurse=True)
-    }
-    return param_state, buffer_state
-
-
-def _restore_module_value_state(module, param_state, buffer_state):
-    current_params = {
-        name: param for name, param in module.named_parameters(recurse=True)
-    }
-    current_buffers = {
-        name: buffer for name, buffer in module.named_buffers(recurse=True)
-    }
-
+def _restore_module_value_state(cache):
     with torch.no_grad():
-        for name, value in param_state.items():
-            if name in current_params:
-                restored = value.to(device=current_params[name].device)
-                current_params[name].data = restored
-        for name, value in buffer_state.items():
-            if name in current_buffers:
-                restored = value.to(device=current_buffers[name].device)
-                current_buffers[name].data = restored
+        for param, value in cache["parameters"].values():
+            param.data = value.to(device=param.device)
+        for buffer, value in cache["buffers"].values():
+            buffer.data = value.to(device=buffer.device)
 
 
 def _module_fp32_cache(module):
-    params = {name: param for name, param in module.named_parameters(recurse=True)}
-    buffers = {name: buffer for name, buffer in module.named_buffers(recurse=True)}
     cache = {"parameters": {}, "buffers": {}}
 
     with torch.no_grad():
-        for name, param in params.items():
-            if param.is_floating_point():
-                cache["parameters"][name] = param.detach().to(dtype=torch.float32)
-                param.data = cache["parameters"][name]
-        for name, buffer in buffers.items():
-            if buffer.is_floating_point():
-                cache["buffers"][name] = buffer.detach().to(dtype=torch.float32)
-                buffer.data = cache["buffers"][name]
+        for name, param in module.named_parameters(recurse=True):
+            if param.is_floating_point() and param.dtype != torch.float32:
+                value = param.detach().clone()
+                cache["parameters"][name] = (param, value)
+                param.data = value.to(dtype=torch.float32)
+        for name, buffer in module.named_buffers(recurse=True):
+            if buffer.is_floating_point() and buffer.dtype != torch.float32:
+                value = buffer.detach().clone()
+                cache["buffers"][name] = (buffer, value)
+                buffer.data = value.to(dtype=torch.float32)
 
     return cache
 
@@ -266,16 +227,11 @@ def temporary_module_fp32_dtype(
         yield module
         return
 
-    if not _module_requires_fp32_cast(module):
-        yield module
-        return
-
-    param_state, buffer_state = _capture_module_value_state(module)
     cache = _module_fp32_cache(module)
     try:
         yield module
     finally:
-        _restore_module_value_state(module, param_state, buffer_state)
+        _restore_module_value_state(cache)
         cache.clear()
 
 
@@ -292,30 +248,19 @@ def temporary_modules_fp32_dtype(
     the exact original dtype/value state after the context exits.
     """
     enabled_list = [enabled] * len(modules) if isinstance(enabled, bool) else enabled
-    states = []
     caches = []
 
     for module, is_enabled in zip(modules, enabled_list):
-        if not is_enabled or not _module_requires_fp32_cast(module):
-            states.append((None, None))
-            caches.append(None)
-            continue
-
-        states.append(_capture_module_value_state(module))
-        caches.append(_module_fp32_cache(module))
+        caches.append(_module_fp32_cache(module) if is_enabled else None)
 
     try:
         yield modules
     finally:
-        for module, state, cache, is_enabled in zip(
-            modules, states, caches, enabled_list
-        ):
-            if not is_enabled or state == (None, None):
+        for cache, is_enabled in zip(caches, enabled_list):
+            if not is_enabled or cache is None:
                 continue
-            param_state, buffer_state = state
-            _restore_module_value_state(module, param_state, buffer_state)
-            if cache is not None:
-                cache.clear()
+            _restore_module_value_state(cache)
+            cache.clear()
 
 
 @contextmanager

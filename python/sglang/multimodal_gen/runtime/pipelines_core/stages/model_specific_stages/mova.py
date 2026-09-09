@@ -696,13 +696,20 @@ class MOVADenoisingStage(PipelineStage):
         visual_context = context.to(device=device, dtype=model_dtype)
         audio_context = context.to(device=device, dtype=model_dtype)
 
-        # See [Note] Use temporary_module_dtype for the upcast on CPU
+        # See [Note] Use temporary_module_fp32_dtype for the upcast on CPU.
         autocast_ctx = (
             torch.autocast(
                 device_type=current_platform.device_type, dtype=torch.float32
             )
             if current_platform.device_type != "cpu"
-            else temporary_modules_fp32_dtype([visual_dit, self.audio_dit])
+            else temporary_modules_fp32_dtype(
+                [
+                    visual_dit.time_embedding,
+                    visual_dit.time_projection,
+                    self.audio_dit.time_embedding,
+                    self.audio_dit.time_projection,
+                ]
+            )
         )
         with autocast_ctx:
             visual_t = visual_dit.time_embedding(
@@ -1005,7 +1012,7 @@ class MOVADecodingStage(PipelineStage):
         ) as audio_vae:
             assert audio_vae is not None
             self.audio_vae = audio_vae
-            # See [Note] Use temporary_module_dtype for the upcast on CPU
+            # See [Note] Use temporary_module_fp32_dtype for the upcast on CPU.
             autocast_ctx = (
                 torch.autocast(
                     device_type=current_platform.device_type, dtype=torch.float32
