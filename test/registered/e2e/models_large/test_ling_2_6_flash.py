@@ -26,7 +26,7 @@ class TestLing26Flash(GSM8KMixin, DefaultServerBase):
         "--tp-size",
         "4",
         "--trust-remote-code",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
         "--mem-fraction-static",
         "0.75",
