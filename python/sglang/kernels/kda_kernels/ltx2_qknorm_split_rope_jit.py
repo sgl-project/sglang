@@ -130,6 +130,15 @@ def _is_sm100_or_newer(x: torch.Tensor) -> bool:
         return False
 
 
+def _is_sm90(x: torch.Tensor) -> bool:
+    if not x.is_cuda or torch.version.hip is not None:
+        return False
+    try:
+        return torch.cuda.get_device_capability(x.device) == (9, 0)
+    except RuntimeError:
+        return False
+
+
 def can_use_ltx2_qknorm_split_rope_cuda(
     q: torch.Tensor,
     q_cos: torch.Tensor,
@@ -142,9 +151,10 @@ def can_use_ltx2_qknorm_split_rope_cuda(
     *,
     num_heads: int,
     head_dim: int,
+    allow_sm90: bool = False,
 ) -> bool:
     return (
-        _is_sm100_or_newer(q)
+        (_is_sm100_or_newer(q) or (allow_sm90 and _is_sm90(q)))
         and _supported_side(
             q,
             q_cos,
@@ -177,6 +187,7 @@ def ltx2_qknorm_split_rope_cuda(
     eps: float,
     num_heads: int,
     head_dim: int,
+    allow_sm90: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not can_use_ltx2_qknorm_split_rope_cuda(
         q,
@@ -189,6 +200,7 @@ def ltx2_qknorm_split_rope_cuda(
         k_weight,
         num_heads=num_heads,
         head_dim=head_dim,
+        allow_sm90=allow_sm90,
     ):
         raise RuntimeError("unsupported input for LTX2 QKNorm split-RoPE CUDA")
     return _ltx2_qknorm_split_rope_custom_op(
