@@ -499,27 +499,49 @@ class TestFusedScaleShiftKernels:
             (torch.float16, torch.float32),
         ],
     )
+    @pytest.mark.parametrize("broadcast_c", [False, True])
     def test_fused_scale_shift(
         self,
         input_dtype,
         param_dtype,
+        broadcast_c,
     ):
         B, S, D = 2, 4, 67
         x = torch.randn(B, S, D, dtype=input_dtype)
-        scale = torch.randn(B, 1, D, dtype=param_dtype)
-        shift = torch.randn(B, S, D, dtype=param_dtype)
+
+        if broadcast_c:
+            # hidden dimension broadcast -> stride_c == 0
+            scale = torch.randn(B, 1, 1, dtype=param_dtype)
+            shift = torch.randn(B, S, 1, dtype=param_dtype)
+        else:
+            # normal vector load -> stride_c == 1
+            scale = torch.randn(B, 1, D, dtype=param_dtype)
+            shift = torch.randn(B, S, D, dtype=param_dtype)
 
         scale_expanded = scale.expand_as(x)
         shift_expanded = shift.expand_as(x)
 
+        if broadcast_c:
+            assert scale_expanded.stride(2) == 0
+            assert shift_expanded.stride(2) == 0
+        else:
+            assert scale_expanded.stride(2) == 1
+            assert shift_expanded.stride(2) == 1
+
         out = torch.ops.sgl_kernel.fused_scale_shift_cpu(
-            x, scale_expanded, shift_expanded, 1.0
+            x,
+            scale_expanded,
+            shift_expanded,
+            1.0,
         )
 
         ref = (x.float() * (1.0 + scale.float()) + shift.float()).to(input_dtype)
 
         torch.testing.assert_close(
-            out, ref, atol=precision[input_dtype], rtol=precision[input_dtype]
+            out,
+            ref,
+            atol=precision[input_dtype],
+            rtol=precision[input_dtype],
         )
 
     @pytest.mark.parametrize(
@@ -558,24 +580,23 @@ class TestFusedScaleShiftKernels:
         )
 
     @pytest.mark.parametrize(
-        "input_dtype,param_dtype,norm_dtype",
+        "input_dtype,param_dtype",
         [
-            (torch.bfloat16, torch.bfloat16, torch.float32),
-            (torch.bfloat16, torch.float32, torch.float32),
-            (torch.float16, torch.float16, torch.float32),
-            (torch.float16, torch.float32, torch.float32),
+            (torch.bfloat16, torch.bfloat16),
+            (torch.bfloat16, torch.float32),
+            (torch.float16, torch.float16),
+            (torch.float16, torch.float32),
         ],
     )
     def test_fused_norm_scale_shift(
         self,
         input_dtype,
         param_dtype,
-        norm_dtype,
     ):
         B, S, D = 2, 4, 67
 
         x = torch.randn(B, S, D, dtype=input_dtype)
-        weight = torch.randn(D, dtype=norm_dtype)
+        weight = torch.randn(D, dtype=torch.float32)
         scale = torch.randn(B, 1, D, dtype=param_dtype)
         shift = torch.randn(B, S, D, dtype=param_dtype)
 
@@ -601,20 +622,28 @@ class TestFusedScaleShiftKernels:
         )
 
     @pytest.mark.parametrize(
-        "input_dtype,gate_dtype,norm_dtype,param_dtype,norm_type,use_gate,use_norm",
+        "input_dtype,gate_dtype,norm_dtype,param_dtype,norm_type",
         [
-            # Same-dtype gate.
-            (torch.bfloat16, torch.bfloat16, None, torch.bfloat16, "rms", True, False),
-            (torch.float16, torch.float16, None, torch.float16, "rms", True, False),
-            # FP32 gate + FP32 affine norm.
+            (
+                torch.bfloat16,
+                torch.bfloat16,
+                None,
+                torch.bfloat16,
+                "rms",
+            ),
+            (
+                torch.float16,
+                torch.float16,
+                None,
+                torch.float16,
+                "rms",
+            ),
             (
                 torch.bfloat16,
                 torch.float32,
                 torch.float32,
                 torch.bfloat16,
                 "layer",
-                True,
-                True,
             ),
             (
                 torch.float16,
@@ -622,12 +651,21 @@ class TestFusedScaleShiftKernels:
                 torch.float32,
                 torch.float16,
                 "layer",
-                True,
-                True,
             ),
-            # FP32 scale/shift + no gate + no affine norm.
-            (torch.bfloat16, None, None, torch.float32, "layer", False, False),
-            (torch.float16, None, None, torch.float32, "layer", False, False),
+            (
+                torch.bfloat16,
+                None,
+                None,
+                torch.float32,
+                "layer",
+            ),
+            (
+                torch.float16,
+                None,
+                None,
+                torch.float32,
+                "layer",
+            ),
         ],
     )
     def test_fused_scale_residual_norm_scale_shift(
@@ -637,21 +675,19 @@ class TestFusedScaleShiftKernels:
         norm_dtype,
         param_dtype,
         norm_type,
-        use_gate,
-        use_norm,
     ):
         B, S, D = 2, 4, 67
 
         x = torch.randn(B, S, D, dtype=input_dtype)
         residual = torch.randn(B, S, D, dtype=input_dtype)
 
-        gate = torch.randn(D, dtype=gate_dtype) if use_gate else None
+        gate = torch.randn(D, dtype=gate_dtype) if gate_dtype is not None else None
 
-        weight = torch.randn(D, dtype=norm_dtype) if use_norm else None
+        weight = torch.randn(D, dtype=norm_dtype) if norm_dtype is not None else None
 
         bias = (
             torch.randn(D, dtype=norm_dtype)
-            if use_norm and norm_type == "layer"
+            if norm_dtype is not None and norm_type == "layer"
             else None
         )
 
