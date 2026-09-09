@@ -53,7 +53,7 @@ def draft_forward_guard(is_draft: bool):
     """Run a draft forward with DCP disabled (the draft KV pool is not sharded)."""
     if not is_draft:
         return contextlib.nullcontext()
-    return get_parallel().override(dcp_enabled=False)
+    return get_parallel().override(dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0)
 
 
 def dcp_enabled() -> bool:
