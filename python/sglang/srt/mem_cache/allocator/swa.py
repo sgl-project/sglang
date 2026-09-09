@@ -22,6 +22,9 @@ if _is_npu:
     )
 
 
+# free_swa releases whatever the mapping points at, so an entry that reads as the
+# padding slot would push slot 0 into the SWA free list and hand it out twice.
+_SWA_PEER_MAPPED = Invariant("swa.peer_mapped", Bucket.FATAL_UNCONTAINABLE, IsTrue())
 # free_full leaves the mapping alone, so a live entry would strand its SWA peer.
 _SWA_PEER_RELEASED = Invariant("swa.peer_released", Bucket.GUARD, IsTrue())
 
@@ -428,8 +431,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_swa(self, free_index: torch.Tensor):
         """Release the SWA peers of an arbitrary slot set and clear their mapping.
-        Synchronizes at page_size > 1; kv-row segments go through free_swa_segment()."""
-        if free_index.numel() == 0:
+        No-op for a per-request ring, which owns no paged SWA peers. Otherwise
+        synchronizes at page_size > 1; kv-row segments use free_swa_segment()."""
+        if self._swa_req_ring or free_index.numel() == 0:
             return
 
         if self.page_size == 1:
@@ -452,22 +456,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """free_swa() for a kv-row segment; same start-alignment contract as
-        free_segment(), and fixed-shape at every page size."""
-        if free_index.numel() == 0:
+        free_segment(), and fixed-shape at every page size. No-op for a
+        per-request ring, as in free_swa()."""
+        if self._swa_req_ring or free_index.numel() == 0:
             return
         self._free_swa_pages(free_index, start_pos=start_pos)
 
     def _free_swa_pages(self, free_index: torch.Tensor, *, start_pos: int):
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
-        # First token of every page the segment touches.
+        # First token of every page the segment touches; the caller allocated
+        # each one, so a dead entry means the caller wanted free_full.
         reps = free_index[::ps]
         swa_tokens = self.full_to_swa_index_mapping[reps]
-        # Reps with no SWA peer read as the padding slot 0 and are passed
-        # deliberately (see SWAComponent.evict_component). Drop them as
-        # _release_swa does: free_page_ids does not dedup, so page 0 would
-        # otherwise be freed once per unmapped rep.
-        swa_tokens = swa_tokens[swa_tokens > 0]
+        expect(_SWA_PEER_MAPPED, swa_tokens > 0, msg="caller wants free_full")
 
         if ps == 1:
             swa_pages = swa_tokens
