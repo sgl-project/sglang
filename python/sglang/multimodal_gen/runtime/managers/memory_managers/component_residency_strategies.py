@@ -10,10 +10,16 @@ from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
     shared_pool_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    capture_weight_snapshot,
+    restore_weight_snapshot,
+    weight_snapshot,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -134,13 +140,16 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         self._prefetch_stream: object | None = None
         self._ready_events: dict[str, object] = {}
 
+    def _load_component(self, module: nn.Module, use: ComponentUse) -> None:
+        _module_to_local_device(module, dtype=use.target_dtype)
+
     def prepare_for_use(
         self,
         module: nn.Module,
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        _module_to_local_device(module, dtype=use.target_dtype)
+        self._load_component(module, use)
 
     def wait_for_use(
         self,
@@ -169,7 +178,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
                 device=get_local_torch_device()
             )
         with torch.get_device_module().stream(self._prefetch_stream):
-            _module_to_local_device(module, dtype=use.target_dtype)
+            self._load_component(module, use)
             event = torch.get_device_module().Event()
             event.record(self._prefetch_stream)
         self._ready_events[use.component_name] = event
@@ -208,6 +217,36 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             self.wait_for_use(module, use, state)
             return
         self.finish_use(module, use, state)
+
+
+class SnapshotOffloadStrategy(ComponentOffloadStrategy):
+    """Keep CPU weights during device use; restore them without weight D2H."""
+
+    def __init__(self, *, pin_budget: HostPinBudget | None = None) -> None:
+        super().__init__()
+        self._pin_budget = pin_budget
+
+    def _load_component(self, module: nn.Module, use: ComponentUse) -> None:
+        if weight_snapshot(module) is not None and not _module_ready_on_local_device(
+            module, dtype=use.target_dtype
+        ):
+            restore_weight_snapshot(module)
+        if weight_snapshot(module) is None:
+            if use.target_dtype is not None:
+                module.to(dtype=use.target_dtype)
+            capture_weight_snapshot(
+                module, pin_budget=self._pin_budget, component_name=use.component_name
+            )
+        super()._load_component(module, use)
+
+    def finish_use(
+        self, module: nn.Module, use: ComponentUse, state: ResidencyState
+    ) -> None:
+        self.wait_for_use(module, use, state)
+        if restore_weight_snapshot(module):
+            self._ready_events.pop(use.component_name, None)
+        else:
+            super().finish_use(module, use, state)
 
 
 class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
