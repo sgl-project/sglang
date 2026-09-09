@@ -95,7 +95,7 @@ python3 -m sglang.launch_server \
     --chunked-prefill-size 16384 \
     --tp-size 1 \
     --mem-fraction-static 0.85 \
-    --cuda-graph-bs 8 12 24 36 48 51 55 60 63 64 66 68 70 \
+    --cuda-graph-bs-decode 8 12 24 36 48 51 55 60 63 64 66 68 70 \
     --dtype bfloat16 \
     --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 \
@@ -192,7 +192,7 @@ python3 -m sglang.launch_server \
     --chunked-prefill-size -1 \
     --tp-size 2 \
     --mem-fraction-static 0.894 \
-    --cuda-graph-bs 1 \
+    --cuda-graph-bs-decode 1 \
     --dtype bfloat16 \
     --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 \
@@ -289,7 +289,7 @@ python3 -m sglang.launch_server \
     --chunked-prefill-size -1 \
     --tp-size 2 \
     --mem-fraction-static 0.894 \
-    --cuda-graph-bs 1 5 15 16 \
+    --cuda-graph-bs-decode 1 5 15 16 \
     --dtype bfloat16 \
     --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 \

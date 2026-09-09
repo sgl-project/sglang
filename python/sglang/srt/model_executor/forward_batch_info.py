@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
+    mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
@@ -304,12 +305,12 @@ def compute_local_num_token_non_padded_cpu(
 def prefill_graph_tolerates_sum_len() -> bool:
     """Whether MegaMoE may replay prefill graphs with local shapes."""
     from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-    from sglang.srt.layers.cp.utils import is_mla_prefill_cp_enabled
+    from sglang.srt.layers.cp.utils import is_mla_cp_enabled
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if not get_moe_a2a_backend().is_megamoe():
         return False
-    return not (is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled())
+    return not (is_dsa_enable_prefill_cp() or is_mla_cp_enabled())
 
 
 @dataclass
@@ -1059,6 +1060,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sharded=sharded,
         )
 
+    def mamba_track_aligned_lens(self) -> Optional[torch.Tensor]:
+        """Tokens of this extend chunk covered by the tracked mamba state,
+        floored to the mamba_cache_chunk_size boundary the scheduler snapshots at;
+        the +1 that _force_track_h adds cancels under the floor.
+        Sole home of this math: every side state snapshotting alongside mamba calls it.
+        None means tracking is skipped for this forward:
+        no mask, or a prefill CUDA-graph replay without mamba_track_seqlens.
+        Masked-off rows hold garbage.
+        """
+        if (
+            self.mamba_track_mask is None
+            or self.mamba_track_seqlens is None
+            or self.extend_prefix_lens is None
+        ):
+            return None
+
+        chunk_size = mamba_cache_chunk_size()
+        lens_to_track = self.mamba_track_seqlens - self.extend_prefix_lens
+        return (lens_to_track // chunk_size) * chunk_size
+
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
         Merge all multimodal inputs in the batch into a single MultiModalInputs object.
@@ -1331,10 +1352,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
-        # Local imports: module-level CP helper imports here are circular (#27014).
-        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-        from sglang.srt.layers.cp.utils import enable_cp_v2
-
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -1347,16 +1364,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
-
-        # make sure that each rank has the same number of tokens to do collective communication.
-        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
-        # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
-        # prefill with NaN draft logits, see #23269).
-        # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
-        if not enable_cp_v2():
-            cp_align_size = get_cp_padding_align_size()
-            for i in range(sync_group_size):
-                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
