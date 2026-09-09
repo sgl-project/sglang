@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "torch==2.13.0+xpu", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -55,7 +55,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
+  "sglang-kernel-xpu @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
   "tiktoken",

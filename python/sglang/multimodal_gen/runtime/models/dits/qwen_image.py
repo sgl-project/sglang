@@ -762,9 +762,9 @@ class QwenImageCrossAttention(nn.Module):
         self.inner_kv_dim = self.inner_dim
 
         tp_size = get_tp_world_size()
-        assert (
-            self.num_heads % tp_size == 0
-        ), f"num_heads ({self.num_heads}) must be divisible by tp_size ({tp_size})"
+        assert self.num_heads % tp_size == 0, (
+            f"num_heads ({self.num_heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.local_num_heads = self.num_heads // tp_size
         self._unquantized_added_qkv_is_packed = False
 
@@ -824,7 +824,7 @@ class QwenImageCrossAttention(nn.Module):
                 )
                 if self._unquantized_added_qkv_is_packed:
                     # Packing changes BF16 GEMM reduction association. Keep it
-                    # off for lossless requests and mount it for quality=high.
+                    # off for lossless and mount it at extra-high or high.
                     mark_qwen_image_added_qkv_site(self)
             else:
                 self.add_q_proj = ColumnParallelLinear(
@@ -899,6 +899,7 @@ class QwenImageCrossAttention(nn.Module):
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN,
                 AttentionBackendEnum.SAGE_ATTN_3,
+                AttentionBackendEnum.SPARGE_ATTN,
             },
         )
 
@@ -1170,7 +1171,7 @@ class QwenImageGELU(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.proj",
             )
-        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # Extra-high-or-higher fusion site: up-proj GEMM + tanh-GELU in cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 

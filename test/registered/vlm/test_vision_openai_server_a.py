@@ -29,7 +29,7 @@ from sglang.test.vlm_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=560, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=578, stage="base-b", runner_config="1-gpu-large")
 
 
 # --- Qwen3-VL grounding regression (deepstack fusion) --------------------------
@@ -269,9 +269,9 @@ class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
         import re
 
         coord_pattern = r"\[\[[\d\s,]+\]\]"
-        assert re.search(
-            coord_pattern, text
-        ), f"OCR text: {text}, should contain coordinate format [[x1, y1, x2, y2]]"
+        assert re.search(coord_pattern, text), (
+            f"OCR text: {text}, should contain coordinate format [[x1, y1, x2, y2]]"
+        )
 
         # Verify basic response fields
         assert response.id

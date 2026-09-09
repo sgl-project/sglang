@@ -221,8 +221,7 @@ class CausalSelfAttentionKVCache:
                         self.k[:, sink_tokens : sink_tokens + num_rolled_tokens] = (
                             self.k[
                                 :,
-                                sink_tokens
-                                + num_evicted_tokens : sink_tokens
+                                sink_tokens + num_evicted_tokens : sink_tokens
                                 + num_evicted_tokens
                                 + num_rolled_tokens,
                             ].clone()
@@ -230,8 +229,7 @@ class CausalSelfAttentionKVCache:
                         self.v[:, sink_tokens : sink_tokens + num_rolled_tokens] = (
                             self.v[
                                 :,
-                                sink_tokens
-                                + num_evicted_tokens : sink_tokens
+                                sink_tokens + num_evicted_tokens : sink_tokens
                                 + num_evicted_tokens
                                 + num_rolled_tokens,
                             ].clone()
@@ -244,8 +242,7 @@ class CausalSelfAttentionKVCache:
                             :,
                         ] = self.k[
                             :,
-                            sink_tokens
-                            + num_evicted_tokens : sink_tokens
+                            sink_tokens + num_evicted_tokens : sink_tokens
                             + num_evicted_tokens
                             + num_rolled_tokens,
                             cache_head_slice,
@@ -258,8 +255,7 @@ class CausalSelfAttentionKVCache:
                             :,
                         ] = self.v[
                             :,
-                            sink_tokens
-                            + num_evicted_tokens : sink_tokens
+                            sink_tokens + num_evicted_tokens : sink_tokens
                             + num_evicted_tokens
                             + num_rolled_tokens,
                             cache_head_slice,
