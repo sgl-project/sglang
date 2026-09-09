@@ -336,6 +336,12 @@ struct VdnDeltaFactorsKernel {
         injection.data_ptr() != A.data_ptr() && injection.data_ptr() != B.data_ptr() &&
         transition.data_ptr() != injection.data_ptr())
         << "vdn_delta_factors outputs must not alias inputs";
+    // every tensor is read or written as float4; a storage offset breaks this
+    const auto aligned16 = [](const void* p) { return reinterpret_cast<uintptr_t>(p) % 16 == 0; };
+    CHECK_HOST(
+        aligned16(A.data_ptr()) && aligned16(B.data_ptr()) && aligned16(alpha.data_ptr()) &&
+        aligned16(transition.data_ptr()) && aligned16(injection.data_ptr()))
+        << "vdn_delta_factors needs 16-byte aligned tensors";
     const DLDevice dev = device.unwrap();
     // 64 KB of dynamic shared memory needs the opt-in, once per device.
     static bool attr_set[64] = {};

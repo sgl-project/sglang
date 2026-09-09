@@ -94,6 +94,28 @@ def test_sana_scaled_ignores_fused():
         assert torch.equal(x, y)
 
 
+def _storage_offset_copy(t: torch.Tensor) -> torch.Tensor:
+    # contiguous, but one element past a 16-byte boundary
+    flat = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)
+    out = flat[1:].view(t.shape)
+    out.copy_(t)
+    assert out.is_contiguous() and out.data_ptr() % 16 != 0
+    return out
+
+
+@pytest.mark.parametrize("which", ["A", "B", "alpha"])
+def test_storage_offset_input_matches_aligned(which):
+    """A contiguous input with a storage offset must not fault in the float4 loads."""
+    A, B, alpha = _inputs(3, 2, 64)
+    ref = vdn_delta_factors(A, B, alpha)
+    inputs = {"A": A, "B": B, "alpha": alpha}
+    inputs[which] = _storage_offset_copy(inputs[which])
+    assert can_use_vdn_delta_factors(inputs["A"], inputs["B"], inputs["alpha"])
+    out = vdn_delta_factors(inputs["A"], inputs["B"], inputs["alpha"])
+    for got, want in zip(out, ref):
+        assert torch.equal(got, want)
+
+
 def test_can_use_rejects_unsupported():
     A, B, alpha = _inputs(2, 2, 32)
     assert can_use_vdn_delta_factors(A, B, alpha)

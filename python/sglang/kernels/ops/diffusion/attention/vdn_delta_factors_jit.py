@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 HEAD_DIM = 128
+_FLOAT4_BYTES = 16
 
 
 @cache_once
@@ -33,6 +34,11 @@ def _jit_vdn_delta_factors_module() -> Module:
             ("vdn_delta_factors", "vdn_delta_factors::VdnDeltaFactorsKernel::run")
         ],
     )
+
+
+def _aligned(t: torch.Tensor) -> torch.Tensor:
+    # the kernel loads float4; .contiguous() keeps a storage offset, a fresh allocation is aligned
+    return t if t.data_ptr() % _FLOAT4_BYTES == 0 else t.clone()
 
 
 def _fake_impl(
@@ -55,6 +61,7 @@ def vdn_delta_factors(
     ``B`` has the shape of ``A``; ``alpha`` is ``[..., 128]``.  Same accuracy as the eager
     cholesky path (both are dominated by cond(I + A) in fp32).
     """
+    A, B, alpha = _aligned(A), _aligned(B), _aligned(alpha)
     transition = torch.empty_like(A)
     injection = torch.empty_like(B)
     module = _jit_vdn_delta_factors_module()

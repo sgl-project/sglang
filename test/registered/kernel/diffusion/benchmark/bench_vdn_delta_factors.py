@@ -43,12 +43,8 @@ def _inputs(num: int):
 @marker.benchmark("impl", ["jit", "eager"], unit="us")
 def benchmark(num_matrices: int, impl: str):
     A, B, alpha = _inputs(num_matrices)
-    return marker.do_bench(
-        FN_MAP[impl],
-        input_args=(A, B, alpha),
-        graph_clone_args=(),
-        use_cuda_graph=impl == "jit",
-    )
+    # both eager: graph replay on one side only is not a like-for-like comparison
+    return marker.do_bench(FN_MAP[impl], input_args=(A, B, alpha), use_cuda_graph=False)
 
 
 if __name__ == "__main__":

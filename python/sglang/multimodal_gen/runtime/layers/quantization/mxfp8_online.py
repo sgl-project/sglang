@@ -6,8 +6,8 @@ Weights quantize at load to e4m3 with one E8M0 scale per 32 elements along K
 activations take the same block quant per call unless the producer hands over
 a prequantized ``(fp8, swizzled scales)`` tuple; the GEMM is cuBLASLt's
 block-scaled ``torch.nn.functional.scaled_mm``. Layers with K not a multiple
-of 32, N not a multiple of 16, fp32 params, or pre-Blackwell GPUs keep the
-per-channel fp8 path.
+of 32, N not a multiple of 16, non-bf16 params, or pre-Blackwell GPUs keep
+the per-channel fp8 path.
 """
 
 from typing import Optional
@@ -16,7 +16,10 @@ import torch
 from torch.nn import Module
 from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
 
-from sglang.kernels.ops.diffusion import mxfp8_quantize_swizzled
+from sglang.kernels.ops.diffusion import (
+    can_use_mxfp8_swizzled,
+    mxfp8_quantize_swizzled,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 
 _E8M0 = torch.float8_e8m0fnu
@@ -54,10 +57,8 @@ class MXFP8OnlineLinearMethod(Fp8LinearMethod):
     def process_weights_after_loading(self, layer: Module) -> None:
         layer.mxfp8 = (
             not self.use_marlin
-            and layer.weight.is_cuda
+            and can_use_mxfp8_swizzled(layer.weight)
             and torch.cuda.get_device_capability(layer.weight.device)[0] >= 10
-            and layer.weight.dtype in (torch.bfloat16, torch.float16)
-            and layer.weight.shape[1] % 32 == 0
             and layer.weight.shape[0] % 16 == 0
         )
         if not layer.mxfp8:

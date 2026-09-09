@@ -25,7 +25,9 @@ def _init_parallel() -> None:
         maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
-def _layer(in_f: int, out_f: int, bias: bool):
+def _layer(
+    in_f: int, out_f: int, bias: bool, params_dtype: torch.dtype = torch.bfloat16
+):
     from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
     from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 
@@ -33,7 +35,7 @@ def _layer(in_f: int, out_f: int, bias: bool):
         in_f,
         out_f,
         bias=bias,
-        params_dtype=torch.bfloat16,
+        params_dtype=params_dtype,
         quant_config=MXFP8Config(),
         prefix="mlp.fc2",
     ).to("cuda")
@@ -69,23 +71,31 @@ def test_mxfp8_linear_matches_bf16_and_accepts_prequantized() -> None:
     assert torch.equal(out_tensor, out_tuple)
 
 
-def test_pre_blackwell_aligned_layer_falls_back_to_channelwise() -> None:
-    if torch.cuda.get_device_capability()[0] >= 10:
-        pytest.skip("requires a pre-Blackwell GPU")
+def _assert_aligned_layer_falls_back(params_dtype: torch.dtype) -> None:
     _init_parallel()
-    layer = _layer(512, 384, bias=False)
+    layer = _layer(512, 384, bias=False, params_dtype=params_dtype)
     g = torch.Generator(device="cpu").manual_seed(1)
-    weight = (torch.randn(384, 512, generator=g) * 0.02).to("cuda", torch.bfloat16)
+    weight = (torch.randn(384, 512, generator=g) * 0.02).to("cuda", params_dtype)
     with torch.no_grad():
         layer.weight.copy_(weight)
     layer.quant_method.process_weights_after_loading(layer)
-    assert not layer.mxfp8
-    assert not layer.quant_method.accepts_mxfp8_input(layer)
-    x = torch.randn(200, 512, generator=g).to("cuda", torch.bfloat16)
+    assert not layer.mxfp8 and not layer.quant_method.accepts_mxfp8_input(layer)
+    x = torch.randn(200, 512, generator=g).to("cuda", params_dtype)
     out, _ = layer(x)
     ref = x.float() @ weight.float().t()
     rel = ((out.float() - ref).norm() / ref.norm()).item()
     assert rel < 0.05, rel
+
+
+def test_pre_blackwell_aligned_layer_falls_back_to_channelwise() -> None:
+    if torch.cuda.get_device_capability()[0] >= 10:
+        pytest.skip("requires a pre-Blackwell GPU")
+    _assert_aligned_layer_falls_back(torch.bfloat16)
+
+
+def test_fp16_layer_falls_back_to_channelwise() -> None:
+    """The swizzled quantizer takes bf16 only; an fp16 layer must not fail at load."""
+    _assert_aligned_layer_falls_back(torch.float16)
 
 
 def test_unaligned_layer_falls_back_to_channelwise() -> None:
