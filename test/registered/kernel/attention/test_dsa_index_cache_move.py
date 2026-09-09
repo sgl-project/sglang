@@ -16,7 +16,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+# backend-specific: exercises the ROCm page-64 AITer index-cache layout.
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 PAGE_SIZE = 64
 INDEX_HEAD_DIM = 128
