@@ -612,7 +612,7 @@ class DeepseekMHAForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda:
+        if _is_cuda or _use_aiter_gfx95:
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
@@ -656,9 +656,14 @@ class DeepseekMHAForwardMixin:
             # reads cached prefix KV crashes with "576 != 656".
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             # Read door: the pool never translates, so the production site does.
-            kv_indices = get_attn_backend().kv_index_translator.translate_dcp_read_ids(
-                kv_indices
-            )
+            # Only the FlashAttention/FlashInfer backends bind a translator; the
+            # base class documents its None default as "no translate", and the DSA
+            # backend the EAGLE draft model runs on keeps that default. With no
+            # translator the ids never went VIRTUAL, so there is nothing to
+            # collapse.
+            translator = get_attn_backend().kv_index_translator
+            if translator is not None:
+                kv_indices = translator.translate_dcp_read_ids(kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, torch.bfloat16
             )
@@ -677,9 +682,22 @@ class DeepseekMHAForwardMixin:
     def _concat_and_cast_mha_k(
         self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,
-        k_pe: torch.Tensor,
+        k_pe: torch.Tensor | None,
         forward_batch: ForwardBatch,
     ):
+        if self.qk_rope_head_dim == 0:
+            assert k_pe is None or k_pe.shape[-1] == 0
+            k = k_nope.contiguous()
+            if (
+                _is_cuda
+                and self.current_attention_backend == "fa3"
+                and self.kv_cache_dtype != "auto"
+            ):
+                # fa3 requires k in the pool dtype when KV cache is fp8; the
+                # concat branch below does the same cast for roped models.
+                k = k.to(get_token_to_kv_pool().dtype)
+            return k
+
         # Temporary for DeepSeek V3/R1 only, but can generalize if needed
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
         if (

@@ -4,11 +4,16 @@ ServerArgsAutoTuner tunes the ServerArgs based on the desired performance mode
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+    has_realtime_model_adapter,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
@@ -26,6 +31,49 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
+    """Return why args cannot use warmup-calibrated residency."""
+    if envs.SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY:
+        return "disabled via SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
+    if server_args.performance_mode != "auto":
+        return f"performance_mode={server_args.performance_mode}"
+    if (
+        server_args.pipeline_class_name == "LTX2TwoStagePipeline"
+        and server_args.ltx2_two_stage_device_mode is None
+    ):
+        return "legacy LTX-2 two-stage placement"
+    if server_args.ltx2_two_stage_device_mode == "original":
+        return "LTX-2 original two-stage placement"
+    if (
+        server_args.warmup_mode != "server"
+        or server_args.disagg_role != RoleType.MONOLITHIC
+    ):
+        return "no synthetic server warmup to calibrate from"
+    task_type = server_args.pipeline_config.task_type
+    if not (task_type.is_visual_gen() or task_type.is_mesh_gen()):
+        return "no synthetic server warmup to calibrate from"
+    if not server_args.pipeline_config.supports_auto_residency:
+        return "pipeline does not support post-warmup residency changes"
+    if has_realtime_model_adapter(server_args):
+        return "realtime serving has no representative synthetic warmup"
+    if server_args.backend == "diffusers":
+        return "diffusers backend"
+    if server_args.enable_breakable_cuda_graph:
+        return "breakable CUDA graph captures during warmup"
+    if server_args.enable_torch_compile:
+        # Compile warmup temporarily evicts resident auxiliaries and may
+        # layerwise-offload the DiT, so its peak is not a serving peak.
+        return "torch.compile warmup uses a stripped memory layout"
+    if envs.SGLANG_CACHE_DIT_ENABLED:
+        return "cache-dit enabled"
+    if server_args.batching_max_size > 1:
+        return "dynamic batching enabled"
+    if not current_platform.is_cuda():
+        return "requires CUDA"
+    return None
+
+
 PERFORMANCE_MODES = ("manual", "auto", "speed", "memory")
 
 DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
@@ -39,6 +87,28 @@ DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
 # larger so it only stays resident on very-high-memory gpus
 IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
 DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
+
+
+# torch's CPU allocator (mimalloc since 2.13) keeps freed pages in its arenas
+# and backs them with transparent huge pages, so the fused-weight copies the
+# loader frees once a component is promoted stayed resident: 18.2 GiB of
+# anonymous memory on a GB10 after the DiT went resident, 5.0 GiB with these.
+# Read at process start, so they are set for the workers to inherit; a torch
+# without mimalloc ignores them.
+SHARED_POOL_CPU_ALLOCATOR_DEFAULTS = {
+    "MIMALLOC_PURGE_DELAY": "0",
+    "MIMALLOC_ALLOW_LARGE_OS_PAGES": "0",
+}
+
+
+def apply_shared_pool_cpu_allocator_defaults(environ) -> list[str]:
+    """Set the CPU allocator defaults not already chosen; return the names set."""
+    applied = []
+    for name, value in SHARED_POOL_CPU_ALLOCATOR_DEFAULTS.items():
+        if name not in environ:
+            environ[name] = value
+            applied.append(name)
+    return applied
 
 
 class ServerArgsAutoTuner:
@@ -409,6 +479,104 @@ class ServerArgsAutoTuner:
             args.text_encoder_cpu_offload = False
         if args.image_encoder_cpu_offload is None:
             args.image_encoder_cpu_offload = False
+        if (
+            args.pin_cpu_memory
+            and not args.is_arg_explicitly_set("pin_cpu_memory")
+            and current_platform.device_shares_host_memory()
+        ):
+            # The device reads host pages directly on a shared pool, so a
+            # pinned copy of a mapped weight is the same bytes held twice.
+            args.pin_cpu_memory = False
+            logger.info(
+                "Host and device share one memory pool: pinned host weight "
+                "copies are disabled (pass --pin-cpu-memory true to override)."
+            )
+        if (
+            current_platform.device_shares_host_memory()
+            and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
+        ):
+            # Every byte the caching allocator keeps reserved is a byte the
+            # page cache -- the home of every mapped weight here -- cannot
+            # hold. Measured on a GB10: ~30 GiB of reserved-but-idle segments
+            # forced the encoder and the DiT to take turns being re-read from
+            # disk. Expandable segments let the reserve follow the live peak.
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            logger.info(
+                "Host and device share one memory pool: PYTORCH_CUDA_ALLOC_CONF="
+                "expandable_segments:True so the allocator's reserve does not "
+                "crowd out the page cache."
+            )
+        if current_platform.device_shares_host_memory():
+            applied = apply_shared_pool_cpu_allocator_defaults(os.environ)
+            if applied:
+                logger.info(
+                    "Host and device share one memory pool: %s so the CPU "
+                    "allocator returns freed weight copies to the pool.",
+                    " ".join(f"{name}={os.environ[name]}" for name in applied),
+                )
+        if current_platform.device_shares_host_memory():
+            try:
+                import psutil
+
+                swap_total = psutil.swap_memory().total
+            except Exception:
+                swap_total = 0
+            try:
+                # A cgroup with swap disabled (memory.swap.max = 0) protects
+                # this process whatever the host has mounted.
+                with open("/sys/fs/cgroup/memory.swap.max") as handle:
+                    if handle.read().strip() == "0":
+                        swap_total = 0
+            except OSError:
+                pass
+            try:
+                with open("/sys/fs/cgroup/memory.max") as handle:
+                    uncapped = handle.read().strip() == "max"
+            except OSError:
+                uncapped = True
+            if uncapped:
+                # The driver takes device memory from free pages and does not
+                # wait for the kernel to reclaim page cache: with the cache
+                # full and MemFree near zero, device growth fails outright
+                # (NVRM out-of-memory on a GB10, three runs). A cgroup limit a
+                # little under physical memory makes the kernel reclaim this
+                # process's cache ahead of its own allocations.
+                logger.warning(
+                    "Host and device share one memory pool and this process has "
+                    "no cgroup memory limit: device allocations may fail while "
+                    "the page cache holds the free memory. Run with a limit a few "
+                    "GiB under physical memory (for example docker --memory)."
+                )
+            if swap_total > 0:
+                # Under page-cache pressure the kernel prefers swapping idle
+                # anonymous memory -- here the DiT's fused weight copies --
+                # over dropping cache, and every denoise step then swaps them
+                # back in. Measured on a GB10: 128 s first steps and a 54 s
+                # text encoder with 143 GiB of swap enabled.
+                logger.warning(
+                    "Host and device share one memory pool and swap is enabled "
+                    "(%.0f GiB): the kernel may swap out weight copies under "
+                    "page-cache pressure. Run with swap off for this process "
+                    "(container --memory-swap equal to --memory, or "
+                    "vm.swappiness=0).",
+                    swap_total / 1024**3,
+                )
+            if args.dit_cpu_offload or args.text_encoder_cpu_offload:
+                # Whole-component offload holds a component twice while it
+                # moves: the device copy plus a host copy the size of the
+                # component. On a shared pool both come out of the same
+                # memory. Measured on a GB10: a 57 GiB DiT moving back to
+                # the host at the end of a denoise stage exhausted the pool.
+                logger.warning(
+                    "Host and device share one memory pool and whole-component "
+                    "CPU offload is enabled (dit_cpu_offload=%s, "
+                    "text_encoder_cpu_offload=%s): moving a component holds it "
+                    "twice while it moves. Prefer layerwise offload, where "
+                    "residency is armed layer by layer from the checkpoint "
+                    "mapping.",
+                    bool(args.dit_cpu_offload),
+                    bool(args.text_encoder_cpu_offload),
+                )
 
     def _normalize_performance_mode(self) -> str:
         args = self.server_args

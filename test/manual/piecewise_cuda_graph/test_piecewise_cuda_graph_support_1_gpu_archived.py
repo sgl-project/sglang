@@ -31,7 +31,7 @@ class TestPiecewiseCudaGraphInternVL25(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enforce-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=tc_piecewise",
                 "--disable-radix-cache",
             ],
         )

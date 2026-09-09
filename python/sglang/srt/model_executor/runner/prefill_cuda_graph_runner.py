@@ -58,13 +58,16 @@ from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
 )
 from sglang.srt.layers.cp.bcg import (
-    enable_cp_v2_bcg_capture as should_enable_cp_v2_bcg_capture,
+    enable_cp_bcg_capture as should_enable_cp_bcg_capture,
 )
 from sglang.srt.layers.cp.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import (
+    is_cp_active,
+    is_mla_cp_enabled,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -72,7 +75,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -361,8 +363,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
-        # storage; same physical tensors, stable data_ptr for capture vs
-        # replay. Replaces populate_from_forward_batch on capture/replay paths.
+        # storage; same physical tensors, stable data_ptr for capture vs replay.
         self.buffer_registry: CudaGraphBufferRegistry = build_prefill_registry(
             device=self.device,
             max_bs=self.max_bs,
@@ -379,9 +380,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or self.prefill_backend_name == Backend.FULL
             ),
             require_gathered_buffer=require_gathered_buffer(),
-            enable_prefill_cp=(
-                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
-            ),
+            enable_prefill_cp=(is_dsa_enable_prefill_cp() or is_mla_cp_enabled()),
             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             source=self.buffers,
         )
@@ -414,7 +413,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._is_full_backend = False
         # Same ordering requirement: capture_prepare reads this.
         self._capture_lora = False
-        self.enable_cp_v2_bcg_capture = False
+        self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
@@ -512,10 +511,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 }
 
         server_args = model_runner.server_args
-        self.enable_cp_v2_bcg_capture = isinstance(
+        self.enable_cp_bcg_capture = isinstance(
             self.backend, BreakableCudaGraphBackend
-        ) and should_enable_cp_v2_bcg_capture(server_args)
-        if self.enable_cp_v2_bcg_capture:
+        ) and should_enable_cp_bcg_capture(server_args)
+        if self.enable_cp_bcg_capture:
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
@@ -581,7 +580,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = 0
 
     def _is_mamba_track_enabled(self) -> bool:
-        return self.model_runner.server_args.enable_mamba_extra_buffer() and (
+        return get_exec().mamba.enable_mamba_extra_buffer and (
             not get_memory().disable_radix_cache
         )
 
@@ -1068,14 +1067,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         and stash the returned per-bucket metadata object; otherwise fall
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
         attn_backend = self.model_runner.attn_backend
-        if not self.use_captured_attn_metadata:
-            attn_backend.init_forward_metadata(forward_batch)
-            return
-        metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
-            forward_batch
-        )
-        assert self.attn_metadata_buffers is not None
-        self.attn_metadata_buffers[num_tokens] = metadata
+        with forward_context(ForwardContext(attn_backend=attn_backend)):
+            if not self.use_captured_attn_metadata:
+                attn_backend.init_forward_metadata(forward_batch)
+                return
+            metadata = (
+                attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+                    forward_batch
+                )
+            )
+            assert self.attn_metadata_buffers is not None
+            self.attn_metadata_buffers[num_tokens] = metadata
 
     def _prepare_forward_metadata_for_replay(
         self,
@@ -1228,7 +1230,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         ):
             return False
-        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
             forward_batch
         ):
             assert self.prefill_cp_bcg_input is not None
@@ -1410,7 +1412,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+        with freeze_gc(get_exec().graph.enable_cudagraph_gc):
             with graph_capture(
                 stream=get_or_create_global_graph_capture_stream()
             ) as graph_capture_context:
@@ -1450,7 +1452,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
-        if self.enable_cp_v2_bcg_capture:
+        if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
                 self,
@@ -1528,7 +1530,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
+        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
             forward_batch
         ):
             assert self.prefill_cp_bcg_input is not None
@@ -1742,7 +1744,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         metadata_forward_batch = forward_batch
-        if self.enable_cp_v2_bcg_capture:
+        if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
                 self,
@@ -1910,7 +1912,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner, forward_batch, self.device_module
             )
 
-            if self.enable_cp_v2_bcg_capture:
+            if self.enable_cp_bcg_capture:
                 output = execute_prefill_cp_bcg(
                     self,
                     forward_batch,
