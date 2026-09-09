@@ -1437,7 +1437,7 @@ class DeepseekV4AttnBackend(
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         if max_seq_len_override is None:
-            max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
+            max_seq_len_override = forward_batch.max_seq_len_override
         if max_seq_len_override is not None:
             max_seq_len = max_seq_len_override
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
@@ -1537,10 +1537,7 @@ class DeepseekV4AttnBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
-        max_seq_len = (
-            getattr(forward_batch, "max_seq_len_override", None)
-            or self.MAX_SEQ_LEN_FOR_CAPTURE
-        )
+        max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
@@ -1562,8 +1559,7 @@ class DeepseekV4AttnBackend(
             static_forward_batch if static_forward_batch is not None else forward_batch
         )
         max_seq_len = (
-            getattr(metadata_batch, "max_seq_len_override", None)
-            or self.MAX_SEQ_LEN_FOR_CAPTURE
+            metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
         static_metadata = self._build_forward_metadata(
             metadata_batch,

@@ -79,7 +79,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 args = self.parser.parse_args(["--model", "dummy", option, "200k"])
 
                 self.assertEqual(
-                    ServerArgs.from_cli_args(args).cuda_graph_prefill_context_bucket,
+                    ServerArgs.from_cli_args(args).cuda_graph_prefill_max_context,
                     200_000,
                 )
 

@@ -87,11 +87,11 @@ def parse_cuda_graph_config(server_args: Any):
         # decode is implemented; today decode ignores it.
         _set(Phase.DECODE, "tc_compiler", cfg.cuda_graph_tc_compiler)
         _set(Phase.PREFILL, "tc_compiler", cfg.cuda_graph_tc_compiler)
-    if cfg.cuda_graph_prefill_context_bucket is not None:
+    if cfg.cuda_graph_prefill_max_context is not None:
         _set(
             Phase.PREFILL,
             "max_context_size",
-            cfg.cuda_graph_prefill_context_bucket,
+            cfg.cuda_graph_prefill_max_context,
         )
 
     # ---- Explicit JSON config (highest precedence) ----

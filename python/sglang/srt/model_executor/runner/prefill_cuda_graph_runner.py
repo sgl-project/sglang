@@ -939,12 +939,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     @staticmethod
     def _max_context_len(forward_batch: ForwardBatch) -> Optional[int]:
-        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is not None:
             if torch.is_tensor(seq_lens_cpu):
                 return int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() > 0 else 0
             return max((int(value) for value in seq_lens_cpu), default=0)
-        seq_lens = getattr(forward_batch, "seq_lens", None)
+        seq_lens = forward_batch.seq_lens
         if seq_lens is None or seq_lens.numel() == 0:
             return None
         # Prefill normally has seq_lens_cpu. This fallback is for hand-built
