@@ -24,7 +24,6 @@
 #include <cstdint>
 #include <iterator>
 #include <limits>
-#include <mutex>
 
 namespace sglang {
 
