@@ -1,4 +1,5 @@
 import sys
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -10,9 +11,16 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch  # noqa: E402
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    ReqKvInfo,
+    ScheduleBatch,
+)
 from sglang.srt.managers.tp_worker import _mm_embedding_validation_indices  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.models.llava import LlavaBaseForCausalLM  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -160,6 +168,43 @@ def test_extend_modes_validate_only_overlapping_multimodal_rows(forward_mode):
     )
 
     assert batch.mm_embedding_validation_indices() == [1]
+
+
+@pytest.mark.parametrize("forward_mode", [ForwardMode.EXTEND, ForwardMode.MIXED])
+def test_llava_model_owned_offsets_do_not_enter_item_validation(forward_mode):
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        model_specific_data={
+            "image_sizes": [(4, 4)],
+            "image_aspect_ratio": "pad",
+        },
+    )
+    item.set_hash(42)
+    mm_input = MultimodalInputs(mm_items=[item])
+    model = LlavaBaseForCausalLM()
+    model.config = SimpleNamespace(image_token_index=-200)
+    model.image_size = 4
+    model.patch_size = 2
+    model.image_feature_len = 4
+
+    # use the real padding path: LLaVA fills request-level spans, not item.offsets
+    padded_ids = model.pad_input_ids(array("q", [1, -200, 2]), mm_input)
+    assert list(padded_ids) == [1, *([item.pad_value] * 4), 2]
+    assert mm_input.image_offsets == [1]
+    assert mm_input.image_pad_len == [4]
+    assert item.offsets is None
+
+    batch = _validation_batch(forward_mode, [mm_input], [0], [len(padded_ids)])
+    assert batch.mm_embedding_validation_indices() == []
+
+    # missing or empty offsets must not hide another item's valid span
+    mm_input.mm_items.extend(
+        [
+            MultimodalDataItem(modality=Modality.AUDIO, offsets=[]),
+            MultimodalDataItem(modality=Modality.IMAGE, offsets=[(2, 4)]),
+        ]
+    )
+    assert batch.mm_embedding_validation_indices() == [0]
 
 
 @pytest.mark.parametrize("forward_mode", [ForwardMode.EXTEND, ForwardMode.MIXED])

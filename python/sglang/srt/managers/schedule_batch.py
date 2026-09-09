@@ -2440,9 +2440,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if mm_input is None:
                 continue
             end = start + length
+            # legacy model-owned embedding paths do not provide per-item offsets
             if any(
                 item_start < end and item_end >= start
                 for item in mm_input.mm_items
+                if item.offsets is not None
                 for item_start, item_end in item.offsets
             ):
                 indices.append(i)
