@@ -436,6 +436,41 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, self.forward_metadata, self.device
                 )
 
+    @staticmethod
+    def _gguf_gqa_expand_mixed_qkv(
+        mixed_qkv: torch.Tensor,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+    ) -> torch.Tensor:
+        """Tiled-expand the q/k segments of a packed ``mixed_qkv``.
+
+        GDN linear attention may use fewer key heads than value heads (GQA).
+        The packed ``mixed_qkv`` is laid out as ``[q | k | v]`` where q/k use
+        ``num_k_heads`` heads and v uses ``num_v_heads`` heads. Expanding the
+        q/k segments to ``num_v_heads`` with a tiled repeat makes the fused
+        kernels infer ``H == HV`` and take their plain (non-GQA) path, so no
+        kernel change is required. It is a no-op when the head counts already
+        match or the tensor layout is unexpected.
+        """
+        if num_k_heads == num_v_heads:
+            return mixed_qkv
+        if mixed_qkv.ndim != 2:
+            return mixed_qkv
+        batch, dim = mixed_qkv.shape
+        k_dim = num_k_heads * head_k_dim
+        v_dim = num_v_heads * head_v_dim
+        if dim != 2 * k_dim + v_dim:
+            return mixed_qkv
+        ratio = num_v_heads // num_k_heads
+        q = mixed_qkv[:, :k_dim].view(batch, num_k_heads, head_k_dim)
+        k = mixed_qkv[:, k_dim : 2 * k_dim].view(batch, num_k_heads, head_k_dim)
+        v = mixed_qkv[:, 2 * k_dim :]
+        q = q.repeat(1, ratio, 1).reshape(batch, -1)
+        k = k.repeat(1, ratio, 1).reshape(batch, -1)
+        return torch.cat([q, k, v], dim=-1)
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -631,6 +666,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
         if self.kernel_dispatcher.supports_packed_decode:
+            # GQA: expand the packed q/k segments to num_v_heads so the fused
+            # decode kernel infers H == HV and skips its GQA pairing path.
+            if layer.num_k_heads != layer.num_v_heads:
+                mixed_qkv = self._gguf_gqa_expand_mixed_qkv(
+                    mixed_qkv,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                )
             core_attn_out = self.kernel_dispatcher.packed_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -812,6 +857,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
             key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+
+        # GQA: tiled-expand the q/k heads to num_v_heads so the extend kernel
+        # sees H == HV and skips its GQA pairing path.
+        if layer.num_k_heads != layer.num_v_heads:
+            gqa_ratio = layer.num_v_heads // layer.num_k_heads
+            query = query.repeat(1, 1, gqa_ratio, 1)
+            key = key.repeat(1, 1, gqa_ratio, 1)
 
         if is_target_verify:
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
