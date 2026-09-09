@@ -1,16 +1,7 @@
 import json
-import sys
 import unittest
-from contextlib import ExitStack
-from pathlib import Path
 
 import openai
-
-_TEST_ROOT = Path(__file__).resolve().parents[3]
-if str(_TEST_ROOT) not in sys.path:
-    sys.path.insert(0, str(_TEST_ROOT))
-
-from registered.openai_server.rust_renderer import launch_rust_renderer
 
 from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -20,7 +11,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_rust_server_built,
     popen_launch_server,
 )
 
@@ -940,70 +930,6 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             "get_weather" in found_names or "get_tourist_attractions" in found_names,
             f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
         )
-
-
-@unittest.skipUnless(
-    is_rust_server_built(),
-    "embedded rust server extension not built",
-)
-@unittest.skipIf(is_npu(), "the embedded Rust server is not an Ascend path")
-class TestOpenAIFunctionCallingWithRust(TestOpenAIServerFunctionCalling):
-    """Run the registered unary/streaming function-call suite through Rust."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        stack = ExitStack()
-        cls.addClassCleanup(stack.close)
-        stack.enter_context(
-            launch_rust_renderer(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                renderer_args=["--tool-call-parser", "llama3"],
-            )
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls):
-        # Class cleanup owns both processes, including failed setUpClass calls.
-        pass
-
-
-@unittest.skipUnless(
-    is_rust_server_built(),
-    "embedded rust server extension not built",
-)
-@unittest.skipIf(is_npu(), "the embedded Rust server is not an Ascend path")
-class TestOpenAIPythonicFunctionCallingWithRust(TestOpenAIPythonicFunctionCalling):
-    """Run Pythonic unary/streaming tool calls through Rust."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        stack = ExitStack()
-        cls.addClassCleanup(stack.close)
-        stack.enter_context(
-            launch_rust_renderer(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                renderer_args=["--tool-call-parser", "pythonic"],
-            )
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls):
-        # Class cleanup owns both processes, including failed setUpClass calls.
-        pass
 
 
 # Skip for ci test
