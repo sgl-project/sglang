@@ -59,11 +59,13 @@ class RustServer:
     def __init__(
         self,
         server: Server,
+        http_port: int,
         mm_spec: Optional[RustMmSpec] = None,
         renderer_sidecar: Optional[RustRendererSidecar] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
+        self.http_port = http_port
         self.mm_spec = mm_spec
         self.renderer_sidecar = renderer_sidecar
         self._max_per_poll = max_per_poll
@@ -190,6 +192,7 @@ class RustServer:
 
         return cls(
             server,
+            http_port=listen_port,
             mm_spec=mm_spec,
             renderer_sidecar=renderer_sidecar,
         )
@@ -246,14 +249,13 @@ class RustServer:
                 obj.input_ids = ids
                 pos += nbytes
             if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
-                # The buffers rode the Rust sidecar, parked before the ring push;
-                # wrapping them into tensors is the only Python step of the Rust
-                # path. `None` for a text-only request on a multimodal model.
-                mm_result = self.server.take_mm_result(obj.rid)
-                if mm_result is not None:
-                    obj.mm_inputs = RustMmProcessor.build_output(
-                        self.mm_spec, mm_result
-                    )
+                # The buffers were parked in the Rust result store before the
+                # ring push; wrapping them into tensors is the only Python step
+                # of the Rust path. `None` for a text-only request on a
+                # multimodal model.
+                encoded = self.server.take_mm_result(obj.rid)
+                if encoded is not None:
+                    obj.mm_inputs = RustMmProcessor.wrap_encoded(self.mm_spec, encoded)
             out.append(obj)
         return out
 
@@ -279,9 +281,9 @@ class RustServer:
 
         # Invariant: control requests always carry a rust-minted rid; without
         # one the response is unroutable, so fail loudly rather than drop it.
-        assert (
-            recv_req.rid is not None
-        ), f"control response without rid: {type(output).__name__}"
+        assert recv_req.rid is not None, (
+            f"control response without rid: {type(output).__name__}"
+        )
         # No local try/except: a failed push propagates to run_scheduler_process's
         # outer handler, which logs the full traceback (scheduler-fatal either way).
         payload = (
@@ -408,7 +410,9 @@ class RustServer:
                     assert len(col) in (
                         0,
                         batch_size,
-                    ), f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    ), (
+                        f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    )
                     populated |= len(col) > 0
                 if populated:
                     active.append(extra)

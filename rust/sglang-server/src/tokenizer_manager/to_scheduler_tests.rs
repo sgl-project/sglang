@@ -84,12 +84,12 @@ fn make_intake_inner(
     (intake, detok_rx, consumer, tm_tx, mm_rx)
 }
 
-/// An [`Mm`] over `tx` with a fresh sidecar.
-fn test_mm(tx: flume::Sender<MmRequest>, enabled: bool) -> Mm {
-    Mm {
+/// An [`MmDispatch`] over `tx` with a fresh result store.
+fn test_mm(tx: flume::Sender<MmRequest>, enabled: bool) -> MmDispatch {
+    MmDispatch {
         enabled,
         tx,
-        sidecar: Default::default(),
+        results: Default::default(),
     }
 }
 
@@ -579,7 +579,9 @@ fn multimodal_sentinel_is_validated_after_expansion() {
     };
     g.input_ids = Some(vec![1, -103, 2]);
     g.mm = Some(Box::new(crate::message::request::MmData {
-        audio_data: Some(rmpv::Value::from("data:audio/wav;base64,xxxx")),
+        audio_data: vec![crate::message::multimodal::MmItem::Source(
+            "data:audio/wav;base64,xxxx".into(),
+        )],
         ..Default::default()
     }));
 
@@ -706,7 +708,9 @@ fn mm_generate_req(rid: &str) -> Request {
             rid: rid.to_string().into(),
             text: Some("<image> hi".into()),
             mm: Some(Box::new(crate::message::request::MmData {
-                image_data: Some(rmpv::Value::from("data:image/jpeg;base64,xxxx")),
+                image_data: vec![crate::message::multimodal::MmItem::Source(
+                    "data:image/jpeg;base64,xxxx".into(),
+                )],
                 ..Default::default()
             })),
             ..Default::default()
@@ -716,7 +720,7 @@ fn mm_generate_req(rid: &str) -> Request {
 
 /// An abort while the request is parked for MM cancels it: the pending
 /// entry is removed, the worker's late result is dropped, and its parked
-/// sidecar entry is purged — no scheduler work runs for a dead client.
+/// result-store entry is purged — no scheduler work runs for a dead client.
 #[test]
 fn abort_cancels_parked_mm_request() {
     let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
@@ -724,10 +728,10 @@ fn abort_cancels_parked_mm_request() {
     mm_rx.try_recv().expect("parked to mm pool");
 
     // The worker parks its result, as it always does before MmEncoded.
-    intake.mm.sidecar.park(
+    intake.mm.results.park(
         "mm-gone".into(),
-        crate::multi_modality::sidecar::MmSidecarEntry {
-            features: crate::multi_modality::sidecar::FeatureStore::Inline(vec![]),
+        crate::multi_modality::result_store::MmEncodedEntry {
+            features: crate::multi_modality::result_store::FeatureStore::Inline(vec![]),
             grids: vec![],
             hashes: vec![],
             offsets: vec![],
@@ -738,13 +742,13 @@ fn abort_cancels_parked_mm_request() {
     intake.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
     assert_eq!(consumer.drain(16).headers.len(), 1, "only the AbortReq");
 
-    // The late result must be dropped, not queued, and the sidecar purged.
+    // The late result must be dropped, not queued, and the parked result purged.
     intake.on_mm_encoded("mm-gone".to_string().into(), vec![5, 6]);
     assert!(
         consumer.drain(16).headers.is_empty(),
         "cancelled, not queued"
     );
-    assert!(intake.mm.sidecar.take("mm-gone").is_none(), "entry purged");
+    assert!(intake.mm.results.take("mm-gone").is_none(), "entry purged");
 }
 
 /// A multimodal request parks in `Encoding` (submitted to the mm worker
@@ -761,7 +765,7 @@ fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
     assert_eq!(sub.work.text.as_deref(), Some("<image> hi"));
     assert!(sub.work.input_ids.is_none(), "no client input_ids");
     assert_eq!(
-        sub.work.image_data.as_ref().and_then(|v| v.as_str()),
+        sub.work.image_data.first().and_then(|item| item.source()),
         Some("data:image/jpeg;base64,xxxx")
     );
     assert!(consumer.drain(16).headers.is_empty(), "parked, not queued");
@@ -796,7 +800,7 @@ fn mm_failure_rejects_parked_request() {
     assert!(consumer.drain(16).headers.is_empty(), "nothing queued");
 }
 
-/// On a non-multimodal model (`Mm::enabled == false`), image_data is silently
+/// On a non-multimodal model (`MmDispatch::enabled == false`), image_data is silently
 /// ignored and the request tokenizes as plain text — the Python
 /// TokenizerManager behavior when `mm_processor is None`.
 #[test]

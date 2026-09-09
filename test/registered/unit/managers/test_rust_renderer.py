@@ -110,6 +110,7 @@ class TestRustRendererSidecar(unittest.TestCase):
                     "127.0.0.1", 31000
                 )
                 server = RustServer.launch(scheduler)
+                self.assertEqual(server.http_port, 30001)
                 if enabled:
                     sidecar.assert_called_once_with(
                         scheduler.server_args,

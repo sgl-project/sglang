@@ -128,6 +128,22 @@ def load_bsa_attn_blk64_fwd():
     return mod.bsa_attn_blk64_fwd
 
 
+@functools.lru_cache(maxsize=1)
+def load_bsa_attn_sm120_blk64_fwd():
+    """FlashInfer's CuTe-DSL 64-block sparse attention entry point for SM120."""
+    try:
+        from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import (
+            bsa_attn_sm120_blk64_fwd,
+        )
+    except Exception as exc:
+        raise ImportError(
+            "SM120 SubBlock sparse attention requires FlashInfer's "
+            "flashinfer.cute_dsl.sparse.bsa_attn_sm120 module"
+        ) from exc
+
+    return bsa_attn_sm120_blk64_fwd
+
+
 LOG2E = 1.4426950408889634
 BLOCK = 64  # the kernel's block granularity (kSparseBlockSize=64)
 BUDGET_GRANULARITY = 8  # blocks per query row the kernel bills in, padding to fit

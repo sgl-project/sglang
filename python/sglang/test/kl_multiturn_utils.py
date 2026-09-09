@@ -44,9 +44,9 @@ __all__ = [
 def default_prefill_cache_assert(result: dict, prefix_len: int, label: str):
     """Standard radix cache: cached_tokens == prefix_len."""
     actual = result["meta_info"]["cached_tokens"]
-    assert (
-        actual == prefix_len
-    ), f"{label}: expected cached_tokens={prefix_len}, got {actual}"
+    assert actual == prefix_len, (
+        f"{label}: expected cached_tokens={prefix_len}, got {actual}"
+    )
 
 
 def default_decode_cache_assert(
@@ -55,9 +55,9 @@ def default_decode_cache_assert(
     """Standard radix cache: cached_tokens == history_len + output_len."""
     expected = history_len + output_len
     actual = result["meta_info"]["cached_tokens"]
-    assert (
-        actual == expected
-    ), f"{label}: expected cached_tokens={expected}, got {actual}"
+    assert actual == expected, (
+        f"{label}: expected cached_tokens={expected}, got {actual}"
+    )
 
 
 def make_mamba_prefill_assert(chunk_size: int = 64) -> Callable:
@@ -67,9 +67,9 @@ def make_mamba_prefill_assert(chunk_size: int = 64) -> Callable:
         actual = result["meta_info"]["cached_tokens"]
         upper = (prefix_len // chunk_size) * chunk_size
         lower = max(0, upper - chunk_size)
-        assert (
-            lower <= actual <= upper
-        ), f"{label}: expected cached_tokens in [{lower}, {upper}], got {actual}"
+        assert lower <= actual <= upper, (
+            f"{label}: expected cached_tokens in [{lower}, {upper}], got {actual}"
+        )
 
     return _check
 
@@ -85,9 +85,9 @@ def make_mamba_decode_assert(track_interval: int = 16) -> Callable:
             expected = (
                 (history_len + output_len - 1) // track_interval
             ) * track_interval
-        assert (
-            actual >= expected
-        ), f"{label}: expected cached_tokens={expected}, got {actual}"
+        assert actual >= expected, (
+            f"{label}: expected cached_tokens={expected}, got {actual}"
+        )
 
     return _check
 
@@ -458,9 +458,9 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     different suffixes per branch. Use branches_per_group for interleaved
     submission to stress the radix tree.
     """
-    assert (
-        len(turn_suffixes) >= 1
-    ), "turn_suffixes must have at least 1 entry (for turn 2)"
+    assert len(turn_suffixes) >= 1, (
+        "turn_suffixes must have at least 1 entry (for turn 2)"
+    )
     if assert_decode_cached_tokens is None:
         assert_decode_cached_tokens = default_decode_cache_assert
 

@@ -392,8 +392,7 @@ class Platform:
         """
         if cls.supported_quantization and quant not in cls.supported_quantization:
             raise ValueError(
-                f"{quant} quantization is currently not supported in "
-                f"{cls.device_name}."
+                f"{quant} quantization is currently not supported in {cls.device_name}."
             )
 
     @classmethod
@@ -434,6 +433,16 @@ class Platform:
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         """Whether automatic DiT layerwise offload is enabled on this platform."""
         return True
+
+    @classmethod
+    def device_shares_host_memory(cls) -> bool:
+        """Whether the accelerator draws from the same physical pool as the host.
+
+        On such a part (DGX Spark's GB10, Jetson) a device allocation is host
+        memory the kernel no longer has, and a host copy of a mapped weight is
+        a second copy of bytes the page cache already holds.
+        """
+        return False
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:

@@ -309,6 +309,7 @@ async def generations(
             attention_backend_override=_get_extra_field(
                 request, "attention_backend_override"
             ),
+            skip_softmax_params=_get_extra_field(request, "skip_softmax_params"),
             quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
@@ -424,6 +425,7 @@ async def edits(
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
+    perf_dump_path: Optional[str] = Form(None),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
@@ -484,6 +486,7 @@ async def edits(
             enable_upscaling=enable_upscaling,
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
+            perf_dump_path=perf_dump_path,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
