@@ -55,7 +55,7 @@ def test_allocator_delegates_exact_tensors_in_subprocess() -> None:
             attach_calls.append(options)
             return session
 
-        host_allocator._PROCESS_SESSION_ATTACH = fake_attach
+        host_allocator._attach_process_session = fake_attach
         source = {"tensorcast": {"daemon_address": "127.0.0.1:8073"}}
         first_allocator = host_allocator.create_tensorcast_host_allocator(
             source,
@@ -131,7 +131,7 @@ def test_registry_equal_conflicting_and_store_claims_in_subprocess() -> None:
             attach_calls.append(options)
             return session
 
-        host_allocator._PROCESS_SESSION_ATTACH = fake_attach
+        host_allocator._attach_process_session = fake_attach
         first_config = host_allocator.TensorcastConfig(
             daemon_address="127.0.0.1:8073"
         )
@@ -230,7 +230,7 @@ def test_store_close_lifecycle_is_terminal_and_retains_allocator_roots_in_subpro
                 self.terminate_calls += 1
 
         session = FakeSession()
-        host_allocator._PROCESS_SESSION_ATTACH = lambda options: session
+        host_allocator._attach_process_session = lambda options: session
         source = {
             "tensorcast": {
                 "daemon_address": "127.0.0.1:8073",

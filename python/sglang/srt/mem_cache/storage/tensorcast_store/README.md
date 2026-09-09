@@ -280,7 +280,7 @@ JSON, YAML, or TOML file. TensorCast-specific fields must be nested under
 
 | Field | Default | Meaning |
 |---|---|---|
-| `daemon_address` | required | Numeric node-local `IP:port` for the StoreDaemon RPC endpoint. IPv6 must use `[address]:port`. Hostnames, DNS targets, and Unix socket URIs are rejected. |
+| `daemon_address` | required | StoreDaemon RPC endpoint passed unchanged to TensorCast, for example `127.0.0.1:50052`. |
 | `namespace` | `default` | Byte-artifact namespace. Compatible publishers and consumers must use the same value. |
 | `transfer_mode` | `allocator` | Selects `allocator` or `scratch` for the lifetime of the rank process. |
 | `model_id` | SGLang storage model name | Optional stable model identity override. |
@@ -288,7 +288,7 @@ JSON, YAML, or TOML file. TensorCast-specific fields must be nested under
 | `session_name_prefix` | `sglang` | Diagnostic Session prefix; SGLang appends the world-rank label. |
 | `region_name_prefix` | `sglang_tensorcast` | Diagnostic region prefix; SGLang appends the world-rank label and TensorCast makes concrete names PID-unique. |
 | `exists_timeout_s` | `30.0` | Positive metadata-only exists deadline in seconds. |
-| `transfer_timeout_s` | `null` | Transfer deadline. The initial integration requires `null`; region get/put uses zero transparent retries. |
+| `transfer_timeout_s` | `null` | Optional positive transfer deadline passed unchanged to TensorCast. Region get/put uses zero transparent retries. |
 | `scratch.capacity_bytes` | `16777216` | Positive capacity in bytes for each scratch-direction arena. Ignored by allocator mode. |
 
 ### Generic HiCache fields
@@ -358,8 +358,8 @@ after the SGLang rank exits.
 ## Troubleshooting
 
 - **Attach fails before model startup:** verify Global Store and StoreDaemon
-  status, `cpu_shared_memory.enabled`, the numeric node-local daemon address,
-  local handle socket access, and PID visibility.
+  status, `cpu_shared_memory.enabled`, the configured daemon address, local
+  handle socket access, and PID visibility.
 - **`Too many open files` from `memfd_create`:** raise the StoreDaemon's
   inherited `RLIMIT_NOFILE`, for example with `ulimit -n 65535`, and restart
   the failed daemon and rank processes.

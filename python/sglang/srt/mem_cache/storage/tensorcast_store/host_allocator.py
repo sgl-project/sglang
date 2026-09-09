@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import sys
 import threading
@@ -27,14 +26,6 @@ if TYPE_CHECKING:
     )
 
 
-_GENERIC_HICACHE_FIELDS = frozenset(
-    {
-        "prefetch_threshold",
-        "prefetch_timeout_base",
-        "prefetch_timeout_per_ki_token",
-        "hicache_storage_pass_prefix_keys",
-    }
-)
 _SUPPORTED_LAYOUT_IO_PAIRS = frozenset(
     {
         ("page_first", "kernel"),
@@ -91,11 +82,6 @@ class TensorcastConfig(_FrozenConfig):
     ) = None
     scratch: TensorcastScratchConfig = TensorcastScratchConfig()
 
-    @field_validator("daemon_address")
-    @classmethod
-    def validate_daemon_address(cls, value: str) -> str:
-        return _normalize_daemon_address(value)
-
     @field_validator(
         "namespace",
         "model_version",
@@ -112,15 +98,6 @@ class TensorcastConfig(_FrozenConfig):
         if value is None:
             return None
         return _strip_non_empty(value)
-
-    @field_validator("transfer_timeout_s")
-    @classmethod
-    def validate_transfer_timeout(cls, value: float | None) -> None:
-        if value is not None:
-            raise ValueError(
-                "TensorCast HiCache initially requires transfer_timeout_s=null"
-            )
-        return None
 
 
 TensorcastConfigSource: TypeAlias = TensorcastConfig | str | Mapping[str, object]
@@ -149,22 +126,13 @@ def normalize_tensorcast_config(source: TensorcastConfigSource) -> TensorcastCon
     if isinstance(source, TensorcastConfig):
         return source
 
-    raw = _load_extra_config(source) if isinstance(source, str) else dict(source)
-    payload = dict(raw)
-    for field_name in _GENERIC_HICACHE_FIELDS:
-        payload.pop(field_name, None)
-
-    unexpected = sorted(set(payload) - {"tensorcast"})
-    if unexpected:
-        raise ValueError(
-            f"Unknown TensorCast HiCache top-level configuration fields: {unexpected}"
-        )
-    if "tensorcast" not in payload:
+    raw = _load_extra_config(source) if isinstance(source, str) else source
+    if "tensorcast" not in raw:
         raise ValueError(
             "TensorCast HiCache configuration requires a 'tensorcast' object"
         )
 
-    return TensorcastConfig.model_validate(payload["tensorcast"])
+    return TensorcastConfig.model_validate(raw["tensorcast"])
 
 
 def format_tensorcast_rank_label(world_rank: int, world_size: int) -> str:
@@ -236,9 +204,6 @@ def _attach_process_session(
     return RegionBackedArtifactSession.attach(options)
 
 
-_PROCESS_SESSION_ATTACH = _attach_process_session
-
-
 def attach_early_process_session(
     options: RegionBackedArtifactSessionOptions,
 ) -> RegionBackedArtifactSession:
@@ -262,7 +227,7 @@ def attach_early_process_session(
             return state.session
 
         try:
-            session = _PROCESS_SESSION_ATTACH(options)
+            session = _attach_process_session(options)
         except BaseException:
             state.terminal = True
             raise
@@ -472,57 +437,6 @@ def _strip_non_empty(value: str) -> str:
     if not stripped:
         raise ValueError("value must not be empty")
     return stripped
-
-
-def _normalize_daemon_address(value: str) -> str:
-    endpoint = value.strip()
-    if not endpoint:
-        raise ValueError("daemon_address must not be empty")
-
-    bracketed = endpoint.startswith("[")
-    if bracketed:
-        closing_bracket = endpoint.find("]")
-        if (
-            closing_bracket <= 1
-            or endpoint[closing_bracket + 1 : closing_bracket + 2] != ":"
-        ):
-            raise ValueError(
-                "daemon_address must use numeric IP:port or bracketed [IPv6]:port"
-            )
-        host = endpoint[1:closing_bracket]
-        port_text = endpoint[closing_bracket + 2 :]
-        if ":" not in host or "]" in port_text:
-            raise ValueError(
-                "daemon_address must use numeric IP:port or bracketed [IPv6]:port"
-            )
-    else:
-        if endpoint.count(":") != 1:
-            raise ValueError(
-                "daemon_address must use numeric IP:port or bracketed [IPv6]:port"
-            )
-        host, port_text = endpoint.rsplit(":", maxsplit=1)
-
-    if not port_text.isascii() or not port_text.isdecimal():
-        raise ValueError("daemon_address port must be a decimal integer")
-    port = int(port_text)
-    if port < 1 or port > 65535:
-        raise ValueError("daemon_address port must be in [1, 65535]")
-    if "%" in host:
-        raise ValueError("daemon_address does not accept scoped IPv6 zone identifiers")
-
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError as exc:
-        raise ValueError("daemon_address host must be a numeric IP address") from exc
-    if address.is_unspecified or address.is_multicast:
-        raise ValueError("daemon_address host must be a dialable unicast IP address")
-    if bracketed and address.version != 6:
-        raise ValueError("brackets are accepted only for IPv6 daemon addresses")
-
-    formatted_host = (
-        f"[{address.compressed}]" if address.version == 6 else address.compressed
-    )
-    return f"{formatted_host}:{port}"
 
 
 def _load_extra_config(source: str) -> Mapping[str, object]:

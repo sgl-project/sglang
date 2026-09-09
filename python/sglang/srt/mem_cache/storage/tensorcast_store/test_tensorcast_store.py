@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store import (
     ARTIFACT_LAYOUT_SCHEMA_VERSION,
     FragmentComponent,
     TensorcastStore,
-    _build_registered_full_pool,
+    _build_registered_pool,
     _expand_artifact_specs,
     _expand_transfer_fragments,
     _fold_fragment_mask,
@@ -267,7 +267,7 @@ def _candidate(
         family=normalized_family,
         **(storage_overrides or {}),
     )
-    return _build_registered_full_pool(
+    return _build_registered_pool(
         pool or _make_pool(family, layout),
         storage_config=storage_config,
         tensorcast_config=config

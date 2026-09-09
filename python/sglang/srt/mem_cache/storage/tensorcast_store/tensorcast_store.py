@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to SGLang project
 
-"""TensorCast-backed synchronous FULL-page storage adapter."""
+"""TensorCast-backed synchronous L3 storage adapter."""
 
 from __future__ import annotations
 
@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
 
 logger = logging.getLogger(__name__)
 
+# Schema used for TensorCast byte-artifact key namespace
 ARTIFACT_LAYOUT_SCHEMA_VERSION = "full-fragment-v1"
 _ARTIFACT_LAYOUT_SCHEMA_TOKEN = "ff1"
 _SUPPORTED_FULL_LAYOUTS = frozenset({"page_first", "page_first_direct"})
@@ -78,11 +79,13 @@ class FragmentComponent(str, Enum):
     K = "k"
     V = "v"
     KV = "kv"
+    # TODO: support SWA/Mamba in V2
 
 
 class _PoolFamily(str, Enum):
     MHA = "mha"
     MLA = "mla"
+    # TODO: support SWA/Mamba in V2
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +109,7 @@ class PageFragment:
 
 
 @dataclass(frozen=True, slots=True)
-class _RegisteredFullPool:
+class _RegisteredPool:
     pool: HostKVCache
     family: _PoolFamily
     fragment_schema: tuple[FragmentSchema, ...]
@@ -117,7 +120,7 @@ class _RegisteredFullPool:
 
 
 class TensorcastStore(HiCacheStorage):
-    """Adapt SGLang FULL pages to TensorCast byte-artifact Session calls."""
+    """Adapt SGLang KV pages to TensorCast byte-artifact Session calls."""
 
     def __init__(self, storage_config: HiCacheStorageConfig) -> None:
         source = storage_config.extra_config
@@ -127,12 +130,11 @@ class TensorcastStore(HiCacheStorage):
             )
         tensorcast_config = normalize_tensorcast_config(source)
         session_options = build_tensorcast_session_options(tensorcast_config)
-        _validate_rank_topology(storage_config)
 
         self._storage_config = storage_config
         self._tensorcast_config = tensorcast_config
         self._session_options = session_options
-        self._registered: _RegisteredFullPool | None = None
+        self._registered: _RegisteredPool | None = None
         self._availability_lock = threading.Lock()
         self._disabled = False
         self._failure_logged = False
@@ -154,7 +156,7 @@ class TensorcastStore(HiCacheStorage):
                 "TensorCast Store is already registered with a different HostPool"
             )
 
-        candidate = _build_registered_full_pool(
+        candidate = _build_registered_pool(
             mem_pool_host,
             storage_config=self._storage_config,
             tensorcast_config=self._tensorcast_config,
@@ -176,7 +178,6 @@ class TensorcastStore(HiCacheStorage):
         keys: list[str],
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> int:
-        del extra_info
         if not keys:
             return 0
         if not self._adapter_is_available():
@@ -203,9 +204,9 @@ class TensorcastStore(HiCacheStorage):
         registered = self._require_registered()
         return _expand_artifact_specs(registered, keys)
 
-    def _require_registered(self) -> _RegisteredFullPool:
+    def _require_registered(self) -> _RegisteredPool:
         if self._registered is None:
-            raise RuntimeError("TensorCast Store has no registered FULL HostPool")
+            raise RuntimeError("TensorCast Store has no registered HostPool")
         return self._registered
 
     def get(
@@ -214,7 +215,6 @@ class TensorcastStore(HiCacheStorage):
         target_location: Any | None = None,
         target_sizes: Any | None = None,
     ) -> torch.Tensor | None:
-        del key, target_location, target_sizes
         raise NotImplementedError("TensorCast does not support value-oriented get()")
 
     def batch_get(
@@ -223,7 +223,6 @@ class TensorcastStore(HiCacheStorage):
         target_locations: Any | None = None,
         target_sizes: Any | None = None,
     ) -> list[torch.Tensor | None] | int:
-        del keys, target_locations, target_sizes
         raise NotImplementedError(
             "TensorCast does not support value-oriented batch_get()"
         )
@@ -235,7 +234,6 @@ class TensorcastStore(HiCacheStorage):
         target_location: Any | None = None,
         target_sizes: Any | None = None,
     ) -> bool:
-        del key, value, target_location, target_sizes
         raise NotImplementedError("TensorCast does not support value-oriented set()")
 
     def batch_set(
@@ -245,7 +243,6 @@ class TensorcastStore(HiCacheStorage):
         target_locations: Any | None = None,
         target_sizes: Any | None = None,
     ) -> bool:
-        del keys, values, target_locations, target_sizes
         raise NotImplementedError(
             "TensorCast does not support value-oriented batch_set()"
         )
@@ -256,7 +253,6 @@ class TensorcastStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> list[bool]:
-        del extra_info
         unavailable = [False] * len(keys)
         if not keys:
             return []
@@ -283,7 +279,6 @@ class TensorcastStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> list[bool]:
-        del extra_info
         unavailable = [False] * len(keys)
         if not keys:
             return []
@@ -392,7 +387,6 @@ class TensorcastStore(HiCacheStorage):
         pool_transfers: list[PoolTransfer] | None = None,
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> PoolTransferResult:
-        del keys, pool_transfers, extra_info
         raise NotImplementedError("TensorCast initially supports FULL v1 only")
 
     def batch_get_v2(
@@ -400,7 +394,6 @@ class TensorcastStore(HiCacheStorage):
         transfers: list[PoolTransfer],
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> dict[str, list[bool]]:
-        del transfers, extra_info
         raise NotImplementedError("TensorCast initially supports FULL v1 only")
 
     def batch_set_v2(
@@ -408,21 +401,20 @@ class TensorcastStore(HiCacheStorage):
         transfers: list[PoolTransfer],
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> dict[str, list[bool]]:
-        del transfers, extra_info
         raise NotImplementedError("TensorCast initially supports FULL v1 only")
 
     def clear(self) -> None:
         raise NotImplementedError("TensorCast has no namespace-wide clear operation")
 
 
-def _build_registered_full_pool(
+def _build_registered_pool(
     mem_pool_host: HostKVCache,
     *,
     storage_config: HiCacheStorageConfig,
     tensorcast_config: TensorcastConfig,
-) -> _RegisteredFullPool:
-    family, components, roots = _select_full_pool_adapter(mem_pool_host)
-    _validate_full_v1_scope(
+) -> _RegisteredPool:
+    family, components, roots = _select_pool_adapter(mem_pool_host)
+    _validate_storage_config(
         mem_pool_host,
         family=family,
         storage_config=storage_config,
@@ -443,7 +435,7 @@ def _build_registered_full_pool(
         model_version=tensorcast_config.model_version,
         layout_id=layout_id,
     )
-    return _RegisteredFullPool(
+    return _RegisteredPool(
         pool=mem_pool_host,
         family=family,
         fragment_schema=fragment_schema,
@@ -454,7 +446,7 @@ def _build_registered_full_pool(
     )
 
 
-def _select_full_pool_adapter(
+def _select_pool_adapter(
     mem_pool_host: HostKVCache,
 ) -> tuple[_PoolFamily, tuple[FragmentComponent, ...], tuple[torch.Tensor, ...]]:
     pool_type = type(mem_pool_host)
@@ -485,12 +477,17 @@ def _select_full_pool_adapter(
     )
 
 
-def _validate_full_v1_scope(
+def _validate_storage_config(
     mem_pool_host: HostKVCache,
     *,
     family: _PoolFamily,
     storage_config: HiCacheStorageConfig,
 ) -> None:
+    """Check that the storage configuration matches the implemented data path.
+
+    The current checks cover only FULL v1. Extend this validation as support for
+    additional pool families and storage API versions is implemented.
+    """
     if mem_pool_host.layout not in _SUPPORTED_FULL_LAYOUTS:
         raise NotImplementedError(
             "TensorCast FULL v1 supports only page_first and page_first_direct, "
@@ -573,7 +570,7 @@ def _validate_roots(roots: tuple[torch.Tensor, ...], *, pool_type: str) -> None:
 
 
 def _validate_transfer_mode_registration(
-    registered: _RegisteredFullPool,
+    registered: _RegisteredPool,
     *,
     config: TensorcastConfig,
     session: RegionBackedArtifactSession,
@@ -623,26 +620,11 @@ def _build_layout_id(mem_pool_host: HostKVCache, *, family: _PoolFamily) -> str:
     )
 
 
-def _validate_rank_topology(storage_config: HiCacheStorageConfig) -> None:
-    for rank_name, rank, size_name, size in (
-        ("tp_rank", storage_config.tp_rank, "tp_size", storage_config.tp_size),
-        ("pp_rank", storage_config.pp_rank, "pp_size", storage_config.pp_size),
-    ):
-        if size <= 0:
-            raise ValueError(f"{size_name} must be positive, got {size}")
-        if rank < 0 or rank >= size:
-            raise ValueError(
-                f"{rank_name} must be in [0, {size_name}), got "
-                f"{rank_name}={rank}, {size_name}={size}"
-            )
-
-
 def _build_rank_suffix(
     storage_config: HiCacheStorageConfig,
     *,
     family: _PoolFamily,
 ) -> str:
-    _validate_rank_topology(storage_config)
     if family is _PoolFamily.MLA:
         return f"pp{storage_config.pp_rank}of{storage_config.pp_size}"
     tp_suffix = f"tp{storage_config.tp_rank}of{storage_config.tp_size}"
@@ -680,7 +662,7 @@ def _build_engine_key(
 
 
 def _expand_page_fragments(
-    registered: _RegisteredFullPool,
+    registered: _RegisteredPool,
     keys: list[str],
 ) -> tuple[PageFragment, ...]:
     fragments = tuple(
@@ -709,7 +691,7 @@ def _expand_page_fragments(
 
 
 def _expand_artifact_specs(
-    registered: _RegisteredFullPool,
+    registered: _RegisteredPool,
     keys: list[str],
 ) -> tuple[ByteArtifactSpec, ...]:
     return tuple(
@@ -723,7 +705,7 @@ def _expand_artifact_specs(
 
 
 def _expand_transfer_fragments(
-    registered: _RegisteredFullPool,
+    registered: _RegisteredPool,
     keys: list[str],
     host_indices: torch.Tensor,
 ) -> tuple[PageFragment, ...]:
@@ -799,7 +781,7 @@ def _expand_transfer_fragments(
 
 
 def _expand_artifact_transfers(
-    registered: _RegisteredFullPool,
+    registered: _RegisteredPool,
     keys: list[str],
     host_indices: torch.Tensor,
 ) -> tuple[RegionArtifactTransfer, ...]:

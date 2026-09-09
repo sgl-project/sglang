@@ -108,7 +108,7 @@ def get_allocator_from_storage(allocator_type):
             return get_tensorcast_host_allocator_from_runtime()
         except ImportError:
             logger.warning(
-                "TensorCast's tensor allocator requires tensorcast >= 0.1.0. Please install TensorCast by 'pip install tensorcast' or build from source by following https://tensorcast.ai/development/build-from-source/. Fallback to use default allocator"
+                "TensorCast's tensor allocator requires tensorcast >= 0.1.1. Please install TensorCast by 'pip install tensorcast' or build from source by following https://tensorcast.ai/development/build-from-source/. Fallback to use default allocator"
             )
             return HostTensorAllocator()
     else:
