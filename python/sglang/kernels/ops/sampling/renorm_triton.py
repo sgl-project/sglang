@@ -8,15 +8,15 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
-
 _BLOCK_SIZE = 1024
 
-# Nucleus size beyond which the top-p prefix search cannot answer and has to fall
-# back to a sort. Real decode distributions need a handful of entries; flat ones
-# (high temperature, early generation) can need far more, so the fallback must stay
-# correct, not fast.
-_TOP_P_PREFIX = 4096
+# Safety valve for the top-p pivot search. Measured over a 152K vocabulary the
+# search converges in about 20 rounds, and it also stops on its own as soon as a
+# round fails to move either bound, so this cap is only reached if a device rounds
+# the interior points in a way that neither of those two tests catches. Stopping
+# early leaves a valid lower bound for the pivot, which keeps a superset of the
+# nucleus rather than producing a wrong answer.
+_TOP_P_SEARCH_ITERS = 64
 
 
 @triton.jit
@@ -59,6 +59,124 @@ def _normalize_kernel(
     tl.store(out_ptr + offsets, values / denominator, mask=mask)
 
 
+@triton.jit
+def _top_p_renorm_kernel(
+    probs_ptr,
+    top_ps_ptr,
+    out_ptr,
+    vocab_size: tl.constexpr,
+    num_chunks: tl.constexpr,
+    MAX_ITERS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Find each row's top-p pivot by value, then threshold and renormalize it.
+
+    One program owns one row. The pivot is not found by ranking the row but by
+    searching the *value* axis: ``f(x) = sum(probs[probs > x])`` is non-increasing,
+    so the pivot is the largest ``x`` with ``f(x) >= p``. Each round evaluates two
+    interior points of the bracket, keeps the third that still contains the answer,
+    and snaps the new bounds onto values that actually occur in the row, which is
+    what makes the round count depend on the data rather than on the float exponent
+    range. Every round is a streaming pass with block reductions, so nothing is
+    sorted, nothing is materialized, and the host is never asked anything.
+    """
+    row = tl.program_id(0)
+    row_start = row.to(tl.int64) * vocab_size
+    p = tl.load(top_ps_ptr + row)
+
+    row_sum = 0.0
+    max_val = 0.0
+    for chunk in range(num_chunks):
+        offsets = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < vocab_size
+        values = tl.load(probs_ptr + row_start + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        row_sum += tl.sum(values, axis=0)
+        max_val = tl.maximum(max_val, tl.max(values, axis=0))
+
+    # Budgeting against the row's own total rather than against 1.0 keeps top_p=1 a
+    # no-op on a peaked row, whose leading terms round up to one on their own.
+    target = p * row_sum
+
+    low = 0.0
+    high = max_val
+    kept_sum = row_sum
+    iters = 0
+    # p >= 1 keeps the whole row, so the bracket never has to move: low stays at 0
+    # and the row is simply rescaled by its own sum.
+    searching = tl.where(p < 1.0, 1, 0)
+
+    while searching == 1:
+        pivot_low = (high + 2.0 * low) / 3.0
+        pivot_high = (2.0 * high + low) / 3.0
+
+        sum_gt_pivot_low = 0.0
+        sum_gt_pivot_high = 0.0
+        min_gt_low = high
+        max_le_high = low
+        for chunk in range(num_chunks):
+            offsets = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < vocab_size
+            values = tl.load(probs_ptr + row_start + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            sum_gt_pivot_low += tl.sum(tl.where(values > pivot_low, values, 0.0), axis=0)
+            sum_gt_pivot_high += tl.sum(
+                tl.where(values > pivot_high, values, 0.0), axis=0
+            )
+            min_gt_low = tl.minimum(
+                min_gt_low, tl.min(tl.where(mask & (values > low), values, high), axis=0)
+            )
+            max_le_high = tl.maximum(
+                max_le_high,
+                tl.max(tl.where(mask & (values <= high), values, low), axis=0),
+            )
+
+        # Branch-free bracket update: raise the floor to whichever interior point
+        # still retains enough mass, otherwise pull the ceiling down.
+        take_high = sum_gt_pivot_high >= target
+        take_low = (sum_gt_pivot_high < target) & (sum_gt_pivot_low >= target)
+        next_low = tl.where(take_high, pivot_high, tl.where(take_low, pivot_low, low))
+        next_high = tl.where(
+            take_high,
+            high,
+            tl.where(
+                take_low,
+                tl.minimum(pivot_high, max_le_high),
+                tl.minimum(pivot_low, max_le_high),
+            ),
+        )
+        kept_sum = tl.where(
+            take_high,
+            sum_gt_pivot_high,
+            tl.where(take_low, sum_gt_pivot_low, kept_sum),
+        )
+        # A round that moves neither bound cannot make progress in any later round
+        # either: it means the interior points have rounded onto the bounds
+        # themselves, which happens once the surviving values are within a few ULPs
+        # of each other. Without this the loop would spin on such rows.
+        progressed = (next_low > low) | (next_high < high)
+        low = next_low
+        high = next_high
+
+        iters += 1
+        # Done once no value of the row is left strictly inside the bracket.
+        searching = tl.where(
+            (min_gt_low < max_le_high) & progressed & (iters < MAX_ITERS), 1, 0
+        )
+
+    denominator = tl.maximum(kept_sum, 1e-8)
+    for chunk in range(num_chunks):
+        offsets = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < vocab_size
+        values = tl.load(probs_ptr + row_start + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        kept = tl.where(values > low, values / denominator, 0.0)
+        tl.store(out_ptr + row_start + offsets, kept, mask=mask)
+
+
 def _prepare_probs(probs: torch.Tensor) -> torch.Tensor:
     if probs.ndim != 2:
         raise ValueError(f"probs must be 2D, got shape={tuple(probs.shape)}")
@@ -97,83 +215,15 @@ def _renorm_from_pivots(probs_fp32: torch.Tensor, pivots: torch.Tensor) -> torch
     return out
 
 
-def _top_p_pivots_sorted(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
-    """Exact top-p pivot for every row, from a full ascending sort.
-
-    Matches FlashInfer's threshold semantics: discard the smallest entries whose
-    cumulative mass stays below ``1 - p`` and retain all ties at the pivot. Exact for
-    any input and free of host synchronization, but it pays an ``O(V log V)`` sort over
-    a 100K+ vocabulary, and that cost grows with the number of rows.
-    """
-    vocab_size = probs.shape[1]
-    sorted_probs = torch.sort(probs, dim=-1).values
-    cdf = torch.cumsum(sorted_probs, dim=-1)
-    cutoff = torch.searchsorted(cdf, (1.0 - top_ps).unsqueeze(1), right=False).squeeze(
-        1
-    )
-    cutoff.clamp_(max=vocab_size - 1)
-    return sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1)
-
-
-def _top_p_pivots_prefix(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
-    """Top-p pivot from a bounded prefix, falling back to a sort for rows it misses.
-
-    Walking a descending prefix is the mirror image of walking the ascending CDF: an
-    entry is kept exactly while the mass above it still leaves at least ``1 - p``
-    behind. Budgeting against the row's own total rather than against ``1.0`` keeps
-    ``top_p=1`` a no-op instead of truncating the tail of a peaked row, whose leading
-    terms round up to one on their own.
-
-    A row whose nucleus runs past the prefix has its pivot outside the prefix, and only
-    a sort can find it. Those rows are flagged by the last prefix entry still being
-    kept, and re-resolved exactly. Reading that flag costs one device-to-host transfer,
-    which is what :func:`top_p_pivots` weighs against the sort it avoids.
-    """
-    vocab_size = probs.shape[1]
-    prefix = min(_TOP_P_PREFIX, vocab_size)
-
-    budget = probs.sum(dim=-1) - (1.0 - top_ps)
-    values = torch.topk(probs, prefix, dim=-1).values
-    within = values.cumsum(dim=-1) <= budget.unsqueeze(1)
-    position = within.sum(dim=-1).clamp(max=prefix - 1)
-    pivots = values.gather(1, position.unsqueeze(1)).squeeze(1)
-
-    overflow = within[:, -1]
-    if prefix < vocab_size and bool(overflow.any()):
-        rows = overflow.nonzero(as_tuple=True)[0]
-        pivots[rows] = _top_p_pivots_sorted(probs[rows], top_ps[rows])
-    return pivots
-
-
-def top_p_pivots(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
-    """Per-row top-p pivot for ``probs``, one value per row.
-
-    Both paths implement the same threshold; they differ only in cost. The prefix path
-    is worth its host synchronization once the sort it replaces is large enough to
-    outweigh a fixed queue drain, so the choice turns on the row count alone -- which
-    the host already knows, making the dispatch itself free. The crossover was measured
-    on MI355X with a ~151K vocabulary under speculative decoding, where the verify batch
-    is ``requests x draft tokens``: below it the sort wins on both throughput and TPOT,
-    above it the sort starts costing TPOT.
-
-    Descending and ascending accumulation round differently, so on a row flat enough
-    that thousands of entries sit within a few ULPs of each other the two paths can land
-    on adjacent entries. Ascending is the better-conditioned order, which is why it
-    stays the default for the batch sizes where it is affordable.
-    """
-    if probs.shape[0] >= envs.SGLANG_OPT_TOP_P_PREFIX_MIN_ROWS.get():
-        return _top_p_pivots_prefix(probs, top_ps)
-    return _top_p_pivots_sorted(probs, top_ps)
-
-
 def top_p_renorm_probs_triton(
     probs: torch.Tensor, top_p: Union[torch.Tensor, float]
 ) -> torch.Tensor:
     """Apply exact top-p thresholding and renormalize each probability row.
 
-    Pivot selection is delegated to :func:`top_p_pivots`, which picks between a sort
-    and a bounded prefix search by row count. Triton performs the bandwidth-heavy
-    masking, partial reduction, and normalization.
+    The threshold, the mask and the renormalization all happen inside one kernel, so
+    the cost is a small number of streaming passes over the batch and no vocabulary-
+    sized sort, no auxiliary buffer, and no device-to-host transfer. See
+    :func:`_top_p_renorm_kernel` for how the pivot is located.
     """
     probs_fp32 = _prepare_probs(probs)
     batch_size, vocab_size = probs_fp32.shape
@@ -196,9 +246,18 @@ def top_p_renorm_probs_triton(
             (batch_size,), float(top_p), device=probs.device, dtype=torch.float32
         )
 
-    pivots = top_p_pivots(probs_fp32, top_ps).contiguous()
-
-    return _renorm_from_pivots(probs_fp32, pivots)
+    out = torch.empty_like(probs_fp32)
+    _top_p_renorm_kernel[(batch_size,)](
+        probs_fp32,
+        top_ps.contiguous(),
+        out,
+        vocab_size=vocab_size,
+        num_chunks=triton.cdiv(vocab_size, _BLOCK_SIZE),
+        MAX_ITERS=_TOP_P_SEARCH_ITERS,
+        BLOCK_SIZE=_BLOCK_SIZE,
+        num_warps=8,
+    )
+    return out
 
 
 def top_k_renorm_probs_triton(

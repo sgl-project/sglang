@@ -1213,14 +1213,6 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
-    # Row count at or above which top-p pivot selection swaps a full per-row sort
-    # for a bounded top-k prefix search (see
-    # sglang.kernels.ops.sampling.renorm.top_p_pivots). The prefix path costs one
-    # host read; the sort it replaces grows with the batch, so the prefix only pays
-    # off once the batch is large enough. Measured crossover on MI355X with a ~151K
-    # vocabulary sits between 144 and 192 rows.
-    SGLANG_OPT_TOP_P_PREFIX_MIN_ROWS = EnvInt(160)
-
     # ===================================================================
     # Deterministic inference and all-reduce
     # ===================================================================
