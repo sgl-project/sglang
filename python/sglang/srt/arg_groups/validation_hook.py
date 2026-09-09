@@ -450,8 +450,16 @@ def check_two_batch_overlap(server_args: Any):
         and cfg.moe_a2a_backend == "none"
         and not cfg.enable_dp_attention
     ):
-        raise ValueError(
+        message = (
             "When enabling two batch overlap without an EP a2a backend "
             "(moe_a2a_backend='none'), --enable-dp-attention is required "
             "(DeepSeek-V4 non-EP DP TBO path)."
         )
+        if cfg.dp_size == 1 and cfg.ep_join_mode != "scale":
+            message += (
+                " DP attention is disabled when --dp-size=1 outside EP scale mode, "
+                "even if --enable-dp-attention is explicitly set. "
+                "Set --dp-size to a value greater than 1 together with "
+                "--enable-dp-attention, or disable --enable-two-batch-overlap."
+            )
+        raise ValueError(message)

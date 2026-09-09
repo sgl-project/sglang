@@ -42,9 +42,11 @@ from sglang.srt.arg_groups.moe_hook import (
     validate_deepep_v2_speculative_draft,
 )
 from sglang.srt.arg_groups.overrides import (
+    _data_parallelism_defaults,
     cutedsl_moe_max_num_tokens,
     max_speculative_num_draft_tokens,
     resolution_result,
+    run_post_process_pass,
 )
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
@@ -2782,8 +2784,8 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     requires --enable-dp-attention. This replaced the removed opt-in
     SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
 
-    dummy-model short-circuits __post_init__, so the guard handler is invoked
-    directly (same pattern as TestWaterfillArgs)."""
+    dummy-model short-circuits __post_init__, so the data-parallel defaults
+    pass and the guard handler are invoked directly, in pipeline order."""
 
     def _args(self, **overrides):
         args = ServerArgs(model_path="dummy")
@@ -2792,17 +2794,41 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args.enable_dp_attention = False
         for key, value in overrides.items():
             setattr(args, key, value)
+        run_post_process_pass(args, _data_parallelism_defaults)
         return args
 
     def test_no_a2a_without_dp_attention_raises(self):
-        args = self._args(enable_dp_attention=False)
-        with self.assertRaisesRegex(ValueError, "enable-dp-attention"):
+        args = self._args(tp_size=2, dp_size=2, enable_dp_attention=False)
+        with self.assertRaisesRegex(ValueError, "enable-dp-attention") as exc:
             check_two_batch_overlap(args)
+        self.assertNotIn("--dp-size=1", str(exc.exception))
+
+    def test_single_dp_rank_explains_disabled_dp_attention(self):
+        for requested_dp_attention in (False, True):
+            with self.subTest(enable_dp_attention=requested_dp_attention):
+                args = self._args(
+                    tp_size=4,
+                    dp_size=1,
+                    enable_dp_attention=requested_dp_attention,
+                )
+                # The raw CLI flag can still be true; validation must inspect
+                # the resolved value after the data-parallel defaults pass.
+                self.assertEqual(args.enable_dp_attention, requested_dp_attention)
+                self.assertFalse(resolution_result(args, "enable_dp_attention"))
+                with self.assertRaisesRegex(
+                    ValueError, "--dp-size=1.*--dp-size to a value greater than 1"
+                ) as exc:
+                    check_two_batch_overlap(args)
+                self.assertIn(
+                    "even if --enable-dp-attention is explicitly set",
+                    str(exc.exception),
+                )
+                self.assertIn("disable --enable-two-batch-overlap", str(exc.exception))
 
     def test_no_a2a_with_dp_attention_ok(self):
         # DP TBO path is valid: --enable-dp-attention + --enable-two-batch-overlap
         # with a2a backend 'none' must NOT raise (no SGLANG_ENABLE_DP_TBO needed).
-        args = self._args(enable_dp_attention=True)
+        args = self._args(tp_size=2, dp_size=2, enable_dp_attention=True)
         check_two_batch_overlap(args)
 
     def test_ep_a2a_backend_ok_without_dp_attention(self):
@@ -2810,6 +2836,21 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
         check_two_batch_overlap(args)
+
+    def test_single_dp_rank_without_tbo_ok(self):
+        args = self._args(enable_two_batch_overlap=False, enable_dp_attention=True)
+        check_two_batch_overlap(args)
+
+    def test_ep_scale_preserves_dp_attention_with_single_dp_rank(self):
+        args = self._args(ep_join_mode="scale", enable_dp_attention=True)
+        self.assertTrue(resolution_result(args, "enable_dp_attention"))
+        check_two_batch_overlap(args)
+
+    def test_ep_scale_without_dp_attention_keeps_original_error(self):
+        args = self._args(ep_join_mode="scale", enable_dp_attention=False)
+        with self.assertRaisesRegex(ValueError, "enable-dp-attention") as exc:
+            check_two_batch_overlap(args)
+        self.assertNotIn("--dp-size=1", str(exc.exception))
 
 
 class TestDcpKvEventContract(CustomTestCase):
