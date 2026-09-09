@@ -74,12 +74,12 @@ from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.dcp import draft_forward_guard
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_v2_active,
     is_mla_prefill_cp_enabled,
 )
+from sglang.srt.layers.dcp import draft_forward_guard
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
