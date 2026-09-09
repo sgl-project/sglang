@@ -58,9 +58,7 @@ pub fn request_tokens_for(
         && value.get("messages").is_some_and(|m| m.is_array())
     {
         // The full request goes down so the encoder can render `tools` and
-        // resolve thinking-mode / task / continue_final_message the way the
-        // engine does (see `dsv4::render_request`) — otherwise such traffic
-        // routes on a tokenization that never matches the engine's blocks.
+        // resolve thinking / task / continue_final_message the engine's way.
         if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
             return Some(RequestTokens {
                 ids,

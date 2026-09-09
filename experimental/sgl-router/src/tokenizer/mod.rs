@@ -27,13 +27,10 @@ pub enum ChatEncoder {
 
 impl ChatEncoder {
     /// Render a parsed chat request into the engine-equivalent prompt text,
-    /// plus — when dsv4's `continue_final_message` surgery extracted a trailing
-    /// assistant turn — its content, for the caller to encode and append after
-    /// the prompt ids (the engine's `_append_assistant_prefix_to_prompt_ids`).
-    ///
-    /// The dsv4 encoder threads the request's `tools`, thinking mode, `task`,
-    /// and `continue_final_message`; the Jinja path renders only `messages`
-    /// with the model's default template (threading the rest is future work).
+    /// plus any assistant prefix dsv4's `continue_final_message` surgery
+    /// extracted (the caller encodes and appends it after the prompt ids).
+    /// The Jinja path renders only `messages`; threading tools/mode through
+    /// it is future work.
     fn render(&self, request: &serde_json::Value) -> Result<(String, Option<String>)> {
         static NO_MESSAGES: serde_json::Value = serde_json::Value::Null;
         let messages = request.get("messages").unwrap_or(&NO_MESSAGES);
@@ -49,16 +46,13 @@ impl ChatEncoder {
         }
     }
 
-    /// Which forwarding predicate this encoder's ids may pass through (see
-    /// [`ForwardParity`]). Stamped onto the ids at production time so the
-    /// provenance travels with the tokens.
+    /// Which forwarding predicate this encoder's ids may pass through,
+    /// stamped onto the ids so the provenance travels with the tokens.
     fn forward_parity(&self) -> ForwardParity {
         match self {
-            // The Jinja encoder renders no tools/thinking/task, so its ids
-            // need the conservative predicate.
+            // Jinja renders no tools/thinking/task; dsv4 mirrors the engine's
+            // full request handling.
             ChatEncoder::Jinja(_) => ForwardParity::Conservative,
-            // The dsv4 encoder mirrors the engine's full dsv4 request handling
-            // (`input_ids_safe_to_forward_dsv4`).
             ChatEncoder::DeepSeekV4 => ForwardParity::Dsv4Full,
         }
     }
@@ -77,11 +71,9 @@ pub enum ForwardParity {
     Dsv4Full,
 }
 
-/// Parse a JSON value the way pydantic v2 (lax mode) coerces an OpenAI boolean
-/// field: a bool as-is; numeric `1`/`0` and the strings `true/yes/on/y/t/1` /
-/// `false/no/off/n/f/0` (case-insensitive). Anything else is `None` — pydantic
-/// would 422 the request, so correctness-sensitive callers must treat it as
-/// unknown rather than defaulting it to `false`.
+/// Parse a JSON value the way pydantic v2 (lax mode) coerces an OpenAI
+/// boolean. Anything else is `None` — pydantic would 422 the request, so
+/// callers must treat it as unknown, not `false`.
 pub fn openai_bool(v: &serde_json::Value) -> Option<bool> {
     match v {
         serde_json::Value::Bool(b) => Some(*b),
@@ -206,9 +198,8 @@ impl TokenizerRegistry {
         self.encoders.contains_key(model_id)
     }
 
-    /// This model's chat encoder's forwarding parity ([`ForwardParity`]);
-    /// `Conservative` when the model has no encoder at all (whose ids are
-    /// never engine-equivalent anyway).
+    /// The model's chat-encoder forwarding parity; `Conservative` when it has
+    /// no encoder at all (such ids are never engine-equivalent anyway).
     pub fn forward_parity(&self, model_id: &str) -> ForwardParity {
         self.encoders
             .get(model_id)
@@ -217,11 +208,10 @@ impl TokenizerRegistry {
     }
 
     /// Render the parsed chat `request` through the model's chat encoder, then
-    /// tokenize the result the same way the engine does (`add_special_tokens =
-    /// false`, so the encoder's literal `bos_token`/role markers carry the
-    /// specials). Returns `None` — caller falls back to raw routing — when the
-    /// model has no encoder, no tokenizer, or rendering/encoding fails or
-    /// yields no tokens.
+    /// tokenize it the way the engine does (`add_special_tokens = false`; the
+    /// rendered marker text carries the specials). `None` — the caller falls
+    /// back to raw routing — when there is no encoder/tokenizer or the
+    /// render/encode fails.
     pub fn encode_chat(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
@@ -256,11 +246,9 @@ impl TokenizerRegistry {
                 return None;
             }
         };
-        // Mirror `_append_assistant_prefix_to_prompt_ids`: the engine encodes
-        // the extracted prefix and appends it after the generation prompt. The
-        // router's encode never adds specials — and the pinned single-user-turn
-        // engine vector proves the V4 tokenizer adds none either — so this
-        // plain encode is exactly what the engine appends.
+        // Mirror `_append_assistant_prefix_to_prompt_ids`: encode the prefix
+        // and append it after the generation prompt (neither side adds
+        // specials, so a plain encode is exactly what the engine appends).
         if let Some(prefix) = assistant_prefix.filter(|p| !p.is_empty()) {
             match adapter::encode(&tokenizer, &prefix) {
                 Ok(pids) if !pids.is_empty() => ids.extend(pids),

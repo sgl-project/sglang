@@ -1,23 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Python-`json.dumps`-compatible serialization for prompt encoders.
-//!
-//! Engine-side prompt encoders build their prompts in Python, so any JSON they
-//! embed (tool schemas, tool-call argument values) carries Python's byte-level
-//! formatting. A router encoder that emits serde's defaults instead produces a
-//! different prompt, different block hashes, and no cache-aware match.
+//! Python-`json.dumps`-compatible serialization for prompt encoders: the
+//! engine embeds JSON with Python's byte-level formatting, and serde's
+//! defaults would produce different block hashes and no cache-aware match.
 
 use serde::Serialize;
 
-/// Serialize `value` the way Python's `json.dumps(v, ensure_ascii=False)` does:
-/// `", "` / `": "` separators (serde's compact form omits the spaces), raw
-/// UTF-8, key order preserved (the crate's `preserve_order` feature), floats
-/// through [`py_float`].
-///
-/// RESIDUE: an integer literal outside `i64`/`u64` range is already an `f64`
-/// at parse time, so Python's exact-integer output cannot be recovered; such
-/// values are routing-quality only.
+/// Python's `json.dumps(v, ensure_ascii=False)`: `", "` / `": "` separators,
+/// raw UTF-8, key order preserved, floats through [`py_float`]. Residue: an
+/// integer outside `i64`/`u64` range is already an `f64` at parse time, so
+/// Python's exact-integer output cannot be recovered.
 pub(crate) fn py_json(value: &serde_json::Value) -> String {
     let mut buf = Vec::new();
     let mut serializer = serde_json::Serializer::with_formatter(&mut buf, PyJsonFormatter);
@@ -27,15 +20,11 @@ pub(crate) fn py_json(value: &serde_json::Value) -> String {
     String::from_utf8(buf).expect("serde_json emits valid UTF-8")
 }
 
-/// CPython's `repr(float)` — what `json.dumps` uses for floats.
-///
-/// CPython emits the shortest round-tripping digits, then lays them out
-/// scientific iff `exp < -4 || exp >= 16` with a signed, two-digit-padded
-/// exponent (`1e-06`, `1e+16`), else positional with a trailing `.0` when
-/// there is no fraction. Rust's `{}` never switches to scientific and `{:e}`
-/// always does, so neither matches alone: take the digits from `{:e}` and
-/// re-lay them out. Exact only because serde_json is built with
-/// `float_roundtrip`.
+/// CPython's `repr(float)`, which `json.dumps` uses: shortest round-tripping
+/// digits, scientific iff `exp < -4 || exp >= 16` with a signed two-digit
+/// exponent, else positional with a trailing `.0`. Neither Rust `{}` nor
+/// `{:e}` matches alone, so take `{:e}`'s digits and re-lay them out. Exact
+/// only because serde_json is built with `float_roundtrip`.
 fn py_float(v: f64) -> String {
     // Non-finite floats cannot appear: serde_json parses them to `Null`.
     if v == 0.0 {
@@ -114,9 +103,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// `py_float` reproduces CPython `repr` across the layout boundaries the
-    /// two writers disagree on. This text renders into the tools block at the
-    /// FRONT of the prompt, so one divergent byte shifts every block hash.
+    /// CPython-`repr` parity across the layout boundaries; one divergent byte
+    /// in the tools block shifts every block hash.
     #[test]
     fn py_float_matches_cpython_repr() {
         for (v, want) in [
