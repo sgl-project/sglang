@@ -780,6 +780,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 for comp in self.components
             )
 
+        # Clamping is only meaningful when some component's device-only validator
+        # can outrun the host-gated one; gating on that keeps the reuse path
+        # byte-identical for everyone else instead of relying on min() happening to
+        # be an identity.
+        clamp_device_anchor = for_reuse and any(
+            comp.device_anchor_needs_reuse_clamp() for comp in self.components
+        )
+
         def _all_valid(validators, node):
             return all([v(node) for v in validators])
 
@@ -825,7 +833,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if key_offset < len(key):
                 child_key = key.child_key_at(key_offset, self.page_size)
 
-        if for_reuse:
+        if clamp_device_anchor:
             # Reuse path only: never let the FULL device anchor extend past the
             # host-gated best_match_node boundary, even if the per-request
             # device-only validators (trusting `cd.value`) matched further.

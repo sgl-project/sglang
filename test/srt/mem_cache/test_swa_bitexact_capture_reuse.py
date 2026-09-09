@@ -404,9 +404,10 @@ class TestReuseAnchorHostClamp(unittest.TestCase):
         return types.SimpleNamespace(
             component_type=ComponentType.FULL,
             create_match_validator=create_match_validator,
+            device_anchor_needs_reuse_clamp=lambda: False,
         )
 
-    def _make_swa_component(self):
+    def _make_swa_component(self, needs_clamp=True):
         def create_match_validator(match_device_only=False):
             if match_device_only:
                 # I2'-required for self-match: trusts the per-request device
@@ -422,6 +423,7 @@ class TestReuseAnchorHostClamp(unittest.TestCase):
         return types.SimpleNamespace(
             component_type=ComponentType.SWA,
             create_match_validator=create_match_validator,
+            device_anchor_needs_reuse_clamp=lambda: needs_clamp,
         )
 
     def _build_chain(self):
@@ -459,7 +461,7 @@ class TestReuseAnchorHostClamp(unittest.TestCase):
 
         return root, node_a, node_b
 
-    def _run_match_prefix_helper(self, for_reuse: bool):
+    def _run_match_prefix_helper(self, for_reuse: bool, needs_clamp: bool = True):
         root, node_a, node_b = self._build_chain()
         fake_self = types.SimpleNamespace(
             root_node=root,
@@ -469,7 +471,7 @@ class TestReuseAnchorHostClamp(unittest.TestCase):
             enable_hicache=True,
             components=(
                 self._make_full_component(),
-                self._make_swa_component(),
+                self._make_swa_component(needs_clamp=needs_clamp),
             ),
         )
         key = RadixKey(array("q", [1, 2, 3, 4]))
@@ -524,6 +526,26 @@ class TestReuseAnchorHostClamp(unittest.TestCase):
         self.assertIs(best_match_node, node_a)
         self.assertIs(best_match_device_node, node_b)
         # NOT clamped: covers both node_a and node_b's chunks.
+        self.assertEqual(len(device_indices), 2 * self.PAGE_SIZE)
+        self.assertTrue(torch.equal(device_indices, torch.tensor([100, 101, 102, 103])))
+
+    def test_reuse_does_not_clamp_when_no_component_asks_for_it(self):
+        """The clamp is opt-in per component: only a device-only validator that
+        can outrun the host-gated one needs it, which in-tree means strict SWA
+        (`SWAComponent.device_anchor_needs_reuse_clamp` returns
+        `_strict_bit_exact`). With no such component the reuse match must return
+        the upstream anchor untouched, so enabling the strict feature cannot
+        change what any other configuration matches."""
+        (
+            node_a,
+            node_b,
+            best_match_node,
+            best_match_device_node,
+            device_indices,
+        ) = self._run_match_prefix_helper(for_reuse=True, needs_clamp=False)
+
+        self.assertIs(best_match_node, node_a)
+        self.assertIs(best_match_device_node, node_b)
         self.assertEqual(len(device_indices), 2 * self.PAGE_SIZE)
         self.assertTrue(torch.equal(device_indices, torch.tensor([100, 101, 102, 103])))
 

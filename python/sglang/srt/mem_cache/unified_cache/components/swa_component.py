@@ -742,6 +742,11 @@ class SWAComponent(TreeComponent):
 
         return validator
 
+    def device_anchor_needs_reuse_clamp(self) -> bool:
+        # only the strict branch above lets an out-of-window node keep the
+        # device-only anchor going on the strength of its host copy
+        return self._strict_bit_exact
+
     def finalize_match_result_in_tree_core(
         self,
         result: MatchResult,

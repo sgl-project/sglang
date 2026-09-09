@@ -854,9 +854,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         swa_pages = self.unified_kv_pool.swa_pages
         head_dim = self.unified_kv_pool.head_dim
         rows_per_page = self.unified_swa_ring_size
-        assert (
-            swa_pages % rows_per_page == 0
-        ), f"swa_pages {swa_pages} not a multiple of ring size {rows_per_page}"
+        assert swa_pages % rows_per_page == 0, (
+            f"swa_pages {swa_pages} not a multiple of ring size {rows_per_page}"
+        )
         num_pages = swa_pages // rows_per_page
 
         views: List[torch.Tensor] = []
@@ -913,6 +913,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         a SWA device location ``swa_loc`` the coupled state row is
         ``(swa_loc // swa_page_size) * ring_size + (swa_loc % ring_size)`` when
         ``swa_loc >= 0`` else ``-1`` (== translate_from_swa_loc_to_state_loc).
+
+        On unified_kv the state row is owned by the request slot, not by swa_loc:
+        the authoritative mapping there is ``req_pool_idx * ring_size + pos %
+        ring_size`` (translate_from_req_position_to_state_loc), which the form
+        above only reproduces when ``swa_page_size == ring_size``. A connector
+        driving a unified_kv pool must use the req-position form.
 
         Co-lifetime invariant the connector MUST honor: for a given (rid, B) the
         SWA window and its coupled state rows are allocated/freed together and
