@@ -1286,7 +1286,7 @@ class _ServerArgsOverride:
         # Underscore names seed private property caches (the strict guard
         # exempts them); everything else must be a real config field.
         unknown = {name for name in self._fields if not name.startswith("_")} - set(
-            type(server_args).__dataclass_fields__
+            type(server_args).__struct_fields__
         )
         if unknown:
             raise ValueError(
@@ -1299,7 +1299,7 @@ class _ServerArgsOverride:
         # real field, and seeding it as a raw attribute would leave the earlier
         # declaration authoritative, so `resolution_result` and the bag would
         # both keep answering the pre-override value.
-        fields = set(type(server_args).__dataclass_fields__)
+        fields = set(type(server_args).__struct_fields__)
         declared = {n: v for n, v in self._fields.items() if n in fields}
         if declared:
             declare_resolution(server_args, "override_server_args", **declared)
@@ -1307,7 +1307,7 @@ class _ServerArgsOverride:
         # and friends), which are not configuration and never were.
         seeds = {n: v for n, v in self._fields.items() if n not in fields}
         for name, value in seeds.items():
-            object.__setattr__(server_args, name, value)
+            msgspec.Struct.__setattr__(server_args, name, value)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args

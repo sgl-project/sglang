@@ -2118,7 +2118,7 @@ def server_args_variant(server_args, **fields):
     unknown = {
         name
         for name in fields
-        if name not in cls.__dataclass_fields__
+        if name not in cls.__struct_fields__
         and not hasattr(cls, name)
         and name not in _RUNNER_WRITTEN_NAMES
     }
@@ -2132,9 +2132,7 @@ def server_args_variant(server_args, **fields):
         stash = []
         object.__setattr__(variant, "_resolved_overrides", stash)
     declared = {
-        name: value
-        for name, value in fields.items()
-        if name in cls.__dataclass_fields__
+        name: value for name, value in fields.items() if name in cls.__struct_fields__
     }
     if declared:
         stash.append(("server_args_variant", dict(declared)))

@@ -60,10 +60,7 @@ def collect_input_fields(
             if field.default is not msgspec.NODEFAULT:
                 defaults[field.name] = field.default
             elif field.default_factory is not msgspec.NODEFAULT:
-                # The declarations are Structs; the record they are assembled
-                # into is still a dataclass, so the factory is handed on in the
-                # spelling that consumer understands.
-                defaults[field.name] = dataclasses.field(
+                defaults[field.name] = msgspec.field(
                     default_factory=field.default_factory
                 )
     known = [n for n in POSITIONAL_FIELD_ORDER if n in annotations]

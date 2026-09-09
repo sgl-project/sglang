@@ -54,6 +54,7 @@ from typing import (
 )
 
 import msgspec
+import msgspec.structs
 
 A = Annotated
 
@@ -150,7 +151,7 @@ def namespace_of(cls) -> dict:
     the per-field ``NS`` marker. A field with neither is absent from the map
     (the coverage lint flags them). Non-dataclass types yield an empty map.
     """
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return {}
     # An assembled record: the collector recorded who declared each field,
     # because there are no base classes left to ask.
@@ -163,10 +164,10 @@ def namespace_of(cls) -> dict:
             continue
         for name in getattr(base, "__annotations__", {}):
             out.setdefault(name, path)
-    if len(out) == len(dataclasses.fields(cls)):
+    if len(out) == len(record_fields(cls)):
         return out
     hints = get_type_hints(cls, include_extras=True)
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         if field.name in out:
             continue
         tp = hints.get(field.name, field.type)
@@ -181,9 +182,9 @@ def namespace_of(cls) -> dict:
 @functools.cache
 def field_names(cls) -> frozenset:
     """Names of ``cls`` dataclass fields — what a declaration may name."""
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return frozenset()
-    return frozenset(field.name for field in dataclasses.fields(cls))
+    return frozenset(field.name for field in record_fields(cls))
 
 
 @functools.cache
@@ -193,11 +194,11 @@ def resolvable_fields(cls) -> frozenset:
 
     Non-dataclass types (e.g. mock config objects in tests) have no Arg
     metadata and yield an empty whitelist."""
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return frozenset()
     hints = get_type_hints(cls, include_extras=True)
     names = set()
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
         if arg is not None and arg.resolvable:
             names.add(field.name)
@@ -212,11 +213,11 @@ def fallbacks_of(cls) -> dict:
     beside the help text of the field it belongs to rather than in whatever
     hook used to fill it in.
     """
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return {}
     hints = get_type_hints(cls, include_extras=True)
     out = {}
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
         if arg is not None and arg.fallback is not None:
             # Two things `with_fallback` relies on and cannot check itself,
@@ -251,6 +252,26 @@ def with_fallback(cls, name: str, value: Any) -> Any:
     if value is not None:
         return value
     return fallbacks_of(cls).get(name, value)
+
+
+def record_fields(cls):
+    """The declared fields of a record, Struct or dataclass.
+
+    `ServerArgs` and the namespace classes are `msgspec.Struct`; the config-bag
+    tests build ad-hoc dataclasses spanning namespaces, and the helpers here are
+    driven with both. Anything else yields nothing.
+    """
+    if isinstance(cls, type) and issubclass(cls, msgspec.Struct):
+        return msgspec.structs.fields(cls)
+    if dataclasses.is_dataclass(cls):
+        return dataclasses.fields(cls)
+    return ()
+
+
+def is_record(cls) -> bool:
+    """Whether ``cls`` declares fields the way a record does."""
+    target = cls if isinstance(cls, type) else type(cls)
+    return issubclass(target, msgspec.Struct) or dataclasses.is_dataclass(cls)
 
 
 # ---------------------------------------------------------------------------
@@ -313,10 +334,16 @@ def _infer_type_func(tp):
 
 
 def _field_default(field):
-    """Return the default value for a dataclass field, or _MISSING."""
-    if field.default is not _MISSING:
+    """Return the default value for a field, or `_MISSING`.
+
+    The two record shapes spell "no default" differently -- a Struct field says
+    `msgspec.NODEFAULT`, a dataclass field `dataclasses.MISSING` -- so both are
+    normalized here and every caller below tests against `_MISSING` alone.
+    """
+    absent = (_MISSING, msgspec.NODEFAULT)
+    if field.default not in absent:
         return field.default
-    if field.default_factory is not _MISSING:
+    if field.default_factory not in absent:
         return field.default_factory()
     return _MISSING
 
@@ -346,7 +373,7 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: list[str] | None = None)
     """
     hints = get_type_hints(cls, include_extras=True)
 
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         if fields is not None and field.name not in fields:
             continue
 

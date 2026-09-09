@@ -9,7 +9,6 @@ or is projected into the wrong namespace therefore fails on observed state.
 
 import ast
 import copy
-import dataclasses
 import json
 import os
 import pathlib
@@ -17,6 +16,9 @@ import shutil
 import tempfile
 import unittest
 import unittest.mock
+
+import msgspec
+import msgspec.structs
 
 import sglang
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -30,7 +32,7 @@ _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 
 # Every field of the record: resolution has no bare-assignment writer left, so
 # the scan states that as a whole rather than a converted-so-far list.
-_RESOLVED_FIELDS = frozenset(field.name for field in dataclasses.fields(ServerArgs))
+_RESOLVED_FIELDS = frozenset(field.name for field in msgspec.structs.fields(ServerArgs))
 
 # Shapes the agreement check runs on. Each needs a real config.json:
 # `model_path="dummy"` takes the pipeline's early return.
@@ -201,14 +203,14 @@ class TestResolutionDeclarations(CustomTestCase):
             supplied = {"random_seed": 42, **shape}
             server_args = self._resolve(shape)
             overlay = _stash_overlay(server_args)
-            for field in dataclasses.fields(server_args):
+            for field in msgspec.structs.fields(server_args):
                 if field.name in ("model_path", "device") or field.name in overlay:
                     continue
                 if field.name in supplied:
                     before = supplied[field.name]
-                elif field.default is not dataclasses.MISSING:
+                elif field.default is not msgspec.NODEFAULT:
                     before = field.default
-                elif field.default_factory is not dataclasses.MISSING:
+                elif field.default_factory is not msgspec.NODEFAULT:
                     before = field.default_factory()
                 else:
                     continue
@@ -278,7 +280,7 @@ class TestResolutionDeclarations(CustomTestCase):
         dump = server_args.resolved_dict()
         self.assertEqual(
             sorted(dump),
-            sorted(field.name for field in dataclasses.fields(server_args)),
+            sorted(field.name for field in msgspec.structs.fields(server_args)),
             "the readback dump is no longer exactly the fields",
         )
         leaked = sorted(
@@ -532,7 +534,7 @@ class TestResolutionDeclarations(CustomTestCase):
             overlay = _stash_overlay(server_args)
             raw_input = getattr(server_args, "_raw_input", None)
             self.assertTrue(raw_input, f"{shape}: the record kept no raw snapshot")
-            for field in dataclasses.fields(server_args):
+            for field in msgspec.structs.fields(server_args):
                 name = field.name
                 if name in overlay or name not in raw_input:
                     continue
