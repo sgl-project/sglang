@@ -1676,7 +1676,7 @@ def set_global_dwdp_manager(manager: Any) -> None:
 def _group_leaves(group: _FlagGroupBase) -> dict[str, Any]:
     """The leaf values of a flag group, recursively."""
     leaves: dict[str, Any] = {}
-    for name in type(group).__dataclass_fields__:
+    for name in type(group).__struct_fields__:
         value = getattr(group, name)
         if isinstance(value, _FlagGroupBase):
             leaves[name] = _group_leaves(value)
