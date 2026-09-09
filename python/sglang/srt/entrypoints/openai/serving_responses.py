@@ -2714,6 +2714,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
                 require_reasoning=adapted_request.require_reasoning,
+                # Every turn of a tool loop must stay on the rank that holds
+                # the conversation's KV cache.
+                routed_dp_rank=adapted_request.routed_dp_rank,
             )
 
             # Update sampling params with reduced max_tokens
