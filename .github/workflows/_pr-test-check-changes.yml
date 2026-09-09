@@ -117,6 +117,9 @@ jobs:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-jit-kernel.yml"
               - "python/pyproject.toml"
+              - "python/sglang/srt/speculative/dflash_worker_v2.py"
+              - "python/sglang/srt/speculative/domino_utils.py"
+              - "test/registered/kernel/**"
               - "test/registered/kernels/**"
               # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the
               # base-b-kernel suites import it directly, so kernel edits must run them.
