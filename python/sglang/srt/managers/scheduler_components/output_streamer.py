@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -419,16 +418,6 @@ class _GenerationStreamAccumulator:
     def accept(self, *, req: Req) -> None:
         if req.beam_group is not None and not self._beam_admits(req=req):
             return
-        # Record output readiness independently of output message batching.
-        # Speculative decoding can produce several first tokens together.
-        if (
-            req.time_stats is not None
-            and req.time_stats.first_token_ready_time == 0.0
-            and req.time_stats.enable_metrics
-            and req.output_ids
-        ):
-            req.time_stats.first_token_ready_time = time.perf_counter()
-
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
@@ -452,9 +441,15 @@ class _GenerationStreamAccumulator:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
             else:
-                should_output = (
+                # Send the first output through detokenization immediately so
+                # non-streaming TTFT includes detok without waiting for a batch.
+                # Speculative decoding may produce several first tokens at once.
+                first_output = req.send_token_offset == 0 and bool(req.output_ids)
+                should_output = first_output or (
                     len(req.output_ids) % self.default_force_stream_interval == 0
                 )
+                if first_output:
+                    should_output &= not req.check_match_stop_str_prefix()
 
         if not should_output:
             return

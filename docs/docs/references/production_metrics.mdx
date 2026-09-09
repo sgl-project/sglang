@@ -7,7 +7,7 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
-For Python generation metrics, `sglang:time_to_first_token_seconds` measures the interval from request creation in the API server to the scheduler's first output being ready, for both streaming and non-streaming requests. It excludes subsequent output buffering, detokenization, and network delivery. The observation is published when the next existing output message reaches the API server, which can be later for non-streaming requests. If scheduler timing is unavailable, it falls back to the first output message's arrival time.
+For Python generation metrics, `sglang:time_to_first_token_seconds` measures the interval from request creation in the API server to its first output message arriving after detokenization. It includes internal transport and detokenization, but excludes subsequent response processing and network delivery to the client. Non-streaming generation sends its first output token or speculative output block through detokenization without waiting for the regular output batch interval; subsequent outputs retain their batching, and the client still receives only the completed response. Stop-string prefix protection and beam-search admission can delay the first output. This metric measures the first processed output, which may contain no printable text, rather than the first visible character.
 
 Here is an example of the metrics:
 

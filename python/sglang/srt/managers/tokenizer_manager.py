@@ -2947,9 +2947,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
                 labels,
-                state.time_stats.get_first_token_latency(
-                    recv_obj.time_stats[i] if recv_obj.time_stats is not None else None
-                ),
+                state.time_stats.get_first_token_latency(),
                 stream=getattr(state.obj, "stream", False),
             )
         else:
