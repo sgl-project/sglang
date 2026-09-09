@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
     RESIDENT,
+    SNAPSHOT_OFFLOAD,
     normalize_component_residency,
     resolve_component_residency_mode,
     resolve_diffusers_pipeline_offload,
@@ -111,6 +112,27 @@ def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
     return pipeline_class_name in LTX2_TWO_STAGE_PIPELINE_NAMES
 
 
+def _infer_direct_constructor_explicit_arg_names(server_args) -> set[str]:
+    explicit_arg_names: set[str] = set()
+    for attr in dataclasses.fields(server_args):
+        if not attr.init or attr.name == "_explicit_arg_names":
+            continue
+
+        value = getattr(server_args, attr.name)
+        if attr.default is not dataclasses.MISSING:
+            default = attr.default
+        elif attr.default_factory is not dataclasses.MISSING:
+            default = attr.default_factory()
+        else:
+            explicit_arg_names.add(attr.name)
+            continue
+
+        if value != default:
+            explicit_arg_names.add(attr.name)
+
+    return explicit_arg_names
+
+
 def _normalize_component_precisions(value: object) -> dict[str, str]:
     if not isinstance(value, dict):
         raise ValueError("component_precisions must be a mapping")
@@ -165,6 +187,7 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
+        "black-forest-labs/flux.1-dev",
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
@@ -172,6 +195,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "sana-video_2b_480p_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
+        "flux.1-dev",
         "glm-image",
         "ideogram-4",
         "ideogram-4-fp8",
@@ -203,6 +227,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
+        "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
         "JoyEchoPipelineConfig",
@@ -741,7 +766,7 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, "
+            "[Diffusion BCG] disabled for %s: only FLUX.1-dev, Ideogram-4, "
             "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
             "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
             "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
@@ -915,6 +940,23 @@ class ServerArgs(DisaggServerArgsMixin):
         self.component_residency = normalize_component_residency(
             self.component_residency
         )
+        if SNAPSHOT_OFFLOAD in (self.component_residency or {}).values():
+            if (
+                not current_platform.is_cuda()
+                or current_platform.device_shares_host_memory()
+            ):
+                raise ValueError(
+                    "snapshot-offload requires CUDA with separate host and device memory; "
+                    "use component-offload or layerwise-offload on this platform"
+                )
+            if self.enable_breakable_cuda_graph and any(
+                self.canonical_residency_mode(name) == SNAPSHOT_OFFLOAD
+                for name in ("transformer", "transformer_2")
+            ):
+                raise ValueError(
+                    "snapshot-offload for DiT is incompatible with "
+                    "--enable-breakable-cuda-graph because weight addresses change"
+                )
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
@@ -942,7 +984,7 @@ class ServerArgs(DisaggServerArgsMixin):
             component_name: residency_mode
             for component_name in ("transformer", "transformer_2")
             if (residency_mode := self.explicit_residency_mode(component_name))
-            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
         }
         if mode == "resident" and explicit_nonresident_dits:
             configured = ", ".join(
@@ -1644,11 +1686,15 @@ class ServerArgs(DisaggServerArgsMixin):
         return RESIDENT
 
     def should_cpu_offload_component(self, component_name: str) -> bool:
-        return self.residency_mode(component_name) == COMPONENT_OFFLOAD
+        return self.residency_mode(component_name) in (
+            COMPONENT_OFFLOAD,
+            SNAPSHOT_OFFLOAD,
+        )
 
     def should_start_component_on_cpu(self, component_name: str) -> bool:
         return self.residency_mode(component_name) in (
             COMPONENT_OFFLOAD,
+            SNAPSHOT_OFFLOAD,
             LAYERWISE_OFFLOAD,
         )
 
@@ -1745,7 +1791,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         has_explicit_dit_offload = bool(
             self.canonical_residency_mode("transformer")
-            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
             or self.is_explicit_layerwise_offload_component("transformer")
             or (
                 self.is_arg_explicitly_set("cpu_offload_components")
@@ -1839,11 +1885,17 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(f"Could not parse attention backend config: {config_str}")
 
     def __post_init__(self):
+        if not self._explicit_arg_names:
+            self._explicit_arg_names = _infer_direct_constructor_explicit_arg_names(
+                self
+            )
+
         # configure logger before use
         configure_logger(server_args=self)
 
         component_paths: dict[str, str] = {}
         component_weights_paths = dict(self.component_weights_paths)
+        migrated_component_weight_path = False
         for component, path in self.component_paths.items():
             if not is_explicit_weight_file_reference(path):
                 component_paths[component] = path
@@ -1855,6 +1907,11 @@ class ServerArgs(DisaggServerArgsMixin):
                     f"{existing!r} and {path!r}"
                 )
             component_weights_paths[component] = path
+            migrated_component_weight_path = True
+        if migrated_component_weight_path and self.is_arg_explicitly_set(
+            "component_paths"
+        ):
+            self._explicit_arg_names.add("component_weights_paths")
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
         self.component_precisions = _normalize_component_precisions(
@@ -2408,7 +2465,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.component_residency,
             metavar="COMPONENT=MODE",
             help=(
-                "Select resident, component-offload, or layerwise-offload for "
+                "Select resident, component-offload, snapshot-offload, or layerwise-offload for "
                 "pipeline components. Exact model_index.json component keys override "
                 "the dit, text_encoder, image_encoder, vae, and all groups. "
                 "Components without an assignment keep their automatic placement."
