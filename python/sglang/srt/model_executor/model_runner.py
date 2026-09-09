@@ -215,6 +215,8 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_cuda_graph_max_batch_size,
+    get_eager_max_batch_size,
     is_host_cpu_arm64,
     is_npu,
     numa_utils,
@@ -1102,7 +1104,13 @@ class ModelRunner:
                 model=self.model,
                 model_config=self.model_config,
                 num_tokens=self.max_token_pool_size + self.page_size,
-                max_running_requests=self.max_running_requests,
+                max_decode_tokens=max(
+                    get_eager_max_batch_size(self.max_running_requests),
+                    get_cuda_graph_max_batch_size(self.req_to_token_pool.size),
+                )
+                * self.decode_num_tokens_per_req(
+                    num_draft_tokens=max_speculative_num_draft_tokens()
+                ),
                 device=self.device,
             )
         )
