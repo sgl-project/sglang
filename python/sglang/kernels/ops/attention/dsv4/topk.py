@@ -32,22 +32,22 @@ def _jit_topk_v2_module():
     from sglang.kernels.ops.misc import get_max_active_clusters
 
     args = make_cpp_args(is_arch_support_pdl())
-    size = (0, 0)
+    # Leave these undefined if the probe fails: topk_v2.cuh carries per-arch
+    # defaults, and a 0 would size the persistent pool to an empty grid.
+    extra_cuda_cflags = []
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
         try:
-            size0 = get_max_active_clusters(cluster_size=8, occupancy=2)
-            size1 = get_max_active_clusters(cluster_size=16, occupancy=1)
-            size = (size0, size1)
+            extra_cuda_cflags = [
+                f"-DSGL_TOPK_V2_MAX_C8_OCC2={get_max_active_clusters(8, occupancy=2)}",
+                f"-DSGL_TOPK_V2_MAX_C16_OCC1={get_max_active_clusters(16, occupancy=1)}",
+            ]
         except Exception:
             pass
     kernel = f"TopKKernel<{args}>"
     return load_jit(
         make_name("topk_v2"),
         *args,
-        extra_cuda_cflags=[
-            f"-DSGL_TOPK_V2_MAX_C8_OCC2={size[0]}",
-            f"-DSGL_TOPK_V2_MAX_C16_OCC1={size[1]}",
-        ],
+        extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[
             ("topk_transform_paged", f"{kernel}::transform_paged"),
