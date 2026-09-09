@@ -28,20 +28,21 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
             for use_aiter in (False, True):
                 for marked in (False, True):
                     for gfx950 in (False, True):
-                        with self.subTest(
-                            enabled=enabled,
-                            use_aiter=use_aiter,
-                            marked=marked,
-                            gfx950=gfx950,
-                        ), envs.SGLANG_DSA_FP8_PROJ_GEMM.override(
-                            enabled
-                        ), patch.object(
-                            unquant, "_use_aiter", use_aiter
-                        ), patch.object(
-                            unquant,
-                            "is_gfx95_supported",
-                            return_value=gfx950,
-                        ) as gfx95_supported:
+                        with (
+                            self.subTest(
+                                enabled=enabled,
+                                use_aiter=use_aiter,
+                                marked=marked,
+                                gfx950=gfx950,
+                            ),
+                            envs.SGLANG_DSA_FP8_PROJ_GEMM.override(enabled),
+                            patch.object(unquant, "_use_aiter", use_aiter),
+                            patch.object(
+                                unquant,
+                                "is_gfx95_supported",
+                                return_value=gfx950,
+                            ) as gfx95_supported,
+                        ):
                             if marked:
                                 layer._fp8_proj_gemm = True
                             elif hasattr(layer, "_fp8_proj_gemm"):
@@ -62,19 +63,20 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
         layer = SimpleNamespace(weight=torch.nn.Parameter(weight, requires_grad=False))
         x = torch.randn(3, 8, dtype=torch.bfloat16)
 
-        with envs.SGLANG_DSA_FP8_PROJ_GEMM.override(False), patch.object(
-            unquant, "_use_aiter", True
-        ), patch.object(unquant, "is_gfx95_supported", return_value=True), patch.object(
-            method, "_repack_bf16_to_fp8_ptpc"
-        ) as repack, patch.object(
-            unquant, "_is_cpu_amx_available", False
+        with (
+            envs.SGLANG_DSA_FP8_PROJ_GEMM.override(False),
+            patch.object(unquant, "_use_aiter", True),
+            patch.object(unquant, "is_gfx95_supported", return_value=True),
+            patch.object(method, "_repack_bf16_to_fp8_ptpc") as repack,
+            patch.object(unquant, "_is_cpu_amx_available", False),
         ):
             method.process_weights_after_loading(layer)
 
         repack.assert_not_called()
-        with patch.object(
-            unquant, "use_intel_amx_backend", return_value=False
-        ), patch.object(unquant, "_use_aiter", False):
+        with (
+            patch.object(unquant, "use_intel_amx_backend", return_value=False),
+            patch.object(unquant, "_use_aiter", False),
+        ):
             actual = method.apply(layer, x)
         torch.testing.assert_close(actual, F.linear(x, weight), rtol=0, atol=0)
         self.assertFalse(hasattr(layer, "_fp8_proj_ready"))
@@ -87,14 +89,12 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
             ),
             _fp8_proj_gemm=True,
         )
-        with envs.SGLANG_DSA_FP8_PROJ_GEMM.override(True), patch.object(
-            unquant, "_use_aiter", True
-        ), patch.object(
-            unquant, "is_gfx95_supported", return_value=False
-        ), patch.object(
-            method, "_repack_bf16_to_fp8_ptpc"
-        ) as repack, patch.object(
-            unquant, "_is_cpu_amx_available", False
+        with (
+            envs.SGLANG_DSA_FP8_PROJ_GEMM.override(True),
+            patch.object(unquant, "_use_aiter", True),
+            patch.object(unquant, "is_gfx95_supported", return_value=False),
+            patch.object(method, "_repack_bf16_to_fp8_ptpc") as repack,
+            patch.object(unquant, "_is_cpu_amx_available", False),
         ):
             method.process_weights_after_loading(layer)
         repack.assert_not_called()
@@ -180,11 +180,13 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
         bf16_output = torch.empty(512, 4, dtype=torch.bfloat16, device="meta")
         ptpc_output = torch.empty(513, 4, dtype=torch.bfloat16, device="meta")
 
-        with patch.object(unquant, "_use_aiter", False), patch.object(
-            unquant.F, "linear", return_value=bf16_output
-        ) as bf16_linear, patch.object(
-            fp8_utils, "apply_fp8_ptpc_linear", return_value=ptpc_output
-        ) as apply_ptpc:
+        with (
+            patch.object(unquant, "_use_aiter", False),
+            patch.object(unquant.F, "linear", return_value=bf16_output) as bf16_linear,
+            patch.object(
+                fp8_utils, "apply_fp8_ptpc_linear", return_value=ptpc_output
+            ) as apply_ptpc,
+        ):
             x_bf16 = torch.empty(512, 8, dtype=torch.bfloat16, device="meta")
             self.assertIs(method.apply(layer, x_bf16), bf16_output)
             bf16_linear.assert_called_once_with(x_bf16, layer.weight, None)
@@ -276,11 +278,13 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
 
         layer._fp8_proj_ready = False
         expected_bf16 = torch.empty_like(expected_ptpc)
-        with patch.object(
-            unquant, "use_intel_amx_backend", return_value=False
-        ), patch.object(unquant, "_use_aiter", False), patch.object(
-            unquant.F, "linear", return_value=expected_bf16
-        ) as bf16_linear:
+        with (
+            patch.object(unquant, "use_intel_amx_backend", return_value=False),
+            patch.object(unquant, "_use_aiter", False),
+            patch.object(
+                unquant.F, "linear", return_value=expected_bf16
+            ) as bf16_linear,
+        ):
             actual_bf16 = method.apply(layer, x)
 
         self.assertIs(actual_bf16, expected_bf16)

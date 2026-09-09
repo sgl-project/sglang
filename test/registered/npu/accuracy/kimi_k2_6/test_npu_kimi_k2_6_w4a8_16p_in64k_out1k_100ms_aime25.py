@@ -63,7 +63,7 @@ OTHER_ARGS = [
     "deepep",
     "--deepep-mode",
     "auto",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     "--disable-radix-cache",
     "--speculative-algorithm",
@@ -92,7 +92,6 @@ MODEL_CONFIG = {
 
 
 class TestNPUKimiK2_6_W4A8_16P_AIME2025(TestNpuAccuracyMultiNodePdMixTestCaseBase):
-
     model_config = MODEL_CONFIG
     accuracy = 0.961
     datasets = ["aime25"]

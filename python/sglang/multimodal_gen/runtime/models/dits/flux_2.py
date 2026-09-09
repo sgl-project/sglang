@@ -27,10 +27,12 @@ from sglang.kernels.ops.diffusion import (
     can_use_flux2_gated_resnorm,
     can_use_fused_layernorm_modulate,
     flux2_gated_resnorm_raw,
+    flux2_nvfp4_swiglu_quant_active,
     fused_layernorm_modulate_fp8_quant_raw,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
     is_plain_layer_norm,
+    mark_flux2_nvfp4_swiglu_quant_site,
     residual_gate_add,
     try_flux2_token_cat_fp8,
     try_flux2_token_cat_nvfp4,
@@ -70,6 +72,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     ModelOptFp8LinearMethod,
     apply_nvfp4_gemm_prequantized,
+    apply_nvfp4_gemm_swiglu_quant,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -214,6 +217,13 @@ def _flux2_gated_resnorm(
 
     residual = residual_gate_add(residual, update, gate)
     return _flux2_norm_modulate(norm, residual, scale, shift), residual
+
+
+def _can_use_nvfp4_swiglu_quant_fusion(capability: Any) -> bool:
+    # The end-to-end accuracy and performance validation for this fusion was
+    # done on SM103.  SM100 currently produces a deterministic but materially
+    # different FLUX.2 image, so keep B200/GB200 on the existing unfused path.
+    return capability is not None and (capability.major, capability.minor) == (10, 3)
 
 
 def _flux2_norm_maybe_fp8(
@@ -405,7 +415,31 @@ class Flux2FeedForward(nn.Module):
             prefix=f"{prefix}.linear_out" if prefix else "linear_out",
         )
 
+        capability = current_platform.get_device_capability()
+        if (
+            _can_use_nvfp4_swiglu_quant_fusion(capability)
+            and isinstance(self.linear_in.quant_method, ModelOptFp4LinearMethod)
+            and isinstance(self.linear_out.quant_method, ModelOptFp4LinearMethod)
+            and self.linear_in.output_size_per_partition % 128 == 0
+            and self.linear_in.input_size_per_partition % 16 == 0
+            and self.linear_in.bias is None
+            and self.linear_out.bias is None
+        ):
+            # These flags are consumed after checkpoint loading.  Keep the
+            # regular weight layout as well so graph/compile fallback remains
+            # available.
+            self.linear_in._interleave_for_swiglu_fusion = True
+            self.linear_out._accepts_prequantized_fp4 = True
+            mark_flux2_nvfp4_swiglu_quant_site(self)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            flux2_nvfp4_swiglu_quant_active(self)
+            and getattr(self.linear_in, "_swiglu_fusion_ready", False)
+            and not torch.compiler.is_compiling()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return apply_nvfp4_gemm_swiglu_quant(self.linear_in, self.linear_out, x)
         x, _ = self.linear_in(x)
         x = self.act_fn(x)
         x, _ = self.linear_out(x)

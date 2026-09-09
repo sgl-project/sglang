@@ -83,9 +83,9 @@ class AibrixKVCacheStorage(HiCacheStorage):
             kv_blocks = handle.to_tensors()
             assert len(kv_blocks) == len(target_locations)
             for i in range(len(kv_blocks)):
-                assert (
-                    target_locations[i].nbytes == kv_blocks[i].nbytes
-                ), f"{target_locations[i].nbytes}, {kv_blocks[i].nbytes}"
+                assert target_locations[i].nbytes == kv_blocks[i].nbytes, (
+                    f"{target_locations[i].nbytes}, {kv_blocks[i].nbytes}"
+                )
                 target_locations[i].copy_(kv_blocks[i].flatten())
             handle.release()
             return target_locations
@@ -120,9 +120,9 @@ class AibrixKVCacheStorage(HiCacheStorage):
             logger.warning("aibrix_kvcache set allocate not enough")
             return False
         for i in range(len(tensors)):
-            assert (
-                tensors[i].nbytes == values[i].nbytes
-            ), f"{tensors[i].nbytes}, {values[i].nbytes}"
+            assert tensors[i].nbytes == values[i].nbytes, (
+                f"{tensors[i].nbytes}, {values[i].nbytes}"
+            )
             tensors[i].reshape(values[i].shape).copy_(values[i]).reshape(
                 tensors[i].shape
             )

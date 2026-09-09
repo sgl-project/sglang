@@ -11,8 +11,10 @@ use crate::message::request::{MmRequest, Request, RequestKind, SchedulerRequest}
 use crate::message::response::ResponseItem;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
-pub use crate::tokenizer_manager::to_scheduler_types::{Limits, Mm};
-use crate::tokenizer_manager::to_scheduler_validation::{check_total_tokens, validate};
+pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
+use crate::tokenizer_manager::to_scheduler_validation::{
+    check_total_tokens, validate, validate_input_ids,
+};
 use crate::tokenizer_manager::wiring::{AbortSource, Senders, TmEvent};
 use crate::utils::{
     error::Error,
@@ -34,7 +36,7 @@ pub struct Intake {
     senders: Senders,
     to_scheduler_tx: ToSchedulerTx,
     limits: Limits,
-    mm: Mm,
+    mm: MmDispatch,
     /// Requests parked in `Encoding` while an MM worker processes their media;
     /// resumed by `MmEncoded` / `MmFailed`. Only this thread touches it, so no
     /// lock.
@@ -49,7 +51,7 @@ impl Intake {
         senders: Senders,
         to_scheduler_tx: ToSchedulerTx,
         limits: Limits,
-        mm: Mm,
+        mm: MmDispatch,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
@@ -124,7 +126,7 @@ impl Intake {
         }
         // A rejected request never reaches the scheduler drain, so purge any
         // parked MM result (no-op for the common non-mm request).
-        self.mm.sidecar.purge(req.rid.as_str());
+        self.mm.results.purge(req.rid.as_str());
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(ResponseItem::Error(err)); // client may be gone
         if registered {
@@ -274,7 +276,8 @@ impl Intake {
                 // a text request has no ids yet.
                 RequestState::PreSendValidating => {
                     if let RequestKind::Generate(g) = &mut req.kind
-                        && let Err(e) = check_total_tokens(g, &self.limits)
+                        && let Err(e) = validate_input_ids(g, self.limits.vocab_size)
+                            .and_then(|()| check_total_tokens(g, &self.limits))
                     {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
@@ -399,7 +402,7 @@ impl Intake {
         let Some(mut req) = self.pending_mm.remove(&rid) else {
             tracing::debug!(rid = %rid, "mm result for unknown/finished request; dropped");
             // It will never reach the scheduler drain, so purge or leak.
-            self.mm.sidecar.purge(rid.as_str());
+            self.mm.results.purge(rid.as_str());
             return;
         };
         if let RequestKind::Generate(g) = &mut req.kind {
@@ -429,8 +432,8 @@ impl Intake {
     /// ([`Rid::from_client`]), so no later request can ever answer to it.
     ///
     /// A request parked in `pending_mm` is cancelled here, so the worker's late
-    /// result lands in `on_mm_encoded`'s no-entry branch and purges the sidecar —
-    /// no generation runs for output nobody will read.
+    /// result lands in `on_mm_encoded`'s no-entry branch and purges the parked
+    /// result — no generation runs for output nobody will read.
     fn on_abort(&mut self, source: AbortSource) {
         let rid = source.rid().clone();
         if self.pending_mm.remove(&rid).is_some() {

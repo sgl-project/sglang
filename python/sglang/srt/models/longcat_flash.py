@@ -183,8 +183,7 @@ class LongcatFlashMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -247,7 +246,6 @@ class LongcatFlashRouter(nn.Module):
 
 
 class LongcatFlashMoE(nn.Module):
-
     def __init__(
         self,
         config: LongcatFlashConfig,
@@ -357,7 +355,6 @@ class LongcatFlashMoE(nn.Module):
 
 
 class LongcatFlashDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: LongcatFlashConfig,
