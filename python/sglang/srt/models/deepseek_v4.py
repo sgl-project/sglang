@@ -61,14 +61,12 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.communicator_dsa_cp import (
-    dsa_cp_gather_hidden_states,
-    dsa_cp_reduce_scatter_hidden_states,
-)
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
     dsa_prefill_cp_fused_symm_mem,
+    dsa_prefill_cp_moe_gather,
+    dsa_prefill_cp_moe_reduce_scatter,
 )
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
@@ -2450,11 +2448,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                # use_cp_fused_symm_mem is set only when the fused path
-                # really runs, so the skip sees what the kernels saw.
-                _comm = get_tp_group().torch_symm_mem_comm
-                if _comm is None or not _comm.use_cp_fused_symm_mem:
-                    hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+                hidden_states = dsa_prefill_cp_moe_gather(hidden_states)
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -2497,17 +2491,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 skip_shared_experts=_do_shared_local,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
-            _comm = get_tp_group().torch_symm_mem_comm
-            if _comm is None or not _comm.use_cp_fused_symm_mem:
-                hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
-            else:
-                # Experts emitted unreduced [M, topk, H]; a 3D tensor here
-                # means fused RS fell back after that, which nothing repairs.
-                assert hidden_states.dim() == 2, (
-                    "fused CP RS fell back after no_topk_reduce expert output; "
-                    "add the missing condition to "
-                    "dsa_prefill_cp_fused_symm_mem_eligible"
-                )
+            hidden_states = dsa_prefill_cp_moe_reduce_scatter(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),

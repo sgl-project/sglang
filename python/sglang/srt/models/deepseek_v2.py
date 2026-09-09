@@ -56,10 +56,6 @@ from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
-    maybe_fused_ag_shared_experts,
-    maybe_fused_shared_add_rs,
-)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -85,6 +81,10 @@ from sglang.srt.layers.communicator_dsa_cp import (
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import (
+    dsa_prefill_cp_shared_add_rs,
+    dsa_prefill_cp_shared_experts,
+)
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -841,14 +841,6 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
-        # Fused CP AG/RS eligibility, used by the gate
-        # dsa_prefill_cp_fused_symm_mem_eligible.
-        self.cp_fused_symm_mem_eligible = (
-            self.num_fused_shared_experts == 0
-            and not self._fuse_shared_experts_inside_sbo
-            and self.shared_experts_weight_block_size is not None
-            and self.experts.moe_runner_config.inplace
-        )
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
@@ -1175,14 +1167,8 @@ class DeepseekV2MoE(nn.Module):
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
             )
-        # tp_size arg = shard divisor = cp_size (RS runs on the attn CP group).
-        fused_out = maybe_fused_shared_add_rs(
-            final_hidden_states,
-            shared_output,
-            get_parallel().attn_cp_size,
-            self.n_shared_experts,
-            self.top_k,
-            self.routed_scaling_factor,
+        fused_out = dsa_prefill_cp_shared_add_rs(
+            self, final_hidden_states, shared_output
         )
         if fused_out is not None:
             return fused_out
@@ -1504,31 +1490,11 @@ class DeepseekV2MoE(nn.Module):
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
-            ag_out, gate_up_local = maybe_fused_ag_shared_experts(
+            return dsa_prefill_cp_shared_experts(
+                self,
                 hidden_states,
-                self.shared_experts.gate_up_proj,
-            )
-            if ag_out is not None:
-                if gate_up_local is not None:
-                    return ag_out, self.shared_experts(
-                        hidden_states,
-                        gemm_output_zero_allocator=gemm_output_zero_allocator,
-                        precomputed_gate_up=gate_up_local,
-                    )
-                if pre_quant_input is not None:
-                    # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
-                    # multiple of 4; the padded rows flow through the MLP (all ops
-                    # are row-local) and are sliced off here.
-                    out = self.shared_experts(
-                        hidden_states, gateup_pre_quant=pre_quant_input
-                    )
-                    return ag_out, out[: hidden_states.shape[0]]
-                return ag_out, self.shared_experts(
-                    hidden_states,
-                    gemm_output_zero_allocator=gemm_output_zero_allocator,
-                )
-            return None, self.shared_experts(
-                hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                pre_quant_input=pre_quant_input,
             )
         else:
             return None, None
