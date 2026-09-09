@@ -59,7 +59,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     def a5_packed_kv_dim(self) -> int:
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim
-        scale_dim = math.ceil(nope_dim / _NPU_ARCH35_KV_QUANT_GROUP_SIZE)
+        scale_dim = math.ceil(nope_dim / _NPU_ARCH35_KV_QUANT_GROUP_SIZE) * 2  # BF16 scales
         bytes_per_token = nope_dim + rope_dim * 2 + scale_dim
         return (
             math.ceil(bytes_per_token / _NPU_ARCH35_KV_ROW_ALIGNMENT)
@@ -70,8 +70,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
         if self.store_dtype != torch.bfloat16:
             return super().create_buffer(num_pages=num_pages)
-        _native_attn = os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1"
-        if is_npu_arch35() and not _native_attn:
+        if is_npu_arch35() and os.environ.get("SGLANG_DSV4_BF16_KV", "0") != "1":
             kv_dim = self.a5_packed_kv_dim
             kv_dtype = torch.float8_e4m3fn
         else:
@@ -620,8 +619,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """
         # Index by raw layer_id (see get_swa_buffer) to avoid bucket collision.
         buf = self.swa_kv_pool.kv_buffer[layer_id]
-        _native_attn = os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1"
-        if is_npu_arch35() and not _native_attn:
+        if is_npu_arch35() and buf.dtype == torch.float8_e4m3fn:
             self._write_a5_packed_kv(buf=buf, loc=loc, cache=cache)
             return
         buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
@@ -653,15 +651,35 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
-        torch.ops.npu.kv_compress_epilog(
-            buf.view(-1, 1, buf.shape[-1]),
-            cache_2d,
-            slot_mapping,
-            quant_group_size=_NPU_ARCH35_KV_QUANT_GROUP_SIZE,
-            quant_mode=2,
-            round_scale_flag=True,
-            layout=1,
-        )
+        nope_dim = self.qk_nope_head_dim
+        rope_dim = self.qk_rope_head_dim
+        group_size = _NPU_ARCH35_KV_QUANT_GROUP_SIZE
+        num_groups = nope_dim // group_size
+
+        nope_bf16 = cache_2d[:, :nope_dim].contiguous()  # (N, 448)
+        rope_bf16 = cache_2d[:, nope_dim:nope_dim + rope_dim].contiguous()  # (N, 64)
+
+        # Per-group FP8 e4m3fn quantization with BF16 scales (all math in fp32)
+        nope_f32 = nope_bf16.float().reshape(-1, num_groups, group_size)  # (N, 7, 64)
+        max_abs = nope_f32.abs().amax(dim=-1, keepdim=True).clamp(min=1e-20)  # (N, 7, 1)
+        # BF16 scale: precise per-group scale, stored as 2 bytes each
+        scale_bf16 = (max_abs / 448.0).squeeze(-1).to(torch.bfloat16)  # (N, 7)
+        actual_scale = scale_bf16.float().unsqueeze(-1)  # (N, 7, 1)
+        fp8_vals = (nope_f32 / actual_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)  # (N, 7, 64)
+
+        # Write to buffer via uint8 view, matching A5 kernel expected layout:
+        # [rope_bf16(128B) | nope_fp8(448B) | scales_bf16(14B) | padding]
+        buf_u8 = buf.view(torch.uint8)
+        buf_flat = buf_u8.reshape(-1, buf.shape[-1])
+        slots = slot_mapping.to(torch.int64)
+
+        rope_bytes = rope_bf16.view(torch.uint8)  # (N, 128)
+        fp8_flat_u8 = fp8_vals.reshape(-1, nope_dim).view(torch.uint8)  # (N, 448)
+        scale_bytes = scale_bf16.view(torch.uint8)  # (N, 14)
+
+        buf_flat[slots, :rope_dim * 2] = rope_bytes
+        buf_flat[slots, rope_dim * 2:rope_dim * 2 + nope_dim] = fp8_flat_u8
+        buf_flat[slots, rope_dim * 2 + nope_dim:rope_dim * 2 + nope_dim + num_groups * 2] = scale_bytes
 
     def set_swa_key_buffer_radix_fused_norm_rope(
         self,
@@ -744,6 +762,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             # layer_mapping already points at the owning source pool.
             _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
             buf = compress_kv_pool.kv_buffer[compress_layer_id]
+            if is_npu_arch35() and buf.dtype == torch.float8_e4m3fn and buf.shape[-1] != kv.shape[-1]:
+                self._write_a5_packed_kv(buf=buf, loc=loc, cache=kv)
+                return
             buf_flat = buf.flatten(0, 1) if buf.dim() > 2 else buf
             kv_view = kv.to(buf_flat.dtype)
             if kv_view.ndim == buf_flat.ndim - 1:
@@ -755,8 +776,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
             buf = compress_pool.kv_buffer[compress_layer_id]
-            _native_attn = os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1"
-            if is_npu_arch35() and not _native_attn:
+            if is_npu_arch35() and buf.dtype == torch.float8_e4m3fn:
                 self._write_a5_packed_kv(buf=buf, loc=loc, cache=kv)
                 return
             buf_flat = buf.flatten(0, 1)
