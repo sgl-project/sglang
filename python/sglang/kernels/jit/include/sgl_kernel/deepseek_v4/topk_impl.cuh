@@ -43,9 +43,18 @@ namespace sglang {
 
 namespace device::topk {
 
+/// Hints that `value` is warp-uniform so it can live in a uniform register. The
+/// caller must already guarantee that: on ROCm this is the identity, since the
+/// 32-bit mask below covers only half of a 64-lane wavefront and there is no
+/// uniform register file to hint at.
 template <typename T>
 SGL_DEVICE T broadcast(T value, uint32_t src = 0) {
+#if defined(USE_ROCM)
+  static_cast<void>(src);
+  return value;
+#else
   return __shfl_sync(0xFFFFFFFF, value, src);
+#endif
 }
 
 /// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
