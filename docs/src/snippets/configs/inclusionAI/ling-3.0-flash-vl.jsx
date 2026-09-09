@@ -24,7 +24,6 @@ export const config = {
   placeholders: {
     HOST_IP:   { target: "command", label: "Bind host",         default: "0.0.0.0"         },
     PORT:      { target: "command", label: "Bind port",         default: "30000"           },
-    HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
     CURL_HOST: { target: "curl",    label: "Server host",       default: "localhost"       },
     CURL_PORT: { target: "curl",    label: "Server port",       default: "30000"           },
   },
