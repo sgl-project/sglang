@@ -3308,13 +3308,15 @@ fn insert_host_publishes_a_host_store_event() {
     let root = tc.arena.root();
     let key = vec![1i64, 2, 7, 8];
     let hashes = crate::node::get_hash_str::<Vec<i64>>(&key, None, 2);
-    let result = tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        key.clone(),
-        Tensor::from_slice(&[100i64, 101, 102, 103]),
-        hashes.clone(),
-    );
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            key.clone(),
+            Tensor::from_slice(&[100i64, 101, 102, 103]),
+            hashes.clone(),
+        )
+        .expect("live test node");
     assert!(!result.host_insert_dropped);
     assert!(result.inserted_host_node.is_some());
     assert_eq!(
