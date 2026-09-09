@@ -1411,6 +1411,11 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    # DSv4.1 HC plan-1 triton-ascend kernels on NPU: one mix+sinkhorn+combine
+    # and one hc_post launch per sublayer boundary instead of the all-torch
+    # chain (~140 launches per sublayer, sinkhorn loop alone ~114). 0 = the
+    # torch chain (hc_split_sinkhorn + hc_combine + hc_post torch impls).
+    SGLANG_OPT_USE_HC_TRITON = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),

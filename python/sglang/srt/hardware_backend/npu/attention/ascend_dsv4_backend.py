@@ -29,6 +29,12 @@ from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
+from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+    low_ratio_compress_triton,
+)
+from sglang.kernels.ops.attention.dsv4.low_ratio_compress_decode import (
+    low_ratio_compress_decode,
+)
 from sglang.srt.layers.attention.dsv4.dsv41_compressor import (
     last_token_per_request,
 )
@@ -991,6 +997,7 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_q_head_num = cfg.num_attention_heads // tp_size
         self._dsv4_kv_head_num = 1  # V4 MQA / latent
         self._dsv4_head_dim = cfg.head_dim
+        self._dsv4_kv_cache_head_dim = cfg.head_dim + 128
         hf = getattr(cfg, "hf_config", cfg)
         self._dsv4_index_topk = hf.index_topk
         self._dsv4_index_n_heads = hf.index_n_heads
@@ -1868,6 +1875,12 @@ class DeepseekV4AscendAttnBackend(
                 if forward_batch.forward_mode.is_target_verify()
                 else self.speculative_num_draft_tokens
             )
+        elif forward_batch.forward_mode.is_extend():
+            seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            if isinstance(seq_lens_cpu, list):
+                max_seqlen_q = max(seq_lens_cpu) if seq_lens_cpu else 1
+            else:
+                max_seqlen_q = int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() > 0 else 1
         else:
             max_seqlen_q = 1
         return self._kernel_metadata_from_parts(
@@ -1891,10 +1904,32 @@ class DeepseekV4AscendAttnBackend(
     ) -> dict:
         fm = self.forward_metadata
         metadata_op, _ = _sparse_attn_ops()
+
+        # Build per-sequence query lengths (seqused_q) and cumulative KV
+        # lengths (cu_seqlens_ori_kv) that the A5 metadata kernel needs.
+        device = actual_seq_lengths_kv.device
+        # vllm-ascend always passes an empty tensor for seqused_q; the
+        # kernel derives per-batch query lengths from cu_seqlens_q instead.
+        seqused_q = torch.tensor([], dtype=torch.int32, device=device)
+        cu_seqlens_ori_kv = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.cumsum(actual_seq_lengths_kv.to(torch.int32), dim=0),
+            ]
+        )
+        max_seqlen_kv = int(actual_seq_lengths_kv.max().item()) if actual_seq_lengths_kv.numel() > 0 else 0
+
+        _kv_kwargs = _sparse_attn_kv_quant_kwargs()
         common = {
-            **_sparse_attn_kv_quant_kwargs(),
+            "kv_quant_mode": _kv_kwargs["kv_quant_mode"],
+            "tile_size": _kv_kwargs.get("tile_size", 0),
+            "rope_head_dim": _kv_kwargs.get("rope_head_dim", 0),
             "cu_seqlens_q": actual_seq_lengths_q_pa,
+            "cu_seqlens_ori_kv": actual_seq_lengths_q_pa,
+            "seqused_q": seqused_q,
             "seqused_kv": actual_seq_lengths_kv,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_kv": max_seqlen_kv,
             "cmp_ratio": 1,
             "ori_mask_mode": 4,
             "cmp_mask_mode": 3,
@@ -1909,7 +1944,7 @@ class DeepseekV4AscendAttnBackend(
             "batch_size": bs,
             "num_heads_q": self._dsv4_q_head_num,
             "num_heads_kv": self._dsv4_kv_head_num,
-            "head_dim": self._dsv4_head_dim,
+            "head_dim": self._dsv4_kv_cache_head_dim,
             "has_ori_kv": True,
             "has_cmp_kv": False,
         }
@@ -1930,13 +1965,18 @@ class DeepseekV4AscendAttnBackend(
             }
             metadata_op, _ = _sparse_attn_ops()
         c1a_metadata = metadata_op(**c1a_kwargs)
-        kernel_metadata = {"c1a_metadata": c1a_metadata}
+        kernel_metadata = {
+            "c1a_metadata": c1a_metadata,
+            "cu_seqlens_ori_kv": cu_seqlens_ori_kv,
+            "seqused_q": seqused_q,
+        }
 
         if self._dsv4_has_c1:
             fulla_overrides = {
                 "cmp_ratio": 1,
                 "has_cmp_kv": True,
                 "cmp_topk": self._dsv4_index_topk,
+                "cu_seqlens_cmp_kv": actual_seq_lengths_q_pa,
             }
             fulla_kwargs = c1a_kwargs | fulla_overrides
             metadata_op, _ = _sparse_attn_ops()
@@ -2064,27 +2104,61 @@ class DeepseekV4AscendAttnBackend(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
         if compress_ratio == 0:
-            if os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1":
-                return self._forward_swa_native(
-                    q, layer, forward_batch, attn_sink
-                )
             return self._forward_swa(q, layer, forward_batch, attn_sink)
-        if os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1":
-            return self._forward_compressed_native(
-                q, layer, forward_batch, attn_sink, compress_ratio
-            )
         return self._forward_compressed(
             q, layer, forward_batch, attn_sink, compress_ratio
         )
 
     # ---- Native PyTorch attention fallback (SGLANG_DSV4_NATIVE_ATTN=1) ----
 
+    _A5_NOPE_DIM = 448
+    _A5_ROPE_DIM = 64
+    _A5_NUM_SCALES = 7
+    _A5_GROUP_SIZE = 64
+    _A5_HEAD_DIM = 512
+
+    @staticmethod
+    def _unpack_a5_packed_kv(pages_u8, kv_len):
+        """Unpack A5 FP8 packed KV pages to bf16 (kv_len, 512).
+
+        A5 kernel expected layout per token (640 bytes):
+        [0:128]   BF16 rope key (64 dims x 2 bytes)
+        [128:576] FP8 e4m3fn nope key (448 dims)
+        [576:590] BF16 scales (7 scales x 2 bytes, one per 64 dims)
+        [590:640] padding
+        """
+        NOPE = DeepseekV4AscendAttnBackend._A5_NOPE_DIM
+        ROPE = DeepseekV4AscendAttnBackend._A5_ROPE_DIM
+        NS = DeepseekV4AscendAttnBackend._A5_NUM_SCALES
+        GS = DeepseekV4AscendAttnBackend._A5_GROUP_SIZE
+
+        raw = pages_u8.reshape(-1, 1, pages_u8.shape[-1])[:kv_len].contiguous()
+
+        rope_bf16 = raw[..., :ROPE * 2].view(torch.bfloat16)
+        fp8_nope = raw[..., ROPE * 2 : ROPE * 2 + NOPE].view(torch.float8_e4m3fn).to(torch.float32)
+        scales_bf16 = raw[..., ROPE * 2 + NOPE : ROPE * 2 + NOPE + NS * 2].view(torch.bfloat16).to(torch.float32)
+        scales_exp = scales_bf16.repeat_interleave(GS, dim=-1)
+        nope_bf16 = (fp8_nope * scales_exp).to(torch.bfloat16)
+
+        kv = torch.cat([nope_bf16, rope_bf16], dim=-1).squeeze(1)
+        return kv
+
     @staticmethod
     def _gather_paged_kv(kv_buffer, block_table_row, kv_len, D):
-        """Gather KV from PA_ND paged buffer: (num_pages, page_size, 1, D)."""
+        """Gather KV from PA_ND paged buffer: (num_pages, page_size, 1, dim).
+
+        If A5 FP8 packed (float8_e4m3fn), view as uint8 for NPU index
+        compatibility, then unpack to bf16 (kv_len, 512).
+        """
         page_size = kv_buffer.shape[1]
         num_pages = (kv_len + page_size - 1) // page_size
         page_ids = block_table_row[:num_pages].to(torch.int64).reshape(-1)
+
+        if kv_buffer.dtype == torch.float8_e4m3fn:
+            buf_u8 = kv_buffer.view(torch.uint8)
+            pages_u8 = buf_u8[page_ids]
+            return DeepseekV4AscendAttnBackend._unpack_a5_packed_kv(pages_u8, kv_len)
+
         pages = kv_buffer[page_ids]
         return pages.reshape(-1, D)[:kv_len]
 
@@ -2120,7 +2194,7 @@ class DeepseekV4AscendAttnBackend(
             kv_seq = self._gather_paged_kv(ori_kv, block_table[i], kv_len_i, D)
             q_i = q[q_start:q_end]
             scores = torch.matmul(
-                q_i.transpose(0, 1).float(), kv_seq.transpose(0, 1).float()
+                q_i.transpose(0, 1), kv_seq.transpose(0, 1)
             ) * scale
             q_pos = torch.arange(q_len_i, device=q.device)
             k_pos = torch.arange(kv_len_i, device=q.device)
@@ -2139,22 +2213,27 @@ class DeepseekV4AscendAttnBackend(
                 if n_heads_eff < H:
                     pad = torch.zeros(H - n_heads_eff, q_len_i, 1, device=q.device)
                     sink_bias = torch.cat([sink_bias, pad], dim=0)
-                scores = torch.cat([sink_bias, scores], dim=-1)
+                scores = torch.cat([sink_bias, scores.float()], dim=-1)
                 sink_mask = torch.ones(q_len_i, 1, dtype=torch.bool, device=q.device)
                 mask = torch.cat([sink_mask, mask], dim=-1)
+            else:
+                scores = scores.float()
             scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
-            attn = torch.softmax(scores, dim=-1)
+            attn = torch.softmax(scores, dim=-1).to(q.dtype)
+            del scores
             if attn_sink is not None:
                 attn_kv = attn[..., 1:]
             else:
                 attn_kv = attn
             out_i = torch.matmul(
-                attn_kv, kv_seq.unsqueeze(0).float()
-            ).to(q.dtype).squeeze(0)
+                attn_kv, kv_seq.unsqueeze(0)
+            ).squeeze(0)
+            del attn_kv, kv_seq
             outputs.append(out_i.transpose(0, 1))
         if not outputs:
             return q.new_zeros(T, H, D)
-        return torch.cat(outputs, dim=0)
+        result = torch.cat(outputs, dim=0)
+        return result
 
     def _forward_compressed_native(
         self,
@@ -2207,7 +2286,7 @@ class DeepseekV4AscendAttnBackend(
                 all_kv = torch.cat([swa_kv, c_kv], dim=0)
             n_keys = all_kv.shape[0]
             scores = torch.matmul(
-                q_i.transpose(0, 1).float(), all_kv.transpose(0, 1).float()
+                q_i.transpose(0, 1), all_kv.transpose(0, 1)
             ) * scale
             q_pos = torch.arange(q_len_i, device=q.device)
             k_pos = torch.arange(n_keys, device=q.device)
@@ -2242,22 +2321,29 @@ class DeepseekV4AscendAttnBackend(
                 if n_heads_eff < H:
                     pad = torch.zeros(H - n_heads_eff, q_len_i, 1, device=q.device)
                     sink_bias = torch.cat([sink_bias, pad], dim=0)
-                scores = torch.cat([sink_bias, scores], dim=-1)
+                scores = torch.cat([sink_bias, scores.float()], dim=-1)
                 sink_mask = torch.ones(q_len_i, 1, dtype=torch.bool, device=q.device)
                 full_mask = torch.cat([sink_mask, full_mask], dim=-1)
+            else:
+                scores = scores.float()
             scores = scores.masked_fill(~full_mask.unsqueeze(0), float("-inf"))
-            attn = torch.softmax(scores, dim=-1)
+            attn = torch.softmax(scores, dim=-1).to(q.dtype)
+            del scores
             if attn_sink is not None:
                 attn_kv = attn[..., 1:]
             else:
                 attn_kv = attn
             out_i = torch.matmul(
-                attn_kv, all_kv.unsqueeze(0).float()
-            ).to(q.dtype).squeeze(0)
+                attn_kv, all_kv.unsqueeze(0)
+            ).squeeze(0)
+            del attn_kv, all_kv, swa_kv
+            if c_kv is not None:
+                del c_kv
             outputs.append(out_i.transpose(0, 1))
         if not outputs:
             return q.new_zeros(T, H, D)
-        return torch.cat(outputs, dim=0)
+        result = torch.cat(outputs, dim=0)
+        return result
 
     def _forward_swa(
         self,
@@ -2266,6 +2352,10 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: ForwardBatch,
         attn_sink: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1":
+            return self._forward_swa_native(
+                q, layer, forward_batch, attn_sink
+            )
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
@@ -2296,7 +2386,8 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
         _, attn_op = _sparse_attn_ops()
-        out, _ = attn_op(q_arg, **attn_kwargs)
+        _kvqm = attn_kwargs.pop("kv_quant_mode", 1)
+        out, _ret = attn_op(q_arg, _kvqm, **attn_kwargs)
         return out
 
     def _forward_compressed(
@@ -2307,6 +2398,10 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor],
         compress_ratio: int,
     ) -> torch.Tensor:
+        if os.environ.get("SGLANG_DSV4_NATIVE_ATTN", "0") == "1":
+            return self._forward_compressed_native(
+                q, layer, forward_batch, attn_sink, compress_ratio
+            )
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         if compress_ratio == 1:
@@ -2376,10 +2471,9 @@ class DeepseekV4AscendAttnBackend(
         else:
             attn_kwargs["cmp_sparse_indices"] = None
         q_arg = attn_kwargs.pop("q")
+        _kvqm = attn_kwargs.pop("kv_quant_mode")
         _, attn_op = _sparse_attn_ops()
-
-
-        out, _ = attn_op(q_arg, **attn_kwargs)
+        out, _ = attn_op(q_arg, _kvqm, **attn_kwargs)
         return out
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
@@ -2545,13 +2639,10 @@ class DeepseekV4AscendAttnBackend(
         pos = positions.to(torch.int64)
         fm = self.forward_metadata
         if layer.compressor is not None:
-            if is_npu_arch35():
-                self._low_ratio_compress_torch(layer, x, req, pos, fm, forward_batch)
+            if forward_batch.forward_mode.is_decode():
+                self._low_ratio_compress_decode(layer, x, req, pos, forward_batch)
             else:
-                if forward_batch.forward_mode.is_decode():
-                    self._low_ratio_compress_decode(layer, x, req, pos, forward_batch)
-                else:
-                    self._low_ratio_compress_torch(layer, x, req, pos, fm, forward_batch)
+                self._low_ratio_compress_torch(layer, x, req, pos, fm, forward_batch)
         if layer.indexer is not None:
             if is_npu_arch35():
                 self._low_ratio_index_topk_torch_a5(layer, x, q_lora, req, pos, fm)
@@ -2573,6 +2664,27 @@ class DeepseekV4AscendAttnBackend(
             group_pos = pos
             pooled = kv
         else:
+            use_triton = (
+                os.environ.get("SGLANG_COMPRESSOR_PREFILL_USE_TRITON", "0") == "1"
+            )
+            if use_triton:
+                pooled, compacted_out_loc, compacted_group_pos = (
+                    low_ratio_compress_triton(
+                        kv,
+                        score,
+                        pos,
+                        req,
+                        out_loc,
+                        pool.c2_pair_kv_state[layer.layer_id],
+                        pool.c2_pair_score_state[layer.layer_id],
+                    )
+                )
+                if pooled.shape[0] == 0:
+                    return
+                self._low_ratio_write_group(
+                    layer, pooled, compacted_out_loc, compacted_group_pos
+                )
+                return
             odd = pos % 2 == 1
             is_pad = forward_batch.out_cache_loc == 0
             req_safe = torch.where(
@@ -2603,12 +2715,7 @@ class DeepseekV4AscendAttnBackend(
             )
         if not bool(group_mask.any()):
             return
-        if is_npu_arch35():
-            self._low_ratio_write_group_a5(
-                layer, pooled, out_loc[group_mask], group_pos, forward_batch
-            )
-        else:
-            self._low_ratio_write_group(layer, pooled, out_loc[group_mask], group_pos)
+        self._low_ratio_write_group(layer, pooled, out_loc[group_mask], group_pos)
 
     def _low_ratio_write_group_a5(self, layer, pooled, slots, group_pos, forward_batch):
         """Pre-RoPE latent publishes indexer keys first, then rope + store.
@@ -2657,6 +2764,47 @@ class DeepseekV4AscendAttnBackend(
         ratio = layer.compress_ratio
         kv, score = layer.compressor.project(x)
         out_loc_raw = forward_batch.out_cache_loc.to(torch.int64)
+
+        use_triton = (
+            os.environ.get("SGLANG_COMPRESSOR_DECODE_USE_TRITON", "0") == "1"
+        )
+        if use_triton:
+            if ratio == 1:
+                out_loc = out_loc_raw
+                raw_out_loc = None
+                pair_kv_state = None
+                pair_score_state = None
+                pad_row = 0
+            else:
+                completes = pos % 2 == 1
+                out_loc = torch.where(
+                    completes,
+                    out_loc_raw // 2,
+                    torch.full_like(out_loc_raw, -1),
+                )
+                raw_out_loc = forward_batch.out_cache_loc
+                pair_kv_state = pool.c2_pair_kv_state[layer.layer_id]
+                pair_score_state = pool.c2_pair_score_state[layer.layer_id]
+                pad_row = pool.c2_pair_pad_row
+            latent, group_pos, slots = low_ratio_compress_decode(
+                kv,
+                score,
+                req,
+                pos,
+                out_loc,
+                layer.compressor.norm.weight,
+                layer.compressor.norm.eps,
+                ratio=ratio,
+                raw_out_loc=raw_out_loc,
+                pair_kv_state=pair_kv_state,
+                pair_score_state=pair_score_state,
+                pad_row=pad_row,
+            )
+            self._low_ratio_write_group(
+                layer, latent, slots, group_pos
+            )
+            return
+
         if ratio == 1:
             pooled, group_pos = kv, pos
             out_loc = out_loc_raw
@@ -2833,24 +2981,10 @@ class DeepseekV4AscendAttnBackend(
             slots_j = (
                 self.req_to_token[r, j * ratio].to(torch.int64) // ratio
             )
-            # NPU stores indexer K in PA_ND buffer (bf16 or fp8 on A5).
-            # NPU does not support indexing on FP8, so view as uint8 first.
-            compress_ratio = layer.compress_ratio
-            indexer_pool = pool._indexer_pool(compress_ratio)
-            if hasattr(indexer_pool, "index_k_buffer"):
-                source = pool.latent_source_layer(layer.layer_id)
-                source_slot = pool.low_ratio_sources[compress_ratio].index(source)
-                buf = indexer_pool.get_index_k(source_slot)
-                d = buf.shape[-1]
-                if buf.dtype == torch.float8_e4m3fn:
-                    gathered = buf.view(torch.uint8).reshape(-1, d)[slots_j]
-                    index_k = gathered.view(torch.float8_e4m3fn).to(torch.bfloat16)
-                else:
-                    index_k = buf.reshape(-1, d)[slots_j].to(torch.bfloat16)
-            else:
-                index_k = pool.get_low_ratio_index_k_dequant(
-                    layer.layer_id, slots_j
-                )
+            # Dequantize indexer K (handles FP8+scale on A5, int8+scale on older NPUs).
+            index_k = pool.get_low_ratio_index_k_dequant(
+                layer.layer_id, slots_j
+            )
             k = min(topk, lc)
             idx, reach, masks = topk_from_scores(
                 indexer.scores(q[tok], index_k, weights[tok]),

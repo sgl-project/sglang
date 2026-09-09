@@ -13,6 +13,11 @@ from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
 
+from sglang.srt.utils import is_npu
+
+if is_npu():
+    from sglang.kernels.ops.speculative.ngram_embedding_triton import update_token_table
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
