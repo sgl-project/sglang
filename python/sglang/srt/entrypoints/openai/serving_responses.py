@@ -300,6 +300,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "cannot be forced."
             )
 
+        tool_choice = request.effective_tool_choice()
+        if isinstance(tool_choice, dict) and not any(
+            tool.type in ("function", "custom") and tool.name == tool_choice["name"]
+            for tool in request.tools or []
+        ):
+            return self.create_error_response(
+                f"Tool {tool_choice['name']!r} is not declared in tools",
+                param="tool_choice",
+            )
+
         # harmony emits raw tokens; per-token logprobs aren't wired there.
         if self.use_harmony and request.is_include_output_logprobs():
             return self.create_error_response(
@@ -956,7 +966,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
             )
 
-        is_required = request.tool_choice == "required"
+        tool_choice = request.effective_tool_choice()
+        is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         custom_names = custom_tool_names(request.tools)
         tool_call_items: list[
             Union[ResponseFunctionToolCall, ResponseCustomToolCall]
@@ -2076,7 +2087,8 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
-        is_required = request.tool_choice == "required"
+        tool_choice = request.effective_tool_choice()
+        is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False

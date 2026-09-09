@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import Mock
 
@@ -120,6 +121,54 @@ class CustomToolShimTestCase(CustomTestCase):
         self.assertEqual(item.name, "emit_command")
         self.assertEqual(item.input, "pwd")
         self.assertTrue(item.call_id)
+
+    def test_named_choice_parses_json_in_full_and_stream_responses(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+        for tool_type in ("function", "custom"):
+            for nested in (False, True):
+                with self.subTest(tool_type=tool_type, nested=nested):
+                    name = "emit_command"
+                    choice = {"type": tool_type}
+                    choice.update(
+                        {"function": {"name": name}} if nested else {"name": name}
+                    )
+                    request = _custom_request(
+                        tools=[{"type": tool_type, "name": name}],
+                        tool_choice=choice,
+                        stream=True,
+                    )
+                    raw = '[{"name":"emit_command","parameters":{"input":"pwd"}}]'
+                    (item,) = serving._make_response_output_items(
+                        request, raw, tokenizer=Mock(), require_reasoning=False
+                    )
+                    self.assertEqual(
+                        item.type,
+                        f"{tool_type}_tool_call"
+                        if tool_type == "custom"
+                        else "function_call",
+                    )
+                    events = StreamFixture(serving, request).run(
+                        [engine_chunk(raw[:30]), engine_chunk(raw, 2, finish=True)]
+                    )
+                    (stream_item,) = find_completed_event(events)["response"]["output"]
+                    self.assertEqual(stream_item["type"], item.type)
+                    self.assertEqual(stream_item["name"], name)
+                    field = "input" if tool_type == "custom" else "arguments"
+                    self.assertEqual(stream_item[field], getattr(item, field))
+                    self.assertNotIn("response.output_text.delta", event_types(events))
+
+    def test_named_choice_rejects_an_undeclared_tool_before_generation(self):
+        serving = make_serving()
+        for stream in (False, True):
+            request = _custom_request(
+                tool_choice={"type": "custom", "name": "missing"}, stream=stream
+            )
+            result = asyncio.run(serving.create_responses(request))
+            self.assertEqual(result.status_code, 400)
+            self.assertIn(b"tool_choice", result.body)
+        serving.tokenizer_manager.generate_request.assert_not_called()
 
     def test_function_tools_still_report_json_arguments(self):
         serving = make_serving()
