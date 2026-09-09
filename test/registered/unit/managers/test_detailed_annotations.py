@@ -152,7 +152,7 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
         )
         self.assertEqual(
             self._name(fb),
-            "step[TARGET_VERIFY bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30]",
+            "step[VERIFY bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30]",
         )
 
     def test_target_verify_without_cpu_mirror_falls_back_to_base(self):
@@ -162,7 +162,16 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
             seq_lens_cpu=None,
             num_tokens_per_req=3,
         )
-        self.assertEqual(self._name(fb), "step[TARGET_VERIFY bs=2]")
+        self.assertEqual(self._name(fb), "step[VERIFY bs=2]")
+
+    def test_draft_worker_prefixes_stage(self):
+        # A draft runner can run under TARGET_VERIFY; its span must read as
+        # the draft's, not the target's.
+        fb = _fb(ForwardMode.TARGET_VERIFY, batch_size=2)
+        self.assertEqual(
+            build_step_span_name(fb, detailed_annotations=False, is_draft_worker=True),
+            "step[DRAFT bs=2]",
+        )
 
     def test_draft_extend_v2_uses_extend_mirrors_with_context_prefix(self):
         # EAGLE/MTP draft-extend is extend-shaped
