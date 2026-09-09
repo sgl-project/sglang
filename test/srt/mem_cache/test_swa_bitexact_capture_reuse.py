@@ -823,9 +823,9 @@ class TestSparseSwaReuseClamp(unittest.TestCase):
 class TestSwaStagingCleanupRobustToRetract(unittest.TestCase):
     """B0-3: decode capture stages (req_pool_idx, B) across many steps; the
     retract/abort path caches with is_insert=False (prepare_for_caching_req and
-    thus _capture_rid never run). cleanup_after_caching_req must still free this
-    request's staging keyed by req.req_pool_idx, else it leaks and can mis-bind a
-    stale window once req_pool_idx is recycled."""
+    thus _capture_rid never run). The cleanup sweep must still free this
+    request's staging keyed by req.kv.req_pool_idx, else it leaks and can mis-bind
+    a stale window once req_pool_idx is recycled."""
 
     def _hp(self):
         hp = _FakeHostPool(win=2, head_dim=4, num_pages=64, layers=2)
@@ -846,8 +846,8 @@ class TestSwaStagingCleanupRobustToRetract(unittest.TestCase):
             _compress_state_pools=[object()] if state_hp is not None else None,
             _indexer_compress_state_pools=None,
         )
-        req = types.SimpleNamespace(req_pool_idx=req_pool_idx)
-        SWAComponent.cleanup_after_caching_req(fake_self, req, is_finished=True)
+        req = types.SimpleNamespace(kv=types.SimpleNamespace(req_pool_idx=req_pool_idx))
+        SWAComponent._release_capture_staging(fake_self, req)
 
     def test_frees_by_req_pool_idx_when_capture_rid_stale(self):
         hp = self._hp()

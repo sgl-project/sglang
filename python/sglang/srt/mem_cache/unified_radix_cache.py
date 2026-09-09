@@ -930,7 +930,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # the recycled device ring. Per-node gates (SWA lock_ref==0, host copy
         # committed) are enforced inside evict_device_on_owner_release; nodes
         # still held by another active request (lock_ref>0) are left intact.
-        swa_comp = self.components.get(ComponentType.SWA)
+        swa_comp = (
+            self.components.get(ComponentType.SWA)
+            if req.last_node is not None
+            else None
+        )
         if swa_comp is not None:
             node = self.tree_core.node_by_id(req.last_node)
             root_node = self.tree_core.root_node

@@ -461,6 +461,8 @@ class SWAComponent(TreeComponent):
         self._unified_positional_swa = False
 
     component_type = ComponentType.SWA
+    # class default: subclassed probes skip __init__ and still read this
+    _strict_bit_exact = False
 
     def _dirty_backup_window(self, node: UnifiedTreeNode) -> list[UnifiedTreeNode]:
         if not self.tree_core.has_swa_host_pool:
@@ -1444,7 +1446,7 @@ class SWAComponent(TreeComponent):
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
-        self._capture_rid = req.req_pool_idx
+        self._capture_rid = req.kv.req_pool_idx
 
         branching_seqlen = req.swa_branching_seqlen
         if branching_seqlen is None or branching_seqlen <= req.kv.cache_protected_len:
@@ -1497,6 +1499,8 @@ class SWAComponent(TreeComponent):
         ):
             forward_key_len = len(req.get_fill_ids()) - int(self.tree_core.is_eagle)
             self._free_out_of_window_slots(req, forward_key_len - 1)
+
+        self._release_capture_staging(req)
 
     # ---- HiCache Hooks ----
 
@@ -1961,9 +1965,10 @@ class SWAComponent(TreeComponent):
         drop it at the next BACKUP_HOST commit. The flag is SWA-specific, so it is
         cleared here rather than in the generic TreeCore setter.
         """
-        node = self.tree_core.node_by_id(node_id)
-        if getattr(node, "_swa_release_pending", False):
-            node._swa_release_pending = False
+        if self._strict_bit_exact:
+            node = self.tree_core.node_by_id(node_id)
+            if getattr(node, "_swa_release_pending", False):
+                node._swa_release_pending = False
         self.tree_core.set_component_device_value(node_id, self.component_type, value)
 
     # ---- Strict bit-exact SWA: capture / bind ----
@@ -2222,23 +2227,21 @@ class SWAComponent(TreeComponent):
         # tiles (pending or durable host) so the state host pools don't leak.
         _free_state_bindings(self, node)
 
-    def cleanup_after_caching_req(
-        self,
-        req: Req,
-        is_finished: bool,
-        insert_result: Optional[InsertResult] = None,
-        insert_params: Optional[InsertParams] = None,
-    ) -> None:
+    def _release_capture_staging(self, req: Req) -> None:
         # Release any capture staging this request owns that no node claimed
         # (interior / out-of-window windows), then drop the stashed rid. Key off
-        # req.req_pool_idx rather than _capture_rid: on the retract/abort path
+        # req.kv.req_pool_idx rather than _capture_rid: on the retract/abort path
         # caching runs with is_insert=False, so prepare_for_caching_req never ran
         # and _capture_rid is unset, while decode capture stages (req_pool_idx, B)
         # across many steps -- those windows would leak here and could later
         # mis-bind to a new request once req_pool_idx is recycled. The two agree on
         # the is_insert=True path. Fall back to the stashed rid only if the slot is
         # already gone.
-        rid = req.req_pool_idx if req.req_pool_idx is not None else self._capture_rid
+        rid = (
+            req.kv.req_pool_idx
+            if req.kv.req_pool_idx is not None
+            else self._capture_rid
+        )
         self._capture_rid = None
         if rid is None:
             return
