@@ -248,8 +248,31 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             or self.swa_available_size() < num_tokens
         ):
             return False
+        if self._token_allocation_byte_shortfall(num_tokens) > 0:
+            return False
         return _relieve_for_alloc(self, num_tokens) and self.token_allocation_ready(
             num_tokens
+        )
+
+    def _token_allocation_byte_shortfall(self, num_tokens: int) -> int:
+        """Minimum bytes that must be freed before layout recovery can succeed.
+
+        Credit every non-live byte, including holes and pending reuse. Only the
+        sink prefix excluded by ALL members is subtracted; alignment and layout
+        restrictions can make less space usable. This optimistic bound may allow
+        an unsuccessful recovery, but cannot skip one that could satisfy demand.
+        """
+        members = self._flush_targets()
+        sink_bytes = min(m.min_page_index * m.entry_bytes_per_page for m in members)
+        live_bytes = sum(m.allocated_count() * m.entry_bytes for m in members)
+        pages = -(-num_tokens // self.page_size)
+        required_bytes = pages * (
+            self.full_attn_allocator.entry_bytes_per_page
+            + self.swa_attn_allocator.entry_bytes_per_page
+        )
+        return max(
+            0,
+            required_bytes + live_bytes + sink_bytes - self.unified_buffer.total_bytes,
         )
 
     # Slot-conservation views for the leak invariant only; the byte-coordinated

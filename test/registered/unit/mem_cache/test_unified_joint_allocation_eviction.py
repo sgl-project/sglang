@@ -39,7 +39,10 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
     def tearDown(self):
         reset_context()
 
-    def build_cache(self, *, occupancy=96, lazy=False, page_size=1):
+    def build_cache(
+        self, *, occupancy=96, lazy=False, page_size=1, ratio=(1, 1), total_bytes=None
+    ):
+        full_layers, swa_layers = ratio
         bundle = init_unified_swa_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
@@ -51,14 +54,15 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             swa_v_head_dim=8,
             page_size=page_size,
             start_layer=0,
-            end_layer=2,
-            swa_attention_layer_ids=[1],
-            full_attention_layer_ids=[0],
+            end_layer=full_layers + swa_layers,
+            swa_attention_layer_ids=list(range(full_layers, full_layers + swa_layers)),
+            full_attention_layer_ids=list(range(full_layers)),
             full_max_total_num_tokens=100 * page_size,
             swa_max_total_num_tokens=100 * page_size,
             enable_memory_saver=False,
             need_sort=False,
             lazy_compaction=lazy,
+            unified_total_bytes=total_bytes,
         )
         allocator = bundle.token_to_kv_pool_allocator
         req_pool = ReqToTokenPool(
@@ -88,6 +92,37 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             )
         return allocator, cache
 
+    def test_byte_shortfall_skips_recovery_until_first_sufficient_eviction(self):
+        for lazy in (False, True):
+            for page_size in (1, 4, 16):
+                with self.subTest(lazy=lazy, page_size=page_size):
+                    allocator, cache = self.build_cache(lazy=lazy, page_size=page_size)
+                    with patch(
+                        "sglang.srt.mem_cache.allocator.unified_hybrid_swa._relieve_for_alloc",
+                        side_effect=AssertionError("recovery cannot create bytes"),
+                    ):
+                        evict_from_tree_cache(cache, 4 * page_size)
+                    self.assertEqual(cache.full_evictable_size(), 95 * page_size)
+                    self.assertIsNotNone(allocator.alloc(4 * page_size))
+                    self.assertFalse(allocator.verify_byte_accounting())
+
+    def test_byte_bound_allows_recovery_from_unequal_peer_holes(self):
+        allocator, cache = self.build_cache(
+            occupancy=0, lazy=True, ratio=(1, 4), total_bytes=256 * 32
+        )
+        slots = allocator.alloc(50)
+        self.assertIsNotNone(slots)
+        # Window retirement preserves live Full bindings. Larger SWA holes can
+        # fund both members after compaction despite the immediate joint limit.
+        allocator.free_swa(slots[:4])
+        self.assertLess(allocator.available_size(), 3)
+        self.assertGreaterEqual(allocator.full_available_size(), 3)
+        self.assertGreaterEqual(allocator.swa_available_size(), 3)
+        evict_from_tree_cache(cache, 3)
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 50)
+        self.assertIsNotNone(allocator.alloc(3))
+        self.assertFalse(allocator.verify_byte_accounting())
+
     def test_joint_shortfall_enters_eviction_when_individual_targets_fit(self):
         for lazy in (False, True):
             with self.subTest(lazy=lazy):
@@ -114,8 +149,18 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
     def test_tri_pool_token_allocation_with_live_state(self):
         for temporal in ((0, 0, 0), (1, 4, 8)):
-            for lazy in (False, True):
-                with self.subTest(temporal=temporal, lazy=lazy):
+            cases = [(False, 96, 3), (True, 96, 3)]
+            if temporal == (0, 0, 0):
+                cases += [
+                    (False, 80, 24),
+                    (True, 80, 24),
+                    (False, 96, 8),
+                    (True, 96, 8),
+                ]
+            for lazy, occupancy, state_count in cases:
+                with self.subTest(
+                    temporal=temporal, lazy=lazy, state_count=state_count
+                ):
                     state_config = SimpleNamespace(
                         shape=SimpleNamespace(conv=[(3, 8)], temporal=temporal),
                         dtype=SimpleNamespace(
@@ -168,11 +213,11 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                             ),
                         )
                     )
-                    slots = allocator.alloc(96)
-                    states = req_pool.mamba_allocator.alloc(3)
+                    slots = allocator.alloc(occupancy)
+                    states = req_pool.mamba_allocator.alloc(state_count)
                     self.assertIsNotNone(slots)
                     self.assertIsNotNone(states)
-                    for i, (lo, hi) in enumerate(((0, 1), (1, 2), (2, 96))):
+                    for i, (lo, hi) in enumerate(((0, 1), (1, 2), (2, occupancy))):
                         cache.insert(
                             InsertParams(
                                 key=RadixKey(
@@ -183,7 +228,23 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                             )
                         )
                     demand = allocator.available_size() + 1
+                    if state_count == 8:
+                        demand += 1
+                    if state_count == 24:
+                        demand = min(
+                            allocator.full_available_size(),
+                            allocator.swa_available_size(),
+                        )
+                        with patch(
+                            "sglang.srt.mem_cache.allocator.unified_hybrid_swa._relieve_for_alloc",
+                            side_effect=AssertionError(
+                                "live state consumes shared bytes"
+                            ),
+                        ):
+                            self.assertFalse(allocator.prepare_token_allocation(demand))
                     evict_from_tree_cache(cache, demand)
+                    if state_count == 8:
+                        self.assertEqual(cache.full_evictable_size(), 95)
                     self.assertTrue(allocator.token_allocation_ready(demand))
                     self.assertIsNotNone(allocator.alloc(demand))
                     self.assertGreaterEqual(allocator.conserve_full_available_size(), 0)
