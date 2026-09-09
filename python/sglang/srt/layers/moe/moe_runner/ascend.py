@@ -19,7 +19,6 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
-    NPUW4A4MXFP4MoEMethod,
     NPUW4A8Int8MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
@@ -155,25 +154,11 @@ class AscendRunnerCore(MoeRunnerCore):
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
         x = runner_input.hidden_states
-        w13_kernel = self.config.layer.w13_kernel
-        # MX routing replaces the input dtype; retain FP16 model outputs.
-        original_dtype = (
-            torch.float16
-            if x.dtype == torch.float16
-            or (
-                (
-                    x.dtype == torch.float8_e4m3fn
-                    or (
-                        x.dtype == torch.uint8
-                        and isinstance(w13_kernel, NPUW4A4MXFP4MoEMethod)
-                    )
-                )
-                and self.config.params_dtype == torch.float16
-            )
-            else torch.bfloat16
-        )
+        original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
+
+        w13_kernel = self.config.layer.w13_kernel
 
         if isinstance(w13_kernel, NPUMXFP8MoEMethod):
             # --- w13 projection + activation, fused into one kernel ---
