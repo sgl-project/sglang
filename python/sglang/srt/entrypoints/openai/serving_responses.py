@@ -201,9 +201,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Message storage for conversation continuity
         # Note: In production, this should use a proper storage backend (Redis, database)
         # with TTL/expiration to prevent memory leaks
-        self.msg_store: dict[
-            str, Union[list[ChatCompletionMessageParam], list[OpenAIMessage]]
-        ] = {}
+        self.msg_store: dict[str, Union[list[dict], list[OpenAIMessage]]] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
@@ -541,7 +539,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Store the input messages
             if request.store:
-                self.msg_store[request.request_id] = messages
+                self.msg_store[request.request_id] = (
+                    messages[2:]
+                    if self.use_harmony
+                    else self._response_input_history(request)
+                )
 
             if request.background and not request.stream:
                 created_time = int(time.time())
@@ -815,6 +817,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                 # If the response is already cancelled, don't update it
                 if stored_response is None or stored_response.status != "cancelled":
                     self.response_store[response.id] = response
+                    if self.use_harmony:
+                        self.msg_store[response.id] = (
+                            self.msg_store.get(response.id, []) + context.messages
+                            if isinstance(context, StreamingHarmonyContext)
+                            else context.messages[2:]
+                        )
+                    else:
+                        self.msg_store[response.id] = self._response_input_history(
+                            request
+                        ) + [
+                            item.model_dump(exclude_none=True)
+                            for item in response.output
+                        ]
 
         return response
 
@@ -1296,33 +1311,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         }
 
     @staticmethod
-    def _output_message_text(output_item: Any) -> Optional[str]:
-        """Return assistant text from a ``message`` output item (joining
-        ``output_text`` parts with newlines), or None for non-message items."""
-        if isinstance(output_item, ResponseReasoningItem):
-            return None
-        if hasattr(output_item, "model_dump"):
-            output_item = output_item.model_dump(exclude_none=True)
-        if not isinstance(output_item, dict):
-            return None
-        if output_item.get("type") != "message":
-            return None
-
-        text_parts = []
-        for content in output_item.get("content") or []:
-            if isinstance(content, ResponseOutputText):
-                text_parts.append(content.text)
-                continue
-            if hasattr(content, "model_dump"):
-                content = content.model_dump(exclude_none=True)
-            if isinstance(content, dict) and content.get("type") == "output_text":
-                text = content.get("text")
-                if text is not None:
-                    text_parts.append(text)
-
-        return "\n".join(text_parts) if text_parts else None
-
-    @staticmethod
     def _merge_consecutive_assistant_messages(
         messages: list,
     ) -> list:
@@ -1377,6 +1365,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             merged.append(msg)
         return merged
 
+    def _response_input_history(self, request: ResponsesRequest) -> list:
+        history = (
+            list(self.msg_store[request.previous_response_id])
+            if request.previous_response_id is not None
+            else []
+        )
+        if isinstance(request.input, str):
+            history.append({"role": "user", "content": request.input})
+        else:
+            history.extend(request.input)
+        return history
+
     def _construct_input_messages(
         self,
         request: ResponsesRequest,
@@ -1391,27 +1391,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 }
             )
 
-        # Prepend the conversation history
-        if prev_response is not None:
-            # Add the previous messages
-            prev_msg = self.msg_store[prev_response.id]
-            messages.extend(prev_msg)
-
-            for output_item in prev_response.output:
-                assistant_text = self._output_message_text(output_item)
-                if assistant_text is None:
-                    continue
-                messages.append({"role": "assistant", "content": assistant_text})
-
-        # Append the new input
-        # Responses API supports simple text inputs without chat format
-        if isinstance(request.input, str):
-            messages.append({"role": "user", "content": request.input})
-        else:
-            for input_item in request.input:
-                normalized = self._normalize_response_message_for_chat(input_item)
-                if normalized is not None:
-                    messages.append(normalized)  # type: ignore
+        for input_item in self._response_input_history(request):
+            normalized = self._normalize_response_message_for_chat(input_item)
+            if normalized is not None:
+                messages.append(normalized)
 
         # One Responses-API assistant turn maps to multiple input items
         # (message + function_call(s)); collapse them into one chat message
@@ -1447,59 +1430,33 @@ class OpenAIServingResponses(OpenAIServingChat):
         prev_response: Optional[ResponsesResponse],
     ) -> list[OpenAIMessage]:
         messages: list[OpenAIMessage] = []
-        if prev_response is None:
-            # New conversation.
-            reasoning_effort = request.reasoning.effort if request.reasoning else None
-            tool_types = [tool.type for tool in request.tools]
-            enable_browser = (
-                any(t in tool_types for t in ("web_search", "web_search_preview"))
-                and self.tool_server is not None
-            )
-            enable_code_interpreter = (
-                "code_interpreter" in tool_types and self.tool_server is not None
-            )
-            sys_msg = get_system_message(
-                reasoning_effort=reasoning_effort,
-                browser_description=(
-                    self.tool_server.get_tool_description("browser")
-                    if self.tool_server and enable_browser
-                    else None
-                ),
-                python_description=(
-                    self.tool_server.get_tool_description("python")
-                    if self.tool_server and enable_code_interpreter
-                    else None
-                ),
-            )
-            messages.append(sys_msg)
-            dev_msg = get_developer_message(request.instructions, request.tools)
-            messages.append(dev_msg)
-        else:
-            # Continue the previous conversation.
-            # FIXME: Currently, request params like reasoning and
-            # instructions are ignored.
-            prev_msgs = self.msg_store[prev_response.id]
-            # Remove the previous chain-of-thoughts if there is a new "final"
-            # message.
-            if (
-                len(prev_msgs) > 0
-                and hasattr(prev_msgs[-1], "channel")
-                and prev_msgs[-1].channel == "final"
-            ):  # type: ignore[union-attr]
-                prev_final_msg_idx = -1
-                for i in range(len(prev_msgs) - 2, -1, -1):
-                    if (
-                        hasattr(prev_msgs[i], "channel")
-                        and prev_msgs[i].channel == "final"
-                    ):  # type: ignore[union-attr]
-                        prev_final_msg_idx = i
-                        break
-                recent_turn_msgs = prev_msgs[prev_final_msg_idx + 1 :]
-                del prev_msgs[prev_final_msg_idx + 1 :]
-                for msg in recent_turn_msgs:
-                    if hasattr(msg, "channel") and msg.channel != "analysis":  # type: ignore[union-attr]
-                        prev_msgs.append(msg)
-            messages.extend(prev_msgs)
+        reasoning_effort = request.reasoning.effort if request.reasoning else None
+        tool_types = [tool.type for tool in request.tools]
+        enable_browser = (
+            any(t in tool_types for t in ("web_search", "web_search_preview"))
+            and self.tool_server is not None
+        )
+        enable_code_interpreter = (
+            "code_interpreter" in tool_types and self.tool_server is not None
+        )
+        sys_msg = get_system_message(
+            reasoning_effort=reasoning_effort,
+            browser_description=(
+                self.tool_server.get_tool_description("browser")
+                if self.tool_server and enable_browser
+                else None
+            ),
+            python_description=(
+                self.tool_server.get_tool_description("python")
+                if self.tool_server and enable_code_interpreter
+                else None
+            ),
+        )
+        messages.append(sys_msg)
+        dev_msg = get_developer_message(request.instructions, request.tools)
+        messages.append(dev_msg)
+        if prev_response is not None:
+            messages.extend(self.msg_store[prev_response.id])
         # Append the new input.
         # Responses API supports simple text inputs without chat format.
         if isinstance(request.input, str):
@@ -2748,6 +2705,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stored = self.response_store.get(final_response.id)
                 if stored is None or stored.status != "cancelled":
                     self.response_store[final_response.id] = final_response
+                    self.msg_store[final_response.id] = self._response_input_history(
+                        request
+                    ) + [
+                        item.model_dump(exclude_none=True)
+                        for item in final_response.output
+                    ]
 
         response_dict = _sanitize_response_dict(final_response.model_dump())
 

@@ -8,7 +8,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from utils import make_serving
+from utils import StreamFixture, engine_chunk, make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
@@ -63,7 +63,10 @@ class InputMessageConstructionTestCase(CustomTestCase):
                 type="message",
             ),
         ]
-        serving.msg_store["resp_prev"] = [{"role": "user", "content": "old input"}]
+        serving.msg_store["resp_prev"] = [
+            {"role": "user", "content": "old input"},
+            *[item.model_dump(exclude_none=True) for item in prev_response.output],
+        ]
 
         request = ResponsesRequest(
             model="x",
@@ -82,11 +85,113 @@ class InputMessageConstructionTestCase(CustomTestCase):
                 {"role": "user", "content": "old input"},
                 {
                     "role": "assistant",
-                    "content": "first answer part\nsecond answer part",
+                    "content": [
+                        {"type": "text", "text": "first answer part"},
+                        {"type": "text", "text": "second answer part"},
+                    ],
                 },
                 {"role": "user", "content": "new input"},
             ],
         )
+
+    def test_stored_tool_turn_matches_client_replay_without_old_instructions(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                serving = make_serving()
+                serving.reasoning_parser = "deepseek-r1"
+                serving.tool_call_parser = None
+                request = ResponsesRequest(
+                    model="x",
+                    input="old input",
+                    instructions="OLD INSTRUCTION",
+                    tools=[{"type": "function", "name": "lookup"}],
+                    tool_choice="required",
+                    store=True,
+                    stream=stream,
+                )
+                chunk = engine_chunk(
+                    '<think>secret plan</think>[{"name":"lookup","parameters":{}}]',
+                    finish=True,
+                )
+                if stream:
+                    StreamFixture(serving, request).run([chunk])
+                    response = serving.response_store[request.request_id]
+                else:
+                    context = SimpleContext()
+                    context.append_output(chunk)
+
+                    async def empty():
+                        if False:
+                            yield
+
+                    response = asyncio.run(
+                        serving.responses_full_generator(
+                            request,
+                            {},
+                            empty(),
+                            context,
+                            "x",
+                            Mock(),
+                            RequestResponseMetadata(request_id=request.request_id),
+                            require_reasoning=False,
+                        )
+                    )
+                call = next(
+                    item for item in response.output if item.type == "function_call"
+                )
+                result = {
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": "answer 42",
+                }
+                for instructions in ("NEW INSTRUCTION", None):
+                    followup = ResponsesRequest(
+                        model="x",
+                        previous_response_id=response.id,
+                        input=[result],
+                        instructions=instructions,
+                        store=False,
+                    )
+                    explicit = ResponsesRequest(
+                        model="x",
+                        input=[{"role": "user", "content": "old input"}]
+                        + [item.model_dump() for item in response.output]
+                        + [result],
+                        instructions=instructions,
+                        store=False,
+                    )
+                    messages = serving._construct_input_messages(followup, response)
+                    self.assertEqual(
+                        messages, serving._construct_input_messages(explicit)
+                    )
+                    self.assertNotIn("OLD INSTRUCTION", str(messages))
+                    self.assertIn("secret plan", str(messages))
+                    self.assertIn(call.call_id, str(messages))
+                self.assertEqual(
+                    [item["type"] for item in serving.msg_store[response.id][1:]],
+                    ["reasoning", "function_call"],
+                )
+
+    def test_harmony_instructions_are_rebuilt_for_each_request(self):
+        serving = make_serving()
+        serving.use_harmony = True
+        previous = Mock(id="resp_previous", output=[])
+        first = ResponsesRequest(
+            model="x", input="old input", instructions="OLD INSTRUCTION"
+        )
+        messages = serving._construct_input_messages_with_harmony(first, None)
+        serving.msg_store[previous.id] = messages[2:]
+        for instructions in ("NEW INSTRUCTION", None):
+            request = ResponsesRequest(
+                model="x",
+                input="next",
+                instructions=instructions,
+                previous_response_id=previous.id,
+            )
+            actual = serving._construct_input_messages_with_harmony(request, previous)
+            expected = serving._construct_input_messages_with_harmony(request, None)
+            self.assertEqual(actual[:2], expected[:2])
+            self.assertEqual(actual[2:], messages[2:] + expected[2:])
 
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
