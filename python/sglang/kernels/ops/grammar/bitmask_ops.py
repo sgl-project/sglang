@@ -114,9 +114,9 @@ def apply_token_bitmask_inplace_triton(
         indices = torch.tensor(indices, dtype=torch.int32, device=logits.device)
         num_rows = indices.shape[0]
     else:
-        assert (
-            logits_shape[0] == bitmask_shape[0]
-        ), f"batch size mismatch: logits {logits_shape[0]} vs bitmask {bitmask_shape[0]}"
+        assert logits_shape[0] == bitmask_shape[0], (
+            f"batch size mismatch: logits {logits_shape[0]} vs bitmask {bitmask_shape[0]}"
+        )
         num_rows = logits_shape[0]
 
     if NUM_SMS > 0:
