@@ -536,9 +536,9 @@ def forward_dsa_core_npu(
             torch.bmm(
                 attn_output,
                 m.w_vc,
-                out=attn_bmm_output.view(
-                    -1, m.num_local_heads, m.v_head_dim
-                ).transpose(0, 1),
+                out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
+                    0, 1
+                ),
             )
     else:
         attn_output = attn_output.contiguous()
