@@ -10,13 +10,17 @@ import triton.language as tl
 
 _BLOCK_SIZE = 1024
 
-# Safety valve for the top-p pivot search. Measured over a 152K vocabulary the
-# search converges in about 20 rounds, and it also stops on its own as soon as a
-# round fails to move either bound, so this cap is only reached if a device rounds
-# the interior points in a way that neither of those two tests catches. Stopping
-# early leaves a valid lower bound for the pivot, which keeps a superset of the
-# nucleus rather than producing a wrong answer.
-_TOP_P_SEARCH_ITERS = 64
+
+@triton.jit
+def _next_float_up(x):
+    """Smallest float strictly greater than a non-negative ``x``.
+
+    For non-negative finite floats the IEEE-754 bit pattern read as a signed
+    integer is monotonic in the value, so incrementing it steps to the adjacent
+    representable float. Probabilities are non-negative, so this is all the top-p
+    search needs from a ``nextafter`` toward ``+inf``.
+    """
+    return (x.to(tl.int32, bitcast=True) + 1).to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -66,7 +70,6 @@ def _top_p_renorm_kernel(
     out_ptr,
     vocab_size: tl.constexpr,
     num_chunks: tl.constexpr,
-    MAX_ITERS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Find each row's top-p pivot by value, then threshold and renormalize it.
@@ -99,10 +102,14 @@ def _top_p_renorm_kernel(
     # no-op on a peaked row, whose leading terms round up to one on their own.
     target = p * row_sum
 
+    # Loop invariant: f(low) >= target and f(high) < target, where
+    # f(x) = sum(probs[probs > x]). min_gt_low and max_le_high are the smallest and
+    # largest values of the row still inside the bracket, so the search stops once
+    # they are the same value or two adjacent floats -- at that point no
+    # representable pivot is left to test.
     low = 0.0
     high = max_val
     kept_sum = row_sum
-    iters = 0
     # p >= 1 keeps the whole row, so the bracket never has to move: low stays at 0
     # and the row is simply rescaled by its own sum.
     searching = tl.where(p < 1.0, 1, 0)
@@ -152,18 +159,17 @@ def _top_p_renorm_kernel(
             sum_gt_pivot_high,
             tl.where(take_low, sum_gt_pivot_low, kept_sum),
         )
-        # A round that moves neither bound cannot make progress in any later round
-        # either: it means the interior points have rounded onto the bounds
-        # themselves, which happens once the surviving values are within a few ULPs
-        # of each other. Without this the loop would spin on such rows.
-        progressed = (next_low > low) | (next_high < high)
         low = next_low
         high = next_high
 
-        iters += 1
-        # Done once no value of the row is left strictly inside the bracket.
+        # Done once no representable float separates the two surviving values. The
+        # adjacency test is what keeps the loop finite: once the interior points
+        # round onto the bounds themselves the bracket can no longer shrink, and
+        # testing only ``min_gt_low < max_le_high`` would spin forever.
         searching = tl.where(
-            (min_gt_low < max_le_high) & progressed & (iters < MAX_ITERS), 1, 0
+            (min_gt_low < max_le_high) & (_next_float_up(min_gt_low) < max_le_high),
+            1,
+            0,
         )
 
     denominator = tl.maximum(kept_sum, 1e-8)
@@ -253,7 +259,6 @@ def top_p_renorm_probs_triton(
         out,
         vocab_size=vocab_size,
         num_chunks=triton.cdiv(vocab_size, _BLOCK_SIZE),
-        MAX_ITERS=_TOP_P_SEARCH_ITERS,
         BLOCK_SIZE=_BLOCK_SIZE,
         num_warps=8,
     )
