@@ -230,6 +230,16 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
     },
     {
+      name: "Cosmos-Dreams (Cosmos3-Interactive)",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Bimanual"],
+      note: "Causal action-conditioned Cosmos3; local checkpoints are also detected by the CosmosDreamsPipeline class name.",
+    },
+    {
+      name: "Cosmos-Dreams-Transfer",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Transfer"],
+      note: "Causal control-video (edge/blur/depth/seg) Cosmos3; local checkpoints are also detected by the CosmosDreamsTransferPipeline class name.",
+    },
+    {
       name: "LingBotWorld",
       modelIds: [
         "IPostYellow/lingbot-world-fast-diffusers",
