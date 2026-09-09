@@ -728,7 +728,9 @@ def test_a_greedy_row_reports_a_point_mass_on_the_token_it_committed():
     torch.testing.assert_close(q.sum(-1), torch.ones(1, 3))
     assert torch.equal(q.max(-1).values, torch.ones(1, 3))
     committed = q.argmax(-1)
-    assert torch.equal(torch.gather(tokens, 2, committed.unsqueeze(-1)).squeeze(-1), picked)
+    assert torch.equal(
+        torch.gather(tokens, 2, committed.unsqueeze(-1)).squeeze(-1), picked
+    )
 
 
 def test_the_proposal_is_a_distribution_over_that_slots_candidates():
