@@ -11,6 +11,7 @@ end to end attention solution with aiter kernels
 """
 
 import logging
+import math
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
@@ -75,10 +76,7 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
-from sglang.kernels.ops.attention.dcp_kernels import (
-    _LOG2E,
-    build_dcp_block_table,
-)
+from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
@@ -166,11 +164,19 @@ class ForwardMetadata:
     dcp_local_kv_lens: Optional[torch.Tensor] = None
     # Per-ROW token table for the DCP verify stage A: the window is flattened to
     # one row per query token and rows of a request repeat its shard, which
-    # mla_gluon reads through its 2-D view. See build_dcp_block_table.
+    # mla_gluon reads through its 2-D view. See _build_dcp_verify_token_table.
     dcp_verify_token_table: Optional[torch.Tensor] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
+
+# Natural-log -> base-2 rebase for the DCP LSE merges. mla_gluon returns a
+# natural-log LSE while is_mla_dcp_lse_base_on_e() reports base-2 for aiter.
+_LOG2E = math.log2(math.e)
+
+# Token columns one program of create_mla_kv_page_table_for_dcp covers when it
+# builds the DCP verify table (its PAGES_PER_BLOCK at PHYSICAL_PAGE_SIZE=1).
+_DCP_VERIFY_TABLE_COLS_PER_BLOCK = 128
 
 
 # AITER's gfx950 FP8 FMHA ASM kernels only cover these GQA ratios. Other
@@ -1669,7 +1675,7 @@ class AiterAttnBackend(AttentionBackend):
                         dcp_local_kv_lens,
                     ) = self._build_dcp_verify_token_table(
                         kv_indptr,
-                        kv_indices,
+                        forward_batch.req_pool_indices,
                         bs,
                         draft_num,
                         (max_kv_len + self.dcp_world_size - 1) // self.dcp_world_size,
@@ -1988,7 +1994,7 @@ class AiterAttnBackend(AttentionBackend):
     def _build_dcp_verify_token_table(
         self,
         kv_indptr: torch.Tensor,
-        kv_indices: torch.Tensor,
+        req_pool_indices: torch.Tensor,
         bs: int,
         q_len: int,
         max_local_kv_len: int,
@@ -1998,16 +2004,63 @@ class AiterAttnBackend(AttentionBackend):
         """Per-ROW token table + shard lengths for the DCP verify stage A.
 
         Stage A flattens the window into ``bs * q_len`` single-token rows (see
-        _mla_verify_fwd_dcp). Rows of one request share its shard, so the
-        per-request table just repeats ``q_len`` times, once per forward. One
-        column per TOKEN, because mla_gluon fixes PAGE_SIZE at 1.
+        _mla_verify_fwd_dcp). Rows of one request share its shard, so the table
+        is produced once per request and broadcast to that request's other rows,
+        once per forward.
+
+        The producer is the shared ``create_mla_kv_page_table_for_dcp``, the same
+        one trtllm_mla's DCP decode uses. At ``PHYSICAL_PAGE_SIZE=1`` its cyclic
+        gather (``rank + j * W``), its ``// W`` collapse and its v2p hop are
+        exactly the selection, translation and scatter this path needs, so it
+        reads ``req_to_token`` directly and writes the caller's buffer with no
+        ragged intermediate. One column per TOKEN, because mla_gluon fixes
+        PAGE_SIZE at 1.
+
+        Tail columns past a row's shard are left as they are (the kernel masks
+        its stores) and never read: mla_gluon bounds each row by its own
+        ``cache_seqlens``, which is ``out_lens``.
         """
-        per_req = build_dcp_block_table(kv_indptr, kv_indices, bs, max_local_kv_len)
         local_kv_lens = self._build_dcp_local_kv_lens(kv_indptr, bs)
         n_rows = bs * q_len
         if out is None:
-            out = per_req.new_empty((n_rows, per_req.shape[1]))
-        out.view(bs, q_len, -1).copy_(per_req.unsqueeze(1).expand(bs, q_len, -1))
+            # Quantize the eager width: the row stride below is a Triton
+            # constexpr, so every distinct value costs a JIT specialization.
+            # trtllm_mla pads its own DCP table for the same reason.
+            out = local_kv_lens.new_empty(
+                (
+                    n_rows,
+                    triton.cdiv(max_local_kv_len, _DCP_VERIFY_TABLE_COLS_PER_BLOCK)
+                    * _DCP_VERIFY_TABLE_COLS_PER_BLOCK,
+                )
+            )
+        num_cols = out.shape[1]
+
+        # Write each request's row 0 in place: the row stride handed to the
+        # kernel spans that request's whole q_len-row block.
+        translator = self.kv_index_translator
+        v2p = translator.full_v2p_table
+        create_mla_kv_page_table_for_dcp[
+            (bs, triton.cdiv(num_cols, _DCP_VERIFY_TABLE_COLS_PER_BLOCK))
+        ](
+            self.req_to_token,
+            req_pool_indices,
+            local_kv_lens,
+            out,
+            v2p,
+            self.req_to_token.stride(0),
+            q_len * num_cols,
+            translator.full_page_multiplier,
+            PHYSICAL_PAGE_SIZE=1,
+            DCP_SIZE=self.dcp_world_size,
+            DCP_RANK=get_parallel().attn_dcp_rank,
+            PAGES_PER_BLOCK=_DCP_VERIFY_TABLE_COLS_PER_BLOCK,
+            HAS_V2P=v2p is not None,
+        )
+        rows = out.view(bs, q_len, num_cols)
+        if q_len > 1:
+            # Source is row 0, destination rows 1.., so the copy never overlaps.
+            rows[:, 1:, :].copy_(rows[:, :1, :].expand(bs, q_len - 1, num_cols))
+
         if out_lens is None:
             out_lens = local_kv_lens.new_empty((n_rows,))
         out_lens.view(bs, q_len).copy_(local_kv_lens.unsqueeze(1).expand(bs, q_len))
@@ -2414,7 +2467,7 @@ class AiterAttnBackend(AttentionBackend):
                     dcp_local_kv_lens,
                 ) = self._build_dcp_verify_token_table(
                     kv_indptr,
-                    kv_indices,
+                    req_pool_indices,
                     bs,
                     self.num_draft_tokens,
                     self._dcp_graph_max_local_kv_len(),
