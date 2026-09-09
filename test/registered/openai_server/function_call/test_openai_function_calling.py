@@ -5,7 +5,11 @@ import openai
 
 from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_cuda_ci, register_npu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_npu_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -16,6 +20,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=73, suite="stage-b-test-1-gpu-small-amd")
 # Backend-specific: Ascend uses a local model mirror and its native
 # attention backend, while sharing the protocol assertions below.
 register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
