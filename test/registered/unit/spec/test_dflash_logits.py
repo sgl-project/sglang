@@ -271,6 +271,39 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     assert worker.draft_model.lm_head is None
 
 
+def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(monkeypatch):
+    """The sampled LiLiCorr commit rides the selector's accept path, which needs
+    ``chain_speculative_sampling_triton`` and so is unavailable on NPU. Requesting it
+    there has to fall through to the warning and the argmax verify; returning early as
+    though it were supported would publish a proposal the accept path cannot consume."""
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    warnings = []
+    monkeypatch.setattr(
+        worker_mod.logger, "warning", lambda *args: warnings.append(args)
+    )
+    monkeypatch.setattr(
+        worker_mod, "is_dflash_sampling_verify_available", lambda: False
+    )
+    worker = SimpleNamespace(
+        selector=None,
+        lilicorr=object(),
+        _lilicorr_sampling_enabled=False,
+        _warned_sampling_fallback=False,
+        ps=SimpleNamespace(tp_rank=0),
+    )
+    batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
+
+    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
+    assert worker._warned_sampling_fallback
+    assert len(warnings) == 1
+
+    worker._lilicorr_sampling_enabled = True
+    worker._warned_sampling_fallback = False
+    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
+    assert len(warnings) == 1
+
+
 def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch):
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 

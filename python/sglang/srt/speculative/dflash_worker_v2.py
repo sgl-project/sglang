@@ -344,6 +344,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
+        # The sampled LiLiCorr commit rides the selector's accept path, so it is
+        # available exactly where that path is. Requesting it elsewhere falls back to
+        # the argmax commit and the existing verify, with the warning below.
+        self._lilicorr_sampling_enabled = (
+            _LILICORR_SAMPLING_ENABLED and self._selector_sampling_enabled
+        )
         # Set by LiLiCorrDraftModel, None on every other DFLASH draft.
         self.lilicorr = self.draft_model.lilicorr
         self._lilicorr_anchor: Optional[torch.Tensor] = None
@@ -679,6 +685,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("quantized lm_head")
         if self.lilicorr is not None:
             return build_lilicorr_draft_sampler(
+                sampling_enabled=self._lilicorr_sampling_enabled,
                 head=self.lilicorr,
                 draft_model=self.draft_model,
                 embed_tokens=target_input_embeddings(target_model),
@@ -1898,7 +1905,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # is correct: the argmax draft is still verified losslessly, just target-only.
         # Checked after the selector branch because the two heads are mutually
         # exclusive: a selector worker returns above and never reads `lilicorr`.
-        if self.lilicorr is not None and _LILICORR_SAMPLING_ENABLED:
+        if self.lilicorr is not None and self._lilicorr_sampling_enabled:
             return
 
         if (
@@ -2218,7 +2225,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
             elif (
                 self.lilicorr is not None
-                and _LILICORR_SAMPLING_ENABLED
+                and self._lilicorr_sampling_enabled
                 and not _is_all_greedy(batch.sampling_info)
             ):
                 # Same buffers, same shapes, same accept path as the selector: the
@@ -2245,7 +2252,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # already warns when it refuses to fold; this covers the other half of
             # `folded`, where the sampler exists but the graph could not run the step.
             if (
-                _LILICORR_SAMPLING_ENABLED
+                self._lilicorr_sampling_enabled
                 and not self._warned_lilicorr_eager
                 and self.ps.tp_rank == 0
             ):

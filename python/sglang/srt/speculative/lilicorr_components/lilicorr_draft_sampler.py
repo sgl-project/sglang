@@ -100,8 +100,14 @@ class LiLiCorrDraftSampler:
         org_vocab_start: int,
         max_bs: int,
         anchor_features: int,
+        sampling_enabled: bool,
     ) -> None:
         self.head = head
+        # Device-gated by the worker, exactly as the selector's sampler is: the
+        # sampled accept path needs `chain_speculative_sampling_triton`, which does
+        # not run on NPU. Off here means the argmax commit and no published
+        # proposal, which is what the existing verify fallback is correct for.
+        self.sampling_enabled = bool(sampling_enabled)
         self.embed_tokens = embed_tokens
         self.weight = weight
         self.block_size = int(block_size)
@@ -154,7 +160,7 @@ class LiLiCorrDraftSampler:
         self._select = torch.compile(
             # Exactly one of the two is compiled per process: the mode is a module
             # constant, so there is no bucket that could end up with the other body.
-            head.select_with_proposal if SAMPLING_ENABLED else head.select,
+            head.select_with_proposal if sampling_enabled else head.select,
             # "default", not max-autotune: the head's GEMMs already go to cuBLAS
             # and the gap being closed is pointwise fusion, which default mode
             # does.
@@ -208,7 +214,7 @@ class LiLiCorrDraftSampler:
         bucket size and those rows already score a zeroed anchor, so their drafts are
         discarded by the worker's ``out[: bs * slots]`` slice whatever they sample.
         """
-        if not SAMPLING_ENABLED:
+        if not self.sampling_enabled:
             return
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
@@ -339,7 +345,7 @@ class LiLiCorrDraftSampler:
             anchor_valid=self.anchor_valid[:bs],
             already_projected=pre_projected,
         )
-        if SAMPLING_ENABLED:
+        if self.sampling_enabled:
             selected, q_rows = self._select(
                 # In-graph philox draw: each replay advances the generator and redraws.
                 # Drawn here rather than inside `_select` because an RNG op in the
@@ -374,6 +380,7 @@ def build_lilicorr_draft_sampler(
     embed_tokens,
     lm_head,
     block_size: int,
+    sampling_enabled: bool = SAMPLING_ENABLED,
 ) -> Optional[LiLiCorrDraftSampler]:
     """Build the graph-folded LiLiCorr sampler, or None to keep the head eager.
 
@@ -417,6 +424,7 @@ def build_lilicorr_draft_sampler(
         org_vocab_start=org_vocab_start,
         max_bs=int(max_bs),
         anchor_features=int(draft_model.fc.out_features),
+        sampling_enabled=sampling_enabled,
     )
     logger.info(
         "LiLiCorr select folded into the draft cuda graph: max_bs=%d block_size=%d "

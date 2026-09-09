@@ -574,6 +574,7 @@ def test_a_lilicorr_head_is_dispatched_to_the_folded_sampler():
         block_size=5,
         selector=None,
         lilicorr=head,
+        _lilicorr_sampling_enabled=True,
         ps=SimpleNamespace(tp_rank=0),
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
@@ -599,6 +600,10 @@ def test_a_lilicorr_head_is_dispatched_to_the_folded_sampler():
     # it was trained against; the draft's own table exists on Nemotron-3.5 drafts
     # and would load, run, and score the wrong function.
     assert built["kwargs"]["embed_tokens"] is embed_tokens
+    # The device gate reaches the sampler rather than only the publish site: with it
+    # off the sampler must compile the argmax body, or the draft would sample while
+    # verify treated the drawn token as a point mass.
+    assert built["kwargs"]["sampling_enabled"] is True
 
 
 # --- grouped convolution coverage ------------------------------------------
