@@ -410,6 +410,34 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         return (x_norm * weight).to(compute_dtype)
 
 
+def _ple_table_is_fp8(
+    config: Qwen4ExpTextConfig,
+    quant_config: Optional[QuantizationConfig],
+    ngram_prefix: str,
+) -> bool:
+    """Whether the PLE n-gram table should be stored as fp8.
+
+    True when the config pins it (``ple_embedding_dtype``), when the whole
+    checkpoint is fp8, or when a mixed-precision (ModelOpt) checkpoint lists
+    the table itself as FP8. The last case matters because the storage dtype
+    is fixed at construction: with ``ple_offload_embedding`` the pinned host
+    table cannot be swapped to fp8 later in ``load_weights``.
+    """
+    if getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn":
+        return True
+    if quant_config is None:
+        return False
+    if quant_config.get_name() == "fp8":
+        return True
+    resolve = getattr(quant_config, "_resolve_quant_algo", None)
+    if resolve is None:
+        return False
+    try:
+        return resolve(ngram_prefix) == "FP8"
+    except ValueError:
+        return False
+
+
 class Qwen4ExpNGramEmbedding(nn.Module):
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -423,6 +451,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         embedding_dim: int,
         ple_layer_index: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -484,8 +513,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             self.head_dim_per_ngram,
             params_dtype=(
                 torch.float8_e4m3fn
-                if (quant_config is not None and quant_config.get_name() == "fp8")
-                or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
+                if _ple_table_is_fp8(config, quant_config, f"{prefix}.ngram_embedding")
                 else torch.bfloat16
             ),
             output_dtype=torch.bfloat16,
@@ -881,6 +909,7 @@ class Qwen4ExpPLELayer(nn.Module):
             self.ple_embed_dim,
             ple_layer_index=ple_layer_index,
             quant_config=quant_config,
+            prefix=f"{prefix}.ple_embedding" if prefix else "ple_embedding",
         )
         if config.ple_offload_embedding:
             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
