@@ -460,14 +460,10 @@ class TokenizerControlMixin:
     async def _weight_update_session_call(
         self: TokenizerManager, communicator, obj, staged: bool = False
     ) -> Tuple[bool, str]:
-        """Run one weight-update session RPC under the same pause-aware locking as
-        update_weights_from_distributed: while the engine is paused the writer lock
-        is already held by whoever paused it, so taking it again would deadlock.
-
-        A staged session runs under the reader lock, concurrent with generation:
-        it touches nothing a running forward reads — deferred names are not
-        servable and base tensors are rejected. Base and fixed-name sessions
-        keep the writer lock."""
+        """Run one weight-update RPC with pause-aware locking (a paused engine
+        already holds the writer lock). A staged session takes the reader lock
+        and runs alongside generation: deferred names are not servable and base
+        tensors are rejected; other sessions keep the writer lock."""
         self.auto_create_handle_loop()
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -535,8 +531,7 @@ class TokenizerControlMixin:
 
     async def _discard_pending_publications(self: TokenizerManager) -> None:
         """Drop deferred publications after an aborted or failed session: the
-        names never reached the serving registry, but the backends hold their
-        zeroed identities and must forget them."""
+        backends must forget the zeroed identities the names never served."""
         pending, self._pending_lora_publications = self._pending_lora_publications, {}
         async with self.lora_update_lock:
             for ref in pending.values():
@@ -555,8 +550,7 @@ class TokenizerControlMixin:
                     )
 
     async def _publish_pending_adapters(self: TokenizerManager) -> None:
-        """Commit deferred publications: the session applied and verified their
-        weights, so the names become servable atomically here."""
+        """Commit deferred publications: the names become servable atomically."""
         pending, self._pending_lora_publications = self._pending_lora_publications, {}
         async with self.lora_update_lock:
             for name, ref in pending.items():
