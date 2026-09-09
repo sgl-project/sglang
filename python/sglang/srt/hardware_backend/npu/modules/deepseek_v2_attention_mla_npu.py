@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.layers.dcp import (
+    all_gather_kv_cache_for_dcp,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
@@ -495,6 +496,71 @@ def forward_dsa_prepare_npu(
     )
 
 
+def _dcp_gather_extend_kv_npu(
+    m: "DeepseekV2AttentionMLA",
+    forward_batch: "ForwardBatch",
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> torch.Tensor:
+    """Materialise each request's FULL prefix+extend KV, for one layer.
+
+    Under DCP a rank holds only 1/c of the context, so at extend it cannot
+    attend over the pool: the sparse operator would need every position and this
+    rank has a sixteenth of them. SGLang's answer for extend is to gather the KV
+    rather than shard the attention and merge -- prefill has many query tokens
+    and few heads (no query all-gather happens here, so the head count is
+    num_local_heads, not the decode path's num_local_heads * dcp_size), which
+    makes moving the KV the cheap direction and moving the query the expensive
+    one. Decode is the mirror image and gathers the query instead.
+
+    The layout is the reason this is written here rather than calling
+    ``all_gather_kv_cache_for_mla_extend``. That helper fills ``dcp_kv_buffer``
+    the way CUDA's kernels read it -- every request's prefix in one region, then
+    every request's extend tokens in another -- so a single request's KV is two
+    disjoint runs. Measured on the box (p6_prefill_nonpaged_sfa_probe.py),
+    ``npu_sparse_flash_attention`` under a non-paged layout wants
+    ``sparse_indices`` **relative to each request's KV start** and
+    ``actual_seq_lengths_kv`` **cumulative**, which together require one
+    contiguous run per request. Reordering afterwards would cost a full copy of
+    the context per layer -- about 1.1 GiB per layer at 1M -- so this writes the
+    contiguous order directly instead. ``all_gather_kv_cache_for_dcp`` itself is
+    reused unchanged: it is pure torch plus one collective, and its own re-org
+    step already returns each request's prefix in global position order.
+
+    Only the prefix is gathered. This chunk's own KV is computed identically on
+    every rank and arrives as ``k_nope``/``k_pe``, so it is copied in locally.
+    """
+    md = forward_batch.attn_dcp_metadata
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    extend_lens = forward_batch.extend_seq_lens_cpu
+
+    cache_k_nope, cache_k_rope = get_token_to_kv_pool().get_mla_kv_buffer(
+        m.attn_mqa,
+        md.dcp_local_prefix_kv_indices,
+    )
+    gathered = all_gather_kv_cache_for_dcp(
+        cache_k_nope,
+        cache_k_rope,
+        torch.tensor(prefix_lens, dtype=torch.int32),
+    )
+
+    buf = md.dcp_kv_buffer
+    src_prefix = 0
+    src_extend = 0
+    dst = 0
+    for prefix_len, extend_len in zip(prefix_lens, extend_lens):
+        prefix_len = int(prefix_len)
+        extend_len = int(extend_len)
+        buf[dst : dst + prefix_len] = gathered[src_prefix : src_prefix + prefix_len]
+        tail = buf[dst + prefix_len : dst + prefix_len + extend_len]
+        tail[..., : m.kv_lora_rank] = k_nope[src_extend : src_extend + extend_len]
+        tail[..., m.kv_lora_rank :] = k_pe[src_extend : src_extend + extend_len]
+        src_prefix += prefix_len
+        src_extend += extend_len
+        dst += prefix_len + extend_len
+    return buf[:dst]
+
+
 def forward_dsa_core_npu(
     m: "DeepseekV2AttentionMLA",
     q_pe: torch.Tensor,
@@ -516,6 +582,19 @@ def forward_dsa_core_npu(
     # context parallelism has to be composed here as well. This mirrors
     # forward_mla.py:640-809 rather than sharing it -- the two prepare/core
     # pairs have different shapes -- so the two must be kept in step by hand.
+    if (
+        get_parallel().dcp_enabled
+        and forward_batch.forward_mode.is_extend()
+        and not is_dcp_mla_decode_phase(forward_batch)
+        and forward_batch.attn_dcp_metadata is not None
+    ):
+        # Extend under DCP: gather the context so this rank can see all of it,
+        # and hand the result to the backend through the metadata it already
+        # reads. Without this the backend attends over its own shard with a
+        # full-span page table -- in bounds and wrong, which is why generation
+        # came out fluent and unrelated to the prompt rather than crashing.
+        _dcp_gather_extend_kv_npu(m, forward_batch, k_nope, k_pe)
+
     if is_dcp_mla_decode_phase(forward_batch):
         # Every rank attends with the FULL head set against its own KV shard and
         # keeps only its own share after the merge, so the query is gathered

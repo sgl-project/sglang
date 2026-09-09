@@ -1210,6 +1210,32 @@ class AscendAttnBackend(AttentionBackend):
                 or forward_batch.forward_mode.is_target_verify()
             )
 
+            # Extend under DCP is the mirror image of decode: the query stays
+            # rank-local (num_local_heads, no gather) and the CONTEXT is gathered
+            # instead, by _dcp_gather_extend_kv_npu before this runs. So there is
+            # nothing sharded left to address -- no rank-local page table, no
+            # top-k remap, no LSE merge -- and the operator reads a contiguous
+            # buffer rather than the paged pool.
+            #
+            # This condition and the one guarding _dcp_gather_extend_kv_npu in
+            # deepseek_v2_attention_mla_npu.py must select the same forwards. If
+            # the model gathers and the backend does not, attention silently
+            # reads the sharded pool with a full-span page table; if the backend
+            # reads and the model did not gather, it reads a stale buffer. Both
+            # are wrong-but-plausible rather than loud, so they are written in
+            # the same shape and cross-referenced deliberately.
+            dcp_meta = forward_batch.attn_dcp_metadata
+            dcp_extend = (
+                get_parallel().dcp_enabled
+                and forward_batch.forward_mode.is_extend()
+                and not dcp_decode
+                and dcp_meta is not None
+                and dcp_meta.dcp_kv_buffer is not None
+            )
+
+            key_nope, key_rope = k_nope, k_pe
+            layout_kv = "PA_BSND"
+
             if dcp_decode:
                 # Rank-local everything. The indexer selected top-k over the
                 # replicated view and so returned global positions; this
@@ -1232,6 +1258,29 @@ class AscendAttnBackend(AttentionBackend):
                 # construction. vLLM-Ascend reasons identically at
                 # sfa_cp.py:1238-1249.
                 sparse_mode = 0
+            elif dcp_extend:
+                # Every convention below was measured, not inferred, by
+                # glm5.2_testing/p6_prefill_nonpaged_sfa_probe.py: of the four
+                # combinations of {relative, absolute} indices and {per-batch,
+                # cumulative} kv lengths, exactly one reproduced a float64
+                # reference (1.9e-3 against 0.65-0.89 for the other three, on a
+                # ragged batch). Three of them RUN and return plausible garbage,
+                # so do not "simplify" any of this without re-running that probe.
+                #
+                # Indices relative to each request's KV start means the indexer's
+                # own output is already correct -- it selects within a request --
+                # and it is why the gather writes each request's KV as one
+                # contiguous run.
+                gathered = dcp_meta.dcp_kv_buffer
+                key_nope = gathered[..., : self.kv_lora_rank]
+                key_rope = gathered[..., self.kv_lora_rank :]
+                block_table = None
+                seq_lengths_kv = dcp_meta.dcp_kv_indptr[1:]
+                layout_kv = "TND"
+                # layout_kv must equal layout_query unless it is PA_BSND
+                # (sparse_flash_attention_tiling.cpp:1761), which is why this is
+                # TND and not BSND.
+                sparse_mode = 3
             else:
                 block_table = self.forward_metadata.block_tables
                 seq_lengths_kv = actual_seq_lengths_kv
@@ -1240,10 +1289,10 @@ class AscendAttnBackend(AttentionBackend):
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             call = dict(
                 query=q_nope,
-                key=k_nope,
-                value=k_nope,
+                key=key_nope,
+                value=key_nope,
                 query_rope=q_pe,
-                key_rope=k_pe,
+                key_rope=key_rope,
                 sparse_indices=topk_indices,
                 scale_value=layer.scaling,
                 actual_seq_lengths_query=actual_seq_qlen.to(
@@ -1252,13 +1301,17 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv=seq_lengths_kv.to(
                     device=q_nope.device, dtype=torch.int32
                 ),
-                block_table=block_table,
                 sparse_block_size=1,
                 layout_query="TND",
-                layout_kv="PA_BSND",
+                layout_kv=layout_kv,
                 sparse_mode=sparse_mode,
                 attention_mode=2,
             )
+            # Omitted rather than passed as None on the gathered path: the probe
+            # that fixed these conventions omitted it, and "absent" and "None"
+            # are not always the same thing to a tiling function.
+            if block_table is not None:
+                call["block_table"] = block_table
 
             if dcp_decode:
                 # CANN's build of this operator refuses return_softmax_lse under
