@@ -214,3 +214,16 @@ register_kernel(
         description="Row gather of quantized values plus their scales, one launch.",
     )
 )
+
+# Inverse of the trtllm-gen MoE permutation: brings the FC1 activation back to
+# expanded (token, slot) order for a down-projection LoRA, zeroing the slots the
+# routing left inactive.
+register_kernel(
+    KernelSpec(
+        op="moe.gather_permuted_activation",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.moe_gather_permuted:gather_permuted_activation",
+        capabilities=_CUDA,
+        description="Permuted -> expanded MoE activation gather, one launch.",
+    )
+)

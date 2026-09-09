@@ -5,9 +5,10 @@ It is rank-specialized: the ``R`` dimension (LoRA rank) is a Triton
 ``constexpr``, so each rank value used at runtime gets its own JIT-compiled
 specialization.
 
-Called from :mod:`sglang.kernels.ops.moe.virtual_experts` when
-``use_direct_expand_add=True``. Ranks above 64 are accumulated in multiple
-rank tiles.
+Called from :mod:`sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts`
+when ``use_direct_expand_add=True`` (not the stock ``moe.virtual_experts``
+next to it, which never reaches this kernel). Ranks above 64 are accumulated
+in multiple rank tiles.
 """
 
 from typing import Any
@@ -49,6 +50,7 @@ def _moe_lora_expand_add_kernel(
     GROUP_SIZE_M: tl.constexpr,
     GATED_A_HALF: tl.constexpr,
     BROADCAST_A: tl.constexpr,
+    SWAP_OUT_HALVES: tl.constexpr,
 ):
     """Rank-specialized LoRA-B expand for virtual-expert LoRA.
 
@@ -59,6 +61,12 @@ def _moe_lora_expand_add_kernel(
     up-shrink columns ``[R:2R]`` instead of ``[0:R]``. ``GATED_A_HALF`` must be
     a multiple of ``BLOCK_SIZE_N`` so no tile straddles the gate/up boundary.
     ``GATED_A_HALF == 0`` is the non-gated path (read ``[0:R]`` for all tiles).
+
+    ``SWAP_OUT_HALVES`` writes the gate half of the result into the up columns
+    and vice-versa, for consumers whose gate_up weight is stacked ``[up | gate]``
+    instead of ``[gate | up]``. Costs nothing: it is a per-tile constant offset
+    on the store column, legal only because ``GATED_A_HALF`` is a multiple of
+    ``BLOCK_SIZE_N``, so every tile sits wholly inside one half.
     """
     pid = tl.program_id(0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
@@ -81,6 +89,9 @@ def _moe_lora_expand_add_kernel(
 
     off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_expert == -1:
+        # No SWAP_OUT_HALVES here: off_expert is uniform over pid_n for a given
+        # pid_m, so every n-tile of this m-block takes this branch and the union
+        # of zeroed columns is all of [0, N) either way.
         if not FUSE_SUM_ALL_REDUCE:
             offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
             c_ptrs = (
@@ -127,7 +138,24 @@ def _moe_lora_expand_add_kernel(
         offs_token_out = offs_token // router_topk
     else:
         offs_token_out = offs_token
-    c_ptrs = c_ptr + offs_token_out[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    offs_n_out = offs_n
+    if SWAP_OUT_HALVES:
+        # Shift the whole tile into the other half. The tile is entirely in the
+        # gate half or entirely in the up half (GATED_A_HALF % BLOCK_SIZE_N == 0),
+        # so one scalar offset per program is enough.
+        offs_n_out = offs_n + tl.where(
+            pid_n * BLOCK_SIZE_N >= GATED_A_HALF, -GATED_A_HALF, GATED_A_HALF
+        )
+    c_ptrs = (
+        c_ptr + offs_token_out[:, None] * stride_cm + offs_n_out[None, :] * stride_cn
+    )
+    # Mask on the SOURCE column, not the store column. The grid is sized from
+    # sorted_token_ids while num_pid_m comes from num_tokens_post_padded, so a
+    # partial trailing GROUP_SIZE_M group hands some programs a pid_n >=
+    # num_pid_n. Those load b out of range (masked -> 0) and hold an all-zero
+    # accumulator; offs_n >= N masks them out, while offs_n_out would pull them
+    # back in range and let them race a real tile's store to zero. offs_n < N
+    # also implies offs_n_out < N, since GATED_A_HALF is N // 2.
     c_mask = token_mask[:, None] & (offs_n[None, :] < N)
     if FUSE_SUM_ALL_REDUCE:
         tl.atomic_add(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
@@ -165,11 +193,15 @@ def _invoke_moe_lora_expand_add(
     fuse_sum_all_reduce: bool,
     force_block_size_n: "int | None" = None,
     broadcast_intermediate: bool = False,
+    swap_out_halves: bool = False,
 ) -> None:
     """Launch the rank-specialized LoRA-B expand kernel.
 
     Ranks through 64 use one rank tile. Larger ranks use the same kernel with
     multiple 64-wide tiles.
+
+    ``swap_out_halves`` exchanges the two halves of the gated gate_up output
+    (see ``SWAP_OUT_HALVES``); it requires the gated layout.
     """
     N = weight.shape[1]
     R = weight.shape[2]
@@ -202,6 +234,14 @@ def _invoke_moe_lora_expand_add(
         assert N % 2 == 0 and (N // 2) % block_size_n == 0, (
             f"gated gate_up split needs N/2 ({N // 2}) divisible by BLOCK_SIZE_N "
             f"({block_size_n})"
+        )
+    elif swap_out_halves:
+        # GATED_A_HALF is both the A-column split and the output half boundary, so
+        # an adapter that shares one LoRA-A between gate and up (intermediate width
+        # R, not 2*R) would silently get a no-op swap. Fail loudly instead.
+        raise ValueError(
+            "swap_out_halves needs the gated gate_up layout (2*R-wide intermediate); "
+            f"got intermediate width {intermediate.shape[1]} for rank {R}"
         )
 
     grid = (
@@ -236,6 +276,7 @@ def _invoke_moe_lora_expand_add(
         GROUP_SIZE_M=group_size_m,
         GATED_A_HALF=gated_a_half,
         BROADCAST_A=broadcast_intermediate,
+        SWAP_OUT_HALVES=swap_out_halves,
         num_warps=config.get("num_warps", 4),
         num_stages=1,
     )

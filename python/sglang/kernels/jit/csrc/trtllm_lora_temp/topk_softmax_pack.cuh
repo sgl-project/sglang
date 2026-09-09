@@ -9,12 +9,12 @@
  *     packed[idx] = (topk_id << 16) | bf16_bits(topk_weight)
  *
  * computed in the kernel epilogue AFTER renormalization — bit-identical to the
- * standalone `fused_pack_topk` triton kernel applied to the (post-processed)
+ * standalone `PackTopkIds` triton kernel applied to the (post-processed)
  * topk_ids/topk_weights, including the padded-region mask: rows at or beyond
  * `num_token_non_padded` pack id = -1 (the `_mask_topk_ids_padded_region`
  * sentinel), matching what the separate pack would produce after the mask.
- * This removes the per-MoE-layer `_pack_topk_kernel` launch from the decode
- * critical path entirely (fusion instead of stream overlap).
+ * This removes the per-MoE-layer `_pack_topk_ids_triton_kernel` launch from the
+ * decode critical path entirely (fusion instead of stream overlap).
  *
  * Scope intentionally narrowed vs the AOT kernel (callers fall back to the AOT
  * topk_softmax + separate pack otherwise):
@@ -58,7 +58,7 @@ __device__ float convert_to_float(T x) {
   }
 }
 
-// Reference pack (bit-identical to kernels/ops/moe/trtllm_lora_temp/topk_pack.py):
+// Reference pack (bit-identical to kernels/ops/moe/pack_topk_ids.py):
 // low 16 bits = bf16(weight) bits (round-to-nearest-even, same as torch/triton
 // `.to(bfloat16)`), high 16 bits = int16 expert id.
 __device__ __forceinline__ int32_t pack_routed(int32_t id, float w) {

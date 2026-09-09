@@ -4,7 +4,9 @@ Migrated from ``sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe``
 (RFC #29630, Phase 2.5). Used by the FlashInfer TRT-LLM routed-MoE path, which
 consumes routing ids and bf16 weights packed as ``(id << 16) | weight_bits``.
 Routing ids may be int32 or the int64 dtype produced by ``torch.topk``; they are
-converted to int32 by the Triton kernel before packing.
+converted to int32 by the Triton kernel before packing. Any other id dtype, a
+non-fp32 weight dtype, and non-contiguous inputs are coerced on the host, so
+callers can hand over whatever their routing produced.
 """
 
 import torch
@@ -37,16 +39,16 @@ class PackTopkIds:
         )
         assert topk_ids.ndim >= 1, f"expected >=1D, got {topk_ids.shape=}"
 
-        assert topk_ids.dtype in (
-            torch.int32,
-            torch.int64,
-        ), f"topk_ids must be int32 or int64, got {topk_ids.dtype}"
-        assert topk_weights.dtype == torch.float32, (
-            f"topk_weights must be float32, got {topk_weights.dtype}"
-        )
-
-        assert topk_ids.is_contiguous(), "topk_ids must be contiguous"
-        assert topk_weights.is_contiguous(), "topk_weights must be contiguous"
+        # Coerce instead of asserting: the routed-MoE call sites reach this from
+        # several different topk implementations, and rejecting their dtype /
+        # layout there would only push the same casts back onto every caller.
+        # int64 needs no cast -- the kernel narrows it while loading.
+        if topk_ids.dtype not in (torch.int32, torch.int64):
+            topk_ids = topk_ids.to(torch.int32)
+        topk_ids = topk_ids.contiguous()
+        if topk_weights.dtype != torch.float32:
+            topk_weights = topk_weights.to(torch.float32)
+        topk_weights = topk_weights.contiguous()
 
         out = torch.empty_like(topk_ids, dtype=torch.int32)
         numel = out.numel()

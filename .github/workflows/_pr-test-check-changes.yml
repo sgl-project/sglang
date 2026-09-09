@@ -118,10 +118,16 @@ jobs:
               - ".github/workflows/pr-test-jit-kernel.yml"
               - "python/pyproject.toml"
               - "test/registered/kernels/**"
+              # check_registered_tests.py mandates the singular `kernel` kind for new
+              # registered kernel tests, so both spellings gate the same suites.
+              - "test/registered/kernel/**"
               # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the
               # base-b-kernel suites import it directly, so kernel edits must run them.
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**"
+              # The BF16 MoE-LoRA dispatch is guarded only by a base-b-kernel test
+              # (test/registered/kernel/lora/), so its edits have to dispatch here too.
+              - "python/sglang/srt/lora/trtllm_lora_temp/**"
             sgl_kernel:
               # Intentionally excludes ".github/workflows/pr-test-sgl-kernel.yml" —
               # see API-side detector below for rationale.

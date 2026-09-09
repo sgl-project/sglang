@@ -35,6 +35,10 @@ def _warm_sgl_trtllm_moe_module() -> None:
     first forward happens INSIDE decode cuda-graph capture, so the boot looks
     hung mid-capture with an idle main thread. Building here (module init,
     before capture) makes the cost visible at startup and keeps capture fast.
+
+    Only the FP4 and FP8 branches call this. The BF16 dispatch runs the stock
+    ``trtllm_bf16_routed_moe`` and would otherwise pay the whole build for a
+    module it never loads.
     """
     global _SGL_TRTLLM_MODULE_WARMED
     if _SGL_TRTLLM_MODULE_WARMED:
@@ -61,8 +65,6 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
     )
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    _warm_sgl_trtllm_moe_module()
-
     # ---- NVFP4 (modelopt) path ----
     # The fp4 weight loader sets ``g1_scale_c`` on the FusedMoE layer (see
     # ModelOptNvFp4FusedMoEMethod.apply). Mirror the non-LoRA construction in
@@ -77,6 +79,7 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
             FlashInferTrtllmFp4MoeQuantInfo,
         )
 
+        _warm_sgl_trtllm_moe_module()
         layer._lora_runner = None
         layer._quant_info = FlashInferTrtllmFp4MoeQuantInfo(
             w13_weight=base_layer.w13_weight.data,
@@ -110,9 +113,9 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
 
     # ---- BF16 (unquantized) path ----
     # No quant_config / block scales => the checkpoint is bf16. The bf16 LoRA dispatch
-    # runs the decomposed trtllm pipeline (sgl_trtllm_bf16_routed_moe_lora): permute ->
-    # raw gate_up GEMM -> LoRA-aware activation -> down GEMM, all bf16 — using the SAME
-    # prepared w13/w2 tensors (shuffled + BlockMajorK) the plain trtllm_bf16 path consumes.
+    # runs the stock trtllm_bf16_routed_moe with the gate_up delta as gemm1_lora_delta
+    # (an FC1 epilogue bias) — using the SAME prepared w13/w2 tensors (shuffled +
+    # BlockMajorK) the plain trtllm_bf16 path consumes.
     # intermediate_size / local_num_experts / routing_method_type come from
     # base_layer.moe_runner_config at dispatch time (the bf16 quant-info is minimal).
     if quant_config is None and not getattr(quant_method, "block_quant", False):
@@ -157,6 +160,7 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
         w2_weight_scale = getattr(base_layer, "w2_weight_scale", None)
     assert w13_weight_scale is not None and w2_weight_scale is not None
 
+    _warm_sgl_trtllm_moe_module()
     layer._lora_runner = None
     layer._quant_info = FlashInferTrtllmFp8MoeQuantInfo(
         w13_weight=base_layer.w13_weight,

@@ -1,12 +1,15 @@
-"""Precision test for the fused packed-topk unpack triton kernel used by the
-Marlin MoE runner (fused-gate-topk support).
+"""Precision tests for the packed-topk encoding: the Marlin unpack and the pack.
 
 The FlashInfer / Inkling fused gate emits PackedTopKOutput -- int32
 ``(expert_id << 16) | bf16-weight-bits``. The Marlin runner reads topk_ids /
-topk_weights separately, so it unpacks with a single Triton launch. This test
-checks the kernel is bit-identical to the torch elementwise reference and that
-pack -> unpack round-trips, across shapes / top_k / num_experts / weight
-distributions.
+topk_weights separately, so it unpacks with a single Triton launch. That kernel
+is checked bit-identical to the torch elementwise reference, and pack -> unpack
+round-trips, across shapes / top_k / num_experts / weight distributions.
+
+The pack direction is ``PackTopkIds``, which now serves the trtllm MoE-LoRA
+dispatch too (it replaced that package's own ``fused_pack_topk`` on seven call
+sites) and coerces id/weight dtype and layout on the host instead of asserting.
+``PackTopkIds.vanilla`` is the bit-exact oracle for ``PackTopkIds.triton``.
 """
 
 import sys
@@ -27,7 +30,7 @@ def _torch_unpack(packed: torch.Tensor):
 
 
 def _torch_pack(ids: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    # inverse of the unpack, matching trtllm_lora_temp/topk_pack._pack_topk_kernel
+    # inverse of the unpack, matching kernels/ops/moe/pack_topk_ids.PackTopkIds
     wbits = weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
     return (ids.to(torch.int32) << 16) | wbits
 
@@ -77,6 +80,34 @@ def test_unpack_matches_reference_and_roundtrips(num_tokens, top_k, num_experts,
     )
     assert t_ids.dtype == torch.int32 and t_w.dtype == torch.float32
     assert t_ids.shape == (num_tokens, top_k) and t_w.shape == (num_tokens, top_k)
+
+
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64, torch.int16])
+@pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_pack_matches_vanilla(ids_dtype, w_dtype, contiguous):
+    """The encoding must stay bit-identical to the torch reference.
+
+    Including on the dtypes and layouts the host-side coercion now admits instead
+    of rejecting: the id narrowing moved from the host into the kernel, and the
+    weight cast / contiguity fix-up are new code with no other coverage.
+    """
+    from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
+
+    torch.manual_seed(0)
+    ids = torch.randint(0, 256, (129, 6), dtype=torch.int64, device="cuda").to(
+        ids_dtype
+    )
+    w = torch.softmax(torch.randn(129, 6, device="cuda"), dim=-1).to(w_dtype)
+    if not contiguous:
+        ids, w = ids.t().contiguous().t(), w.t().contiguous().t()
+
+    got = PackTopkIds.execute(ids, w)
+    ref = PackTopkIds.vanilla(
+        ids.contiguous().to(torch.int32), w.contiguous().to(torch.float32)
+    )
+    assert got.dtype == torch.int32 and got.shape == ids.shape
+    assert torch.equal(got, ref)
 
 
 def test_unpack_empty():

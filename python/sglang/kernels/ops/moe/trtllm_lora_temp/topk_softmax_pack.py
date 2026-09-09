@@ -4,10 +4,10 @@ JIT port of sgl-kernel's AOT ``topk_softmax`` power-of-2 fast path
 (``topkGatingSoftmax``) extended with a third output: the FlashInfer routed-MoE
 packed format ``(topk_id << 16) | bf16_bits(topk_weight)`` computed in the
 kernel epilogue after renormalization — bit-identical to running the standalone
-``fused_pack_topk`` triton kernel on the post-processed topk_ids/topk_weights
+``PackTopkIds`` triton kernel on the post-processed topk_ids/topk_weights
 (including the ``_mask_topk_ids_padded_region`` id=-1 sentinel for rows at or
 beyond ``num_token_non_padded``). This removes the per-MoE-layer
-``_pack_topk_kernel`` launch from the decode critical path.
+``_pack_topk_ids_triton_kernel`` launch from the decode critical path.
 
 Scope (callers must fall back to the AOT ``topk_softmax`` + separate pack
 otherwise): power-of-2 ``num_experts`` in [1, 512]; no softcapping or
@@ -76,7 +76,7 @@ def topk_softmax_pack(
     num_experts = gating_output.shape[-1]
     assert num_experts & (num_experts - 1) == 0 and num_experts <= 512, (
         "topk_softmax_pack supports power-of-2 num_experts in [1, 512] only; "
-        "fall back to topk_softmax + fused_pack_topk"
+        "fall back to topk_softmax + PackTopkIds"
     )
     if gating_output.shape[0] == 0:
         return

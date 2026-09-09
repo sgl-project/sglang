@@ -47,11 +47,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
 ) -> StandardCombineInput:
     from flashinfer.fused_moe import Fp8QuantizationType
 
+    from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
     from sglang.kernels.ops.moe.trtllm_lora_temp import (
         trtllm_fp8_block_scale_moe_lora_finalize,
         trtllm_fp8_block_scale_routed_moe_lora,
     )
-    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
@@ -159,7 +159,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
     # the padded-region id=-1 mask. Fall back to the separate pack otherwise.
     packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
     if packed_topk_ids is None:
-        packed_topk_ids = fused_pack_topk(
+        packed_topk_ids = PackTopkIds.execute(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
@@ -305,17 +305,25 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     quant_info: FlashInferTrtllmBf16MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     lora_info,
+    gate_up_lora_stream: torch.cuda.Stream | None = None,
 ) -> StandardCombineInput:
     """BF16 sibling of ``fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``.
 
-    Decomposed (unfused-activation) MoE-LoRA, bf16 end-to-end (no quantization):
-    routing -> gather -> gate_up grouped GEMM (raw 2*inter, bf16) -> activation that
-    adds ``gate_up_lora_delta`` pre-SwiGLU and captures ``activation_lora_input`` ->
-    down grouped GEMM -> finalize, then the virtual-experts down-LoRA is merged into
-    the output. Single-stream version (no two-stream overlap yet — phase 2).
+    Runs the stock ``flashinfer.fused_moe.trtllm_bf16_routed_moe`` with the gate_up
+    LoRA delta handed over as ``gemm1_lora_delta``, i.e. as an FC1 epilogue bias
+    applied before the fused SwiGLU. The op returns its post-SwiGLU activation in
+    permuted (expert-sorted) order together with the expanded -> permuted map; a
+    gather brings it back to ``[num_tokens, top_k, inter]`` so the virtual-experts
+    down-LoRA can be merged into the finalized output.
+
+    ``gate_up_lora_stream`` runs the gate_up shrink/expand on that stream and joins
+    it on the main stream just before the MoE op (used by the two-stream override in
+    :mod:`sglang.srt.lora.trtllm_lora_temp.moe_overlap`).
     """
-    from sglang.kernels.ops.moe.trtllm_lora_temp import trtllm_bf16_routed_moe_lora
-    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from flashinfer.fused_moe import trtllm_bf16_routed_moe
+
+    from sglang.kernels.ops.moe.moe_gather_permuted import gather_permuted_activation
+    from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
@@ -331,19 +339,27 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     assert runner_config.activation == "silu" and runner_config.is_gated, (
         "experimental_sgl_trtllm BF16 LoRA currently supports the gated SwiGLU path only."
     )
+    # The BF16 routed entry point rejects every weight layout but BlockMajorK, so
+    # the flat [E, 2F, D] w13 the decomposed overlay op also accepted has nowhere to
+    # go here. Say so at the shape instead of failing inside the GEMM.
+    assert quant_info.gemm1_weights.dim() == 4, (
+        "experimental_sgl_trtllm BF16 LoRA needs BlockMajorK gate_up weights "
+        f"([E, N, K // 128, 128]); got {tuple(quant_info.gemm1_weights.shape)}. "
+        "Prepare w13 the way unquant.py does for flashinfer_trtllm."
+    )
+    # expanded_idx_to_permuted_idx is [num_tokens * (top_k + num_fused_shared_experts)]
+    # and the activation gather has no destination for a shared expert's extra slots.
+    assert not runner_config.num_fused_shared_experts, (
+        "Fused shared experts are not supported for experimental_sgl_trtllm BF16 LoRA."
+    )
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
     assert TopKOutputChecker.format_is_standard(topk_output)
     assert runner_config.top_k is not None
 
-    # No-LoRA non-capture decode -> fast bf16 path, valid only for 4-D block-shuffled
-    # weights ([E, M//128, K//128, 128]); flat [E, 2F, D] stays on the decomposed kernel.
-    if (
-        not get_is_capture_mode()
-        and not lora_info.has_active_lora
-        and quant_info.gemm1_weights.dim() == 4
-    ):
+    # No-LoRA non-capture decode -> plain bf16 path (same weights, no delta).
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
         return fused_experts_none_to_flashinfer_trtllm_bf16(
             dispatch_output, quant_info, runner_config, use_routed_topk=True
         )
@@ -357,40 +373,92 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     token_lora_mapping = lora_info.token_lora_mapping
     fused_lora_routing_cache: dict = {}
 
+    num_tokens = hidden_states.shape[0]
+    top_k = runner_config.top_k
     inter = runner_config.intermediate_size_per_partition
+    # Only the rank-specialized expand can emit the swapped halves for free; the
+    # generic kernel is stock and shared, so ranks above 64 pay a copy below.
+    use_direct_expand_add = lora_info.max_lora_rank <= 64
 
-    # Gated gate_up LoRA delta (same shape/semantics as the fp8/fp4 paths). EP args scope
-    # the delta to this rank's experts, matching the EP-aware trtllm MoE base.
-    gate_up_delta = hidden_states.new_empty(
-        (hidden_states.shape[0], runner_config.top_k, 2 * inter)
-    )
-    merged_experts_fused_moe_lora_add(
-        output=gate_up_delta,
-        hidden_states=hidden_states,
-        lora_a=lora_info.gate_up_lora_a_weights,
-        lora_b=lora_info.gate_up_lora_b_weights,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        token_lora_mapping=token_lora_mapping,
-        mul_routed_weight=False,
-        experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
-        experts_shared_outer_loras_b=False,
-        routing_cache=fused_lora_routing_cache,
-        fuse_add_to_output=False,
-        use_direct_expand_add=lora_info.max_lora_rank <= 64,
-        local_expert_offset=quant_info.local_expert_offset,
-        local_num_experts=runner_config.num_local_experts,
-    )
+    # Gated gate_up LoRA delta (same shape/semantics as the fp8/fp4 paths). EP args
+    # scope the delta to this rank's experts. Uninitialized is fine for the values:
+    # trtllm-gen applies the delta as an FC1 epilogue bias through its own permuted
+    # -> expanded row map, and a permuted row no expanded slot claims only reaches
+    # gemm1 output rows the gather below never reads.
+    gate_up_delta = hidden_states.new_empty((num_tokens, top_k, 2 * inter))
+
+    gate_up_lora_intermediate = None
+    if gate_up_lora_stream is not None:
+        # Hoist every side-chain allocation onto the MAIN stream: pre-warm the routing
+        # cache and pre-allocate the shrink intermediate so the side-stream block below
+        # only launches kernels. Tensors allocated inside a side-stream context during
+        # cuda-graph capture get pool-reused with no cross-stream guard -> '!!!!' decode
+        # corruption at max-loras >= 2.
+        merged_experts_fused_moe_lora_add(
+            output=gate_up_delta,
+            hidden_states=hidden_states,
+            lora_a=lora_info.gate_up_lora_a_weights,
+            lora_b=lora_info.gate_up_lora_b_weights,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=False,
+            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+            experts_shared_outer_loras_b=False,
+            routing_cache=fused_lora_routing_cache,
+            stage="routing",
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=runner_config.num_local_experts,
+        )
+        gate_up_lora_intermediate = hidden_states.new_empty(
+            (
+                num_tokens,
+                topk_ids.shape[1],
+                lora_info.gate_up_lora_a_weights.shape[2],
+            )
+        )
+        gate_up_lora_stream.wait_stream(torch.cuda.current_stream())
+
+    def _run_gate_up_lora() -> None:
+        merged_experts_fused_moe_lora_add(
+            output=gate_up_delta,
+            hidden_states=hidden_states,
+            lora_a=lora_info.gate_up_lora_a_weights,
+            lora_b=lora_info.gate_up_lora_b_weights,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=False,
+            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+            experts_shared_outer_loras_b=False,
+            routing_cache=fused_lora_routing_cache,
+            fuse_add_to_output=False,
+            use_direct_expand_add=use_direct_expand_add,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=runner_config.num_local_experts,
+            intermediate_buffer=gate_up_lora_intermediate,
+            # trtllm-gen adds gemm1_lora_delta[..., :inter] to FC1's FIRST half, and
+            # the trtllm w13 prep loads that half as `up` (models/inkling.py), while
+            # the expand natively emits [gate | up]. Emit [up | gate] instead so
+            # up-delta meets Up and gate-delta meets Gate.
+            swap_out_halves=use_direct_expand_add,
+        )
+
+    if gate_up_lora_stream is not None:
+        with torch.cuda.stream(gate_up_lora_stream):
+            _run_gate_up_lora()
+    else:
+        _run_gate_up_lora()
 
     activation_lora_input = torch.empty(
-        (hidden_states.shape[0], runner_config.top_k, inter),
+        (num_tokens, top_k, inter),
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
 
     packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
     if packed_topk_ids is None:
-        packed_topk_ids = fused_pack_topk(
+        packed_topk_ids = PackTopkIds.execute(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
@@ -403,36 +471,67 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
 
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         direct_down_output = torch.empty(
-            hidden_states.shape[0],
+            num_tokens,
             hidden_states.shape[1],
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
 
-    output = trtllm_bf16_routed_moe_lora(
-        topk_ids=packed_topk_ids,
-        routing_bias=None,
-        hidden_states=hidden_states,
-        gemm1_weights=quant_info.gemm1_weights,
-        gemm2_weights=quant_info.gemm2_weights,
-        gate_up_lora_delta=gate_up_delta,
-        activation_lora_input=activation_lora_input,
-        num_experts=quant_info.global_num_experts,
-        top_k=runner_config.top_k,
-        intermediate_size=inter,
-        local_expert_offset=quant_info.local_expert_offset,
-        local_num_experts=runner_config.num_local_experts,
-        routed_scaling_factor=(
-            runner_config.routed_scaling_factor
-            if runner_config.routed_scaling_factor is not None
-            else 1.0
-        ),
-        routing_method_type=routing_method_type,
-        do_finalize=True,
-        output=direct_down_output,
-        activation_type=get_activation_type(
-            runner_config.activation, is_gated=runner_config.is_gated
-        ),
+    if gate_up_lora_stream is not None:
+        # The stock op has no in-op event hook, so the join happens on the main
+        # stream before the whole op: routing and permute no longer overlap the
+        # LoRA, only the work enqueued between the fork and this point.
+        torch.cuda.current_stream().wait_stream(gate_up_lora_stream)
+    if not use_direct_expand_add:
+        # Generic expand: the kernel that wrote gate_up_delta is stock and shared
+        # with every LoRA backend, so the half swap has to be a copy out here.
+        # The swap is all this copy fixes -- the generic expand also contracts both
+        # halves against the gate-shrink columns and drops the up LoRA-A (see the
+        # KNOWN DEFECT note on _merged_experts_fused_moe_lora_add_impl). That
+        # predates this migration; rank > 64 is not a validated configuration.
+        gate_up_delta = torch.cat(
+            (gate_up_delta[..., inter:], gate_up_delta[..., :inter]), dim=-1
+        )
+
+    output, expanded_idx_to_permuted_idx, gemm1_activation_output = (
+        trtllm_bf16_routed_moe(
+            topk_ids=packed_topk_ids,
+            hidden_states=hidden_states,
+            gemm1_weights=quant_info.gemm1_weights,
+            gemm2_weights=quant_info.gemm2_weights,
+            num_experts=quant_info.global_num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=inter,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=runner_config.num_local_experts,
+            routed_scaling_factor=(
+                runner_config.routed_scaling_factor
+                if runner_config.routed_scaling_factor is not None
+                else 1.0
+            ),
+            routing_method_type=routing_method_type,
+            do_finalize=True,
+            gemm1_lora_delta=gate_up_delta,
+            tune_max_num_tokens=next_power_of_2(num_tokens),
+            activation_type=get_activation_type(
+                runner_config.activation, is_gated=runner_config.is_gated
+            ),
+            output=direct_down_output,
+        )
+    )
+
+    # gemm1_activation_output is [max_num_padded_tokens_gemm1, inter] in permuted
+    # (expert-sorted) order. The down-LoRA below indexes expanded (token, slot) rows
+    # and sums over every slot unconditionally, so slots the routing left inactive
+    # have to read back as exact zeros -- which is what the gather writes for -1.
+    gather_permuted_activation(
+        gemm1_activation_output,
+        expanded_idx_to_permuted_idx,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        out=activation_lora_input,
     )
 
     merged_experts_fused_moe_lora_add(
@@ -470,10 +569,10 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     then the virtual-experts down-LoRA is merged into the output. Single-stream
     version; ``moe_overlap.py`` provides the two-stream variant.
     """
+    from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
     from sglang.kernels.ops.moe.trtllm_lora_temp import (
         trtllm_fp4_block_scale_routed_moe_lora,
     )
-    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
@@ -552,7 +651,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
         device=hidden_states.device,
     )
 
-    packed_topk_ids = fused_pack_topk(
+    packed_topk_ids = PackTopkIds.execute(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
     )

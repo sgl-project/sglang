@@ -15,6 +15,7 @@ from sglang.kernels.ops.gemm.trtllm_lora_temp.kernel_utils import (
 from sglang.kernels.ops.moe.moe_align import (
     moe_align_block_size as jit_moe_align_block_size,
 )
+from sglang.kernels.ops.moe.specialized_expand import _invoke_moe_lora_expand_add
 from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
 
@@ -396,14 +397,6 @@ def _get_moe_lora_shrink_split_k(
     return max(1, min(triton.cdiv(target, base_grid), max_split_k, 8))
 
 
-# Rank-specialized LoRA-B expand kernel lives in lora/trtllm_lora_temp/.
-# Re-export so existing call sites (and any external imports) keep working.
-from sglang.srt.lora.trtllm_lora_temp.specialized_expand import (  # noqa: E402,F401
-    _invoke_moe_lora_expand_add,
-    _moe_lora_expand_add_kernel,
-)
-
-
 def _align_block_size_jit(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -632,6 +625,7 @@ def _merged_experts_fused_moe_lora_add_impl(
     prewarm_a_routing: bool = True,
     prewarm_b_routing: bool = True,
     zero_intermediate: bool = False,
+    swap_out_halves: bool = False,
 ) -> "torch.Tensor | None":
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
@@ -653,9 +647,31 @@ def _merged_experts_fused_moe_lora_add_impl(
     ``broadcast_intermediate`` is an expand-only mode where one rank vector per
     token is reused for every routed expert.
 
+    ``swap_out_halves`` writes the gated gate_up delta as ``[up | gate]`` instead
+    of ``[gate | up]``, for consumers that stack the base gate_up weight the other
+    way round. Only the rank-specialized direct expand implements it.
+
+    KNOWN DEFECT on the generic (``use_direct_expand_add=False``) expand with a
+    gated gate_up adapter: ``invoke_fused_moe_kernel`` derives its contraction
+    width from ``lora_b.shape[2] == R`` (``fused_moe_triton_kernels.py``), while
+    the shrink intermediate is ``2*R`` wide, so BOTH output halves contract the
+    gate-shrink columns ``[0:R]`` and the up LoRA-A is dropped. Only the
+    rank-specialized kernel's ``GATED_A_HALF`` splits them. This predates the
+    stock-FlashInfer migration and is why callers gate on rank <= 64.
+
     EP accepts either global weights/IDs with a local range or already-localized
     weights/IDs from the standard dispatcher.
     """
+    if swap_out_halves and not (
+        use_direct_expand_add and not experts_shared_outer_loras_b
+    ):
+        # Reject early rather than silently emitting [gate | up]: a caller that
+        # asked for the swap and did not get it produces plausible-looking but
+        # cross-paired numbers. The generic expand path must swap for itself.
+        raise ValueError(
+            "swap_out_halves is only implemented on the rank-specialized direct "
+            "expand (use_direct_expand_add=True, experts_shared_outer_loras_b=False)"
+        )
     max_loras, _, max_lora_rank, _ = lora_a.shape
     # Global per-expert dim of the LoRA weights. lora_a may be shared-outer (expert
     # dim 1) while lora_b is per-expert, so take the max for the true global count.
@@ -1039,6 +1055,7 @@ def _merged_experts_fused_moe_lora_add_impl(
             mul_routed_weight,
             fuse_sum_all_reduce,
             broadcast_intermediate=broadcast_intermediate,
+            swap_out_halves=swap_out_halves,
         )
     else:
         assert not broadcast_intermediate, (
@@ -1137,6 +1154,7 @@ def merged_experts_fused_moe_lora_add(
     prewarm_a_routing: bool = True,
     prewarm_b_routing: bool = True,
     zero_intermediate: bool = False,
+    swap_out_halves: bool = False,
 ) -> "torch.Tensor | None":
     """Public API: wraps the registered op with routing_cache support."""
     return _merged_experts_fused_moe_lora_add_impl(
@@ -1163,4 +1181,5 @@ def merged_experts_fused_moe_lora_add(
         prewarm_a_routing=prewarm_a_routing,
         prewarm_b_routing=prewarm_b_routing,
         zero_intermediate=zero_intermediate,
+        swap_out_halves=swap_out_halves,
     )
