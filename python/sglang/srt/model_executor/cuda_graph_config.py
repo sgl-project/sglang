@@ -98,8 +98,10 @@ class PhaseConfig:
     # Only meaningful for the prefill phase with backend == full: max number of
     # request slots baked into each captured graph. Real bs <= full_prefill_max_req
     # reuses the graph (unused slots become zero-length sentinels); larger
-    # batches fall back to eager. Ignored by BCG and TC_PIECEWISE. None
-    # auto-derives chunked_prefill_size // 512.
+    # batches fall back to eager. Ignored by BCG and TC_PIECEWISE. None uses
+    # the full request-pool capacity for MHA; MLA retains the conservative
+    # chunked_prefill_size // 512 default because its request-slot count is
+    # coupled to the cached-prefix chunk shape.
     full_prefill_max_req: Optional[int] = None
     # Only meaningful for Full prefill CUDA graphs that capture a distinct
     # cached-prefix topology: aggregate cached-prefix tokens represented by one

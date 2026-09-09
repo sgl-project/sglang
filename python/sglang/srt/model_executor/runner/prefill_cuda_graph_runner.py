@@ -23,9 +23,10 @@ Backend selection comes from cuda_graph_config.prefill:
   - "full"         — FullCudaGraphBackend: one graph per num_tokens bucket
                       for the captured transformer body. Capture uses
                       cuda_graph_config.prefill.full_prefill_max_req request
-                      slots (auto-derived when unset); replay pads num_tokens
-                      to the nearest bucket and pads unused request slots with
-                      zero-length sentinels. bs > slots falls back to eager.
+                      slots (the full request-pool capacity by default for
+                      MHA); replay pads num_tokens to the nearest bucket and
+                      pads unused request slots with zero-length sentinels.
+                      bs > slots falls back to eager.
                       Attention metadata is refreshed out-of-graph against the
                       slot-padded batch before capture/replay.
   - "tc_piecewise" — TcPiecewiseCudaGraphBackend: torch.compile
@@ -460,10 +461,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._is_full_backend
             else None
         )
-        # This flag controls whether the model dispatches through the distinct
-        # chunked-prefix topology; backend capability is validated separately.
+        # Only MLA's latent-KV -> MHA path has a Python-unrolled prefix-chunk
+        # topology. Ordinary MHA reads full K/V directly from the paged cache;
+        # prefix lengths are data in its existing graph, not graph variants.
         self._capture_chunked_prefix = (
-            self._is_full_backend and not get_schedule().disable_chunked_prefix_cache
+            self._is_full_backend
+            and model_runner.use_mla_backend
+            and not get_schedule().disable_chunked_prefix_cache
         )
         self._prefix_chunk_len = 0
         self._prefix_chunk_capacity = 0
