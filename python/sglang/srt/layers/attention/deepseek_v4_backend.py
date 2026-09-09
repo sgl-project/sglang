@@ -831,6 +831,14 @@ class DeepseekV4AttnBackend(
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
 
+        # Eager CP writes only logical tokens. BCG gathers a fixed global
+        # bucket, including dummy rows, into the KV/compressor store paths.
+        # Keep those write buffers fixed while expanding causal metadata from
+        # the real extend lengths and partitioning queries over physical rows.
+        num_write_tokens = (
+            out_cache_loc.shape[0] if use_prefill_cuda_graph else num_tokens
+        )
+
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,
@@ -1438,6 +1446,23 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
+    def _use_sparse_prefill(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> bool:
+        # SparsePrefillChunkCache uses global request offsets. CP has already
+        # interleaved the query rows, so even the large-query heuristic must
+        # stay on the CP-compatible paged attention path. Disabling the env
+        # switch alone does not disable that heuristic.
+        return (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and not is_cp_active(forward_batch)
+            and not get_platform().is_sm120
+            and (
+                num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            )
+        )
+
     def prepare_prefill_shared_read_snapshot(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> None:
@@ -1457,11 +1482,7 @@ class DeepseekV4AttnBackend(
             return
 
         assert isinstance(metadata, DSV4Metadata)
-        use_sparse_prefill = not get_platform().is_sm120 and (
-            num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
-            or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-        )
-        if use_sparse_prefill:
+        if self._use_sparse_prefill(forward_batch, num_qo_tokens=num_qo_tokens):
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, num_qo_tokens=num_qo_tokens
             )
@@ -1476,6 +1497,12 @@ class DeepseekV4AttnBackend(
         assert seq_lens_cpu is not None
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
+        num_global_queries = sum(extend_seq_lens_cpu)
+        assert num_qo_tokens >= num_global_queries, (
+            "DSV4 sparse prefill requires global query rows: "
+            f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
+            "CP-local queries must use paged attention."
+        )
         seq_lens_cpu_list = seq_lens_cpu.tolist()
         total_swa = sum(
             min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
@@ -1837,14 +1864,7 @@ class DeepseekV4AttnBackend(
                 )
 
             # sparse_prefill_fwd does not support SM120.
-            if (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and not get_platform().is_sm120
-                and (
-                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-                )
-            ):
+            if self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0]):
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
                     return self._forward_prefill_sparse_q8kv8(
                         q=q,
