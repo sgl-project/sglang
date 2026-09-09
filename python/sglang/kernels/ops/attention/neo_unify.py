@@ -75,17 +75,24 @@ def resolve_neo_backend(q: torch.Tensor, *, image_aware: bool, backend: str) -> 
     major, _ = torch.cuda.get_device_capability(q.device)
     if backend == "triton":
         return backend
+    neo_fa3_available = major in (8, 9) and _neo_fa3() is not None
+    if backend == "fa3":
+        if image_aware and neo_fa3_available:
+            return backend
+        if not image_aware and (major == 9 or neo_fa3_available):
+            return backend
+        raise RuntimeError(
+            "NEO image-aware FA3 requires the support_neo build on SM80-SM90; "
+            "ordinary FA3 requires Hopper or that build on SM80-SM89"
+        )
     if image_aware:
-        fa3_available = major == 9 and _neo_fa3() is not None
+        # Keep SM80-SM89 opt-in until it has target-device performance data.
+        fa3_available = major == 9 and neo_fa3_available
     else:
         # Restrict auto selection to Hopper, the initial validation target.
         fa3_available = major == 9
     if fa3_available:
         return "fa3"
-    if backend == "fa3":
-        raise RuntimeError(
-            "NEO FA3 requires Hopper; mixed prefill also requires the image_token_end build"
-        )
     return "triton"
 
 
@@ -166,6 +173,9 @@ def neo_unify_attention(
     if image_token_end is not None:
         fn = _neo_fa3()
         extra = {"image_token_end": image_token_end.reshape(-1).contiguous()}
+    elif torch.cuda.get_device_capability(q.device)[0] == 8:
+        fn = _neo_fa3()
+        extra = {}
     else:
         from sglang.kernels.ops.attention.flash_attention import (
             flash_attn_with_kvcache as fn,

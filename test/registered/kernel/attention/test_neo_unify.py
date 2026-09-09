@@ -79,13 +79,14 @@ class TestNeoUnifyGPU(CustomTestCase):
         self.compare_backend("triton")
 
     def test_fa3(self):
-        if torch.cuda.get_device_capability()[0] != 9 or _neo_fa3() is None:
-            self.skipTest("Hopper and the optional image_token_end FA3 build required")
+        if torch.cuda.get_device_capability()[0] not in (8, 9) or _neo_fa3() is None:
+            self.skipTest("SM80-SM90 and the image_token_end FA3 build required")
         self.compare_backend("fa3")
 
     def test_fa3_standard(self):
-        if torch.cuda.get_device_capability()[0] != 9:
-            self.skipTest("Hopper required")
+        major = torch.cuda.get_device_capability()[0]
+        if major != 9 and (major != 8 or _neo_fa3() is None):
+            self.skipTest("Hopper or the SM80-SM89 support_neo build required")
         self.compare_backend("fa3", image_aware=False)
 
     def test_image_does_not_see_future_text(self):

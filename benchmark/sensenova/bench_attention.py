@@ -19,9 +19,7 @@ from sglang.kernels.ops.attention.neo_unify import (
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("prefill", "denoise"), default="prefill")
-    parser.add_argument(
-        "--backends", nargs="+", default=["eager", "sdpa", "triton", "fa3"]
-    )
+    parser.add_argument("--backends", nargs="+", default=["legacy", "sdpa", "triton"])
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--query-length", type=int, default=1024)
     parser.add_argument("--prefix-length", type=int, default=128)
@@ -76,21 +74,32 @@ def main():
     ids[start:end] = start
     ends = build_image_token_end(ids, args.prefix_length) if causal else None
     allow = None
+    legacy_mask = None
+    flash_attn_func = None
+    if args.mode == "denoise" and "legacy" in args.backends:
+        try:
+            from flash_attn import flash_attn_func
+        except ImportError:
+            pass
 
     def run(backend):
-        if backend not in ("eager", "sdpa"):
+        if backend not in ("legacy", "eager", "sdpa"):
             return neo_unify_attention(
                 q, k, v, image_token_end=ends, causal=causal, backend=backend
             )
+        if backend == "legacy" and not causal and flash_attn_func is not None:
+            return flash_attn_func(q, k, v, dropout_p=0.0, causal=False)
         qh = q.transpose(1, 2)
         kh = k.transpose(1, 2).repeat_interleave(args.heads // args.kv_heads, 1)
         vh = v.transpose(1, 2).repeat_interleave(args.heads // args.kv_heads, 1)
-        if backend == "sdpa":
+        if backend == "sdpa" or (backend == "legacy" and not causal):
             return F.scaled_dot_product_attention(
                 qh, kh, vh, attn_mask=allow
             ).transpose(1, 2)
         scores = (qh @ kh.transpose(-1, -2)) * args.head_dim**-0.5
-        if allow is not None:
+        if backend == "legacy" and legacy_mask is not None:
+            scores = scores + legacy_mask
+        elif allow is not None:
             scores = scores.masked_fill(~allow, float("-inf"))
         return (scores.softmax(-1, dtype=torch.float32).to(dtype) @ vh).transpose(1, 2)
 
@@ -98,17 +107,32 @@ def main():
     for backend in args.backends:
         # Like the model, prepare masks once outside the layer/denoising loop.
         allow = None
-        if causal and backend in ("eager", "sdpa"):
+        if causal and backend in ("legacy", "eager", "sdpa"):
             kp = torch.arange(k.shape[1], device=device)
             qp = torch.arange(q.shape[1], device=device) + args.prefix_length
             allow = (kp <= qp[:, None]) | (kp < ends[:, None])
             del kp, qp
+            legacy_mask = None
+            if backend == "legacy":
+                legacy_mask = torch.where(
+                    allow[None, None],
+                    torch.tensor(0.0, device=device),
+                    torch.tensor(float("-inf"), device=device),
+                )
         # Forced backends must succeed: a missing FA3 build is not a fallback timing.
-        actual_backend = (
-            backend
-            if backend in ("eager", "sdpa")
-            else resolve_neo_backend(q, image_aware=ends is not None, backend=backend)
-        )
+        if backend == "legacy":
+            if causal:
+                actual_backend = "legacy/eager"
+            else:
+                actual_backend = (
+                    "legacy/flash" if flash_attn_func is not None else "legacy/sdpa"
+                )
+        elif backend in ("eager", "sdpa"):
+            actual_backend = backend
+        else:
+            actual_backend = resolve_neo_backend(
+                q, image_aware=ends is not None, backend=backend
+            )
         for _ in range(args.warmup):
             run(backend)
         torch.cuda.synchronize()

@@ -175,6 +175,14 @@ def _flash_or_sdpa(
     )
 
 
+def _use_neo_denoise_attention(q: torch.Tensor, backend: str) -> bool:
+    if backend == "legacy":
+        return False
+    if backend != "auto":
+        return True
+    return q.is_cuda and torch.cuda.get_device_capability(q.device)[0] == 9
+
+
 @dataclass(frozen=True)
 class NeoUnifyAttentionMask:
     image_token_end: Optional[torch.Tensor]
@@ -834,11 +842,7 @@ class Qwen3Attention(nn.Module):
             assert q.shape[3] == k.shape[3] == v.shape[3], (q.shape, k.shape, v.shape)
 
             neo_backend = getattr(self.config, "neo_denoise_backend", "auto")
-            if (
-                self.training
-                or neo_backend == "legacy"
-                or (neo_backend == "auto" and q.device.type != "cuda")
-            ):
+            if self.training or not _use_neo_denoise_attention(q, neo_backend):
                 attn_output = _flash_or_sdpa(
                     q,
                     k,

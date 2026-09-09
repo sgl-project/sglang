@@ -13,10 +13,13 @@ prefill helper. This does not add an image-editing serving endpoint.
 dense FP32 oracle and is intended for small correctness cases. Non-CUDA
 `auto` retains the original model path.
 
-On CUDA, `auto` selects the image-aware FA3 build on Hopper when available,
-otherwise Triton. Denoising uses SGLang's ordinary FA3 on Hopper and Triton
-elsewhere. Explicit `fa3` never silently falls back. Unsupported optimized
-dtypes/head dimensions use the Torch path only in `auto` mode.
+On CUDA, prefill `auto` selects the image-aware FA3 build on Hopper when
+available, otherwise Triton. The pinned `support_neo` build also contains
+SM80-SM89 kernels; use explicit `fa3` to validate those GPUs until target-device
+performance data justifies automatic selection. Denoising `auto` uses SGLang's
+ordinary FA3 on Hopper and preserves the existing FlashAttention/SDPA path on
+other GPU architectures. Explicit `triton` remains available for denoising
+experiments, and explicit `fa3` never silently falls back.
 
 Mixed prefill is causal except within each contiguous image block. An image
 query cannot attend to later text or another later image. Metadata consists
@@ -41,12 +44,13 @@ Image-aware FA3 additionally requires the upstream-linked fork:
 - Required Python entry point: `flash_attn_interface.flash_attn_with_kvcache`
   with `image_token_end` (not the older boolean `image_token_tag`).
 
-Use that fork's Hopper build instructions in a separate Linux CUDA
-environment. Both its Python interface and compiled extension must come
-from the same revision. The initial FA3 dispatch is limited to SM90;
-Ampere/Blackwell use Triton. Importing the model does not import this optional
-extension. The actual CUDA build, numeric checks and performance must be
-validated on the target GPU before treating this implementation as qualified.
+Use that fork's build instructions in a separate Linux CUDA environment. Both
+its Python interface and compiled extension must come from the same revision.
+The fork contains image-aware forward kernels for SM80-SM90. `auto` remains
+limited to SM90; explicit `fa3` enables target-device validation on Ampere and
+Ada. Importing the model does not import this optional extension. The actual
+CUDA build, numeric checks and performance must be validated on the target GPU
+before treating this implementation as qualified.
 
 ## Correctness
 
@@ -69,10 +73,10 @@ initialized attention layer, without downloading a checkpoint.
 
 ```bash
 python benchmark/sensenova/bench_attention.py --mode prefill \
-  --backends eager sdpa triton fa3 --query-length 1024 --prefix-length 128 \
+  --backends legacy sdpa triton --query-length 1024 --prefix-length 128 \
   --output prefill.json
 python benchmark/sensenova/bench_attention.py --mode denoise \
-  --backends sdpa triton fa3 --query-length 4096 --prefix-length 128 \
+  --backends legacy sdpa triton --query-length 4096 --prefix-length 128 \
   --output denoise.json
 ```
 
@@ -81,7 +85,11 @@ batch sizes and image token lengths. Dense baselines may OOM at long lengths;
 run them separately instead of reducing only their sequence lengths. Timings
 include adapter/layout work; JIT compilation is excluded by warmup. Both the
 baseline mask and optimized metadata are prepared outside the timed loop,
-as in the model. These are operator timings, not end-to-end speedups.
+as in the model. `legacy` reports the implementation it resolved to: eager for
+image-aware prefill, and FlashAttention when installed or SDPA otherwise for
+denoising. Add `fa3` after installing the pinned `support_neo` build on
+SM80-SM90; ordinary SGLang FA3 is also available for denoising on Hopper. These
+are operator timings, not end-to-end speedups.
 
 ## Model A/B runs
 

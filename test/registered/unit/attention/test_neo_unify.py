@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -6,6 +7,7 @@ import torch
 from sglang.kernels.ops.attention.neo_unify import (
     build_image_token_end,
     neo_unify_attention,
+    resolve_neo_backend,
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import get_neo_attention_backends
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -15,6 +17,25 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestNeoUnify(CustomTestCase):
+    def test_sm89_support_neo_is_explicit_only(self):
+        q = SimpleNamespace(
+            is_cuda=True,
+            dtype=torch.bfloat16,
+            shape=(1, 128, 16, 128),
+            device=torch.device("cuda"),
+        )
+        module = "sglang.kernels.ops.attention.neo_unify"
+        with (
+            patch.object(torch.cuda, "get_device_capability", return_value=(8, 9)),
+            patch(f"{module}._neo_fa3", return_value=object()),
+        ):
+            self.assertEqual(
+                resolve_neo_backend(q, image_aware=True, backend="fa3"), "fa3"
+            )
+            self.assertEqual(
+                resolve_neo_backend(q, image_aware=True, backend="auto"), "triton"
+            )
+
     def test_fa3_packing_preserves_batch_boundaries(self):
         # Emulate only the optional extension boundary. Its varlen inputs are
         # consumed independently, so a wrong packing/offset changes the output.

@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from transformers.cache_utils import DynamicCache
@@ -12,6 +14,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_ch
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
     NeoUnifyAttentionMask,
     Qwen3Attention,
+    _use_neo_denoise_attention,
     create_block_causal_mask,
     create_neo_attention_mask,
 )
@@ -35,6 +38,17 @@ class TestSenseNovaAttention(CustomTestCase):
         )
         self.config._attn_implementation = "eager"
         self.layer = Qwen3Attention(self.config, 0).eval()
+
+    def test_auto_denoise_backend_only_selects_neo_on_hopper(self):
+        cpu = SimpleNamespace(is_cuda=False, device=torch.device("cpu"))
+        cuda = SimpleNamespace(is_cuda=True, device=torch.device("cuda"))
+        self.assertFalse(_use_neo_denoise_attention(cpu, "auto"))
+        self.assertFalse(_use_neo_denoise_attention(cuda, "legacy"))
+        self.assertTrue(_use_neo_denoise_attention(cuda, "triton"))
+        with patch.object(torch.cuda, "get_device_capability", return_value=(8, 9)):
+            self.assertFalse(_use_neo_denoise_attention(cuda, "auto"))
+        with patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)):
+            self.assertTrue(_use_neo_denoise_attention(cuda, "auto"))
 
     @torch.no_grad()
     def test_prefill_matches_original(self):
