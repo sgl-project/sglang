@@ -44,7 +44,7 @@ def _accept_pointer(P, Ptr, Candidates, Coins, Count, S: tl.constexpr, V: tl.con
     n, active = 0, 1
     for j in range(S - 1):
         token = tl.load(Candidates + b * S + j + 1)
-        p = tl.load(P + b * S + j)
+        p = tl.load(P + b * S + j).to(tl.float32)
         q = tl.load(qptr + (b * (S - 1) + j) * V + token)
         u = tl.load(Coins + b * S + j)
         active = active & (u * q < p)

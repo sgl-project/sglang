@@ -96,6 +96,17 @@ def main():
         )
         compare(runner.run(), runner.baseline())
         result["tests"].append("reference_nan_q_rule")
+        tiny_local = obj.local.clone()
+        tiny_local[0, 0].fill_(-90)
+        if rank == 0:
+            tiny_local[0, 0, 1] = 0
+        tiny_q = obj.q.clone()
+        tiny_q[0, 0, 0] = 0
+        tiny_candidates = obj.candidates.clone()
+        tiny_candidates[0, 1] = 0
+        runner.bind(tiny_local, tiny_q, tiny_candidates, obj.coins, obj.final_coins, obj.idx)
+        compare(runner.run(), runner.baseline())
+        result["tests"].append("subnormal_reference_probability")
         runner.bind(
             obj.local, obj.q, obj.candidates, obj.coins, obj.final_coins, obj.idx
         )
