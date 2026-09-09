@@ -33,7 +33,6 @@ Two declaration forms, keyed on ``hf_config.architectures[0]``:
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import json
 import logging
@@ -116,9 +115,9 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
     an empty dict is a validation, and it may run on the published instance --
     it has to, because ``Engine(server_args=sa)`` after ``Engine.shutdown()``
     re-runs ``check_server_args`` on the very instance the context still holds.
-    A pass that returns a non-empty dict there is refused, as
-    ``declare_late_resolution`` is -- post-publish changes go to the bags through
-    ``get_context().override(...)``.
+    A pass that returns a non-empty dict there is refused by the guard in
+    ``declare_resolution``, as a late declaration is -- post-publish changes go
+    to the bags through ``get_context().override(...)``.
     """
 
     declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
@@ -133,29 +132,12 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
         # a rebuild: `Engine(server_args=sa)` after `Engine.shutdown()` hands
         # back the same instance while the context still holds it, and
         # refusing on identity alone would fail that launch.
-        try:
-            published = get_context().server_args
-        except ValueError:
-            published = None
-        if published is server_args:
-            raise ValueError(
-                f"run_post_process_pass({fn.__qualname__!r}) declared "
-                f"{sorted(declared)} on the published config; the stash is "
-                "projected at publish and never again, so this would be a "
-                "silent no-op -- post-publish changes go to the bags via "
-                "get_context().override(...)"
-            )
-        entry = (fn.__qualname__, dict(declared))
-        stash = getattr(server_args, "_resolved_overrides", None)
-        if stash is None:
-            # Handlers hosting pass slots may be invoked directly on fixtures
-            # that never ran the monolith dispatch (which owns the stash);
-            # create it lazily. Real publishes always pass through the
-            # dispatch first — the dispatch ASSIGNS the stash, so pass slots
-            # must sit at or after it in __post_init__ order.
-            stash = server_args._resolved_overrides = []
-        stash.append(entry)
-        validate_declarations(server_args, [entry])
+        # Only a non-empty return is a declaration. An empty one is a
+        # validation and may run on the published instance -- see above -- so it
+        # must not reach the guard in `declare_resolution`.
+        if declared:
+            declare_resolution(server_args, fn.__qualname__, **declared)
+            validate_declarations(server_args, [(fn.__qualname__, dict(declared))])
 
 
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
@@ -167,14 +149,32 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     (or `resolved_view(server_args)`), which
     `test_resolution_reads_the_declarations` pins.
 
-    For resolvers inside ``__post_init__``; launcher-stage resolution goes
-    through ``declare_late_resolution``. A name that is not a field is rejected
-    here rather than becoming an attribute nothing reads.
+    Every declaration goes through here, whenever it is made: inside
+    ``__post_init__``, at launcher stage (LoRA normalization, the auto-detected
+    parsers -- they decide what the process will run with, so they belong to the
+    pipeline even though they run after it), and on a copy about to cross a
+    process boundary. A name that is not a field is rejected here rather than
+    becoming an attribute nothing reads.
+
+    Refuses the published config. The stash is projected at publish and never
+    again, so a declaration afterwards is a silent no-op; post-publish changes
+    go to the bags through ``get_context().override(...)``.
     """
     if dataclasses.is_dataclass(type(server_args)):
         unknown = sorted(set(fields) - field_names(type(server_args)))
         if unknown:
             raise AttributeError(f"{source}: {unknown} are not ServerArgs fields")
+    try:
+        published = get_context().server_args
+    except ValueError:
+        published = None
+    if published is server_args:
+        raise ValueError(
+            f"{source}: declared on the published config; the stash is "
+            "projected at publish and never again, so this would be a silent "
+            "no-op -- post-publish changes go to the bags via "
+            "get_context().override(...)"
+        )
     stash = getattr(server_args, "_resolved_overrides", None)
     if stash is None:
         stash = []
@@ -183,41 +183,22 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
 
 
 def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
-    """Resolve fields on a config that is **not published yet**.
+    """`declare_resolution`, spelled so a scan can see it is launcher-stage.
 
     A few resolution rules cannot run inside ``__post_init__``: LoRA
     normalization and the auto-parser detection need the launcher's validation
-    stage (and, for the parsers, a tokenizer / chat-template load). They still
-    belong to the resolution pipeline — they decide what the process will run
-    with — so their decision goes to the stash like any other, and the record
-    keeps what the caller passed. Every holder of that instance reads the
-    decision the same way the rest of the pipeline does: the bags it publishes,
-    or ``resolution_result``, both of which survive the pickle to a child.
+    stage (and, for the parsers, a tokenizer / chat-template load). The
+    mechanism is identical -- the decision goes to the stash and the record
+    keeps what the caller passed -- so this delegates rather than duplicating.
 
-    Refuses to touch the published instance: after publish the bags exist and a
-    field write would desync them, which is what ``get_context().override`` is
-    for.
+    It stays a separate name because the name is the only marker of *when* the
+    declaration is made, and two guardrails read it: the chain ratchet's
+    `_declared_by_late_resolution` and the exposure ratchet's
+    `_late_resolution_written_fields`. Location cannot substitute -- `lora_hook`
+    is late and sits inside `arg_groups/`, while the NPU default helper and the
+    expert-pack loader are not late and sit outside it.
     """
-
-    try:
-        published = get_context().server_args
-    except ValueError:
-        published = None
-    if published is server_args:
-        raise ValueError(
-            f"declare_late_resolution({source!r}) called on the published config; "
-            "post-publish changes go to the bags via get_context().override(...)"
-        )
-    log = getattr(server_args, "_runtime_mutations", None)
-    if log is None:
-        log = []
-        server_args._runtime_mutations = log
-    log.append((source, dict(fields)))
-    stash = getattr(server_args, "_resolved_overrides", None)
-    if stash is None:
-        stash = []
-        server_args._resolved_overrides = stash
-    stash.append((source, dict(fields)))
+    declare_resolution(server_args, source, **fields)
 
 
 def declare_direct_writes(
@@ -257,14 +238,11 @@ def declare_direct_writes(
 
     with record_writable(server_args):
         result = resolve(server_args)
-    stash = getattr(server_args, "_resolved_overrides", None)
-    if stash is None:
-        stash = []
-        server_args._resolved_overrides = stash
     # A resolver reached this way can also declare properly -- the in-tree
     # implementations of these hooks do. Those fields are already explained, and
     # recording them again would attribute them to the wrapper and bury an
     # actual direct write among the echoes.
+    stash = getattr(server_args, "_resolved_overrides", None) or ()
     declared = {name for _source, fields in stash[already:] for name in fields}
     changed = {
         name: getattr(server_args, name)
@@ -272,7 +250,7 @@ def declare_direct_writes(
         if name not in declared and getattr(server_args, name) is not previous
     }
     if changed:
-        stash.append((source, changed))
+        declare_resolution(server_args, source, **changed)
     return result
 
 
@@ -301,40 +279,6 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     if raw is not None and field in raw:
         return with_fallback(type(server_args), field, raw[field])
     return with_fallback(type(server_args), field, getattr(server_args, field, default))
-
-
-def resolution_projection(server_args: Any) -> Dict[str, Any]:
-    """Every field's resolved value, nested dataclasses expanded.
-
-    The whole-object shape of ``resolution_result``, for the exits that hand out
-    the entire configuration (``/server_info``, the gRPC and engine readbacks).
-    They used ``dataclasses.asdict``, which reads the fields -- the operator's
-    input, not what resolution decided. Field values only: the private resolution
-    bookkeeping and the ``model_config`` memo that a ``vars()`` dump carried into
-    the readback are not configuration.
-    """
-    return {
-        field.name: _plain(resolution_result(server_args, field.name))
-        for field in dataclasses.fields(server_args)
-    }
-
-
-def _plain(value: Any) -> Any:
-    """``dataclasses.asdict``'s conversion, applied to one value: dataclasses
-    become dicts, containers recurse, everything else is deep-copied (a caller
-    mutating the dump must not reach the live configuration)."""
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {
-            field.name: _plain(getattr(value, field.name))
-            for field in dataclasses.fields(value)
-        }
-    if isinstance(value, tuple) and hasattr(value, "_fields"):  # namedtuple
-        return type(value)(*(_plain(item) for item in value))
-    if isinstance(value, (list, tuple)):
-        return type(value)(_plain(item) for item in value)
-    if isinstance(value, dict):
-        return type(value)((_plain(k), _plain(v)) for k, v in value.items())
-    return copy.deepcopy(value)
 
 
 def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> float:

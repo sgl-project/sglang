@@ -53,7 +53,7 @@ from sglang.srt.arg_groups.argparse_actions import (
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
 from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
-    resolution_projection,
+    resolution_result,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -168,6 +168,24 @@ from sglang.srt.utils.common import (  # noqa: F401
     json_list_type,
     nullable_str,
 )
+
+
+def _plain(value: Any) -> Any:
+    """``dataclasses.asdict``'s conversion, applied to one value: dataclasses
+    become dicts, containers recurse, everything else is deep-copied (a caller
+    mutating the dump must not reach the live configuration)."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _plain(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        }
+    if isinstance(value, tuple) and hasattr(value, "_fields"):  # namedtuple
+        return type(value)(*(_plain(item) for item in value))
+    if isinstance(value, (list, tuple)):
+        return type(value)(_plain(item) for item in value)
+    if isinstance(value, dict):
+        return type(value)((_plain(k), _plain(v)) for k, v in value.items())
+    return copy.deepcopy(value)
 
 
 class ServerArgs:
@@ -298,7 +316,10 @@ class ServerArgs:
         `model_config` memo are not fields and do not appear.
         """
 
-        return resolution_projection(self)
+        return {
+            field.name: _plain(resolution_result(self, field.name))
+            for field in dataclasses.fields(self)
+        }
 
     def replace_resolved(self, source: str, **changes: Any) -> ServerArgs:
         """A copy of this record that stays resolved, and says what it changed.
