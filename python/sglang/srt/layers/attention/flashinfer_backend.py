@@ -841,19 +841,25 @@ class FlashInferAttnBackend(AttentionBackend):
         # replay (bound onto the metadata at capture below).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             n = forward_batch.out_cache_loc.shape[0]
-            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            swa_out_cache_loc = (
+                self.full_cg_prefill_swa_out_cache_loc
+                if forward_mode.is_extend_or_draft_extend_or_mixed()
+                else self.cuda_graph_swa_out_cache_loc
+            )
+            assert_buffer_fits(
+                n, swa_out_cache_loc.shape[0], "FlashInfer graph SWA write locations"
+            )
+            swa_out_cache_loc[n:].zero_()
             if in_capture:
-                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+                swa_out_cache_loc[:n].zero_()
             else:
-                self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                swa_out_cache_loc[:n].copy_(
                     self.kv_index_translator.sliding_window_write_loc_for(
                         forward_batch.out_cache_loc
                     )
                 )
             if in_capture:
-                self.forward_metadata.swa_out_cache_loc = (
-                    self.cuda_graph_swa_out_cache_loc[:n]
-                )
+                self.forward_metadata.swa_out_cache_loc = swa_out_cache_loc[:n]
 
     def _prepare_dequant_workspace_metadata_for_extend(
         self, forward_batch: ForwardBatch, use_ragged: bool = False
@@ -1194,6 +1200,13 @@ class FlashInferAttnBackend(AttentionBackend):
         """
         device = self.workspace_buffer.device
         self.full_cg_prefill_req_slots = num_slots
+        # Prefill captures before decode state is initialized. Its captured
+        # write targets must retain their address when decode allocates its own.
+        self.full_cg_prefill_swa_out_cache_loc = (
+            torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+            if self.use_sliding_window_kv_pool
+            else None
+        )
         upd = self.indices_updater_prefill
         workspace_bytes = self._full_cg_prefill_workspace_bytes(
             num_slots,
