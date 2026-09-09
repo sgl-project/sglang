@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -305,11 +306,9 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
-        # unified_kv never caches the SWA ring (per-request, not content-stable),
-        # so SWA bookkeeping must not gate the match here.
-        is_unified_kv = getattr(
-            self.cache.token_to_kv_pool_allocator.get_kvcache(), "_unified_kv", False
-        )
+        # A per-request SWA ring is not stored in tree nodes, so its bookkeeping
+        # must not gate prefix matching.
+        swa_req_ring = is_swa_req_ring(self.cache.token_to_kv_pool_allocator)
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
@@ -317,7 +316,7 @@ class SWAComponent(TreeComponent):
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if is_unified_kv and (node.backuped or not node.evicted):
+                if swa_req_ring and (node.backuped or not node.evicted):
                     return True
                 return False
             state["len"] += len(node.key)

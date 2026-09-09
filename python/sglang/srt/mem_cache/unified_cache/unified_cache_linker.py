@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -143,8 +144,8 @@ class UnifiedCacheLinkerWrapper:
         self.cache = cache
         self.cache_linker = cache_linker
         swa = cache.components.get(ComponentType.SWA)
-        self._skip_swa = swa is not None and getattr(
-            cache.token_to_kv_pool_allocator.get_kvcache(), "_unified_kv", False
+        self._skip_swa = swa is not None and is_swa_req_ring(
+            cache.token_to_kv_pool_allocator
         )
         self._components = tuple(
             component

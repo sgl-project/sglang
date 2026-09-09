@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertResult, MatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -99,6 +100,14 @@ def _cache_for_wrapper(**kwargs):
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
+
+
+def _swa_allocator(swa_req_ring):
+    if swa_req_ring is None:
+        return SimpleNamespace()
+    allocator = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
+    allocator._swa_req_ring = swa_req_ring
+    return allocator
 
 
 def test_cache_linker_attachment_is_backend_independent():
@@ -455,24 +464,22 @@ def test_component_commit_keeps_only_adopted_pages():
 
 
 @pytest.mark.parametrize(
-    "pool,unified_kv",
-    [
-        pytest.param(SimpleNamespace(), False, id="other-pool"),
-        pytest.param(SimpleNamespace(_unified_kv=False), False, id="paged"),
-        pytest.param(SimpleNamespace(_unified_kv=True), True, id="unified"),
-    ],
+    "swa_req_ring",
+    [None, False, True],
+    ids=["other-allocator", "paged", "request-ring"],
 )
 @pytest.mark.parametrize("enable_hicache", [False, True])
 def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
-    monkeypatch, pool, unified_kv, enable_hicache
+    monkeypatch, swa_req_ring, enable_hicache
 ):
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
 
+    unified_kv = swa_req_ring is True
     monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: unified_kv)
     component = SWAComponent.__new__(SWAComponent)
     component.sliding_window_size = 128
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-    cache.token_to_kv_pool_allocator = SimpleNamespace(get_kvcache=lambda: pool)
+    cache.token_to_kv_pool_allocator = _swa_allocator(swa_req_ring)
     cache.components = {ComponentType.SWA: component}
     cache.cache_controller = object() if enable_hicache else None
     cache.tree_core = SimpleNamespace(
@@ -532,9 +539,7 @@ def test_linker_filters_request_relative_swa_from_lookup_and_offload(
     cache = _cache_for_wrapper(
         _components_tuple=(full, swa),
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
-        token_to_kv_pool_allocator=SimpleNamespace(
-            get_kvcache=lambda: SimpleNamespace(_unified_kv=True)
-        ),
+        token_to_kv_pool_allocator=_swa_allocator(True),
         tree_core=SimpleNamespace(
             enable_external_cache_linker=False, mark_write_through_pending=MagicMock()
         ),
@@ -568,25 +573,20 @@ def test_linker_filters_request_relative_swa_from_lookup_and_offload(
 
 
 @pytest.mark.parametrize(
-    "unified_kv,previous_boundary,expected_boundary",
+    "swa_req_ring,previous_boundary,expected_boundary",
     [
         pytest.param(True, None, 4, id="unified-tombstones"),
         pytest.param(True, 8, 8, id="preserve-existing-boundary"),
         pytest.param(False, None, 2, id="paged-prepare-boundary"),
-        pytest.param(None, None, 2, id="other-pool-prepare-boundary"),
+        pytest.param(None, None, 2, id="other-allocator-prepare-boundary"),
     ],
 )
 def test_linker_load_preserves_swa_boundaries(
-    full_linker_component, unified_kv, previous_boundary, expected_boundary
+    full_linker_component, swa_req_ring, previous_boundary, expected_boundary
 ):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
-    pool = (
-        SimpleNamespace()
-        if unified_kv is None
-        else SimpleNamespace(_unified_kv=unified_kv)
-    )
-    participates = not unified_kv
+    participates = not swa_req_ring
 
     def prepare(phase, req, full_transfer, transfer, prefix_len, **kwargs):
         if phase == ExternalLinkerLoadPhase.PREPARE:
@@ -609,7 +609,7 @@ def test_linker_load_preserves_swa_boundaries(
         _components_tuple=(full, swa),
         page_size=2,
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
-        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
+        token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
         tree_core=SimpleNamespace(
             empty_match_result=SimpleNamespace(
                 device_indices=torch.empty(0, dtype=torch.int64)
