@@ -231,6 +231,16 @@ framework-specific optimization workflow.
   reduction order of the eager RMSNorm that follows under fp32 autocast
   (Wan pipelines decode with fp32 VAE weights under bf16 autocast, where this
   was measured non-bit-exact even though the add itself is commutative).
+- `conv_bias_epilogue` (`modulate/conv_bias_epilogue_triton.py`): PyTorch's
+  cuDNN conv adds its bias as a separate unvectorised `add_` on channels_last
+  outputs (~10% of a Wan 2.1 decode). `WanCausalConv3d._conv_with_epilogue`
+  runs the conv without bias and applies it in one bit-exact pass, fused with
+  the residual add for `conv2` (`residual=`) and deferred into `norm2` for
+  `conv1` (`skip_bias=` + `WanRMS_norm.forward(x, conv_bias=...)`; the gated
+  `wan_rmsnorm_silu` absorbs it via `conv_bias=`). `wan_rmsnorm_silu` itself
+  now tiles `[ROWS, C]` pixels per program (0.63 -> ~3 TB/s at C = 96); its
+  reduction tree changed, which moves ~2e-6 of the elements by one bf16 ulp
+  relative to the previous kernel, within the same quality-gated contract.
 - The Qwen-Image VAE (`autoencoder_kl_qwenimage.py`) uses the same
   `cat_pad_channels_last_3d` + compact-cache helper for every causal conv
   slot; single-frame image decodes keep the compact cache at the reference

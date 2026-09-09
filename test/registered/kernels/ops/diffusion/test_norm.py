@@ -272,6 +272,43 @@ def test_wan_rmsnorm_silu_numerics(x_dtype, affine_dtype, atol, rtol):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize(
+    "shape", [(1, 96, 2, 37, 53), (2, 384, 1, 9, 13), (1, 1024, 1, 5, 7)]
+)
+def test_wan_rmsnorm_silu_multirow_tiles_cover_ragged_rows(shape):
+    # Row counts that are not multiples of the per-program tile, at the three
+    # tile configurations the channel count selects (32 / 8 / 4 rows).
+    x = _cl3d(shape, torch.bfloat16)
+    c = shape[1]
+    gamma = torch.randn((c, 1, 1, 1), device=DEVICE, dtype=torch.float32)
+    expected = F.silu(F.normalize(x, dim=1) * c**0.5 * gamma)
+    actual = wan_rmsnorm_silu(x, gamma)
+    assert actual.stride() == x.stride()
+    torch.testing.assert_close(actual, expected, atol=1.5e-1, rtol=3e-2)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "x_dtype,bias_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float32),
+    ],
+)
+def test_wan_rmsnorm_silu_conv_bias_fold_is_exact(x_dtype, bias_dtype):
+    # Folding the preceding conv's bias must reproduce aten's add_ (fp32 add,
+    # one rounding to x.dtype) so the kernel sees exactly the biased tensor.
+    x = _cl3d((1, 96, 2, 10, 14), x_dtype)
+    gamma = torch.randn((96, 1, 1, 1), device=DEVICE, dtype=torch.float32)
+    conv_bias = torch.randn(96, device=DEVICE, dtype=bias_dtype)
+    biased = x.clone().add_(conv_bias.to(x_dtype).view(1, 96, 1, 1, 1))
+    assert can_use_wan_rmsnorm_silu(x, gamma, None, conv_bias)
+    folded = wan_rmsnorm_silu(x, gamma, conv_bias=conv_bias)
+    assert torch.equal(folded, wan_rmsnorm_silu(biased, gamma))
+
+
+@torch.no_grad()
 def test_wan_rmsnorm_silu_rejects_empty_input():
     x = torch.empty(1, 96, 0, 2, 2, device=DEVICE, dtype=torch.bfloat16).to(
         memory_format=torch.channels_last_3d

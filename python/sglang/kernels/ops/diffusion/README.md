@@ -116,7 +116,7 @@ Several norms look interchangeable and are not. Start here.
 |---|---|---|---|
 | `triton_group_norm_silu` / `apply_group_norm_silu` | Triton | close | NCHW-contiguous, any channels-per-group, always applies SiLU |
 | `group_norm_silu_4d` / `group_norm_silu_rows` | Triton | close | **channels_last only**; power-of-two `C <= 2048`; optional SiLU. This is what lets a VAE decoder run channels_last end-to-end with no `nchwToNhwc` |
-| `wan_rmsnorm_silu` | Triton | close | dense `channels_last_3d` 5D (`stride(C) == 1`), Wan VAE channel-first RMSNorm + SiLU |
+| `wan_rmsnorm_silu` | Triton | close | dense `channels_last_3d` 5D (`stride(C) == 1`), Wan VAE channel-first RMSNorm + SiLU; `[ROWS, C]` tiles (~3 TB/s at C = 96); optional `conv_bias` folds the preceding conv's bias with aten `add_` arithmetic |
 | `rmsnorm_scale` / `rmsnorm_tanh_residual` | Triton | bf16-native statistics | Z-Image (matches its own reference exactly), Ideogram 4 (gated) |
 | `zimage_qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
 | `fused_qk_head_layernorm` | Triton | bit-exact | per-head LN on q/k, `dim_head % 4 == 0`, `<= 128` |
@@ -162,12 +162,22 @@ tensor copy per residual site.
 `fused_pack_segmented_qkv`, `fused_scatter_to_padded`,
 `fused_causal_conv3d_cat_pad_cuda`,
 `cat_pad_channels_last_3d`, `dup_up3d_add`, `nearest_upsample_nhwc`,
-`fused_temb_table_slices`,
+`conv_bias_epilogue`, `fused_temb_table_slices`,
 and `ltx2_ada_values9` are bit-exact data movement or same-order arithmetic.
 `fused_layernorm_modulate_fp8_quant_raw` folds FLUX.2 LayerNorm, adaLN
 modulation, and static FP8 quantization. `try_flux2_token_cat_fp8` and
 `try_flux2_token_cat_nvfp4` fuse branch concatenation directly into the
 quantized representation selected by the FLUX.2 checkpoint path.
+
+`conv_bias_epilogue` exists because PyTorch's cuDNN conv path adds the bias as
+a separate broadcast `add_` after `cudnn_convolution`, and on channels_last
+outputs aten does not vectorise that add (1.5 TB/s vs 4.1 TB/s here on H200;
+~10% of a Wan 2.1 decode). Run the conv without bias and apply the bias in one
+pass with aten's exact arithmetic (fp32 add, one rounding), optionally fused
+with the residual add that follows (`x.dtype(x.dtype(conv + b) + h)`, the two
+roundings of the eager chain). The Wan decoder defers `conv1`'s bias into the
+following norm (`WanRMS_norm.forward(x, conv_bias=...)`, absorbed by the fused
+kernel under the gate) and fuses `conv2`'s bias with the block's residual add.
 
 `nearest_upsample_nhwc` replaces `nn.Upsample(nearest / nearest-exact,
 integer factor)` on a dense channels_last input with a Triton gather: same

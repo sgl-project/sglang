@@ -24,8 +24,10 @@ logger = init_logger(__name__)
 
 try:
     from sglang.kernels.ops.diffusion import (
+        can_use_conv_bias_epilogue,
         can_use_nearest_upsample_nhwc,
         can_use_wan_rmsnorm_silu,
+        conv_bias_epilogue,
         nearest_upsample_nhwc,
         wan_rmsnorm_silu,
     )
@@ -51,11 +53,25 @@ class FusedWanRMSNormSiLU(nn.Module):
         self.scale = float(norm.scale)
         self._sgl_gate = gate
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, conv_bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``conv_bias`` is a preceding conv's deferred bias (see
+        ``WanCausalConv3d._conv_with_epilogue``): folded into the fused kernel
+        when the gate is on, otherwise applied first with aten's arithmetic."""
         if self._sgl_gate.enabled and not torch.compiler.is_compiling():
             bias = self.bias if isinstance(self.bias, torch.Tensor) else None
-            if can_use_wan_rmsnorm_silu(x, self.gamma, bias):
-                return wan_rmsnorm_silu(x, self.gamma, bias, rms_scale=self.scale)
+            if can_use_wan_rmsnorm_silu(x, self.gamma, bias, conv_bias):
+                return wan_rmsnorm_silu(
+                    x, self.gamma, bias, rms_scale=self.scale, conv_bias=conv_bias
+                )
+        if conv_bias is not None:
+            if not torch.compiler.is_compiling() and can_use_conv_bias_epilogue(
+                x, conv_bias
+            ):
+                x = conv_bias_epilogue(x, conv_bias)  # bit-exact, vectorised
+            else:
+                x = x + conv_bias.to(x.dtype).view(1, -1, 1, 1, 1)
         # WanRMS_norm.forward (channel-first) + SiLU, same ops in the same
         # order, so the off-path stays bit-identical.
         return F.silu(F.normalize(x, dim=1) * self.scale * self.gamma + self.bias)
