@@ -1677,6 +1677,64 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
+    def test_swa_unfinished_requests_do_not_release_each_others_locks(self):
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 4
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires FULL+SWA with page_size=window_size=4")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = self._make_seq(1, 3)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+
+        def make_early_released_req():
+            match = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            )
+            req = self._make_req(req_to_token_pool)
+            req.origin_input_ids = array("q", tokens)
+            req.output_ids = array("q")
+            req.full_untruncated_fill_ids = array("q", tokens)
+            req.prefix_indices = match.device_indices
+            req.set_extend_range(len(req.prefix_indices), len(tokens))
+            req_to_token_pool.write(
+                (req.kv.req_pool_idx, slice(0, len(tokens))),
+                match.device_indices,
+            )
+            req.kv.kv_committed_len = len(tokens)
+            req.kv.kv_allocated_len = len(tokens)
+            req.kv.cache_protected_len = len(tokens)
+            req.last_node = match.last_device_node
+            req.extra_key = None
+
+            lock_result = cache.inc_lock_ref(req.last_node)
+            req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+            req.skip_lock_node_ids = lock_result.skip_lock_node_ids
+            cache.dec_swa_lock_only(
+                req.last_node,
+                req.swa_uuid_for_lock,
+                req.skip_lock_node_ids,
+            )
+            req.swa_prefix_lock_released = True
+            return req
+
+        req_a = make_early_released_req()
+        req_b = make_early_released_req()
+        node = req_a.last_node
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
+
+        cache.cache_unfinished_req(req_a)
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 1)
+        cache.cache_unfinished_req(req_b)
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 2)
+
+        cache._dec_req_lock(req_a)
+        cache._dec_req_lock(req_b)
+        cache.sanity_check()
+
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")
