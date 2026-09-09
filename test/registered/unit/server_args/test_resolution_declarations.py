@@ -436,7 +436,7 @@ class TestResolutionDeclarations(CustomTestCase):
 
         The parser detection and the LoRA normalization run at launcher stage --
         they need a tokenizer, a chat template, an adapter directory -- and they
-        declare through `declare_late_resolution`. The declaration is the only
+        declare through `declare_resolution`. The declaration is the only
         home for what they decide: the record keeps `--reasoning-parser auto`,
         and the bags a process publishes carry the detected parser.
 
@@ -444,14 +444,12 @@ class TestResolutionDeclarations(CustomTestCase):
         so its `resolve_once` re-runs and re-snapshots the raw input from
         already-late-resolved fields, which hides exactly this.
         """
-        from sglang.srt.arg_groups.overrides import declare_late_resolution
+        from sglang.srt.arg_groups.overrides import declare_resolution
         from sglang.srt.runtime_context import get_serving, publish, reset_context
 
         server_args = self._resolve({"reasoning_parser": "auto"})
         self.addCleanup(reset_context)
-        declare_late_resolution(
-            server_args, "template-detection", reasoning_parser="qwen3"
-        )
+        declare_resolution(server_args, "template-detection", reasoning_parser="qwen3")
         self.assertEqual(
             resolution_result(server_args, "reasoning_parser"),
             "qwen3",
@@ -469,10 +467,10 @@ class TestResolutionDeclarations(CustomTestCase):
 
     def test_pre_engine_late_resolution_reaches_the_projection(self):
         """A launcher declaration survives the engine's first resolution pass."""
-        from sglang.srt.arg_groups.overrides import declare_late_resolution
+        from sglang.srt.arg_groups.overrides import declare_resolution
 
         server_args = ServerArgs(model_path="dummy")
-        declare_late_resolution(
+        declare_resolution(
             server_args,
             "launcher",
             enable_forward_pass_metrics=True,
@@ -738,7 +736,7 @@ class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
 
         The property is about the stash, so the seam is the stash: a list that
         snapshots on append. Every declaration path -- `declare_resolution`,
-        `declare_late_resolution`, `capture_foreign_writes` and the passes --
+        `declare_resolution`, `capture_foreign_writes` and the passes --
         reaches it through `.append`, whatever it was imported as.
         """
         recorded = []

@@ -182,25 +182,6 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     stash.append((source, dict(fields)))
 
 
-def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
-    """`declare_resolution`, spelled so a scan can see it is launcher-stage.
-
-    A few resolution rules cannot run inside ``__post_init__``: LoRA
-    normalization and the auto-parser detection need the launcher's validation
-    stage (and, for the parsers, a tokenizer / chat-template load). The
-    mechanism is identical -- the decision goes to the stash and the record
-    keeps what the caller passed -- so this delegates rather than duplicating.
-
-    It stays a separate name because the name is the only marker of *when* the
-    declaration is made, and two guardrails read it: the chain ratchet's
-    `_declared_by_late_resolution` and the exposure ratchet's
-    `_late_resolution_written_fields`. Location cannot substitute -- `lora_hook`
-    is late and sits inside `arg_groups/`, while the NPU default helper and the
-    expert-pack loader are not late and sit outside it.
-    """
-    declare_resolution(server_args, source, **fields)
-
-
 def capture_foreign_writes(
     server_args: Any, source: str, resolve: Callable[[Any], Any]
 ) -> Any:

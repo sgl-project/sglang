@@ -91,12 +91,11 @@ with what the operator typed, not with what resolution decided.**
 - **Late launcher-stage resolution (pre-publish)**: a few rules cannot run inside
   `__post_init__` — LoRA normalization, and the auto-parser detection that needs a
   tokenizer/chat-template load. They are resolution, not mutation, and they
-  **declare** via `arg_groups.overrides.declare_late_resolution(server_args,
-  source, **fields)` — a two-line delegator to `declare_resolution`, kept as a
-  separate name because the name is the only marker of *when* the declaration is
-  made and two guardrails scan for it (location cannot substitute: `lora_hook`
-  is late and sits inside `arg_groups/`, while the NPU default helper and the
-  expert-pack loader are not late and sit outside it). The declaration lands
+  **declare** via `arg_groups.overrides.declare_resolution(server_args, source,
+  **fields)`, the same call the rest of the pipeline makes; there is no
+  `declare_late_resolution` any more. *When* a declaration is made is not
+  something the code marks — the guardrails that used to read that marker
+  cover these sites through the ordinary keyword scan instead. The declaration lands
   in the stash on that very object, so every holder of it carries the decision —
   the HTTP server, the multi-tokenizer workers it is serialized for, the
   schedulers it forks — and each of them publishes bags projected from it. The
@@ -438,7 +437,6 @@ around it are spellings, not mechanisms:
 
 | name | what it adds |
 |---|---|
-| `declare_late_resolution` | nothing but the name, which marks launcher-stage so the guardrails can scan for it |
 | `run_post_process_pass` | runs a pass at its slot and validates its return; declares through `declare_resolution`. A pass returning an **empty** dict is a validation, not a declaration, and stays legal on the published instance — `Engine(server_args=sa)` after `Engine.shutdown()` re-runs `check_server_args` on the very instance the context holds |
 | `capture_foreign_writes` | not a declaration channel: it hands the record to a writer this tree does not own (an out-of-tree platform plugin, a registered speculative algorithm), lifts the write seal for that call, and declares the diff. Every in-tree implementation declares properly, so it captures nothing for them |
 

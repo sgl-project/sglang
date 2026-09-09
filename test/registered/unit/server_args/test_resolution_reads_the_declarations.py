@@ -86,7 +86,6 @@ def _field_reads(fn, holders):
 _DECLARERS = frozenset(
     {
         "declare_resolution",
-        "declare_late_resolution",
         "capture_foreign_writes",
     }
 )
