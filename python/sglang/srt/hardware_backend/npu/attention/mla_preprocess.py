@@ -243,6 +243,14 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
 
     def mlaprolog_preprocess_weight(self):
+        # MLAPrologV3 weight quantization modes (self.weight_quant_mode) used here:
+        #   0: No weight quantization. QKV-A and Q-B weights are FP16/BF16.
+        #   1: Partial INT8 quantization. Only weight_uq_qr (Q-B projection)
+        #      is INT8; weight_dq and weight_dkv_kr (QKV-A projection) remain
+        #      FP16/BF16. dequant_scale_w_uq_qr is required.
+        #   3: MXFP8 quantization. token_x, weight_dq, weight_uq_qr, and
+        #      weight_dkv_kr use MXFP8 with their corresponding dequant scales.
+        #      weight_uk remains unquantized.
         from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
             NPUMXFP8LinearMethod,
         )
