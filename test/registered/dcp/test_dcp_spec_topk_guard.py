@@ -58,13 +58,15 @@ class TestDCPSpecTopkGuard(CustomTestCase):
             with self.subTest(topk=topk):
                 self._validate("DSPARK", topk, dcp_size=8)
 
-    def test_algorithm_predicates_are_not_getattr_defaulted(self):
+    def test_algorithm_predicates_the_guard_reads(self):
         """A renamed predicate must break loudly, not silently disable the guard."""
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         algo = SpeculativeAlgorithm.from_string("EAGLE3")
-        for name in ("is_eagle", "is_dflash", "is_dspark"):
-            self.assertTrue(hasattr(algo, name), f"SpeculativeAlgorithm lost {name}()")
+        self.assertTrue(algo.is_eagle())
+        self.assertFalse(algo.is_standalone())
+        self.assertFalse(algo.is_dflash())
+        self.assertFalse(algo.is_dspark())
 
 
 if __name__ == "__main__":
