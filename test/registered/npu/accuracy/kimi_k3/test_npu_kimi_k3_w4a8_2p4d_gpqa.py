@@ -33,7 +33,7 @@ KIMI_K3_W4A8_2P4D_PREFILL_ENVS = {
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
     "HCCL_BUFFSIZE": "800",
-    "SGLANG_PP_LAYER_PARTITION": "48,45",
+    # "SGLANG_PP_LAYER_PARTITION": "48,45",
 }
 
 KIMI_K3_W4A8_2P4D_DECODE_ENVS = {
@@ -61,9 +61,9 @@ KIMI_K3_W4A8_2P4D_PREFILL_ARGS = [
     "--disaggregation-mode",
     "prefill",
     "--tp-size",
-    16,
+    32,
     "--pp-size",
-    2,
+    1,
     "--dp-size",
     2,
     "--nnodes",
