@@ -27,6 +27,7 @@ import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -165,10 +166,11 @@ class UnifiedTreeNode:
         return self.hash_value[-1]
 
     def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
-        if node is None or node.hash_value is None:
-            return []
-
-        return node.get_prefix_hash_values(node.parent) + node.hash_value
+        chunks = []
+        while node is not None and node.hash_value is not None:
+            chunks.append(node.hash_value)
+            node = node.parent
+        return [value for chunk in reversed(chunks) for value in chunk]
 
 
 class UnifiedLRUList:
@@ -404,7 +406,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
-        self.eviction_strategy = get_eviction_strategy(params.eviction_policy.lower())
+        self.eviction_strategy = get_eviction_strategy(
+            params.eviction_policy.lower(), params.eviction_policy_config
+        )
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
@@ -1131,9 +1135,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         state.phase = _InsertPhase.TAIL
 
     def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
+        components = self.components
+        if self.is_write_back:
+            swa = self.components_by_type.get(ComponentType.SWA)
+            components = () if swa is None else (swa,)
         return any(
             component.needs_incremental_backup(node)
-            for component in self.components
+            for component in components
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
@@ -1147,7 +1155,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = state.target_node
         return (
             self.enable_hicache
-            and not self.is_write_back
             and node.backuped
             and node.write_through_pending_id is None
             and self._needs_incremental_component_backup(node)
@@ -1484,11 +1491,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if absent. Under
-        write_back, FULL pressure reclaims redundant Full host copies first."""
+        write_back, FULL pressure reclaims redundant Full host copies first
+        (skipped if SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM=1)."""
         result = DriveHostEvictionResult()
         comp = self.components_by_type.get(component_type)
         if comp is not None:
-            if self.is_write_back and component_type == BASE_COMPONENT_TYPE:
+            if (
+                not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+                and self.is_write_back
+                and component_type == BASE_COMPONENT_TYPE
+            ):
                 self._reclaim_full_host_duplicates(
                     num_tokens,
                     result.tracker,
@@ -1979,7 +1991,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
-            if node.component_data[comp.component_type].host_value is not None:
+            cd = node.component_data[comp.component_type]
+            if cd.host_value is not None and not comp.needs_incremental_backup(node):
                 continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
@@ -2203,10 +2216,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self._update_duplicate_tracking(node)
             node = node.parent
 
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
-        """Mark a node as having an in-flight write-through backup."""
-        node = self.node_by_id(node_id)
-        node.write_through_pending_id = node_id
+    def mark_write_through_pending(
+        self, node_ids: list[NodeId], ack_id: NodeId
+    ) -> list[NodeId]:
+        """Stamp ack_id on every covered node; returns them ancestors first."""
+        marked: list[tuple[int, NodeId]] = []
+        for node_id in node_ids:
+            node = self.node_by_id(node_id)
+            assert node.write_through_pending_id in (
+                None,
+                ack_id,
+            ), f"node {node.id} is already pending under a different write-through ack"
+            node.write_through_pending_id = ack_id
+            marked.append((self._depth_from_root(node), node_id))
+        marked.sort()
+        return [node_id for _, node_id in marked]
+
+    @staticmethod
+    def _depth_from_root(node: UnifiedTreeNode) -> int:
+        depth = 0
+        while node.parent is not None:
+            depth += 1
+            node = node.parent
+        return depth
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the

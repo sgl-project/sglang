@@ -27,6 +27,7 @@ import triton
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
+    qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
@@ -67,6 +68,10 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    bf16_gemm_dispatch,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -100,6 +105,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_stream,
 )
@@ -128,6 +134,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
+_QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
@@ -365,19 +372,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # projection of the input hidden states
         self.in_proj_qkvzba = None
         if gdn_in_proj_merge.ENABLED:
-            self.in_proj_qkvzba = gdn_in_proj_merge.build(
-                hidden_size=self.hidden_size,
-                key_dim=self.key_dim,
-                value_dim=self.value_dim,
-                num_v_heads=self.num_v_heads,
-                quant_config=quant_config,
-                prefix=add_prefix(gdn_in_proj_merge.MERGED_PARAM, prefix),
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
-            )
-            if self.in_proj_qkvzba is not None:
-                self.qkvz_width = (2 * self.key_dim + 2 * self.value_dim) // self.attn_tp_size
-                self.ba_width = (2 * self.num_v_heads) // self.attn_tp_size
+            self.in_proj_qkvzba = gdn_in_proj_merge.build(self, quant_config, prefix)
 
         self.in_proj_qkvz = self.create_qkvz_proj(
             hidden_size=self.hidden_size,
@@ -387,7 +382,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("in_proj_qkvz", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-        ) if self.in_proj_qkvzba is None else None
+        )
 
         self.in_proj_ba = self.create_ba_proj(
             hidden_size=self.hidden_size,
@@ -396,21 +391,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("in_proj_ba", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-        ) if self.in_proj_qkvzba is None else None
+        )
 
         # Override weight loaders for packed checkpoint format.
         # Important: for FP8, this must cover not only `.weight` but also
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
+        self._bind_packed_weight_loaders(self.in_proj_qkvz)
+        self._bind_packed_weight_loaders(self.in_proj_ba)
         if self.in_proj_qkvzba is not None:
-            self._bind_packed_weight_loaders(self.in_proj_qkvzba)
-        else:
-            self._bind_packed_weight_loaders(self.in_proj_qkvz)
-            self._bind_packed_weight_loaders(self.in_proj_ba)
+            gdn_in_proj_merge.claim_input_proj(self)
+        self._fused_in_proj_weight: Optional[torch.Tensor] = None
+        self._fused_in_proj_qkvz_width = 0
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
-                and self.in_proj_qkvz is not None
-                and self.in_proj_ba is not None
                 and self.in_proj_qkvz._parameters.get("weight") is not None
                 and self.in_proj_ba._parameters.get("weight") is not None
                 and self.in_proj_qkvz._parameters["weight"].dtype == torch.bfloat16
@@ -644,14 +638,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=tp_size,
         )
 
-    @property
-    def qkvz_proj(self) -> nn.Module:
-        return (
-            self.in_proj_qkvzba
-            if self.in_proj_qkvzba is not None
-            else self.in_proj_qkvz
-        )
-
     def fix_query_key_value_ordering(
         self,
         mixed_qkvz: torch.Tensor,
@@ -674,13 +660,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
+    def finalize_fused_in_proj(self) -> None:
+        """Stack in_proj_qkvz + in_proj_ba into one GEMM weight;
+        the module weights become row views of it,
+        so weight reload and dtype checks still see them."""
+        if not _is_cuda or self._fused_in_proj_weight is not None:
+            return
+        if get_lora().enable_lora or get_lora().lora_paths:
+            # LoRA wraps the individual Linear modules; the fused GEMM would
+            # bypass their adapters.
+            return
+        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        if not (
+            isinstance(qkvz.quant_method, UnquantizedLinearMethod)
+            and isinstance(ba.quant_method, UnquantizedLinearMethod)
+            and qkvz.weight.dtype == torch.bfloat16
+            and ba.weight.dtype == torch.bfloat16
+            and qkvz.bias is None
+            and ba.bias is None
+        ):
+            return
+        fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
+        self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
+        qkvz.weight.data = fused[: self._fused_in_proj_qkvz_width]
+        ba.weight.data = fused[self._fused_in_proj_qkvz_width :]
+        self._fused_in_proj_weight = fused
+
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if gdn_in_proj_merge.ENABLED and self.in_proj_qkvzba is not None:
-            hs = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvzba)
-            projected_states, _ = self.in_proj_qkvzba(hs)
-            return gdn_in_proj_merge.split_output(
-                projected_states, self.qkvz_width, self.ba_width
-            )
+        if gdn_in_proj_merge.owns_input_proj(self):
+            return gdn_in_proj_merge.project(self, hidden_states)
 
         # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
         # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
@@ -689,6 +697,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # the tuple branch and keep the original control flow below unchanged.
         if _use_aiter and isinstance(hidden_states, tuple):
             return self._forward_input_proj_fused_quant_amd(hidden_states)
+
+        if (
+            self._fused_in_proj_weight is not None
+            and hidden_states.dtype == torch.bfloat16
+            # Measured on cuBLAS above ~1k rows:
+            # the merged (m, 4120) GEMM is ~10% slower than the two separate GEMMs.
+            and hidden_states.shape[0] <= 1024
+        ):
+            fused_out = bf16_gemm_dispatch(
+                hidden_states, self._fused_in_proj_weight, None
+            )
+            return (
+                fused_out[:, : self._fused_in_proj_qkvz_width],
+                fused_out[:, self._fused_in_proj_qkvz_width :],
+            )
 
         if (
             _is_cpu
@@ -818,6 +841,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     backend, projected_states_qkvz, projected_states_ba, forward_batch
                 )
 
+        use_strided_prefill_z = False
         use_fused_decode_proj_conv = (
             _gdn_decode_fused_proj_conv
             and forward_batch.forward_mode.is_decode()
@@ -841,7 +865,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+            use_strided_prefill_z = (
+                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+            split_fn = (
+                qwen3_5_gdn_prefill_projection_views
+                if use_strided_prefill_z
+                else fused_qkvzba_split_reshape_cat_contiguous
+            )
+            mixed_qkv, z, b, a = split_fn(
                 projected_states_qkvz,
                 projected_states_ba,
                 num_k_heads_tp,
@@ -881,11 +913,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        if use_strided_prefill_z:
+            z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
+        else:
+            z = z.reshape(-1, z.shape[-1])
+            z_flat_shape = z.shape
 
         # Add padding for DP-Attn
-        if core_attn_out.shape != z.shape:
-            core_attn_out_pad = torch.zeros_like(z)
+        if core_attn_out.shape != z_flat_shape:
+            core_attn_out_pad = z.new_zeros(z_flat_shape)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
@@ -922,7 +958,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # NOTE: Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type == "qwen3_5_moe_text":
+        if config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -971,7 +1007,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # it. Otherwise, stay on the plain AR+RMSNorm path.
         enable_fused_ar_quant = (
             _enable_qwen35_fused_ar_quant()
-            and _linear_accepts_fp8_tuple(self.linear_attn.qkvz_proj)
+            and _linear_accepts_fp8_tuple(gdn_in_proj_merge.qkvz_proj(self.linear_attn))
         )
         self.layer_communicator = _layer_communicator_class(config, is_nextn)(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -1174,7 +1210,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
-        elif config.model_type == "qwen3_5_moe_text":
+        elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1366,6 +1402,37 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
         return q, k, v, gate
 
+    def _prepare_qkv_gate(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if _is_cuda and self.attn_output_gate:
+            return self.forward_prepare_cuda_fused(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        if (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
+            return self.forward_prepare_fused_gate(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or not self.attn_output_gate
+        ):
+            return self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        return self.forward_prepare_npu(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -1373,31 +1440,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
-            q, k, v, gate = self.forward_prepare_cuda_fused(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-        elif (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
-            q, k, v, gate = self.forward_prepare_fused_gate(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-        elif (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
-            q, k, v, gate = self.forward_prepare_native(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-        else:
-            q, k, v, gate = self.forward_prepare_npu(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+        q, k, v, gate = self._prepare_qkv_gate(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
 
         attn_output = self.attn(q, k, v, forward_batch)
 
@@ -1513,6 +1560,8 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    decoder_layer_types = ALL_DECODER_LAYER_TYPES
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1554,14 +1603,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         elif module_name == "gate_up_proj":
             # MoE: shared expert uses shared_expert_intermediate_size
             # Dense: regular MLP uses intermediate_size
-            is_moe = "moe" in getattr(config, "model_type", "")
+            is_moe = config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES
             if is_moe:
                 inter = config.shared_expert_intermediate_size
             else:
                 inter = config.intermediate_size
             return config.hidden_size, inter * 2
         elif module_name == "down_proj":
-            is_moe = "moe" in getattr(config, "model_type", "")
+            is_moe = config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES
             if is_moe:
                 inter = config.shared_expert_intermediate_size
             else:
@@ -1595,20 +1644,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
-        if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                enable_tp=not is_dp_attention_enabled(),
-            )
-        else:
-            self.embed_tokens = PPMissingLayer()
+        self.embed_tokens = self._build_embed_tokens(config)
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):
             layer_type = config.layers_block_type[idx]
-            layer_class = ALL_DECODER_LAYER_TYPES[layer_type]
+            layer_class = self.decoder_layer_types[layer_type]
             if layer_type == "attention":
                 prefix = add_prefix("self_attn", prefix)
             else:
@@ -1679,6 +1720,17 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
 
         self.layers_to_capture = []
+
+    def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
+        """Embedding sharding hook for models reusing this backbone."""
+        if not self.pp_group.is_first_rank:
+            return PPMissingLayer()
+        return VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            enable_tp=not is_dp_attention_enabled(),
+        )
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -2690,7 +2742,7 @@ def _qwen3_5_shared_experts_fusion_disable_reason(hf_config, quant_config):
     if not _is_hip:
         return None
     text_config = getattr(hf_config, "text_config", hf_config)
-    if getattr(text_config, "model_type", None) != "qwen3_5_moe_text":
+    if text_config.model_type not in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
         return None
     if can_fuse_shared_expert(text_config, quant_config):
         return None

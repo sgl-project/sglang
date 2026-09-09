@@ -171,12 +171,12 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     a,
     mixed_qkvz,
     mixed_ba,
+    qkvz_row_stride,
+    ba_row_stride,
     NUM_HEADS_QK: tl.constexpr,
     NUM_HEADS_V: tl.constexpr,
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
-    QKVZ_STRIDE: tl.constexpr,
-    BA_STRIDE: tl.constexpr,
     V_POW2: tl.constexpr,
 ):
     i_bs, i_qk = tl.program_id(0), tl.program_id(1)
@@ -193,11 +193,13 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
 
     # ── Read from contiguous input ──
     # q for head group i_qk: in the all_q region, offset i_qk * HEAD_QK
-    blk_q_ptr = mixed_qkvz + i_bs * QKVZ_STRIDE + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
+    blk_q_ptr = (
+        mixed_qkvz + i_bs * qkvz_row_stride + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
+    )
     # k for head group i_qk: in the all_k region
     blk_k_ptr = (
         mixed_qkvz
-        + i_bs * QKVZ_STRIDE
+        + i_bs * qkvz_row_stride
         + TOTAL_Q
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
@@ -210,7 +212,7 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     # dead branch is pruned before tl.arange validation.
     v_ld_base = (
         mixed_qkvz
-        + i_bs * QKVZ_STRIDE
+        + i_bs * qkvz_row_stride
         + TOTAL_Q
         + TOTAL_K
         + i_qk * V_PER_GROUP * HEAD_V
@@ -254,12 +256,14 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
 
     # ── b and a from contiguous [all_b | all_a] ──
     for i in tl.static_range(V_PER_GROUP):
-        blk_b_ptr = mixed_ba + i_bs * BA_STRIDE + i_qk * V_PER_GROUP + i
+        blk_b_ptr = mixed_ba + i_bs * ba_row_stride + i_qk * V_PER_GROUP + i
         blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
 
     for i in tl.static_range(V_PER_GROUP):
-        blk_a_ptr = mixed_ba + i_bs * BA_STRIDE + NUM_HEADS_V + i_qk * V_PER_GROUP + i
+        blk_a_ptr = (
+            mixed_ba + i_bs * ba_row_stride + NUM_HEADS_V + i_qk * V_PER_GROUP + i
+        )
         blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
 
@@ -273,9 +277,6 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     head_v,
 ):
     """Fused split/reshape/cat for CONTIGUOUS input format (Qwen3.5).
-
-    Rows are addressed by each tensor's own stride, so inputs may be column slices of
-    a wider projection.
 
     Input layout:
         mixed_qkvz: [all_q | all_k | all_v | all_z]
@@ -326,16 +327,34 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         a,
         mixed_qkvz,
         mixed_ba,
+        mixed_qkvz.stride(0),
+        mixed_ba.stride(0),
         num_heads_qk,
         num_heads_v,
         head_qk,
         head_v,
-        mixed_qkvz.stride(0),
-        mixed_ba.stride(0),
         V_POW2=(v_per_group & (v_per_group - 1)) == 0,
         num_warps=num_warps,
         num_stages=3,
     )
+    return mixed_qkv, z, b, a
+
+
+def qwen3_5_gdn_prefill_projection_views(
+    mixed_qkvz,
+    mixed_ba,
+    num_heads_qk,
+    num_heads_v,
+    head_qk,
+    head_v,
+):
+    """Return strided views accepted by the prefill GDN consumers."""
+    tokens = mixed_qkvz.shape[0]
+    qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+    mixed_qkv = mixed_qkvz[:, :qkv_dim]
+    z = mixed_qkvz[:, qkv_dim:].view(tokens, num_heads_v, head_v)
+    b = mixed_ba[:, :num_heads_v]
+    a = mixed_ba[:, num_heads_v : 2 * num_heads_v]
     return mixed_qkv, z, b, a
 
 
