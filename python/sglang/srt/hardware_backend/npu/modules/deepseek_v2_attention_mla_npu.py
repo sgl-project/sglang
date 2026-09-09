@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+_is_npu_arch35 = is_npu_arch35()
 
 
 # region MHA
@@ -371,8 +372,6 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
-    if not hasattr(m, "_npu_is_arch35"):
-        m._npu_is_arch35 = is_npu_arch35()
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -543,7 +542,7 @@ def forward_dsa_core_npu(
     )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
-    if m._npu_is_arch35 or (
+    if _is_npu_arch35 or (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_draft_extend_v2()
         and not forward_batch.forward_mode.is_target_verify()
