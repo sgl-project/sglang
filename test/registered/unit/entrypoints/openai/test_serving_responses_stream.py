@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from utils import (
@@ -394,6 +395,206 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             if ev == "response.output_text.delta"
         )
         self.assertEqual(streamed, "Answer<|e")
+
+
+class HarmonyStreamLifecycleTestCase(CustomTestCase):
+    def test_truncated_harmony_arguments_close_the_emitted_item(self):
+        from openai_harmony import Role
+
+        from sglang.srt.entrypoints.context import StreamingHarmonyContext
+
+        serving = make_serving()
+        serving.use_harmony = True
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        context = Mock(spec=StreamingHarmonyContext)
+        context.messages = []
+        context.parser = SimpleNamespace(
+            current_content='{"city":',
+            current_role=Role.ASSISTANT,
+            current_channel="commentary",
+            current_recipient="functions.lookup",
+        )
+        context.num_prompt_tokens = 5
+        context.num_output_tokens = 3
+        context.num_cached_tokens = 0
+        context.num_reasoning_tokens = 0
+        context.finish_reason = {"type": "length"}
+
+        async def generate():
+            yield context
+
+        events = asyncio.run(
+            collect_stream_events(
+                serving.responses_stream_generator(
+                    request,
+                    {},
+                    generate(),
+                    context,
+                    "x",
+                    Mock(),
+                    RequestResponseMetadata(request_id=request.request_id),
+                    require_reasoning=False,
+                )
+            )
+        )
+        payloads = event_payloads(events)
+        self.assertEqual(payloads[-1]["type"], "response.incomplete")
+        output = payloads[-1]["response"]["output"]
+        self.assertEqual(output[0]["arguments"], '{"city":')
+        self.assertEqual(output[0]["status"], "incomplete")
+        added = next(
+            p["item"] for p in payloads if p["type"] == "response.output_item.added"
+        )
+        done = next(
+            p["item"] for p in payloads if p["type"] == "response.output_item.done"
+        )
+        self.assertEqual(added["id"], done["id"])
+        self.assertEqual(done, output[0])
+        self.assertEqual(added["call_id"], done["call_id"])
+
+    def test_split_and_coalesced_messages_preserve_stream_items(self):
+        from openai_harmony import Message, Role, StreamState
+
+        from sglang.srt.entrypoints.context import StreamingHarmonyContext
+
+        reasoning = Message.from_role_and_content(Role.ASSISTANT, "plan").with_channel(
+            "analysis"
+        )
+        commentary = Message.from_role_and_content(
+            Role.ASSISTANT, "checking"
+        ).with_channel("commentary")
+        call = (
+            Message.from_role_and_content(Role.ASSISTANT, '{"city":"Beijing"}')
+            .with_channel("commentary")
+            .with_recipient("functions.lookup")
+        )
+        code = (
+            Message.from_role_and_content(Role.ASSISTANT, "print(42)")
+            .with_channel("commentary")
+            .with_recipient("python")
+        )
+        search = (
+            Message.from_role_and_content(Role.ASSISTANT, '{"query":"weather"}')
+            .with_channel("commentary")
+            .with_recipient("browser.search")
+        )
+        final = Message.from_role_and_content(Role.ASSISTANT, "answer").with_channel(
+            "final"
+        )
+        snapshots = [
+            ([], "analysis", None, "pl"),
+            ([reasoning], "commentary", None, "checking"),
+            ([reasoning, commentary], "commentary", "functions.lookup", '{"city":'),
+            ([reasoning, commentary, call], "commentary", "python", "print("),
+            ([reasoning, commentary, call, code, search], "final", None, "ans"),
+            ([reasoning, commentary, call, code, search, final], None, None, ""),
+        ]
+        for chunks in (snapshots, [snapshots[0], snapshots[-1]]):
+            with self.subTest(chunk_count=len(chunks)):
+                serving = make_serving()
+                serving.use_harmony = True
+                request = ResponsesRequest(
+                    model="x",
+                    input="hi",
+                    stream=True,
+                    store=True,
+                    include=["reasoning.encrypted_content"],
+                    reasoning={"summary": "auto"},
+                )
+                context = StreamingHarmonyContext.__new__(StreamingHarmonyContext)
+                context.num_init_messages = 2
+                context.num_prompt_tokens = 5
+                context.num_output_tokens = 10
+                context.num_cached_tokens = 0
+                context.num_reasoning_tokens = 0
+                context.finish_reason = {"type": "stop"}
+                context.last_tok = None
+                context.encoding = Mock()
+                context.encoding.stop_tokens_for_assistant_actions.return_value = []
+
+                async def generate():
+                    for messages, channel, recipient, text in chunks:
+                        context.parser = SimpleNamespace(
+                            messages=messages,
+                            current_role=Role.ASSISTANT,
+                            current_channel=channel,
+                            current_recipient=recipient,
+                            current_content=text,
+                            last_content_delta=text,
+                            state=StreamState.CONTENT,
+                        )
+                        yield context
+
+                events = asyncio.run(
+                    collect_stream_events(
+                        serving.responses_stream_generator(
+                            request,
+                            {},
+                            generate(),
+                            context,
+                            "x",
+                            Mock(),
+                            RequestResponseMetadata(request_id=request.request_id),
+                            require_reasoning=False,
+                        )
+                    )
+                )
+                payloads = event_payloads(events)
+                output = find_completed_event(events)["response"]["output"]
+                self.assertEqual(
+                    [item["type"] for item in output],
+                    [
+                        "reasoning",
+                        "message",
+                        "function_call",
+                        "code_interpreter_call",
+                        "web_search_call",
+                        "message",
+                    ],
+                )
+                added = [
+                    p for p in payloads if p["type"] == "response.output_item.added"
+                ]
+                done = [p for p in payloads if p["type"] == "response.output_item.done"]
+                self.assertEqual([p["output_index"] for p in added], list(range(6)))
+                self.assertEqual([p["output_index"] for p in done], list(range(6)))
+                self.assertEqual(
+                    [p["item"]["id"] for p in added], [i["id"] for i in output]
+                )
+                self.assertEqual(len({i["id"] for i in output}), 6)
+                self.assertEqual([p["item"] for p in done], output)
+                self.assertEqual(
+                    [p["sequence_number"] for p in payloads], list(range(len(payloads)))
+                )
+                for index, field, event_type in (
+                    (0, "content", "response.reasoning_text.delta"),
+                    (1, "content", "response.output_text.delta"),
+                    (2, "arguments", "response.function_call_arguments.delta"),
+                    (5, "content", "response.output_text.delta"),
+                ):
+                    text = "".join(
+                        p["delta"]
+                        for p in payloads
+                        if p["type"] == event_type and p["output_index"] == index
+                    )
+                    expected = output[index][field]
+                    self.assertEqual(
+                        text, expected[0]["text"] if field == "content" else expected
+                    )
+                self.assertEqual(output[1]["phase"], "commentary")
+                self.assertEqual(output[5]["phase"], "final_answer")
+                self.assertTrue(output[0]["encrypted_content"])
+                self.assertEqual(output[3]["code"], "print(42)")
+                for event_type in (
+                    "response.code_interpreter_call_code.done",
+                    "response.code_interpreter_call.completed",
+                    "response.web_search_call.completed",
+                ):
+                    self.assertIn(event_type, event_types(events))
+                self.assertEqual(
+                    serving.response_store[request.request_id].model_dump()["output"],
+                    output,
+                )
 
 
 class MultiToolCallStreamingOrderTestCase(CustomTestCase):

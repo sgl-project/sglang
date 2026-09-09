@@ -9,6 +9,7 @@ from typing import Optional, Union
 
 import orjson
 from openai.types.responses import (
+    ResponseCodeInterpreterToolCall,
     ResponseOutputItem,
 )
 from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
@@ -323,6 +324,17 @@ def parse_output_message(message: Message):
             type="web_search_call",
         )
         output_items.append(web_search_item)
+    elif recipient is not None and recipient.startswith("python"):
+        output_items.append(
+            ResponseCodeInterpreterToolCall(
+                id=f"ci_{random_uuid()}",
+                type="code_interpreter_call",
+                code="".join(content.text for content in message.content),
+                container_id="auto",
+                outputs=[],
+                status="completed",
+            )
+        )
     elif message.channel == "analysis":
         for content in message.content:
             reasoning_item = ResponseReasoningItem(
@@ -339,7 +351,7 @@ def parse_output_message(message: Message):
             output_items.append(reasoning_item)
     elif message.channel == "commentary" and message.recipient is not None:
         if message.recipient.startswith("functions."):
-            function_name = message.recipient.split(".")[-1]
+            function_name = message.recipient.removeprefix("functions.")
             for content in message.content:
                 random_id = random_uuid()
                 response_item = ResponseFunctionToolCall(
@@ -403,6 +415,17 @@ def parse_remaining_state(parser: StreamableParser):
     if current_recipient is not None and current_recipient.startswith("browser."):
         return []
 
+    if current_recipient is not None and current_recipient.startswith("python"):
+        return [
+            ResponseCodeInterpreterToolCall(
+                id=f"ci_{random_uuid()}",
+                type="code_interpreter_call",
+                code=parser.current_content,
+                container_id="auto",
+                outputs=[],
+                status="in_progress",
+            )
+        ]
     if parser.current_channel == "analysis":
         reasoning_item = ResponseReasoningItem(
             id=f"rs_{random_uuid()}",
@@ -416,6 +439,18 @@ def parse_remaining_state(parser: StreamableParser):
             status=None,
         )
         return [reasoning_item]
+    elif current_recipient is not None and current_recipient.startswith("functions."):
+        random_id = random_uuid()
+        return [
+            ResponseFunctionToolCall(
+                id=f"ft_{random_id}",
+                call_id=f"call_{random_id}",
+                type="function_call",
+                name=current_recipient.removeprefix("functions."),
+                arguments=parser.current_content,
+                status="in_progress",
+            )
+        ]
     elif parser.current_channel == "final" or (
         parser.current_channel == "commentary" and current_recipient is None
     ):
