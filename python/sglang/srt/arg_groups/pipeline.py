@@ -187,12 +187,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     apply_inkling_prefill_cuda_graph_default(server_args)
     apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args)
-    apply_glm5_chunked_prefill_default(server_args)
 
     # must run before _handle_cuda_graph_config and _handle_data_parallelism
     handle_dwdp(server_args)
 
     handle_cuda_graph_config(server_args)
+    # Requires the parsed backend and explicit-input locks, and must precede
+    # handle_gpu_memory_settings so the chunk size feeds memory budgeting.
+    apply_glm5_chunked_prefill_default(server_args)
 
     # Handle device-specific backends.
     from sglang.srt.arg_groups.platform_hook import (
