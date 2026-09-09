@@ -11,32 +11,12 @@ import torch
 import torch.distributed as dist
 
 from .comparison import compare
-from .dispatcher import forward_layer, initialize, run_layer
+from .dispatcher import dispatchers_for, forward_layer, initialize, run_layer
 from .ep_audit import EpAudit
 from .oracle import RoutingBatch, expected_combine, make_fixture, validate_capacity
 
 CASES = ("balanced", "hotspot", "padding", "empty_rank", "all_masked")
 CHANGES = ("tokens", "routing", "weights", "all")
-
-
-def dispatchers_for(coordinator, layers):
-    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-    from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
-
-    return [
-        NcclEpDispatcher(
-            MoeRunnerConfig(
-                num_experts=4,
-                num_local_experts=2,
-                hidden_size=2048,
-                top_k=2,
-                params_dtype=torch.bfloat16,
-                layer_id=layer,
-            ),
-            coordinator,
-        )
-        for layer in range(layers)
-    ]
 
 
 def backend_for(coordinator, capacity):

@@ -4,7 +4,8 @@ The two-rank execution snapshot is based on PR #32329 commit
 `efd30456466549fd2be6131eaba0edd8972506a4`. The validated implementation patch has
 SHA256 `7227531565825e203c3fdc71fbdf14e013c2ec01a08f03c831aa280d46a67c1e`.
 PR preparation relocates the shared harness, registers the unit tests, provides
-an in-tree CLI, and adds installation metadata/documentation. Those changes must
+an in-tree CLI, shares test factories, reorders unchanged resource declarations,
+and adds installation metadata/documentation. Those changes must
 not be confused with a fresh two-GPU run of the final submission commit.
 
 ## Environment
@@ -41,6 +42,11 @@ matrix verifier checked 27 required reports and the 2942-file source inventory.
 
 The submitted registered tests also passed locally on RTX 4060 Laptop (SM89):
 88 tests across the six NCCL EP files, including real CUDA Graphs with fake EP.
+The combined NCCL EP and existing runtime/configuration/input-buffer selection
+passes 202 tests and 8 subtests. Changed production-line coverage is 89% against
+the fixed parent SHA (repository threshold: 60%). Both Mintlify checks and the
+full pre-commit hook set pass.
+
 That local environment uses the historical Torch `2.11.0+cu130.nccl2307` build;
 only the target-hardware results above use the official Torch wheel.
 

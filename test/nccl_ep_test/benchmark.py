@@ -14,9 +14,9 @@ import torch
 import torch.distributed as dist
 
 from .comparison import compare
-from .dispatcher import forward_layer, initialize
+from .dispatcher import dispatchers_for, forward_layer, initialize
 from .oracle import make_fixture, validate_capacity
-from .sglang_graph import backend_for, dispatchers_for, gpu_inputs
+from .sglang_graph import backend_for, gpu_inputs
 
 METRICS = ("cuda_step_ms", "host_submit_ms", "host_step_ms")
 

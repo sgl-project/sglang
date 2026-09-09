@@ -15,34 +15,6 @@ import torch
 from sglang.srt.runtime_context import get_resources
 
 
-def get_nccl_ep_graph_resources():
-    return get_resources().buffers.get("nccl_ep_graph_resources")
-
-
-def nccl_ep_eager_session():
-    owner = get_nccl_ep_graph_resources()
-    return owner.submission_session("eager") if owner is not None else nullcontext()
-
-
-def require_nccl_ep_eager_session():
-    owner = get_nccl_ep_graph_resources()
-    if owner is not None:
-        owner.require_session("eager")
-
-
-def destroy_nccl_ep_resources():
-    """Close graph executables and EP groups before releasing coordinators."""
-    owner = get_nccl_ep_graph_resources()
-    if owner is not None:
-        owner.shutdown()
-    state = get_resources().buffers.get("nccl_ep_state")
-    if state is not None and state.group is not None:
-        from .nccl_ep import NcclEpBuffer
-
-        torch.cuda.synchronize()
-        NcclEpBuffer.destroy()
-
-
 class NcclEpGraphResources:
     def __init__(self, capacity: int, *, shutdown):
         if not 0 < capacity <= 1024:
@@ -243,3 +215,31 @@ class NcclEpGraphResources:
         self.state = self.signature = self.rows = None
         if not self._sessions and get_nccl_ep_graph_resources() is self:
             get_resources().buffers.pop("nccl_ep_graph_resources")
+
+
+def get_nccl_ep_graph_resources():
+    return get_resources().buffers.get("nccl_ep_graph_resources")
+
+
+def nccl_ep_eager_session():
+    owner = get_nccl_ep_graph_resources()
+    return owner.submission_session("eager") if owner is not None else nullcontext()
+
+
+def require_nccl_ep_eager_session():
+    owner = get_nccl_ep_graph_resources()
+    if owner is not None:
+        owner.require_session("eager")
+
+
+def destroy_nccl_ep_resources():
+    """Close graph executables and EP groups before releasing coordinators."""
+    owner = get_nccl_ep_graph_resources()
+    if owner is not None:
+        owner.shutdown()
+    state = get_resources().buffers.get("nccl_ep_state")
+    if state is not None and state.group is not None:
+        from .nccl_ep import NcclEpBuffer
+
+        torch.cuda.synchronize()
+        NcclEpBuffer.destroy()

@@ -6,12 +6,13 @@ verify NCCL EP communication, its native layout, or cross-rank correctness.
 
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from nccl_ep_test.sglang_graph import backend_for as graph_backend
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -47,20 +48,6 @@ def test_eager_dispatcher_restores_tokens_and_closes_each_external_handle():
         assert environment.events.count("handle_destroy") == 3
     assert environment.events.count("group_create") == 1
     assert environment.events.count("group_destroy") == 1
-
-
-def graph_backend(coordinator, capacity):
-    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
-        FullCudaGraphBackend,
-    )
-
-    return FullCudaGraphBackend(
-        SimpleNamespace(
-            device_module=torch.cuda,
-            model_runner=SimpleNamespace(tp_group=coordinator),
-        ),
-        nccl_ep_capacity=capacity,
-    )
 
 
 def test_graph_replays_changed_data_without_python_handle_updates():

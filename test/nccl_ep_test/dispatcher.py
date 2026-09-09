@@ -61,6 +61,26 @@ def initialize(capacity, *, graph_enabled=False):
     return rank, coordinator, bindings
 
 
+def dispatchers_for(coordinator, layers):
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+
+    return [
+        NcclEpDispatcher(
+            MoeRunnerConfig(
+                num_experts=4,
+                num_local_experts=2,
+                hidden_size=2048,
+                top_k=2,
+                params_dtype=torch.bfloat16,
+                layer_id=layer,
+            ),
+            coordinator,
+        )
+        for layer in range(layers)
+    ]
+
+
 def forward_layer(dispatcher, x, ids, weights, rank, *, identity=False):
     """Only GPU work: safe to use as a runner callback once EP capture is enabled.
 
@@ -94,26 +114,9 @@ def run_layer(dispatcher, batch, rank, *, identity=False):
 
 def exercise_eager(*, buckets=(8, 16, 32), layers=2, identity=False, **unused):
     rank, coordinator, bindings = initialize(max(buckets))
-    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-    from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
-        NcclEpBuffer,
-        NcclEpDispatcher,
-    )
+    from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
 
-    dispatchers = [
-        NcclEpDispatcher(
-            MoeRunnerConfig(
-                num_experts=4,
-                num_local_experts=2,
-                hidden_size=2048,
-                top_k=2,
-                params_dtype=torch.bfloat16,
-                layer_id=layer,
-            ),
-            coordinator,
-        )
-        for layer in range(layers)
-    ]
+    dispatchers = dispatchers_for(coordinator, layers)
     checked = 0
     for bucket, case, change, step in product(
         buckets,
