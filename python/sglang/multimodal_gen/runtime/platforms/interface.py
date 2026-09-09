@@ -8,13 +8,13 @@ import enum
 import random
 from collections.abc import Callable
 from functools import lru_cache
+from pkgutil import resolve_name
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import resolve_obj_by_qualname
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -451,7 +451,7 @@ class Platform:
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
-        return resolve_obj_by_qualname(attention_cls_str)
+        return resolve_name(attention_cls_str)
 
 
 class UnspecifiedPlatform(Platform):
