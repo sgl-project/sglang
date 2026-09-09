@@ -5,7 +5,7 @@ import torch
 
 from sglang.srt.dllm.attention import build_dllm_prefill_blockwise_mask
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
 try:
     from flashinfer import (
@@ -18,8 +18,12 @@ try:
 except ImportError:
     _HAS_FLASHINFER = False
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+# The blockwise-mask cases are pure CPU, but the FlashInfer parity cases they
+# sit beside need a GPU, and a kernel test takes one suite. Running the cheap
+# half on the GPU runner costs a few seconds; splitting the file to keep a CPU
+# lane would cost a second fixture. 1-gpu-large is SM90, which is the shape the
+# wrapper's backend pinning is about (see FlashInferAttnBackend.__init__).
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def _dense_blockwise_reference(q, k, v, prefix_len, block_size):
