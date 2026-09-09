@@ -18,11 +18,15 @@ python -m venv ${PYTHON_ENV_FOR_EVALSCOPE}
 if [ ! -d "${EVALSCOPE_SOURCE_PATH}" ]; then
     echo "The evalscope source does not exist: ${EVALSCOPE_SOURCE_PATH}."
     echo "Install evalscope online."
-    ${PIP_FOR_EVALSCOPE} install -U pip -i ${pip_mirror_source}
-    ${PIP_FOR_EVALSCOPE} install evalscope -i ${pip_mirror_source}
+    # The bundled pip is sufficient; make self-upgrade non-fatal because some
+    # pypi mirrors intermittently return 403 for the latest pip wheel.
+    ${PIP_FOR_EVALSCOPE} install -U pip -i ${pip_mirror_source} \
+        || echo "WARN: pip self-upgrade failed, continue with existing pip"
+    ${PIP_FOR_EVALSCOPE} install --retries 5 --timeout 60 evalscope -i ${pip_mirror_source}
 else
     echo "Install evalscope from local source: ${EVALSCOPE_SOURCE_PATH}"
-    ${PIP_FOR_EVALSCOPE} install -U pip -i ${pip_mirror_source}
-    ${PIP_FOR_EVALSCOPE} install -e ${EVALSCOPE_SOURCE_PATH} -i ${pip_mirror_source}
+    ${PIP_FOR_EVALSCOPE} install -U pip -i ${pip_mirror_source} \
+        || echo "WARN: pip self-upgrade failed, continue with existing pip"
+    ${PIP_FOR_EVALSCOPE} install --retries 5 --timeout 60 -e ${EVALSCOPE_SOURCE_PATH} -i ${pip_mirror_source}
 fi
 echo "===== Install evalscope in virtual env - End ====="
