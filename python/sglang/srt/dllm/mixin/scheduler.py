@@ -187,18 +187,18 @@ class SchedulerDllmMixin:
         context_len = req.dllm_block_offset
         block_size = self.dllm_config.block_size
         assert req.extend_range.end == context_len + block_size
-        assert req.kv is not None and req.req_pool_idx is not None
+        assert req.kv is not None and req.kv.req_pool_idx is not None
 
         allocated_len = req.kv.kv_allocated_len
         page_size = self.token_to_kv_pool_allocator.page_size
         free_start = -(-context_len // page_size) * page_size
         if free_start < allocated_len:
             slots = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, free_start:allocated_len
+                req.kv.req_pool_idx, free_start:allocated_len
             ]
             self.token_to_kv_pool_allocator.free_segment(slots, start_pos=free_start)
 
-        req.kv_committed_len = context_len
+        req.kv.kv_committed_len = context_len
         req.kv.kv_allocated_len = context_len
         assert req.kv.swa_evicted_seqlen <= context_len
         req.set_extend_range(context_len, context_len)

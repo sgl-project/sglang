@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -34,12 +34,12 @@ class _Req:
         self.extend_range = SimpleNamespace(
             start=context_len, end=context_len + block_size, length=block_size
         )
-        self.req_pool_idx = 1
-        self.kv = SimpleNamespace(
+        self.kv = ReqKvInfo(
+            req_pool_idx=1,
             kv_allocated_len=context_len + block_size,
+            kv_committed_len=context_len + block_size,
             swa_evicted_seqlen=0,
         )
-        self.kv_committed_len = context_len + block_size
         self.finished_reason = None
         self.finish_on_update = False
         self.retracted_stain = False
@@ -193,10 +193,15 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
 
     def test_completed_canvas_frees_only_decoder_pages_and_keeps_slot(self):
         context_len, block_size, page_size = 10, 256, 256
-        req = _Req(context_len=context_len, block_size=block_size)
-        req.req_pool_idx = 3
+        req = Req(
+            "completed-canvas", "", array("q", range(context_len)), SamplingParams()
+        )
+        req.full_untruncated_fill_ids.extend([0] * block_size)
+        req.dllm_block_offset = context_len
+        req.set_extend_range(context_len, context_len + block_size)
+        req.kv.req_pool_idx = 3
         req.kv.kv_allocated_len = context_len + block_size
-        req.kv_committed_len = context_len + block_size
+        req.kv.kv_committed_len = context_len + block_size
 
         req_to_token = torch.arange(4 * 600, dtype=torch.int64).view(4, 600)
         allocator = SimpleNamespace(page_size=page_size, free_segment=Mock())
@@ -211,8 +216,8 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         freed = allocator.free_segment.call_args.args[0]
         torch.testing.assert_close(freed, expected)
         self.assertEqual(allocator.free_segment.call_args.kwargs, {"start_pos": 256})
-        self.assertEqual(req.req_pool_idx, 3)
-        self.assertEqual(req.kv_committed_len, context_len)
+        self.assertEqual(req.kv.req_pool_idx, 3)
+        self.assertEqual(req.kv.kv_committed_len, context_len)
         self.assertEqual(req.kv.kv_allocated_len, context_len)
         self.assertEqual(
             (req.extend_range.start, req.extend_range.end),
@@ -224,7 +229,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         context_len, block_size, slot = 5, 4, 2
         scheduler = _Scheduler(fdfo=True, block_size=block_size)
         req = _Req(context_len=context_len, block_size=block_size)
-        req.req_pool_idx = slot
+        req.kv.req_pool_idx = slot
         state = {"step": 7}
         next_canvas = torch.tensor([9, 8, 7, 6])
 
@@ -239,7 +244,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                 ),
             )
         release.assert_not_called()
-        self.assertEqual(req.req_pool_idx, slot)
+        self.assertEqual(req.kv.req_pool_idx, slot)
         self.assertEqual(req.kv.kv_allocated_len, context_len + block_size)
         self.assertEqual(req.dllm_incomplete_ids.tolist(), next_canvas.tolist())
         self.assertIs(req.dllm_algo_state, state)
