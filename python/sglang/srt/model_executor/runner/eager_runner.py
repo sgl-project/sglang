@@ -324,6 +324,7 @@ class EagerRunner(BaseRunner):
                 model_runner.attn_backend.resolve_prefill_shared_read_ends(
                     forward_batch,
                     num_qo_tokens=len(forward_batch.input_ids),
+                    spec_algorithm=model_runner.spec_algorithm,
                 )
             )
             maybe_publish_prefill_shared_read_done(

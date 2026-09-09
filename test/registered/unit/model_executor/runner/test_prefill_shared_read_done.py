@@ -34,7 +34,6 @@ def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
         attn_backend=attn_backend,
         shared_read_done_event=None,
     )
-    attn_backend.model_runner = runner
     return runner
 
 
@@ -47,7 +46,7 @@ def _batch(mode=ForwardMode.EXTEND):
 
 def _prepare_and_publish(runner, batch):
     shared_read_ends = runner.attn_backend.resolve_prefill_shared_read_ends(
-        batch, num_qo_tokens=8
+        batch, num_qo_tokens=8, spec_algorithm=runner.spec_algorithm
     )
     maybe_publish_prefill_shared_read_done(runner, shared_read_ends, _DEVICE_MODULE)
 

@@ -1129,6 +1129,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return attn_backend.resolve_prefill_shared_read_ends(
             forward_batch,
             num_qo_tokens=num_tokens,
+            spec_algorithm=self.model_runner.spec_algorithm,
             allow_prepare=prepare_late_reads,
         )
 

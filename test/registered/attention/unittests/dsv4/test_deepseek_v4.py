@@ -402,9 +402,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         backend = object.__new__(DeepseekV4AttnBackend)
-        backend.model_runner = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.DFLASH
-        )
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -422,7 +419,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             ),
         ):
             shared_read_ends = backend.resolve_prefill_shared_read_ends(
-                batch, num_qo_tokens=_LARGE_INDEXER_QUERY_THRESHOLD
+                batch,
+                num_qo_tokens=_LARGE_INDEXER_QUERY_THRESHOLD,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
             )
 
         self.assertIs(
@@ -448,9 +447,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         ):
             with self.subTest(num_qo_tokens=num_qo_tokens):
                 backend = object.__new__(DeepseekV4AttnBackend)
-                backend.model_runner = SimpleNamespace(
-                    spec_algorithm=SpeculativeAlgorithm.DFLASH
-                )
                 backend.forward_metadata = DSV4Metadata(
                     self._make_core_metadata(0), indexer_metadata=None
                 )
@@ -466,7 +462,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     ),
                 ):
                     shared_read_ends = backend.resolve_prefill_shared_read_ends(
-                        batch, num_qo_tokens=num_qo_tokens
+                        batch,
+                        num_qo_tokens=num_qo_tokens,
+                        spec_algorithm=SpeculativeAlgorithm.DFLASH,
                     )
 
                 metadata = backend.forward_metadata
@@ -490,9 +488,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         backend = object.__new__(DeepseekV4AttnBackend)
-        backend.model_runner = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.DFLASH
-        )
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -509,7 +504,11 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "snapshot failed"),
         ):
-            backend.resolve_prefill_shared_read_ends(batch, num_qo_tokens=12288)
+            backend.resolve_prefill_shared_read_ends(
+                batch,
+                num_qo_tokens=12288,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            )
 
     def test_refresh_replay_metadata_preserves_captured_tensor_storage(self):
         capture_metadata = self._make_core_metadata(0)

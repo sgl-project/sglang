@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
+    from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 
 class SharedReadEnds(Enum):
@@ -167,6 +167,7 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
         *,
         num_qo_tokens: int,
+        spec_algorithm: SpeculativeAlgorithm,
         allow_prepare: bool = True,
     ) -> SharedReadEnds:
         """Resolve one batch's prefill boundary, preparing snapshots if safe."""
@@ -177,7 +178,6 @@ class AttentionBackend(ABC):
             return SharedReadEnds.UNKNOWN
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return SharedReadEnds.UNKNOWN
-        spec_algorithm = self.model_runner.spec_algorithm
         # EAGLE/MTP may have a later draft-extend reader.
         if not spec_algorithm.is_none() and not spec_algorithm.is_dflash_family():
             return SharedReadEnds.UNKNOWN
