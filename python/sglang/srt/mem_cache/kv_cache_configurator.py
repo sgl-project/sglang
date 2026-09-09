@@ -1029,14 +1029,21 @@ class KVCacheConfigurator:
 
         if not isinstance(self.mambaish_config, Qwen4ExpTextConfig):
             return {}
+        short_conv_layer_ids = [
+            i
+            for i in self.mambaish_config.short_conv_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
         return {
-            "short_conv_layer_ids": [
-                i
-                for i in self.mambaish_config.short_conv_layer_ids
-                if self.layer_info.start_layer <= i < self.layer_info.end_layer
-            ],
-            "short_conv_state_shape": self.mambaish_config.short_conv_state_shape,
-            "ngram_context_len": self.mambaish_config.ngram_context_len,
+            "short_conv_layer_ids": short_conv_layer_ids,
+            "short_conv_state_shape": (
+                self.mambaish_config.short_conv_state_shape
+                if short_conv_layer_ids
+                else None
+            ),
+            "ngram_context_len": (
+                self.mambaish_config.ngram_context_len if short_conv_layer_ids else 0
+            ),
             "ngram_eos_token_id": int(self.mambaish_config.eos_token_id),
         }
 
