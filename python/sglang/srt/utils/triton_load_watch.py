@@ -1,12 +1,18 @@
 """Detect Triton kernel device-loads after the engine starts serving.
 
-Triton loads each kernel specialization's cubin onto the GPU at its first
-launch (``CompiledKernel._init_handles`` -> ``cuModuleLoadData``). That load
-needs free device memory *outside* the torch caching allocator. Engines size
-their pools to leave little post-init headroom, and the allocator's high-water
-mark consumes the rest during early serving — so a specialization first used
-mid-serving (e.g. a new adaptive speculative draft length, or a rare batch-size
-bucket) can die in ``cuModuleLoadData`` with CUDA OOM, minutes or hours in.
+Triton loads each kernel specialization's binary onto the device at its first
+launch (``CompiledKernel._init_handles``, reaching ``cuModuleLoadData`` on CUDA
+and the equivalent elsewhere). That load needs free device memory *outside* the
+torch caching allocator. Engines size their pools to leave little post-init
+headroom, and the allocator's high-water mark consumes the rest during early
+serving — so a specialization first used mid-serving (e.g. a new adaptive
+speculative draft length, or a rare batch-size bucket) can reach that load with
+almost nothing free, minutes or hours in.
+
+The cost lands in two ways. The load runs inside the scheduler loop, so a slow
+one delays every queued request's first token for as long as it takes; stalls of
+tens of seconds have been measured on a memory-starved device. Where the
+allocation cannot be satisfied at all, the load fails outright.
 
 Once ``mark_serving_started()`` has been called, this module warns when an
 uncached Triton compilation takes at least one second or a device-load starts
@@ -35,6 +41,7 @@ logger = logging.getLogger(__name__)
 _serving_started = False
 _prev_compile_listener = None
 _installed = False
+_unknown_memory_warning_emitted = False
 
 
 def install() -> None:
@@ -83,31 +90,52 @@ def _on_compilation(*, src, metadata, metadata_group, times, cache_hit) -> None:
     )
 
 
+def _free_device_memory_gb() -> float | None:
+    accelerator = torch.accelerator.current_accelerator()
+    if accelerator is None:
+        return None
+    try:
+        # Take the index from torch.accelerator as well. A bare
+        # torch.get_device_module() resolves the device through a separate,
+        # availability-aware path, so with a compiled-in accelerator and no
+        # visible devices the two disagree and the index arrives as "cpu".
+        return get_available_gpu_memory(
+            accelerator.type,
+            torch.accelerator.current_device_index(),
+            empty_cache=False,
+        )
+    except RuntimeError:
+        logger.debug("Unable to query free device memory", exc_info=True)
+        return None
+
+
 def _on_kernel_load(module, function, name, metadata_group, hash) -> None:
+    global _unknown_memory_warning_emitted
+
     if not _serving_started:
         return
 
-    free_gb = None
-    if torch.cuda.is_available():
-        try:
-            free_gb = get_available_gpu_memory(
-                "cuda", torch.cuda.current_device(), empty_cache=False
-            )
-        except RuntimeError:
-            logger.debug("Unable to query free device memory", exc_info=True)
+    free_gb = _free_device_memory_gb()
 
     should_crash = envs.SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY.get()
-    if not should_crash and (
-        free_gb is None or free_gb >= envs.SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB.get()
+    if (
+        not should_crash
+        and free_gb is not None
+        and (free_gb >= envs.SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB.get())
     ):
+        return
+    if not should_crash and free_gb is None and _unknown_memory_warning_emitted:
         return
 
     free_memory = f"{free_gb:.2f} GiB" if free_gb is not None else "unknown"
     msg = (
         f"Triton kernel '{name}' device-loaded after serving started "
-        f"(free device mem: {free_memory}). Pre-load it during engine init "
-        f"to avoid CUDA OOM."
+        f"(free device mem: {free_memory}). Late loads run inside the "
+        f"scheduler loop and stall serving when memory is tight; pre-load it "
+        f"during engine init."
     )
     if should_crash:
         raise RuntimeError(msg)
+    if free_gb is None:
+        _unknown_memory_warning_emitted = True
     logger.warning(msg)
