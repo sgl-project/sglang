@@ -649,16 +649,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_qwen4_modelopt_config_json_selects_trtllm_moe_runner(self):
-        """`nvidia/Qwen3.8-Flash-Next-NVFP4` is a MIXED_PRECISION ModelOpt
-        checkpoint, which ModelConfig resolves to modelopt_mixed. The family
-        override used to whitelist only fp8 / modelopt_fp4 for
-        `moe_runner_backend=flashinfer_trtllm`, so the FP4 experts fell to the
-        CUTLASS runner, whose weight post-processing pads w13
-        (moe_intermediate_size 640) and asserts on gated activations.
-
-        The raw `--quantization modelopt` (online quantization of a bf16
-        checkpoint) must stay off that whitelist: the trtllm MoE hook rejects
-        it, so whitelisting it turns a working launch into an assertion."""
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
         mixed_ckpt = {
             "quantization_config": {

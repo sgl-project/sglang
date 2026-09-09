@@ -38,12 +38,7 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             overrides["quantization"] = quant_method
             quantization = quant_method
-        # MIXED_PRECISION ModelOpt checkpoints resolve to modelopt_mixed
-        # (ModelConfig rewrites hf_config.quantization_config in place before
-        # this runs). Leaving it on the CUTLASS runner fails for gated experts
-        # whose w13 needs padding (Qwen4-Exp NVFP4, moe_intermediate_size 640).
-        # Do not add the raw "modelopt" here: it is also the online
-        # quantization request, which the trtllm MoE hook rejects.
+
         if (
             (
                 quantization in ("fp8", "modelopt_fp4", "modelopt_mixed")
