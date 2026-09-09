@@ -855,6 +855,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
         host.device_pool = device_pool
+        host.host_layer_by_device = {
+            layer_id: layer_id for layer_id in range(layer_num)
+        }
         host.layout = "page_first"
         host.page_size = page_size
         host.layer_num = layer_num

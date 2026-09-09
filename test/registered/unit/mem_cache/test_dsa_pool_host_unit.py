@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _get_rank_local_dsa_indexer_layers,
     build_anchor_sidecar_stack,
 )
 from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -52,10 +53,22 @@ class TestDSAProducerHostSidecar(unittest.TestCase):
 
         self.assertEqual(producer_layers, [0, 1, 2, *range(6, 75, 4)])
         self.assertEqual(len(producer_layers), 21)
+        self.assertEqual(get_dsa_hicache_indexer_layers(config, 3, 6), [])
         self.assertEqual(get_dsa_hicache_indexer_layers(config, 6, 14), [0, 4])
 
         config.index_topk_freq = 1
         self.assertEqual(get_dsa_hicache_indexer_layers(config, 0, 78), list(range(78)))
+
+    def test_rank_local_indexer_layers(self):
+        pool = SimpleNamespace(
+            hicache_indexer_layers=[0, 1, 2, 6, 10],
+            layer_shard_enabled=True,
+            _owned_local_layer_range=lambda: (3, 6),
+        )
+        self.assertEqual(_get_rank_local_dsa_indexer_layers(pool), [])
+
+        pool._owned_local_layer_range = lambda: (6, 10)
+        self.assertEqual(_get_rank_local_dsa_indexer_layers(pool), [6])
 
     def test_compacts_target_layers_and_preserves_packed_drafts(self):
         target_buffers = [torch.empty(1, dtype=torch.uint8) for _ in range(4)]
@@ -122,6 +135,11 @@ class TestDSAProducerHostSidecar(unittest.TestCase):
             can_use_write_back_jit=False,
         )
         sidecar_host = SimpleNamespace(can_use_write_back_jit=False)
+        memory_config = SimpleNamespace(
+            hicache_write_policy="write_through",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="normal",
+        )
 
         with (
             mock.patch(
@@ -132,6 +150,10 @@ class TestDSAProducerHostSidecar(unittest.TestCase):
             mock.patch(
                 "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
                 "HybridCacheController"
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.get_memory",
+                return_value=memory_config,
             ),
         ):
             group, _ = build_anchor_sidecar_stack(
@@ -157,6 +179,62 @@ class TestDSAProducerHostSidecar(unittest.TestCase):
             group.get_entry(PoolName.INDEXER).packed_draft_device_pools,
             (draft_pool,),
         )
+
+    def test_page_first_stack_omits_empty_indexer_sidecar(self):
+        target_pool = SimpleNamespace(layer_num=3, kv_cache_dim=576)
+        params = SimpleNamespace(
+            page_size=64,
+            mtp_draft_device_pools=(),
+            token_to_kv_pool_allocator=mock.sentinel.allocator,
+            tp_cache_group=mock.sentinel.tp_group,
+            attn_cp_cache_group=mock.sentinel.attn_cp_group,
+            attn_tp_cache_group=mock.sentinel.attn_tp_group,
+            pp_cache_group=mock.sentinel.pp_group,
+        )
+        anchor_host = SimpleNamespace(
+            layout="page_first",
+            page_size=64,
+            device="cpu",
+            size=128,
+            logical_size=128,
+            can_use_write_back_jit=False,
+        )
+        memory_config = SimpleNamespace(
+            hicache_write_policy="write_through",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="normal",
+        )
+        sidecar_factory = mock.Mock()
+
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+                "build_kv_host_pool",
+                return_value=anchor_host,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+                "HybridCacheController"
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.get_memory",
+                return_value=memory_config,
+            ),
+        ):
+            group, _ = build_anchor_sidecar_stack(
+                params=params,
+                kv_pool=target_pool,
+                sidecar_pool_name=PoolName.INDEXER,
+                full_layer_mapping={i: i for i in range(3)},
+                sidecar_layer_mapping={},
+                load_cache_event=mock.sentinel.load_cache_event,
+                storage_backend=None,
+                use_mla=True,
+                sidecar_host_pool_factory=sidecar_factory,
+            )
+
+        self.assertEqual([entry.name for entry in group.entries], [PoolName.KV])
+        sidecar_factory.assert_not_called()
 
 
 class TestDSAHiCacheTransfer(unittest.TestCase):
