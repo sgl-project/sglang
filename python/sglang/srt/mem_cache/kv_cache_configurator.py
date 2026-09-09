@@ -262,6 +262,21 @@ class _InitializedPools(msgspec.Struct, frozen=True, kw_only=True):
     unified_memory_pool: Optional[UnifiedKVPool] = None
 
 
+class _UnifiedSWAHeadGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """Per-GPU head geometry of a hybrid-SWA host's full and SWA sub-pools.
+
+    The byte solve prices `_full_per_token` / `_swa_per_token` from the same
+    ModelConfig fields, so the priced and the allocated entry agree.
+    """
+
+    head_num: int
+    head_dim: int
+    v_head_dim: int
+    swa_head_num: int
+    swa_head_dim: int
+    swa_v_head_dim: int
+
+
 class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     max_total_num_tokens: int
     max_running_requests: int
@@ -868,26 +883,7 @@ class KVCacheConfigurator:
         if get_spec().speculative_num_draft_tokens is not None:
             extra_max_context_len += get_spec().speculative_num_draft_tokens
 
-        head_num = self.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-        )
-        head_dim = self.model_config.head_dim
-        if self.is_hybrid_swa_compress:
-            # Asymmetric full/SWA head geometry (Inkling): SWA dims from the
-            # hf text config, same as the 2-pool SWA wrapper.
-            v_head_dim = self.model_config.hf_text_config.v_head_dim
-            swa_head_num = max(
-                1,
-                self.model_config.hf_text_config.swa_num_key_value_heads
-                // get_parallel().attn_tp_size,
-            )
-            swa_head_dim = self.model_config.hf_text_config.swa_head_dim
-            swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
-        else:
-            v_head_dim = head_dim
-            swa_head_num = head_num
-            swa_head_dim = head_dim
-            swa_v_head_dim = head_dim
+        geometry = self._unified_swa_head_geometry()
 
         # Not the HF config's full_attention_layer_ids: that one returns ALL layers.
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
@@ -912,12 +908,12 @@ class KVCacheConfigurator:
         return init_unified_mamba_swa_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            v_head_dim=v_head_dim,
-            swa_head_num=swa_head_num,
-            swa_head_dim=swa_head_dim,
-            swa_v_head_dim=swa_v_head_dim,
+            head_num=geometry.head_num,
+            head_dim=geometry.head_dim,
+            v_head_dim=geometry.v_head_dim,
+            swa_head_num=geometry.swa_head_num,
+            swa_head_dim=geometry.swa_head_dim,
+            swa_v_head_dim=geometry.swa_v_head_dim,
             page_size=self.page_size,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
@@ -952,6 +948,32 @@ class KVCacheConfigurator:
                 else 0
             ),
             fused_draft=self._fused_draft_for_mamba_factory(),
+        )
+
+    def _unified_swa_head_geometry(self) -> _UnifiedSWAHeadGeometry:
+        """Head geometry of a hybrid-SWA host's full and SWA sub-pools."""
+        mc = self.model_config
+        attn_tp = get_parallel().attn_tp_size
+        head_num = mc.get_num_kv_heads(attn_tp, get_parallel().attn_dcp_size)
+        if self.is_hybrid_swa_compress:
+            # NPU compress path: the SWA dims live only on the hf text config.
+            return _UnifiedSWAHeadGeometry(
+                head_num=head_num,
+                head_dim=mc.head_dim,
+                v_head_dim=mc.hf_text_config.v_head_dim,
+                swa_head_num=max(
+                    1, mc.hf_text_config.swa_num_key_value_heads // attn_tp
+                ),
+                swa_head_dim=mc.hf_text_config.swa_head_dim,
+                swa_v_head_dim=mc.hf_text_config.swa_v_head_dim,
+            )
+        return _UnifiedSWAHeadGeometry(
+            head_num=head_num,
+            head_dim=mc.head_dim,
+            v_head_dim=mc.v_head_dim,
+            swa_head_num=mc.get_swa_num_kv_heads(attn_tp),
+            swa_head_dim=mc.swa_head_dim,
+            swa_v_head_dim=mc.swa_v_head_dim,
         )
 
     def _fused_draft_decision(self):
@@ -1136,6 +1158,18 @@ class KVCacheConfigurator:
                 grow_direction="down",
                 draft_region=region,
             )
+        if self.is_hybrid_swa:
+            geometry = self._unified_swa_head_geometry()
+            return MHASubPoolSpec(
+                name="full",
+                layer_num=len(full_attention_layer_ids),
+                head_num=geometry.head_num,
+                head_dim=geometry.head_dim,
+                v_head_dim=geometry.v_head_dim,
+                store_dtype=_store_dtype_for(self.kv_cache_dtype),
+                grow_direction="down",
+                draft_region=region,
+            )
         return MHASubPoolSpec(
             name="full",
             layer_num=len(full_attention_layer_ids),
@@ -1248,26 +1282,7 @@ class KVCacheConfigurator:
         )
         req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
 
-        head_num = self.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-        )
-        head_dim = self.model_config.head_dim
-        if self.is_hybrid_swa_compress:
-            # Asymmetric head dims between full and SWA (NPU compress path):
-            # pull SWA-specific dims from the hf text config.
-            v_head_dim = self.model_config.hf_text_config.v_head_dim
-            swa_head_num = max(
-                1,
-                self.model_config.hf_text_config.swa_num_key_value_heads
-                // get_parallel().attn_tp_size,
-            )
-            swa_head_dim = self.model_config.hf_text_config.swa_head_dim
-            swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
-        else:
-            v_head_dim = head_dim
-            swa_head_num = head_num
-            swa_head_dim = head_dim
-            swa_v_head_dim = head_dim
+        geometry = self._unified_swa_head_geometry()
 
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
@@ -1281,12 +1296,12 @@ class KVCacheConfigurator:
         bundle = init_unified_swa_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            v_head_dim=v_head_dim,
-            swa_head_num=swa_head_num,
-            swa_head_dim=swa_head_dim,
-            swa_v_head_dim=swa_v_head_dim,
+            head_num=geometry.head_num,
+            head_dim=geometry.head_dim,
+            v_head_dim=geometry.v_head_dim,
+            swa_head_num=geometry.swa_head_num,
+            swa_head_dim=geometry.swa_head_dim,
+            swa_v_head_dim=geometry.swa_v_head_dim,
             page_size=self.page_size,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,

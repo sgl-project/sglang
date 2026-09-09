@@ -174,6 +174,47 @@ class TestAsymmetricBackendRule(CustomTestCase):
         )
 
 
+class TestUnifiedSWAHeadGeometry(CustomTestCase):
+    """BUG REGRESSION. The hybrid-SWA factories hard-coded a symmetric shape
+    on GPU hosts, so an asymmetric model (MiMo-V2-Flash, 192/128) allocated
+    192-wide V rows in both sub-pools while the boot solve priced 128."""
+
+    def _configurator(self):
+        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.is_hybrid_swa = True
+        cfg.is_hybrid_swa_compress = False
+        cfg.use_mla_backend = False
+        cfg.kv_cache_dtype = _DTYPE
+        cfg.layer_info = SimpleNamespace(full_attention_layer_ids=[0, 3])
+        cfg.model_config = SimpleNamespace(
+            get_num_kv_heads=lambda tp, dcp: 4,
+            head_dim=192,
+            v_head_dim=128,
+            get_swa_num_kv_heads=lambda tp: 8,
+            swa_head_dim=192,
+            swa_v_head_dim=128,
+        )
+        return cfg
+
+    def test_both_sub_pools_take_the_model_config_geometry(self):
+        with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
+            g = self._configurator()._unified_swa_head_geometry()
+        self.assertEqual((g.head_num, g.head_dim, g.v_head_dim), (4, 192, 128))
+        self.assertEqual(
+            (g.swa_head_num, g.swa_head_dim, g.swa_v_head_dim), (8, 192, 128)
+        )
+
+    def test_the_fused_price_reads_the_same_geometry(self):
+        region = DenseDraftRegion(
+            lane_num=1, head_num=4, head_dim=64, store_dtype=_DTYPE
+        )
+        with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
+            spec = self._configurator()._full_host_spec(region)
+        self.assertEqual(
+            (spec.layer_num, spec.head_dim, spec.v_head_dim), (2, 192, 128)
+        )
+
+
 class TestFusedDraftDecision(CustomTestCase):
     """The target's boot decision over a host whose full sub-pool fuses."""
 
