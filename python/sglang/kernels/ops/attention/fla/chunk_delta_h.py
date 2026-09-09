@@ -119,20 +119,19 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_k = Hg * K
     stride_w = H * K
 
-    # Slot stride comes from the caller (initial_state.stride(0)): the state pool
-    # may be an envelope-strided view (page-major / unified memory), where the
-    # per-slot pitch spans ALL layers' state, not H*V*K. int64: envelope pitches
-    # overflow an int32 index product.
-    index = tl.load(initial_state_indices + i_n).to(tl.int64)
-    # Padded rows carry the -1 sentinel; the decode kernel guards on it
-    # (fused_recurrent.py), the chunked extend path did not.
-    valid_state = index >= 0
-    h0 = initial_state + index * stride_init_state
-    ht = initial_state + index * stride_init_state
-    if USE_INITIAL_STATE:
-        h0 = h0 + i_h * V * K
-    if INPLACE_UPDATE:
-        ht = ht + i_h * V * K
+    if USE_INITIAL_STATE or INPLACE_UPDATE:
+        # Slot stride comes from the caller (initial_state.stride(0)): the state
+        # pool may be an envelope-strided view (page-major / unified memory),
+        # where the per-slot pitch spans all layers' state, not H*V*K. int64:
+        # envelope pitches overflow an int32 index product.
+        index = tl.load(initial_state_indices + i_n).to(tl.int64)
+        # Padded rows carry the -1 sentinel; the decode kernel guards on it
+        # (fused_recurrent.py), the chunked extend path did not.
+        valid_state = index >= 0
+        if USE_INITIAL_STATE:
+            h0 = initial_state + index * stride_init_state + i_h * V * K
+        if INPLACE_UPDATE:
+            ht = initial_state + index * stride_init_state + i_h * V * K
 
     if TRACK_STATE:
         i_track = tl.load(track_chunk_idx + i_n).to(tl.int32)
@@ -426,7 +425,7 @@ def chunk_gated_delta_rule_fwd_h(
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
-        INPLACE_UPDATE=True,
+        INPLACE_UPDATE=initial_state is not None,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),

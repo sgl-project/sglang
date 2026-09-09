@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -38,12 +39,15 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
+    DFlashKDAConfig,
     can_dflash_slice_qkv_weight,
+    get_dflash_attention_modes,
     get_dflash_attention_sliding_window_size,
     get_dflash_layer_types,
     is_dense_head_weight,
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
+    parse_dflash_kda_config,
 )
 from sglang.srt.utils import is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
@@ -353,6 +357,488 @@ class DFlashAttention(nn.Module):
         return k
 
 
+class DFlashKDAShortConvolution(nn.Module):
+    """Checkpoint-compatible causal depthwise convolution for KDA."""
+
+    def __init__(self, channels: int, kernel_size: int) -> None:
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.weight = nn.Parameter(torch.empty(channels, self.kernel_size))
+        nn.init.normal_(self.weight, mean=0.0, std=0.02)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        channels_first = inputs.transpose(1, 2)
+        channels_first = F.pad(channels_first, (self.kernel_size - 1, 0))
+        convolved = F.conv1d(
+            channels_first,
+            self.weight.unsqueeze(1),
+            bias=None,
+            groups=self.weight.shape[0],
+        )
+        return F.silu(convolved.transpose(1, 2))
+
+
+class DFlashKDAGatedRMSNorm(nn.Module):
+    """RMSNorm followed by KDA's sigmoid output gate."""
+
+    def __init__(self, hidden_size: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = float(eps)
+
+    def forward(self, inputs: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        variance = inputs.float().square().mean(dim=-1, keepdim=True)
+        normalized = inputs * torch.rsqrt(variance + self.eps).to(inputs.dtype)
+        return normalized * self.weight.to(inputs.dtype) * torch.sigmoid(gate)
+
+
+def _kda_kernel_beta(raw_beta: torch.Tensor) -> torch.Tensor:
+    """Beta as the Triton KDA kernels expect it: post-sigmoid, fp32.
+
+    ``chunk_kda`` activates the decay gate in-kernel from the raw gate, A_log,
+    dt_bias and lower_bound, but it does NOT apply sigmoid to beta (the
+    ``beta_is_raw`` keyword is swallowed by ``**kwargs``). Feeding the raw
+    ``b_proj`` output silently changes the delta rule; SpecForge's FLA call
+    uses ``use_beta_sigmoid_in_kernel=True``, so the sigmoid must happen here.
+    """
+    return torch.sigmoid(raw_beta.float())
+
+
+def reference_dflash_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_gate: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: Optional[float],
+    *,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+):
+    """Small-sequence KDA oracle and non-CUDA fallback.
+
+    ``initial_state`` (``[B, H, K, V]`` fp32) seeds the recurrence and
+    ``output_final_state`` also returns the state after the last step, the
+    same contract as SpecForge's ``reference_kda``. Note the FLA/Triton pool
+    layout is ``[.., H, V, K]``: transpose the last two dims when crossing.
+    """
+    q = F.normalize(q.float(), dim=-1).to(q.dtype)
+    k = F.normalize(k.float(), dim=-1).to(k.dtype)
+    beta = torch.sigmoid(beta.float()).to(q.dtype)
+
+    gate_input = raw_gate.float() + dt_bias.view(1, 1, *raw_gate.shape[-2:])
+    decay_scale = A_log.float().exp().view(1, 1, -1, 1)
+    if lower_bound is None:
+        log_decay = -decay_scale * F.softplus(gate_input)
+    else:
+        log_decay = float(lower_bound) * torch.sigmoid(decay_scale * gate_input)
+
+    if initial_state is None:
+        state = torch.zeros(
+            q.shape[0],
+            q.shape[2],
+            q.shape[3],
+            v.shape[3],
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        state = initial_state.to(device=q.device, dtype=torch.float32)
+    outputs = []
+    score_scale = q.shape[-1] ** -0.5
+    for step in range(q.shape[1]):
+        state = state * log_decay[:, step].exp().unsqueeze(-1)
+        step_key = k[:, step].float()
+        step_value = v[:, step].float()
+        prediction = torch.einsum("bhd,bhdv->bhv", step_key, state)
+        delta = (step_value - prediction) * beta[:, step].float().unsqueeze(-1)
+        state = state + torch.einsum("bhd,bhv->bhdv", step_key, delta)
+        output = torch.einsum("bhd,bhdv->bhv", q[:, step].float(), state)
+        outputs.append((output * score_scale).to(q.dtype))
+    if outputs:
+        output = torch.stack(outputs, dim=1)
+    else:
+        output = q.new_zeros((q.shape[0], 0, q.shape[2], v.shape[3]))
+    if output_final_state:
+        return output, state
+    return output
+
+
+class DFlashKDAAttention(nn.Module):
+    """KDA recurrent attention over DFlash proposal blocks.
+
+    ``linear_attn_config.context_state`` selects where a block's recurrent
+    state starts (SpecForge PR #836 semantics):
+
+    * ``reset``: every block is an independent sequence starting from a zero
+      state; target context reaches the layer only through the hybrid stack's
+      KV-cache attention layers.
+    * ``scan``: the recurrence first consumes the target context. A per-request
+      running state (and the last ``kernel_size - 1`` context rows for the
+      short convolution) lives in a slot pool indexed by ``req_pool_indices``;
+      the worker advances it with every newly verified context slice
+      (:meth:`advance_context_state`) and each block forward starts from it.
+      The context scan runs through the same raw-gate ``chunk_kda`` kernel as
+      the block, which writes the final state back into the pool slot.
+    """
+
+    is_dflash_kda = True
+
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
+        super().__init__()
+        del layer_id, prefix
+        tp_size = int(get_parallel().tp_size)
+        if tp_size != 1:
+            raise ValueError(
+                "DFLASH KDA draft attention currently requires tp_size=1, "
+                f"got tp_size={tp_size}. Run one independent draft server per GPU."
+            )
+        if quant_config is not None:
+            raise ValueError(
+                "DFLASH KDA draft attention currently requires unquantized "
+                "draft weights."
+            )
+
+        spec = parse_dflash_kda_config(config)
+        if spec is None:
+            raise ValueError("DFlashKDAAttention requires a KDA draft config.")
+        self.kda_config: DFlashKDAConfig = spec
+        self.hidden_size = int(config.hidden_size)
+        self.head_dim = spec.head_dim
+        self.num_heads = spec.num_heads
+        self.block_size = parse_dflash_draft_config(
+            draft_hf_config=config
+        ).resolve_block_size(default=16)
+        self.lower_bound = spec.gate_lower_bound
+        projection_size = spec.projection_size
+
+        self.q_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+        self.q_conv1d = DFlashKDAShortConvolution(
+            projection_size, spec.short_conv_kernel_size
+        )
+        self.k_conv1d = DFlashKDAShortConvolution(
+            projection_size, spec.short_conv_kernel_size
+        )
+        self.v_conv1d = DFlashKDAShortConvolution(
+            projection_size, spec.short_conv_kernel_size
+        )
+
+        self.A_log = nn.Parameter(
+            torch.log(torch.empty(spec.num_heads, dtype=torch.float32).uniform_(1, 16))
+        )
+        self.f_a_proj = nn.Linear(self.hidden_size, spec.head_dim, bias=False)
+        self.f_b_proj = nn.Linear(spec.head_dim, projection_size, bias=False)
+        self.dt_bias = nn.Parameter(torch.zeros(projection_size, dtype=torch.float32))
+        self.b_proj = nn.Linear(self.hidden_size, spec.num_heads, bias=False)
+        if spec.use_full_rank_gate:
+            self.g_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+        else:
+            self.g_a_proj = nn.Linear(self.hidden_size, spec.head_dim, bias=False)
+            self.g_b_proj = nn.Linear(spec.head_dim, projection_size, bias=False)
+        self.o_norm = DFlashKDAGatedRMSNorm(
+            spec.head_dim, eps=float(config.rms_norm_eps)
+        )
+        self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
+
+        # Context-scanning policy: per-request running state, allocated by
+        # init_context_state() once the worker knows the request-slot count.
+        self.scans_context = bool(spec.scans_context)
+        self.is_dflash_kda_scan = self.scans_context
+        self.conv_window = int(spec.short_conv_kernel_size) - 1
+        self._ctx_state: Optional[torch.Tensor] = None  # [slots, H, V, K] fp32
+        self._ctx_tail: Optional[torch.Tensor] = None  # [slots, window, hidden]
+
+    def set_block_size(self, block_size: int) -> None:
+        self.block_size = int(block_size)
+
+    def _output_gate(self, blocks: torch.Tensor) -> torch.Tensor:
+        if self.kda_config.use_full_rank_gate:
+            return self.g_proj(blocks)
+        return self.g_b_proj(self.g_a_proj(blocks))
+
+    def _gates(self, rows: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Raw decay gate ``[..., H, D]`` and raw beta ``[..., H]`` for rows."""
+        leading = tuple(rows.shape[:-1])
+        raw_gate = self.f_b_proj(self.f_a_proj(rows)).reshape(
+            *leading, self.num_heads, self.head_dim
+        )
+        beta = self.b_proj(rows).reshape(*leading, self.num_heads)
+        return raw_gate, beta
+
+    @staticmethod
+    def _conv_with_left_rows(
+        conv: DFlashKDAShortConvolution,
+        proj: nn.Linear,
+        left_rows: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convolve ``rows`` as if ``left_rows`` immediately preceded them."""
+        joined = torch.cat((proj(left_rows), proj(rows)), dim=1)
+        return conv(joined)[:, left_rows.shape[1] :]
+
+    # -- context-scanning state pool -------------------------------------
+    def init_context_state(
+        self, max_slots: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        """Allocate the per-request running state for ``max_slots`` request slots."""
+        if not self.scans_context:
+            return
+        if max_slots < 1:
+            raise ValueError(f"DFLASH KDA scan needs max_slots >= 1, got {max_slots}.")
+        self._ctx_state = torch.zeros(
+            (int(max_slots), self.num_heads, self.head_dim, self.head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._ctx_tail = torch.zeros(
+            (int(max_slots), self.conv_window, self.hidden_size),
+            dtype=dtype,
+            device=device,
+        )
+
+    def _require_context_state(self) -> torch.Tensor:
+        if not self.scans_context:
+            raise RuntimeError("DFLASH KDA layer does not scan context.")
+        if self._ctx_state is None or self._ctx_tail is None:
+            raise RuntimeError(
+                "DFLASH KDA scan state is not allocated; call init_context_state() "
+                "with the request-slot count before serving."
+            )
+        return self._ctx_state
+
+    def reset_context_state(self, slots: torch.Tensor) -> None:
+        """Forget the running context of the given request slots."""
+        state = self._require_context_state()
+        slots = slots.to(device=state.device, dtype=torch.int64)
+        state[slots] = 0
+        self._ctx_tail[slots] = 0
+
+    def advance_context_state(
+        self,
+        slots: torch.Tensor,
+        rows: torch.Tensor,
+        row_lens: torch.Tensor,
+        reset_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Consume newly verified context rows for a batch of request slots.
+
+        ``rows`` is ``[sum(row_lens), hidden_size]``: the rows of slot ``i``
+        are contiguous, in ascending position order, and follow the rows of
+        slot ``i - 1``. Slots flagged in ``reset_mask`` start a new request
+        (their state and conv tail are zeroed first). States are updated in
+        place; nothing is returned.
+        """
+        state = self._require_context_state()
+        device = state.device
+        slots = slots.to(device=device, dtype=torch.int64)
+        lens = [int(n) for n in row_lens.tolist()]
+        if slots.numel() != len(lens):
+            raise ValueError(
+                "DFLASH KDA scan: slots and row_lens disagree: "
+                f"{slots.numel()} vs {len(lens)}."
+            )
+        if reset_mask is not None:
+            reset_mask = reset_mask.to(device=device, dtype=torch.bool)
+            if bool(reset_mask.any()):
+                self.reset_context_state(slots[reset_mask])
+        if rows.device != device:
+            rows = rows.to(device)
+        rows = rows.to(self._ctx_tail.dtype)
+
+        keys, values, gates, betas, seq_slots, seq_lens = [], [], [], [], [], []
+        start = 0
+        for index, length in enumerate(lens):
+            if length == 0:
+                continue
+            slice_rows = rows[start : start + length].unsqueeze(0)  # [1, n, hidden]
+            start += length
+            slot = slots[index]
+            tail = self._ctx_tail[slot].unsqueeze(0)  # [1, window, hidden]
+            shape = (1, length, self.num_heads, self.head_dim)
+            keys.append(
+                self._conv_with_left_rows(
+                    self.k_conv1d, self.k_proj, tail, slice_rows
+                ).reshape(shape)
+            )
+            values.append(
+                self._conv_with_left_rows(
+                    self.v_conv1d, self.v_proj, tail, slice_rows
+                ).reshape(shape)
+            )
+            raw_gate, beta = self._gates(slice_rows)
+            gates.append(raw_gate)
+            betas.append(beta)
+            seq_slots.append(slot)
+            seq_lens.append(length)
+            if self.conv_window:
+                self._ctx_tail[slot] = torch.cat((tail[0], slice_rows[0]), dim=0)[
+                    -self.conv_window :
+                ]
+        if start != int(rows.shape[0]):
+            raise ValueError(
+                f"DFLASH KDA scan: rows has {int(rows.shape[0])} entries but "
+                f"row_lens sum to {start}."
+            )
+        if not seq_lens:
+            return
+
+        k = torch.cat(keys, dim=1)
+        v = torch.cat(values, dim=1)
+        raw_gate = torch.cat(gates, dim=1)
+        beta = torch.cat(betas, dim=1)
+        slot_index = torch.stack(seq_slots)
+        if device.type == "cuda":
+            from sglang.kernels.ops.attention.fla.kda import chunk_kda
+
+            cu_seqlens = torch.tensor(
+                [0, *itertools.accumulate(seq_lens)], device=device, dtype=torch.int64
+            )
+            # The state does not depend on queries; reuse k so the l2norm has
+            # a finite input. With initial_state + initial_state_indices the
+            # kernel reads h0 from, and writes the final state back into, the
+            # addressed pool slots.
+            chunk_kda(
+                q=k,
+                k=k,
+                v=v,
+                g=raw_gate,
+                beta=_kda_kernel_beta(beta),
+                use_qk_l2norm_in_kernel=True,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                lower_bound=self.lower_bound,
+                initial_state=state,
+                initial_state_indices=slot_index,
+                cu_seqlens=cu_seqlens,
+            )
+            return
+        offset = 0
+        for slot, length in zip(seq_slots, seq_lens):
+            sl = slice(offset, offset + length)
+            offset += length
+            # Reference layout is [B, H, K, V]; the pool is [slots, H, V, K].
+            initial = state[slot].transpose(-1, -2).unsqueeze(0)
+            _, final = reference_dflash_kda(
+                k[:, sl],
+                k[:, sl],
+                v[:, sl],
+                raw_gate[:, sl],
+                beta[:, sl],
+                self.A_log,
+                self.dt_bias,
+                self.lower_bound,
+                initial_state=initial,
+                output_final_state=True,
+            )
+            state[slot] = final[0].transpose(-1, -2)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        del positions
+        if hidden_states.ndim != 2:
+            raise ValueError(
+                "DFLASH KDA expects flattened [batch * block_size, hidden_size] "
+                f"states, got shape={tuple(hidden_states.shape)}."
+            )
+        token_count = int(hidden_states.shape[0])
+        if token_count % self.block_size:
+            raise ValueError(
+                "DFLASH KDA token count must be divisible by block_size; "
+                f"got token_count={token_count}, block_size={self.block_size}."
+            )
+
+        blocks = hidden_states.reshape(-1, self.block_size, self.hidden_size)
+        block_count = int(blocks.shape[0])
+        projection_shape = (
+            block_count,
+            self.block_size,
+            self.num_heads,
+            self.head_dim,
+        )
+        initial_state = None
+        if self.scans_context:
+            state = self._require_context_state()
+            slots = forward_batch.req_pool_indices
+            if slots is None:
+                raise RuntimeError(
+                    "DFLASH KDA scan needs forward_batch.req_pool_indices."
+                )
+            slots = slots.to(device=state.device, dtype=torch.int64).reshape(-1)
+            if int(slots.numel()) != block_count:
+                raise ValueError(
+                    "DFLASH KDA scan expects one proposal block per request; got "
+                    f"{block_count} blocks for {int(slots.numel())} requests."
+                )
+            tail = self._ctx_tail[slots]  # [B, window, hidden]
+            q = self._conv_with_left_rows(self.q_conv1d, self.q_proj, tail, blocks)
+            k = self._conv_with_left_rows(self.k_conv1d, self.k_proj, tail, blocks)
+            v = self._conv_with_left_rows(self.v_conv1d, self.v_proj, tail, blocks)
+            # Clone: the kernel writes the post-block state back into whatever
+            # it was handed, and block tokens are speculative.
+            initial_state = state[slots].clone()
+        else:
+            q = self.q_conv1d(self.q_proj(blocks))
+            k = self.k_conv1d(self.k_proj(blocks))
+            v = self.v_conv1d(self.v_proj(blocks))
+        q = q.reshape(projection_shape)
+        k = k.reshape(projection_shape)
+        v = v.reshape(projection_shape)
+        raw_gate, beta = self._gates(blocks)
+
+        if hidden_states.device.type == "cuda":
+            from sglang.kernels.ops.attention.fla.kda import chunk_kda
+
+            state_kwargs = {}
+            if initial_state is not None:
+                state_kwargs = dict(
+                    initial_state=initial_state,
+                    initial_state_indices=torch.arange(
+                        block_count, device=initial_state.device, dtype=torch.int64
+                    ),
+                )
+            attention_output = chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=raw_gate,
+                beta=_kda_kernel_beta(beta),
+                use_qk_l2norm_in_kernel=True,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                lower_bound=self.lower_bound,
+                **state_kwargs,
+            )
+        else:
+            attention_output = reference_dflash_kda(
+                q,
+                k,
+                v,
+                raw_gate,
+                beta,
+                self.A_log,
+                self.dt_bias,
+                self.lower_bound,
+                initial_state=(
+                    None if initial_state is None else initial_state.transpose(-1, -2)
+                ),
+            )
+
+        output_gate = self._output_gate(blocks).reshape(projection_shape)
+        attention_output = self.o_norm(attention_output, output_gate)
+        attention_output = self.o_proj(attention_output.flatten(-2))
+        return attention_output.reshape(token_count, self.hidden_size)
+
+
 class DFlashMLP(nn.Module):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -483,7 +969,13 @@ class DFlashDecoderLayer(nn.Module):
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         attention_prefix = f"{prefix}.self_attn" if prefix else ""
-        self.self_attn = self.attention_cls(
+        attention_modes = get_dflash_attention_modes(config)
+        layer_mode = attention_modes[layer_id]
+        if layer_mode == "kda":
+            attention_class = DFlashKDAAttention
+        else:
+            attention_class = self.attention_cls
+        self.self_attn = attention_class(
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
@@ -559,6 +1051,11 @@ class DFlashDraftModel(nn.Module):
 
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
+        self.attention_modes = get_dflash_attention_modes(config)
+        self.supports_fused_context_kv = (
+            bool(type(self).supports_fused_context_kv)
+            and "kda" not in self.attention_modes
+        )
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         draft_config = self.draft_config = parse_dflash_draft_config(
             draft_hf_config=config
@@ -644,9 +1141,49 @@ class DFlashDraftModel(nn.Module):
         """
         self.block_size = int(block_size)
         for layer in self.layers:
+            set_attention_block_size = getattr(layer.self_attn, "set_block_size", None)
+            if set_attention_block_size is not None:
+                set_attention_block_size(self.block_size)
             for conv in (layer.attention_conv, layer.mlp_conv):
                 if conv is not None:
                     conv.block_size = self.block_size
+
+    def iter_context_attention_layers(self):
+        """Yield only draft layers that own a target-context KV cache."""
+        for layer in self.layers:
+            if not getattr(layer.self_attn, "is_dflash_kda", False):
+                yield layer
+
+    def iter_scan_kda_layers(self):
+        """Yield draft layers whose KDA recurrence scans the target context."""
+        for layer in self.layers:
+            if getattr(layer.self_attn, "is_dflash_kda_scan", False):
+                yield layer
+
+    @property
+    def has_scan_kda_layers(self) -> bool:
+        return any(True for _ in self.iter_scan_kda_layers())
+
+    def init_kda_context_state(
+        self, max_slots: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        """Allocate the per-request running state of context-scanning KDA layers."""
+        for layer in self.iter_scan_kda_layers():
+            layer.self_attn.init_context_state(max_slots, device, dtype)
+
+    def advance_kda_context(
+        self,
+        slots: torch.Tensor,
+        ctx_hidden: torch.Tensor,
+        row_lens: torch.Tensor,
+        reset_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Feed newly verified context rows to every context-scanning KDA layer."""
+        for layer in self.iter_scan_kda_layers():
+            layer_ctx_hidden = self.prepare_context_hidden_for_kv(layer, ctx_hidden)
+            layer.self_attn.advance_context_state(
+                slots, layer_ctx_hidden, row_lens, reset_mask
+            )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -751,6 +1288,8 @@ class DFlashDraftModel(nn.Module):
                 return aliased_name
             return None
 
+        loaded_names = set()
+        ignored_names = []
         for name, loaded_weight in weights:
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
@@ -762,12 +1301,15 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_names.add(resolved_name)
                 break
             else:
                 resolved_name = resolve_param_name(name)
                 if resolved_name is None:
                     # Ignore unexpected weights (e.g., HF rotary caches).
+                    ignored_names.append(name)
                     continue
+                loaded_names.add(resolved_name)
                 param = params_dict[resolved_name]
                 if resolved_name.endswith("fc.weight"):
                     if self.is_nemotron_35_draft:
@@ -798,6 +1340,16 @@ class DFlashDraftModel(nn.Module):
                         )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+        missing_names = sorted(set(params_dict) - loaded_names)
+        logger.info(
+            "DFLASH draft load_weights: loaded=%d params, ignored=%d checkpoint tensors%s, "
+            "params without checkpoint tensor=%d%s",
+            len(loaded_names),
+            len(ignored_names),
+            f" (e.g. {ignored_names[:6]})" if ignored_names else "",
+            len(missing_names),
+            f" (e.g. {missing_names[:6]})" if missing_names else "",
+        )
 
 
 class DFlashLagunaAttention(DFlashAttention):
