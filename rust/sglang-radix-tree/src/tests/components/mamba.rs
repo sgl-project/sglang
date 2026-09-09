@@ -1,7 +1,9 @@
 use super::*;
 use crate::components::{FULL, MAMBA, SWA};
+use crate::test_utils::{CacheAction, InsertParams, InsertResult, PoolTransfer, UnifiedTreeCore};
 use crate::test_utils::{accumulate_step, action_kinds};
 use crate::unified_lru_list::UnifiedLRUList;
+use tch::Tensor;
 
 fn mamba_core(page_size: usize) -> UnifiedTreeCore<Vec<i64>> {
     mamba_core_with_chunk(page_size, /* chunk = */ 256)
@@ -474,11 +476,11 @@ fn host_unlock_skips_the_lru_for_device_backed_nodes() {
 fn eviction_priority_is_the_lowest_tier_everywhere() {
     let mamba = mamba_component();
     assert_eq!(
-        TreeComponent::<Vec<i64>>::eviction_priority(&mamba, /* is_leaf = */ true),
+        TreeComponent::<Vec<i64>, Tensor>::eviction_priority(&mamba, /* is_leaf = */ true),
         0
     );
     assert_eq!(
-        TreeComponent::<Vec<i64>>::eviction_priority(&mamba, /* is_leaf = */ false),
+        TreeComponent::<Vec<i64>, Tensor>::eviction_priority(&mamba, /* is_leaf = */ false),
         0
     );
 }
@@ -1126,7 +1128,7 @@ fn load_back_build_adds_the_per_request_cow_transfer() {
             &tc,
             a,
             CacheTransferPhase::LoadBack,
-            /* mamba_pool_idx = */ Some(Tensor::from_slice(&[3i64]).squeeze()),
+            /* mamba_pool_idx = */ Some(Tensor::from_slice(&[3i64])),
             None,
             None,
             0,

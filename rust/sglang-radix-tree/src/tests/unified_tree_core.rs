@@ -1,10 +1,13 @@
 use std::sync::Mutex;
 
-use tch::Tensor;
+use tch::{Kind, Tensor};
 
 use super::*;
 use crate::components::{FULL, MAMBA, SWA};
 use crate::node::{NodeAccessError, ValueSlotIdx};
+use crate::test_utils::{
+    CacheAction, InsertParams, InsertResult, InsertStepResult, UnifiedTreeCore,
+};
 use crate::test_utils::{accumulate_step, action_kinds};
 
 fn core() -> UnifiedTreeCore<Vec<i64>> {
@@ -18,7 +21,7 @@ struct RecordingComponentForTest {
     host_eviction_calls: Mutex<Vec<(&'static str, usize)>>,
 }
 
-impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for RecordingComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
     }
@@ -136,7 +139,7 @@ struct CountingComponentForTest {
     validator_calls: Arc<Mutex<usize>>,
 }
 
-impl TreeComponent<Vec<i64>> for CountingComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for CountingComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
     }
@@ -225,7 +228,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
 // test can pin that dec_swa_lock_only dispatches lower-priority releases.
 struct LowPriorityComponentForTest;
 
-impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for LowPriorityComponentForTest {
     fn component_type(&self) -> ComponentType {
         MAMBA
     }
@@ -304,7 +307,7 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
 
 struct SwaComponentForTest;
 
-impl TreeComponent<Vec<i64>> for SwaComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for SwaComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
     }
@@ -393,7 +396,7 @@ impl SwaEvictionComponentForTest {
     }
 }
 
-impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
+impl TreeComponent<Vec<i64>, Tensor> for SwaEvictionComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
     }
@@ -8062,7 +8065,7 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                 // Insert-while-locked churn, the cache_finished_req shape.
                 let matched = tc.match_prefix(&match_params(&key));
                 let anchor = matched.best_match_node_id;
-                let matched_len = matched.device_indices.numel() as usize;
+                let matched_len = matched.device_indices.numel();
                 let lock = tc.inc_lock_ref(anchor).expect("live match anchor");
                 tc.insert(&sequence_insert_params(
                     &key,

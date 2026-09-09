@@ -15,11 +15,20 @@ use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
-    BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
-    DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams, InsertResult, InsertStepResult,
-    MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req,
-    UnifiedTreeCore,
+    BufferBackupSnapshot, BufferBackupState, CacheInitParams, CacheTransferPhase, DecLockRefParams,
+    EvictLayer, MatchPrefixParams, PoolHitPolicy, PoolName, PoolTransferResult,
 };
+
+// The binding is Tensor-only; name the generic tree types once.
+type CacheAction = crate::unified_tree_core::CacheAction<Tensor>;
+type EvictionStepResult = crate::unified_tree_core::EvictionStepResult<Tensor>;
+type InsertParams<'k, K> = crate::unified_tree_core::InsertParams<'k, K, Tensor>;
+type InsertResult = crate::unified_tree_core::InsertResult<Tensor>;
+type InsertStepResult = crate::unified_tree_core::InsertStepResult<Tensor>;
+type MatchResult = crate::unified_tree_core::MatchResult<Tensor>;
+type PoolTransfer = crate::unified_tree_core::PoolTransfer<Tensor>;
+type Req = crate::unified_tree_core::Req<Tensor>;
+type UnifiedTreeCore<K> = crate::unified_tree_core::UnifiedTreeCore<K, Tensor>;
 
 /// Parse a torch-style device string (e.g. "cpu", "cuda", "cuda:1"); a bare
 /// "cuda" means index 0, so callers must resolve the index themselves.
@@ -435,7 +444,6 @@ impl TreeCoreInitParamsBinding {
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
             write_through_threshold: self.write_through_threshold,
-            device: parse_device(&self.device)?,
             swa_sliding_window_size: self.swa_sliding_window_size,
             // Wired post-construction via set_has_swa_host_pool.
             has_swa_host_pool: false,
@@ -912,11 +920,15 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                  'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
             )));
         }
+        let device = parse_device(&init_params.device)?;
         let params = init_params.to_cache_init_params()?;
-        let device = params.device;
         let page_size = params.page_size;
         Ok(TreeCoreBinding {
-            core: Mutex::new(UnifiedTreeCore::new(params, component_types)),
+            core: Mutex::new(UnifiedTreeCore::new_on_device(
+                params,
+                component_types,
+                device,
+            )),
             device,
             page_size,
         })
@@ -1646,8 +1658,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         node_id: NodeId,
         mamba_pool_idx: Option<PyTensor>,
     ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
+        // Python keeps the request's Mamba slot as a 0-dim tensor; the core
+        // works on one-atom values.
         let req = Req {
-            mamba_pool_idx: mamba_pool_idx.map(|t| t.0),
+            mamba_pool_idx: mamba_pool_idx.map(|t| t.0.unsqueeze(0)),
         };
         let (kv_xfer, comp_xfers) = py
             .allow_threads(move || self.core().build_load_back_spec(node_id, Some(&req)))

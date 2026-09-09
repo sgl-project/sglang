@@ -13,8 +13,8 @@ features = ["python-extension"]
 torch-compat-header = "torch_2_13_compat.h"
 
 [lib]
-name = "mem_cache"
-crate-type = ["cdylib"]
+name = "sglang_radix_tree"
+crate-type = ["cdylib", "rlib"]
 
 # Keep this crate in its own workspace until its PyO3 version can be aligned
 # with the root workspace without conflicting native `links = "python"` crates.
@@ -24,7 +24,7 @@ crate-type = ["cdylib"]
 hashbrown = "0.16"
 pyo3 = { version = "0.22", optional = true }
 sha2 = "0.10"
-tch = "=0.24.0"
+tch = { version = "=0.24.0", optional = true }
 thiserror = "1"
 
 # Hardware SHA extensions; identical digests.
@@ -36,5 +36,6 @@ sha2 = { version = "0.10", features = ["asm"] }
 # extension. Wheel and source builds select python-extension through package
 # metadata; shared white-box tests additionally select inspection.
 default = []
-python-extension = ["dep:pyo3", "pyo3/extension-module", "tch/python-extension"]
+torch = ["dep:tch"]
+python-extension = ["dep:pyo3", "pyo3/extension-module", "torch", "tch/python-extension"]
 inspection = []

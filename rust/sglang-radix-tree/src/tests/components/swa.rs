@@ -1,13 +1,17 @@
 use super::*;
 use crate::components::{FULL, MAMBA, SWA};
+use crate::test_utils::{
+    CacheAction, InsertParams, InsertResult, MatchResult, PoolTransfer, UnifiedTreeCore,
+};
 use crate::test_utils::{accumulate_step, action_kinds};
 use crate::unified_tree_core::CacheInitParams;
+use tch::{Kind, Tensor};
 
 #[test]
 fn component_type_is_swa() {
     let swa = SwaComponent::new(&swa_params());
     assert_eq!(
-        <SwaComponent as TreeComponent<Vec<i64>>>::component_type(&swa),
+        <SwaComponent as TreeComponent<Vec<i64>, Tensor>>::component_type(&swa),
         SWA
     );
 }
@@ -294,7 +298,7 @@ fn match_validator_hicache_with_a_host_pool_rejects_swa_tombstones() {
     let swa = SwaComponent {
         sliding_window_size: 2,
     };
-    let mut validator = <SwaComponent as TreeComponent<Vec<i64>>>::create_match_validator(
+    let mut validator = <SwaComponent as TreeComponent<Vec<i64>, Tensor>>::create_match_validator(
         &swa, &tc, /* match_device_only = */ true,
     );
     assert!(!validator(&tc, live));
@@ -1887,11 +1891,11 @@ fn device_and_host_lock_walks_mint_independent_uuids() {
 fn eviction_priority_is_zero_for_leaf_one_for_internal() {
     let swa = swa_component(4);
     assert_eq!(
-        <SwaComponent as TreeComponent<Vec<i64>>>::eviction_priority(&swa, true),
+        <SwaComponent as TreeComponent<Vec<i64>, Tensor>>::eviction_priority(&swa, true),
         0
     );
     assert_eq!(
-        <SwaComponent as TreeComponent<Vec<i64>>>::eviction_priority(&swa, false),
+        <SwaComponent as TreeComponent<Vec<i64>, Tensor>>::eviction_priority(&swa, false),
         1
     );
 }
@@ -2321,7 +2325,7 @@ fn release_window_lock_breaks_on_a_tombstone_carrying_the_uuid() {
     tc.arena.node_mut(b).swa_uuid = Some(99);
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
-    <SwaComponent as TreeComponent<Vec<i64>>>::release_window_lock(
+    <SwaComponent as TreeComponent<Vec<i64>, Tensor>>::release_window_lock(
         &swa,
         &mut tc,
         c,
@@ -2341,7 +2345,7 @@ fn release_window_lock_panics_on_a_non_swa_component() {
     let root = tc.arena.root();
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
-    <FullComponent as TreeComponent<Vec<i64>>>::release_window_lock(
+    <FullComponent as TreeComponent<Vec<i64>, Tensor>>::release_window_lock(
         &FullComponent,
         &mut tc,
         root,
@@ -3598,11 +3602,11 @@ fn build_transfers_are_gated_off_until_the_swa_host_pool_is_wired() {
 }
 
 #[test]
-fn backup_host_build_wraps_the_device_value_as_int64() {
+fn backup_host_build_carries_the_device_value() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
     tc.arena
-        .set_device_value(a, SWA, Tensor::from_slice(&[5i32]));
+        .set_device_value(a, SWA, Tensor::from_slice(&[5i64]));
     let transfers = swa_component(4)
         .build_hicache_transfers(
             &tc,
