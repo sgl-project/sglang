@@ -837,14 +837,14 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if capture_enabled:
+        if core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
+        elif capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
 
         all_rows = slice(0, _c4sl.shape[0])
 
@@ -868,7 +868,7 @@ class C4IndexerBackendMixin:
                     indexer_metadata.c4_page_size,
                     row_raw_indices,
                 )
-            elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
+            elif self.dsa_topk_backend.should_use_topk_v2():
                 topk_transform_paged_v2(
                     logits,
                     c4_seq_lens[rows],
@@ -882,6 +882,7 @@ class C4IndexerBackendMixin:
                         if rows == all_rows or not is_hip()
                         else plan_topk_v2(c4_seq_lens[rows])
                     ),
+                    row_raw_indices,
                 )
             else:
                 topk_transform_paged(
