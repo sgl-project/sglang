@@ -699,6 +699,60 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.v_buffer[layer_id - self.start_layer],
         )
 
+    def get_kv_buffer_shape(self):
+        """The shape of ONE TOKEN's KV, not of the paged buffer.
+
+        The inherited implementation returns ``get_kv_buffer(start_layer)``'s
+        shapes, which on this pool are two *separate* paged tensors of
+        ``(pages, page_size, 1, dim)`` -- nope and rope kept apart, where CUDA's
+        MLA pool keeps one fused ``(rows, 1, kv_lora_rank + qk_rope_head_dim)``.
+
+        Its only caller is the DCP extend gather, which builds its buffer as
+        ``(seq_lens_sum, *shape[0][1:])`` (``layers/dcp/planner.py``). Under the
+        inherited reading that allocates ``page_size`` rows per token and drops
+        the rope half entirely: roughly a gigabyte at an 8k prefill and about
+        137 GiB at 1M, for a buffer that is then never read. So this reports
+        what the caller is actually asking -- how big is one token -- rather
+        than how this pool happens to store it, and reports it in CUDA's fused
+        form because that is the layout the gather writes and reads.
+
+        Both halves of the tuple are the same fused shape. The caller takes
+        ``[0]``; there is no separate v-shape to report once the two are fused,
+        and returning the rope-only shape as ``[1]`` would invite exactly the
+        per-half reading this override exists to prevent.
+        """
+        per_token = torch.Size((1, self.kv_lora_rank + self.qk_rope_head_dim))
+        return per_token, per_token
+
+    def get_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        """Gather ``(nope, rope)`` at physical rows ``loc``.
+
+        The inherited implementation reads a single fused ``kv_buffer`` through
+        ``get_mla_kv_buffer_triton``; this pool stores the halves in two paged
+        tensors, so that kernel would index the wrong memory rather than fail.
+
+        ``loc`` arrives already rank-local and physical -- the DCP caller
+        translates through ``translate_dcp_read_ids`` before calling, which is
+        the read door's stated contract -- so this must NOT apply the owner
+        filter or the ``// dcp_size`` again. Flattening the page axes and
+        selecting is then the whole operation, and it is correct at any
+        ``dcp_size`` including 1.
+        """
+        k = self.get_key_buffer(layer.layer_id).view(-1, self.kv_lora_rank)
+        v = self.get_value_buffer(layer.layer_id).view(-1, self.qk_rope_head_dim)
+        idx = loc.to(torch.int64)
+        cache_k_nope = k.index_select(0, idx).unsqueeze(1)
+        cache_k_rope = v.index_select(0, idx).unsqueeze(1)
+        if dst_dtype is not None and dst_dtype != cache_k_nope.dtype:
+            cache_k_nope = cache_k_nope.to(dst_dtype)
+            cache_k_rope = cache_k_rope.to(dst_dtype)
+        return cache_k_nope, cache_k_rope
+
     def _index_k_item_len(self, i: int) -> int:
         """Bytes per page for one layer's index-K buffer, 0 when elided.
 
