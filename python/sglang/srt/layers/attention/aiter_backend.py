@@ -62,7 +62,10 @@ try:
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
+        asm_verify_attn_enabled,
+        unified_attention_3d_mtp_decode_func,
         unified_attention_3d_mtp_func,
+        unified_attention_3d_mtp_ragged_func,
     )
 except ImportError:
     print(
@@ -152,6 +155,18 @@ class ForwardMetadata:
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
+
+
+# AITER's gfx950 FP8 FMHA ASM kernels only cover these GQA ratios. Other
+# ratios (e.g. Qwen3.8-27B 24Q/4KV = 6) must not take the pertensor shortcut.
+_AITER_FP8_ASM_GQA_RATIOS = frozenset({1, 2, 4, 8, 16})
+
+
+def _aiter_fp8_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
+    """Whether AITER's FP8 FMHA ASM kernel supports this GQA ratio."""
+    if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+        return False
+    return (num_q_heads // num_kv_heads) in _AITER_FP8_ASM_GQA_RATIOS
 
 
 def _asm_context_prefill_gather_indices(
@@ -2697,7 +2712,16 @@ class AiterAttnBackend(AttentionBackend):
                         is_gfx95_supported()
                         and 1 < self.forward_metadata.max_q_len <= 4
                         and max_kv_len > 512
-                        and num_queries_per_kv == 16
+                        and (
+                            num_queries_per_kv == 16
+                            or (
+                                num_queries_per_kv == 8
+                                # GQA 8 is validated for the 4-token verify
+                                # block; shorter draft configs keep the old path
+                                and self.forward_metadata.max_q_len == 4
+                                and asm_verify_attn_enabled()
+                            )
+                        )
                         and layer.tp_k_head_num == layer.tp_v_head_num
                         and layer.qk_head_dim == 256
                         and layer.v_head_dim == 256
@@ -2822,6 +2846,38 @@ class AiterAttnBackend(AttentionBackend):
                 # NaN. The verify (seq_lens + max_q_len) and decode
                 # (seq_lens) call sites pass int64 for the same reason.
                 seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int64)
+                # draft_extend has ragged short Q (accepted tokens, 1..4); the
+                # asm verify kernel serves it via in-kernel tail alignment.
+                if (
+                    is_gfx95_supported()
+                    and de_window == (-1, -1)
+                    and not layer.logit_cap
+                    and sinks is None
+                    and self.page_size == 16
+                    and layer.qk_head_dim == 256
+                    and layer.v_head_dim == 256
+                    and layer.tp_k_head_num == layer.tp_v_head_num
+                    and 1 <= self.forward_metadata.max_q_len <= 4
+                    and unified_attention_3d_mtp_ragged_func(
+                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k=k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v=v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        cu_seqlens_q=self.forward_metadata.qo_indptr,
+                        seqused_k=seqused_k,
+                        max_seqlen_q=self.forward_metadata.max_q_len,
+                        max_seqlen_k=pt.shape[1] * self.page_size,
+                        softmax_scale=layer.scaling,
+                        block_table=pt,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
+                ):
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
@@ -2871,6 +2927,9 @@ class AiterAttnBackend(AttentionBackend):
                 and layer.qk_head_dim == 256
                 and layer.v_head_dim == 256
                 and self.kv_cache_dtype == fp8_dtype
+                and _aiter_fp8_asm_supports_gqa(
+                    layer.tp_q_head_num, layer.tp_k_head_num
+                )
                 and not self.kv_cache_is_vectorized_5d
                 and self.forward_metadata.max_kv_len is not None
             ):
@@ -2936,6 +2995,9 @@ class AiterAttnBackend(AttentionBackend):
                 and layer.qk_head_dim == 256
                 and layer.v_head_dim == 256
                 and self.kv_cache_dtype == fp8_dtype
+                and _aiter_fp8_asm_supports_gqa(
+                    layer.tp_q_head_num, layer.tp_k_head_num
+                )
             ):
                 q_c = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 k_c = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
@@ -3155,6 +3217,37 @@ class AiterAttnBackend(AttentionBackend):
                         page_table = self.forward_metadata.swa_page_table
 
                 max_kv_len = page_table.shape[1] * self.page_size
+                # q_len==1 decode (incl. EAGLE draft decode steps) via the asm
+                # verify kernel (in-kernel tail alignment; static shapes, so
+                # the path is cuda-graph capture safe). Must run BEFORE the
+                # scaled_fp8_quant below: the asm kernel takes bf16 Q.
+                if (
+                    is_gfx95_supported()
+                    and self.forward_metadata.max_q_len == 1
+                    and window_size == (-1, -1)
+                    and sinks is None
+                    and self.page_size == 16
+                    and layer.qk_head_dim == 256
+                    and layer.v_head_dim == 256
+                    and layer.tp_k_head_num == layer.tp_v_head_num
+                    and unified_attention_3d_mtp_decode_func(
+                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k=k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v=v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        seqused_k=forward_batch.seq_lens,
+                        max_seqlen_k=max_kv_len,
+                        softmax_scale=self.scale,
+                        block_table=page_table,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
+                ):
+                    return o
                 q_descale = None
                 if self.kv_cache_dtype == fp8_dtype:
                     q_descale = (
