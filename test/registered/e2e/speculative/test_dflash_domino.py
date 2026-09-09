@@ -17,15 +17,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestDFlashDomino(CustomTestCase, GSM8KMixin):
+class TestDFlashDominoFullVocab(CustomTestCase):
     model = "Qwen/Qwen3-8B"
     draft_model = "Huang2020/Qwen3-8B-Domino-b16"
-    gsm8k_score_threshold = 0.90
-    gsm8k_num_examples = 200
-    gsm8k_accept_length_thres = 4.0
-    gsm8k_num_threads = 128
-    gsm8k_num_shots = 5
-    candidate_pool_size = 2048
+    candidate_pool_size = 0
 
     @classmethod
     def setUpClass(cls):
@@ -96,8 +91,13 @@ class TestDFlashDomino(CustomTestCase, GSM8KMixin):
             kill_process_tree(cls.process.pid)
 
 
-class TestDFlashDominoFullVocab(TestDFlashDomino):
-    candidate_pool_size = 0
+class TestDFlashDomino(TestDFlashDominoFullVocab, GSM8KMixin):
+    gsm8k_score_threshold = 0.90
+    gsm8k_num_examples = 200
+    gsm8k_accept_length_thres = 4.0
+    gsm8k_num_threads = 128
+    gsm8k_num_shots = 5
+    candidate_pool_size = 2048
 
 
 if __name__ == "__main__":
