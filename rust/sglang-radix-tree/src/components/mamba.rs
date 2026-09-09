@@ -132,6 +132,8 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
         &self,
         tree_core: &UnifiedTreeCore<K, V>,
         mut result: MatchResult<V>,
+        _last_device_node_idx: NodeIdx_,
+        best_match_node_idx: NodeIdx_,
         _params: &MatchPrefixParams<'_, K>,
         _value_chunks: &[V],
         _best_value_len: usize,
@@ -148,9 +150,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
 
         // HiCache: if mamba was evicted from device but has host backup,
         // ensure mamba_host_hit_length >= 1 so load_back is triggered.
-        let last_node = tree_core
-            .arena
-            .node(tree_core.arena.resolve(result.best_match_node_id));
+        let last_node = tree_core.arena.node(best_match_node_idx);
         if !last_node.has_device_value(MAMBA) && last_node.has_host_value(MAMBA) {
             result.mamba_host_hit_length = result.mamba_host_hit_length.max(1);
         }
@@ -648,7 +648,12 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
                 let target_node_id = insert_result
                     .as_deref()
                     .and_then(|result| result.inserted_host_node)
-                    .map(|id| tree_core.arena.resolve(id));
+                    .map(|id| {
+                        tree_core
+                            .arena
+                            .resolve(id)
+                            .expect("prefetch insert results must reference live nodes")
+                    });
                 let attach_target = match (host_indices, target_node_id) {
                     (Some(_), Some(target))
                         if loaded && !tree_core.arena.has_host_value(target, MAMBA) =>

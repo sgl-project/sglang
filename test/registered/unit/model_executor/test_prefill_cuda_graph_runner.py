@@ -27,7 +27,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeAttentionBackend:
@@ -213,7 +213,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.capture_num_tokens = [4]
         runner.buffer_registry = _FakeBatchRegistry()
         runner.model_runner = SimpleNamespace(attn_tp_sequence_sharded=lambda _: False)
-        runner.enable_cp_v2_bcg_capture = False
+        runner.enable_cp_bcg_capture = False
         runner._is_full_backend = False
         runner.backend = SimpleNamespace()
         runner.has_mha_companion_layers = False

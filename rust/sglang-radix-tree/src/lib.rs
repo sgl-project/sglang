@@ -29,7 +29,9 @@ mod unified_tree_core;
 mod value;
 
 pub use components::{ComponentType, FULL, MAMBA, SWA};
-pub use node::{ChildKeyType, KeyNamespace, KeyNamespaceRef, NodeId, TreeCoreRuntimeError};
+pub use node::{
+    ChildKeyType, KeyNamespace, KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError,
+};
 pub use unified_tree_core::{
     BackupKV, BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams,
     CacheTransferPhase, DecLockRefParams, DecLockRefResult, EvictLayer, EvictionStepResult,

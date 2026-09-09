@@ -228,7 +228,12 @@ impl SwaComponent {
         });
         let target = insert_result
             .and_then(|result| result.inserted_host_node)
-            .map(|id| tree_core.arena.resolve(id));
+            .map(|id| {
+                tree_core
+                    .arena
+                    .resolve(id)
+                    .expect("prefetch insert results must reference live nodes")
+            });
 
         let (Some(target), Some(host_indices)) = (target, transfer.host_indices.as_ref()) else {
             if let Some(host_indices) = &transfer.host_indices {
@@ -236,6 +241,15 @@ impl SwaComponent {
             }
             return;
         };
+        // Cache-mode graft commit only (buffer fills never reach here):
+        // a hit-shrunk window mid-tree is missing its head, so drop it.
+        // Root anchors are complete windows of their own.
+        if node_id != tree_core.arena.root()
+            && window_require_pages < self.sliding_window_size.div_ceil(page_size)
+        {
+            self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
+            return;
+        }
         if window_require_pages == 0 || loaded_pages < window_require_pages {
             self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
             return;
@@ -340,6 +354,8 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
         &self,
         tree_core: &UnifiedTreeCore<K, V>,
         mut result: MatchResult<V>,
+        _last_device_node_idx: NodeIdx_,
+        best_match_node_idx: NodeIdx_,
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[V],
         best_value_len: usize,
@@ -349,9 +365,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
         // toward the SWA host hit.
         let mut n_swa = 0;
         let mut swa_host_hit = 0;
-        let mut node = tree_core
-            .arena
-            .node(tree_core.arena.resolve(result.best_match_node_id));
+        let mut node = tree_core.arena.node(best_match_node_idx);
         while !node.is_root() && n_swa < self.sliding_window_size {
             if node.has_device_value(SWA) {
                 n_swa += node.device_value_len(SWA);
@@ -962,7 +976,10 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                 let mut swa_chunks: Vec<V> = Vec::new();
                 let mut offset = 0usize;
                 for &loaded_id in transfer.nodes_to_load.iter().flatten() {
-                    let loaded_idx = tree_core.arena.resolve(loaded_id);
+                    let loaded_idx = tree_core
+                        .arena
+                        .resolve(loaded_id)
+                        .expect("load-back transfers must reference live nodes");
                     let n_tokens = tree_core.arena.host_value_len(loaded_idx, SWA);
                     let swa_chunk = device_indices.slice(offset, n_tokens).copy_for_adoption();
                     tree_core.set_component_device_value_(

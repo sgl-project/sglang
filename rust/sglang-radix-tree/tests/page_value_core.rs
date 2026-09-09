@@ -54,7 +54,8 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
         namespace: KeyNamespaceRef::default(),
     });
     assert_eq!(prefix.device_indices.as_slice(), &[1, 2]);
-    tree.inc_lock_ref(prefix.last_device_node_id);
+    tree.inc_lock_ref(prefix.last_device_node_id)
+        .expect("live node");
     assert_eq!(tree.protected_size(), 2);
 
     let result = tree.insert_suffix_from_node(
@@ -76,17 +77,21 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
     assert_eq!(result.total_len, 4);
     assert!(result.cache_actions.is_empty());
 
-    let canonical_suffix = tree.collect_full_device_indices(
-        result.last_device_node_id.expect("inserted node"),
-        prefix.last_device_node_id,
-    );
+    let canonical_suffix = tree
+        .collect_full_device_indices(
+            result.last_device_node_id.expect("inserted node"),
+            prefix.last_device_node_id,
+        )
+        .expect("live nodes");
     assert_eq!(canonical_suffix.as_slice(), &[5, 6]);
 
     let inserted_node = result.last_device_node_id.expect("inserted node");
-    tree.inc_lock_ref(inserted_node);
-    tree.dec_lock_ref(prefix.last_device_node_id, None, false);
+    tree.inc_lock_ref(inserted_node).expect("live node");
+    tree.dec_lock_ref(prefix.last_device_node_id, None, false)
+        .expect("live node");
     assert_eq!(tree.protected_size(), 4);
-    tree.dec_lock_ref(inserted_node, None, false);
+    tree.dec_lock_ref(inserted_node, None, false)
+        .expect("live node");
     assert_eq!(tree.protected_size(), 0);
     // The original [30, 40] branch plus the new branch remain cacheable.
     assert_eq!(tree.evictable_size(), 6);
@@ -122,10 +127,12 @@ fn continuation_insert_rejects_a_host_only_anchor() {
         .last_device_node_id;
     // Back both nodes up and drop their device copies: the anchor is now a
     // host-only tombstone.
-    tree.commit_backup(anchor, PageValue::from_vec(vec![101, 102]), HashMap::new());
-    tree.commit_backup(leaf, PageValue::from_vec(vec![103, 104]), HashMap::new());
-    let _ = tree.demote(leaf);
-    let _ = tree.demote(anchor);
+    tree.commit_backup(anchor, PageValue::from_vec(vec![101, 102]), HashMap::new())
+        .expect("live node");
+    tree.commit_backup(leaf, PageValue::from_vec(vec![103, 104]), HashMap::new())
+        .expect("live node");
+    tree.demote(leaf).expect("backed-up node");
+    tree.demote(anchor).expect("backed-up node");
 
     let key = vec![10, 20, 50, 60];
     let error = tree
@@ -292,7 +299,9 @@ fn every_eviction_policy_operates_without_torch() {
         tree.evict_device_start(FULL, 1);
         let (node_id, step) = tree.evict_device_next_node(FULL, &HashMap::new());
         assert!(step.tracker.is_empty(), "{policy}");
-        let (_, result) = tree.evict_device_leaf(node_id.expect("eviction candidate"), false);
+        let (_, result) = tree
+            .evict_device_leaf(node_id.expect("eviction candidate"), false)
+            .expect("live leaf");
         tree.evict_device_end(FULL);
 
         assert_eq!(result.tracker.get(&FULL), Some(&2), "{policy}");
@@ -335,10 +344,12 @@ fn inserted_values_do_not_retain_the_caller_buffer() {
 
     // The tree holds its own compact copy, so dropping or reusing the caller's
     // buffer releases it even while these pages stay cached.
-    let stored = tree.collect_full_device_indices(
-        result.last_device_node_id.expect("inserted node"),
-        prefix.last_device_node_id,
-    );
+    let stored = tree
+        .collect_full_device_indices(
+            result.last_device_node_id.expect("inserted node"),
+            prefix.last_device_node_id,
+        )
+        .expect("live nodes");
     assert_eq!(stored.as_slice(), &[3, 4]);
     assert_ne!(stored.as_slice().as_ptr(), extended_ptr);
     assert_eq!(stored.to_i64_vec(), vec![3, 4]);

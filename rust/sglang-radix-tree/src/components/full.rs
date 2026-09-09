@@ -50,6 +50,8 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
         &self,
         tree_core: &UnifiedTreeCore<K, V>,
         mut result: MatchResult<V>,
+        last_device_node_idx: NodeIdx_,
+        best_match_node_idx: NodeIdx_,
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[V],
         best_value_len: usize,
@@ -57,9 +59,8 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
         // Compute Full KV host hit length: walk from last_host_node up to
         // last_device_node, summing host_value lengths of evicted nodes.
         let mut kv_host_hit = 0;
-        let mut node_idx = tree_core.arena.resolve(result.best_match_node_id);
-        let last_device_idx = tree_core.arena.resolve(result.last_device_node_id);
-        while node_idx != last_device_idx {
+        let mut node_idx = best_match_node_idx;
+        while node_idx != last_device_node_idx {
             let node = tree_core.arena.node(node_idx);
             let parent = node.try_parent().unwrap_or_else(|| {
                 panic!(
@@ -470,7 +471,10 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
                 {
                     let mut offset = 0usize;
                     for &loaded_id in transfer.nodes_to_load.iter().flatten() {
-                        let loaded_idx = tree_core.arena.resolve(loaded_id);
+                        let loaded_idx = tree_core
+                            .arena
+                            .resolve(loaded_id)
+                            .expect("load-back transfers must reference live nodes");
                         let loaded = tree_core.arena.node_mut(loaded_idx);
                         let n_len = loaded.host_value_len(FULL);
                         loaded.set_device_value(

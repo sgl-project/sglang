@@ -129,6 +129,8 @@ pub trait TreeComponent<K: ChildKeyType, V: RadixValue> {
         &self,
         tree_core: &UnifiedTreeCore<K, V>,
         result: MatchResult<V>,
+        _last_device_node_idx: NodeIdx_,
+        _best_match_node_idx: NodeIdx_,
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[V],
         best_value_len: usize,

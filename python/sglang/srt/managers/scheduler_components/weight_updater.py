@@ -41,6 +41,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.runtime_context import get_model
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +199,7 @@ class SchedulerWeightUpdaterManager:
         freeing them would leave the daemon and every peer pointing at released
         memory.
         """
-        mode = self.tp_worker.model_runner.server_args.weight_cache_mode
+        mode = get_model().weight_cache_mode
         if mode != "off":
             raise RuntimeError(
                 f"[weight_cache] {op} of model weights is not supported while the "
