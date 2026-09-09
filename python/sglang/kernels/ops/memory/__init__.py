@@ -18,6 +18,7 @@ _TRITON_KERNELS = [
     ("virtual_slot", "alloc_bind_inplace"),
     ("virtual_slot", "free_unbind_inplace"),
     ("virtual_slot", "bind_inplace"),
+    ("virtual_slot", "write_loc_to_kernel_ids"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
