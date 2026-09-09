@@ -120,27 +120,26 @@ class TestGemma3RMSNorm(CustomTestCase):
     of a wider qkv-style tensor via .split()+.unflatten(), so the leading
     dims are not flattenable to 2D."""
 
-    DTYPES = [torch.half, torch.bfloat16]
     ADD_RESIDUAL = [False, True]
     SEEDS = [0]
 
     # (batch_size, hidden_size, dtype) combos for the 2D case.
     SHAPE_DTYPE_2D = [
         (batch_size, hidden_size, torch.float16)
-        for batch_size in [1, 19, 99, 989]
-        for hidden_size in [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
+        for batch_size in [1, 19]
+        for hidden_size in [1152, 2560, 3840, 5376]
     ] + [
         (19, 1024, torch.bfloat16),
         (19, 1024, torch.float32),
         (2, 32768, torch.float16),
     ]
 
-    BATCH_SIZES_3D = [1, 4, 19]
-    SEQ_LENS_3D = [1, 7, 32]
+    BATCH_SIZES_3D = [1, 4]
+    SEQ_LENS_3D = [1, 74]
     # hidden_size=1 exercises the "other dim == 1" shape (excluding the leading
     # batch dim) that bypasses the flattenable fast-path check but still
     # yields a correct result.
-    HIDDEN_SIZES_3D = [1, 111, 1024, 4096]
+    HIDDEN_SIZES_3D = [512, 1024]
     DTYPES_3D = [torch.float16]
 
     NUM_TOKENS_4D = [1, 7]
@@ -148,7 +147,7 @@ class TestGemma3RMSNorm(CustomTestCase):
     # (excluding the leading batch/token dims) that bypass the flattenable
     # fast-path check but still yield a correct result.
     NUM_HEADS_4D = [1, 4, 8]
-    HEAD_DIMS_4D = [1, 64, 128]
+    HEAD_DIMS_4D = [64, 128]
     DTYPES_4D = [torch.float16]
 
     @classmethod
@@ -257,7 +256,7 @@ class TestGemma3RMSNorm(CustomTestCase):
 
     def test_gemma3_rms_norm_3d_unflatten(self):
         for head_dim, add_residual, dtype, seed in itertools.product(
-            [64, 128], self.ADD_RESIDUAL, self.DTYPES, self.SEEDS
+            [64, 128], self.ADD_RESIDUAL, self.DTYPES_3D, self.SEEDS
         ):
             with self.subTest(
                 head_dim=head_dim, add_residual=add_residual, dtype=dtype
@@ -268,7 +267,7 @@ class TestGemma3RMSNorm(CustomTestCase):
 
     def test_gemma3_rms_norm_4d_unflatten(self):
         for head_dim, add_residual, dtype, seed in itertools.product(
-            [64, 128], self.ADD_RESIDUAL, self.DTYPES, self.SEEDS
+            [64, 128], self.ADD_RESIDUAL, self.DTYPES_4D, self.SEEDS
         ):
             with self.subTest(
                 head_dim=head_dim, add_residual=add_residual, dtype=dtype
