@@ -12,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo  # noqa: E402
 from sglang.srt.mem_cache.chunk_cache import ChunkCache  # noqa: E402
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req  # noqa: E402
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache  # noqa: E402
@@ -39,9 +40,8 @@ class TestSkipRadixCacheInsert(CustomTestCase):
         last_node = object()
         req = SimpleNamespace(
             skip_radix_cache_insert=True,
-            req_pool_idx=0,
+            kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=2),
             prefix_indices=kv_indices[0, :2].clone(),
-            cache_protected_len=2,
             last_node=last_node,
             origin_input_ids=array("q", [1, 2, 3, 4, 5, 6]),
             output_ids=array("q"),
@@ -53,7 +53,7 @@ class TestSkipRadixCacheInsert(CustomTestCase):
         maybe_cache_unfinished_req(req, cache, chunked=True)
 
         torch.testing.assert_close(req.prefix_indices, kv_indices[0])
-        self.assertEqual(req.cache_protected_len, 2)
+        self.assertEqual(req.kv.cache_protected_len, 2)
         self.assertIs(req.last_node, last_node)
         cache.insert.assert_not_called()
         cache.match_prefix.assert_not_called()
@@ -77,7 +77,7 @@ class TestSkipRadixCacheInsert(CustomTestCase):
         cache.req_to_token_pool = SimpleNamespace(req_to_token=kv_indices)
         req = SimpleNamespace(
             skip_radix_cache_insert=True,
-            req_pool_idx=0,
+            kv=ReqKvInfo(req_pool_idx=0),
             prefix_indices=kv_indices[0, :2].clone(),
             extend_range=SimpleNamespace(end=6),
         )
@@ -98,9 +98,8 @@ class TestSkipRadixCacheInsert(CustomTestCase):
                 cache.insert = MagicMock()
                 req = SimpleNamespace(
                     skip_radix_cache_insert=True,
-                    req_pool_idx=0,
+                    kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=2),
                     prefix_indices=kv_indices[0, :2].clone(),
-                    cache_protected_len=2,
                     extend_range=SimpleNamespace(end=6),
                     get_fill_ids=lambda: array("q", [1, 2, 3, 4, 5, 6]),
                 )
@@ -108,7 +107,7 @@ class TestSkipRadixCacheInsert(CustomTestCase):
                 maybe_cache_unfinished_req(req, cache, chunked=True)
 
                 torch.testing.assert_close(req.prefix_indices, kv_indices[0])
-                self.assertEqual(req.cache_protected_len, 2)
+                self.assertEqual(req.kv.cache_protected_len, 2)
                 cache.insert.assert_not_called()
 
 
