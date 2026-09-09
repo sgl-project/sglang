@@ -245,6 +245,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # --hicache-serialize-load-back; resolved in init_hicache.
+        self.serialize_load_back = False
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -481,6 +483,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     pool=PoolName.KV.value,
                 )
         self.load_back_threshold = 10
+        # --hicache-serialize-load-back: submit and complete each request's H2D
+        # inside its own admission instead of after the batch is formed.
+        # Meaningless in buffer mode, which stages load-backs through its own
+        # pipeline rather than through ongoing_load_back.
+        self.serialize_load_back = (
+            get_memory().hicache_serialize_load_back
+            and self.cache_controller is not None
+            and self.buffer_pipeline is None
+        )
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
@@ -1600,6 +1611,16 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
+        if self.serialize_load_back:
+            return self._load_back_per_node(
+                anchor_id=node_id,
+                kv_xfer=kv_xfer,
+                comp_xfers=comp_xfers,
+                sidecar_xfers=sidecar_xfers,
+                ancestor_lock_params=ancestor_lock_params,
+                host_anchor_params=host_anchor_params,
+            )
+
         avail = self._component_available_size(ComponentType.FULL)
         if avail < kv_tokens:
             needed = kv_tokens - avail
@@ -1637,6 +1658,135 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         return True
+
+    def _load_back_per_node(
+        self,
+        *,
+        anchor_id: NodeId,
+        kv_xfer: PoolTransfer,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        sidecar_xfers: list[PoolTransfer],
+        ancestor_lock_params: DecLockRefParams,
+        host_anchor_params: DecLockRefParams,
+    ) -> bool:
+        """Load the anchor's chain a node at a time, draining each H->D.
+
+        Each step evicts only what that node needs, and its ack registers the
+        node as a host duplicate that the next step's write-back can reclaim
+        instead of destroying an unrelated session's sole host copy. The anchor
+        host pin taken by the caller is held across the whole loop: it keeps the
+        chain out of ``evictable_host_leaves`` (an ancestor with a host-resident
+        child is not a host leaf), so the chain cannot evict itself mid-load.
+
+        Aux components ride the final step. Their specs are anchor-scoped (Mamba
+        keys off the request's pool slot), so they stay a single commit, and a
+        chain that cannot finish reports total failure rather than a Full prefix
+        deeper than the aux state meant to accompany it.
+        """
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        # A KV-derived sidecar cannot ride the final step with the rest. It carries
+        # no indices of its own -- the controller resolves them from the operation
+        # it travels on -- so one attached to the last step is restored for that
+        # step's node only, and the rest of the chain keeps whatever its freshly
+        # allocated slots held. Each step builds its own below.
+        aux_xfers.extend(x for x in sidecar_xfers if x.indices_from_pool != PoolName.KV)
+        # An anchor whose Full KV is already resident still arrives here for its
+        # aux transfers; that aux-only load is the single-step case.
+        steps = self.tree_core.split_full_load_back_spec(kv_xfer) or [kv_xfer]
+
+        loaded_locks: list[tuple[NodeId, DecLockRefParams]] = []
+        try:
+            for i, step_xfer in enumerate(steps):
+                is_last = i == len(steps) - 1
+                step_tokens = len(step_xfer.host_indices)
+                if step_tokens and not self._evict_for_load_back(step_tokens):
+                    return False
+
+                step_id = anchor_id if is_last else step_xfer.nodes_to_load[0]
+                host_step_params = self.inc_host_lock_ref(step_id).to_dec_params()
+                step_pools = self._build_sidecar_transfers(
+                    CacheTransferPhase.LOAD_BACK, step_xfer, {}
+                )
+                if is_last:
+                    step_pools = aux_xfers + step_pools
+                device_indices = self.cache_controller.load(
+                    host_indices=step_xfer.host_indices,
+                    node_id=step_id,
+                    extra_pools=step_pools or None,
+                )
+                if device_indices is None:
+                    self.dec_host_lock_ref(step_id, host_step_params)
+                    return False
+
+                self._apply_cache_actions(
+                    self.tree_core.commit_load_back(
+                        step_id,
+                        device_indices,
+                        step_xfer,
+                        comp_xfers if is_last else {},
+                    )
+                )
+                self.ongoing_load_back[step_id] = _OngoingLoadBack(
+                    step_id,
+                    self.inc_lock_ref(step_id).to_dec_params(),
+                    host_step_params,
+                )
+                # Outlives the ack that drops the lock above: the next step's
+                # eviction must not reclaim what this one just brought in.
+                loaded_locks.append(
+                    (step_id, self.inc_lock_ref(step_id).to_dec_params())
+                )
+                self._drain_serialized_load_back()
+            return True
+        finally:
+            for nid, params in loaded_locks:
+                self.dec_lock_ref(nid, params)
+            self.dec_lock_ref(anchor_id, ancestor_lock_params)
+            self.dec_host_lock_ref(anchor_id, host_anchor_params)
+
+    def _evict_for_load_back(self, num_tokens: int) -> bool:
+        """Free device room for one load-back step.
+
+        Asks the same question the batched path asks for a whole chain, and
+        answers it the same way: evicting for Full can cascade to peer
+        components, so feasibility is re-read from the allocator rather than
+        inferred from how many tokens the eviction reported freeing.
+        """
+        avail = self._component_available_size(ComponentType.FULL)
+        if avail >= num_tokens:
+            return True
+        self.evict_for_alloc(EvictParams(num_tokens=num_tokens - avail))
+        return self._component_available_size(ComponentType.FULL) >= num_tokens
+
+    def _drain_serialized_load_back(self) -> None:
+        """Finish one load-back step's H->D before anything else is admitted.
+
+        By default a load-back only queues a CacheOperation; the batch's
+        transfers are merged and submitted once, after admission has closed
+        (``ready_to_load_host_cache``). Nothing loaded that way is a host
+        duplicate until that single ack, so a whole batch of chains competes for
+        host room that none of them can release.
+
+        Draining here is what makes the step boundary mean anything: duplicate
+        registration happens in ``finish_load_back`` at ack time, so the next
+        step's eviction only sees this step's node as reclaimable once the ack
+        has landed. It costs no transfer parallelism -- the batched path
+        serializes on the same host_to_device_stream anyway.
+
+        Draining also keeps at most one producer outstanding, which the
+        3-slot ``LayerDoneCounter`` ring requires: ``update_producer`` asserts
+        the slot it wraps onto has already finished.
+
+        The batch's later ``ready_to_load_host_cache`` finds an empty queue and
+        returns -1, so the forward runs with no layer-transfer consumer, which
+        is correct: the load already completed.
+        """
+        producer_id = self.cache_controller.start_loading()
+        if producer_id < 0:
+            return
+        # Exactly one ack is outstanding in this mode, so skip the cross-rank
+        # count consensus in loading_check(None) -- each rank drains its own.
+        self.loading_check(finish_count=1)
 
     def _build_sidecar_transfers(
         self,

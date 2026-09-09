@@ -123,6 +123,15 @@ class Memory:
             choices=["direct", "kernel", "kernel_ascend"],
         ),
     ] = "kernel"
+    hicache_serialize_load_back: A[
+        bool,
+        "Load a prefix back from host one radix node at a time, completing each "
+        "node's H2D before evicting for the next, instead of submitting the "
+        "whole batch's chains together after admission closes. Under write_back "
+        "this bounds how much device memory one eviction has to clear, and lets "
+        "each loaded node be reclaimed as a host duplicate to fund the next one, "
+        "rather than forcing the write-back cascade to destroy sole host copies.",
+    ] = False
     hicache_mem_layout: A[
         str,
         Arg(

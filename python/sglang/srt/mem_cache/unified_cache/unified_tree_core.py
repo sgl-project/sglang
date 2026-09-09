@@ -2121,6 +2121,33 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return empty_kv, {}
         return kv_xfer, comp_xfers
 
+    def split_full_load_back_spec(self, kv_xfer: PoolTransfer) -> list[PoolTransfer]:
+        """One Full transfer per source node, in the chain's root-first order.
+
+        A node only counts as a reclaimable host duplicate once its KV is on
+        device (``_is_settled_full_host_duplicate``), so every node of a chain
+        that has not been loaded yet is a sole host copy. Loading the chain as
+        one transfer therefore demands a device eviction sized for the whole
+        chain at the moment none of it can fund the write-back that eviction
+        cascades into, and the host pressure falls through to a destructive
+        ``_evict_host_leaf``. Loaded root-first one at a time, each node becomes
+        a duplicate at its own ack and pays for the next node's write-back.
+        """
+        transfers: list[PoolTransfer] = []
+        for nid in kv_xfer.nodes_to_load or ():
+            host_value = (
+                self.node_by_id(nid).component_data[BASE_COMPONENT_TYPE].host_value
+            )
+            assert host_value is not None
+            transfers.append(
+                PoolTransfer(
+                    name=PoolName.KV,
+                    host_indices=host_value,
+                    nodes_to_load=[nid],
+                )
+            )
+        return transfers
+
     def prefetch_anchor_info(
         self, node_id: NodeId
     ) -> tuple[Optional[str], Optional[str]]:
