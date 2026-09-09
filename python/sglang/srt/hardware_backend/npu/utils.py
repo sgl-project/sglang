@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
@@ -18,6 +22,32 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
 gva_is_inited = False
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch35() -> bool:
+    """Whether the runtime is on NPU architecture 35."""
+    if not is_npu():
+        return False
+
+    import acl
+
+    return acl.rt.get_device_info(0, 601) == (3510, 0)
+
+
+def use_npu_arch35_mxfp8_wo_a(quant_config) -> bool:
+    """Whether wo_a runs the native NPU arch35 MXFP8 GEMM.
+
+    Only for serialized DeepSeek block-FP8 checkpoints — those are the ones
+    ``Fp8LinearMethod.process_weights_after_loading`` can reinterpret into the
+    NPU arch35 MXFP8 scale layout.
+    """
+    if not _is_npu or not is_npu_arch35() or quant_config is None:
+        return False
+    if not getattr(quant_config, "is_checkpoint_fp8_serialized", False):
+        return False
+    weight_block_size = getattr(quant_config, "weight_block_size", None)
+    return tuple(weight_block_size or ()) == (128, 128)
 
 
 class NPUACLFormat(IntEnum):
@@ -44,7 +74,6 @@ def set_default_server_args(args: "ServerArgs"):
     """
     Set default server arguments for NPU backend.
     """
-    from sglang.srt.arg_groups.overrides import resolving_view
 
     cfg = resolving_view(args)
 
@@ -148,7 +177,7 @@ def set_default_server_args(args: "ServerArgs"):
             "set_default_server_args",
             hicache_io_backend="kernel_ascend",
         )
-        if args.use_mla_backend():
+        if use_mla_backend(args):
             declare_resolution(
                 args,
                 "set_default_server_args",

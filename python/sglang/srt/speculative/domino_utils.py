@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+
 def _domino_gru_cell(
     prefix_gru: nn.GRU, input: torch.Tensor, hidden: torch.Tensor
 ) -> torch.Tensor:
@@ -17,7 +18,7 @@ def _domino_gru_cell(
         prefix_gru.bias_hh_l0 if prefix_gru.bias else None,
     )
 
-_DOMINO_CANDIDATE_POOL_SIZE = 2048
+
 # Throughput policy for the logical full-vocabulary tensor. TP>1 uses the
 # compact candidate pool when this gathered representation would be large.
 _DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES = 96 * 1024 * 1024
@@ -302,14 +303,14 @@ def validate_domino_runtime(
 def domino_greedy_rollout(
     *,
     draft_hidden: torch.Tensor,
-    verified_ids: torch.Tensor,
+    bonus_tokens: torch.Tensor,
     target_embedding: nn.Module,
     lm_head_weight: torch.Tensor,
     prefix_gru: nn.GRU,
     embed_proj: nn.Sequential,
     vocab_size: int,
     shift_label: bool,
-    candidate_pool_size: int = _DOMINO_CANDIDATE_POOL_SIZE,
+    candidate_pool_size: int,
     tp_group=None,
     lm_head_org_vocab_start: int = 0,
     lm_head_num_org: int | None = None,
@@ -322,9 +323,9 @@ def domino_greedy_rollout(
             f"draft_hidden must have shape [batch, block, hidden], got {tuple(draft_hidden.shape)}."
         )
     batch_size, block_size, hidden_size = draft_hidden.shape
-    if verified_ids.shape != (batch_size,):
+    if bonus_tokens.shape != (batch_size,):
         raise ValueError(
-            f"verified_ids must have shape ({batch_size},), got {tuple(verified_ids.shape)}."
+            f"bonus_tokens must have shape ({batch_size},), got {tuple(bonus_tokens.shape)}."
         )
 
     num_proposals = int(block_size) - 1
@@ -449,7 +450,7 @@ def domino_greedy_rollout(
         ).transpose(0, 1)
         candidate_weight = F.embedding(candidate_ids, embed_proj[2].weight)
 
-    prefix_ids = torch.stack((verified_ids, first_ids), dim=1)
+    prefix_ids = torch.stack((bonus_tokens, first_ids), dim=1)
     _, gru_hidden = prefix_gru(target_embedding(prefix_ids))
 
     for index in range(1, num_proposals):

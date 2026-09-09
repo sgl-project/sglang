@@ -61,13 +61,21 @@ export const config = {
   --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
       aime26_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime26 \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 64000 \\
+  --temperature 1.0 --top-p 0.95 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+      aime25_pct:
+`# To install sgl-eval: pip install sgl-eval
+sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 64000 \\
   --temperature 1.0 --top-p 0.95 --thinking \\
@@ -79,6 +87,7 @@ sgl-eval run aime26 \\
 
   accuracyLabels: [
     ["aime26_pct", "AIME26",         "%"],
+    ["aime25_pct", "AIME25",         "%"],
     ["gsm8k_pct", "GSM8K (1-shot)", "%"],
   ],
 
@@ -160,7 +169,8 @@ sgl-eval run aime26 \\
 
     // ----- Card 4: "Speculative Decoding" -----
     // GLM-5.3 ships a single MTP (nextn) layer; index_share_for_mtp_iteration reuses the
-    // DSA indexer topk across draft steps (topk==1 only).
+    // DSA indexer topk across draft steps (topk==1 only). DFlash2 is the one
+    // algorithm no Deploy cell ships: its draft is a separate checkpoint.
     speculative: {
       options: [
         { id: "current", label: "Inherited from base" },
@@ -175,6 +185,25 @@ sgl-eval run aime26 \\
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
           disable: { hw: ["mi355x", "mi325x", "mi300x"] },
           disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+        { id: "dflash", label: "DFlash2 (block diffusion)",
+          // Block-wise draft from a separate checkpoint, not the in-checkpoint
+          // MTP layer. The block size (8) comes from the draft's own
+          // dflash_config, so no --speculative-num-draft-tokens here. The draft
+          // is a small dense model and does not run on the target's DSA
+          // backends, hence the explicit draft attention backend.
+          flags: ["--speculative-algorithm DFLASH",
+                  "--speculative-draft-model-path incoai/GLM-5.3-DFlash2",
+                  "--speculative-draft-attention-backend fa4"],
+          // The DFlash2 drafter (PR #35371) merged after v0.5.18, so neither the
+          // release wheel nor the lmsysorg/sglang:latest image this page pins
+          // carries it. Drop this note once a release ships it.
+          note: "⚠️ Needs a nightly image: the DFlash2 drafter (PR #35371) is not in the release wheel nor the lmsysorg/sglang:latest image this page pins — install SGLang from main or use a lmsysorg/sglang:dev image. The draft is a separate checkpoint, so fetch incoai/GLM-5.3-DFlash2 alongside the target; it is public but licensed CC BY-NC-ND 4.0 for research and evaluation.",
+          disable: [
+            { when: { dpAttnOn: [true] },
+              reason: "DFLASH speculative decoding does not support DP-Attention — the server rejects the combination at startup. Turn DP-Attention off in the Attention card above (the high-throughput recipes enable it)." },
+            { when: { hw: ["mi355x", "mi325x", "mi300x"] },
+              reason: "DFLASH speculative decoding only supports CUDA and NPU devices; the server rejects it on ROCm at startup." },
+          ] },
       ],
     },
 
@@ -687,7 +716,7 @@ sgl-eval run aime26 \\
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs 16",
+        "--cuda-graph-max-bs-decode 16",
         "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -729,7 +758,7 @@ sgl-eval run aime26 \\
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.85",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs 16",
+        "--cuda-graph-max-bs-decode 16",
         "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -796,7 +825,7 @@ sgl-eval run aime26 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -813,7 +842,7 @@ sgl-eval run aime26 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -847,7 +876,7 @@ sgl-eval run aime26 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -864,7 +893,7 @@ sgl-eval run aime26 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -898,7 +927,7 @@ sgl-eval run aime26 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -915,7 +944,7 @@ sgl-eval run aime26 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -949,7 +978,7 @@ sgl-eval run aime26 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -966,7 +995,7 @@ sgl-eval run aime26 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1000,7 +1029,7 @@ sgl-eval run aime26 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1017,7 +1046,7 @@ sgl-eval run aime26 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",

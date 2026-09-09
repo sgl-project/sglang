@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    declare_late_resolution,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -23,7 +24,9 @@ def check_lora_server_args(server_args: Any):
     # Enable LoRA if any LoRA paths are provided for backward compatibility.
     if cfg.lora_paths:
         if cfg.enable_lora is None:
-            server_args._late_resolution("check_lora_server_args", enable_lora=True)
+            declare_late_resolution(
+                server_args, "check_lora_server_args", enable_lora=True
+            )
             logger.warning(
                 "--enable-lora is set to True because --lora-paths is provided."
             )
@@ -34,8 +37,8 @@ def check_lora_server_args(server_args: Any):
 
     if cfg.enable_lora:
         if cfg.enable_lora_overlap_loading is None:
-            server_args._late_resolution(
-                "check_lora_server_args", enable_lora_overlap_loading=False
+            declare_late_resolution(
+                server_args, "check_lora_server_args", enable_lora_overlap_loading=False
             )
 
         if cfg.enable_lora_overlap_loading:
@@ -73,9 +76,9 @@ def check_lora_server_args(server_args: Any):
                             pinned=False,
                         )
                 elif isinstance(lora_path, dict):
-                    assert (
-                        "lora_name" in lora_path and "lora_path" in lora_path
-                    ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                    assert "lora_name" in lora_path and "lora_path" in lora_path, (
+                        f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                    )
                     lora_ref = LoRARef(
                         lora_id=LoRARef.deterministic_id(
                             lora_path["lora_name"], lora_path["lora_path"]
@@ -90,11 +93,12 @@ def check_lora_server_args(server_args: Any):
                         "Expected a string or a dictionary."
                     )
                 parsed_lora_paths.append(lora_ref)
-            server_args._late_resolution(
-                "check_lora_server_args", lora_paths=parsed_lora_paths
+            declare_late_resolution(
+                server_args, "check_lora_server_args", lora_paths=parsed_lora_paths
             )
         elif isinstance(cfg.lora_paths, dict):
-            server_args._late_resolution(
+            declare_late_resolution(
+                server_args,
                 "check_lora_server_args",
                 lora_paths=[
                     LoRARef(
@@ -107,7 +111,9 @@ def check_lora_server_args(server_args: Any):
                 ],
             )
         elif cfg.lora_paths is None:
-            server_args._late_resolution("check_lora_server_args", lora_paths=[])
+            declare_late_resolution(
+                server_args, "check_lora_server_args", lora_paths=[]
+            )
         else:
             raise ValueError(
                 f"Invalid type for --lora-paths: {type(cfg.lora_paths)}. "
@@ -117,19 +123,20 @@ def check_lora_server_args(server_args: Any):
         # Normalize target modules to a set; keep {"all"} as a sentinel
         # that gets resolved model-awarely in lora_manager.init_lora_shapes().
         if cfg.lora_target_modules:
-            server_args._late_resolution(
+            declare_late_resolution(
+                server_args,
                 "check_lora_server_args",
                 lora_target_modules=set(cfg.lora_target_modules),
             )
             if "all" in cfg.lora_target_modules:
-                assert (
-                    len(cfg.lora_target_modules) == 1
-                ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                assert len(cfg.lora_target_modules) == 1, (
+                    "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                )
 
         # Ensure sufficient information is provided for LoRA initialization.
-        assert cfg.lora_paths or (
-            cfg.max_lora_rank and cfg.lora_target_modules
-        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        assert cfg.lora_paths or (cfg.max_lora_rank and cfg.lora_target_modules), (
+            "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        )
 
         # Validate max_loaded_loras
         if cfg.max_loaded_loras is not None:
@@ -151,9 +158,9 @@ def check_lora_server_args(server_args: Any):
         if cfg.lora_use_virtual_experts:
             logger.info("Virtual expert computation enabled.")
 
-        assert (
-            cfg.lora_drain_wait_threshold >= 0.0
-        ), "--lora-drain-wait-threshold must be non-negative."
+        assert cfg.lora_drain_wait_threshold >= 0.0, (
+            "--lora-drain-wait-threshold must be non-negative."
+        )
 
 
 def check_lora_speculative_compatibility(server_args: Any):
