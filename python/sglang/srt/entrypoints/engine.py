@@ -1762,8 +1762,8 @@ def _set_envs_and_config(server_args: ServerArgs):
             "the process tree when a child process fails."
         )
 
-    # Set mp start method
-    mp.set_start_method("spawn", force=True)
+    # Set mp start method (forkserver when start_early() prepared one).
+    mp.set_start_method(envs.SGLANG_MP_START_METHOD.get(), force=True)
 
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:
