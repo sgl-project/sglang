@@ -110,6 +110,8 @@ def _rust_unported_feature(params: CacheInitParams) -> Optional[str]:
     """The flag of an enabled opt-in feature only the Python TreeCore implements."""
     if params.hicache_serialize_load_back:
         return "--hicache-serialize-load-back"
+    if params.allow_subagent_keepalive:
+        return "--allow-subagent-keepalive"
     return None
 
 

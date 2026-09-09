@@ -29,6 +29,7 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
         cache.dec_lock_ref = MagicMock()
         cache._components_tuple = ()
         cache.enable_session_radix_cache = False
+        cache.allow_subagent_keepalive = False
 
         kv = ReqKvInfo(
             req_pool_idx=0,
