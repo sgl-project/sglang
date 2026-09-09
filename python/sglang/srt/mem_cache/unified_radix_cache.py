@@ -2794,18 +2794,20 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
     ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
         cc = self.cache_controller
-        if cc is None:
+        extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
+        extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
+        if cc is None or self.pp_rank > 0:
             write_acks = 0
             load_acks = 0
-            storage_queue_sizes = ()
-            extra_pool_names = ()
+            # Zero placeholders shaped like PP0's slots: _pp_sync hands the
+            # received tensor back in place, so all ranks must build the same
+            # length or PP1+ would recv into a mismatched buffer.
+            storage_queue_sizes = (
+                (0,) * (4 + len(extra_pool_names)) if self.enable_storage else ()
+            )
         else:
             write_acks = self._count_ready_acks(cc.ack_write_queue)
             load_acks = self._count_ready_acks(cc.ack_load_queue)
-            extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
-            extra_pool_names = (
-                tuple(extra_release_queues) if self.enable_storage else ()
-            )
             storage_queue_sizes = (
                 (
                     cc.prefetch_hit_queue.qsize(),
@@ -2835,8 +2837,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
-        assert count_values[-2] == -count_values[-1], (
-            "write_back duplicate-reclaim victims diverged across TP ranks"
+        assert digest == count_values[-2] and digest == -count_values[-1], (
+            "write_back duplicate-reclaim victims diverged across PP/TP ranks"
         )
         return (
             count_values[0],
@@ -3030,50 +3032,29 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
-        if self.pp_size != 1:
-            finish_counts = torch.zeros(2, dtype=torch.int, device="cpu")
-            if self.pp_rank == 0 and self.cache_controller is not None:
-                finish_counts[0] = self._count_ready_acks(
-                    self.cache_controller.ack_write_queue
-                )
-                finish_counts[1] = self._count_ready_acks(
-                    self.cache_controller.ack_load_queue
-                )
-            self._all_reduce(finish_counts, torch.distributed.ReduceOp.MIN)
-            write_finish_count, load_finish_count = map(int, finish_counts.tolist())
-            self.writing_check(finish_count=write_finish_count)
-            self.loading_check(finish_count=load_finish_count)
-            if self.enable_storage:
-                self.drain_storage_control_queues()
-        else:
-            (
-                write_finish_count,
-                load_finish_count,
-                storage_queue_sizes,
-                extra_pool_names,
-            ) = self._sync_hicache_ready_counts()
-            self.writing_check(finish_count=write_finish_count)
-            self.loading_check(finish_count=load_finish_count)
+        (
+            write_finish_count,
+            load_finish_count,
+            storage_queue_sizes,
+            extra_pool_names,
+        ) = self._sync_hicache_ready_counts()
+        self.writing_check(finish_count=write_finish_count)
+        self.loading_check(finish_count=load_finish_count)
 
-            if self.enable_storage and storage_queue_sizes:
-                n_storage_hit, n_ack_prefetch, n_backup, n_release = (
-                    storage_queue_sizes[:4]
-                )
-                extra_release_counts = {
-                    pool_name: count
-                    for pool_name, count in zip(
-                        extra_pool_names,
-                        storage_queue_sizes[4:],
-                    )
-                }
-                self._drain_storage_control_queues_impl(
-                    n_storage_hit=n_storage_hit,
-                    n_ack_prefetch=n_ack_prefetch,
-                    n_backup=n_backup,
-                    n_release=n_release,
-                    extra_release_counts=extra_release_counts,
-                    log_metrics=True,
-                )
+        if self.enable_storage and storage_queue_sizes:
+            n_storage_hit, n_ack_prefetch, n_backup, n_release = storage_queue_sizes[:4]
+            extra_release_counts = {
+                pool_name: count
+                for pool_name, count in zip(extra_pool_names, storage_queue_sizes[4:])
+            }
+            self._drain_storage_control_queues_impl(
+                n_storage_hit=n_storage_hit,
+                n_ack_prefetch=n_ack_prefetch,
+                n_backup=n_backup,
+                n_release=n_release,
+                extra_release_counts=extra_release_counts,
+                log_metrics=True,
+            )
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
@@ -3123,20 +3104,28 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_reprefill_tail_tokens(self) -> int:
         """
-        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
-        (state_slot/pos), not content-stable and never offloaded to host, so a
+        Only unified_kv needs this: SWA lives in a per-request ring
+        (state_slot/pos), not content-stable and never stored in the tree, so a
         reused prefix's trailing sliding window would read another request's
-        stale ring slots. Re-prefilling that window rewrites this request's ring
-        (what plain radix reuse does via its SWA match gate). 0 for every other
-        layout.
+        stale ring slots. Re-prefilling that window rewrites this request's ring.
+
+        Applies to plain radix reuse as well as HiCache -- the ring is stale
+        either way. Returns 0 once SWA has a host pool to restore exact contents
+        from, and for every non-unified_kv layout, whose SWA slots are
+        content-stable.
         """
-        swa = self.components.get(ComponentType.SWA)
-        unified_compress_only_hicache = (
-            self.cache_controller is not None
-            and swa is not None
-            and not self.tree_core.has_swa_host_pool
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
         )
-        return swa.sliding_window_size if unified_compress_only_hicache else 0
+
+        swa = self.components.get(ComponentType.SWA)
+        if swa is None or not swa.sliding_window_size:
+            return 0
+        if not is_unified_kv_triton():
+            return 0
+        if self.tree_core.has_swa_host_pool:
+            return 0
+        return swa.sliding_window_size
 
     def swa_retain_floor(self, req) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:

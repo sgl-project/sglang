@@ -114,7 +114,7 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         self.free_group = None
         # free_segment() routes back to free(), so this stays empty; the paged
         # base's free_group_end() reads it unconditionally.
-        self.free_page_reps_group = []
+        self.free_page_ids_group = []
         # Neutralize the base single-list attributes: every consumer of this
         # allocator must go through the classed API (or fail loud on None),
         # never a stale flat free list.
