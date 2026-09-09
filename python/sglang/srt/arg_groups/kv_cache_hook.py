@@ -816,14 +816,8 @@ def handle_page_major_kv_layout(server_args: Any):
     assert backends <= allowed_full, (
         "--enable-page-major-kv-layout: the resolved attention backends "
         f"{sorted(backends)} are not in the allowed set "
-        f"{sorted(allowed_full)} for this configuration (unified memory "
-        "allows the stride-aware per-layer-view families; asymmetric K/V "
-        f"rows -- this model has head_dim={model_config.head_dim}, "
-        f"v_head_dim={model_config.v_head_dim}, "
-        f"swa_head_dim={model_config.swa_head_dim}, "
-        f"swa_v_head_dim={model_config.swa_v_head_dim} -- narrow it to the "
-        "backends that carry v_head_dim through to the kernel). Pass a "
-        "compatible --attention-backend."
+        f"{sorted(allowed_full)} for this configuration. Pass a compatible "
+        "--attention-backend."
     )
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):
