@@ -933,7 +933,9 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     this directly, so the body is not decoded and checked a second time."""
     # Same precedence as the OpenAI routes: the X-Data-Parallel-Rank header
     # beats the body, and the env-gated x-override-* headers beat both.
-    obj.routed_dp_rank = extract_routed_dp_rank(request.headers, obj.routed_dp_rank)
+    obj.routed_dp_rank = extract_routed_dp_rank(
+        headers=request.headers, body_routed_dp_rank=obj.routed_dp_rank
+    )
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
