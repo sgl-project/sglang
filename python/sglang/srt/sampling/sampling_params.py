@@ -152,6 +152,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
+    # Force the decoder to emit this token sequence while preserving the model's
+    # original sampling distribution for returned logprobs.
+    trace_decode_token_ids: Optional[List[int]] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -277,6 +280,35 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             strict=True,
         )
 
+        if self.trace_decode_token_ids is not None:
+            if not self.trace_decode_token_ids:
+                raise ValueError("trace_decode_token_ids must not be empty.")
+            if self.n != 1:
+                raise ValueError(
+                    "trace_decode_token_ids is only supported when n=1."
+                )
+            if self.beam_width is not None and self.beam_width > 1:
+                raise ValueError(
+                    "trace_decode_token_ids is not supported with beam search."
+                )
+            if any(
+                type(token_id) is not int or token_id < 0
+                for token_id in self.trace_decode_token_ids
+            ):
+                raise ValueError(
+                    "trace_decode_token_ids must contain non-negative integers."
+                )
+            invalid_token_ids = [
+                token_id
+                for token_id in self.trace_decode_token_ids
+                if token_id >= vocab_size
+            ]
+            if invalid_token_ids:
+                raise ValueError(
+                    "trace_decode_token_ids contains out-of-vocabulary token ids: "
+                    f"{invalid_token_ids[:8]}"
+                )
+
         grammars = [
             self.json_schema,
             self.regex,
@@ -286,6 +318,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         if sum(x is not None for x in grammars) > 1:
             raise ValueError(
                 "Only one of json_schema, regex, ebnf, or structural_tag can be set."
+            )
+        if self.trace_decode_token_ids is not None and any(
+            grammar is not None for grammar in grammars
+        ):
+            raise ValueError(
+                "trace_decode_token_ids cannot be combined with structured outputs."
             )
 
     def normalize(self, tokenizer):
@@ -338,6 +376,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
 
             self.stop_regex_max_len = stop_regex_max_len
 
+        # Trace replay owns the complete output sequence. Stop conditions would
+        # otherwise terminate the request before the supplied trace is consumed.
+        if self.trace_decode_token_ids is not None:
+            self.stop_strs = []
+            self.stop_regex_strs = []
+            self.stop_str_max_len = 0
+            self.stop_regex_max_len = 0
+            self.stop_token_ids = None
+            self.ignore_eos = True
+            self.min_new_tokens = 0
+
         # Validate tokenizer is available for tokenizer-dependent features
         raise_if_tokenizer_required(
             tokenizer, self.stop_strs, self.stop_regex_strs, self.min_new_tokens
@@ -347,6 +396,47 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.stop = None
         self.stop_regex = None
         self.is_normalized = True
+
+    def normalize_trace_decode_token_ids(
+        self,
+        prompt_len: int,
+        context_len: int,
+        reserved_tokens: int = 0,
+        vocab_size: Optional[int] = None,
+    ):
+        """Apply request-local limits and stop behavior for trace replay."""
+        if self.trace_decode_token_ids is None:
+            return
+
+        invalid_token_ids = [
+            token_id
+            for token_id in self.trace_decode_token_ids
+            if type(token_id) is not int
+            or token_id < 0
+            or (vocab_size is not None and token_id >= vocab_size)
+        ]
+        if invalid_token_ids:
+            raise ValueError(
+                "trace_decode_token_ids contains invalid token ids: "
+                f"{invalid_token_ids[:8]}"
+            )
+
+        max_trace_len = max(context_len - prompt_len - reserved_tokens, 0)
+        self.trace_decode_token_ids = self.trace_decode_token_ids[:max_trace_len]
+        trace_len = len(self.trace_decode_token_ids)
+        if self.max_new_tokens is None:
+            self.max_new_tokens = trace_len
+        else:
+            self.max_new_tokens = min(self.max_new_tokens, trace_len)
+        self.min_new_tokens = 0
+        self.ignore_eos = True
+        self.stop = None
+        self.stop_regex = None
+        self.stop_token_ids = None
+        self.stop_strs = []
+        self.stop_regex_strs = []
+        self.stop_str_max_len = 0
+        self.stop_regex_max_len = 0
 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need

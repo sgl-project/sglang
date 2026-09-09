@@ -83,6 +83,49 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    # Trace replay state. The token table is [batch_size, max_trace_len]; rows
+    # with no trace have a zero trace length.
+    trace_decode_token_ids: Optional[torch.Tensor] = None
+    trace_decode_token_lens: Optional[torch.Tensor] = None
+    trace_decode_prompt_lens: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def _build_trace_decode_tensors(reqs, device):
+        traces = []
+        for req in reqs:
+            trace = getattr(req.sampling_params, "trace_decode_token_ids", None)
+            traces.append(trace if isinstance(trace, list) else None)
+        if not any(trace is not None for trace in traces):
+            return None, None, None
+
+        max_trace_len = max((len(trace) for trace in traces if trace), default=0)
+        _pin = is_pin_memory_available(device)
+        token_ids_cpu = torch.zeros(
+            (len(reqs), max_trace_len),
+            dtype=torch.int32,
+            pin_memory=_pin,
+        )
+        trace_lens_cpu = torch.zeros(
+            len(reqs), dtype=torch.int32, pin_memory=_pin
+        )
+        prompt_lens_cpu = torch.zeros(
+            len(reqs), dtype=torch.int64, pin_memory=_pin
+        )
+        for i, (req, trace) in enumerate(zip(reqs, traces)):
+            prompt_ids = req.origin_input_ids
+            prompt_lens_cpu[i] = len(prompt_ids) if prompt_ids is not None else 0
+            if trace:
+                trace_lens_cpu[i] = len(trace)
+                token_ids_cpu[i, : len(trace)] = torch.tensor(
+                    trace, dtype=torch.int32
+                )
+
+        return (
+            token_ids_cpu.to(device, non_blocking=True),
+            trace_lens_cpu.to(device, non_blocking=True),
+            prompt_lens_cpu.to(device, non_blocking=True),
+        )
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
@@ -173,6 +216,12 @@ class SamplingBatchInfo:
             merged_custom_logit_processor = None
             custom_params = None
 
+        (
+            trace_decode_token_ids,
+            trace_decode_token_lens,
+            trace_decode_prompt_lens,
+        ) = cls._build_trace_decode_tensors(reqs, device)
+
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
         # should not add hefty computation overhead other than simple checks.
@@ -210,6 +259,9 @@ class SamplingBatchInfo:
             device=device,
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
+            trace_decode_token_ids=trace_decode_token_ids,
+            trace_decode_token_lens=trace_decode_token_lens,
+            trace_decode_prompt_lens=trace_decode_prompt_lens,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -327,6 +379,9 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "trace_decode_token_ids",
+            "trace_decode_token_lens",
+            "trace_decode_prompt_lens",
         ]:
             value = getattr(self, item, None)
             if value is not None:
@@ -401,6 +456,55 @@ class SamplingBatchInfo:
 
         return merged_dict
 
+    @staticmethod
+    def _merge_trace_token_ids(lhs, rhs, lhs_size, rhs_size):
+        if lhs is None and rhs is None:
+            return None
+
+        lhs_width = lhs.shape[1] if lhs is not None else 0
+        rhs_width = rhs.shape[1] if rhs is not None else 0
+        width = max(lhs_width, rhs_width)
+        dtype = lhs.dtype if lhs is not None else rhs.dtype
+        device = lhs.device if lhs is not None else rhs.device
+
+        def pad_rows(value, rows, value_width):
+            if value is None:
+                return torch.zeros((rows, width), dtype=dtype, device=device)
+            if value_width == width:
+                return value
+            return torch.cat(
+                [
+                    value,
+                    torch.zeros(
+                        (value.shape[0], width - value_width),
+                        dtype=value.dtype,
+                        device=value.device,
+                    ),
+                ],
+                dim=1,
+            )
+
+        return torch.cat(
+            [
+                pad_rows(lhs, lhs_size, lhs_width),
+                pad_rows(rhs, rhs_size, rhs_width),
+            ],
+            dim=0,
+        )
+
+    @staticmethod
+    def _merge_trace_metadata(lhs, rhs, lhs_size, rhs_size):
+        if lhs is None and rhs is None:
+            return None
+        reference = lhs if lhs is not None else rhs
+        dtype = reference.dtype
+        device = reference.device
+        if lhs is None:
+            lhs = torch.zeros(lhs_size, dtype=dtype, device=device)
+        if rhs is None:
+            rhs = torch.zeros(rhs_size, dtype=dtype, device=device)
+        return torch.cat([lhs, rhs], dim=0)
+
     def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
@@ -426,6 +530,25 @@ class SamplingBatchInfo:
 
         self_len = len(self)
         other_len = len(other)
+
+        self.trace_decode_token_ids = self._merge_trace_token_ids(
+            self.trace_decode_token_ids,
+            other.trace_decode_token_ids,
+            self_len,
+            other_len,
+        )
+        self.trace_decode_token_lens = self._merge_trace_metadata(
+            self.trace_decode_token_lens,
+            other.trace_decode_token_lens,
+            self_len,
+            other_len,
+        )
+        self.trace_decode_prompt_lens = self._merge_trace_metadata(
+            self.trace_decode_prompt_lens,
+            other.trace_decode_prompt_lens,
+            self_len,
+            other_len,
+        )
 
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).

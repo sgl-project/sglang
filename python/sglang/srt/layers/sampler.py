@@ -72,6 +72,42 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
+def apply_trace_decode_tokens(
+    sampled_token_ids: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Replace sampled IDs with the next IDs from each request's trace."""
+    trace_token_ids = sampling_info.trace_decode_token_ids
+    trace_token_lens = sampling_info.trace_decode_token_lens
+    trace_prompt_lens = sampling_info.trace_decode_prompt_lens
+    if (
+        trace_token_ids is None
+        or trace_token_lens is None
+        or trace_prompt_lens is None
+        or trace_token_ids.shape[1] == 0
+    ):
+        return sampled_token_ids
+
+    original_shape = sampled_token_ids.shape
+    sampled_token_ids = sampled_token_ids.reshape(-1)
+    positions = positions.to(torch.int64).reshape(-1)
+    trace_step = positions - trace_prompt_lens + 1
+    should_replay = (trace_step >= 0) & (trace_step < trace_token_lens)
+
+    safe_trace_step = trace_step.clamp(min=0, max=trace_token_ids.shape[1] - 1)
+    forced_token_ids = torch.gather(
+        trace_token_ids,
+        dim=1,
+        index=safe_trace_step.to(torch.long).view(-1, 1),
+    ).view(-1)
+    return torch.where(
+        should_replay,
+        forced_token_ids.to(sampled_token_ids.dtype),
+        sampled_token_ids,
+    ).reshape(original_shape)
+
+
 def _trace_e2e_sampler(stage: str, **fields) -> None:
     if not envs.SGLANG_TRACE_SAMPLER_E2E.get():
         return
@@ -258,6 +294,14 @@ class Sampler(nn.Module):
                         else torch.log(probs)
                     )
                 del probs
+
+        # Keep the natural logits/logprobs intact and only override the selected
+        # IDs. This makes returned logprobs describe the model distribution for
+        # the forced trace token.
+        if sampling_info.trace_decode_token_ids is not None:
+            batch_next_token_ids = apply_trace_decode_tokens(
+                batch_next_token_ids, sampling_info, positions
+            )
 
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
