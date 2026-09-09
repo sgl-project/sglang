@@ -518,7 +518,11 @@ class SWARadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        token_ids = req.get_fill_ids()
+        # Not get_fill_ids(): a dLLM request's trailing in-flight denoise block
+        # is rewritten every step, so it must not enter the tree (see
+        # ReqDllmMixin.get_cacheable_fill_ids). For every other request this is
+        # the same value.
+        token_ids = req.get_cacheable_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]
