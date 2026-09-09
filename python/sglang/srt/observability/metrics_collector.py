@@ -2125,6 +2125,14 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
         self.labels = labels
 
+        # Label children for the per-node kv_age hooks, resolved once per label
+        # combination (see _kv_age_child and friends below). Plain instance
+        # attributes, deliberately named differently from the helper methods
+        # that fill them so they cannot shadow those methods.
+        self._kv_age_child_cache = {}
+        self._kv_age_tokens_child_cache = {}
+        self._kv_eviction_child_cache = {}
+
         bucket_eviction_duration = get_histogram_conf_from_env(
             "SGLANG_BUCKET_EVICTION_DURATION"
         )
@@ -2362,7 +2370,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     # so the label children are resolved once per label combination (a handful
     # of series) instead of paying prometheus_client's labels() lookup each time.
     def _kv_age_child(self, event: str, tier: str, outcome: str):
-        cache = self.__dict__.setdefault("_kv_age_children", {})
+        cache = self._kv_age_child_cache
         key = (event, tier, outcome)
         child = cache.get(key)
         if child is None:
@@ -2372,7 +2380,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         return child
 
     def _kv_age_tokens_child(self, event: str, tier: str, outcome: str, age_le: str):
-        cache = self.__dict__.setdefault("_kv_age_tokens_children", {})
+        cache = self._kv_age_tokens_child_cache
         key = (event, tier, outcome, age_le)
         child = cache.get(key)
         if child is None:
@@ -2382,7 +2390,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         return child
 
     def _kv_eviction_children(self, tier: str, outcome: str):
-        cache = self.__dict__.setdefault("_kv_eviction_children", {})
+        cache = self._kv_eviction_child_cache
         key = (tier, outcome)
         pair = cache.get(key)
         if pair is None:
