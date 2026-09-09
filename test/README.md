@@ -83,11 +83,6 @@ Hardware is expressed by one or more `register_*_ci` calls, never by creating a
 new top-level hardware directory. The admission checker applies the layout and
 kind/suite contract incrementally while legacy paths are migrated.
 
-The existing vendor trees -- `amd/`, `mlx/`, `musa/`, `npu/`, `xpu/` -- are the
-exception and stay flat. Put a test there only when the path it guards is
-specific to that backend; anything a CUDA runner can also catch belongs under
-`<kind>/<subsystem>/` with an extra `register_*_ci`.
-
 Diffusion workflows also enter through `test/run_suite.py`; registered bridge
 files preserve their case-level pytest partitioning until the remaining
 diffusion cases are moved out of the package test-support tree.
