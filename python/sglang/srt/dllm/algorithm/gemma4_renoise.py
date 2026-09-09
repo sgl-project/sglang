@@ -142,6 +142,7 @@ class Gemma4Renoise(DllmAlgorithm):
         self.t_min = temperature_config.get("t_min", algorithm_config.get("t_min", 0.4))
         self.t_max = temperature_config.get("t_max", algorithm_config.get("t_max", 0.8))
         stopping_config = section("stopping_config")
+        # Zero disables adaptive convergence: entropy cannot be negative.
         self.confidence_threshold = stopping_config.get(
             "confidence_threshold",
             algorithm_config.get("confidence_threshold", 0.005),
@@ -165,7 +166,7 @@ class Gemma4Renoise(DllmAlgorithm):
         if (
             not isinstance(self.stability_threshold, int)
             or self.stability_threshold < 0
-            or self.confidence_threshold <= 0
+            or self.confidence_threshold < 0
         ):
             raise ValueError("invalid stopping_config")
         if self.seed is not None and not isinstance(self.seed, int):

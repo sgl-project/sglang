@@ -151,7 +151,7 @@ class TestGemma4Renoise(unittest.TestCase):
                 "stopping_config",
             ),
             (
-                {"stopping_config": {"confidence_threshold": 0}},
+                {"stopping_config": {"confidence_threshold": -1}},
                 "stopping_config",
             ),
             ({"sampler_config": "invalid"}, "sampler_config"),
@@ -176,6 +176,19 @@ class TestGemma4Renoise(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "max_denoising_steps"):
             get_algorithm(_config(max_denoising_steps=0))
+
+    def test_zero_confidence_threshold_requires_all_denoising_steps(self):
+        algorithm = Gemma4Renoise(
+            _config(max_denoising_steps=3, confidence_threshold=0.0)
+        )
+        batch = _batch(["fixed-work"], 3)
+        states = self._initialize(algorithm, batch)
+        logits = torch.full((3, 4), -1000.0)
+        logits[:, 0] = 0.0
+        # Even a stable, zero-entropy canvas must perform the full schedule.
+        self.assertEqual(algorithm.step(batch, logits, states), [False])
+        self.assertEqual(algorithm.step(batch, logits, states), [False])
+        self.assertEqual(algorithm.step(batch, logits, states), [True])
 
     def test_launch_constraints_are_owned_by_algorithm(self):
         hf_config = SimpleNamespace(
