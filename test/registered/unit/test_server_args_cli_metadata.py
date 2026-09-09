@@ -45,7 +45,16 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         )
         self.assertEqual(
             self.actions_by_option["--schedule-policy"].choices,
-            ["lpm", "random", "fcfs", "dfs-weight", "lof", "priority", "routing-key"],
+            [
+                "lpm",
+                "random",
+                "fcfs",
+                "dfs-weight",
+                "lof",
+                "priority",
+                "routing-key",
+                "hrrn",
+            ],
         )
         self.assertEqual(
             self.actions_by_option["--load-balance-method"].choices,
