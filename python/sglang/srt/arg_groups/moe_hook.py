@@ -93,10 +93,9 @@ def handle_moe_kernel_config(server_args: Any):
             "modelopt_fp8",
             "modelopt_mixed",
             "compressed-tensors",
-            "w8a8_fp8",
             None,
         ], (
-            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'mxfp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', 'w8a8_fp8', or bfloat16 (None)."
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
         )
 
     if view.moe_runner_backend == "flashinfer_trtllm_routed":
@@ -107,10 +106,9 @@ def handle_moe_kernel_config(server_args: Any):
             "modelopt_mixed",
             "nvfp4_online",
             "compressed-tensors",
-            "w8a8_fp8",
             None,
         ], (
-            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', 'compressed-tensors', 'w8a8_fp8', or bfloat16 (None)."
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', 'compressed-tensors', or bfloat16 (None)."
         )
 
     # The runner-driven shared-experts fusion disables moved to the
