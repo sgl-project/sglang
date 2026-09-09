@@ -1202,6 +1202,7 @@ class DeepseekV2MoE(nn.Module):
             True,  # inplace
             self.shared_experts_is_int8,  # use_int8_w8a8
             self.shared_experts_is_fp8,  # use_fp8_w8a16
+            False,  # use_mxfp4
             (
                 self.shared_experts.gate_up_proj.weight_scale
                 if self.shared_experts_is_int8
@@ -1225,6 +1226,8 @@ class DeepseekV2MoE(nn.Module):
                 if self.shared_experts_is_fp8
                 else None
             ),  # block_size
+            None,  # alpha
+            None,  # limit
             True,  # is_vnni
         )
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(

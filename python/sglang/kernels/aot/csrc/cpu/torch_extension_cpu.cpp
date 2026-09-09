@@ -520,13 +520,6 @@ at::Tensor causal_conv1d_update_cpu(
     int64_t pad_slot_id,
     bool is_vnni);
 
-at::Tensor apply_rotary_emb_interleaved_cpu(
-    at::Tensor& x,
-    at::Tensor& freqs,
-    bool inverse,
-    const std::optional<at::Tensor>& positions,
-    const std::optional<at::Tensor>& k);
-
 // set_k_and_s
 void set_k_and_s_cpu(
     at::Tensor& buf,
@@ -611,6 +604,13 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data);
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op);
 
 // rope
+at::Tensor apply_rotary_emb_interleaved_cpu(
+    at::Tensor& x,
+    at::Tensor& freqs,
+    bool inverse,
+    const std::optional<at::Tensor>& positions,
+    const std::optional<at::Tensor>& k);
+
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
@@ -1031,12 +1031,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
 
-  // rope
-  m.def(
-      "apply_rotary_emb_interleaved_cpu(Tensor(a!) x, Tensor freqs, bool inverse, Tensor? positions=None, Tensor(b!)? "
-      "k=None) -> Tensor(a!)");
-  m.impl("apply_rotary_emb_interleaved_cpu", torch::kCPU, &apply_rotary_emb_interleaved_cpu);
-
   // hadamard transform
   m.def("fast_hadamard_transform_cpu(Tensor x, float scale) -> Tensor");
   m.impl("fast_hadamard_transform_cpu", torch::kCPU, &fast_hadamard_transform_cpu);
@@ -1114,6 +1108,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("shm_reduce_scatter_tensor", torch::kCPU, &shm_reduce_scatter_tensor);
 
   // rope
+  m.def(
+      "apply_rotary_emb_interleaved_cpu(Tensor(a!) x, Tensor freqs, bool inverse, Tensor? positions=None, Tensor(b!)? "
+      "k=None) -> Tensor(a!)");
+  m.impl("apply_rotary_emb_interleaved_cpu", torch::kCPU, &apply_rotary_emb_interleaved_cpu);
+
   m.def(
       "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
