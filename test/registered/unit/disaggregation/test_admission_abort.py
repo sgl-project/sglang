@@ -141,7 +141,7 @@ def code():
         ns,
         "disaggregation/mooncake/conn.py",
         {
-            "MooncakeKVManager": {"notify_bootstrap_failure"},
+            "MooncakeKVManager": {"notify_bootstrap_failure", "start_prefill_thread"},
             "MooncakeFailureExceptionMixin": {"failure_exception"},
             "MooncakeKVSender": {"abort", "poll"},
             "MooncakeKVReceiver": {"poll"},
@@ -181,6 +181,7 @@ def code():
                 "_pp_pd_get_bootstrapped_ids",
                 "_pp_pd_get_prealloc_ids",
                 "_route_aborts_to_bad",
+                "get_rids",
             },
         },
     )
@@ -368,7 +369,7 @@ def test_decode_abort_respects_queue_filter(code, pp):
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
-def test_pp_consensus_routes_pending_abort_to_bad(code, role):
+def test_pp_consensus_keeps_ready_prefill_admission_abort_in_ready_set(code, role):
     req = _req(code)
     scheduler = code.SchedulerPPMixin()
     scheduler.pp_group = SimpleNamespace(is_first_rank=True)
@@ -382,7 +383,8 @@ def test_pp_consensus_routes_pending_abort_to_bad(code, role):
         if role == "prefill"
         else scheduler._pp_pd_get_prealloc_ids
     )
-    assert method() == [[], [req.rid]]
+    expected = [[req.rid], []] if role == "prefill" else [[], [req.rid]]
+    assert method() == expected
 
 
 @pytest.mark.parametrize("status", [0, 2])
@@ -454,7 +456,7 @@ def test_general_sender_abort_does_not_notify_or_clear_inflight_room(code):
     assert sender.kv_mgr._staging_outstanding[42] == 1
 
 
-def test_prefill_timeout_retires_unknown_room_without_leaking_state(code, monkeypatch):
+def test_prefill_timeout_cleans_current_room_state(code, monkeypatch):
     req = _req(code)
     original = req.to_finish
     queue, sender = _prefill_queue(code, req, code.KVPoll.Bootstrapping)
@@ -529,6 +531,153 @@ def test_decode_abort_does_not_repeat_finished_output(code):
     assert req.finished_reason.status_code == 400
     queue.scheduler.output_streamer.stream_output.assert_not_called()
     receiver._send_abort_notification.assert_called_once_with()
+
+
+def _pp_prefill_queues(code):
+    queues = []
+    for rank in range(3):
+        queue, sender = _prefill_queue(code, _req(code), code.KVPoll.Bootstrapping)
+        queue.pp_size = 3
+        sender.kv_mgr.pp_rank = rank
+        sender.kv_mgr.pp_size = 3
+        sender.kv_mgr.transfer_infos.clear()
+        sender.kv_mgr.req_to_decode_prefix_len.clear()
+        queues.append(queue)
+    return queues
+
+
+def _pp_prefill_round(code, queues):
+    consensus = None
+    for rank, queue in enumerate(queues):
+        scheduler = code.SchedulerPPMixin()
+        scheduler.pp_group = SimpleNamespace(is_first_rank=rank == 0)
+        scheduler.attn_cp_cpu_group = None
+        scheduler.attn_tp_cpu_group = None
+        scheduler.disagg_prefill_bootstrap_queue = queue
+        scheduler._pp_recv_pyobj_from_prev_stage = Mock(return_value=consensus)
+        consensus = scheduler._pp_pd_get_bootstrapped_ids()
+    results = [
+        queue.pop_bootstrapped(
+            return_failed_reqs=True,
+            pp_good_rids=consensus[0],
+            pp_bad_rids=consensus[1],
+        )
+        for queue in queues
+    ]
+    return consensus, results
+
+
+def _deliver_prefill_metadata(manager, monkeypatch):
+    # Run the actual registration loop once; only transport and parsing are mocked.
+    namespace = manager.start_prefill_thread.__globals__
+    monkeypatch.setitem(
+        namespace,
+        "threading",
+        SimpleNamespace(Thread=lambda target: SimpleNamespace(start=target)),
+    )
+    info = SimpleNamespace(
+        endpoint="decode", dst_port=8001, is_dummy=False, decode_prefix_len=64
+    )
+    monkeypatch.setitem(
+        namespace, "TransferInfo", SimpleNamespace(from_zmq=Mock(return_value=info))
+    )
+    manager.resolve_kv_replica_factor = Mock()
+    manager.server_socket = SimpleNamespace(
+        recv_multipart=Mock(
+            side_effect=[
+                [b"42", b"decode", b"8001", b"session", b"", b"", b"", b"1"],
+                StopIteration,
+            ]
+        )
+    )
+    with pytest.raises(StopIteration):
+        manager.start_prefill_thread()
+
+
+@pytest.mark.parametrize("arrival_order", [(0, 1, 2), (2, 1, 0)])
+def test_pp_admission_abort_waits_for_metadata_on_every_stage(
+    code, monkeypatch, arrival_order
+):
+    queues = _pp_prefill_queues(code)
+    reqs = [queue.queue[0] for queue in queues]
+    original_errors = [req.to_finish for req in reqs]
+    senders = [req.disagg_kv_sender for req in reqs]
+
+    for rank in arrival_order:
+        assert _pp_prefill_round(code, queues) == ([[], []], [([], [])] * 3)
+        for queue, req in zip(queues, reqs):
+            assert queue.queue == [req]
+            assert req.finished_reason is None
+            assert req.prefill_attempt_count == 0
+            queue.ensure_metadata_buffer.assert_not_called()
+            queue.finalize_bootstrap.assert_not_called()
+            queue.scheduler.output_streamer.stream_output.assert_not_called()
+            req.disagg_kv_sender.kv_mgr.sync_status_to_decode_endpoint.assert_not_called()
+        _deliver_prefill_metadata(senders[rank].kv_mgr, monkeypatch)
+
+    consensus, results = _pp_prefill_round(code, queues)
+    assert consensus == [[reqs[0].rid], []]
+    assert results == [([], [req]) for req in reqs]
+    for queue, req, error, sender in zip(queues, reqs, original_errors, senders):
+        assert req.finished_reason is error
+        assert error.status_code == 400
+        assert not sender._send_started
+        assert not req.pending_bootstrap
+        manager = sender.kv_mgr
+        manager.sync_status_to_decode_endpoint.assert_called_once_with(
+            "decode", 8001, 42, code.KVPoll.Failed, manager._prefill_unique_rank()
+        )
+        assert manager.request_status == manager.transfer_infos == {}
+        assert manager.req_to_decode_prefix_len == manager.failure_records == {}
+    assert _pp_prefill_round(code, queues) == ([[], []], [([], [])] * 3)
+    for queue, req in zip(queues, reqs):
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
+            [req], False
+        )
+    code.release_kv_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("completed_rank", [0, 1, 2])
+def test_pp_completed_abort_keeps_immediate_bad_union(code, completed_rank):
+    queues = _pp_prefill_queues(code)
+    reqs = [queue.queue[0] for queue in queues]
+    reqs[completed_rank].update_finish_state()
+    consensus, results = _pp_prefill_round(code, queues)
+    assert consensus == [[], [reqs[0].rid]]
+    assert results == [([], [req]) for req in reqs]
+    assert all(not queue.queue for queue in queues)
+
+
+def test_pp_admission_timeout_cleans_known_state_but_late_metadata_can_recreate_room(
+    code, monkeypatch
+):
+    queues = _pp_prefill_queues(code)
+    reqs = [queue.queue[0] for queue in queues]
+    senders = [req.disagg_kv_sender for req in reqs]
+    _deliver_prefill_metadata(senders[0].kv_mgr, monkeypatch)
+    assert _pp_prefill_round(code, queues) == ([[], []], [([], [])] * 3)
+
+    monkeypatch.setattr(code.logger, "warning_once", code.logger.warning, raising=False)
+    senders[1].init_time -= senders[1].kv_mgr.bootstrap_timeout + 1
+    consensus, results = _pp_prefill_round(code, queues)
+    assert consensus == [[], [reqs[0].rid]]
+    assert results == [([], [req]) for req in reqs]
+    senders[0].kv_mgr.sync_status_to_decode_endpoint.assert_called_once()
+    for sender in senders:
+        manager = sender.kv_mgr
+        assert manager.request_status == manager.transfer_infos == {}
+        assert manager.req_to_decode_prefix_len == manager.failure_records == {}
+    for sender in senders[1:]:
+        sender.kv_mgr.sync_status_to_decode_endpoint.assert_not_called()
+
+    late_manager = senders[2].kv_mgr
+    _deliver_prefill_metadata(late_manager, monkeypatch)
+    assert _pp_prefill_round(code, queues) == ([[], []], [([], [])] * 3)
+    # Existing timeout behavior: late metadata has no scheduler owner to retire it.
+    assert late_manager.request_status[42] == code.KVPoll.WaitingForInput
+    assert 42 in late_manager.transfer_infos
+    assert late_manager.req_to_decode_prefix_len == {42: 64}
+    late_manager.sync_status_to_decode_endpoint.assert_not_called()
 
 
 if __name__ == "__main__":
