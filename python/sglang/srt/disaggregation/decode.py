@@ -145,6 +145,7 @@ def _flush_gpudirect_writes_to_cuda_owner() -> None:
         flush_target = target_enum.cudaFlushGPUDirectRDMAWritesTargetCurrentDevice
         flush_scope = scope_enum.cudaFlushGPUDirectRDMAWritesToOwner
         (err,) = cuda_rt.cudaDeviceFlushGPUDirectRDMAWrites(flush_target, flush_scope)
+        unsupported = cuda_rt.cudaError_t.cudaErrorNotSupported
     except (ImportError, AttributeError):
         logger.warning_once(
             "CUDA GPUDirect RDMA flush bindings are unavailable; falling back "
@@ -153,8 +154,7 @@ def _flush_gpudirect_writes_to_cuda_owner() -> None:
         torch.cuda.synchronize()
         return
 
-    unsupported = getattr(cuda_rt.cudaError_t, "cudaErrorNotSupported", None)
-    if unsupported is not None and err == unsupported:
+    if err == unsupported:
         logger.warning_once(
             "CUDA GPUDirect RDMA host flush is unsupported on this device; "
             "falling back to a device synchronization before QSA decode."

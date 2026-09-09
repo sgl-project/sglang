@@ -1509,13 +1509,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
                 if has_heterogeneous_attn_tp and is_qwen4_qsa_state:
-                    if len(src_item_lens) != len(src_data_ptrs) or len(
-                        dst_item_lens
-                    ) != len(dst_data_ptrs):
+                    if len(dst_item_lens) != len(dst_data_ptrs):
                         raise RuntimeError(
-                            f"Replicated {st.upper()} pointer/item-length metadata "
-                            "is inconsistent: "
-                            f"src ptrs={len(src_data_ptrs)} lens={len(src_item_lens)}, "
+                            f"Replicated {st.upper()} destination pointer/item-length "
+                            "metadata is inconsistent: "
                             f"dst ptrs={len(dst_data_ptrs)} lens={len(dst_item_lens)}"
                         )
                     qsa_entry_pairs = build_transfer_entry_pairs(
