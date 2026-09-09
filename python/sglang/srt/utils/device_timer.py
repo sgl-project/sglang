@@ -18,10 +18,13 @@ def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
 
 
 class DeviceTiming:
-    """One closed group of existing GPU timing intervals, measured in seconds.
+    """Elapsed span between a group's first and last existing CUDA events.
 
     Completion is driven by DeviceTimer's nonblocking event queries. The callback
     may be registered after completion (e.g. when CPU result processing catches up).
+    No events are moved or added. Work outside these boundaries is not measured.
+    A group spanning different streams has no ordered boundary pair and reports
+    None rather than silently claiming a complete iteration duration.
     """
 
     def __init__(self):
@@ -30,15 +33,28 @@ class DeviceTiming:
         self._sealed = False
         self._elapsed = 0.0
         self._callback = None
+        self._first_interval = None
+        self._last_interval = None
+        self._same_stream = True
 
-    def when_ready(self, callback: Callable[[float], None]):
+    def when_ready(self, callback: Callable[[Optional[float]], None]):
         self._callback = callback
         self._notify()
 
     def _notify(self):
         if self._sealed and self._pending == 0 and self._callback is not None:
             callback, self._callback = self._callback, None
-            callback(self._elapsed)
+            if self._first_interval is None:
+                callback(0.0)
+            elif not self._same_stream:
+                callback(None)
+            else:
+                callback(
+                    self._first_interval.start_event.elapsed_time(
+                        self._last_interval.end_event
+                    )
+                    / 1000.0
+                )
 
 
 class DeviceTimer:
@@ -72,8 +88,14 @@ class DeviceTimer:
         interval = _TimingInterval.create()
         interval.capture = self._capture
         if interval.capture is not None:
-            interval.capture.num_intervals += 1
-            interval.capture._pending += 1
+            timing = interval.capture
+            timing.num_intervals += 1
+            timing._pending += 1
+            if timing._first_interval is None:
+                timing._first_interval = interval
+            elif interval.stream != timing._first_interval.stream:
+                timing._same_stream = False
+            timing._last_interval = interval
         self._intervals.append(interval)
         self._in_wrap = True
         try:
@@ -95,6 +117,8 @@ class DeviceTimer:
                 reporter(t=elapsed, **interval.metadata)
             if interval.capture is not None:
                 timing = interval.capture
+                # Groups retain their boundary intervals; avoid an ownership cycle.
+                interval.capture = None
                 timing._elapsed += elapsed
                 timing._pending -= 1
                 timing._notify()
@@ -135,12 +159,14 @@ class _TimingInterval:
     end_event: Optional[torch.cuda.Event] = None
     metadata: Optional[Dict] = None
     capture: Optional[DeviceTiming] = None
+    stream: Optional[torch.cuda.Stream] = None
 
     @staticmethod
     def create():
+        stream = torch.cuda.current_stream()
         start_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        return _TimingInterval(start_event=start_event)
+        start_event.record(stream)
+        return _TimingInterval(start_event=start_event, stream=stream)
 
     def end(self, metadata: Dict):
         end_event = torch.cuda.Event(enable_timing=True)

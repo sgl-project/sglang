@@ -1109,8 +1109,9 @@ class SchedulerMetricsReporter:
     ):
         """Emit per-iteration ForwardPassMetrics over ZMQ PUB.
 
-        GPU time is the sum of instrumented model/graph segments owned by this
-        result, not end-to-end iteration latency or just target-verify time.
+        GPU time spans this result's first/last existing instrumented events on
+        one stream, including gaps between segments but not leading/trailing work.
+        This is not complete iteration latency or just target-verify time.
         Snapshot scheduling stats now; publish later if those events are pending.
         Falls back to monotonic clock when DeviceTimer is not enabled.
         """
@@ -1140,6 +1141,11 @@ class SchedulerMetricsReporter:
         if self.scheduler._fpm_uses_device_timer:
             # Frozen scalar stats only; never retain a mutable batch/request.
             def publish(elapsed):
+                if elapsed is None:
+                    logger.warning(
+                        "FPM timing spans multiple CUDA streams; skipping ambiguous span"
+                    )
+                    return
                 publisher.publish(replace(fpm, wall_time=elapsed))
 
             timing.when_ready(publish)
