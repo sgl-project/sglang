@@ -83,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SessionParams,
     ShutdownReq,
+    SubagentKeepaliveReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -812,6 +813,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Log the request
             self.request_logger.log_received_request(obj, self.tokenizer, request)
+
+            self._maybe_send_subagent_keepalive(obj)
 
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -1572,6 +1575,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (not get_parallel().enable_dp_attention)
                 and (not self._batch_has_text(batch_size, requests))
             )
+        )
+
+    def _maybe_send_subagent_keepalive(self, obj: Any) -> None:
+        """Keep a parent session's prefix cache hot while its subagent runs.
+
+        The parent's KV lives on whichever attention-DP rank served its last
+        turn, which is not in general the rank this subagent request is routed
+        to, so this goes out as a control request: the DP controller hands
+        control requests to rank 0, whose scheduler broadcasts them over the
+        full TP group. Every rank then refreshes the session if it holds it and
+        ignores it otherwise.
+        """
+        if not get_memory().allow_subagent_keepalive:
+            return
+        parent_session_id = getattr(obj, "parent_session_id", None)
+        if not parent_session_id:
+            return
+        self._dispatch_to_scheduler(
+            SubagentKeepaliveReqInput(session_id=parent_session_id)
         )
 
     async def _send_one_request(

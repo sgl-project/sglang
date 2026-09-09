@@ -171,6 +171,7 @@ from sglang.srt.managers.io_struct import (
     ShutdownReq,
     SlowDownReqInput,
     SlowDownReqOutput,
+    SubagentKeepaliveReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
@@ -1722,6 +1723,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (SubagentKeepaliveReqInput, self.handle_subagent_keepalive),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -5593,6 +5595,15 @@ class Scheduler(
             or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
+
+    def handle_subagent_keepalive(self, recv_req: SubagentKeepaliveReqInput):
+        """Refresh a parent session's prefix-cache LRU while its subagent runs.
+
+        Broadcast to every rank, so a rank that never served this session just
+        misses the lookup and returns.
+        """
+        self.tree_cache.bump_session_keepalive(recv_req.session_id)
+        return None
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

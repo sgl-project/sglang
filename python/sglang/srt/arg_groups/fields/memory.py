@@ -85,6 +85,13 @@ class Memory:
         bool,
         "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
     ] = False
+    allow_subagent_keepalive: A[
+        bool,
+        "Refresh a parent session's UnifiedRadixCache LRU whenever one of its "
+        "subagents issues a request. Requests carry session_id / "
+        "parent_session_id; the parent's KV is kept hot while it is blocked on "
+        "the subagent it spawned.",
+    ] = False
     radix_cache_backend: A[
         Optional[str],
         "Name of a radix-cache backend previously registered via register_radix_cache_backend. Omit this flag to use the built-in default cache selection chain.",

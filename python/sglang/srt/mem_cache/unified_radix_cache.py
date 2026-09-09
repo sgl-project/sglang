@@ -4,6 +4,7 @@ import atexit
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -117,6 +118,14 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+# Cap on --allow-subagent-keepalive's session -> tail-node map. Sized well above
+# any plausible live conversation count so eviction only ever drops sessions that
+# have been silent for a long time; a dropped entry costs one missed keepalive.
+_SESSION_TAIL_LIMIT = 65536
+
+# How often bump_session_keepalive reports its cumulative hit rate.
+_KEEPALIVE_LOG_INTERVAL = 256
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -206,6 +215,15 @@ class UnifiedRadixCache(BasePrefixCache):
             tree_core=self.tree_core,
             enable_session_radix_cache=self.enable_session_radix_cache,
         )
+
+        # Subagent keepalive (--allow-subagent-keepalive): session id -> the
+        # NodeId that session's last completed turn ended on. Bounded LRU; a
+        # dropped entry only costs a missed keepalive. NodeIds come from a
+        # monotonic counter and are never reused, so a stale id can only miss.
+        self.allow_subagent_keepalive = params.allow_subagent_keepalive
+        self._session_tail_node: OrderedDict[str, NodeId] = OrderedDict()
+        self._keepalive_hits = 0
+        self._keepalive_misses = 0
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
@@ -1014,6 +1032,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.finished_reason, FINISH_ABORT
             ):
                 self.session_refs.register_session_ref(req)
+
+        if self.allow_subagent_keepalive and is_insert and result is not None:
+            self._record_session_tail(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -3314,6 +3335,74 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)
+
+    # ---- Subagent keepalive API (--allow-subagent-keepalive) ----
+
+    def _record_session_tail(self, req: Req) -> None:
+        """Remember which node a session's last completed turn ended on."""
+        session_id = req.session_id
+        node_id = req.last_node
+        if not session_id or node_id is None:
+            return
+        if self.tree_core.is_root(node_id):
+            # Nothing of this turn survived in the tree; a keepalive on the root
+            # would refresh the whole cache, so forget the session instead.
+            self._session_tail_node.pop(session_id, None)
+            return
+        self._session_tail_node[session_id] = node_id
+        self._session_tail_node.move_to_end(session_id)
+        while len(self._session_tail_node) > _SESSION_TAIL_LIMIT:
+            self._session_tail_node.popitem(last=False)
+
+    def bump_session_keepalive(self, session_id: str) -> bool:
+        """Re-age a parent session's cached path while its subagent runs.
+
+        An agent that spawns a subagent resumes as soon as the subagent returns,
+        so its KV is idle-but-live for the whole subagent run and would
+        otherwise age out and be re-prefilled. Refreshing on every subagent
+        request keeps the parent as recently-used as its own child's traffic.
+
+        This is broadcast to every attention-DP rank, so a miss (unknown
+        session, or one whose path has since been reclaimed) is the normal case
+        and returns False without touching the tree.
+        """
+        if not self.allow_subagent_keepalive or not session_id:
+            return False
+        node_id = self._session_tail_node.get(session_id)
+        if node_id is not None and self.tree_core.refresh_lru_to_root(node_id):
+            self._session_tail_node.move_to_end(session_id)
+            self._keepalive_hits += 1
+            self._maybe_log_keepalive_rate()
+            return True
+
+        if node_id is not None:
+            # Path already reclaimed -- drop it so the map does not grow a tail
+            # of dead sessions.
+            self._session_tail_node.pop(session_id, None)
+        self._keepalive_misses += 1
+        self._maybe_log_keepalive_rate()
+        return False
+
+    def _maybe_log_keepalive_rate(self) -> None:
+        """Periodically report how often keepalives find their parent.
+
+        A keepalive is broadcast to every attention-DP rank but only the rank
+        holding that session can act on it, so a low hit rate here is the
+        expected shape rather than a fault -- what it does tell you is whether
+        the feature is reaching any cached parent at all, which is otherwise
+        invisible.
+        """
+        total = self._keepalive_hits + self._keepalive_misses
+        # Always log the first one: on a short run the interval alone can leave the
+        # feature with no evidence that it ran at all.
+        if total != 1 and total % _KEEPALIVE_LOG_INTERVAL:
+            return
+        logger.info(
+            "subagent keepalive: %d/%d refreshed a live parent path (%d sessions tracked)",
+            self._keepalive_hits,
+            total,
+            len(self._session_tail_node),
+        )
 
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 

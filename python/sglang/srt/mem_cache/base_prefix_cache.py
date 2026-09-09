@@ -488,6 +488,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()
 
+    def bump_session_keepalive(self, session_id: str) -> bool:
+        """Refresh the LRU of the cached path that a session ended on.
+
+        Called on every rank for a broadcast keepalive, so the default is a
+        no-op miss rather than an error; only caches that index their tree by
+        session id can honour it. Returns whether anything was refreshed.
+        """
+        return False
+
     def supports_swa(self) -> bool:
         return False
 

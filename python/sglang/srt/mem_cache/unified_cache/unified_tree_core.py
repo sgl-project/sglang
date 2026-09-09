@@ -506,6 +506,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """
         return self._node_arena[node_id]
 
+    def refresh_lru_to_root(self, node_id: NodeId) -> bool:
+        """Re-age a cached path as if it had just been matched.
+
+        This is the refresh half of ``_match_post_processor``: aux components
+        move to MRU, and Full's ``last_access_time`` is rewritten from a
+        decreasing counter so every ancestor sorts older than its child. Both
+        the device and the host eviction heaps order Full by
+        ``last_access_time``, so one walk protects the path on both tiers.
+
+        Returns False when the node is no longer in the arena, i.e. its KV was
+        already reclaimed and there is nothing left to keep alive.
+        """
+        node = self._node_arena.get(node_id)
+        if node is None:
+            return False
+
+        for comp in self.components:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue  # Full uses last_access_time, not LRU
+            comp.refresh_lru(LRURefreshPhase.MATCH_END, node, self.root_node)
+
+        cur_time = get_and_increase_time_counter()
+        while node:
+            node.last_access_time = cur_time
+            cur_time -= 0.00001
+            node = node.parent
+        return True
+
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
