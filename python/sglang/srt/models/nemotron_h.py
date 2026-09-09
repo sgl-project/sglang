@@ -215,6 +215,7 @@ class NemotronHMoE(nn.Module):
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_idx,
             use_grouped_topk=True,
             topk_group=config.topk_group,
             num_expert_group=config.n_group,
