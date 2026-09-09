@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.attention_hook import (
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
     disable_tc_piecewise_cudagraph_if_incompatible,
+    finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
 )
 from sglang.srt.arg_groups.hicache_hook import (
@@ -1793,6 +1794,49 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 
         self.assertEqual(config.get_capture_sizes(), [32, 64])
         self.assertEqual(config.compiler, "eager")
+
+
+class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
+    @staticmethod
+    def _make_args(max_context_size, model_context_len=4096, page_size=64):
+        args = ServerArgs(
+            model_path="dummy",
+            page_size=page_size,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(
+                    backend=Backend.BREAKABLE,
+                    max_context_size=max_context_size,
+                )
+            ),
+        )
+        args._model_config = SimpleNamespace(context_len=model_context_len)
+        return args
+
+    def test_page_aligns_limit_without_mutating_raw_config(self):
+        args = self._make_args(700)
+        raw_config = args.cuda_graph_config
+
+        finalize_cuda_graph_prefill_max_context(args)
+
+        self.assertIs(args.cuda_graph_config, raw_config)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").prefill.max_context_size,
+            704,
+        )
+
+    def test_rejects_invalid_values_during_resolution(self):
+        cases = (
+            ([256, 1024], "exactly one integer"),
+            (True, "exactly one integer"),
+            (0, "positive integer"),
+            (-1, "positive integer"),
+            (4097, "model context length"),
+        )
+        for max_context_size, expected_error in cases:
+            with self.subTest(max_context_size=max_context_size):
+                args = self._make_args(max_context_size)
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    finalize_cuda_graph_prefill_max_context(args)
 
 
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):

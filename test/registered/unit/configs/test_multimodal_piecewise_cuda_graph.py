@@ -45,7 +45,6 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner.capture_num_tokens = [4, 16]
         runner.max_context_size = None
         runner.max_num_tokens = 16
-        runner.enable_cp_v2_bcg_capture = False
         return runner
 
     def _make_multimodal_forward_batch(self):

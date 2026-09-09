@@ -447,7 +447,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
         runner.backend = SimpleNamespace()
-        runner.enable_cp_v2_bcg_capture = False
         runner.prefill_backend_name = Backend.FULL
         runner.has_mha_companion_layers = False
         runner._prefix_chunk_len = 2

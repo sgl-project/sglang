@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
@@ -511,6 +511,65 @@ def validate_cuda_graph_config(server_args: Any):
                 f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
                 f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
             )
+
+
+def _resolve_max_context_size(
+    *, requested_size: Any, page_size: int, model_context_len: Optional[int]
+) -> int:
+    if isinstance(requested_size, bool) or not isinstance(requested_size, int):
+        raise ValueError("--cuda-graph-prefill-max-context accepts exactly one integer")
+    if requested_size <= 0:
+        raise ValueError("--cuda-graph-prefill-max-context must be a positive integer")
+
+    aligned_size = ((requested_size + page_size - 1) // page_size) * page_size
+    if (
+        model_context_len is not None
+        and model_context_len > 0
+        and aligned_size > model_context_len
+    ):
+        raise ValueError(
+            "--cuda-graph-prefill-max-context exceeds the model context length: "
+            f"aligned size {aligned_size} > {model_context_len}"
+        )
+    if requested_size != aligned_size:
+        logger.info(
+            "Page-aligning prefill CUDA graph max context size %d -> %d "
+            "(page_size=%d).",
+            requested_size,
+            aligned_size,
+            page_size,
+        )
+    return aligned_size
+
+
+def finalize_cuda_graph_prefill_max_context(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    requested_size = cfg.cuda_graph_config.prefill.max_context_size
+    if requested_size is None:
+        return
+    page_size = cfg.page_size
+    assert page_size is not None and page_size > 0, (
+        "page_size must be resolved before prefill CUDA graph max context size"
+    )
+
+    max_context_size = _resolve_max_context_size(
+        requested_size=requested_size,
+        page_size=page_size,
+        model_context_len=model_config_of(server_args).context_len,
+    )
+    logger.info(
+        "Prefill CUDA graph max context size: %d; graph keys remain token-only.",
+        max_context_size,
+    )
+    declare_resolution(
+        server_args,
+        "_finalize_cuda_graph_prefill_max_context",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config,
+            Phase.PREFILL,
+            max_context_size=max_context_size,
+        ),
+    )
 
 
 def generate_prefill_cuda_graph_batch_sizes(max_bs: int):

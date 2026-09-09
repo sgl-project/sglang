@@ -310,14 +310,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
-        self.max_context_size = self._resolve_max_context_size(
-            model_runner, prefill_config.max_context_size
+        self.max_context_size = prefill_config.max_context_size
+        self._validate_max_context_capacity(
+            max_context_size=self.max_context_size,
+            table_width=model_runner.req_to_token_pool.req_to_token.shape[1],
         )
         if (
             self.prefill_backend_name == Backend.TC_PIECEWISE
             and self.max_context_size is not None
         ):
-            # TODO: Plumb max_seq_len_override through TcPiecewise
+            # TODO(SYChen123): Plumb max_seq_len_override through TcPiecewise
             # metadata preparation before enabling the fixed context limit here.
             self._ignore_max_context_size("tc_piecewise prefill CUDA graph")
 
@@ -443,23 +445,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             assert max_req is not None, "full_prefill_max_req must be resolved"
             self._capture_req_slots = max_req
 
-        server_args = model_runner.server_args
-        self.enable_cp_v2_bcg_capture = isinstance(
-            self.backend, BreakableCudaGraphBackend
-        ) and should_enable_cp_v2_bcg_capture(server_args)
-        if self.enable_cp_v2_bcg_capture and self.max_context_size is not None:
-            # TODO: Preserve max_seq_len_override through CP-v2's
-            # padded metadata preparation before enabling this limit.
-            self._ignore_max_context_size("CP-v2 breakable prefill CUDA graph")
-        if self.max_context_size is not None and not (
-            model_runner.attn_backend.supports_prefill_cuda_graph_max_context_size
-        ):
-            raise ValueError(
-                "--cuda-graph-prefill-max-context is only supported by attention "
-                "backends that implement fixed-context prefill graph metadata; "
-                f"got {type(model_runner.attn_backend).__name__}"
-            )
-
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
@@ -544,13 +529,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ) and should_enable_cp_bcg_capture(server_args)
         if self.enable_cp_bcg_capture:
             if self.max_context_size is not None:
-                # TODO: Preserve max_seq_len_override through CP-v2's padded
+                # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
                 # metadata preparation before enabling the fixed context limit.
-                self._ignore_max_context_size("CP-v2 breakable prefill CUDA graph")
+                self._ignore_max_context_size("CP breakable prefill CUDA graph")
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+        if self.max_context_size is not None and not (
+            model_runner.attn_backend.supports_prefill_cuda_graph_max_context_size
+        ):
+            raise ValueError(
+                "--cuda-graph-prefill-max-context is only supported by attention "
+                "backends that implement fixed-context prefill graph metadata; "
+                f"got {type(model_runner.attn_backend).__name__}"
+            )
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
@@ -901,34 +894,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     @staticmethod
-    def _resolve_max_context_size(
-        model_runner, requested_size: Optional[int]
-    ) -> Optional[int]:
-        if requested_size is None:
-            return None
-        if isinstance(requested_size, bool) or not isinstance(requested_size, int):
+    def _validate_max_context_capacity(
+        *, max_context_size: Optional[int], table_width: int
+    ) -> None:
+        if max_context_size is not None and max_context_size > table_width:
             raise ValueError(
-                "--cuda-graph-prefill-max-context accepts exactly one integer"
+                "--cuda-graph-prefill-max-context exceeds the request-to-token "
+                f"pool capacity: requested size {max_context_size} > {table_width}"
             )
-        if requested_size <= 0:
-            raise ValueError(
-                "--cuda-graph-prefill-max-context must be a positive integer"
-            )
-
-        max_context_len = PrefillCudaGraphRunner._max_addressable_prefix_len(
-            model_runner
-        )
-        if requested_size > max_context_len:
-            raise ValueError(
-                "--cuda-graph-prefill-max-context exceeds the maximum "
-                "addressable context: "
-                f"requested size {requested_size} > {max_context_len}"
-            )
-        logger.info(
-            "Prefill CUDA graph max context size: %d; graph keys remain token-only.",
-            requested_size,
-        )
-        return requested_size
 
     def _ignore_max_context_size(self, execution_path: str) -> None:
         if self.max_context_size is None:

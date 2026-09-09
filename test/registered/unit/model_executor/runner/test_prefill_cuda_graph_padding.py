@@ -33,7 +33,6 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner.capture_num_tokens = [4, 16]
         runner.max_context_size = None
         runner.max_num_tokens = 16
-        runner.enable_cp_v2_bcg_capture = False
         return runner
 
     def _make_forward_batch(self, num_tokens):
@@ -106,30 +105,16 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         uncovered.seq_lens_cpu.fill_(701)
         self.assertFalse(runner.can_run_graph(uncovered))
 
-    def test_max_context_size_preserves_requested_limit_and_is_bounded(self):
-        model_runner = SimpleNamespace(
-            model_config=SimpleNamespace(context_len=4096),
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.empty((1, 4096), dtype=torch.int32)
-            ),
+    def test_max_context_size_is_bounded_by_runtime_pool_capacity(self):
+        PrefillCudaGraphRunner._validate_max_context_capacity(
+            max_context_size=704,
+            table_width=704,
         )
-
-        self.assertEqual(
-            PrefillCudaGraphRunner._resolve_max_context_size(model_runner, 700),
-            700,
-        )
-        with self.assertRaisesRegex(ValueError, "maximum addressable context"):
-            PrefillCudaGraphRunner._resolve_max_context_size(model_runner, 4097)
-        with self.assertRaisesRegex(ValueError, "exactly one integer"):
-            PrefillCudaGraphRunner._resolve_max_context_size(model_runner, [256, 1024])
-        with self.assertRaisesRegex(ValueError, "exactly one integer"):
-            PrefillCudaGraphRunner._resolve_max_context_size(model_runner, True)
-        for requested_size in (0, -1):
-            with self.subTest(requested_size=requested_size):
-                with self.assertRaisesRegex(ValueError, "positive integer"):
-                    PrefillCudaGraphRunner._resolve_max_context_size(
-                        model_runner, requested_size
-                    )
+        with self.assertRaisesRegex(ValueError, "request-to-token pool capacity"):
+            PrefillCudaGraphRunner._validate_max_context_capacity(
+                max_context_size=704,
+                table_width=700,
+            )
 
     def test_capture_has_only_token_axis(self):
         runner = self._make_runner()
