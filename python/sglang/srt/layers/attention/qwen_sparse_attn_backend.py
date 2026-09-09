@@ -256,6 +256,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return max(1, int(sequence_lengths.max()))
         spec_info = forward_batch.spec_info
+        # Target verify exposes ``draft_token_num`` while draft-extend exposes
+        # ``num_tokens_per_req``. Both modes use this gather-width bound.
         draft_window = int(
             getattr(
                 spec_info,

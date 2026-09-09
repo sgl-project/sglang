@@ -240,10 +240,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
         if not self.full_attention_layer_id_mapping:
             return [], [], []
         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
-        return (
-            [tensor.data_ptr() for tensor in tensors],
-            [tensor.nbytes for tensor in tensors],
-            [tensor[0].nbytes * self.qsa_compress_ratio for tensor in tensors],
+        return self._get_paged_state_buf_infos(
+            tensors,
+            self.qsa_compress_ratio,
         )
 
     def get_qsa_pending_state_layer_ids(self):

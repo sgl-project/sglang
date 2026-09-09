@@ -127,14 +127,14 @@ class ShortConvPool:
         self.conv_state[:, indices] = data.to(self.conv_state.device, non_blocking=True)
 
     def iter_transfer_state_entries(self):
-        """Yield per-layer ``[slot, ...]`` tensors for PD state transfer."""
+        """Yield replicated per-layer state for PD transfer."""
         if self.conv_state is None:
             return
         for layer_id, layer_index in self.layer_map.items():
             yield (
                 "ple_short_conv",
                 self.conv_state[layer_index],
-                0,
+                None,
                 layer_id,
             )
 
@@ -237,6 +237,6 @@ class NGramPool:
         )
 
     def iter_transfer_state_entries(self):
-        """Yield the request-wide N-gram history for PD state transfer."""
+        """Yield replicated request-wide N-gram history for PD transfer."""
         if self.context is not None:
-            yield "ple_ngram", self.context, 0, PLE_NGRAM_STATE_LAYER_ID
+            yield "ple_ngram", self.context, None, PLE_NGRAM_STATE_LAYER_ID

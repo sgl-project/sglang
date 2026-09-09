@@ -350,6 +350,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_staging = False
         queue.enable_deferred_kv_release = False
         queue.token_to_kv_pool = object()
+        queue._needs_qsa_gpudirect_flush = False
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
@@ -410,6 +411,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertFalse(receiver.abort_notified)
 
     def test_qsa_successes_share_one_gpudirect_visibility_flush(self):
+        call_order = []
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [
             SimpleNamespace(
@@ -426,6 +428,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             transfer_backend=TransferBackend.MOONCAKE,
         )
         queue.token_to_kv_pool = object.__new__(QSATokenToKVPool)
+        queue._needs_qsa_gpudirect_flush = True
         queue.enable_staging = False
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[1, 2])
         queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(free=MagicMock())
@@ -436,19 +439,21 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 "_poll_with_metadata_gate",
                 return_value=[KVPoll.Success, KVPoll.Success],
             ),
-            patch.object(DecodeTransferQueue, "_commit_transfer_to_req"),
-            patch(
-                "sglang.srt.disaggregation.decode._flush_gpudirect_writes_to_cuda_owner"
-            ) as flush,
-            patch(
-                "sglang.srt.disaggregation.decode._requires_qsa_gpudirect_flush",
-                return_value=True,
+            patch.object(
+                DecodeTransferQueue,
+                "_commit_transfer_to_req",
+                side_effect=lambda _: call_order.append("commit"),
             ),
+            patch(
+                "sglang.srt.disaggregation.decode._flush_gpudirect_writes_to_cuda_owner",
+                side_effect=lambda: call_order.append("flush"),
+            ) as flush,
             patch.object(torch.cuda, "synchronize") as synchronize,
         ):
             transferred = queue.pop_transferred()
 
         self.assertEqual([req.rid for req in transferred], ["req-0", "req-1"])
+        self.assertEqual(call_order, ["flush", "commit", "commit"])
         flush.assert_called_once_with()
         synchronize.assert_not_called()
 
@@ -468,6 +473,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             transfer_backend=TransferBackend.MORI,
         )
         queue.token_to_kv_pool = object.__new__(QSATokenToKVPool)
+        queue._needs_qsa_gpudirect_flush = False
         queue.enable_staging = False
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[1])
         queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(free=MagicMock())

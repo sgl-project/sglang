@@ -44,7 +44,6 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.ple_state_pool import PLE_NGRAM_STATE_LAYER_ID
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
@@ -1317,18 +1316,10 @@ class MoriKVManager(CommonKVManager):
             )
 
             if st == "mamba":
-                state_layer_ids = (
-                    self.kv_args.state_layer_ids[i]
-                    if i < len(self.kv_args.state_layer_ids)
-                    else []
-                )
-                if (
-                    peer_info.decode_tp_size != self.attn_tp_size
-                    and PLE_NGRAM_STATE_LAYER_ID in state_layer_ids
-                ):
+                if peer_info.decode_tp_size != self.attn_tp_size and 0 in src_dims:
                     raise RuntimeError(
-                        "Qwen4 PLE PD state transfer currently requires matching "
-                        "prefill/decode attention TP sizes"
+                        "Replicated Mamba PD state transfer currently requires "
+                        "matching prefill/decode attention TP sizes"
                     )
                 statuses.extend(
                     self._send_mamba_state(

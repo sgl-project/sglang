@@ -56,6 +56,18 @@ class TestMambaStateTransferBuffers(unittest.TestCase):
 
         self.assertEqual(len(pool.get_state_dim_per_tensor()), len(lens))
 
+    def test_sibling_declares_replicated_transfer_without_field_name_coupling(self):
+        pool = _pool(torch.zeros(NUM_LAYERS, NUM_SLOTS, 6, 7, 8))
+
+        class ReplicatedSibling:
+            def iter_transfer_state_entries(self):
+                yield "future_sibling", torch.zeros(NUM_SLOTS, 9), None, 123
+
+        pool._slot_siblings = [ReplicatedSibling()]
+
+        self.assertEqual(pool.get_state_dim_per_tensor()[-1], 0)
+        self.assertEqual(pool.get_state_slice_outer_counts()[-1], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

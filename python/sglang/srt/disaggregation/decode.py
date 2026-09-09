@@ -170,7 +170,11 @@ def _flush_gpudirect_writes_to_cuda_owner() -> None:
 
 
 def _requires_qsa_gpudirect_flush(transfer_backend: TransferBackend) -> bool:
-    """Whether this transport writes QSA state through NVIDIA GPUDirect."""
+    """Whether QSA needs a CUDA-owner visibility operation for this transport.
+
+    This change is intentionally QSA-scoped. Extending the ordering contract to
+    established state types requires a separate audit of each backend/consumer.
+    """
     return (
         transfer_backend
         in (
@@ -2134,6 +2138,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.token_to_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
+        self._needs_qsa_gpudirect_flush = isinstance(
+            self.token_to_kv_pool, QSATokenToKVPool
+        ) and _requires_qsa_gpudirect_flush(scheduler.transfer_backend)
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -2381,25 +2388,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Queue-removed but held for deferred release; excluded from the metadata
         # teardown below.
         deferred_indices = set()
-        qsa_success_indices = {
-            i
-            for i, (decode_req, poll) in enumerate(zip(self.queue, polls))
-            if poll == KVPoll.Success
-            and (rids_to_check is None or decode_req.req.rid in rids_to_check)
-            and not (
-                self.scheduler.enable_decode_hicache
-                and decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
-            )
-        }
-        if (
-            isinstance(self.token_to_kv_pool, QSATokenToKVPool)
-            and qsa_success_indices
-            and _requires_qsa_gpudirect_flush(self.scheduler.transfer_backend)
-        ):
-            # A single blocking flush covers every QSA request completed by this
-            # poll. The CUDA visibility operation is sufficient; a subsequent
-            # device-wide synchronize would unnecessarily wait on unrelated work.
-            _flush_gpudirect_writes_to_cuda_owner()
+        qsa_writes_flushed = False
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -2465,6 +2454,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
+                if self._needs_qsa_gpudirect_flush and not qsa_writes_flushed:
+                    # Completion comes from a host-side RDMA poll. QSA state is
+                    # consumed directly after this queue releases the request,
+                    # so make it CUDA-visible before the first commit. One
+                    # blocking flush covers every success in this poll.
+                    _flush_gpudirect_writes_to_cuda_owner()
+                    qsa_writes_flushed = True
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption

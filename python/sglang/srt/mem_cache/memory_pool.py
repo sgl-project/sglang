@@ -1112,12 +1112,6 @@ class MambaPool:
             "replayssm_beta",
         }
     )
-    _REPLICATED_TRANSFER_STATE_FIELDS = frozenset(
-        {
-            "ple_short_conv",
-            "ple_ngram",
-        }
-    )
 
     def _iter_transfer_state_entries(self):
         """Yield ``[slot, ...]`` state entries and their transfer metadata."""
@@ -1154,11 +1148,11 @@ class MambaPool:
         while Kimi conv state uses the second per-slot axis.
         """
         dim_per_tensor = []
-        for field, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
+        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
             # Zero is a protocol marker for request state replicated across the
             # attention-TP group. Heterogeneous PD copies the whole item from one
             # elected source rank instead of slicing it as a TP-sharded tensor.
-            if field in self._REPLICATED_TRANSFER_STATE_FIELDS:
+            if slice_axis is None:
                 dim_per_tensor.append(0)
                 continue
             # state_tensor shape: [size+1, sliceable_dim, ...]. Kimi conv state
@@ -1180,7 +1174,11 @@ class MambaPool:
         """Get the number of rows preceding each tensor's TP slice axis."""
         outer_counts = []
         for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
-            outer_count = math.prod(state_tensor.shape[1 : 1 + slice_axis])
+            outer_count = (
+                1
+                if slice_axis is None
+                else math.prod(state_tensor.shape[1 : 1 + slice_axis])
+            )
             outer_counts.append(outer_count)
         return outer_counts
 
