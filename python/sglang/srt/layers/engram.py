@@ -707,7 +707,11 @@ def engram_gate(
     )
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
-    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
+    # gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
+    # 修改为（全部在 NPU 上执行）
+    sqrt_val = dot.abs().clamp_min(clamp_value).sqrt()
+    signed_sqrt = torch.where(dot >= 0, sqrt_val, -sqrt_val)
+    gate = torch.sigmoid(signed_sqrt)
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
 
 

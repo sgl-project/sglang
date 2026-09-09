@@ -2363,7 +2363,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         assert post.shape == (x.shape[0], self.hc_mult)
         assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
 
-        @compile_in_capture_mode
+        # @compile_in_capture_mode
         def hc_post_torch_impl(x, residual, post, comb):
             return (
                 post.unsqueeze(-1) * x.unsqueeze(1)

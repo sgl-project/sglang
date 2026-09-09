@@ -35,6 +35,9 @@ from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
 from sglang.kernels.ops.attention.dsv4.low_ratio_compress_decode import (
     low_ratio_compress_decode,
 )
+from sglang.kernels.ops.attention.dsv4.low_ratio_index_score import (
+    low_ratio_index_score_triton,
+)
 from sglang.srt.layers.attention.dsv4.dsv41_compressor import (
     last_token_per_request,
 )
@@ -1041,6 +1044,11 @@ class DeepseekV4AscendAttnBackend(
 
         # V4.1 low-ratio (ratio 1/2) candidate masks for the torch indexer path.
         self.candidate_masks: Optional[list] = None
+        # True while capturing/replaying an aclgraph: low-ratio indexer code
+        # switches to static-shape upper bounds (max_lc etc.) instead of
+        # data-dependent widths / D2H reads, which would either diverge from
+        # the recorded op stream or sync during capture.
+        self._dsv4_in_graph_ctx = False
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1148,9 +1156,14 @@ class DeepseekV4AscendAttnBackend(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
 
-        # 1024 int32 per kernel-metadata buffer (fixed op metadata size)
+        # 1024 int32 per kernel-metadata buffer (fixed op metadata size).
+        # fulla (c1 sparse) / c2a are allocated unconditionally: the model
+        # config decides at runtime whether _kernel_metadata_from_parts emits
+        # them, and the buffers are tiny.
         for key in (
             "kernel_metadata_c1a",
+            "kernel_metadata_fulla",
+            "kernel_metadata_c2a",
             "kernel_metadata_c4a",
             "kernel_metadata_c128a",
             "kernel_metadata_li_quant",
@@ -1189,6 +1202,7 @@ class DeepseekV4AscendAttnBackend(
     ):
         # Parent refreshes shared (block_tables / seq_lens) metadata; we layer DSV4
         # fields on top: capture allocates+zeros, replay refreshes them in place.
+        self._dsv4_in_graph_ctx = True
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         bs = forward_batch.batch_size
         if in_capture:
@@ -1538,7 +1552,16 @@ class DeepseekV4AscendAttnBackend(
             is_graph=True,
             seq_lens_max_override=ctx.compress_seq_lens_max,
         )
-        for key in ("c4_page_table", "c128_page_table"):
+        # c1/c2 page tables come from the same _compute_compress_locs result
+        # (slots // page_size over full-pool page starts); without the refresh
+        # they keep the capture-time -1 fill and the c1/c2 attention sees no
+        # valid compressed pages at replay.
+        for key in (
+            "c1_page_table",
+            "c2_page_table",
+            "c4_page_table",
+            "c128_page_table",
+        ):
             if key in result:
                 self._copy_page_table_into_graph(key, result[key])
 
@@ -1735,6 +1758,8 @@ class DeepseekV4AscendAttnBackend(
         )
         for key in (
             "c1a_metadata",
+            "fulla_metadata",
+            "c2a_metadata",
             "c4a_metadata",
             "c128a_metadata",
             "li_quant_metadata",
@@ -1771,6 +1796,7 @@ class DeepseekV4AscendAttnBackend(
         self.forward_metadata = ctx.fm
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        self._dsv4_in_graph_ctx = False
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
 
@@ -1919,11 +1945,8 @@ class DeepseekV4AscendAttnBackend(
         )
         max_seqlen_kv = int(actual_seq_lengths_kv.max().item()) if actual_seq_lengths_kv.numel() > 0 else 0
 
-        _kv_kwargs = _sparse_attn_kv_quant_kwargs()
         common = {
-            "kv_quant_mode": _kv_kwargs["kv_quant_mode"],
-            "tile_size": _kv_kwargs.get("tile_size", 0),
-            "rope_head_dim": _kv_kwargs.get("rope_head_dim", 0),
+            **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,
             "cu_seqlens_ori_kv": actual_seq_lengths_q_pa,
             "seqused_q": seqused_q,
@@ -2386,8 +2409,7 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
         _, attn_op = _sparse_attn_ops()
-        _kvqm = attn_kwargs.pop("kv_quant_mode", 1)
-        out, _ret = attn_op(q_arg, _kvqm, **attn_kwargs)
+        out, _ret = attn_op(q_arg, **attn_kwargs)
         return out
 
     def _forward_compressed(
@@ -2471,9 +2493,8 @@ class DeepseekV4AscendAttnBackend(
         else:
             attn_kwargs["cmp_sparse_indices"] = None
         q_arg = attn_kwargs.pop("q")
-        _kvqm = attn_kwargs.pop("kv_quant_mode")
         _, attn_op = _sparse_attn_ops()
-        out, _ = attn_op(q_arg, _kvqm, **attn_kwargs)
+        out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
@@ -2645,7 +2666,26 @@ class DeepseekV4AscendAttnBackend(
                 self._low_ratio_compress_torch(layer, x, req, pos, fm, forward_batch)
         if layer.indexer is not None:
             if is_npu_arch35():
-                self._low_ratio_index_topk_torch_a5(layer, x, q_lora, req, pos, fm)
+                # Host-side max compressed length (no device sync): seq_lens_cpu
+                # is a CPU tensor. +1 before // absorbs a possible off-by-one
+                # in seq_lens semantics; extra columns are -inf-masked anyway.
+                # In graph context the capture batch's seq_lens_cpu is a dummy
+                # (tiny) value — use the static graph bound there instead, so
+                # the recorded [T, max_lc] score width covers every replay.
+                if self._dsv4_in_graph_ctx:
+                    max_pages = self.graph_metadata["c1_page_table"].shape[1]
+                    max_lc = max_pages * self.page_size // layer.compress_ratio
+                else:
+                    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                    if seq_lens_cpu is not None:
+                        max_lc = (
+                            int(seq_lens_cpu.max().item()) + 1
+                        ) // layer.compress_ratio
+                    else:
+                        max_lc = self.req_to_token.shape[1] // layer.compress_ratio
+                self._low_ratio_index_topk_torch_a5(
+                    layer, x, q_lora, req, pos, fm, max_lc
+                )
             else:
                 self._low_ratio_index_topk_torch_a3(layer, x, q_lora, req, pos)
 
@@ -2940,19 +2980,198 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         setattr(fm, f"c{ratio}_topk_indices", page_indices)
 
-    def _low_ratio_index_topk_torch_a5(self, layer, x, q_lora, req, pos, fm):
-        """Eager torch top-k for the low-ratio indexer (bond semantics; the
-        DeepGEMM paged decode path is CUDA-only and aclgraph-deferred).
+    @staticmethod
+    def _select_candidate_blocks_graph_safe(
+        logits, compress_lens, topk_blocks, block_size
+    ):
+        """Graph-safe drop-in for ``indexer.select_candidate_blocks``.
 
-        Produces per-token top-k compressed-position indices (+ page rows) and
-        publishes candidate masks for the downstream candidate consumers; the
-        attention op consumes them through the metadata stashed on fm.
+        Same semantics (block amax -> force-keep the block holding each
+        row's newest position -> block top-k -> expand to a position mask)
+        but built from static-shape ops only: fixed-iteration argmax instead
+        of topk / repeat_interleave / F.pad, so aclgraph can capture it.
+        ``logits`` is the causal-masked [T, W] score matrix (values beyond a
+        row's lens are already -inf); ``compress_lens`` may be [T] or [T, 1]
+        (the ``topk_from_scores`` call convention).
+        """
+        T, width = logits.shape
+        device = logits.device
+        num_blocks = -(-width // block_size)
+        pad = num_blocks * block_size - width
+        if pad:
+            logits = torch.cat(
+                [logits, logits.new_full((T, pad), float("-inf"))], dim=-1
+            )
+        compress_lens = compress_lens.reshape(T, 1).to(torch.int64)
+        block_scores = logits.view(T, num_blocks, block_size).amax(dim=-1)
+        # lens == 0 -> (0-1)//block_size == -1 matches no block index.
+        last = (compress_lens - 1) // block_size
+        ar = torch.arange(num_blocks, device=device)
+        block_scores = block_scores.masked_fill(
+            ar[None, :] == last, float("inf")
+        )
+        k = min(topk_blocks, num_blocks)
+        keep_b = torch.zeros(T, num_blocks, dtype=torch.bool, device=device)
+        for _ in range(k):
+            i = block_scores.argmax(dim=-1, keepdim=True)  # [T, 1]
+            v = block_scores.gather(dim=-1, index=i)  # [T, 1]
+            sel = v > float("-inf")
+            # OR-in: once every block is -inf, argmax returns 0 and must not
+            # clear an earlier pick at that position.
+            keep_b = keep_b.scatter(-1, i, keep_b.gather(-1, i) | sel)
+            block_scores.scatter_(-1, i, torch.full_like(v, float("-inf")))
+        keep = (
+            keep_b.unsqueeze(-1)
+            .expand(T, num_blocks, block_size)
+            .reshape(T, num_blocks * block_size)
+        )[:, :width]
+        return keep.contiguous()
+
+    def _low_ratio_index_topk_torch_a5(
+        self, layer, x, q_lora, req, pos, fm, max_lc
+    ):
+        """A5 low-ratio indexer top-k (bond semantics).
+
+        Default: fused triton kernel (dequant + score + causal/consume mask,
+        ``low_ratio_index_score_triton``) over the whole [T, max_lc] batch —
+        no per-request loop, no ``.item()`` D2H, static shapes for aclgraph.
+        The token-level top-k and the candidate-source block top-k stay in
+        torch on the kernel's output (by design; see the kernel docstring).
+        Set SGLANG_DSV4_INDEX_TOPK_TORCH=1 for the eager per-request loop
+        fallback (debug only — it syncs and cannot be captured).
+        """
+        if os.environ.get("SGLANG_DSV4_INDEX_TOPK_TORCH", "0") == "1":
+            self._low_ratio_index_topk_loop_a5(layer, x, q_lora, req, pos, fm)
+            return
+
+        pool = self.token_to_kv_pool
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        topk = indexer.index_topk
+        device = pos.device
+        total = int(req.numel())
+
+        q, _ = indexer.wq_b(q_lora)
+        q = q.view(q.shape[0], indexer.n_local_heads, indexer.index_head_dim)
+        q = _npu_rope_tail(q, layer.freqs_cis, pos, indexer.rope_head_dim)
+        weights = indexer.head_weights(x)
+        compress_lens = (pos + 1) // ratio
+        # c{ratio}_topk_indices holds COMPRESSED POSITIONS (where(reach, idx,
+        # -1)), matching the A3 triton path and the loop fallback: the fused
+        # sparse-attn op resolves positions to pool slots itself via
+        # cmp_block_table. Publishing pool slots here made the kernel gather
+        # the block table with million-scale values -> GatherElements OOB.
+        raw_indices = torch.full(
+            (total, topk), -1, dtype=torch.int32, device=device
+        )
+
+        if max_lc > 0:
+            # Published masks may arrive as a per-request list (loop fallback
+            # publish) or non-bool/non-contiguous — normalize to one [T, W]
+            # bool tensor before use.
+            consume = (
+                getattr(fm, "dsv41_candidate_masks", None)
+                if indexer.uses_candidates
+                else None
+            )
+            if consume is not None:
+                if isinstance(consume, (list, tuple)):
+                    consume = (
+                        torch.cat(consume, dim=0)
+                        if len(consume) > 1
+                        else consume[0]
+                    )
+                consume = consume.to(torch.bool).contiguous()
+
+            source = pool.latent_source_layer(layer.layer_id)
+            source_slot = pool.low_ratio_sources[ratio].index(source)
+            idx_pool = pool._indexer_pool(ratio)
+            d = idx_pool.index_head_dim
+            k_buf = idx_pool.get_index_k(source_slot).reshape(-1, d)
+            k_scale = idx_pool.get_index_scale(source_slot).reshape(-1)
+
+            s, block_scores = low_ratio_index_score_triton(
+                q,
+                weights,
+                req,
+                self.req_to_token,
+                k_buf,
+                compress_lens,
+                max_lc=max_lc,
+                k_scale=k_scale,
+                consume=consume,
+                ratio=ratio,
+                candidate_block_size=(
+                    indexer.candidate_block_size
+                    if indexer.is_candidate_source
+                    else None
+                ),
+            )
+
+            if indexer.is_candidate_source:
+                # Block-level candidate selection is a top-k over blocks —
+                # kept outside the kernel by design. It runs on the kernel's
+                # [T, num_blocks] amax scores (newest block already +inf) via
+                # torch.topk with -inf value filtering.
+                fm.dsv41_candidate_masks = self._select_candidate_blocks_a5(
+                    block_scores,
+                    topk_blocks=indexer.candidate_topk_blocks,
+                    block_size=indexer.candidate_block_size,
+                    width=max_lc,
+                )
+
+            # Token-level top-k stays in torch: rows with lens < k_glob pick
+            # -inf slots that `reach` maps to -1, matching the per-request
+            # k = min(topk, lc) fill of the loop version. The score kernel
+            # already resolved K slots internally via req/req_to_token — no
+            # external slot gather is needed (A3 parity).
+            k_glob = min(topk, max_lc)
+            idx = s.topk(k_glob, dim=-1, sorted=False).indices.sort(dim=-1).values
+            reach = idx < compress_lens[:, None]
+            raw_indices[:, :k_glob] = torch.where(reach, idx, -1).to(
+                torch.int32
+            )
+
+        fm.dsv41_low_ratio_topk_raw = raw_indices
+        setattr(fm, f"c{ratio}_topk_indices", raw_indices)
+
+    @staticmethod
+    def _select_candidate_blocks_a5(block_scores, topk_blocks, block_size, width):
+        """Block-level candidate top-k, kept outside the score kernel by design.
+
+        ``block_scores`` is the kernel's [T, num_blocks] fp32 per-block amax
+        with the newest block already forced to +inf; this picks the top
+        ``topk_blocks`` blocks per row and expands them to a [T, width] bool
+        position mask. torch.topk over the blocks — same aclgraph-capture
+        assumption as the token-level ``s.topk`` in the caller (static k and
+        shapes). Rows with fewer reachable blocks than k get -inf picks,
+        filtered by value so unreachable blocks stay masked (positions beyond
+        lens are causal-masked in the consumer kernel anyway).
+        """
+        T, num_blocks = block_scores.shape
+        k = min(topk_blocks, num_blocks)
+        vals, idx = block_scores.topk(k, dim=-1)  # [T, k], descending
+        sel = vals > float("-inf")
+        keep_b = torch.zeros(
+            T, num_blocks, dtype=torch.bool, device=block_scores.device
+        )
+        keep_b.scatter_(-1, idx, sel)
+        # Block mask -> position mask (== repeat_interleave(block_size, -1)).
+        keep = (
+            keep_b.unsqueeze(-1)
+            .expand(T, num_blocks, block_size)
+            .reshape(T, num_blocks * block_size)
+        )[:, :width]
+        return keep.contiguous()
+
+    def _low_ratio_index_topk_loop_a5(self, layer, x, q_lora, req, pos, fm):
+        """Eager per-request fallback (SGLANG_DSV4_INDEX_TOPK_TORCH=1).
+
+        The original bring-up path kept for debugging: per-request widths via
+        ``.item()`` (D2H sync) and a Python loop — NOT aclgraph-capturable.
         """
         from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
             topk_from_scores,
-        )
-        from sglang.srt.layers.attention.dsv4.indexer import (
-            select_candidate_blocks,
         )
 
         pool = self.token_to_kv_pool
@@ -3001,7 +3220,7 @@ class DeepseekV4AscendAttnBackend(
                     if consume_masks is not None and indexer.uses_candidates
                     else None
                 ),
-                select_candidate_blocks=select_candidate_blocks,
+                select_candidate_blocks=self._select_candidate_blocks_graph_safe,
             )
             page_indices[tok, :k] = torch.where(reach, slots_j[idx], -1).to(
                 torch.int32
