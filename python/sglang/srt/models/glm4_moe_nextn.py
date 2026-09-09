@@ -32,7 +32,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ class Glm4MoeModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            logger.warning(
+            logger.debug(
                 "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 / GLM-4.6 / GLM-4.7 model."
             )
             quant_config = None
@@ -129,6 +129,13 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             quant_config = None
         self.quant_config = quant_config
 
+        # The draft's own gate: its quantization can differ from the
+        # target's, and the decoder below reads the ACTIVE decision while it
+        # builds. Also sets num_fused_shared_experts, which drives the
+        # inherited loader's shared-expert remap.
+        self.num_fused_shared_experts = 0
+        self.determine_num_fused_shared_experts()
+
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -140,10 +147,6 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-
-        self.num_fused_shared_experts = (
-            0 if get_exec().moe.disable_shared_experts_fusion else 1
-        )
 
     @torch.no_grad()
     def forward(

@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 struct MlaOutputGateParams {
   const bf16_t* __restrict__ x;     // [N] contiguous (flattened [T, H])
@@ -81,4 +81,4 @@ struct MlaOutputGateKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

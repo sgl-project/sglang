@@ -47,8 +47,6 @@ class SchedulerActor:
         dp_rank: Optional[int],
         dist_init_addr: Optional[str] = None,
     ):
-        import dataclasses
-
         from sglang.srt.environ import envs
         from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
         from sglang.srt.utils.numa_utils import (
@@ -56,10 +54,11 @@ class SchedulerActor:
             numa_bind_to_node,
         )
 
-        # Override dist_init_addr if provided (for multi-node)
+        # Override dist_init_addr if provided (for multi-node), through
+        # `replace_resolved` so the copy keeps the parent's resolution.
         if dist_init_addr:
-            server_args = dataclasses.replace(
-                server_args, dist_init_addr=dist_init_addr
+            server_args = server_args.replace_resolved(
+                "ray.scheduler_actor", dist_init_addr=dist_init_addr
             )
 
         # Get actual GPU IDs from Ray runtime context
@@ -74,6 +73,10 @@ class SchedulerActor:
             # Fallback to passed gpu_id
             actual_gpu_id = gpu_id
             logger.info(f"[TP{tp_rank}] Using passed gpu_id: {gpu_id}")
+
+        # This actor takes the place of run_scheduler_process, which is where
+        # a forked scheduler publishes.
+        publish(server_args, role="scheduler")
 
         # Configure worker (logging, process title, etc.)
         dp_rank = configure_scheduler_process(
@@ -98,10 +101,6 @@ class SchedulerActor:
                 logger.info(
                     f"[TP{tp_rank}] Bound to NUMA node {numa_node} for GPU {actual_gpu_id}"
                 )
-
-        # This actor constructs Scheduler directly (no run_scheduler_process),
-        # which reads the config namespaces before the model worker's publish.
-        publish(server_args, role="scheduler")
 
         # Create scheduler (loads model into GPU, initializes NCCL)
         self.scheduler = Scheduler(

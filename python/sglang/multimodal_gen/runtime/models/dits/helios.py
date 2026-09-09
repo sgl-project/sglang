@@ -16,7 +16,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion import (
+    can_use_helios_qk_rope,
+    fused_inplace_helios_qk_rope,
+    mark_helios_gated_residual_site,
+    try_helios_gated_residual,
+)
 from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_world_size,
@@ -284,6 +291,24 @@ class HeliosSelfAttention(nn.Module):
             self.history_scale_mode = history_scale_mode
             self.max_scale = 10.0
 
+    def _apply_rotary_qk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        rotary_emb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.tp_rmsnorm and can_use_helios_qk_rope(q, k, rotary_emb):
+            fused_inplace_helios_qk_rope(
+                q.view(-1, q.shape[-2], q.shape[-1]),
+                k.view(-1, k.shape[-2], k.shape[-1]),
+                rotary_emb.view(-1, rotary_emb.shape[-1]),
+            )
+            return q, k
+        return (
+            apply_rotary_emb_transposed(q, rotary_emb),
+            apply_rotary_emb_transposed(k, rotary_emb),
+        )
+
     def forward(self, hidden_states, rotary_emb=None, original_context_length=None):
         q, _ = self.to_q(hidden_states)
         k, _ = self.to_k(hidden_states)
@@ -301,8 +326,7 @@ class HeliosSelfAttention(nn.Module):
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
         if rotary_emb is not None:
-            q = apply_rotary_emb_transposed(q, rotary_emb)
-            k = apply_rotary_emb_transposed(k, rotary_emb)
+            q, k = self._apply_rotary_qk(q, k, rotary_emb)
 
         history_seq_len = (
             hidden_states.shape[1] - original_context_length
@@ -371,6 +395,7 @@ class HeliosCrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             skip_sequence_parallel=True,
+            is_cross_attention=True,
         )
 
     def project_kv(self, encoder_hidden_states):
@@ -474,6 +499,8 @@ class HeliosTransformerBlock(nn.Module):
         # 4. Guidance cross-attention flag
         self.guidance_cross_attn = guidance_cross_attn
 
+        mark_helios_gated_residual_site(self)
+
     def forward(
         self,
         hidden_states,
@@ -503,8 +530,11 @@ class HeliosTransformerBlock(nn.Module):
         attn_output = self.attn1(
             norm_hidden_states, rotary_emb, original_context_length
         )
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(
-            hidden_states
+        fused = try_helios_gated_residual(self, hidden_states, attn_output, gate_msa)
+        hidden_states = (
+            fused
+            if fused is not None
+            else (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
         )
 
         # 2. Cross-attention
@@ -539,9 +569,14 @@ class HeliosTransformerBlock(nn.Module):
         # 3. Feed-forward
         norm_hidden_states = self.norm3(hidden_states, c_shift_msa, c_scale_msa)
         ff_output = self.ffn(norm_hidden_states)
+        fused = try_helios_gated_residual(self, hidden_states, ff_output, c_gate_msa)
         hidden_states = (
-            hidden_states.float() + ff_output.float() * c_gate_msa
-        ).type_as(hidden_states)
+            fused
+            if fused is not None
+            else (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(
+                hidden_states
+            )
+        )
 
         return hidden_states
 
@@ -559,9 +594,8 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     with zero_history_timestep and guidance_cross_attn.
     """
 
-    _fsdp_shard_conditions = HeliosConfig()._fsdp_shard_conditions
-    _compile_conditions = HeliosConfig()._compile_conditions
-    _supported_attention_backends = HeliosConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = HeliosConfig().param_names_mapping
     reverse_param_names_mapping = HeliosConfig().reverse_param_names_mapping
     lora_param_names_mapping = HeliosConfig().lora_param_names_mapping

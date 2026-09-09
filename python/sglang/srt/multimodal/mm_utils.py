@@ -130,8 +130,9 @@ def select_best_resolution(original_size, possible_resolutions):
     for width, height in possible_resolutions:
         # Calculate the downscaled size to keep the aspect ratio
         scale = min(width / original_width, height / original_height)
-        downscaled_width, downscaled_height = int(original_width * scale), int(
-            original_height * scale
+        downscaled_width, downscaled_height = (
+            int(original_width * scale),
+            int(original_height * scale),
         )
 
         # Calculate effective and wasted resolutions
@@ -557,9 +558,11 @@ def run_dp_sharded_mrope_vision_model(
     grid_thw_list: list,
     *,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
+    pool_temporal_dimension: bool = False,
     load_local_pixel_values: Optional[Callable[[list[int]], torch.Tensor]] = None,
     pixel_values_device: Optional[torch.device] = None,
     pixel_values_dtype: Optional[torch.dtype] = None,
+    pass_grid_thw_list: bool = False,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -576,6 +579,11 @@ def run_dp_sharded_mrope_vision_model(
                    "rope_2d" for packed 2D rope outputs (e.g., Kimi-VL)
                    "rope_2d_packed" for packed 2D rope outputs that accept
                    ``grid_thws`` positionally (e.g., Kimi-K2.5/K2.7)
+        pool_temporal_dimension: Whether the vision model pools away the temporal
+                   grid dimension. Its output length is then h * w divided by
+                   the spatial merge area instead of t * h * w divided by it.
+        pass_grid_thw_list: Forward the existing host grid list to the vision
+            model so graph-aware towers do not materialize it from a CUDA tensor.
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -614,11 +622,13 @@ def run_dp_sharded_mrope_vision_model(
             device=pixel_values.device if rope_type == "rope_2d" else None,
         )
         if rope_type == "rope_2d":
-            image_embeds = vision_model(
-                pixel_values,
-                grid_hw=grid_thw,
-                max_seqlen=max(math.prod(grid) for grid in grid_thw_list),
-            )
+            kwargs = {
+                "grid_hw": grid_thw,
+                "max_seqlen": max(math.prod(grid) for grid in grid_thw_list),
+            }
+            if pass_grid_thw_list:
+                kwargs["grid_thw_list"] = grid_thw_list
+            image_embeds = vision_model(pixel_values, **kwargs)
             # MoonViT returns one tensor per image. The multi-GPU path below
             # already concatenates these tensors before returning, so keep the
             # TP=1 DP-encoder path on the same projector-facing contract.
@@ -687,7 +697,9 @@ def run_dp_sharded_mrope_vision_model(
         )
 
     output_tokens_per_image = [
-        math.prod(grid) // embed_dim_reduction_factor for grid in grid_thw_list
+        math.prod(grid[1:] if pool_temporal_dimension else grid)
+        // embed_dim_reduction_factor
+        for grid in grid_thw_list
     ]
     grouped_output_lengths = []
     assignment_offset = 0
@@ -717,11 +729,13 @@ def run_dp_sharded_mrope_vision_model(
                 device=(pixel_values_local.device if rope_type == "rope_2d" else None),
             )
             if rope_type == "rope_2d":
-                image_embeds_local = vision_model(
-                    pixel_values_local,
-                    grid_hw=local_grid_thw,
-                    max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
-                )
+                kwargs = {
+                    "grid_hw": local_grid_thw,
+                    "max_seqlen": max(math.prod(grid) for grid in local_grid_thw_list),
+                }
+                if pass_grid_thw_list:
+                    kwargs["grid_thw_list"] = local_grid_thw_list
+                image_embeds_local = vision_model(pixel_values_local, **kwargs)
             else:
                 image_embeds_local = vision_model(pixel_values_local, local_grid_thw)
             if isinstance(image_embeds_local, list):
@@ -809,3 +823,67 @@ def run_dp_sharded_mrope_vision_model(
             current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
     return out_embeddings
+
+
+def run_dp_presharded_mrope_vision_model(
+    vision_model: torch.nn.Module,
+    pixel_values_local: torch.Tensor,
+    local_grid_thw_list: list,
+    global_grid_thw_list: list,
+    gpu_sample_counts: list,
+) -> torch.Tensor:
+    """Rank-local shards are contiguous, so rank-order concatenation restores global video order."""
+    parallel = get_parallel()
+    tp_size = parallel.attn_tp_size
+    patches_per_unit = [math.prod(grid) for grid in global_grid_thw_list]
+    grouped_patch_counts = []
+    offset = 0
+    for rank in range(tp_size):
+        count = gpu_sample_counts[rank]
+        grouped_patch_counts.append(sum(patches_per_unit[offset : offset + count]))
+        offset += count
+
+    merge_factor = vision_model.spatial_merge_size**2
+    grouped_output_lengths = [
+        patch_count // merge_factor for patch_count in grouped_patch_counts
+    ]
+    max_output_length = max(grouped_output_lengths)
+    try:
+        model_device = vision_model.device
+        model_dtype = vision_model.dtype
+    except AttributeError:
+        parameter = next(vision_model.parameters())
+        model_device, model_dtype = parameter.device, parameter.dtype
+
+    if pixel_values_local.shape[0] > 0:
+        pixel_values_local = pixel_values_local.to(
+            device=model_device, dtype=model_dtype
+        )
+        local_embeddings = vision_model(
+            pixel_values_local,
+            grid_thw=torch.tensor(local_grid_thw_list),
+        )
+    else:
+        local_embeddings = torch.empty(
+            (0, vision_model.out_hidden_size),
+            device=model_device,
+            dtype=model_dtype,
+        )
+
+    if local_embeddings.shape[0] < max_output_length:
+        padding = torch.empty(
+            (
+                max_output_length - local_embeddings.shape[0],
+                local_embeddings.shape[1],
+            ),
+            device=local_embeddings.device,
+            dtype=local_embeddings.dtype,
+        )
+        local_embeddings = torch.cat([local_embeddings, padding], dim=0)
+
+    gathered = parallel.attn_tp_group.all_gather(local_embeddings, dim=0)
+    pieces = []
+    for rank, output_length in enumerate(grouped_output_lengths):
+        start = rank * max_output_length
+        pieces.append(gathered[start : start + output_length])
+    return torch.cat(pieces, dim=0)

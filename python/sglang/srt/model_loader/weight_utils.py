@@ -16,6 +16,7 @@ import os
 import re
 import struct
 import tempfile
+import threading
 from collections import defaultdict
 from pathlib import Path
 from typing import (
@@ -41,14 +42,15 @@ from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
-from sglang.srt.distributed import (
-    get_world_group,
-)
+from sglang.srt.distributed import get_world_group
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
+)
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
 )
 from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
@@ -131,6 +133,8 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
+_PREFETCH_STOP_TIMEOUT_SECONDS = 60.0
+CAPTURE_SAFE_WEIGHT_SENTINEL = 1e-3
 
 
 def _get_prefetch_block_size() -> int:
@@ -234,6 +238,44 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
+def _resolve_explicit_draft_quant_config(
+    model_config: ModelConfig,
+    quant_config: QuantizationConfig,
+) -> QuantizationConfig:
+    if not (
+        model_config.is_draft_model and model_config.is_draft_quantization_explicit
+    ):
+        return quant_config
+
+    if model_config.quantization == "modelopt_fp4" and (
+        isinstance(quant_config, ModelOptFp4Config)
+        and quant_config.is_checkpoint_nvfp4_serialized
+        and quant_config.is_layer_excluded("mtp.layers.0.mlp.experts")
+    ):
+        return ModelOptFp4Config.for_online_weight_quantization(
+            quant_config.packed_modules_mapping
+        )
+
+    return quant_config
+
+
+def _modelopt_quant_section(config: dict) -> dict:
+    """Return ModelOpt quant settings from nested or flat ``hf_quant_config.json``.
+
+    Nested LLM format::
+
+        {"quantization": {"quant_algo": "FP8", "exclude_modules": [...]}}
+
+    Flat format (``config.json`` ``quantization_config`` / Cosmos3-style exports)::
+
+        {"quant_algo": "FP8", "ignore": [...], "quant_method": "modelopt", ...}
+    """
+    quantization = config.get("quantization")
+    if isinstance(quantization, dict):
+        return quantization
+    return config
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
@@ -247,19 +289,9 @@ def get_quant_config(
     if model_config.quantization == "gguf":
         return quant_cls.from_config({})
 
-    # Read the quantization config from the HF model config, if available.
-    hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
-    # some vision model may keep quantization_config in their text_config
-    hf_text_config = getattr(model_config.hf_config, "text_config", None)
-    if hf_quant_config is None and hf_text_config is not None:
-        hf_quant_config = getattr(hf_text_config, "quantization_config", None)
-    if hf_quant_config is None:
-        # compressed-tensors uses a compressions_config
-        hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
-    if hf_quant_config is not None:
-        if not isinstance(hf_quant_config, dict):
-            hf_quant_config = hf_quant_config.to_dict()
-
+    checkpoint_quant_spec = resolve_checkpoint_quant_spec(model_config.hf_config)
+    if checkpoint_quant_spec is not None:
+        hf_quant_config = checkpoint_quant_spec.config
         # For modelopt_mixed, config.json's quantization_config may not
         # contain all runtime metadata. Fall through to the file-based
         # hf_quant_config.json path when the per-layer map or KV-cache
@@ -278,11 +310,13 @@ def get_quant_config(
             hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
             hf_quant_config["hf_config"] = model_config.hf_config
 
-            # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
+            # This is only used by quantization methods that support requantization (e.g. from nvfp4/fp8 to mxfp4).
             if model_config.quantization in REQUANTIZATION_METHODS:
                 hf_quant_config["requantization_method"] = model_config.quantization
 
-            return quant_cls.from_config(hf_quant_config)
+            return _resolve_explicit_draft_quant_config(
+                model_config, quant_cls.from_config(hf_quant_config)
+            )
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
@@ -318,8 +352,29 @@ def get_quant_config(
     # TODO: standardize the handling of online quantization with custom handlenames (mxfp8, quark_mxfp4, etc.)
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
-            return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+            if not issubclass(quant_cls, Fp8Config):
+                quant_cls = Fp8Config
+            return quant_cls(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         if model_config.quantization == "quark_mxfp4":
+            # Some ModelOpt NVFP4 checkpoints store quant metadata only in
+            # hf_quant_config.json; others duplicate it in config.json. Read
+            # hf_quant_config.json first when present and FP4-typed.
+            modelopt_quant_path = os.path.join(hf_folder, "hf_quant_config.json")
+            if os.path.isfile(modelopt_quant_path):
+                with open(modelopt_quant_path) as f:
+                    raw_quant_config = json.load(f)
+                source_quant = raw_quant_config.get("quantization", raw_quant_config)
+                if "FP4" in (source_quant.get("quant_algo") or "").upper():
+                    flat_quant_config = dict(source_quant)
+                    flat_quant_config["quant_method"] = (
+                        raw_quant_config.get("producer", {}).get("name") or "modelopt"
+                    )
+                    flat_quant_config["requantization_method"] = (
+                        model_config.quantization
+                    )
+                    flat_quant_config["packed_modules_mapping"] = packed_modules_mapping
+                    flat_quant_config["hf_config"] = model_config.hf_config
+                    return quant_cls.from_config(flat_quant_config)
             return quant_cls(
                 online_scheme=model_config.quantization,
                 hf_config=model_config.hf_config,
@@ -332,6 +387,12 @@ def get_quant_config(
         f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
     ]
     if len(quant_config_files) == 0:
+        if model_config.quantization == "modelopt_fp4":
+            # Without serialized metadata, quantize MoE expert weights online;
+            # leave dense layers in source precision.
+            if not issubclass(quant_cls, ModelOptFp4Config):
+                quant_cls = ModelOptFp4Config
+            return quant_cls.for_online_weight_quantization(packed_modules_mapping)
         raise ValueError(f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
         raise ValueError(
@@ -342,12 +403,17 @@ def get_quant_config(
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
         config = json.load(f)
+        quant_section = _modelopt_quant_section(config)
         if remap_prefix is not None:
-            exclude_modules = [
-                replace_prefix(key, remap_prefix)
-                for key in config["quantization"]["exclude_modules"]
-            ]
-            config["quantization"]["exclude_modules"] = exclude_modules
+            # Nested configs use ``exclude_modules``; flat ModelOpt exports use ``ignore``.
+            exclude_key = (
+                "exclude_modules" if "exclude_modules" in quant_section else "ignore"
+            )
+            if exclude_key in quant_section:
+                quant_section[exclude_key] = [
+                    replace_prefix(key, remap_prefix)
+                    for key in quant_section[exclude_key]
+                ]
         config["packed_modules_mapping"] = packed_modules_mapping
 
         if model_config.quantization == "bitsandbytes":
@@ -355,7 +421,7 @@ def get_quant_config(
         elif model_config.quantization.startswith("modelopt") and (
             config.get("producer", {}).get("name", "").startswith("modelopt")
         ):
-            quant_algo = config["quantization"]["quant_algo"]
+            quant_algo = quant_section.get("quant_algo")
             if quant_algo is None:
                 # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
                 if model_config.hf_config.architectures[0] != "LlamaForCausalLMEagle3":
@@ -365,21 +431,33 @@ def get_quant_config(
                     )
                 return None
             elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
-                return ModelOptFp8Config.from_config(config)
+                if not issubclass(quant_cls, ModelOptFp8Config):
+                    quant_cls = ModelOptFp8Config
+                return quant_cls.from_config(config)
             elif "FP4" in quant_algo:
-                return ModelOptFp4Config.from_config(config)
-        return quant_cls.from_config(config)
+                if not issubclass(quant_cls, ModelOptFp4Config):
+                    quant_cls = ModelOptFp4Config
+                return _resolve_explicit_draft_quant_config(
+                    model_config, quant_cls.from_config(config)
+                )
+        return _resolve_explicit_draft_quant_config(
+            model_config, quant_cls.from_config(config)
+        )
 
 
-def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
+def _check_index_files_exist(
+    snapshot_dir: str, allow_patterns: Optional[List[str]] = None
+) -> Tuple[bool, Optional[str]]:
     """
-    Check if all files listed in safetensors index files actually exist on disk.
+    Check if files listed in safetensors index files actually exist on disk.
 
     This catches cases where the snapshot directory exists but files are missing
-    (e.g., due to incomplete downloads or corrupted cache).
+    (e.g., due to incomplete downloads or corrupted cache). If allow_patterns is
+    provided, only indexed files matching those patterns are validated.
 
     Args:
         snapshot_dir: Path to the model snapshot directory
+        allow_patterns: Optional source patterns to scope validation.
 
     Returns:
         Tuple of (all_exist, error_message)
@@ -401,6 +479,15 @@ def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
             if not weight_map:
                 continue
             required_files = set(weight_map.values())
+            if allow_patterns is not None:
+                required_files = {
+                    fn
+                    for fn in required_files
+                    if any(
+                        fnmatch.fnmatch(fn.replace(os.sep, "/"), pattern)
+                        for pattern in allow_patterns
+                    )
+                }
             missing_files = [
                 fn
                 for fn in required_files
@@ -503,7 +590,9 @@ def _find_local_hf_snapshot_dir_unlocked(
     # Check for missing files from index (lightweight, for all users)
     # This catches incomplete downloads before they cause cryptic load errors
     if local_weight_files:
-        is_complete, error_msg = _check_index_files_exist(found_local_snapshot_dir)
+        is_complete, error_msg = _check_index_files_exist(
+            found_local_snapshot_dir, allow_patterns
+        )
         if not is_complete:
             log_info_on_rank0(
                 logger,
@@ -663,7 +752,10 @@ def download_safetensors_index_file_from_hf(
 # So, we use the index_file to
 # look up which safetensors files should be used.
 def filter_duplicate_safetensors_files(
-    hf_weights_files: List[str], hf_folder: str, index_file: str
+    hf_weights_files: List[str],
+    hf_folder: str,
+    index_file: str,
+    allow_patterns: Optional[List[str]] = None,
 ) -> List[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
@@ -687,9 +779,18 @@ def filter_duplicate_safetensors_files(
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
     # Fail fast if the index references shard files that are not on disk (e.g. an
-    # incomplete or interrupted download). Otherwise those shards are silently
-    # dropped and the model loads with uninitialized weights.
-    missing_files = sorted(f for f in weight_files_in_index if not os.path.isfile(f))
+    # incomplete or interrupted download). For subfolder-scoped loads, only
+    # validate the indexed shards that match the requested source patterns.
+    if allow_patterns is None:
+        files_to_validate = weight_files_in_index
+    else:
+        files_to_validate = set()
+        for f in weight_files_in_index:
+            rel_path = os.path.relpath(f, hf_folder).replace(os.sep, "/")
+            if any(fnmatch.fnmatch(rel_path, pattern) for pattern in allow_patterns):
+                files_to_validate.add(f)
+
+    missing_files = sorted(f for f in files_to_validate if not os.path.isfile(f))
     if missing_files:
         raise RuntimeError(
             f"{index_file} references {len(missing_files)} shard file(s) missing "
@@ -817,21 +918,72 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
-def _prefetch_checkpoint_file(file_path: str) -> None:
+def _prefetch_checkpoint_file(
+    file_path: str,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
     """Prefetch a checkpoint file into the OS page cache.
 
     Reads the file sequentially in 16 MB blocks so the kernel caches its pages
     before workers load the same file via mmap.
     """
     with open(file_path, "rb") as f:
-        while f.read(_get_prefetch_block_size()):
-            pass
+        while cancel_event is None or not cancel_event.is_set():
+            if not f.read(_get_prefetch_block_size()):
+                break
+
+
+class CheckpointFilePrefetchHandle:
+    """Lifecycle handle for background checkpoint page-cache prefetching."""
+
+    def __init__(
+        self,
+        *,
+        thread: threading.Thread,
+        cancel_event: threading.Event,
+        succeeded_event: threading.Event,
+        errors: List[Tuple[str, Exception]],
+    ) -> None:
+        self._thread = thread
+        self._cancel_event = cancel_event
+        self._succeeded_event = succeeded_event
+        self._errors = errors
+
+    def wait(self, timeout: Optional[float] = None) -> None:
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("Timed out waiting for checkpoint prefetching")
+
+    def cancel(self) -> None:
+        """Stop scheduling shards and interrupt reads at the next block."""
+        self._cancel_event.set()
+
+    def stop(self, timeout: Optional[float] = _PREFETCH_STOP_TIMEOUT_SECONDS) -> None:
+        """Cancel prefetching and wait for the background worker to finish."""
+        self.cancel()
+        self.wait(timeout)
+
+    @property
+    def done(self) -> bool:
+        return not self._thread.is_alive()
+
+    @property
+    def failed(self) -> bool:
+        return bool(self._errors) or (self.done and not self._succeeded_event.is_set())
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    @property
+    def errors(self) -> Tuple[Tuple[str, Exception], ...]:
+        return tuple(self._errors)
 
 
 def _prefetch_all_checkpoints(
     sorted_files: List[str],
     num_threads: int = 4,
-) -> None:
+) -> CheckpointFilePrefetchHandle:
     """Start prefetching checkpoint files into page cache in a background thread.
 
     When multiple ranks on the same node load the same checkpoint (e.g.
@@ -847,7 +999,6 @@ def _prefetch_all_checkpoints(
     naturally adapts to any RAM size — even if the full checkpoint does
     not fit in page cache, the prefetch thread stays ahead of the loader.
     """
-    import threading
     import time
 
     if num_threads < 1:
@@ -866,8 +1017,11 @@ def _prefetch_all_checkpoints(
 
     my_files = sorted_files[local_rank::local_world_size]
     total_for_rank = len(my_files)
+    cancel_event = threading.Event()
+    succeeded_event = threading.Event()
+    errors: List[Tuple[str, Exception]] = []
 
-    logger.info(
+    logger.debug(
         "Rank %d: prefetching %d/%d checkpoint shards into page cache "
         "(background, %d local ranks sharing the work, %d threads per rank)...",
         local_rank,
@@ -888,7 +1042,7 @@ def _prefetch_all_checkpoints(
             if total_for_rank > 0 and next_log_pct <= 100:
                 pct = 100 * completed / total_for_rank
                 while pct >= next_log_pct and next_log_pct <= 100:
-                    logger.info(
+                    logger.debug(
                         "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
                         local_rank,
                         next_log_pct,
@@ -902,7 +1056,11 @@ def _prefetch_all_checkpoints(
             pending: Dict[concurrent.futures.Future, str] = {}
 
             for path in itertools.islice(file_iter, num_threads):
-                pending[executor.submit(_prefetch_checkpoint_file, path)] = path
+                if cancel_event.is_set():
+                    break
+                pending[
+                    executor.submit(_prefetch_checkpoint_file, path, cancel_event)
+                ] = path
 
             while pending:
                 done, _ = concurrent.futures.wait(
@@ -911,35 +1069,45 @@ def _prefetch_all_checkpoints(
                 )
                 for future in done:
                     path = pending.pop(future)
-                    try:
-                        future.result()
-                    except Exception:
+                    exc = future.exception()
+                    if exc is not None:
+                        errors.append((path, exc))
                         logger.warning(
-                            "Failed to prefetch checkpoint file %r.",
+                            "Failed to prefetch checkpoint file %r: %s",
                             path,
-                            exc_info=True,
+                            exc,
                         )
-                    finally:
-                        record_complete()
+                    record_complete()
 
-                    next_path = next(file_iter, None)
+                    next_path = None if cancel_event.is_set() else next(file_iter, None)
                     if next_path is not None:
                         pending[
-                            executor.submit(_prefetch_checkpoint_file, next_path)
+                            executor.submit(
+                                _prefetch_checkpoint_file,
+                                next_path,
+                                cancel_event,
+                            )
                         ] = next_path
 
     def _run_prefetch() -> None:
         start = time.perf_counter()
         _prefetch_all()
-        elapsed = time.perf_counter() - start
-        logger.info(
-            "Rank %d: prefetching checkpoint files into page cache "
-            "finished in %.2fs",
+        succeeded_event.set()
+        logger.debug(
+            "Rank %d: prefetching checkpoint files into page cache finished in %.2fs",
             local_rank,
-            elapsed,
+            time.perf_counter() - start,
         )
 
-    threading.Thread(target=_run_prefetch, daemon=True).start()
+    thread = threading.Thread(target=_run_prefetch, daemon=True)
+    handle = CheckpointFilePrefetchHandle(
+        thread=thread,
+        cancel_event=cancel_event,
+        succeeded_event=succeeded_event,
+        errors=errors,
+    )
+    thread.start()
+    return handle
 
 
 def _drop_file_cache_after_load(path: str) -> None:
@@ -1403,11 +1571,18 @@ def row_parallel_weight_loader(
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
+def sharded_weight_loader(
+    shard_axis: int,
+    tp_rank_getter=None,
+) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_parallel().attn_tp_rank
+        tp_rank = (
+            tp_rank_getter()
+            if tp_rank_getter is not None
+            else get_parallel().attn_tp_rank
+        )
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
@@ -1462,7 +1637,6 @@ def runai_safetensors_weights_iterator(
     device = device if is_distributed and is_cuda_alike() else "cpu"
 
     with SafetensorsStreamer() as streamer:
-
         streamer.stream_files(
             hf_weights_files,
             device=device,
@@ -1511,6 +1685,21 @@ def set_runai_streamer_env(load_config: LoadConfig):
         os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
 
 
+@torch.no_grad()
+def initialize_capture_safe_weights(
+    model: torch.nn.Module,
+    value: float = CAPTURE_SAFE_WEIGHT_SENTINEL,
+) -> None:
+    """Fill floating-point parameters with finite values for graph warmup.
+
+    Persistent buffers are intentionally left intact: unlike parameters, they
+    are not guaranteed to be replaced by ``model.load_weights()``.
+    """
+    for param in model.parameters():
+        if torch.is_floating_point(param):
+            param.fill_(value)
+
+
 def initialize_dummy_weights(
     model: torch.nn.Module,
     low: float = -1e-3,
@@ -1529,8 +1718,11 @@ def initialize_dummy_weights(
     is fixed, the random values generated by this function only depends on
     the parameter's number of elements and its data type.
     """
-    for param in model.state_dict().values():
+    for name, param in model.state_dict().items():
         if torch.is_floating_point(param):
+            if name.endswith("weight_scale_inv"):
+                param.fill_(1.0)
+                continue
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)
             # Tensor subclasses such as MXFP8 wrappers expose a low-bit raw
@@ -1661,9 +1853,9 @@ class KVCacheQuantSchema(BaseModel):
                     f"{len(layer_maps)}."
                 )
             for i in range(tp_size):
-                assert (
-                    i in self.scaling_factor
-                ), f"KV cache scales map for TP rank {i} not found."
+                assert i in self.scaling_factor, (
+                    f"KV cache scales map for TP rank {i} not found."
+                )
         return self
 
     @model_validator(mode="after")
@@ -1811,9 +2003,9 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
             int(output_size / total_output_size * raw_output_size)
             for output_size in output_sizes
         ]
-        assert (
-            sum(weight_split_size) == raw_output_size
-        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+        assert sum(weight_split_size) == raw_output_size, (
+            f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+        )
 
         split_weight = loaded_weight.split_with_sizes(weight_split_size, dim=output_dim)
         for i, output_size in enumerate(output_sizes):

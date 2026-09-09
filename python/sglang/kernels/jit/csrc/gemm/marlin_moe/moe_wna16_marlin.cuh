@@ -28,6 +28,8 @@
 #include "kernel.h"
 #include "marlin_template.h"
 
+namespace sglang {
+
 namespace device::marlin_moe {
 
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
@@ -1114,3 +1116,5 @@ void moe_wna16_marlin_gemm(
       use_fp32_reduce,
       is_zp_float);
 }
+
+}  // namespace sglang

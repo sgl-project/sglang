@@ -1,7 +1,20 @@
 import torch
 from torch import nn
 
-from sglang.multimodal_gen.runtime.layers.lora.linear import LinearWithLoRA
+from sglang.multimodal_gen.runtime.layers.lora.linear import (
+    LinearWithLoRA,
+    _compute_lora_delta,
+)
+
+
+def test_stacked_lora_delta_preserves_projection_order():
+    x = torch.tensor([[2.0, 3.0]])
+    lora_a = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
+    lora_b = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
+
+    actual = _compute_lora_delta(x, lora_a, lora_b)
+
+    torch.testing.assert_close(actual, torch.tensor([[2.0, 4.0, 9.0, 12.0]]))
 
 
 def test_lora_merge_unmerge_handles_inference_base_weight():

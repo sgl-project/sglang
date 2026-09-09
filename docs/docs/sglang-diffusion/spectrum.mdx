@@ -1,0 +1,54 @@
+---
+title: "Spectrum Acceleration"
+description: "Approximate request-scoped denoising-step acceleration."
+tag: "approx"
+---
+
+Spectrum forecasts DiT features and skips selected denoising steps. It is an
+approximation: validate visual or video quality and latency on the exact model,
+shape, hardware, and sampling settings you plan to deploy.
+
+## Quick start
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --prompt "A paper boat floating through a misty mountain lake" \
+  --enable-spectrum \
+  --save-output
+```
+
+## Scope and constraints
+
+- Available only on native FLUX.1, Wan, HunyuanVideo, and SD3 implementation
+  paths. It is not a `--backend diffusers` feature and does not currently
+  cover FLUX.2.
+- The request control is available through `sglang generate` and Python
+  sampling parameters. It is not a `sglang serve` or OpenAI-server request
+  option yet.
+- Spectrum and `--enable-teacache` are mutually exclusive.
+- Start with the defaults. `--debug` adds shadow-prediction validation work, so
+  its latency is not representative of normal Spectrum execution.
+
+## Advanced controls
+
+Use `--enable-spectrum` explicitly. Providing any Spectrum override also
+enables it, but that implicit behavior is intended for scripts rather than new
+commands.
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--spectrum-window-size` | `2.0` | Initial step-skipping window |
+| `--spectrum-flex-window` | `0.75` | Window growth after a real forward |
+| `--spectrum-warmup-steps` | `5` | Initial exact DiT forwards |
+| `--spectrum-m` | `4` | Chebyshev basis count |
+| `--spectrum-lam` | `0.1` | Ridge regularization |
+| `--spectrum-tau-num-steps` | `50` | Chebyshev time horizon |
+| `--history-size` | `100` | Recent feature-history capacity |
+| `--taylor-order` | `1` | Local predictor order (`1`, `2`, or `3`) |
+| `--w` | `1.0` | Chebyshev/Taylor blend weight |
+
+<Warning>
+These controls trade speed against output fidelity. Change one control at a
+time and retain a lossless baseline for comparison.
+</Warning>

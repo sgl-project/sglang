@@ -22,8 +22,7 @@ def _normalize_mxfp_scale(scale: torch.Tensor) -> torch.Tensor:
 
     ``npu_moe_init_routing_v2(quant_mode=3)`` emits the scale flat, while the
     grouped matmul wants the pair-split view. Already-3D scales (what
-    ``npu_dynamic_mx_quant`` returns) pass through untouched. Mirrors
-    vllm-ascend's ``maybe_normalize_mxfp_scale_layout``.
+    ``npu_dynamic_mx_quant`` returns) pass through untouched.
     """
     if scale is None or scale.ndim != 2:
         return scale

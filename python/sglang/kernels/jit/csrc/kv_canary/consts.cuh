@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 namespace canary {
 
 constexpr uint64_t kCanaryChainAnchor = 0xC0FFEE1234567890ULL;
@@ -60,3 +62,5 @@ constexpr int kRealKvSourceFieldNumBytesPerToken = 1;
 constexpr int kRealKvSourceFieldReadBytes = 2;
 
 }  // namespace canary
+
+}  // namespace sglang

@@ -583,8 +583,6 @@ __global__ __launch_bounds__(kBlockSize)  //
   if (!kCastFirst) cast_latent();
 }
 
-}  // namespace sglang
-
 template <bool kUsePDL>
 struct RouteRadixKernel {
   static void
@@ -616,7 +614,7 @@ struct RouteRadixKernel {
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device).verify(out_i);
 
     RuntimeCheck(
-        N_.unwrap() == sglang::kNumExperts_ && K_.unwrap() == sglang::kTopK_ && topk == sglang::kTopK_,
+        N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_,
         "route_radix is specialized for N=896, K=16");
     // Vectorized row loads (8B for bf16, 16B for fp32) need aligned row
     // starts; stride % 4 elements covers both (4 x 2B = 8B / 4 x 4B = 16B).
@@ -625,7 +623,7 @@ struct RouteRadixKernel {
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
 
-    const auto params = sglang::RouteRadixParams{
+    const auto params = RouteRadixParams{
         scores.data_ptr(),
         static_cast<const fp32_t*>(bias.data_ptr()),
         static_cast<fp32_t*>(out_w.data_ptr()),
@@ -642,11 +640,11 @@ struct RouteRadixKernel {
         sorted ? 1 : 0};
 
     if (score_dtype.is_type<fp32_t>()) {
-      LaunchKernel(M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
-          .enable_pdl(kUsePDL)(sglang::route_radix_kernel<kUsePDL, fp32_t>, params);
+      LaunchKernel(M, LargeRouterRadixTrait::kBlockSize, device.unwrap())
+          .enable_pdl(kUsePDL)(route_radix_kernel<kUsePDL, fp32_t>, params);
     } else {
-      LaunchKernel(M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
-          .enable_pdl(kUsePDL)(sglang::route_radix_kernel<kUsePDL, bf16_t>, params);
+      LaunchKernel(M, LargeRouterRadixTrait::kBlockSize, device.unwrap())
+          .enable_pdl(kUsePDL)(route_radix_kernel<kUsePDL, bf16_t>, params);
     }
   }
 };
@@ -685,10 +683,10 @@ struct FusedFrontEpilogueKernel {
     const auto M = static_cast<int>(M_.unwrap());
     const auto latent = static_cast<int>(L_.unwrap());
     RuntimeCheck(
-        E_.unwrap() == sglang::kFGTNumExperts && K_.unwrap() == sglang::kFGTTopK && topk == sglang::kFGTTopK,
+        E_.unwrap() == kFGTNumExperts && K_.unwrap() == kFGTTopK && topk == kFGTTopK,
         "fused_front_epilogue is specialized for E=896, topk=16");
     RuntimeCheck(
-        static_cast<int>(W_.unwrap()) == static_cast<int>(sglang::kFGTNumExperts) + latent,
+        static_cast<int>(W_.unwrap()) == static_cast<int>(kFGTNumExperts) + latent,
         "fused_front_epilogue: merged width must be num_experts + latent");
     // 16B vectorized reads of the fp32 rows and 8B writes of the bf16 rows.
     RuntimeCheck(latent % 4 == 0, "fused_front_epilogue: latent must be a multiple of 4");
@@ -697,7 +695,7 @@ struct FusedFrontEpilogueKernel {
         "fused_front_epilogue: row strides must be a multiple of 4");
     if (M == 0) return;
 
-    auto params = sglang::MoEFrontParams{};
+    auto params = MoEFrontParams{};
     params.bias = static_cast<const fp32_t*>(bias.data_ptr());
     params.logits = static_cast<fp32_t*>(merged.data_ptr());
     params.out_w = static_cast<fp32_t*>(out_w.data_ptr());
@@ -718,9 +716,8 @@ struct FusedFrontEpilogueKernel {
     RuntimeCheck(cast_vec == 2 || cast_vec == 4 || cast_vec == 8, "fused_front_epilogue: cast_vec must be 2, 4 or 8");
     RuntimeCheck(latent % cast_vec == 0, "fused_front_epilogue: cast_vec must divide latent");
 
-#define SGL_FRONT_LAUNCH(BS, CV, CF)   \
-  LaunchKernel(M, BS, device.unwrap()) \
-      .enable_pdl(kUsePDL)(sglang::fused_front_epilogue_kernel<kUsePDL, BS, CV, CF>, params)
+#define SGL_FRONT_LAUNCH(BS, CV, CF) \
+  LaunchKernel(M, BS, device.unwrap()).enable_pdl(kUsePDL)(fused_front_epilogue_kernel<kUsePDL, BS, CV, CF>, params)
 #define SGL_FRONT_DISPATCH_CV(BS, CF) \
   do {                                \
     if (cast_vec == 2) {              \
@@ -751,3 +748,5 @@ struct FusedFrontEpilogueKernel {
 #undef SGL_FRONT_LAUNCH
   }
 };
+
+}  // namespace sglang

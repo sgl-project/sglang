@@ -17,12 +17,17 @@ from sglang.kernels.ops.layernorm.norm import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_mm,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_capability,
-    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_hip,
@@ -30,7 +35,6 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     print_info_once,
-    use_intel_xpu_backend,
 )
 from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
@@ -133,7 +137,6 @@ class SingletonCache:
 
 @dataclasses.dataclass
 class VisionAttentionMetadata:
-
     cu_seqlens: torch.Tensor
     seq_lens: torch.Tensor
     max_seqlen: int
@@ -169,6 +172,43 @@ def prepare_vision_attention_metadata(
     )
 
 
+def prepare_flashinfer_cudnn_vision_attention_metadata(
+    cu_seqlens: torch.Tensor,
+    device: torch.device,
+    *,
+    elem_per_token: int,
+) -> VisionAttentionMetadata:
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    batch_size = int(seq_lens.numel())
+    padded_batch_size = next(
+        (size for size in BATCH_BUCKETS if size >= batch_size),
+        math.ceil(batch_size / BATCH_BUCKETS[0]) * BATCH_BUCKETS[0],
+    )
+    if padded_batch_size != batch_size:
+        pad_size = padded_batch_size - batch_size
+        padded_indptrs = torch.cat([cu_seqlens, cu_seqlens[-1].expand(pad_size)])
+        padded_seq_lens = torch.cat([seq_lens, seq_lens.new_zeros(pad_size)])
+    else:
+        padded_indptrs = cu_seqlens
+        padded_seq_lens = seq_lens
+
+    elem_indptrs = padded_indptrs * elem_per_token
+    real_max_seqlen = int(seq_lens.max().item())
+    max_seqlen = next(
+        (size for size in FLASHINFER_MAX_SEQLEN_BUCKETS if size >= real_max_seqlen),
+        math.ceil(real_max_seqlen / FLASHINFER_MAX_SEQLEN_BUCKETS[-1])
+        * FLASHINFER_MAX_SEQLEN_BUCKETS[-1],
+    )
+    return prepare_vision_attention_metadata(
+        cu_seqlens,
+        device=device,
+        packed_indptrs=torch.cat([elem_indptrs] * 3),
+        sequence_lengths=padded_seq_lens.view(-1, 1, 1, 1),
+        flashinfer_max_seqlen=max_seqlen,
+    )
+
+
 # TODO: requires real seqlens from images
 @functools.lru_cache(maxsize=128)
 def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Tensor:
@@ -201,9 +241,9 @@ def resolve_seqlens(
         resolved_seqlens = cu_seqlens.get_data()
     else:
         resolved_seqlens = cu_seqlens
-    assert isinstance(
-        resolved_seqlens, torch.Tensor
-    ), "cu_seqlens must be a torch.Tensor"
+    assert isinstance(resolved_seqlens, torch.Tensor), (
+        "cu_seqlens must be a torch.Tensor"
+    )
     return resolved_seqlens
 
 
@@ -364,7 +404,9 @@ class VisionSdpaAttention(nn.Module):
         else:
             attention_mask = attention_mask.to(device=q.device)
 
-        q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
+        q = q.reshape(bsz, s, self.num_heads, self.head_size).transpose(1, 2)
+        k = k.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
+        v = v.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
 
         if self.softmax_in_single_precision:
             k = rearrange(k, "b h s d -> b h d s")
@@ -397,7 +439,7 @@ class VisionSdpaAttention(nn.Module):
             )
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
-        output = rearrange(output, "b h s d -> (b s) h d")
+        output = output.transpose(1, 2).reshape(bsz * s, self.num_heads, self.head_size)
 
         return output
 
@@ -456,8 +498,7 @@ class VisionTritonAttention(nn.Module):
             seq_lens = kwargs.get("sequence_lengths")
             if seq_lens is None:
                 seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
-            else:
-                seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
+            seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
             max_seqlen = resolve_precomputed_max_seqlen(
                 cu_seqlens_gpu, kwargs.get("max_seqlen")
             )
@@ -778,7 +819,6 @@ class VisionAiterAttention(nn.Module):
 
 
 class VisionAscendAttention(nn.Module):
-
     def __init__(
         self,
         **kwargs,
@@ -836,6 +876,7 @@ class VisionAscendAttention(nn.Module):
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
             seq_len_arg = cu_seqlens[1:].to(torch.int32)
+            output = torch.empty_like(q)
 
         _, num_heads, head_size = q.shape
         num_kv_heads = k.shape[1]
@@ -843,7 +884,42 @@ class VisionAscendAttention(nn.Module):
         scale_value = softmax_scale if softmax_scale is not None else head_size**-0.5
 
         seq_len_arg = seq_len_arg.tolist()
-        output = torch_npu.npu_fused_infer_attention_score(
+
+        total_tokens = int(seq_len_arg[-1])
+
+        # Vision encoders may pad each image's token sequence up to a common
+        # length (e.g. MiniCPM-V2.6 pads every image to the batch's max patch
+        # count). FIA requires queryT == last(actual_seq_lengths), so drop the
+        # padding before the kernel and put the result back into the padded
+        # layout afterwards.
+        valid_indices = None
+        if q.shape[0] != total_tokens:
+            # Recover each image's real token count from the cumulative seqlens.
+            per_seq_lens = [seq_len_arg[0] - 0] + [
+                seq_len_arg[i] - seq_len_arg[i - 1] for i in range(1, len(seq_len_arg))
+            ]
+            if len(per_seq_lens) == 1:
+                q = q[:total_tokens]
+                k = k[:total_tokens]
+                v = v[:total_tokens]
+            else:
+                padded_seq_len = q.shape[0] // len(per_seq_lens)
+                valid_indices = torch.cat(
+                    [
+                        torch.arange(
+                            b * padded_seq_len,
+                            b * padded_seq_len + per_seq_lens[b],
+                            dtype=torch.long,
+                            device=q.device,
+                        )
+                        for b in range(len(per_seq_lens))
+                    ]
+                )
+                q = q[valid_indices]
+                k = k[valid_indices]
+                v = v[valid_indices]
+
+        attn_output = torch_npu.npu_fused_infer_attention_score(
             query=q,
             key=k,
             value=v,
@@ -855,6 +931,15 @@ class VisionAscendAttention(nn.Module):
             sparse_mode=0,
             input_layout="TND",
         )[0]
+
+        if valid_indices is not None:
+            output.index_copy_(0, valid_indices, attn_output)
+        elif output.shape[0] != total_tokens:
+            # Single image: write the compact result into the front of the
+            # pre-allocated padded output, leaving the padding rows as-is.
+            output[:total_tokens].copy_(attn_output)
+        else:
+            output = attn_output
         return output
 
 
@@ -973,6 +1058,10 @@ QKV_BACKEND_IMPL = {
     "xpu_attn": VisionIntelXPUAttention,
 }
 
+# backends that read q/k/v through explicit per-dim strides, and so accept the
+# strided views of the packed qkv projection output instead of dense copies
+STRIDED_QKV_BACKENDS = frozenset({"fa3", "fa4", "triton_attn", "amx_attn"})
+
 
 class VisionAttention(nn.Module):
     r"""
@@ -1065,7 +1154,7 @@ class VisionAttention(nn.Module):
         # Select attention backend via a unified method
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
-        if get_mm().mm_attention_backend is None and _passed_backend is None:
+        if _passed_backend is None and get_mm().mm_attention_backend is None:
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
@@ -1087,6 +1176,19 @@ class VisionAttention(nn.Module):
         )
 
         self.use_qkv_parallel = use_qkv_parallel
+        # `qkv_proj` writes q, k and v interleaved into a single buffer, so slicing
+        # it back apart yields views whose only non-unit stride is over tokens.
+        # Backends in `STRIDED_QKV_BACKENDS` consume those views directly, which
+        # saves copying the whole projection output once per layer. Two consumers
+        # sitting between the projection and the backend need a dense layout and
+        # so opt out: the internvl qk-norm, which normalizes q/k in place, and the
+        # model-supplied position embedding appliers, which reshape q/k freely.
+        self.pass_strided_qkv = (
+            use_qkv_parallel
+            and self.qkv_backend_name in STRIDED_QKV_BACKENDS
+            and not qk_normalization
+            and customized_position_embedding_applier is None
+        )
         if use_qkv_parallel:
             self.qkv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
@@ -1175,7 +1277,14 @@ class VisionAttention(nn.Module):
         - Ascend NPU: "ascend_attn"
         - Other platforms: device-specific optimized backend or "sdpa"
         """
-        override_backend = get_mm().mm_attention_backend
+        try:
+            override_backend = get_mm().mm_attention_backend
+        except ValueError:
+            if passed_backend is None or get_context().is_config_namespace_published(
+                "mm"
+            ):
+                raise
+            override_backend = None
         if override_backend is not None:
             backend = override_backend
         elif passed_backend is not None:
@@ -1203,10 +1312,10 @@ class VisionAttention(nn.Module):
         elif _is_cpu and _is_cpu_amx_available:
             backend = "amx_attn"
         elif _is_xpu:
-            backend = "triton_attn" if not use_intel_xpu_backend() else "xpu_attn"
+            backend = "xpu_attn"
         else:
             backend = "sdpa"
-        if backend == "fa3" and is_blackwell_supported():
+        if backend == "fa3" and get_platform().is_blackwell:
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
 
         return backend
@@ -1328,7 +1437,7 @@ class VisionAttention(nn.Module):
             # [s, b, head, head_size] --> [b, s, head, head_size]
             q, k, v = [rearrange(x, "s b ... -> b s ...") for x in (q, k, v)]
 
-        if not (_is_cpu and _is_cpu_amx_available):
+        if not self.pass_strided_qkv:
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()
@@ -1394,7 +1503,6 @@ class VisionAttention(nn.Module):
         if self.qk_normalization and not self.qk_normalization_by_head_size:
             # jit kernel
             if can_use_jit_qk_norm(self.head_size, q.dtype):
-
                 # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
                 head_dim_for_norm = head * self.head_size
 
@@ -1440,7 +1548,7 @@ class VisionAttention(nn.Module):
 
         if self.use_qkv_parallel:
             # [b * s, h, head_size] --> [b, s, h * head_size]
-            output = rearrange(output, "(b s) ... h d -> b s ... (h d)", b=bsz)
+            output = output.reshape(bsz, s, -1)
 
             # [b, s, h * head_size] --> [b, s, h * head_size]
             output, _ = self.proj(output)

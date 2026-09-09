@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 SGL_DEVICE int64_t clamp_accept_len(int64_t delta, int64_t max_accept) {
   if (delta < 0) return 0;
@@ -402,4 +402,4 @@ struct OnlineC128MTPCommitPendingKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

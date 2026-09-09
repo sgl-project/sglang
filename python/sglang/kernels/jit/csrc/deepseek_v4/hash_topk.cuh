@@ -10,7 +10,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 [[maybe_unused]]
 SGL_DEVICE float act_sqrt_softplus(float x) {
@@ -211,4 +211,4 @@ struct MaskKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

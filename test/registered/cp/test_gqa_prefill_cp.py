@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, stage="extra-b", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(est_time=466, stage="extra-b", runner_config="4-gpu-h100")
 
 GQA_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
@@ -44,11 +44,10 @@ class TestGQACP2TP2EP2(CustomTestCase):
                 "--max-running-requests",
                 "32",
                 "--trust-remote-code",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
-            env={"SGLANG_ENABLE_CP_V2": "1"},
         )
 
     @classmethod
@@ -103,11 +102,10 @@ class TestGQACPTP2CP2EP4(CustomTestCase):
                 "--max-running-requests",
                 "32",
                 "--trust-remote-code",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
-            env={"SGLANG_ENABLE_CP_V2": "1"},
         )
 
     @classmethod
@@ -164,7 +162,7 @@ class TestGQACPCP4EP4(CustomTestCase):
                 "--max-running-requests",
                 "32",
                 "--trust-remote-code",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],

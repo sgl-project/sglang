@@ -7,6 +7,8 @@
 #include <string>
 #include <tuple>
 
+namespace sglang {
+
 namespace ngram {
 
 SuffixAutomaton::SuffixAutomaton() {
@@ -281,3 +283,5 @@ Result SuffixAutomaton::buildFrequency(
 }
 
 }  // namespace ngram
+
+}  // namespace sglang

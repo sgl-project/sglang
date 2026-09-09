@@ -118,6 +118,12 @@ Pass as a JSON string via `--hisparse-config`:
 
 Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'`
 
+### Shared-index prefetch (automatic)
+
+When a model reuses one anchor layer's top-k selection across a run of subsequent "skip" layers (DSA `index_topk_freq` / `index_topk_pattern`; native in GLM-5.2 as IndexShare), the working set of every skip layer is known the moment the anchor's index is computed. HiSparse exploits this automatically: the anchor's swap-in kernel records its miss plan (which host slots go to which device-buffer slots), and each skip layer replays that plan with a copy-only kernel issued ahead on a side stream, so the skip layers' host→device IO overlaps the intervening layers' compute instead of sitting on the decode critical path. The replay kernel uses a small fixed grid to keep its SM footprint low while overlapped.
+
+The prefetch is enabled automatically for eligible models (no pipeline parallelism, no speculative decoding) and can be turned off for A/B comparison with `SGLANG_DISABLE_HISPARSE_PREFETCH=1`.
+
 ## Deployment
 
 HiSparse currently requires **PD disaggregation mode** and is enabled only on the **decode instance**.
@@ -157,7 +163,7 @@ python3 -m sglang.launch_server \
     --hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'
 ```
 
-> **Note**: For DSA models, `--kv-cache-dtype` defaults to `auto`, which resolves to `fp8_e4m3` on SM100+ (Blackwell) and `bfloat16` on older architectures. The DSA decode backend is automatically selected based on KV dtype (`bfloat16` → `flashmla_sparse`, `fp8_e4m3` → `flashmla_kv`). DSA backend flags apply only to DSA models; DeepSeek V4 uses its own `dsv4` attention backend.
+> **Note**: For DSA models, `--kv-cache-dtype` defaults to `auto`, which resolves to `fp8_e4m3` on SM100+ (Blackwell) and `bfloat16` on older architectures. The DSA decode backend is automatically selected based on KV dtype (`bfloat16` → `flashmla_sparse`, `fp8_e4m3` → `flashmla_kv`), except for GLM DSA models on SM120/SM121 with `fp8_e4m3`, which use `flashinfer_sparse_mla`. DSA backend flags apply only to DSA models; DeepSeek V4 uses its own `dsv4` attention backend.
 
 ### Benchmark
 
@@ -183,6 +189,7 @@ python3 -m sglang.bench_serving \
 - The prefill instance does not need `--enable-hisparse`; it is unaware of HiSparse.
 - On the decode instance, `--enable-hisparse` and `--hisparse-config` are required for HiSparse.
 - For DSA models, `--kv-cache-dtype bfloat16` uses `flashmla_sparse`, and `--kv-cache-dtype fp8_e4m3` uses `flashmla_kv`.
+- On SM120/SM121 (e.g. RTX PRO 6000, RTX 5090) with GLM DSA models and `--kv-cache-dtype fp8_e4m3`, both DSA backends resolve to `flashinfer_sparse_mla`, which is the only DSA kernel available on that architecture. HiSparse accepts it there; no extra flag is needed.
 - For DeepSeek V4, DSA backend flags are not applicable. DeepSeek V4 uses the `dsv4` attention backend and `fp8_e4m3` KV cache by default.
 - `host_to_device_ratio` should be configured based on the host machine's available memory. For example:
   - **~1 TB** host memory → `host_to_device_ratio: 5`

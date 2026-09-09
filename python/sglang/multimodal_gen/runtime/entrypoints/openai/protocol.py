@@ -13,6 +13,20 @@ class ImageResponseData(BaseModel):
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
     file_path: Optional[str] = None
+    resize: Optional[str] = None
+
+
+class ImagePromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
+class ImageUsage(BaseModel):
+    prompt_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    prompt_tokens_details: Optional[ImagePromptTokensDetails] = None
+    reasoning_tokens: Optional[int] = 0
+    image_count: Optional[int] = None
 
 
 class ImageResponse(BaseModel):
@@ -21,8 +35,13 @@ class ImageResponse(BaseModel):
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    usage: Optional[ImageUsage] = None
 
 
+# Keep request schemas limited to OpenAI fields and stable cross-model SGLang
+# extensions. Model-owned controls travel as allowed extras and are interpreted
+# only after the active SamplingParams subclass is resolved; do not add them to
+# these shared protocol models.
 class ImageGenerationsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 

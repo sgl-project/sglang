@@ -4,6 +4,8 @@
 #pragma once
 #include <sgl_kernel/utils.cuh>
 
+namespace sglang {
+
 namespace device::atomic {
 
 /**
@@ -33,3 +35,5 @@ SGL_DEVICE float max(float* addr, float value) {
 }
 
 }  // namespace device::atomic
+
+}  // namespace sglang

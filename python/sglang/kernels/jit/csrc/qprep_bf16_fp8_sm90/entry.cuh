@@ -23,7 +23,7 @@ limitations under the License.
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace {
+namespace sglang {
 
 // All strides are in elements; validation of dtypes/shapes/alignment happens
 // in the Python wrapper (sglang/kernels/ops/attention/qprep_bf16_fp8_sm90.py).
@@ -81,4 +81,4 @@ void qprep_bf16_fp8_dispatch(
   }
 }
 
-}  // namespace
+}  // namespace sglang

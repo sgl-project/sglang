@@ -1,8 +1,11 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
+
+namespace sglang {
 
 namespace ngram {
 
@@ -23,3 +26,5 @@ Result buildResultFromLeafPaths_(int last_token, int draft_token_num, const std:
 Result combineRootResults_(int last_token, int draft_token_num, const Result& primary, const Result& secondary);
 
 }  // namespace ngram
+
+}  // namespace sglang

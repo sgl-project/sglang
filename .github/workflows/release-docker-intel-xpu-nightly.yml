@@ -55,5 +55,13 @@ jobs:
 
       - name: Push intel/sglang-dev
         run: |
-          docker push "intel/sglang-dev:${{ env.IMAGE_TAG }}"
-          docker push "intel/sglang-dev:latest"
+          push_with_retry() {
+            for i in 1 2 3 4 5; do
+              docker push "$1" && return 0
+              echo "push failed (attempt $i), retrying in $((i*15))s..."
+              sleep $((i*15))
+            done
+            return 1
+          }
+          push_with_retry "intel/sglang-dev:${{ env.IMAGE_TAG }}"
+          push_with_retry "intel/sglang-dev:latest"

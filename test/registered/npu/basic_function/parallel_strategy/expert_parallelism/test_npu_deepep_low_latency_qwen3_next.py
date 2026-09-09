@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=200,
-    suite="nightly-8-npu-a3",
+    suite="full-8-npu-a3",
     nightly=True,
 )
 
@@ -41,7 +41,7 @@ class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "--watchdog-timeout",
         9000,
         "--disable-radix-cache",
-        "--cuda-graph-bs",
+        "--cuda-graph-bs-decode",
         2,
         4,
         6,

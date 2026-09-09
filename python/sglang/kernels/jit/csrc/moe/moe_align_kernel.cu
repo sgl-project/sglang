@@ -29,6 +29,8 @@ limitations under the License.
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
 #define VEC_SIZE 4
+namespace sglang {
+
 using Vec = int4;
 
 inline uint32_t next_pow2(uint32_t x) noexcept {
@@ -454,8 +456,6 @@ __global__ void moe_align_block_size_kernel_v2(
 
 }  // namespace moe
 
-namespace {
-
 template <typename scalar_t>
 struct MoeAlignBlockSizeKernel {
   static void
@@ -579,4 +579,4 @@ struct MoeAlignBlockSizeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

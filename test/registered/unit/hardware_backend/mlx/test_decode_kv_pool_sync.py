@@ -45,6 +45,9 @@ if _HAS_MLX:
     class _FakeLayout:
         num_attention_layers = LAYERS
         attention_layer_indices = list(range(LAYERS))
+        # No sliding-window layers in this fixture, so every attention layer
+        # is full-attention and reaches the pool sync (see _sync_new_kv_to_pool).
+        full_attention_layer_indices = list(range(LAYERS))
         first_attention_layer_index = 0
         has_auxiliary_state = False
 
@@ -66,6 +69,7 @@ def _make_runner():
     runner._req_pool_idx = {}
     runner._req_synced_offset = {}
     runner._req_committed_len = {}
+    runner._req_sampling = {}
     return runner
 
 
@@ -190,7 +194,7 @@ class TestDecodeKvPoolSyncCommittedClamp(CustomTestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = runner
         worker.prepare_for_kv_cache_release(
-            SimpleNamespace(rid="R", mamba_last_track_seqlen=1)
+            SimpleNamespace(rid="R", kv=SimpleNamespace(mamba_last_track_seqlen=1))
         )
         mx.eval(*pool.all_buffers())
         # Committed decode KV reached its real slots and the synced bound

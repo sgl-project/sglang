@@ -4,7 +4,7 @@
 //! abort frames). No HTTP here — the sibling `native_api` module owns the handlers
 //! and streams; it calls these per frame.
 
-use crate::message::{ChunkEvent, ChunkExtras};
+use crate::message::response::{ChunkEvent, ChunkExtras};
 
 /// The text slot of a `[logprob, token_id, text]` tuple: the decoded token when
 /// `return_text_in_logprobs` supplied a text buffer, else `null`.
@@ -152,17 +152,11 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
         // `get`, not a clamped index: clamping only the END leaves `off` past
         // `vals.len()` after one over-long row, making the next range reversed
         // (`start > end`) — which panics on the api thread rather than yielding
-        // an empty row. Same reasoning as the egress decoder's `take_f32`.
+        // an empty row. Same reasoning as the decoder's `take_f32`.
         rows.push(serde_json::json!(vals.get(off..off + l).unwrap_or(&[])));
         off += l;
     }
     serde_json::Value::Array(rows)
-}
-
-/// The `{ "error": { message, code } }` object every error path emits (an SSE
-/// event's data, a unary body, or one entry of a batch array).
-pub(super) fn error_value(code: u16, message: &str) -> serde_json::Value {
-    serde_json::json!({ "error": { "message": message, "code": code } })
 }
 
 /// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`

@@ -14,17 +14,19 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 
 OPS = SUPPORTED_ACTIVATIONS
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+# The kernel requires hidden % (kMaxVecBytes / sizeof(T)) == 0, and kMaxVecBytes
+# is 32 on Blackwell vs 16 before it -- so the tightest constraint is a 16-element
+# vector for fp16/bf16. hidden=8 shapes (last dim 16) are rejected outright there
+# and are dropped rather than made arch-conditional.
 SHAPES = get_ci_test_range(
     full_range=[
-        (7, 16),
         (83, 1024),
-        (3, 5, 16),
         (2, 3, 512),
         (1, 17, 4096),
         (48, 3072),
@@ -33,7 +35,7 @@ SHAPES = get_ci_test_range(
         *[(2**x, 2048) for x in range(0, 15, 2)],
         *[(2**x, 65536) for x in range(0, 5, 2)],
     ],
-    ci_range=[(7, 16), (2, 3, 512), (48, 3072), (38, 8192)],
+    ci_range=[(2, 3, 512), (48, 3072), (38, 8192)],
 )
 
 
@@ -131,9 +133,9 @@ def test_activation_filter_expert(
     if kept.any():
         torch.testing.assert_close(out[kept], expected[kept], atol=atol, rtol=rtol)
     if token_skip.any():
-        assert torch.isnan(
-            out[token_skip]
-        ).all(), "filter_expert kernel touched rows whose expert_id is -1"
+        assert torch.isnan(out[token_skip]).all(), (
+            "filter_expert kernel touched rows whose expert_id is -1"
+        )
 
 
 @pytest.mark.parametrize("op_name", OPS)
@@ -162,6 +164,36 @@ def test_activation_filter_expert_none_skipped(op_name: str) -> None:
     out_filtered = run_activation(op_name, x, None, expert_ids, 1)
     out_unfiltered = run_activation(op_name, x, None)
     torch.testing.assert_close(out_filtered, out_unfiltered, atol=0.0, rtol=0.0)
+
+
+def test_activation_filter_expert_int64_under_torch_compile() -> None:
+    """torch.topk routing ids remain usable after AOTAutograd realizes int64."""
+    shape = (32, 512)
+    dtype = torch.bfloat16
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    expert_ids = torch.zeros((shape[0],), dtype=torch.int64, device="cuda")
+    expert_ids[::3] = -1
+    out = torch.full(
+        shape[:-1] + (shape[-1] // 2,),
+        float("nan"),
+        dtype=dtype,
+        device="cuda",
+    )
+
+    def compiled_activation(input, output, routing_ids):
+        return run_activation("silu", input, output, routing_ids, 1)
+
+    result = torch.compile(compiled_activation, fullgraph=True)(x, out, expert_ids)
+    assert result is out
+
+    skipped = expert_ids == -1
+    assert torch.isnan(out[skipped]).all()
+    torch.testing.assert_close(
+        out[~skipped],
+        _reference("silu", x)[~skipped],
+        atol=1e-2,
+        rtol=1e-2,
+    )
 
 
 UNARY_SHAPES = get_ci_test_range(

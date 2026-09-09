@@ -51,6 +51,15 @@ LEAK_FILLER = (
     "We promptly judged antique ivory buckles for the next prize. "
 ) * 20
 
+SWA_MODEL = "openai/gpt-oss-20b"
+
+# Common gpt-oss-20b launch args. Matches TestSessionLatency/TestSWARadixCacheKL.
+SWA_COMMON_ARGS = [
+    "--mem-fraction-static",
+    "0.70",
+    "--cuda-graph-backend-prefill=disabled",
+]
+
 ABORT_REPRO_CONTEXT_LEN = 512
 ABORT_REPRO_PAGE_SIZE = 256
 ABORT_REPRO_GEN_LEN = 4
@@ -305,8 +314,7 @@ async def _concurrent_logprob_run(base_url: str, tokenizer: Any, **gen_kwargs) -
                 tasks = []
                 for s in range(CONCURRENT_LOGPROB_SESSIONS):
                     text = (
-                        f"S{s} T{turn}: "
-                        f"{LOGPROB_PROMPTS[turn % len(LOGPROB_PROMPTS)]}"
+                        f"S{s} T{turn}: {LOGPROB_PROMPTS[turn % len(LOGPROB_PROMPTS)]}"
                     )
                     ids = tokenizer.encode(text)
                     tasks.append(
@@ -351,9 +359,7 @@ async def _stress_run_all(base_url: str, tokenizer: Any) -> None:
             # Streaming requests — long prompts to trigger chunked prefill.
             for s in range(STRESS_NUM_SESSIONS):
                 offset = (s * STRESS_NUM_TURNS + turn) * 200
-                text = (
-                    f"Session {s} turn {turn}: " f"{LEAK_FILLER[offset : offset + 800]}"
-                )
+                text = f"Session {s} turn {turn}: {LEAK_FILLER[offset : offset + 800]}"
                 ids = tokenizer.encode(text)
                 tasks.append(
                     _async_generate(

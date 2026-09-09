@@ -23,7 +23,7 @@ from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _FakeModel:
@@ -220,6 +220,7 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
         remapper = SimpleNamespace(confidence_head=None)
         model = SimpleNamespace(
             config=SimpleNamespace(n_routed_experts=1),
+            num_fused_shared_experts=0,
             named_parameters=lambda: [
                 ("stages.0.self_attn.wo_a.weight", param),
             ],

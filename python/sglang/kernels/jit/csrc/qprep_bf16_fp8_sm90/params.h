@@ -22,6 +22,8 @@ limitations under the License.
 #include <cstdint>
 #include <cuda_runtime.h>
 
+namespace sglang {
+
 struct QprepBf16Fp8Sm90Params {
   int num_tokens;  // T (runtime; m-tiles are masked)
   int num_heads;   // H (grid dim)
@@ -50,3 +52,5 @@ struct QprepBf16Fp8Sm90Params {
 
   cudaStream_t stream;
 };
+
+}  // namespace sglang

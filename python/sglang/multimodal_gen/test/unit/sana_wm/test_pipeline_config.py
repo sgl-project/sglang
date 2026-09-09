@@ -135,9 +135,11 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertIs(kwargs["camera_conditions"], camera_conditions)
         self.assertIs(kwargs["chunk_plucker"], chunk_plucker)
 
-    def test_get_model_deployment_config_enables_dit_layerwise_offload(self) -> None:
+    def test_deployment_config_enables_memory_mode_dit_layerwise_offload(
+        self,
+    ) -> None:
         deployment = self.config.get_model_deployment_config()
-        self.assertTrue(deployment.auto_dit_layerwise_offload)
+        self.assertEqual(deployment.dit_layerwise_offload_modes, ("memory",))
         self.assertEqual(deployment.fsdp_auto_min_available_memory_gb, 60)
 
     def test_text_encoder_padding_matches_cfg_concat_contract(self) -> None:
