@@ -543,6 +543,45 @@ def test_layerwise_pin_lease_includes_alignment_and_survives_host_aliases():
         assert budget.committed_bytes == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_failed_layerwise_allocation_refunds_only_unallocated_allowance(monkeypatch):
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + 1024
+    )
+    assert budget.request(component_name="other", weight_bytes=64)
+    model = torch.nn.Module()
+    model.blocks = torch.nn.ModuleList([torch.nn.Linear(3, 3) for _ in range(2)])
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=2,
+        enabled=True,
+        initialize=False,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    empty = torch.empty
+    allocations = 0
+
+    def fail_second_pin(*args, **kwargs):
+        nonlocal allocations
+        if kwargs.get("pin_memory"):
+            allocations += 1
+            if allocations == 2:
+                raise RuntimeError("pin allocation failed")
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fail_second_pin)
+    with pytest.raises(RuntimeError, match="pin allocation failed"):
+        manager.initialize()
+    assert allocations == 2
+    gc.collect()
+    assert budget.committed_bytes == 64 + 76
+    del manager, model
+    gc.collect()
+    assert budget.committed_bytes == 64
+
+
 def test_layerwise_configuration_filters_by_component_name(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule

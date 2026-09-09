@@ -8,7 +8,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from time import perf_counter
 from typing import (
@@ -1106,7 +1106,7 @@ class LayerwiseOffloadManager:
             mapped[layer_idx] = from_mapping
         return totals, mapped
 
-    def _plan_layer_hosting(self, layer_groups: Dict) -> Dict[int, str]:
+    def _plan_layer_hosting(self, layer_groups: Dict) -> Tuple[Dict[int, str], int]:
         """Where each layer's weights live on the host: pinned, pageable or mapped.
 
         Pinning is what lets the copy stream run ahead of compute; a pageable
@@ -1144,7 +1144,7 @@ class LayerwiseOffloadManager:
                 len(totals),
                 sum(1 for where in hosting.values() if where == "pageable"),
             )
-            return hosting
+            return hosting, 0
         pinned_bytes = 0
         hosting: Dict[int, str] = {}
         pin_order: List[int] = []
@@ -1219,7 +1219,7 @@ class LayerwiseOffloadManager:
                 counts["mapped"],
                 sum(totals.values()) / 1024**3,
             )
-        return hosting
+        return hosting, pinned_bytes
 
     def _initialize_layer_weights(self) -> None:
         self._named_parameters = dict(self.model.named_parameters())
@@ -1240,8 +1240,19 @@ class LayerwiseOffloadManager:
                 local_tensor.dtype, []
             ).append((name, tensor))
 
-        layer_hosting = self._plan_layer_hosting(layer_groups)
+        layer_hosting, untracked_bytes = self._plan_layer_hosting(layer_groups)
+        try:
+            for storage in self._initialize_host_stores(layer_groups, layer_hosting):
+                self._pin_budget.track_storage(storage)
+                untracked_bytes -= storage.nbytes()
+        finally:
+            # failed allocations have no storage finalizer to return their allowance
+            self._pin_budget.release(untracked_bytes)
 
+    def _initialize_host_stores(
+        self, layer_groups: Dict, layer_hosting: Dict[int, str]
+    ) -> Iterator[torch.UntypedStorage]:
+        """Yield each pinned allocation before copying weights to transfer its lease."""
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
@@ -1300,7 +1311,7 @@ class LayerwiseOffloadManager:
                         pin_memory=pin_this_layer,
                     )
                     if pin_this_layer:
-                        self._pin_budget.track_storage(cpu_tensor.untyped_storage())
+                        yield cpu_tensor.untyped_storage()
                     cpu_tensor.copy_(local_weight)
                     self._strided_cpu_weights[layer_idx][name] = cpu_tensor
                     self._weight_metadata[layer_idx][name] = {
@@ -1334,7 +1345,7 @@ class LayerwiseOffloadManager:
                     total_numel, dtype=dtype, pin_memory=pin_this_layer
                 )
                 if pin_this_layer:
-                    self._pin_budget.track_storage(cpu_buffer.untyped_storage())
+                    yield cpu_buffer.untyped_storage()
 
                 # offload weights to the buffer
                 for name, weight, local_weight in contiguous_weights:
