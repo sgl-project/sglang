@@ -997,9 +997,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # tokenizer-manager-side: the scheduler ships arrays either way.
     return_flat_raw_top_logprobs: bool = False
 
-    # Internal PP control bit, set by PP0 before forwarding the request.
-    pp_prefetch_ticketed: bool = False
-
     # Whether to return hidden states
     return_hidden_states: ReturnHiddenStatesMode = False
 
@@ -1070,6 +1067,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Internal PP control bit, set by PP0 before forwarding the request.
+    # Keep at the end to preserve the positional Rust wire schema.
+    pp_prefetch_ticketed: bool = False
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
