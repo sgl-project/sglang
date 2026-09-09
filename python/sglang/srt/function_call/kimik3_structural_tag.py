@@ -79,10 +79,164 @@ _OBJECT_KEYWORDS = {
     "propertyNames",
     "required",
 }
+_SCHEMA_MAP_KEYWORDS = {
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+}
+_SCHEMA_LIST_KEYWORDS = {"allOf", "anyOf", "oneOf", "prefixItems"}
+_SCHEMA_VALUE_KEYWORDS = {
+    "additionalItems",
+    "additionalProperties",
+    "contains",
+    "else",
+    "if",
+    "items",
+    "not",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+}
+_DYNAMIC_KEY_FORBIDDEN = set('"& \t\r\n\f\v=<>')
 
 
 def _escape_attr(value: str) -> str:
     return value.replace("&", "&amp;").replace('"', "&quot;")
+
+
+def _codepoint_escape(value: int) -> str:
+    return f"\\u{value:04x}" if value <= 0xFFFF else f"\\U{value:08x}"
+
+
+def _character_class_excluding(characters: Set[str]) -> str:
+    if not characters:
+        return r"[\u0000-\U0010ffff]"
+    if all(ord(char) < 128 for char in characters):
+        escapes = {
+            "\t": r"\t",
+            "\n": r"\n",
+            "\v": r"\v",
+            "\f": r"\f",
+            "\r": r"\r",
+            "\\": r"\\",
+            "-": r"\-",
+            "]": r"\]",
+            "^": r"\^",
+        }
+        content = "".join(
+            escapes.get(char, char) for char in sorted(characters, key=ord)
+        )
+        return f"[^{content}]"
+
+    excluded = sorted(ord(char) for char in characters)
+    ranges = []
+    start = 0
+    for value in excluded:
+        if start < value:
+            ranges.append((start, value - 1))
+        start = value + 1
+    if start <= 0x10FFFF:
+        ranges.append((start, 0x10FFFF))
+    content = "".join(
+        _codepoint_escape(begin)
+        if begin == end
+        else f"{_codepoint_escape(begin)}-{_codepoint_escape(end)}"
+        for begin, end in ranges
+    )
+    return f"[{content}]"
+
+
+def _literal_pattern(char: str) -> str:
+    if char.isascii() and (char.isalnum() or char == "_"):
+        return char
+    return _codepoint_escape(ord(char))
+
+
+def _pattern_excluding_exact(
+    values: Set[str], forbidden_characters: Set[str], allow_empty: bool
+) -> str:
+    children: List[Dict[str, int]] = [{}]
+    terminal: Set[int] = set()
+    for value in sorted(values):
+        node = 0
+        for char in value:
+            if char not in children[node]:
+                children[node][char] = len(children)
+                children.append({})
+            node = children[node][char]
+        terminal.add(node)
+
+    alphabet = _character_class_excluding(forbidden_characters)
+    patterns = [""] * len(children)
+    for node in reversed(range(len(children))):
+        node_children = children[node]
+        child_chars = sorted(node_children)
+        unexpected = _character_class_excluding(forbidden_characters.union(child_chars))
+        branches = [f"{unexpected}{alphabet}*"]
+        branches.extend(
+            f"{_literal_pattern(char)}{patterns[node_children[char]]}"
+            for char in child_chars
+        )
+        nonempty = branches[0] if len(branches) == 1 else f"(?:{'|'.join(branches)})"
+        can_stop = node not in terminal and (allow_empty or node != 0)
+        patterns[node] = f"(?:{nonempty})?" if can_stop else nonempty
+
+    return patterns[0]
+
+
+def _normalize_schema_additional_properties(
+    schema: Union[bool, Dict[str, Any]],
+) -> Union[bool, Dict[str, Any]]:
+    if not isinstance(schema, dict):
+        return schema
+
+    result = dict(schema)
+    for keyword in _SCHEMA_MAP_KEYWORDS:
+        value = result.get(keyword)
+        if isinstance(value, dict):
+            result[keyword] = {
+                key: _normalize_schema_additional_properties(item)
+                if isinstance(item, (bool, dict))
+                else item
+                for key, item in value.items()
+            }
+    for keyword in _SCHEMA_LIST_KEYWORDS:
+        value = result.get(keyword)
+        if isinstance(value, list):
+            result[keyword] = [
+                _normalize_schema_additional_properties(item)
+                if isinstance(item, (bool, dict))
+                else item
+                for item in value
+            ]
+    for keyword in _SCHEMA_VALUE_KEYWORDS:
+        value = result.get(keyword)
+        if isinstance(value, (bool, dict)):
+            result[keyword] = _normalize_schema_additional_properties(value)
+
+    properties = result.get("properties")
+    additional = result.get("additionalProperties")
+    pattern_properties = result.get("patternProperties")
+    # XGrammar 0.2.1 cannot complement arbitrary patternProperties regexes,
+    # so preserve those schemas instead of narrowing the keys they match.
+    if (
+        isinstance(properties, dict)
+        and properties
+        and all(isinstance(key, str) for key in properties)
+        and (additional is True or isinstance(additional, dict))
+        and (pattern_properties is None or pattern_properties == {})
+    ):
+        # XGrammar 0.2.1 lets additionalProperties match declared keys. Express
+        # additional keys as a finite-complement pattern until the pin is upgraded.
+        key_pattern = _pattern_excluding_exact(
+            set(properties), forbidden_characters=set(), allow_empty=True
+        )
+        result["patternProperties"] = {f"^{key_pattern}$": additional}
+        result["additionalProperties"] = False
+    return result
 
 
 def _json_type(value: Any) -> str:
@@ -274,6 +428,7 @@ def _value_format(
 ) -> Format:
     if loose_string and json_type == "string":
         return AnyTextFormat()
+    schema = _normalize_schema_additional_properties(schema)
     # XGrammar 0.2.1 miscompiles a one-sided negative integer lower bound:
     # {"type": "integer", "minimum": -N} accepts the incomplete value "-"
     # and rejects every valid negative integer. Splitting the range at zero
@@ -351,11 +506,26 @@ def _dynamic_argument_format(
     schema: Union[bool, Dict[str, Any]],
     root_schema: Dict[str, Any],
     loose_strings: bool = False,
+    excluded_keys: Optional[Set[str]] = None,
 ) -> Format:
+    key_pattern = r'[^"& \t\r\n\f\v=<>]+'
+    if excluded_keys:
+        escaped_keys = {_escape_attr(key) for key in excluded_keys}
+        escaped_keys = {
+            key
+            for key in escaped_keys
+            if key and _DYNAMIC_KEY_FORBIDDEN.isdisjoint(key)
+        }
+        if escaped_keys:
+            key_pattern = _pattern_excluding_exact(
+                escaped_keys,
+                forbidden_characters=_DYNAMIC_KEY_FORBIDDEN,
+                allow_empty=False,
+            )
     variants = [
         SequenceFormat(
             elements=[
-                RegexFormat(pattern=r'[^"& \t\r\n\f\v=<>]+'),
+                RegexFormat(pattern=key_pattern),
                 ConstStringFormat(
                     value=(f'" type="{_JSON_TO_XTML_TYPE[json_type]}"<|sep|>')
                 ),
@@ -410,10 +580,20 @@ def _strict_arguments_format(parameters: Dict[str, Any]) -> Format:
 
     additional = parameters.get("additionalProperties", True)
     if additional is True:
-        elements.append(StarFormat(content=_dynamic_argument_format(True, parameters)))
+        elements.append(
+            StarFormat(
+                content=_dynamic_argument_format(
+                    True, parameters, excluded_keys=set(properties)
+                )
+            )
+        )
     elif isinstance(additional, dict):
         elements.append(
-            StarFormat(content=_dynamic_argument_format(additional, parameters))
+            StarFormat(
+                content=_dynamic_argument_format(
+                    additional, parameters, excluded_keys=set(properties)
+                )
+            )
         )
     elif additional is not False:
         raise ValueError(
