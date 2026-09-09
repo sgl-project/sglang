@@ -915,7 +915,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.max_context_size = None
 
     @staticmethod
-    def _max_context_len(forward_batch: ForwardBatch) -> Optional[int]:
+    def _batch_max_context_len(forward_batch: ForwardBatch) -> Optional[int]:
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is not None:
             if torch.is_tensor(seq_lens_cpu):
@@ -1205,7 +1205,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_hidden_mode,
         return_logprob: bool,
         lora_ineligible: bool = False,
-        max_context_len: Optional[int] = None,
+        batch_max_context_len: Optional[int] = None,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1249,7 +1249,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if return_logprob and not self._uses_eager_prefill_tail():
             return False
         if self.max_context_size is not None:
-            if max_context_len is None or max_context_len > self.max_context_size:
+            if (
+                batch_max_context_len is None
+                or batch_max_context_len > self.max_context_size
+            ):
                 return False
         if num_tokens is None:
             return True
@@ -1277,8 +1280,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         # Non-DP local check (sole decision for tp-only).
-        max_context_len = (
-            self._max_context_len(forward_batch)
+        batch_max_context_len = (
+            self._batch_max_context_len(forward_batch)
             if self.max_context_size is not None
             else None
         )
@@ -1298,7 +1301,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch
                 )
             ),
-            max_context_len=max_context_len,
+            batch_max_context_len=batch_max_context_len,
         ):
             return False
         if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
@@ -1633,8 +1636,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_num_tokens = num_tokens
 
         if self.max_context_size is not None:
-            raw_context_size = self._max_context_len(forward_batch)
-            if raw_context_size is None or raw_context_size > self.max_context_size:
+            batch_max_context_len = self._batch_max_context_len(forward_batch)
+            if (
+                batch_max_context_len is None
+                or batch_max_context_len > self.max_context_size
+            ):
                 raise RuntimeError(
                     "Prefill CUDA graph replay was admitted without a fitting "
                     "maximum context size"
