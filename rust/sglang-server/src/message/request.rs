@@ -1,4 +1,4 @@
-//! The `/generate` request path: the HTTP body and its per-request fan-out
+//! The token-ID `/generate` request path: the HTTP body and per-request fan-out
 //! ([`GenerateBody`] → [`GenerateRequest`]s).
 
 use std::collections::HashSet;
@@ -61,6 +61,7 @@ pub struct GenerateBody {
     /// Optional client-supplied request id(s): a single string (a batch fans it
     /// out as `{rid}_{i}`, mirroring Python `_normalize_batch`) or one per item.
     pub rid: Option<OneOrMany<String>>,
+    /// Recognized so text input is rejected before media I/O or submission.
     pub text: Option<OneOrMany<String>>,
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
@@ -191,10 +192,10 @@ impl GenerateBody {
                     "either `text` or `input_ids` must be provided".into(),
                 ));
             }
-            (Some(OneOrMany::One(s)), None) => (vec![Some(s)], vec![None], false),
-            (Some(OneOrMany::Many(v)), None) => {
-                let n = v.len();
-                (v.into_iter().map(Some).collect(), vec![None; n], true)
+            (Some(_), None) => {
+                return Err(Error::Validation(
+                    "request must provide input_ids; text input is not supported".into(),
+                ));
             }
             // `[]` parses as `One(vec![])` (one prompt with no ids), so the
             // `n == 0` guard below never sees it — reject it here, as Python's
@@ -759,39 +760,17 @@ mod tests {
             .into_requests()
     }
 
-    /// Scalar `text` → one item, not a batch (response stays a single object).
-    #[test]
-    fn scalar_text_is_single() {
-        let (ps, is_batch) = requests(r#"{"text": "hi"}"#).unwrap();
-        assert!(!is_batch);
-        assert_eq!(ps.len(), 1);
-        assert_eq!(ps[0].text.as_deref(), Some("hi"));
-    }
-
-    /// List `text` → batch (even length 1); each prompt becomes its own payload.
-    #[test]
-    fn list_text_is_batch() {
-        let (ps, is_batch) = requests(r#"{"text": ["a", "b"]}"#).unwrap();
-        assert!(is_batch);
-        assert_eq!(ps.len(), 2);
-        assert_eq!(ps[0].text.as_deref(), Some("a"));
-        assert_eq!(ps[1].text.as_deref(), Some("b"));
-
-        let (ps, is_batch) = requests(r#"{"text": ["only"]}"#).unwrap();
-        assert!(is_batch, "single-element list is still a batch");
-        assert_eq!(ps.len(), 1);
-    }
-
     /// Scalar `sampling_params` broadcasts to every item; a list maps per item.
     #[test]
     fn sampling_params_broadcast_and_per_item() {
         let (ps, _) =
-            requests(r#"{"text": ["a", "b"], "sampling_params": {"temperature": 0.5}}"#).unwrap();
+            requests(r#"{"input_ids": [[1], [2]], "sampling_params": {"temperature": 0.5}}"#)
+                .unwrap();
         assert_eq!(ps[0].sampling_params, ps[1].sampling_params);
         assert_eq!(ps[0].sampling_params.temperature, 0.5);
 
         let (ps, _) = requests(
-            r#"{"text": ["a", "b"], "sampling_params": [{"temperature": 0.1}, {"temperature": 0.9}]}"#,
+            r#"{"input_ids": [[1], [2]], "sampling_params": [{"temperature": 0.1}, {"temperature": 0.9}]}"#,
         )
         .unwrap();
         assert_ne!(ps[0].sampling_params, ps[1].sampling_params);
@@ -800,7 +779,7 @@ mod tests {
     /// A per-item `sampling_params` list whose length ≠ batch size is a 400.
     #[test]
     fn sampling_params_length_mismatch_errors() {
-        let err = requests(r#"{"text": ["a", "b"], "sampling_params": [{}]}"#).unwrap_err();
+        let err = requests(r#"{"input_ids": [[1], [2]], "sampling_params": [{}]}"#).unwrap_err();
         assert!(err.to_string().contains("length"), "{err}");
     }
 
@@ -815,6 +794,29 @@ mod tests {
         assert!(is_batch);
         assert_eq!(ps.len(), 2);
         assert_eq!(ps[1].input_ids, Some(vec![3]));
+
+        let (ps, is_batch) = requests(r#"{"input_ids": [[1]]}"#).unwrap();
+        assert!(is_batch, "single-element list is still a batch");
+        assert_eq!(ps.len(), 1);
+    }
+
+    #[test]
+    fn scalar_and_batch_text_inputs_are_rejected() {
+        for text in [serde_json::json!("hi"), serde_json::json!(["a", "b"])] {
+            for stream in [false, true] {
+                let mut body = serde_json::json!({
+                    "text": text,
+                    "stream": stream,
+                    "image_data": {"url": "http://127.0.0.1:1/unfetched.png"},
+                });
+                let err = requests(&body.to_string()).unwrap_err();
+                assert!(matches!(err, Error::Validation(_)));
+                assert!(err.to_string().contains("text input is not supported"));
+                body["input_ids"] = serde_json::json!([1]);
+                let err = requests(&body.to_string()).unwrap_err();
+                assert!(err.to_string().contains("not both"));
+            }
+        }
     }
 
     /// Both / neither of text+input_ids is a 400.
@@ -824,7 +826,7 @@ mod tests {
         assert!(requests(r#"{"stream": true}"#).is_err());
         // Parallel sampling is rejected where Python reads it — in the params,
         // at normalization, not here.
-        let (mut ps, _) = requests(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
+        let (mut ps, _) = requests(r#"{"input_ids": [1], "sampling_params": {"n": 2}}"#).unwrap();
         assert!(ps[0].sampling_params.normalize(false, TEST_VOCAB).is_err());
     }
 
@@ -854,11 +856,11 @@ mod tests {
             r#""n": 1"#,
             r#""totally_made_up": 1"#,
         ] {
-            let body = format!(r#"{{"text": "hi", {field}}}"#);
+            let body = format!(r#"{{"input_ids": [1], {field}}}"#);
             let (ps, _) = requests(&body)
                 .unwrap_or_else(|e| panic!("{field} must be ignored, not rejected: {e}"));
             assert_eq!(ps.len(), 1, "{field}");
-            assert_eq!(ps[0].text.as_deref(), Some("hi"), "{field}");
+            assert_eq!(ps[0].input_ids, Some(vec![1]), "{field}");
         }
     }
 
@@ -872,40 +874,40 @@ mod tests {
     /// suffix must never be visible in the parity-defined shape.
     #[test]
     fn split_rid_matches_python_normalize() {
-        let (ps, _) = requests(r#"{"text": "a", "rid": "r"}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [1], "rid": "r"}"#).unwrap();
         assert_eq!(ps[0].rid.client_facing(), "r");
 
-        let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": "base"}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [[1], [2]], "rid": "base"}"#).unwrap();
         assert_eq!(ps[0].rid.client_facing(), "base_0");
         assert_eq!(ps[1].rid.client_facing(), "base_1");
 
-        let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": ["x", "y"]}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [[1], [2]], "rid": ["x", "y"]}"#).unwrap();
         assert_eq!(ps[0].rid.client_facing(), "x");
         assert_eq!(ps[1].rid.client_facing(), "y");
 
-        let (ps, _) = requests(r#"{"text": ["a", "b"]}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [[1], [2]]}"#).unwrap();
         // Absent → `into_requests` mints one uuid per item, all distinct.
         assert_eq!(ps[0].rid.len(), 32);
         assert_ne!(ps[0].rid, ps[1].rid);
 
         assert!(
-            requests(r#"{"text": ["a", "b"], "rid": ["x"]}"#).is_err(),
+            requests(r#"{"input_ids": [[1], [2]], "rid": ["x"]}"#).is_err(),
             "rid list length must match batch size"
         );
         assert!(
-            requests(r#"{"text": "a", "rid": ["x"]}"#).is_err(),
+            requests(r#"{"input_ids": [1], "rid": ["x"]}"#).is_err(),
             "rid list with a single (non-batch) prompt is rejected"
         );
     }
 
-    /// The native `bench_serving` payload (a `GenerateReqInput` superset) parses:
+    /// A token-ID `bench_serving` payload (a `GenerateReqInput` superset) parses:
     /// its `lora_path`/`return_routed_experts` are accepted-but-ignored and a
     /// `null` `image_data` means "no multimodal input", so `split` succeeds
     /// while the real fields survive.
     #[test]
     fn accepts_bench_serving_payload() {
         let (ps, is_batch) = requests(
-            r#"{"text": "hi", "sampling_params": {"max_new_tokens": 8},
+            r#"{"input_ids": [1], "sampling_params": {"max_new_tokens": 8},
                 "stream": true, "lora_path": null, "return_logprob": false,
                 "return_routed_experts": false, "logprob_start_len": -1,
                 "image_data": null}"#,
@@ -913,7 +915,7 @@ mod tests {
         .unwrap();
         assert!(!is_batch);
         assert_eq!(ps.len(), 1);
-        assert_eq!(ps[0].text.as_deref(), Some("hi"));
+        assert_eq!(ps[0].input_ids, Some(vec![1]));
         assert!(ps[0].stream);
         assert!(!ps[0].has_multimodal());
     }
@@ -927,17 +929,18 @@ mod tests {
         let images_of = |p: &GenerateRequest| p.mm.as_ref().unwrap().image_data.clone();
 
         // Single request: one item, or a flat list, kept as sent.
-        let (ps, _) = requests(r#"{"text": "a", "image_data": "http://x/i.jpg"}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [1], "image_data": "http://x/i.jpg"}"#).unwrap();
         assert_eq!(images_of(&ps[0]), vec![src("http://x/i.jpg")]);
         assert!(ps[0].has_multimodal());
-        let (ps, _) = requests(r#"{"text": "a", "image_data": ["u1", {"url": "u2"}]}"#).unwrap();
+        let (ps, _) =
+            requests(r#"{"input_ids": [1], "image_data": ["u1", {"url": "u2"}]}"#).unwrap();
         assert_eq!(
             images_of(&ps[0]),
             vec![src("u1"), MmItem::Ref { url: "u2".into() }]
         );
 
         // Batch + scalar image: broadcast, one image per item.
-        let (ps, _) = requests(r#"{"text": ["a", "b"], "image_data": "u"}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [[1], [2]], "image_data": "u"}"#).unwrap();
         for p in &ps {
             assert_eq!(images_of(p), vec![src("u")]);
             assert!(p.has_multimodal());
@@ -945,27 +948,27 @@ mod tests {
 
         // Batch + per-item list: element i goes to item i; nested lists are
         // per-item lists.
-        let (ps, _) = requests(r#"{"text": ["a", "b"], "image_data": ["u1", "u2"]}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [[1], [2]], "image_data": ["u1", "u2"]}"#).unwrap();
         assert_eq!(images_of(&ps[0]), vec![src("u1")]);
         assert_eq!(images_of(&ps[1]), vec![src("u2")]);
         let (ps, _) =
-            requests(r#"{"text": ["a", "b"], "image_data": [["u1", "u2"], null]}"#).unwrap();
+            requests(r#"{"input_ids": [[1], [2]], "image_data": [["u1", "u2"], null]}"#).unwrap();
         assert_eq!(images_of(&ps[0]), vec![src("u1"), src("u2")]);
         assert!(!ps[1].has_multimodal());
 
         // Batch + wrong-length list is a 400, as is the batch shape on a single.
-        assert!(requests(r#"{"text": ["a", "b"], "image_data": ["u1"]}"#).is_err());
-        assert!(requests(r#"{"text": "a", "image_data": [["u1"]]}"#).is_err());
+        assert!(requests(r#"{"input_ids": [[1], [2]], "image_data": ["u1"]}"#).is_err());
+        assert!(requests(r#"{"input_ids": [1], "image_data": [["u1"]]}"#).is_err());
 
         // null / [] mean "no multimodal input".
-        let (ps, _) = requests(r#"{"text": "a", "image_data": null}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [1], "image_data": null}"#).unwrap();
         assert!(!ps[0].has_multimodal());
-        let (ps, _) = requests(r#"{"text": "a", "image_data": []}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [1], "image_data": []}"#).unwrap();
         assert!(!ps[0].has_multimodal());
 
         // Batch + scalar video broadcasts too (Python leaves it unwrapped, but
         // every request's input is an item list here).
-        let (ps, _) = requests(r#"{"text": ["a", "b"], "video_data": "v"}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [[1], [2]], "video_data": "v"}"#).unwrap();
         assert_eq!(ps[1].mm.as_ref().unwrap().video_data, vec![src("v")]);
         assert!(ps[1].has_multimodal());
     }
@@ -993,7 +996,8 @@ mod tests {
     #[test]
     fn mm_hashes_single_only() {
         let (mut ps, _) =
-            requests(r#"{"text": "a", "image_data": "u", "mm_hashes": ["a1b2", "0xff"]}"#).unwrap();
+            requests(r#"{"input_ids": [1], "image_data": "u", "mm_hashes": ["a1b2", "0xff"]}"#)
+                .unwrap();
         assert_eq!(ps[0].mm.as_ref().unwrap().mm_hashes, vec!["a1b2", "0xff"]);
         assert_eq!(ps[0].take_mm_work().mm_hashes, vec!["a1b2", "0xff"]);
         assert!(ps[0].mm.as_ref().unwrap().mm_hashes.is_empty());
@@ -1001,37 +1005,36 @@ mod tests {
         // A batch cannot carry hashes (Python drops them), so it is rejected,
         // as is the nested batch shape on a single request...
         for body in [
-            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": [["x"], ["y"]]}"#,
-            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": ["x", "y"]}"#,
-            r#"{"text": "a", "image_data": "u", "mm_hashes": [["x"]]}"#,
+            r#"{"input_ids": [[1], [2]], "image_data": ["u", "v"], "mm_hashes": [["x"], ["y"]]}"#,
+            r#"{"input_ids": [[1], [2]], "image_data": ["u", "v"], "mm_hashes": ["x", "y"]}"#,
+            r#"{"input_ids": [1], "image_data": "u", "mm_hashes": [["x"]]}"#,
         ] {
             let err = requests(body).err().unwrap();
             assert!(matches!(err, Error::Validation(_)), "{body}: {err:?}");
         }
         // ...while an absent or empty field is not a payload and must still pass.
         for body in [
-            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": null}"#,
-            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": []}"#,
+            r#"{"input_ids": [[1], [2]], "image_data": ["u", "v"], "mm_hashes": null}"#,
+            r#"{"input_ids": [[1], [2]], "image_data": ["u", "v"], "mm_hashes": []}"#,
         ] {
             assert!(requests(body).is_ok(), "{body}");
         }
     }
 
-    /// `take_mm_work` clones `text` (the scheduler header still needs it) and
-    /// moves everything the worker owns out of the request.
+    /// `take_mm_work` transfers IDs and media into the worker without cloning.
     #[test]
     fn mm_work_item_takes_owned_fields() {
         let (mut ps, _) =
-            requests(r#"{"text": "hi", "image_data": ["u1", "u2"], "audio_data": "a"}"#).unwrap();
+            requests(r#"{"input_ids": [1], "image_data": ["u1", "u2"], "audio_data": "a"}"#)
+                .unwrap();
         let work = ps[0].take_mm_work();
-        assert_eq!(work.text.as_deref(), Some("hi"));
-        assert!(work.input_ids.is_none());
+        assert_eq!(work.input_ids, Some(vec![1]));
         assert_eq!(work.image_data.len(), 2);
         assert!(work.video_data.is_empty());
         assert_eq!(work.audio_data, vec![MmItem::Source("a".into())]);
-        // Moved out, not cloned; `text` survives for the header.
+        // Moved out, not cloned; expanded IDs replace these on worker return.
         assert!(ps[0].mm.as_ref().unwrap().image_data.is_empty());
-        assert_eq!(ps[0].text.as_deref(), Some("hi"));
+        assert!(ps[0].input_ids.is_none());
     }
 
     /// The body limit is disabled, so an unbounded batch turns a small body into an
@@ -1043,14 +1046,15 @@ mod tests {
     #[test]
     fn oversized_batches_are_rejected_before_allocating() {
         let cap = usize::try_from(*MAX_BATCH_REQS_PER_HTTP_REQ).unwrap();
-        let texts: Vec<String> = (0..cap + 1).map(|i| i.to_string()).collect();
-        let body = serde_json::json!({ "text": texts }).to_string();
+        let input_ids = vec![vec![1]; cap + 1];
+        let body = serde_json::json!({ "input_ids": input_ids }).to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("exceeds the maximum"), "{err}");
 
         // At the cap it is accepted.
-        let texts: Vec<String> = (0..cap).map(|i| i.to_string()).collect();
-        let (reqs, _) = requests(&serde_json::json!({ "text": texts }).to_string()).unwrap();
+        let input_ids = vec![vec![1]; cap];
+        let (reqs, _) =
+            requests(&serde_json::json!({ "input_ids": input_ids }).to_string()).unwrap();
         assert_eq!(reqs.len(), cap);
 
         // A small batch with a huge broadcast `custom_params` is the quadratic case:
@@ -1060,7 +1064,7 @@ mod tests {
         // a cap below 200 would trip the item check first and report that instead.
         let blob = "x".repeat(1 << 20); // 1 MiB
         let body = serde_json::json!({
-            "text": vec!["hi"; 200],
+            "input_ids": vec![vec![1]; 200],
             "sampling_params": { "custom_params": { "k": blob } },
         })
         .to_string();
@@ -1080,22 +1084,23 @@ mod tests {
     /// per-prompt. Regression — the whole value used to be cloned to every item.
     #[test]
     fn token_ids_logprob_broadcasts_flat_and_splits_nested() {
-        let (ps, _) = requests(r#"{"text": ["a", "b"], "token_ids_logprob": [1, 2]}"#).unwrap();
+        let (ps, _) =
+            requests(r#"{"input_ids": [[1], [2]], "token_ids_logprob": [1, 2]}"#).unwrap();
         assert_eq!(ps[0].token_ids_logprob, Some(vec![1, 2]));
         assert_eq!(ps[1].token_ids_logprob, Some(vec![1, 2]));
 
         let (ps, _) =
-            requests(r#"{"text": ["a", "b"], "token_ids_logprob": [[1], [2, 3]]}"#).unwrap();
+            requests(r#"{"input_ids": [[1], [2]], "token_ids_logprob": [[1], [2, 3]]}"#).unwrap();
         assert_eq!(ps[0].token_ids_logprob, Some(vec![1]));
         assert_eq!(ps[1].token_ids_logprob, Some(vec![2, 3]));
 
-        let err = requests(r#"{"text": ["a", "b"], "token_ids_logprob": [[1]]}"#).unwrap_err();
+        let err = requests(r#"{"input_ids": [[1], [2]], "token_ids_logprob": [[1]]}"#).unwrap_err();
         assert!(
             err.to_string().contains("does not match batch size"),
             "{err}"
         );
 
-        let (ps, _) = requests(r#"{"text": ["a", "b"]}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [[1], [2]]}"#).unwrap();
         assert_eq!(ps[0].token_ids_logprob, None);
     }
 
@@ -1107,25 +1112,27 @@ mod tests {
     /// empties through its nested branch verbatim.
     #[test]
     fn empty_token_ids_logprob_collapses_to_none() {
-        let (ps, _) = requests(r#"{"text": "a", "token_ids_logprob": []}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [1], "token_ids_logprob": []}"#).unwrap();
         assert_eq!(ps[0].token_ids_logprob, None);
 
-        let (ps, _) = requests(r#"{"text": ["a", "b"], "token_ids_logprob": []}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [[1], [2]], "token_ids_logprob": []}"#).unwrap();
         assert!(ps.iter().all(|p| p.token_ids_logprob.is_none()));
 
         // Nested, every item empty — Python would ship four `[]`s here.
-        let (ps, _) =
-            requests(r#"{"text": ["a", "b", "c", "d"], "token_ids_logprob": [[], [], [], []]}"#)
-                .unwrap();
+        let (ps, _) = requests(
+            r#"{"input_ids": [[1], [2], [3], [4]], "token_ids_logprob": [[], [], [], []]}"#,
+        )
+        .unwrap();
         assert!(ps.iter().all(|p| p.token_ids_logprob.is_none()));
 
         // Nested and mixed: only the empty cell collapses.
-        let (ps, _) = requests(r#"{"text": ["a", "b"], "token_ids_logprob": [[], [7]]}"#).unwrap();
+        let (ps, _) =
+            requests(r#"{"input_ids": [[1], [2]], "token_ids_logprob": [[], [7]]}"#).unwrap();
         assert_eq!(ps[0].token_ids_logprob, None);
         assert_eq!(ps[1].token_ids_logprob, Some(vec![7]));
 
         // A non-empty list is untouched.
-        let (ps, _) = requests(r#"{"text": "a", "token_ids_logprob": [7]}"#).unwrap();
+        let (ps, _) = requests(r#"{"input_ids": [1], "token_ids_logprob": [7]}"#).unwrap();
         assert_eq!(ps[0].token_ids_logprob, Some(vec![7]));
     }
 
@@ -1134,13 +1141,13 @@ mod tests {
     #[test]
     fn logprob_options_broadcast_scalar_and_split_list() {
         let (ps, _) =
-            requests(r#"{"text": ["a", "b"], "return_logprob": true, "top_logprobs_num": 3}"#)
+            requests(r#"{"input_ids": [[1], [2]], "return_logprob": true, "top_logprobs_num": 3}"#)
                 .unwrap();
         assert!(ps[0].return_logprob);
         assert_eq!(ps[1].top_logprobs_num, 3);
 
         let (ps, _) = requests(
-            r#"{"text": ["a", "b"], "return_logprob": [true, false],
+            r#"{"input_ids": [[1], [2]], "return_logprob": [true, false],
                 "logprob_start_len": [0, 2], "return_hidden_states": [false, true]}"#,
         )
         .unwrap();
@@ -1150,7 +1157,7 @@ mod tests {
         assert_eq!(ps[1].logprob_start_len, 2);
         assert!(ps[1].return_hidden_states);
 
-        let err = requests(r#"{"text": ["a", "b"], "return_logprob": [true]}"#).unwrap_err();
+        let err = requests(r#"{"input_ids": [[1], [2]], "return_logprob": [true]}"#).unwrap_err();
         assert!(
             err.to_string().contains("does not match batch size"),
             "{err}"
@@ -1159,7 +1166,7 @@ mod tests {
 
     /// `{"input_ids": []}` parses as one prompt with no ids, so the batch-size
     /// guard misses it; Python's `_determine_batch_size` raises "input_ids cannot
-    /// be empty." Regression — it used to reach the tokenizer with no text.
+    /// be empty." Empty items must not reach the scheduler.
     #[test]
     fn empty_input_ids_is_rejected() {
         let err = requests(r#"{"input_ids": []}"#).unwrap_err();
@@ -1181,11 +1188,11 @@ mod tests {
     /// the client would get two response entries carrying the same `meta_info.id`.
     #[test]
     fn duplicate_rids_within_one_request_are_rejected() {
-        let err = requests(r#"{"text": ["a", "b"], "rid": ["x", "x"]}"#).unwrap_err();
+        let err = requests(r#"{"input_ids": [[1], [2]], "rid": ["x", "x"]}"#).unwrap_err();
         assert!(err.to_string().contains("duplicate request IDs"), "{err}");
 
-        assert!(requests(r#"{"text": ["a", "b"], "rid": ["x", "y"]}"#).is_ok());
-        let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": "x"}"#).unwrap();
+        assert!(requests(r#"{"input_ids": [[1], [2]], "rid": ["x", "y"]}"#).is_ok());
+        let (ps, _) = requests(r#"{"input_ids": [[1], [2]], "rid": "x"}"#).unwrap();
         assert_eq!(ps[0].rid.client_facing(), "x_0");
         assert_eq!(ps[1].rid.client_facing(), "x_1");
     }
@@ -1197,8 +1204,8 @@ mod tests {
     /// the second's connection. Both still see their own rid echoed back.
     #[test]
     fn concurrent_requests_sharing_an_rid_get_distinct_internal_rids() {
-        let (a, _) = requests(r#"{"text": "a", "rid": "same"}"#).unwrap();
-        let (b, _) = requests(r#"{"text": "b", "rid": "same"}"#).unwrap();
+        let (a, _) = requests(r#"{"input_ids": [1], "rid": "same"}"#).unwrap();
+        let (b, _) = requests(r#"{"input_ids": [2], "rid": "same"}"#).unwrap();
         assert_ne!(
             a[0].rid, b[0].rid,
             "a shared client rid must not become a shared internal rid"
@@ -1214,7 +1221,7 @@ mod tests {
     #[test]
     fn bootstrap_fields_fan_out() {
         let (ps, _) = requests(
-            r#"{"text": ["a", "b"], "bootstrap_host": "h", "bootstrap_port": 8998,
+            r#"{"input_ids": [[1], [2]], "bootstrap_host": "h", "bootstrap_port": 8998,
                 "bootstrap_room": 7, "routed_dp_rank": 1}"#,
         )
         .unwrap();
@@ -1226,7 +1233,7 @@ mod tests {
         }
 
         let (ps, _) = requests(
-            r#"{"text": ["a", "b"], "bootstrap_host": ["h1", "h2"],
+            r#"{"input_ids": [[1], [2]], "bootstrap_host": ["h1", "h2"],
                 "bootstrap_room": [10, 20]}"#,
         )
         .unwrap();
@@ -1235,7 +1242,8 @@ mod tests {
         assert_eq!(ps[0].bootstrap_room, Some(10));
         assert_eq!(ps[1].bootstrap_room, Some(20));
 
-        let err = requests(r#"{"text": ["a", "b"], "bootstrap_room": [1, 2, 3]}"#).unwrap_err();
+        let err =
+            requests(r#"{"input_ids": [[1], [2]], "bootstrap_room": [1, 2, 3]}"#).unwrap_err();
         assert!(err.to_string().contains("bootstrap_room"), "{err}");
     }
 
@@ -1245,7 +1253,7 @@ mod tests {
     #[test]
     fn accepts_pd_router_and_warmup_payloads() {
         let (ps, _) = requests(
-            r#"{"text": ["a", "b"], "bootstrap_host": ["h", "h"],
+            r#"{"input_ids": [[1], [2]], "bootstrap_host": ["h", "h"],
                 "bootstrap_port": [null, null],
                 "bootstrap_room": [123456789, 987654321]}"#,
         )
