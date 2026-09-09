@@ -321,57 +321,6 @@ class ServerArgs:
             for field in dataclasses.fields(self)
         }
 
-    def replace_resolved(self, source: str, **changes: Any) -> ServerArgs:
-        """A copy of this record that stays resolved, and says what it changed.
-
-        `dataclasses.replace` builds a new instance, so the copy carries none of
-        what makes a record resolved: no raw snapshot, no declarations, no
-        finished flag. The next publish therefore resolves it again, which
-        drops every decision the stash held -- the late ones (the auto-detected
-        parsers) and the direct ones alike -- and re-runs the device probes in
-        whatever process opened the copy. The Ray paths replace
-        `dist_init_addr` on a resolved record, which is how they reach this.
-
-        The change is appended to the stash rather than left on the field: the
-        projection reads the raw snapshot plus the declarations, so a field the
-        copy set on its own would publish the parent's raw value instead.
-
-        The carry is shallow. The containers are copied so the copy's own
-        declaration does not travel back into the parent, but everything inside
-        them -- the stash entries, the raw-input values, the memoized
-        `ModelConfig` -- is shared. That is fine for what this is for: a copy
-        that immediately crosses a process boundary (Ray actors, the gateway's
-        workers), where pickling severs the sharing. A caller that mutates the
-        copy's deep structure in-process mutates the parent's too.
-        """
-        replacement = dataclasses.replace(self, **changes)
-        # Provenance, not resolution state: a copy was still launched by
-        # whatever launched its parent, resolved or not.
-        object.__setattr__(replacement, "_launch_command", self.launch_command)
-        if not getattr(self, "_resolution_finished", False):
-            # Not resolved yet: the copy goes through the gate itself.
-            return replacement
-
-        # Everything outside the fields, enumerated from the instance: the raw
-        # snapshot, the stash, and what resolution memoized -- including the
-        # model-configuration memo, which the copy carries over rather than
-        # rebuild.
-        field_names = {field.name for field in dataclasses.fields(self)}
-        for name, value in vars(self).items():
-            if name in field_names or name == "_resolution_finished":
-                continue
-            if isinstance(value, (dict, list, set)):
-                value = copy.copy(value)
-            object.__setattr__(replacement, name, value)
-        stash = getattr(replacement, "_resolved_overrides", None)
-        if stash is None:
-            stash = []
-            object.__setattr__(replacement, "_resolved_overrides", stash)
-        if changes:
-            stash.append((source, dict(changes)))
-        object.__setattr__(replacement, "_resolution_finished", True)
-        return replacement
-
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------

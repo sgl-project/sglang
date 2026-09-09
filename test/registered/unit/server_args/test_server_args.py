@@ -2942,15 +2942,6 @@ class TestLaunchCommand(CustomTestCase):
             server_args.launch_command,
         )
 
-    def test_a_copy_keeps_it(self):
-        """`replace_resolved` is how the Ray paths rewrite `dist_init_addr`;
-        the copy was launched by whatever launched its parent."""
-        server_args = prepare_server_args(["--model-path", "/tmp/x"])
-        self.assertEqual(
-            server_args.replace_resolved("test").launch_command,
-            server_args.launch_command,
-        )
-
     def test_it_is_not_a_config_field(self):
         """It describes how the configuration was asked for, so it is not part
         of the configuration: no CLI flag, no namespace, not in the bags."""
