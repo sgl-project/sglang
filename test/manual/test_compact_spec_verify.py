@@ -58,7 +58,13 @@ def main():
     dist.init_process_group("nccl")
     root = Path(__file__).resolve().parents[2]
     assert Path(engine.__file__).resolve().is_relative_to(root / "python")
-    result = {"tests": [], "status": "FAIL", "source": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()}
+    result = {
+        "tests": [],
+        "status": "FAIL",
+        "source": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip(),
+    }
     runner = None
     try:
         assert engine.runtime_supported()
