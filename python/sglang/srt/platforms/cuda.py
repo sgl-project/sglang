@@ -104,7 +104,16 @@ class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
     """Default in-tree CUDA SRT platform."""
 
     def supports_fp8(self) -> bool:
-        return True
+        if not torch.cuda.is_available():
+            return False
+        try:
+            import torch
+            a = torch.randn(32, 32, device="cuda").to(torch.float8_e4m3fn)
+            b = torch.randn(32, 32, device="cuda").to(torch.float8_e4m3fn).t()
+            torch._scaled_mm(a, b, bias=None, out_dtype=torch.bfloat16)
+            return True
+        except Exception:
+            return False
 
     def support_cuda_graph(self) -> bool:
         return True
