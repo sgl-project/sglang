@@ -667,6 +667,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     layer.w2_weight_bias.float(), requires_grad=False
                 )
 
+        if is_xpu() and not get_moe_runner_backend().is_triton():
+            # Align BF16 expert weights to Column-Major [E, K, N] for Intel Xe2 DPAS VNNI load
+            if not getattr(layer, "_xpu_weights_transposed", False):
+                if layer.w13_weight.ndim == 3:
+                    layer.w13_weight = torch.nn.Parameter(
+                        layer.w13_weight.data.transpose(1, 2).contiguous(),
+                        requires_grad=False,
+                    )
+                    layer.w2_weight = torch.nn.Parameter(
+                        layer.w2_weight.data.transpose(1, 2).contiguous(),
+                        requires_grad=False,
+                    )
+                    layer._xpu_weights_transposed = True
+
         if (
             self.use_deep_gemm
             and layer.w13_weight.dtype == torch.bfloat16
