@@ -15,6 +15,9 @@ import torch
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
@@ -27,6 +30,7 @@ from sglang.srt.observability.fpm_timing import (
     capture_fpm_timing,
     wrap_forward_with_fpm,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval
 from sglang.test.test_utils import CustomTestCase
 
@@ -39,6 +43,74 @@ def _make_ps(**overrides) -> ParallelState:
     )
     defaults.update(overrides)
     return ParallelState.trivial(**defaults)
+
+
+class TestSpecDecodeLengthSnapshot(CustomTestCase):
+    def test_snapshot_precedes_settlement_and_survives_retraction(self):
+        for algorithm in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DSPARK,
+        ):
+            with self.subTest(algorithm=algorithm):
+                reporter = _make_reporter(self, types.SimpleNamespace())
+                reporter.scheduler.enable_fpm = True
+                reqs = [
+                    types.SimpleNamespace(
+                        seqlen=length + 1,
+                        is_retracted=length == 200,
+                        finished=lambda length=length: length == 300,
+                        grammar=None,
+                        spec_verify_ct=0,
+                        spec_num_correct_drafts=0,
+                        update_spec_correct_drafts_histogram=Mock(),
+                        kv=types.SimpleNamespace(kv_committed_len=0),
+                    )
+                    for length in (100, 200, 300)
+                ]
+                batch = types.SimpleNamespace(
+                    reqs=reqs,
+                    spec_algorithm=algorithm,
+                    forward_mode=ForwardMode.DECODE,
+                    seq_lens_cpu=None,
+                )
+                result = GenerationBatchResult(
+                    next_token_ids=torch.arange(24),
+                    accept_lens=torch.tensor([1, 8, 3]),
+                    speculative_output_stride=8,
+                )
+
+                def settle_grammar(result, batch):
+                    # Mutating request state must not affect the earlier snapshot.
+                    for req in batch.reqs:
+                        req.seqlen += 20
+
+                processor = types.SimpleNamespace(
+                    metrics_reporter=reporter,
+                    model_worker=types.SimpleNamespace(on_verify_complete_cpu=Mock()),
+                    advance_grammar_fsm=settle_grammar,
+                )
+                tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
+                    processor, result, batch
+                )
+                self.assertEqual([len(ids) for ids in tokens], [1, 8, 3])
+                self.assertEqual([req.kv.kv_committed_len for req in reqs], [1, 0, 0])
+                metrics = reporter._build_scheduled_request_metrics(batch, result)
+                self.assertEqual(metrics.num_decode_requests, 3)
+                self.assertEqual(metrics.sum_decode_kv_tokens, 600)
+                self.assertAlmostEqual(metrics.var_decode_kv_tokens, 20000 / 3)
+
+    def test_disabled_and_unsupported_do_not_read_requests(self):
+        reporter = _make_reporter(self, types.SimpleNamespace())
+        result = GenerationBatchResult()
+        reporter.snapshot_spec_decode_metrics(None, result)
+        self.assertIsNone(result.fpm_scheduled_requests)
+        reporter.scheduler.enable_fpm = True
+        for algorithm in (SpeculativeAlgorithm.UNO, SpeculativeAlgorithm.FROZEN_KV_MTP):
+            reporter.snapshot_spec_decode_metrics(
+                types.SimpleNamespace(spec_algorithm=algorithm), result
+            )
+            self.assertIsNone(result.fpm_scheduled_requests)
 
 
 class _FakeReq:

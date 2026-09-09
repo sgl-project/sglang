@@ -25,6 +25,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.observability.forward_pass_metrics import ScheduledRequestMetrics
     from sglang.srt.observability.fpm_timing import FpmTiming
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -119,6 +120,7 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
     fpm_timing: Optional[FpmTiming] = None
+    fpm_scheduled_requests: Optional[ScheduledRequestMetrics] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
 
