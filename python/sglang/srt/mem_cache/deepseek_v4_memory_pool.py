@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
+from functools import lru_cache
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
@@ -22,13 +23,30 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils import ceil_div, is_hip, is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+# FlashInfer SM120 NVFP4 sparse-MLA cache ABI: 224 B packed E2M1 nope +
+# 128 B BF16 rope + 32 B E4M3 group scales.
+NVFP4_BYTES_PER_TOKEN = 384
+
+
+@lru_cache(maxsize=1)
+def is_nvfp4_kv_cache() -> bool:
+    """Whether the DSv4 KV pools use FlashInfer's NVFP4 sparse-MLA cache ABI."""
+    if envs.SGLANG_SM120_KV_CACHE_FORMAT.get() != "nvfp4":
+        return False
+    if not is_sm120_supported():
+        raise ValueError(
+            "SGLANG_SM120_KV_CACHE_FORMAT=nvfp4 requires SM120/SM121; FlashInfer "
+            "builds the NVFP4 sparse-MLA kernels for consumer Blackwell only."
+        )
+    return True
 
 
 def get_compress_state_ring_size(
@@ -87,6 +105,12 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
+        self.is_nvfp4 = is_nvfp4_kv_cache()
+        # FlashInfer's NVFP4 sparse-MLA kernels accept a primary page size of
+        # 64 and an extra-cache page size of 2 or 64. The NVFP4 ABI has no
+        # per-page padding, so regrouping a flat slot space into 64-token
+        # pages is pure reindexing and leaves slot ids unchanged.
+        self.nvfp4_page_size = min(self.page_size, 64)
         self._create_buffers()
 
     def _create_buffers(self):
@@ -104,6 +128,8 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
+        if self.is_nvfp4:
+            return NVFP4_BYTES_PER_TOKEN
         dim_per_token = (
             self.qk_nope_head_dim
             + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
@@ -112,8 +138,32 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         return dim_per_token
 
+    def nvfp4_cache_view(self, buf: torch.Tensor) -> torch.Tensor:
+        """[num_nvfp4_pages, nvfp4_page_size, 384] uint8 view of a raw buffer.
+
+        Both the append helper and the attention kernel derive the page split
+        from this shape, so writers and readers must use this single view.
+        ``get_key_buffer`` hands out an ``fp8_e4m3`` view of the raw storage
+        under ``--kv-cache-dtype fp8_e4m3``; the NVFP4 ABI is opaque bytes.
+        """
+        if buf.dtype != torch.uint8:
+            buf = buf.view(torch.uint8)
+        return buf.view(-1, self.nvfp4_page_size, NVFP4_BYTES_PER_TOKEN)
+
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
+        if self.is_nvfp4:
+            # The NVFP4 ABI packs each page exactly, so the slot space is
+            # regrouped into nvfp4_page_size-token rows with no padding.
+            assert self.store_dtype == torch.uint8
+            self.kv_cache_total_dim = bytes_per_token
+            self.bytes_per_page_padded = self.nvfp4_page_size * bytes_per_token
+            return torch.zeros(
+                ceil_div(num_pages * self.page_size, self.nvfp4_page_size),
+                self.bytes_per_page_padded,
+                dtype=self.store_dtype,
+                device=self.device,
+            )
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
@@ -137,6 +187,9 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
+        assert (
+            not self.is_nvfp4
+        ), "pre-quantized FP8 KV writes are not supported by the NVFP4 cache ABI"
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
@@ -150,6 +203,14 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if self.is_nvfp4:
+            from flashinfer.mla import nvfp4_quantize_append_sparse_mla_cache
+
+            return nvfp4_quantize_append_sparse_mla_cache(
+                cache_k,
+                loc,
+                self.nvfp4_cache_view(self.kv_buffer[layer_id]),
+            )
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
@@ -1187,6 +1248,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        assert not self.swa_kv_pool.is_nvfp4, (
+            "the fused norm+rope+store kernel writes the FP8 cache ABI; "
+            "SGLANG_SM120_KV_CACHE_FORMAT=nvfp4 needs the unfused store path"
+        )
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,

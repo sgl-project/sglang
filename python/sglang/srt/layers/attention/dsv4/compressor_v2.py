@@ -139,6 +139,36 @@ class CompressorBackendMixin:
         attr_name = f"c{compress_ratio}_out_loc"
         return getattr(self.forward_metadata.core_metadata, attr_name)
 
+    def _nvfp4_stage(
+        self, compress_ratio: int, num_rows: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """BF16 staging rows plus their identity out_loc, one row per entry.
+
+        Bucketed to a power of two and never evicted, then sliced. A decode
+        CUDA graph bakes in the buffer address at capture time, so the backing
+        tensor for a bucket must never be reallocated; bucketing also bounds
+        the buffer count, which keying on the raw row count would not (prefill
+        row counts follow the chunk's token count and vary per request).
+        Rows are zeroed each step because entries the compress kernel skips
+        must not be quantized into the pool as stale data. out_loc is int64;
+        the compress store kernel rejects int32.
+        """
+        cache = getattr(self, "_nvfp4_stage_cache", None)
+        if cache is None:
+            cache = self._nvfp4_stage_cache = {}
+        capacity = 1 << max(0, num_rows - 1).bit_length()
+        key = (compress_ratio, capacity)
+        entry = cache.get(key)
+        if entry is None:
+            entry = (
+                torch.zeros(capacity, 512, dtype=torch.bfloat16, device=device),
+                torch.arange(capacity, dtype=torch.int64, device=device),
+            )
+            cache[key] = entry
+        rows = entry[0][:num_rows]
+        rows.zero_()
+        return rows, entry[1][:num_rows]
+
     def _forward_compress_all_in_one(
         self,
         *,
@@ -241,6 +271,17 @@ class CompressorBackendMixin:
             page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                 out_loc = compress_kv_pool._translate_loc_to_hisparse_device(out_loc)
+            if compress_kv_pool.is_nvfp4:
+                # The all-in-one kernel only emits the FP8 cache ABI. Land its
+                # normed+roped output in a compacted BF16 staging buffer and
+                # quantize into the NVFP4 pool afterwards.
+                nvfp4_out_loc = out_loc
+                nvfp4_cache = compress_kv_pool.nvfp4_cache_view(kv_cache)
+                kv_cache, out_loc = self._nvfp4_stage(
+                    compressor.ratio, out_loc.shape[0], out_loc.device
+                )
+                page_size = 1
+                bf16_store = True
         self._forward_compress_all_in_one(
             kv_score_buffer=state_pool.kv_score_buffer.kv_score,
             kv_score_input=kv_score_input,
@@ -257,6 +298,14 @@ class CompressorBackendMixin:
             use_fp4_indexer=use_fp4_indexer,
             bf16_store=bf16_store,
         )
+        if not compressor.is_in_indexer and not is_unified_kv_triton():
+            _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
+            if compress_kv_pool.is_nvfp4:
+                from flashinfer.mla import nvfp4_quantize_append_sparse_mla_cache
+
+                nvfp4_quantize_append_sparse_mla_cache(
+                    kv_cache, nvfp4_out_loc, nvfp4_cache
+                )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
             online_c128_mtp.write_prefix_states(

@@ -110,6 +110,7 @@ from sglang.srt.layers.utils.cp_utils import (
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import is_nvfp4_kv_cache
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -968,7 +969,9 @@ class MQALayer(MqaAttentionBase):
         Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
-        if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
+        # The fused kernel below only emits the FP8 cache ABI, so an NVFP4 KV
+        # cache has to take the bf16-intermediate path and quantize on store.
+        if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get() or is_nvfp4_kv_cache():
             # Quantize the nope payload from bf16-rounded values (the fused
             # kernel quantizes from fp32 registers; the bf16 rounding moves
             # values across fp8 bins relative to bf16-sourced consumers).

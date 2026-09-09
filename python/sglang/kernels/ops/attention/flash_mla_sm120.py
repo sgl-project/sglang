@@ -208,6 +208,7 @@ def _sm120_sparse_decode_fwd(
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
 # Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+_sm120_kv_cache_format = envs.SGLANG_SM120_KV_CACHE_FORMAT.get()
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
@@ -229,6 +230,19 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_topk_length = kwargs.get("extra_topk_length")
 
     if _sm120_default_backend == "flashinfer":
+        if _sm120_kv_cache_format == "nvfp4":
+            return _flash_mla_flashinfer_nvfp4(
+                q,
+                k_cache,
+                indices,
+                topk_length,
+                attn_sink,
+                head_dim_v,
+                softmax_scale,
+                extra_k_cache,
+                extra_indices,
+                extra_topk_length,
+            )
         return _flash_mla_flashinfer(
             q,
             k_cache,
@@ -472,6 +486,121 @@ def _split_kv_pages_to_64(
         (num_dst_pages, _PBS_DST, 1, bpt),
         (_BYTES_PER_DST_PAGE_PADDED, bpt, bpt, 1),
     )
+
+
+_nvfp4_plan_cache: dict = {}
+
+
+def _nvfp4_plan(num_tokens, num_heads, topk, extra_topk, extra_page_size, device):
+    """Phase + chunks-per-block decision for the NVFP4 sparse-MLA kernels.
+
+    FlashInfer's planner is CUDA-graph safe (it skips calibration while the
+    stream is capturing and falls back to its CPB heuristic), but it is pure
+    Python, so memoize the decision per shape to keep it off the hot path.
+    """
+    key = (num_tokens, num_heads, topk, extra_topk, extra_page_size)
+    cached = _nvfp4_plan_cache.get(key)
+    if cached is not None:
+        return cached
+
+    from flashinfer.mla._sparse_mla_nvfp4_sm120_plan import (
+        NVFP4KernelVariant,
+        plan_nvfp4_sparse_mla_sm120,
+    )
+
+    planned = plan_nvfp4_sparse_mla_sm120(
+        num_tokens,
+        num_heads,
+        topk,
+        _PBS_DST,
+        device,
+        extra_topk=extra_topk,
+        extra_page_size=extra_page_size,
+        has_topk_length=True,
+        has_extra_topk_length=extra_topk > 0,
+        has_attn_sink=True,
+    )
+    if planned is None:
+        raise ValueError(
+            "no NVFP4 sparse MLA kernel serves "
+            f"T={num_tokens}, H={num_heads}, topk={topk}, extra_topk={extra_topk}"
+        )
+    decision = (planned.variant is NVFP4KernelVariant.PREFILL_STREAMING, planned.cpb)
+    _nvfp4_plan_cache[key] = decision
+    return decision
+
+
+def _flash_mla_flashinfer_nvfp4(
+    q,
+    k_cache,
+    indices,
+    topk_length,
+    attn_sink,
+    head_dim_v,
+    softmax_scale,
+    extra_k_cache,
+    extra_indices,
+    extra_topk_length,
+):
+    """FlashInfer SM120 NVFP4 sparse MLA (384 B/token cache ABI).
+
+    The pool hands over caches already grouped into the page sizes the NVFP4
+    kernels accept (64 primary, 2 or 64 extra) with no per-page padding, so
+    unlike the FP8 path there is no page-split copy here.
+    """
+    from flashinfer.mla._sparse_mla_nvfp4_sm120 import (
+        _sparse_mla_nvfp4_sm120_paged_attention,
+    )
+
+    B, _, H, _ = q.shape
+    dev = q.device
+    idx = indices.squeeze(1) if indices.dim() == 3 else indices
+    extra_idx = (
+        extra_indices.squeeze(1)
+        if extra_indices is not None and extra_indices.dim() == 3
+        else extra_indices
+    )
+
+    topk = idx.shape[-1]
+    extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
+    extra_page_size = extra_k_cache.shape[1] if extra_k_cache is not None else 0
+    use_prefill, cpb = _nvfp4_plan(B, H, topk, extra_topk, extra_page_size, dev)
+
+    output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
+    out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
+
+    if use_prefill:
+        mid_out = None
+        mid_lse = None
+    else:
+        _BI = 64
+        num_splits = (topk + _BI - 1) // _BI + (
+            (extra_topk + _BI - 1) // _BI if extra_topk > 0 else 0
+        )
+        mid_out = torch.empty(
+            B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=dev
+        )
+        mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=dev)
+
+    _sparse_mla_nvfp4_sm120_paged_attention(
+        q.squeeze(1) if q.ndim == 4 else q,
+        k_cache,
+        idx,
+        output,
+        out_lse,
+        softmax_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_k_cache,
+        extra_indices=extra_idx,
+        extra_topk_length=extra_topk_length,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+        use_prefill=use_prefill,
+        chunks_per_block_override=cpb,
+    )
+
+    return (output.unsqueeze(1), None)
 
 
 def _flash_mla_flashinfer(

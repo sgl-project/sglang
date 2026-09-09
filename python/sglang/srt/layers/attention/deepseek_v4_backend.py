@@ -1705,24 +1705,32 @@ class DeepseekV4AttnBackend(
 
             swa_window_size = token_to_kv_pool.swa_window_size
             assert swa_k_cache.ndim == 2
-            k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
-            swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
-                swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
-            )
+            is_nvfp4_kv = token_to_kv_pool.swa_kv_pool.is_nvfp4
+            if is_nvfp4_kv:
+                swa_k_cache = token_to_kv_pool.swa_kv_pool.nvfp4_cache_view(swa_k_cache)
+            else:
+                k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
+                swa_k_cache = swa_k_cache[
+                    :, : swa_window_size * k_cache_total_dim
+                ].view(swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim)
 
             if extra_k_cache is not None:
-                page_sizes = {
-                    4: token_to_kv_pool.page_size // 4,
-                    128: token_to_kv_pool.page_size // 128,
-                }
-                extra_k_cache = extra_k_cache[
-                    :, : page_sizes[compress_ratio] * k_cache_total_dim
-                ].view(
-                    extra_k_cache.shape[0],
-                    page_sizes[compress_ratio],
-                    1,
-                    k_cache_total_dim,
-                )
+                if is_nvfp4_kv:
+                    _, _, extra_pool = token_to_kv_pool.layer_mapping[layer_id]
+                    extra_k_cache = extra_pool.nvfp4_cache_view(extra_k_cache)
+                else:
+                    page_sizes = {
+                        4: token_to_kv_pool.page_size // 4,
+                        128: token_to_kv_pool.page_size // 128,
+                    }
+                    extra_k_cache = extra_k_cache[
+                        :, : page_sizes[compress_ratio] * k_cache_total_dim
+                    ].view(
+                        extra_k_cache.shape[0],
+                        page_sizes[compress_ratio],
+                        1,
+                        k_cache_total_dim,
+                    )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
 
